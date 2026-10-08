@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from engineering_control.activities.gitops import (
     overall_failure_class,
     pod_failure_reason,
     render_sync_failure,
+    sealed_secret_stores,
     split_image,
 )
 from engineering_control.adapters.command import CommandFailure, CommandResult
@@ -199,8 +201,11 @@ class FakeKubectl:
         externalsecrets: dict[str, list[dict[str, Any]]] | None = None,
         stores: dict[str, dict[str, Any]] | None = None,
         application: dict[str, Any] | None = None,
+        eso_log: str | None = None,
     ) -> None:
         self.pods = pods or {}
+        # NEW-155: the external-secrets controller log; None = unreadable.
+        self.eso_log = eso_log
         self.deployments = deployments or {}
         self.statefulsets = statefulsets or {}
         self.externalsecrets = externalsecrets
@@ -301,6 +306,12 @@ class FakeKubectl:
             else:
                 self.application.update(patch)
             return CommandResult(0, "patched", "")
+        if verb == "logs":
+            if self.eso_log == "TIMEOUT":
+                raise subprocess.TimeoutExpired(["kubectl", "logs"], 120, output="Vault is sealed")
+            if self.eso_log is None:
+                return CommandResult(1, "", "logs unavailable")
+            return CommandResult(0, self.eso_log, "")
         if verb in {"annotate", "delete", "rollout"}:
             if verb == "annotate":
                 self._bump()
@@ -3706,3 +3717,328 @@ def test_failure_excerpt_names_every_failing_test_first() -> None:
     many = failure_excerpt("".join(f"not ok {n} - t{n}\n" for n in range(1, 101)))
     assert "Failing tests (100):" in many and "... and 75 more" in many
     assert len(many.splitlines()) <= 60
+
+
+# -- NEW-155: staging environment recovery ----------------------------------------------
+
+ESO_FUNCTION_INVOCATION = {
+    "group": "external-secrets.io",
+    "version": "v1",
+    "kind": "ExternalSecret",
+    "namespace": "musematic-platform",
+    "name": "platform-function-invocation",
+    "status": "Synced",
+}
+
+
+def _waiting_application(message: str, *resources: dict[str, Any]) -> dict[str, Any]:
+    """Production 2026-10-07: Argo CD stuck waiting on one resource's health."""
+    return _application(
+        operationState={
+            "phase": "Running",
+            "startedAt": "2026-10-07T10:00:00Z",
+            "message": message,
+            "operation": {"initiatedBy": {"username": "hermes-engineering"}, "sync": {}},
+        },
+        sync={"status": "Synced"},
+        health={"status": "Progressing"},
+        resources=[
+            {**_managed("Deployment", "web"), "status": "Synced"},
+            _prunable("ConfigMap", "falcone-keycloak-config"),
+            *resources,
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_155_a_health_wait_is_never_reported_as_prune_required(tmp_path: Path) -> None:
+    from engineering_control.workflows.definitions import StagingGitOpsDeliveryWorkflow
+
+    message = (
+        "waiting for healthy state of "
+        "external-secrets.io/ExternalSecret/platform-function-invocation"
+    )
+    kubectl = FakeKubectl(application=_waiting_application(message, ESO_FUNCTION_INVOCATION))
+    result = await _controller(tmp_path, kubectl).handle("gitops.diagnose_sync", {"plan": _plan()})
+    diagnosis = result["diagnosis"]
+    assert result["failure_class"] == "OTHER"
+    assert diagnosis["failed_resources"] == []
+    assert diagnosis["degraded_resources"] == [
+        {
+            "group": "external-secrets.io",
+            "kind": "ExternalSecret",
+            "namespace": "musematic-platform",
+            "name": "platform-function-invocation",
+            "health": "Unknown",
+            "message": "",
+            "pod_reasons": [],
+            "pod_reasons_total": 0,
+            "failure_class": "OTHER",
+        }
+    ]
+    # The prune drift is still reported, just not as the cause.
+    assert diagnosis["prune_required_resources_total"] == 1
+    assert diagnosis["classes"] == ["OTHER", "PRUNE_REQUIRED"]
+    # The (unchanged) workflow mapping then reports the timeout, not ARGO_PRUNE_REQUIRED.
+    blocker = StagingGitOpsDeliveryWorkflow._sync_blocker(
+        {"status": "TIMED_OUT"}, result["failure_class"]
+    )
+    assert blocker == "ARGO_SYNC_TIMEOUT"
+    assert not [call for call in kubectl.calls if call[0] != "get" and call[2] != "get"]
+
+
+@pytest.mark.asyncio
+async def test_new_155_pure_prune_drift_is_still_prune_required(tmp_path: Path) -> None:
+    kubectl = FakeKubectl(application=_prune_application())
+    result = await _controller(tmp_path, kubectl).handle("gitops.diagnose_sync", {"plan": _plan()})
+    assert result["failure_class"] == "PRUNE_REQUIRED"
+    assert result["diagnosis"]["degraded_resources"] == []
+
+
+@pytest.mark.asyncio
+async def test_new_155_waited_on_workloads_and_unknown_resources(tmp_path: Path) -> None:
+    web = {**_managed("Deployment", "web", health="Healthy"), "status": "Synced"}
+    pods = {"musematic-platform": [_owned_pod("web-5d9c7-abcde", "web-5d9c7", "ErrImagePull")]}
+    message = "waiting for healthy state of apps/Deployment/web"
+    application = _waiting_application(message)
+    application["status"]["resources"] = [web]
+    kubectl = FakeKubectl(application=application, pods=pods)
+    result = await _controller(tmp_path, kubectl).handle("gitops.diagnose_sync", {"plan": _plan()})
+    degraded = result["diagnosis"]["degraded_resources"]
+    assert [(item["name"], item["health"], item["failure_class"]) for item in degraded] == [
+        ("web", "Healthy", "TRANSIENT")
+    ]
+    assert result["failure_class"] == "TRANSIENT"
+    # Even next to prune drift, a transient wait keeps its own class.
+    application["status"]["resources"] = [web, _prunable("ConfigMap", "old")]
+    again = await _controller(
+        tmp_path / "b", FakeKubectl(application=application, pods=pods)
+    ).handle("gitops.diagnose_sync", {"plan": _plan()})
+    assert again["failure_class"] == "TRANSIENT"
+    assert again["diagnosis"]["prune_required_resources_total"] == 1
+
+    # Several phrases (core group included); one names a resource Argo does not list.
+    message = (
+        "waiting for healthy state of /Service/missing-svc, "
+        "waiting for healthy state of apps/Deployment/web"
+    )
+    unknown = FakeKubectl(application=_waiting_application(message), pods=pods)
+    result = await _controller(tmp_path / "c", unknown).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
+    assert result["failure_class"] == "OTHER"
+    assert [item["name"] for item in result["diagnosis"]["degraded_resources"]] == ["web"]
+
+
+SEALED_ERROR = (
+    "could not get provider client: unable to log in to auth method: unable to log in with "
+    "Kubernetes auth: Error making API request.\n\nURL: PUT https://openbao.secret-store:8200"
+    "/v1/auth/kubernetes/login\nCode: 503. Errors:\n\n* Vault is sealed"
+)
+
+
+def _eso_log(*entries: dict[str, Any]) -> str:
+    lines = ["plain text line", '{"level":"info","msg":"reconciled"}']
+    lines.extend(
+        json.dumps({"level": "error", "error": SEALED_ERROR, **entry}) for entry in entries
+    )
+    return "\n".join(lines) + "\n"
+
+
+def test_new_155_sealed_stores_are_parsed_from_eso_json_logs() -> None:
+    log = _eso_log(
+        {
+            "logger": "controllers.ClusterSecretStore",
+            "clustersecretstore": {"name": "openbao-backend"},
+        },
+        {"controller": "clustersecretstore", "ClusterSecretStore": {"name": "vault-backend"}},
+        {"controller": "secretstore", "SecretStore": {"name": "local", "namespace": "apps"}},
+        {"clustersecretstore": {"name": "Not_A_Name"}},
+    ) + json.dumps({"error": "permission denied", "clustersecretstore": {"name": "other"}})
+    assert sealed_secret_stores(log) == {
+        ("ClusterSecretStore", "", "openbao-backend"),
+        ("ClusterSecretStore", "", "vault-backend"),
+        ("SecretStore", "apps", "local"),
+    }
+
+
+def _sealed_kubectl(**changes: Any) -> FakeKubectl:
+    values: dict[str, Any] = {
+        "externalsecrets": {
+            "musematic-platform": [
+                {
+                    "metadata": {"name": "platform-db"},
+                    "spec": {
+                        "secretStoreRef": {"name": "openbao-backend", "kind": "ClusterSecretStore"}
+                    },
+                    "status": {
+                        "conditions": [
+                            {"type": "Ready", "status": "False", "reason": "SecretSyncedError"}
+                        ]
+                    },
+                },
+                {
+                    "metadata": {"name": "platform-cache"},
+                    "spec": {"secretStoreRef": {"name": "cache", "kind": "ClusterSecretStore"}},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                },
+            ]
+        },
+        "stores": {
+            "openbao-backend": {
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "InvalidProviderConfig"}
+                    ]
+                }
+            },
+            "cache": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}},
+        },
+        "eso_log": _eso_log({"clustersecretstore": {"name": "openbao-backend"}}),
+        "application": _application(health={"status": "Degraded"}),
+    }
+    values.update(changes)
+    return FakeKubectl(**values)
+
+
+def _rollouts(kubectl: FakeKubectl) -> list[list[str]]:
+    return [call for call in kubectl.calls if "rollout" in call]
+
+
+@pytest.mark.asyncio
+async def test_new_155_a_sealed_backend_is_named_and_never_restarted(tmp_path: Path) -> None:
+    kubectl = _sealed_kubectl()
+    handler = _controller(tmp_path, kubectl)
+    check = await handler.handle("gitops.environment_check", {"plan": _plan()})
+    diagnosis = check["diagnosis"]
+    assert check["status"] == "UNHEALTHY"
+    assert diagnosis["sealed_backend_stores"] == ["openbao-backend"]
+    assert diagnosis["stores_not_ready"] == [
+        {
+            "kind": "ClusterSecretStore",
+            "name": "openbao-backend",
+            "namespace": "",
+            "reason": "InvalidProviderConfig",
+            "sealed": True,
+        }
+    ]
+    assert diagnosis["eso_objects_not_ready"] == [
+        {"namespace": "musematic-platform", "name": "platform-db", "reason": "SecretSyncedError"}
+    ]
+    assert diagnosis["eso_objects_not_ready_total"] == 1
+    # No log text reaches the diagnosis: only store names and the boolean.
+    dumped = json.dumps(check)
+    assert "is sealed" not in dumped and "auth/kubernetes" not in dumped
+    logs = [call for call in kubectl.calls if "logs" in call]
+    assert logs == [
+        [
+            "--namespace",
+            "external-secrets",
+            "logs",
+            "deployment/external-secrets",
+            "--since=15m",
+            "--tail=3000",
+        ]
+    ]
+
+    result = await handler.handle("gitops.remediate", {"plan": _plan(), "round": 1})
+    assert result["actions"] == ["argo-hard-refresh", "argo-sync", "secret-backend-sealed"]
+    assert _rollouts(kubectl) == []
+
+
+@pytest.mark.asyncio
+async def test_new_155_unreadable_or_oversized_logs_are_unknown(tmp_path: Path) -> None:
+    # Review: a timeout degrades like a failed read and leaks none of its output.
+    for index, log in enumerate((None, "x" * 8_000_001, "TIMEOUT")):
+        kubectl = _sealed_kubectl(eso_log=log)
+        handler = _controller(tmp_path / str(index), kubectl)
+        result = await handler.handle("gitops.remediate", {"plan": _plan(), "round": 1})
+        assert result["diagnosis"]["sealed_backend_stores"] == []
+        assert result["diagnosis"]["seal_status_known"] is False
+        assert result["diagnosis"]["stores_not_ready"][0]["sealed"] is None
+        assert "Vault is sealed" not in json.dumps(result)
+        assert "restart-external-secrets" in result["actions"]
+        assert len(_rollouts(kubectl)) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_155_external_secrets_in_backoff_restart_eso_once_stores_recover(
+    tmp_path: Path,
+) -> None:
+    recovered = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    kubectl = _sealed_kubectl(stores={"openbao-backend": recovered, "cache": recovered})
+    handler = _controller(tmp_path, kubectl)
+    result = await handler.handle("gitops.remediate", {"plan": _plan(), "round": 1})
+    assert result["diagnosis"]["stores_not_ready"] == []
+    assert result["diagnosis"]["sealed_backend_stores"] == []
+    assert result["actions"] == ["argo-hard-refresh", "argo-sync", "restart-external-secrets"]
+    assert _rollouts(kubectl) == [
+        ["--namespace", "external-secrets", "rollout", "restart", "deployment/external-secrets"]
+    ]
+    # Every store Ready: the controller log is never read.
+    assert not [call for call in kubectl.calls if "logs" in call]
+
+    # Nothing not Ready: no restart.
+    synced = _sealed_kubectl(stores={"openbao-backend": recovered, "cache": recovered})
+    for item in synced.externalsecrets["musematic-platform"]:
+        item["status"] = recovered["status"]
+    quiet = await _controller(tmp_path / "b", synced).handle(
+        "gitops.remediate", {"plan": _plan(), "round": 1}
+    )
+    assert quiet["actions"] == ["argo-hard-refresh", "argo-sync"]
+
+
+@pytest.mark.asyncio
+async def test_new_155_environment_issue_explains_a_sealed_backend(tmp_path: Path) -> None:
+    handler, fake = _github(tmp_path)
+    diagnosis = {
+        "argo_health": "Degraded",
+        "stores_not_ready": [
+            {
+                "kind": "ClusterSecretStore",
+                "name": "openbao-backend",
+                "namespace": "",
+                "reason": "InvalidProviderConfig",
+                "sealed": True,
+            }
+        ],
+        "sealed_backend_stores": ["openbao-backend", "vault-musematic", "team-store"],
+        "eso_objects_not_ready": [
+            {
+                "namespace": "musematic-platform",
+                "name": "platform-db",
+                "reason": "SecretSyncedError",
+            }
+        ],
+    }
+    opened = await handler.handle(
+        "gitops.environment_issue",
+        {"plan": _plan(), "action": "report", "round": 1, "diagnosis": diagnosis},
+    )
+    assert opened["status"] == "ISSUE_OPENED"
+    body = fake.issues[("gntik-ai/musematic", opened["issue_number"])]["body"]
+    assert "### Secret backends sealed" in body
+    assert "`openbao-backend`, `vault-musematic`, `team-store`" in body
+    assert "Hermes cannot unseal" in body and "3 unseal keys" in body
+    assert "kubectl -n secret-store get secret openbao-recovery" in body
+    assert "kubectl -n secret-store exec -i openbao-0" in body
+    assert "bao operator unseal" in body
+    assert "kubectl -n vault exec -i vault-0" in body and "vault operator unseal" in body
+    assert "platform-db" in body and "SecretSyncedError" in body
+
+    # Unknown store names get only the generic instruction.
+    generic = {**diagnosis, "sealed_backend_stores": ["team-store"]}
+    commented = await handler.handle(
+        "gitops.environment_issue",
+        {"plan": _plan(), "action": "report", "round": 2, "diagnosis": generic},
+    )
+    comment = fake.issues[("gntik-ai/musematic", commented["issue_number"])]["comments"][-1]
+    assert "3 unseal keys" in comment["body"] and "kubectl -n" not in comment["body"]
+
+    healthy = {**diagnosis, "sealed_backend_stores": []}
+    again = await handler.handle(
+        "gitops.environment_issue",
+        {"plan": _plan(), "action": "report", "round": 3, "diagnosis": healthy},
+    )
+    comment = fake.issues[("gntik-ai/musematic", again["issue_number"])]["comments"][-1]
+    assert "Secret backends sealed" not in comment["body"]

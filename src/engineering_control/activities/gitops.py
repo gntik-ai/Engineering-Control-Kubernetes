@@ -417,6 +417,13 @@ _TRANSPORT_FAILURE = re.compile(
 )
 _IMMUTABLE_FIELD = re.compile(r"field is immutable", re.IGNORECASE)
 _DEGRADED_HEALTH = frozenset({"Degraded", "Missing", "Progressing"})
+# NEW-155: Argo CD's Running-phase message names the resource(s) whose health it awaits
+# ("waiting for healthy state of apps/Deployment/x"; the core group is empty).
+_HEALTH_WAIT = re.compile(
+    r"waiting for healthy state of ([a-z0-9.-]{0,253})/([A-Za-z0-9]{1,63})/([a-z0-9.-]{1,253})"
+)
+ESO_LOG_ARGUMENTS = ("--since=15m", "--tail=3000")
+ESO_LOG_LIMIT = 8_000_000
 _WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"})
 _BENIGN_WAITING = frozenset({"ContainerCreating", "PodInitializing"})
 # action -> (failure class it repairs, Argo syncOptions, apply force). Argo reads force
@@ -478,6 +485,35 @@ def classify_degraded(reasons: Iterable[str]) -> str:
     """Degraded health is only TRANSIENT when every pod reason is an image pull back-off."""
     values = {reason for reason in reasons if reason}
     return "TRANSIENT" if values and values <= TRANSIENT_POD_REASONS else "OTHER"
+
+
+def sealed_secret_stores(log: str) -> set[tuple[str, str, str]]:
+    """NEW-155: (kind, namespace, name) of stores whose backend the ESO log reports sealed.
+
+    Only identities leave this function; no log text is ever kept.
+    """
+    sealed: set[tuple[str, str, str]] = set()
+    for line in log.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or "is sealed" not in str(entry.get("error") or "").lower():
+            continue
+        for kind, keys in (
+            ("ClusterSecretStore", ("clustersecretstore", "ClusterSecretStore")),
+            ("SecretStore", ("secretstore", "SecretStore")),
+        ):
+            for key in keys:
+                reference = entry.get(key)
+                name = str(_nested(reference, "name") or "")
+                if not _KUBERNETES_NAME.fullmatch(name):
+                    continue
+                namespace = ""
+                if kind == "SecretStore":
+                    namespace = str(_nested(reference, "namespace") or entry.get("namespace") or "")
+                sealed.add((kind, namespace, name))
+    return sealed
 
 
 def overall_failure_class(classes: Iterable[str]) -> str:
@@ -1011,6 +1047,8 @@ class GitOpsControllerHandler:
         pods: list[dict[str, str]] = []
         workloads: list[dict[str, Any]] = []
         store_refs: set[tuple[str, str, str]] = set()
+        external_secrets: list[dict[str, str]] = []
+        external_secrets_total = 0
         eso_resources_observed = True
         for namespace in flow.namespaces:
             for pod in _items(
@@ -1054,7 +1092,23 @@ class GitOpsControllerHandler:
                 if isinstance(reference, dict) and isinstance(reference.get("name"), str):
                     kind = str(reference.get("kind") or "SecretStore")
                     store_refs.add((kind, str(reference["name"]), namespace))
-        stores: list[dict[str, str]] = []
+                # NEW-155: ExternalSecrets left in ESO's error backoff after a store recovers.
+                ready_condition: dict[str, Any] = {}
+                conditions = _nested(item, "status", "conditions")
+                for condition in conditions if isinstance(conditions, list) else []:
+                    if isinstance(condition, dict) and condition.get("type") == "Ready":
+                        ready_condition = condition
+                if ready_condition.get("status") != "True":
+                    external_secrets_total += 1
+                    if len(external_secrets) < MAXIMUM_DIAGNOSED_RESOURCES:
+                        external_secrets.append(
+                            {
+                                "namespace": namespace,
+                                "name": _name(item),
+                                "reason": str(ready_condition.get("reason") or "Unknown")[:80],
+                            }
+                        )
+        stores: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for kind, name, namespace in sorted(store_refs):
             cluster = kind == "ClusterSecretStore"
@@ -1085,6 +1139,17 @@ class GitOpsControllerHandler:
                         "reason": reason,
                     }
                 )
+        # NEW-155: a sealed OpenBao/Vault shows only as InvalidProviderConfig on the store;
+        # the ESO controller log names the cause. Only store names leave this block.
+        # Review: None means the log could not be read, so seal status is unknown (not
+        # False); the pre-NEW-155 ESO restart still applies then.
+        sealed = self._sealed_stores(flow) if stores else set()
+        for store in stores:
+            store["sealed"] = (
+                None
+                if sealed is None
+                else (store["kind"], store["namespace"], store["name"]) in sealed
+            )
         application = self._application(flow)
         health = str(_nested(application, "status", "health", "status") or "Unknown")
         sync = str(_nested(application, "status", "sync", "status") or "Unknown")
@@ -1095,11 +1160,35 @@ class GitOpsControllerHandler:
             "unhealthy_pods": pods,
             "unready_workloads": workloads,
             "stores_not_ready": stores,
+            "sealed_backend_stores": sorted({store["name"] for store in stores if store["sealed"]}),
+            "seal_status_known": sealed is not None,
+            "eso_objects_not_ready": external_secrets,
+            "eso_objects_not_ready_total": external_secrets_total,
             "eso_resources_observed": eso_resources_observed,
             "argo_application": flow.argo_application,
             "argo_health": health[:40],
             "argo_sync": sync[:40],
         }
+
+    def _sealed_stores(self, flow: StagingFlowPolicy) -> set[tuple[str, str, str]] | None:
+        """NEW-155: stores the ESO controller log reports sealed; None when unreadable."""
+        try:
+            result = self._kubectl(
+                [
+                    "--namespace",
+                    flow.external_secrets_namespace,
+                    "logs",
+                    f"deployment/{flow.external_secrets_deployment}",
+                    *ESO_LOG_ARGUMENTS,
+                ],
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # Review: an optional read; its captured output is never exported.
+            return None
+        if result.return_code or len(result.stdout.encode()) > ESO_LOG_LIMIT:
+            return None
+        return sealed_secret_stores(result.stdout)
 
     def _environment_check(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
@@ -1254,7 +1343,12 @@ class GitOpsControllerHandler:
             deleted.append(f"{namespace}/{name}")
         if deleted:
             actions.append("delete-failed-pods")
-        if diagnosis["stores_not_ready"]:
+        if diagnosis["sealed_backend_stores"]:
+            # NEW-155: a restart cannot unseal OpenBao/Vault; the issue tells the operator.
+            actions.append("secret-backend-sealed")
+        elif diagnosis["stores_not_ready"] or diagnosis["eso_objects_not_ready"]:
+            # NEW-155: also when every store is Ready again but ExternalSecrets sit in
+            # ESO's error backoff (observed >10 min after an unseal).
             self._kubectl(
                 [
                     "--namespace",
@@ -1540,38 +1634,63 @@ class GitOpsControllerHandler:
                 }
             )
         degraded: list[dict[str, Any]] = []
+        degraded_keys: set[str] = set()
         degraded_total = 0
+        pods: dict[str, list[dict[str, Any]]] = {}
+
+        def add_degraded(item: dict[str, Any], item_health: object) -> None:
+            nonlocal degraded_total
+            identity = resource_identity(item)
+            reasons: list[dict[str, str]] = []
+            if (
+                identity["kind"] in _WORKLOAD_KINDS
+                and identity["namespace"] in flow.namespaces
+                and _KUBERNETES_NAME.fullmatch(identity["name"])
+            ):
+                reasons = self._pod_reasons(
+                    identity["namespace"], identity["kind"], identity["name"], pods
+                )
+            failure_class = classify_degraded(reason["reason"] for reason in reasons)
+            classes.append(failure_class)
+            degraded_keys.add(resource_key(identity))
+            degraded_total += 1
+            if len(degraded) >= MAXIMUM_DIAGNOSED_RESOURCES:
+                return
+            degraded.append(
+                {
+                    **identity,
+                    "health": str(item_health)[:40],
+                    "message": self._bounded_message(_nested(item, "health", "message")),
+                    "pod_reasons": reasons[:MAXIMUM_POD_REASONS],
+                    "pod_reasons_total": len(reasons),
+                    "failure_class": failure_class,
+                }
+            )
+
         if sync == "Synced" and health != "Healthy":
-            pods: dict[str, list[dict[str, Any]]] = {}
             for item in managed_items:
                 item_health = _nested(item, "health", "status")
                 if not isinstance(item, dict) or item_health not in _DEGRADED_HEALTH:
                     continue
-                identity = resource_identity(item)
-                reasons: list[dict[str, str]] = []
-                if (
-                    identity["kind"] in _WORKLOAD_KINDS
-                    and identity["namespace"] in flow.namespaces
-                    and _KUBERNETES_NAME.fullmatch(identity["name"])
-                ):
-                    reasons = self._pod_reasons(
-                        identity["namespace"], identity["kind"], identity["name"], pods
-                    )
-                failure_class = classify_degraded(reason["reason"] for reason in reasons)
-                classes.append(failure_class)
-                degraded_total += 1
-                if len(degraded) >= MAXIMUM_DIAGNOSED_RESOURCES:
-                    continue
-                degraded.append(
-                    {
-                        **identity,
-                        "health": str(item_health)[:40],
-                        "message": self._bounded_message(_nested(item, "health", "message")),
-                        "pod_reasons": reasons[:MAXIMUM_POD_REASONS],
-                        "pod_reasons_total": len(reasons),
-                        "failure_class": failure_class,
-                    }
-                )
+                add_degraded(item, item_health)
+        raw_message = str(operation_state.get("message") or "")
+        # NEW-155: a sync stuck waiting for a resource's health is caused by THAT resource
+        # (even one whose health the scan above skips, e.g. an ExternalSecret), never by
+        # unrelated prune drift (production 2026-10-07: ARGO_PRUNE_REQUIRED misreported).
+        waits = _HEALTH_WAIT.findall(raw_message[:20_000])[:MAXIMUM_DIAGNOSED_RESOURCES]
+        for group, kind, name in waits:
+            matches = [
+                item
+                for item in managed_items
+                if isinstance(item, dict)
+                and (str(item.get("group") or ""), item.get("kind"), item.get("name"))
+                == (group, kind, name)
+            ]
+            if not matches:
+                classes.append("OTHER")
+            for item in matches:
+                if resource_key(item) not in degraded_keys:
+                    add_degraded(item, _nested(item, "health", "status") or "Unknown")
         # NEW-116: a successful sync can still leave the application OutOfSync (e.g. it ran
         # with an inherited selective scope); name those resources instead of "none".
         out_of_sync: list[dict[str, str]] = []
@@ -1620,7 +1739,6 @@ class GitOpsControllerHandler:
                 "apply" if _nested(operation_sync, "syncStrategy", "apply") is not None else "hook"
             ),
         }
-        raw_message = str(operation_state.get("message") or "")
         if not classes and phase in {"Failed", "Error"}:
             operation_class = classify_sync_failure("", raw_message)
             classes.append("TRANSIENT" if operation_class == "TRANSIENT" else "OTHER")
@@ -1641,7 +1759,11 @@ class GitOpsControllerHandler:
             "prune_required_resources_total": prune_required_total,
             "operation_scope": operation_scope,
             "classes": sorted(set(classes)),
-            "failure_class": overall_failure_class(classes),
+            # NEW-155: while Argo CD awaits a resource's health, prune drift is reported
+            # (above) but never the class: PRUNE_REQUIRED would outrank a TRANSIENT wait.
+            "failure_class": overall_failure_class(
+                value for value in classes if not waits or value != "PRUNE_REQUIRED"
+            ),
         }
 
     def _diagnose_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3143,11 +3265,63 @@ def render_environment_diagnosis(
         "### Secret stores not Ready",
         *(rows("stores_not_ready", ("kind", "namespace", "name", "reason")) or ["- none"]),
         "",
+        "### ExternalSecrets not Ready",
+        *(rows("eso_objects_not_ready", ("namespace", "name", "reason")) or ["- none"]),
+        *_render_sealed_backends(diagnosis.get("sealed_backend_stores")),
+        "",
         "Bounded remediation: Argo CD hard refresh + sync, deletion of failed pods so their "
         "controllers recreate them, and an external-secrets controller restart when a "
-        "secret store is not Ready. No secret values are included in this report.",
+        "secret store or ExternalSecret is not Ready (never while a secret backend is "
+        "sealed). No secret values are included in this report.",
     ]
     return "\n".join(lines)
+
+
+# NEW-155: store name -> (product, namespace, recovery secret, pod, CLI) of the known
+# sealed-backend recoveries; any other store gets the generic instruction only.
+_UNSEAL_PROCEDURES = {
+    "openbao-backend": ("falcone OpenBao", "secret-store", "openbao-recovery", "openbao-0", "bao"),
+    "vault-backend": ("musematic Vault", "vault", "vault-recovery", "vault-0", "vault"),
+    "vault-musematic": ("musematic Vault", "vault", "vault-recovery", "vault-0", "vault"),
+}
+
+
+def _render_sealed_backends(value: Any) -> list[str]:
+    """NEW-155: operator guidance for sealed secret backends; store names only."""
+    names = [
+        str(name)
+        for name in (value if isinstance(value, list) else [])[:MAXIMUM_DIAGNOSED_RESOURCES]
+        if isinstance(name, str) and _KUBERNETES_NAME.fullmatch(name)
+    ]
+    if not names:
+        return []
+    lines = [
+        "",
+        "### Secret backends sealed",
+        "The backend (OpenBao/Vault) of these secret stores is sealed: "
+        + ", ".join(f"`{name}`" for name in names)
+        + ". Hermes cannot unseal it and does not restart External Secrets while it is sealed.",
+        "",
+        "Operator: unseal each sealed backend with 3 unseal keys, then retry the loop; Hermes "
+        "restarts External Secrets itself once the stores are Ready.",
+    ]
+    procedures = sorted({_UNSEAL_PROCEDURES[name] for name in names if name in _UNSEAL_PROCEDURES})
+    for product, namespace, secret, pod, cli in procedures:
+        lines.extend(
+            [
+                "",
+                f"{product}:",
+                "```sh",
+                "for i in 1 2 3; do",
+                f"  kubectl -n {namespace} get secret {secret} "
+                '-o jsonpath="{.data.unseal$i}" | base64 -d \\',
+                f"    | kubectl -n {namespace} exec -i {pod} -- "
+                f"sh -c 'read -r k; {cli} operator unseal \"$k\"'",
+                "done",
+                "```",
+            ]
+        )
+    return lines
 
 
 def _sync_attempts(value: Any) -> list[dict[str, Any]]:
