@@ -20,10 +20,15 @@ from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.adapters.process import (
     PROVIDER_CAPACITY_ERROR,
+    SandboxToolchain,
     subscription_only_environment,
 )
 from engineering_control.agents.instructions import AgentInstructionPack, InstructionBundle
 from engineering_control.config import Settings
+from engineering_control.engineering.toolchain import (
+    ToolchainUnavailableError,
+    project_node_toolchain,
+)
 from engineering_control.engineering.ui_blueprint import agent_pack_parts_only
 from engineering_control.handoff.store import HandoffStore
 from engineering_control.models.core import AgentRequest, AgentResult
@@ -89,6 +94,8 @@ class ProviderAdapter(Protocol):
         self,
         request: AgentRequest,
         on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        *,
+        toolchain: SandboxToolchain | None = None,
     ) -> AgentResult: ...
 
 
@@ -205,6 +212,24 @@ class ProviderActivityHandler:
             },
         }
         try:
+            # NEW-159: the project's selected node/pnpm for the agent's sandbox (None for
+            # the default toolchain); a selection not installed here fails closed. A
+            # manifest this worker cannot read keeps the pre-NEW-159 default sandbox (the
+            # scan worker's delivery.prepare_toolchain fails closed on it instead).
+            sandbox_toolchain = project_node_toolchain(
+                self.settings, request.project.value
+            ).sandbox()
+        except ToolchainUnavailableError as error:
+            return self._blocked(runtime_payload, error.blocker, detail=str(error))
+        except OSError:
+            sandbox_toolchain = None
+        except ValueError as error:
+            return self._blocked(
+                runtime_payload,
+                "TOOLCHAIN_CONTRACT_INVALID",
+                detail=error_detail(error, self.redactor),
+            )
+        try:
             authenticated = await self.adapter.authenticated()
         except FileNotFoundError:
             return self._blocked(
@@ -302,7 +327,7 @@ class ProviderActivityHandler:
 
         keepalive = asyncio.create_task(heartbeat_keepalive())
         try:
-            result = await self.adapter.execute(request, heartbeat_event)
+            result = await self._execute(request, heartbeat_event, sandbox_toolchain)
             for retry, delay in enumerate(self._capacity_backoff_seconds, start=1):
                 if not self._capacity_retry_allowed(result, delay):
                     break
@@ -316,7 +341,7 @@ class ProviderActivityHandler:
                     }
                 )
                 await asyncio.sleep(delay)
-                result = await self.adapter.execute(request, heartbeat_event)
+                result = await self._execute(request, heartbeat_event, sandbox_toolchain)
         except BaseException as error:
             try:
                 await recorder.finish(
@@ -374,6 +399,17 @@ class ProviderActivityHandler:
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
         return safe
+
+    async def _execute(
+        self,
+        request: AgentRequest,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+        toolchain: SandboxToolchain | None,
+    ) -> AgentResult:
+        if toolchain is None:
+            # The default toolchain calls the adapter exactly as before NEW-159.
+            return await self.adapter.execute(request, on_event)
+        return await self.adapter.execute(request, on_event, toolchain=toolchain)
 
     def _capacity_retry_allowed(self, result: AgentResult, delay: float) -> bool:
         """Retry only a model-at-capacity failure, and only within the activity budget."""

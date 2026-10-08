@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
+from engineering_control.adapters.process import SandboxToolchain
 from engineering_control.config import Settings
 from engineering_control.engineering.models import (
+    DEFAULT_TOOLCHAIN_NODE,
     DeploymentPinPolicy,
     ProjectManifest,
     ToolchainPolicy,
@@ -71,11 +75,119 @@ def enabled_toolchain(project_config_root: Path, project: str) -> ToolchainPolic
     return policy if policy is not None and policy.enabled else None
 
 
-def prepare_executables(settings: Settings) -> dict[str, Path]:
+TOOLCHAIN_NODE_UNAVAILABLE = "TOOLCHAIN_NODE_UNAVAILABLE"
+TOOLCHAIN_PNPM_UNAVAILABLE = "TOOLCHAIN_PNPM_UNAVAILABLE"
+# NEW-159: only for a non-default selection. pnpm 11 reads pnpm_config_* (pm-on-fail
+# replaces manage-package-manager-versions); pnpm 10 reads the npm_config_* form. None
+# of them may download or switch to another pnpm (packageManager / devEngines).
+_NON_DEFAULT_NODE_VARIABLES: tuple[tuple[str, str], ...] = (
+    ("npm_config_manage_package_manager_versions", "false"),
+    ("pnpm_config_manage_package_manager_versions", "false"),
+    ("pnpm_config_pm_on_fail", "ignore"),
+    ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+    ("COREPACK_ENABLE_AUTO_PIN", "0"),
+)
+
+
+class ToolchainUnavailableError(ValueError):
+    """The manifest selects a node or pnpm that is not installed on this host."""
+
+    def __init__(self, blocker: str, detail: str) -> None:
+        super().__init__(detail)
+        self.blocker = blocker
+
+
+@dataclass(frozen=True)
+class NodeToolchain:
+    """NEW-159: the node/pnpm a project's toolchain runs with on this host."""
+
+    node: str
+    pnpm: str | None
+    node_bin: Path
+    pnpm_executable: Path
+
+    @property
+    def default(self) -> bool:
+        return self.node == DEFAULT_TOOLCHAIN_NODE and self.pnpm is None
+
+    @property
+    def path_prefix(self) -> tuple[str, ...]:
+        """PATH entries to prepend: none for the default (byte-identical PATH)."""
+        if self.default:
+            return ()
+        # A pinned pnpm goes first so it wins over /usr/local/bin/pnpm even on node 22; the
+        # worker pnpm's directory (/usr/local/bin, which also holds node 22) is never added.
+        entries = [str(self.pnpm_executable.parent)] if self.pnpm is not None else []
+        return tuple(dict.fromkeys((*entries, str(self.node_bin))))
+
+    @property
+    def variables(self) -> dict[str, str]:
+        return {} if self.default else dict(_NON_DEFAULT_NODE_VARIABLES)
+
+    def path(self, base: str) -> str:
+        return ":".join((*self.path_prefix, base))
+
+    def sandbox(self) -> SandboxToolchain | None:
+        if self.default:
+            return None
+        return SandboxToolchain(self.path_prefix, _NON_DEFAULT_NODE_VARIABLES)
+
+
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def resolve_node_toolchain(settings: Settings, policy: ToolchainPolicy | None) -> NodeToolchain:
+    """The project's node/pnpm; a non-default selection fails closed when not installed.
+
+    The default (no policy, node "22", no pinned pnpm) resolves to today's executables
+    without touching the filesystem, so existing projects behave exactly as before.
+    """
+    node = policy.node if policy is not None else DEFAULT_TOOLCHAIN_NODE
+    pnpm = policy.pnpm if policy is not None else None
+    root = settings.toolchain_node_roots.get(node)
+    if node == DEFAULT_TOOLCHAIN_NODE and pnpm is None:
+        node_bin = root / "bin" if root is not None else settings.node_executable.parent
+        return NodeToolchain(node, None, node_bin, settings.toolchain_pnpm_executable)
+    if root is None or not _executable(root / "bin" / "node"):
+        where = "no root is configured" if root is None else f"{root / 'bin' / 'node'} is missing"
+        raise ToolchainUnavailableError(
+            TOOLCHAIN_NODE_UNAVAILABLE, f"Node.js {node} is not installed on this host ({where})"
+        )
+    pnpm_executable = settings.toolchain_pnpm_executable
+    if pnpm is not None:
+        pinned = settings.toolchain_pnpm_executables.get(pnpm)
+        if pinned is None or not _executable(pinned):
+            where = "no executable is configured" if pinned is None else f"{pinned} is missing"
+            raise ToolchainUnavailableError(
+                TOOLCHAIN_PNPM_UNAVAILABLE, f"pnpm {pnpm} is not installed on this host ({where})"
+            )
+        pnpm_executable = pinned
+    return NodeToolchain(node, pnpm, root / "bin", pnpm_executable)
+
+
+def project_node_toolchain(settings: Settings, project: str) -> NodeToolchain:
+    """resolve_node_toolchain for a project manifest; a missing manifest is the default.
+
+    Raises ToolchainUnavailableError (fail closed) when the selection is not installed
+    here, and OSError/ValueError when the manifest is invalid.
+    """
+    try:
+        policy = load_toolchain_policy(settings.project_config_root, project)
+    except FileNotFoundError:
+        policy = None
+    return resolve_node_toolchain(settings, policy)
+
+
+def prepare_executables(
+    settings: Settings, toolchain: NodeToolchain | None = None
+) -> dict[str, Path]:
     """The only executables a prepare command may run (argv[0] name -> absolute path)."""
     return {
         "uv": settings.uv_executable,
-        "pnpm": settings.toolchain_pnpm_executable,
+        "pnpm": (
+            settings.toolchain_pnpm_executable if toolchain is None else toolchain.pnpm_executable
+        ),
         # NEW-79a: Go module downloads and the offline Trivy DB for the sandbox.
         "go": settings.go_executable,
         "trivy": settings.trivy_executable,

@@ -31,11 +31,39 @@ TOOLCHAIN_CACHE_ROOT = Path(
 GO_ROOT_BIN = Path("/usr/local/go/bin")
 
 
-def sandbox_toolchain_environment(base: Mapping[str, str]) -> dict[str, str]:
+@dataclass(frozen=True)
+class SandboxToolchain:
+    """NEW-159: a project's non-default Node.js/pnpm selection for the agent sandbox.
+
+    ``path_prefix`` directories go first on PATH; ``variables`` are added verbatim. The
+    default toolchain (Node 22, worker pnpm) is represented by ``None``, never by an
+    empty instance, so the default environment stays byte-identical.
+    """
+
+    path_prefix: tuple[str, ...]
+    variables: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.path_prefix or any(
+            not entry.startswith("/") or ":" in entry for entry in self.path_prefix
+        ):
+            raise ValueError("sandbox toolchain PATH entries must be absolute directories")
+        if any(key == "PATH" for key, _ in self.variables):
+            raise ValueError("sandbox toolchain variables cannot replace PATH")
+
+
+def sandbox_toolchain_environment(
+    base: Mapping[str, str], toolchain: SandboxToolchain | None = None
+) -> dict[str, str]:
     """Go (module cache prefilled, no proxy) and Trivy (DB prefilled, offline) settings."""
     path = base.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     if GO_ROOT_BIN.is_dir() and str(GO_ROOT_BIN) not in path.split(":"):
         path = f"{GO_ROOT_BIN}:{path}"
+    extra: dict[str, str] = {}
+    if toolchain is not None:
+        # NEW-159: the project's selected node and pnpm win over /usr/local/bin.
+        path = ":".join((*toolchain.path_prefix, path))
+        extra = dict(toolchain.variables)
     return {
         "PATH": path,
         "GOMODCACHE": str(TOOLCHAIN_CACHE_ROOT / "go-mod"),
@@ -52,11 +80,15 @@ def sandbox_toolchain_environment(base: Mapping[str, str]) -> dict[str, str]:
         "TRIVY_OFFLINE_SCAN": "true",
         "TRIVY_CACHE_BACKEND": "memory",
         "TRIVY_NO_PROGRESS": "true",
+        **extra,
     }
 
 
 def subscription_only_environment(
-    provider: str, overrides: Mapping[str, str] | None = None
+    provider: str,
+    overrides: Mapping[str, str] | None = None,
+    *,
+    toolchain: SandboxToolchain | None = None,
 ) -> dict[str, str]:
     """Build an environment that cannot silently select API-paid provider credentials."""
     env = dict(os.environ)
@@ -102,7 +134,7 @@ def subscription_only_environment(
     # NEW-48: a worktree .mypy_cache written by the maker is not writable by the
     # checker (another runner uid). /dev/null is mypy's documented "no cache".
     env["MYPY_CACHE_DIR"] = "/dev/null"
-    env.update(sandbox_toolchain_environment(env))
+    env.update(sandbox_toolchain_environment(env, toolchain))
     if overrides:
         disallowed = forbidden.intersection(overrides)
         if disallowed:
@@ -140,6 +172,7 @@ async def run_jsonl_process(
     on_event: EventCallback | None = None,
     environment: Mapping[str, str] | None = None,
     max_stderr_bytes: int = 256_000,
+    toolchain: SandboxToolchain | None = None,
 ) -> ProcessResult:
     if not command or any(not isinstance(part, str) or "\x00" in part for part in command):
         raise ValueError("command must be a non-empty string sequence without NUL bytes")
@@ -149,7 +182,7 @@ async def run_jsonl_process(
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
-        env=subscription_only_environment(provider, environment),
+        env=subscription_only_environment(provider, environment, toolchain=toolchain),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

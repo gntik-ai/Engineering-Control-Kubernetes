@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +16,10 @@ from engineering_control.workflows.worker_registry import (
     ROLE_WORKER_REGISTRY,
     WorkerKind,
 )
+
+
+def _default_toolchain_node_roots() -> dict[Literal["22", "24"], Path]:
+    return {"22": Path("/usr/local"), "24": Path("/opt/engineering-toolchain/node-24")}
 
 
 class Settings(BaseSettings):
@@ -93,6 +98,18 @@ class Settings(BaseSettings):
     # browser worker's pnpm above is a different, pinned consumer-suite install.
     uv_executable: Path = Path("/usr/local/bin/uv")
     toolchain_pnpm_executable: Path = Path("/usr/local/bin/pnpm")
+    # NEW-159: side-by-side Node.js installs a project manifest selects by major
+    # (toolchain.node, default "22" = today's /usr/local/bin/node, never changed), and
+    # standalone pnpm executables by pinned version (toolchain.pnpm, default None = the
+    # executable above). scripts/bootstrap-worker.sh --node-toolchain installs both.
+    toolchain_node_roots: dict[Literal["22", "24"], Path] = Field(
+        default_factory=_default_toolchain_node_roots
+    )
+    toolchain_pnpm_executables: dict[str, Path] = Field(
+        default_factory=lambda: {
+            "11.28.3": Path("/opt/engineering-toolchain/pnpm-11.28.3/pnpm"),
+        }
+    )
     # NEW-75: makers are offline; delivery.resolve_dependencies (scan worker, network)
     # regenerates go.sum / pnpm-lock.yaml after the maker edited only the manifests.
     go_executable: Path = Path("/usr/local/go/bin/go")
@@ -276,6 +293,25 @@ class Settings(BaseSettings):
     def private_evidence_ingest_only(cls, value: str) -> str:
         if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
             raise ValueError("the evidence ingest service cannot bind to every interface")
+        return value
+
+    @field_validator("toolchain_node_roots")
+    @classmethod
+    def absolute_node_roots(
+        cls, value: dict[Literal["22", "24"], Path]
+    ) -> dict[Literal["22", "24"], Path]:
+        if any(not path.is_absolute() for path in value.values()):
+            raise ValueError("toolchain node roots must be absolute paths")
+        return value
+
+    @field_validator("toolchain_pnpm_executables")
+    @classmethod
+    def pinned_pnpm_executables(cls, value: dict[str, Path]) -> dict[str, Path]:
+        for version, path in value.items():
+            if not re.fullmatch(r"(?:0|[1-9][0-9]{0,3})(?:\.(?:0|[1-9][0-9]{0,3})){2}", version):
+                raise ValueError("toolchain pnpm versions must be exact MAJOR.MINOR.PATCH")
+            if not path.is_absolute() or path.name != "pnpm":
+                raise ValueError("toolchain pnpm executables must be absolute .../pnpm paths")
         return value
 
     @field_validator("agent_pack_root")

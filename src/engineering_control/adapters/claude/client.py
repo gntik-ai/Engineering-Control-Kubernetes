@@ -10,6 +10,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from engineering_control.adapters.auth_probe import AuthProbeError, run_auth_probe
 from engineering_control.adapters.process import (
     EventCallback,
+    SandboxToolchain,
     classify_failure,
     run_jsonl_process,
 )
@@ -47,7 +48,11 @@ class ClaudeCLIAdapter:
         return all(state is True for state in states)
 
     async def execute(
-        self, request: AgentRequest, on_event: EventCallback | None = None
+        self,
+        request: AgentRequest,
+        on_event: EventCallback | None = None,
+        *,
+        toolchain: SandboxToolchain | None = None,
     ) -> AgentResult:
         if request.provider is not self.provider:
             raise ValueError("Claude adapter received a non-Claude request")
@@ -103,6 +108,7 @@ class ClaudeCLIAdapter:
             timeout_seconds=request.timeout_seconds,
             provider=self.provider.value,
             on_event=on_event,
+            toolchain=toolchain,
         )
         structured_result, summary, session_id = self._final(process_result.events)
         usage = self._usage(process_result.events)
