@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -312,6 +313,9 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
     handler._finalize_cleanup = synchronized_finalize  # type: ignore[method-assign]
 
     async def concurrent_finalization() -> None:
+        # The default to_thread pool has cpu_count + 4 workers; a 2-CPU runner could never
+        # fill the 8-party barrier (NEW-165).
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=8))
         results = await asyncio.gather(
             *(handler.handle("cleanup.finalize", finalize_payload) for _ in range(8))
         )

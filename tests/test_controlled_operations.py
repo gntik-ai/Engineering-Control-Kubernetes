@@ -85,7 +85,8 @@ PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects
 
 async def _rotate_candidate(repository, candidate_id, previous_binding):
     """Use the real rotating repository path with explicit synthetic session proof."""
-    dashboard = DashboardRepository(str(repository.engine.url))
+    # str(URL) masks the password as ***; the CI fixture has one (NEW-165).
+    dashboard = DashboardRepository(repository.engine.url.render_as_string(hide_password=False))
     try:
         version = await dashboard.authentication_version()
         if version is None:
