@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2337,9 +2337,16 @@ class ScanActivityHandler(UiPlanScanSteps):
         except (OSError, ValueError) as error:
             return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
         try:
-            toolchain = resolve_node_toolchain(self.settings, policy)
+            # NEW-159 review 3: a re-preparation in the same delivery (e.g. after dependency
+            # resolution) keeps the selection it carries; only the first one reads the manifest.
+            if isinstance(payload.get("toolchain_preparation"), Mapping):
+                toolchain = payload_node_toolchain(self.settings, payload)
+            else:
+                toolchain = resolve_node_toolchain(self.settings, policy)
         except ToolchainUnavailableError as error:
             return self._toolchain_blocked(payload, error.blocker, str(error), [])
+        except ValueError as error:
+            return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
         # NEW-159 review 1: a non-default selection travels in toolchain_preparation to
         # the maker/checker invocations (the provider worker never reads the manifest).
         selection = toolchain.selection()

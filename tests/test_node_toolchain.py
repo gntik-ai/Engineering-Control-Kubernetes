@@ -693,8 +693,23 @@ def test_review_2_manifest_edits_never_change_a_running_delivery(tmp_path: Path)
             **_installs(tmp_path),
         }
     )
-    assert handler._resolve_dependencies(payload)["status"] == "DEPENDENCIES_RESOLVED"
+    payload = {**payload, "toolchain_preparation": {"status": "TOOLCHAIN_READY"}}
+    resolved = handler._resolve_dependencies(payload)
+    assert resolved["status"] == "DEPENDENCIES_RESOLVED"
     assert dependencies.calls[0]["environment"] == handler._dependency_environment()
+    # Review 3: the re-preparation keeps the carried (default) selection for later steps.
+    assert "node_toolchain" not in resolved["toolchain_preparation"]
+
+
+def test_review_3_re_preparation_keeps_a_carried_node_24(tmp_path: Path) -> None:
+    requests = [{"ecosystem": "pnpm", "directory": "."}]
+    handler, _, _, payload, _ = _dependency_setup(tmp_path, requests)
+    handler.settings = handler.settings.model_copy(update=_installs(tmp_path))
+    # The manifest says default; the delivery carries Node 24 from its first preparation.
+    payload = _carrying_node_24(payload)
+    resolved = handler._resolve_dependencies(payload)
+    assert resolved["status"] == "DEPENDENCIES_RESOLVED"
+    assert resolved["toolchain_preparation"]["node_toolchain"]["node"] == "24"
 
 
 def test_review_2_baseline_runs_under_the_carried_selection(tmp_path: Path) -> None:
