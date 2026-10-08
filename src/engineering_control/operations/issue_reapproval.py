@@ -49,11 +49,12 @@ from engineering_control.operations.issue_delivery_approval import (
 )
 from engineering_control.operations.issue_start import issue_start_request, issue_workflow_id
 from engineering_control.operations.models import SolveIssueCommand, parse_command
+from engineering_control.projects import PROJECT_ALTERNATION
 
 REAPPROVAL_EVENT_TYPE = REISSUE_EVENT_TYPE
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ISSUE_LOOP = re.compile(
-    rf"backlog-loop-(?P<project>falcone|musematic|llmwiki)-(?P<campaign>{_UUID})"
+    rf"backlog-loop-(?P<project>{PROJECT_ALTERNATION})-(?P<campaign>{_UUID})"
     rf"-operation-(?P<operation>{_UUID})"
 )
 _OPEN_OPERATION_STATES = frozenset({"DISPATCHING", "STARTED"})

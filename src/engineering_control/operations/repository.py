@@ -115,6 +115,7 @@ from engineering_control.operations.reconciliation import (
     snapshot_token,
     utc_text,
 )
+from engineering_control.projects import GLOBAL_PROJECTS, PROJECT_SET
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -412,7 +413,7 @@ class OperationsRepository:
         issue_number: int,
         create: bool = True,
     ) -> dict[str, Any]:
-        if project not in {"falcone", "musematic", "llmwiki"}:
+        if project not in PROJECT_SET:
             raise ValueError("R3 approval project is not allowlisted")
         if surface not in {"source", "deployment"}:
             raise ValueError("R3 approval surface is not allowlisted")
@@ -1184,8 +1185,8 @@ class OperationsRepository:
                     blockers.extend(self._provider_blockers(session))
         elif isinstance(command, AuditAllProjectsCommand):
             binding = {
-                "projects": ["falcone", "musematic", "llmwiki"],
-                "project_count": 3,
+                "projects": list(GLOBAL_PROJECTS),
+                "project_count": len(GLOBAL_PROJECTS),
                 "execution": "sequential",
                 "preset": command.preset,
                 "effective_preset": (
@@ -3316,7 +3317,7 @@ class OperationsRepository:
                     .order_by(desc(ProjectSnapshot.updated_at))
                     .limit(1)
                 )
-                for project in ("falcone", "musematic", "llmwiki")
+                for project in GLOBAL_PROJECTS
             }
             return {
                 "heartbeats": heartbeats,

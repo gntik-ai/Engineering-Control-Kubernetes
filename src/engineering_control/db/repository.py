@@ -66,6 +66,7 @@ from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
 )
+from engineering_control.projects import GLOBAL_PROJECTS, REPOSITORIES
 from engineering_control.retention_limits import (
     DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
     NOTIFICATION_OUTBOX_METRIC_STATUSES,
@@ -351,7 +352,7 @@ class SQLMetadataRepository:
         *,
         application_run_id: UUID | None = None,
     ) -> None:
-        expected = {Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI}
+        expected = {Project(project) for project in GLOBAL_PROJECTS}
         if set(campaigns) != expected:
             raise ValueError("all-project audit requires the exact project catalog")
         parent_run_id = _application_run_id(application_run_id)
@@ -1057,13 +1058,9 @@ class SQLMetadataRepository:
             "backlog_campaign_id": str(campaign.id),
             "project": project,
             "approval_binding": binding,
-            "safe_repositories": [
-                "gntik-ai/falcone",
-                "gntik-ai/falcone-charts",
-                "gntik-ai/musematic",
-                "gntik-ai/musematic-deploy",
-                "gntik-ai/llmwiki",
-            ],
+            # NEW-157: byte-identical to scripts/reconcile-backlog-github-policy.py
+            # SAFE_REPOSITORIES (pinned by tests/test_project_registry.py).
+            "safe_repositories": list(REPOSITORIES),
             "requested_by": actor,
             "requested_at": datetime.now(UTC).isoformat(),
         }

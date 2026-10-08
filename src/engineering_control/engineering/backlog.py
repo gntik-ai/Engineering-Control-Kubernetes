@@ -18,12 +18,15 @@ from pydantic import (
     model_validator,
 )
 
+from engineering_control.projects import (
+    PROJECT_REPOSITORIES,
+    REPOSITORY_SLUG_ALTERNATION,
+    ProjectName,
+    default_branch,
+)
+
 type RiskLevel = Literal["R0", "R1", "R2", "R3"]
-BACKLOG_PROJECT_PAIRS: dict[str, tuple[str, str]] = {
-    "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
-    "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
-    "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
-}
+BACKLOG_PROJECT_PAIRS: dict[str, tuple[str, str]] = dict(PROJECT_REPOSITORIES)
 BACKLOG_REPOSITORIES = frozenset(
     repository for repositories in BACKLOG_PROJECT_PAIRS.values() for repository in repositories
 )
@@ -49,12 +52,12 @@ ENGINEERING_CTL_OPERATOR_SUBJECT = "engineering-ctl:hermes"
 
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _TELEGRAM_OPERATOR_ACTOR = re.compile(r"^telegram:[1-9][0-9]{0,18}$")
-_REPOSITORY = re.compile(r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$")
+_REPOSITORY = re.compile(rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$")
 _ISSUE_URL = re.compile(
-    r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
+    rf"^https://github\.com/gntik-ai/({REPOSITORY_SLUG_ALTERNATION})/issues/[1-9][0-9]*$"
 )
 _REFERENCE = re.compile(
-    r"(?:(?:gntik-ai/)?(?P<repo>falcone|falcone-charts|musematic|musematic-deploy|llmwiki))?#(?P<number>[1-9][0-9]*)"
+    rf"(?:(?:gntik-ai/)?(?P<repo>{REPOSITORY_SLUG_ALTERNATION}))?#(?P<number>[1-9][0-9]*)"
 )
 _DEPENDENCY = re.compile(
     r"(?i)(?:blocked\s+by|depends\s+on|dependency|requires)\s*[:#-]?\s*([^\n]{0,240})"
@@ -187,7 +190,7 @@ class GitHubRepositoryBacklogSnapshot(BacklogModel):
 
 
 class GitHubBacklogImportSnapshot(BacklogModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     imported_at: datetime
     repositories: tuple[GitHubRepositoryBacklogSnapshot, ...] = Field(min_length=1, max_length=2)
 
@@ -262,7 +265,7 @@ class IssueApprovalReference(BacklogModel):
 
 class BacklogApprovalBinding(BacklogModel):
     backlog_campaign_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     paired_repositories: tuple[str, str]
     source_branch: Literal["main", "master"] = "main"
     deployment_branch: Literal["main", "master"] = "main"
@@ -571,7 +574,7 @@ def plan_records(records: list[BacklogIssueRecord]) -> tuple[list[BacklogIssueRe
 def approval_binding(
     *,
     campaign_id: str,
-    project: Literal["falcone", "musematic", "llmwiki"],
+    project: ProjectName,
     import_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"],
     source_head: str,
     deployment_head: str,
@@ -610,8 +613,8 @@ def approval_binding(
         backlog_campaign_id=campaign_id,
         project=project,
         paired_repositories=BACKLOG_PROJECT_PAIRS[project],
-        source_branch="master" if project == "llmwiki" else "main",
-        deployment_branch="master" if project == "llmwiki" else "main",
+        source_branch=default_branch(project),
+        deployment_branch=default_branch(project),
         source_head=source_head,
         deployment_head=deployment_head,
         issue_filter=import_filter,

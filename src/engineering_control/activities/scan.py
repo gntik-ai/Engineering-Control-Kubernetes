@@ -69,6 +69,14 @@ from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.models.reconciliation import PromotionPlan
+from engineering_control.projects import (
+    PROJECT_ALTERNATION,
+    PROJECT_REPOSITORY_SLUGS,
+    PROJECT_SET,
+    PROJECTS,
+    REPOSITORY_SLUG_ALTERNATION,
+    SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
+)
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.manager import (
@@ -163,13 +171,9 @@ class CleanupCandidate(BaseModel):
 
     lease_id: UUID
     change_set_id: UUID
-    repository: str = Field(
-        pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
+    repository: str = Field(pattern=rf"^({REPOSITORY_SLUG_ALTERNATION})$")
     worktree_path: Path
-    branch: str = Field(
-        pattern=r"^agent/(falcone|musematic|llmwiki)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$"
-    )
+    branch: str = Field(pattern=rf"^agent/({PROJECT_ALTERNATION})/[a-zA-Z0-9._-]+/[a-f0-9-]{{36}}$")
     base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     reason: str = Field(
         pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED|ABANDONED_CHANGESET_STALE)$"
@@ -208,11 +212,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             *UI_PLAN_SCAN_STEPS,
         }
     )
-    _repositories = {
-        Project.FALCONE: ("falcone", "falcone-charts"),
-        Project.MUSEMATIC: ("musematic", "musematic-deploy"),
-        Project.LLMWIKI: ("llmwiki", "llmwiki"),
-    }
+    _repositories = {Project(name): PROJECT_REPOSITORY_SLUGS[name] for name in PROJECTS}
 
     def __init__(
         self,
@@ -884,7 +884,7 @@ class ScanActivityHandler(UiPlanScanSteps):
 
     def _observer_attestation(self, payload: dict[str, Any]) -> dict[str, Any]:
         project_value = str(payload.get("project"))
-        if project_value not in {"falcone", "musematic", "llmwiki"}:
+        if project_value not in PROJECT_SET:
             raise ValueError("observer attestation project is invalid")
         manifest = self.catalog.project(project_value)
         raw_path = Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
@@ -2829,7 +2829,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             for category, expressions in patterns.items()
             if any(re.search(expression, searchable, re.MULTILINE) for expression in expressions)
         )
-        deployment_repository = repository in {"falcone-charts", "musematic-deploy"}
+        deployment_repository = repository in frozenset(SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS)
         risk_floor = "R3" if matched else "R2" if deployment_repository and changed_paths else "R1"
         classifier = {
             "version": 1,

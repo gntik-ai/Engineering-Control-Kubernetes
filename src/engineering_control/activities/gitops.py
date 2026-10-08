@@ -61,6 +61,13 @@ from engineering_control.policy.github_write import (
     GITOPS_WRITE_CAPABLE_GITHUB_STEPS,
     GitHubWritePolicyEvaluator,
 )
+from engineering_control.projects import (
+    PROJECT_ALTERNATION,
+    PROJECT_SET,
+    REPOSITORY_SET,
+    REPOSITORY_SLUG_ALTERNATION,
+    ProjectName,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 GITOPS_CONTROLLER_STEPS = frozenset(
@@ -86,21 +93,13 @@ MAXIMUM_POD_DELETIONS = 25
 _SHA = re.compile(r"[a-f0-9]{40}")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 # NEW-145b: the head branches a publication reconciliation may list PRs for.
-_LISTING_REPOSITORIES = frozenset(
-    {
-        "gntik-ai/falcone",
-        "gntik-ai/falcone-charts",
-        "gntik-ai/musematic",
-        "gntik-ai/musematic-deploy",
-        "gntik-ai/llmwiki",
-    }
-)
-_AGENT_BRANCH = re.compile(r"agent/(?:falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}")
+_LISTING_REPOSITORIES = REPOSITORY_SET
+_AGENT_BRANCH = re.compile(rf"agent/(?:{PROJECT_ALTERNATION})/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}")
 _PR_URL = re.compile(
-    r"https://github\.com/(gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki))"
+    rf"https://github\.com/(gntik-ai/(?:{REPOSITORY_SLUG_ALTERNATION}))"
     r"/pull/([1-9][0-9]*)"
 )
-_REPOSITORY = r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+_REPOSITORY = rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$"
 
 
 class StagingFlowBlocked(ValueError):
@@ -117,7 +116,7 @@ class StagingGitOpsPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     change_set_id: UUID
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     risk_class: Literal["R0", "R1", "R2", "R3"]
     source_repository: str = Field(pattern=_REPOSITORY)
     source_pr_number: int = Field(ge=1)
@@ -154,7 +153,7 @@ class StagingGitOpsPlan(BaseModel):
 def load_project_contract(
     project_config_root: Path, project: str
 ) -> tuple[ProjectManifest, StagingFlowPolicy | None]:
-    if project not in {"falcone", "musematic", "llmwiki"}:
+    if project not in PROJECT_SET:
         raise StagingFlowBlocked("STAGING_FLOW_PROJECT_INVALID")
     root = project_config_root.resolve()
     unresolved = root / f"{project}.yaml"

@@ -19,6 +19,7 @@ from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
     r3_approval_payload_matches,
 )
+from engineering_control.projects import GLOBAL_PROJECT_SET
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -129,7 +130,7 @@ def _global_campaign_authorizes(
         and metadata.get("environment") == "staging"
         and metadata.get("maximum_risk") == "R2"
         and maximum_risk in {"R2", "R3"}
-        and project in {"falcone", "musematic", "llmwiki"}
+        and project in GLOBAL_PROJECT_SET
         and isinstance(delivery_modes, dict)
         and delivery_modes.get(project) == delivery_mode
         and delivery_mode in {"source-pr", "full-delivery"}

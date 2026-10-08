@@ -23,6 +23,8 @@ from engineering_control.engineering.backlog import (
     GitHubPullRequestSnapshot,
     GitHubRepositoryBacklogSnapshot,
 )
+from engineering_control.projects import PROJECT_REPOSITORY_SLUGS, ProjectName
+from engineering_control.projects import default_branch as project_default_branch
 from engineering_control.security.redaction import SecretRedactor
 
 from .gitops import GitOpsGitHubHandler
@@ -189,10 +191,9 @@ class GitHubActivityHandler:
 
     def _refresh_mirrors(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = payload.get("project")
+        # NEW-157: a self-contained project has one mirror.
         mapping = {
-            "falcone": ("falcone", "falcone-charts"),
-            "musematic": ("musematic", "musematic-deploy"),
-            "llmwiki": ("llmwiki",),
+            name: tuple(dict.fromkeys(pair)) for name, pair in PROJECT_REPOSITORY_SLUGS.items()
         }
         repositories = mapping.get(str(project))
         if repositories is None:
@@ -309,9 +310,7 @@ class GitHubActivityHandler:
                 metadata = self.broker.repository_metadata(repository)
                 branch = metadata.get("defaultBranchRef")
                 default_branch = branch.get("name") if isinstance(branch, dict) else None
-                expected_branch: Literal["main", "master"] = (
-                    "master" if project == "llmwiki" else "main"
-                )
+                expected_branch = project_default_branch(project)
                 if default_branch != expected_branch:
                     raise ApplicationError(
                         "backlog repository default branch changed",
@@ -348,7 +347,7 @@ class GitHubActivityHandler:
                 non_retryable=True,
             ) from error
         snapshot = GitHubBacklogImportSnapshot(
-            project=cast(Literal["falcone", "musematic", "llmwiki"], project),
+            project=cast(ProjectName, project),
             imported_at=datetime.now(UTC),
             repositories=tuple(repositories),
         )

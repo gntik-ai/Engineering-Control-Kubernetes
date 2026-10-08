@@ -7,6 +7,12 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from engineering_control.models.enums import AuditLens, Project, RiskClass
+from engineering_control.projects import (
+    GLOBAL_PROJECTS,
+    ProjectName,
+    RepositoryFullName,
+    RepositorySlug,
+)
 
 CoverageSlug = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")]
 
@@ -34,13 +40,7 @@ class SolveIssueCommand(OperationModel):
     action: Literal["solve_issue"] = "solve_issue"
     project: Project
     backlog_campaign_id: UUID
-    repository: Literal[
-        "gntik-ai/falcone",
-        "gntik-ai/falcone-charts",
-        "gntik-ai/musematic",
-        "gntik-ai/musematic-deploy",
-        "gntik-ai/llmwiki",
-    ]
+    repository: RepositoryFullName
     issue_number: int = Field(ge=1)
     maximum_risk: RiskClass = RiskClass.R2
     delivery_mode: Literal["source-pr", "full-delivery"] = "full-delivery"
@@ -67,7 +67,7 @@ class SolveIssueCommand(OperationModel):
 
 class SolveBacklogCommand(OperationModel):
     action: Literal["solve_backlog"] = "solve_backlog"
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     backlog_campaign_id: UUID
     issue_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"] | None = None
     maximum_risk: RiskClass = RiskClass.R2
@@ -97,7 +97,7 @@ class AutonomousBacklogCommand(OperationModel):
 
     @model_validator(mode="after")
     def exact_project_set(self) -> AutonomousBacklogCommand:
-        if set(self.backlog_campaign_ids) != {"falcone", "musematic", "llmwiki"}:
+        if set(self.backlog_campaign_ids) != set(GLOBAL_PROJECTS):
             raise ValueError("global backlog requires exactly Falcone, Musematic, and LLMWiki")
         if self.policy_campaign_id not in set(self.backlog_campaign_ids.values()):
             raise ValueError("policy campaign must be one of the exact imported inventories")
@@ -199,9 +199,7 @@ class WorkflowControlCommand(OperationModel):
         "skip",
     ]
     workflow_id: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z0-9._:-]+$")
-    repository: (
-        Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"] | None
-    ) = None
+    repository: RepositorySlug | None = None
     issue_number: int | None = Field(default=None, ge=1)
     reason_code: str | None = Field(default=None, min_length=3, max_length=120)
 

@@ -118,6 +118,13 @@ from engineering_control.operations.issue_delivery_approval import (
 )
 from engineering_control.operations.publication_authority import persist_publication_intent
 from engineering_control.policy.approvals import ApprovalService
+from engineering_control.projects import (
+    GLOBAL_PROJECT_SET,
+    PROJECT_REPOSITORY_SLUGS,
+    REPOSITORIES,
+    REPOSITORY_SLUGS,
+    default_branch,
+)
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
 from engineering_control.retention_limits import (
@@ -1987,16 +1994,10 @@ class MetadataActivityHandler:
         if payload.get("environment") != "staging":
             raise ValueError("multi-project audit environment is invalid")
         current_project = payload.get("current_project")
-        if current_project is not None and current_project not in {
-            "falcone",
-            "musematic",
-            "llmwiki",
-        }:
+        if current_project is not None and current_project not in GLOBAL_PROJECT_SET:
             raise ValueError("multi-project audit current project is invalid")
         raw_results = payload.get("project_results", {})
-        if not isinstance(raw_results, dict) or not set(raw_results).issubset(
-            {"falcone", "musematic", "llmwiki"}
-        ):
+        if not isinstance(raw_results, dict) or not set(raw_results).issubset(GLOBAL_PROJECT_SET):
             raise ValueError("multi-project audit results are invalid")
         results: dict[str, dict[str, str | None]] = {}
         for project, raw_result in raw_results.items():
@@ -2709,11 +2710,7 @@ class MetadataActivityHandler:
                         "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
                     }
             project = Project(finding.project)
-            source_repository, deployment_repository = {
-                Project.FALCONE: ("falcone", "falcone-charts"),
-                Project.MUSEMATIC: ("musematic", "musematic-deploy"),
-                Project.LLMWIKI: ("llmwiki", "llmwiki"),
-            }[project]
+            source_repository, deployment_repository = PROJECT_REPOSITORY_SLUGS[project.value]
             surface = str(finding.impact_json.get("repository_surface", "source"))
             source_issue_repository, deployment_issue_repository = self._project_issue_repositories(
                 project
@@ -3986,13 +3983,7 @@ class MetadataActivityHandler:
             }
         source_repository = str(payload["source_repository"])
         deployment_repository = str(payload["deployment_repository"])
-        repositories = {
-            "falcone": "gntik-ai/falcone",
-            "falcone-charts": "gntik-ai/falcone-charts",
-            "musematic": "gntik-ai/musematic",
-            "musematic-deploy": "gntik-ai/musematic-deploy",
-            "llmwiki": "gntik-ai/llmwiki",
-        }
+        repositories = dict(zip(REPOSITORY_SLUGS, REPOSITORIES, strict=True))
         if source_repository not in repositories or deployment_repository not in repositories:
             raise ValueError("publication repository is not configured")
         issue = str(payload["issue_url"])
@@ -4016,7 +4007,7 @@ class MetadataActivityHandler:
                 "working_directory": str(payload["source_worktree"]),
                 "branch": str(payload["source_branch"]),
                 "head_sha": source_head,
-                "base_branch": "master" if source_repository == "llmwiki" else "main",
+                "base_branch": default_branch(source_repository),
                 "title": title,
                 "body": body + "\nRepository role: source\n",
             }

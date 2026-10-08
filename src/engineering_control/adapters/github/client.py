@@ -13,16 +13,9 @@ from typing import Any, Literal
 
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
 from engineering_control.models.publication_authority import IssueRevisionObservation
+from engineering_control.projects import REPOSITORY_SET
 
-ALLOWED_REPOSITORIES = frozenset(
-    {
-        "gntik-ai/falcone",
-        "gntik-ai/falcone-charts",
-        "gntik-ai/musematic",
-        "gntik-ai/musematic-deploy",
-        "gntik-ai/llmwiki",
-    }
-)
+ALLOWED_REPOSITORIES = REPOSITORY_SET
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
 # NEW-63: the only content Hermes writes to a CI baseline branch.
 BASELINE_MARKER_CONTENT = (

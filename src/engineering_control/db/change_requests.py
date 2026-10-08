@@ -18,6 +18,7 @@ from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
 )
 from engineering_control.engineering.change_requests import (
+    CHANGE_REQUEST_REPOSITORY_ALTERNATION,
     MAXIMUM_ISSUE_BODY_CHARACTERS,
     ChangeProposal,
     ChangeRequestIntake,
@@ -37,7 +38,7 @@ from engineering_control.security.redaction import SecretRedactor, bounded_detai
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _ISSUE_URL = re.compile(
     r"^https://github\.com/gntik-ai/"
-    r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
+    rf"({CHANGE_REQUEST_REPOSITORY_ALTERNATION})"
     r"/issues/([1-9][0-9]*)$"
 )
 

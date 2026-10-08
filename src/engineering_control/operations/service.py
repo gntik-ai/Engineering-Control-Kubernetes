@@ -59,6 +59,7 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
 )
 from engineering_control.operations.repository import OperationsRepository
+from engineering_control.projects import GLOBAL_PROJECTS
 
 _LOG = logging.getLogger(__name__)
 logger = structlog.get_logger()
@@ -434,7 +435,7 @@ class TypedCommandBus:
             )
         if isinstance(command, AuditAllProjectsCommand):
             if command.mode == "plan":
-                for project in ("falcone", "musematic", "llmwiki"):
+                for project in GLOBAL_PROJECTS:
                     result = await self.control.plan_campaign(
                         AuditPlanRequest(
                             project=project,  # type: ignore[arg-type]

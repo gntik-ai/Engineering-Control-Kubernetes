@@ -15,8 +15,9 @@ from engineering_control.engineering.models import (
     ToolchainPolicy,
     ToolchainTestCommand,
 )
+from engineering_control.projects import PROJECT_SET
 
-_PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
+_PROJECTS = PROJECT_SET
 _MAX_MANIFEST_BYTES = 512 * 1024
 _CD_PREFIX = re.compile(r"^cd\s+(?P<cwd>\S+)\s*&&\s*(?P<command>.+)$", re.DOTALL)
 # NEW-58: makers also report commands as "<cwd>: <command>" (musematic #993 retry 18),

@@ -49,6 +49,17 @@ from engineering_control.policy.github_write import (
     WRITE_CAPABLE_GITHUB_STEPS,
     GitHubWritePolicyEvaluator,
 )
+from engineering_control.projects import (
+    PROJECT_ALTERNATION,
+    PROJECT_REPOSITORIES,
+    PROJECT_REPOSITORY_SLUGS,
+    REPOSITORY_SET,
+    REPOSITORY_SLUG_ALTERNATION,
+    SELF_CONTAINED,
+    SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
+    SPLIT_PROJECTS,
+    alternation,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 _T = TypeVar("_T")
@@ -75,16 +86,10 @@ PublicationContext = tuple[PublicationAuthorityClient, dict[str, Any], dict[str,
 class RepositoryPublication(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    repository: str = Field(
-        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
-    repository_slug: str = Field(
-        pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
+    repository: str = Field(pattern=rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$")
+    repository_slug: str = Field(pattern=rf"^({REPOSITORY_SLUG_ALTERNATION})$")
     working_directory: Path
-    branch: str = Field(
-        pattern=r"^agent/(falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$"
-    )
+    branch: str = Field(pattern=rf"^agent/({PROJECT_ALTERNATION})/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}$")
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
     title: str = Field(min_length=1, max_length=240)
@@ -100,8 +105,12 @@ class RepositoryPublication(BaseModel):
 class DeferredDeployment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    repository_slug: str = Field(pattern=r"^(falcone-charts|musematic-deploy)$")
-    branch: str = Field(pattern=r"^agent/(falcone|musematic)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$")
+    repository_slug: str = Field(
+        pattern=rf"^({alternation(SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS)})$"
+    )
+    branch: str = Field(
+        pattern=rf"^agent/({alternation(SPLIT_PROJECTS)})/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}$"
+    )
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     reason: str = Field(pattern=r"^AWAITING_IMMUTABLE_ARTIFACT$")
@@ -119,16 +128,20 @@ class PublicationPlan(BaseModel):
         slugs = {item.repository_slug for item in self.publications}
         if len(slugs) != len(self.publications):
             raise ValueError("publication repositories must be unique")
-        full_pairs = (
-            {"falcone", "falcone-charts"},
-            {"musematic", "musematic-deploy"},
+        # NEW-157: the registry's split pairs, their sources alone, or a self-contained repo.
+        split = {
+            PROJECT_REPOSITORY_SLUGS[project][0]: PROJECT_REPOSITORY_SLUGS[project][1]
+            for project in SPLIT_PROJECTS
+        }
+        full_pairs = tuple({source, deployment} for source, deployment in split.items())
+        source_only = slugs in tuple({source} for source in split)
+        self_contained = slugs in tuple(
+            {PROJECT_REPOSITORY_SLUGS[project][0]} for project in SELF_CONTAINED
         )
-        source_only = slugs in ({"falcone"}, {"musematic"})
-        llmwiki_self_contained = slugs == {"llmwiki"}
-        if slugs not in full_pairs and not source_only and not llmwiki_self_contained:
+        if slugs not in full_pairs and not source_only and not self_contained:
             raise ValueError("publication plan does not match a configured ChangeSet")
         if source_only:
-            expected = "falcone-charts" if slugs == {"falcone"} else "musematic-deploy"
+            expected = split[next(iter(slugs))]
             if (
                 self.deferred_deployment is None
                 or self.deferred_deployment.repository_slug != expected
@@ -1347,11 +1360,7 @@ class DeliveryActivityHandler:
         if controls.get("disposition") != "CONFIRMED":
             return {**payload, "status": "SKIPPED", "duplicate_issue_url": None}
         project = str(finding.get("project", ""))
-        pairs = {
-            "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
-            "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
-            "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
-        }
+        pairs = dict(PROJECT_REPOSITORIES)
         if project not in pairs:
             raise ApplicationError(
                 "finding project is not allowlisted",
@@ -1469,13 +1478,7 @@ class DeliveryActivityHandler:
                 "blocker": "FINDING_PUBLICATION_NOT_PREPARED",
             }
         repository = str(publication.get("repository", ""))
-        if repository not in {
-            "gntik-ai/falcone",
-            "gntik-ai/falcone-charts",
-            "gntik-ai/musematic",
-            "gntik-ai/musematic-deploy",
-            "gntik-ai/llmwiki",
-        }:
+        if repository not in REPOSITORY_SET:
             raise ApplicationError(
                 "finding publication repository is not allowlisted",
                 type="PolicyViolation",
@@ -1532,13 +1535,7 @@ class DeliveryActivityHandler:
             if isinstance(enhancement, dict)
             else payload.get("affected_repository")
         )
-        allowed = {
-            "gntik-ai/falcone",
-            "gntik-ai/falcone-charts",
-            "gntik-ai/musematic",
-            "gntik-ai/musematic-deploy",
-            "gntik-ai/llmwiki",
-        }
+        allowed = REPOSITORY_SET
         if repository not in allowed:
             raise ApplicationError(
                 "enhancement repository is not allowlisted",

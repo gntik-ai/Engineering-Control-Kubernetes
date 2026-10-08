@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.config import Settings
 from engineering_control.db.models import AgentExecution, AgentLogChunk, DashboardEvent
+from engineering_control.projects import ProjectName
 from engineering_control.security.redaction import SecretRedactor
 
 TranscriptStream = Literal["system", "progress", "assistant", "tool", "test", "stderr"]
@@ -111,7 +112,7 @@ class GatewayEventInput(ObservabilityModel):
     ]
     command: str = Field(min_length=1, max_length=40, pattern=r"^[a-z][a-z0-9-]*$")
     outcome: str | None = Field(default=None, max_length=40, pattern=r"^[A-Z0-9_]+$")
-    project: Literal["falcone", "musematic", "llmwiki"] | None = None
+    project: ProjectName | None = None
     issue_number: int | None = Field(default=None, ge=1)
     mode: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9-]+$")
     workflow_id: str | None = Field(default=None, max_length=240)

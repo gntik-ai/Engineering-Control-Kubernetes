@@ -8,6 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from engineering_control.engineering.backlog import DocumentationImpact
 from engineering_control.models.enums import Project
 from engineering_control.models.reconciliation import DeliveryControlPolicy
+from engineering_control.projects import (
+    PROJECT_ALTERNATION,
+    PROJECT_REPOSITORIES,
+    REPOSITORY_SLUG_ALTERNATION,
+    SOURCE_REPOSITORY_ALTERNATION,
+)
 
 
 class FinalClosureModel(BaseModel):
@@ -15,18 +21,16 @@ class FinalClosureModel(BaseModel):
 
 
 class ProtectedPullRequestBinding(FinalClosureModel):
-    repository: str = Field(
-        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
+    repository: str = Field(pattern=rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$")
     number: int = Field(ge=1)
     url: str = Field(
         pattern=(
             r"^https://github\.com/gntik-ai/"
-            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/pull/[1-9][0-9]*$"
+            rf"({REPOSITORY_SLUG_ALTERNATION})/pull/[1-9][0-9]*$"
         )
     )
     head_branch: str = Field(
-        pattern=r"^agent/(falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$"
+        pattern=rf"^agent/({PROJECT_ALTERNATION})/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}$"
     )
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     base_branch: Literal["main", "master"] = "main"
@@ -46,7 +50,7 @@ class FinalClosurePlan(FinalClosureModel):
     backlog_campaign_id: UUID
     approval_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     project: Project
-    issue_repository: str = Field(pattern=r"^gntik-ai/(falcone|musematic|llmwiki)$")
+    issue_repository: str = Field(pattern=rf"^gntik-ai/({SOURCE_REPOSITORY_ALTERNATION})$")
     issue_number: int = Field(ge=1)
     r3_approval_binding_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     source: ProtectedPullRequestBinding
@@ -59,12 +63,7 @@ class FinalClosurePlan(FinalClosureModel):
 
     @model_validator(mode="after")
     def exact_project_pair_and_independent_review(self) -> FinalClosurePlan:
-        pairs = {
-            Project.FALCONE: ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
-            Project.MUSEMATIC: ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
-            Project.LLMWIKI: ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
-        }
-        source, deployment = pairs[self.project]
+        source, deployment = PROJECT_REPOSITORIES[self.project.value]
         if (
             self.issue_repository != source
             or self.source.repository != source
@@ -82,9 +81,7 @@ class FinalClosurePlan(FinalClosureModel):
 
 
 class ProtectedMergeResult(FinalClosureModel):
-    repository: str = Field(
-        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
+    repository: str = Field(pattern=rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$")
     pull_request_number: int = Field(ge=1)
     pull_request_url: str
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")

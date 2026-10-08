@@ -7,12 +7,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from engineering_control.engineering.models import GitSHA, RepositoryName
+from engineering_control.projects import PROJECT_REPOSITORIES, SELF_CONTAINED, ProjectName
 
 
 class FindingPublication(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     classification: Literal["application", "deployment", "cross-repository", "falcone-contract-gap"]
     affected_repositories: list[RepositoryName] = Field(min_length=1, max_length=3)
     source_sha: GitSHA
@@ -58,12 +59,9 @@ class FindingPublication(BaseModel):
     def primary_repository(self) -> str:
         if self.classification == "falcone-contract-gap":
             return "gntik-ai/falcone"
-        if self.project == "llmwiki":
-            return "gntik-ai/llmwiki"
-        source = f"gntik-ai/{self.project}"
-        deployment = (
-            "gntik-ai/falcone-charts" if self.project == "falcone" else "gntik-ai/musematic-deploy"
-        )
+        source, deployment = PROJECT_REPOSITORIES[self.project]
+        if self.project in SELF_CONTAINED:
+            return source
         if self.classification == "application":
             return source
         if self.classification == "deployment":

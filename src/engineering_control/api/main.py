@@ -105,6 +105,7 @@ from engineering_control.operations.recurring_reconciliation import RecurringRun
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
+from engineering_control.projects import PROJECT_ALTERNATION, PROJECT_SET, REPOSITORY_SLUG_SET
 
 # NEW-123 review 2: how long a claimed but not yet started fan-out counts as starting.
 UI_FANOUT_START_GRACE = timedelta(minutes=5)
@@ -728,7 +729,7 @@ def create_app(
 
     @app.get("/v1/backlogs/locate")
     async def backlog_issue_locate(
-        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str = Query(pattern=rf"^({PROJECT_ALTERNATION})$"),
         surface: str = Query(pattern=r"^(source|deployment)$"),
         issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
@@ -741,7 +742,7 @@ def create_app(
 
     @app.get("/v1/r3-issues/candidate")
     async def r3_issue_candidate_get(
-        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str = Query(pattern=rf"^({PROJECT_ALTERNATION})$"),
         surface: str = Query(pattern=r"^(source|deployment)$"),
         issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
@@ -754,7 +755,7 @@ def create_app(
 
     @app.post("/v1/r3-issues/candidate", status_code=201)
     async def r3_issue_candidate_create(
-        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str = Query(pattern=rf"^({PROJECT_ALTERNATION})$"),
         surface: str = Query(pattern=r"^(source|deployment)$"),
         issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
@@ -1146,7 +1147,7 @@ def create_app(
     ) -> OperationAccepted:
         backlog = await repository.get_backlog_campaign(body.campaign_id)
         if backlog is not None:
-            if body.project.value not in {"falcone", "musematic", "llmwiki"}:
+            if body.project.value not in PROJECT_SET:
                 raise HTTPException(status_code=409, detail="backlog project is not supported")
             if body.execution_mode not in {"source-pr", "full-delivery"}:
                 raise HTTPException(status_code=409, detail="backlog delivery mode is invalid")
@@ -1182,7 +1183,7 @@ def create_app(
 
     @app.get("/v1/backlogs", response_model=RecordList)
     async def backlog_list(
-        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str | None = Query(default=None, pattern=rf"^({PROJECT_ALTERNATION})$"),
         limit: int = Query(default=20, ge=1, le=100),
         _subject: str = auth_dependency,
         repository: MetadataRepository = metadata_dependency,
@@ -1221,13 +1222,7 @@ def create_app(
         _subject: str = auth_dependency,
         repository: MetadataRepository = metadata_dependency,
     ) -> dict[str, Any]:
-        if repository_short_name not in {
-            "falcone",
-            "falcone-charts",
-            "musematic",
-            "musematic-deploy",
-            "llmwiki",
-        }:
+        if repository_short_name not in REPOSITORY_SLUG_SET:
             raise HTTPException(status_code=404, detail="backlog repository not found")
         value = await repository.get_backlog_issue(
             campaign_id, f"gntik-ai/{repository_short_name}", issue_number
@@ -1491,7 +1486,7 @@ def create_app(
 
     @app.get("/v1/ui-blueprints", response_model=RecordList)
     async def ui_blueprint_list(
-        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str | None = Query(default=None, pattern=rf"^({PROJECT_ALTERNATION})$"),
         status: str | None = Query(
             default=None,
             pattern=r"^(DRAFTING|BLOCKED|FAILED|CANDIDATE|APPROVED|SUPERSEDED)$",
@@ -1806,7 +1801,7 @@ def create_app(
 
     @app.get("/v1/change-requests", response_model=RecordList)
     async def change_request_list(
-        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
+        project: str | None = Query(default=None, pattern=rf"^({PROJECT_ALTERNATION})$"),
         status: str | None = Query(
             default=None,
             pattern=r"^(DRAFTING|CANDIDATE|APPROVED|PUBLISHED|REJECTED|FAILED|MERGED)$",

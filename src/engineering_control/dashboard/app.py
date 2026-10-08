@@ -55,11 +55,12 @@ from engineering_control.logging import configure_logging
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.registry import COMMAND_REGISTRY
 from engineering_control.operations.repository import OperationsRepository
+from engineering_control.projects import PROJECT_SET
 
 PACKAGE_ROOT = Path(__file__).parent
 TEMPLATE_ROOT = PACKAGE_ROOT / "templates"
 STATIC_ROOT = PACKAGE_ROOT / "static"
-PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
+PROJECTS = PROJECT_SET
 LOGGER = logging.getLogger(__name__)
 
 

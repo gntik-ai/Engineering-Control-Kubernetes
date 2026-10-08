@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from engineering_control.projects import PROJECTS
+
 
 def _entry(
     category: str,
@@ -26,7 +28,7 @@ def _entry(
     }
 
 
-_PROJECT = {"name": "project", "type": "select", "values": ["falcone", "musematic", "llmwiki"]}
+_PROJECT = {"name": "project", "type": "select", "values": list(PROJECTS)}
 _WORKFLOW = {"name": "workflow_id", "type": "text", "maxlength": 240}
 _ENHANCEMENT = {"name": "enhancement_id", "type": "text", "maxlength": 80}
 
