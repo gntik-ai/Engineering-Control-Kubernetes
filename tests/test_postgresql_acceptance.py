@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -37,11 +38,21 @@ def _postgresql_url() -> str:
     value = os.getenv("ENGINEERING_TEST_POSTGRES_URL")
     if not value:
         pytest.skip("ENGINEERING_TEST_POSTGRES_URL is required for real PostgreSQL acceptance")
-    if (
-        value != "postgresql+psycopg://engineering_ci@127.0.0.1:5432/engineering_control_ci"
-        or os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") != "network-none"
-    ):
-        raise AssertionError("PostgreSQL acceptance requires the owned network-none fixture")
+    # Only a disposable database is ever dropped and recreated here: the owned local
+    # network-none fixture, or (NEW-165) the GitHub Actions service container of
+    # .github/workflows/postgresql-acceptance.yml with its synthetic credential.
+    local = (
+        value == "postgresql+psycopg://engineering_ci@127.0.0.1:5432/engineering_control_ci"
+        and os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") == "network-none"
+    )
+    github = (
+        value
+        == "postgresql+psycopg://engineering_ci:synthetic_ci_only@127.0.0.1:5432/engineering_control_ci"
+        and os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") == "github-actions-service"
+        and os.getenv("GITHUB_ACTIONS") == "true"
+    )
+    if not (local or github):
+        raise AssertionError("PostgreSQL acceptance requires an owned disposable fixture")
     return value
 
 
@@ -302,6 +313,9 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
     handler._finalize_cleanup = synchronized_finalize  # type: ignore[method-assign]
 
     async def concurrent_finalization() -> None:
+        # The default to_thread pool has cpu_count + 4 workers; a 2-CPU runner could never
+        # fill the 8-party barrier (NEW-165).
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=8))
         results = await asyncio.gather(
             *(handler.handle("cleanup.finalize", finalize_payload) for _ in range(8))
         )

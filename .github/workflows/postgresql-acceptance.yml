@@ -31,6 +31,9 @@ jobs:
           --pids-limit 256
     env:
       ENGINEERING_TEST_POSTGRES_URL: postgresql+psycopg://engineering_ci:synthetic_ci_only@127.0.0.1:5432/engineering_control_ci
+      # The disposable service container above; tests/test_postgresql_acceptance.py accepts
+      # it only together with GITHUB_ACTIONS=true and this exact URL.
+      HERMES_RECONCILIATION_PG_FIXTURE: github-actions-service
     steps:
       - name: Checkout immutable workflow revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
