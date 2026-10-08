@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -306,6 +307,8 @@ class FakeKubectl:
                 self.application.update(patch)
             return CommandResult(0, "patched", "")
         if verb == "logs":
+            if self.eso_log == "TIMEOUT":
+                raise subprocess.TimeoutExpired(["kubectl", "logs"], 120, output="Vault is sealed")
             if self.eso_log is None:
                 return CommandResult(1, "", "logs unavailable")
             return CommandResult(0, self.eso_log, "")
@@ -3945,12 +3948,15 @@ async def test_new_155_a_sealed_backend_is_named_and_never_restarted(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_new_155_unreadable_or_oversized_logs_are_unknown(tmp_path: Path) -> None:
-    for index, log in enumerate((None, "x" * 8_000_001)):
+    # Review: a timeout degrades like a failed read and leaks none of its output.
+    for index, log in enumerate((None, "x" * 8_000_001, "TIMEOUT")):
         kubectl = _sealed_kubectl(eso_log=log)
         handler = _controller(tmp_path / str(index), kubectl)
         result = await handler.handle("gitops.remediate", {"plan": _plan(), "round": 1})
         assert result["diagnosis"]["sealed_backend_stores"] == []
-        assert result["diagnosis"]["stores_not_ready"][0]["sealed"] is False
+        assert result["diagnosis"]["seal_status_known"] is False
+        assert result["diagnosis"]["stores_not_ready"][0]["sealed"] is None
+        assert "Vault is sealed" not in json.dumps(result)
         assert "restart-external-secrets" in result["actions"]
         assert len(_rollouts(kubectl)) == 1
 

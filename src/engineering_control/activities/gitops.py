@@ -1141,9 +1141,15 @@ class GitOpsControllerHandler:
                 )
         # NEW-155: a sealed OpenBao/Vault shows only as InvalidProviderConfig on the store;
         # the ESO controller log names the cause. Only store names leave this block.
+        # Review: None means the log could not be read, so seal status is unknown (not
+        # False); the pre-NEW-155 ESO restart still applies then.
         sealed = self._sealed_stores(flow) if stores else set()
         for store in stores:
-            store["sealed"] = (store["kind"], store["namespace"], store["name"]) in sealed
+            store["sealed"] = (
+                None
+                if sealed is None
+                else (store["kind"], store["namespace"], store["name"]) in sealed
+            )
         application = self._application(flow)
         health = str(_nested(application, "status", "health", "status") or "Unknown")
         sync = str(_nested(application, "status", "sync", "status") or "Unknown")
@@ -1155,6 +1161,7 @@ class GitOpsControllerHandler:
             "unready_workloads": workloads,
             "stores_not_ready": stores,
             "sealed_backend_stores": sorted({store["name"] for store in stores if store["sealed"]}),
+            "seal_status_known": sealed is not None,
             "eso_objects_not_ready": external_secrets,
             "eso_objects_not_ready_total": external_secrets_total,
             "eso_resources_observed": eso_resources_observed,
@@ -1163,20 +1170,24 @@ class GitOpsControllerHandler:
             "argo_sync": sync[:40],
         }
 
-    def _sealed_stores(self, flow: StagingFlowPolicy) -> set[tuple[str, str, str]]:
-        """NEW-155: stores the ESO controller log reports sealed; unreadable -> unknown."""
-        result = self._kubectl(
-            [
-                "--namespace",
-                flow.external_secrets_namespace,
-                "logs",
-                f"deployment/{flow.external_secrets_deployment}",
-                *ESO_LOG_ARGUMENTS,
-            ],
-            check=False,
-        )
+    def _sealed_stores(self, flow: StagingFlowPolicy) -> set[tuple[str, str, str]] | None:
+        """NEW-155: stores the ESO controller log reports sealed; None when unreadable."""
+        try:
+            result = self._kubectl(
+                [
+                    "--namespace",
+                    flow.external_secrets_namespace,
+                    "logs",
+                    f"deployment/{flow.external_secrets_deployment}",
+                    *ESO_LOG_ARGUMENTS,
+                ],
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # Review: an optional read; its captured output is never exported.
+            return None
         if result.return_code or len(result.stdout.encode()) > ESO_LOG_LIMIT:
-            return set()
+            return None
         return sealed_secret_stores(result.stdout)
 
     def _environment_check(self, payload: dict[str, Any]) -> dict[str, Any]:
