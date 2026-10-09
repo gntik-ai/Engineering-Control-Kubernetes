@@ -35,6 +35,7 @@ def release_impact(
     changed_paths: list[str],
     diff_sha256: str,
     risk_floor: str = "R1",
+    categories: list[str] | None = None,
 ) -> dict[str, object]:
     impact: dict[str, object] = {
         "version": 1,
@@ -43,8 +44,8 @@ def release_impact(
             "\n".join(path.lower() for path in changed_paths).encode()
         ).hexdigest(),
         "diff_sha256": diff_sha256,
-        "categories": [],
-        "migration": False,
+        "categories": list(categories or []),
+        "migration": "migration" in (categories or []),
         "risk_floor": risk_floor,
     }
     impact["sha256"] = hashlib.sha256(
@@ -1522,3 +1523,229 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         assert "Report a test as FAIL only when it ran and the code under test failed it" in prompt
         assert "is SKIPPED with that exact reason" in prompt
         assert "Never mark a real assertion failure as SKIPPED" in prompt
+
+
+def _self_contained_evidence(head: str, *, deployment_floor: str) -> dict[str, object]:
+    paths = ["packages/templates/src/page.tsx"]
+    diff_sha = "9" * 64
+    side = {
+        "base_sha": "a" * 40,
+        "head_sha": head,
+        "changed_file_count": 1,
+        "changed_paths": paths,
+        "status_sha256": "3" * 64,
+        "diff_sha256": diff_sha,
+        "diff_redacted_sha256": "4" * 64,
+    }
+    return {
+        "source": {
+            **side,
+            "release_impact": release_impact("gntik-ui", changed_paths=paths, diff_sha256=diff_sha),
+        },
+        "deployment": {
+            **side,
+            "release_impact": release_impact(
+                "gntik-ui", changed_paths=paths, diff_sha256=diff_sha, risk_floor=deployment_floor
+            ),
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("deployment_floor", "accepted"), [("R1", True), ("R2", False)])
+async def test_a_self_contained_publication_uses_the_scan_workers_release_floor(
+    tmp_path: Path, deployment_floor: str, accepted: bool
+) -> None:
+    # NEW-173: gntik-ui #26 published its PR, then persistence refused it ("deployment
+    # release impact is not diff-bound"): the scan worker floors only a SEPARATE deployment
+    # repository's change at R2, while this check expected R2 for any deployment change.
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'self-contained.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id, run_id = uuid4(), uuid4()
+    head = "b" * 40
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="gntik-ui",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="gntik-ui",
+                source_branch=None,
+                source_base_sha="a" * 40,
+                source_head_sha=None,
+                source_pr_url=None,
+                deployment_repository="gntik-ui",
+                deployment_branch=None,
+                deployment_base_sha="a" * 40,
+                deployment_head_sha=None,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-self-contained",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="gntik-ui",
+            )
+        )
+    branch = f"agent/gntik-ui/26/{change_set_id}"
+    request = {
+        "change_set_id": str(change_set_id),
+        "run_id": str(run_id),
+        "status": "SOURCE_PRS_CREATED",
+        "publication_plan": {
+            "change_set_id": str(change_set_id),
+            "publications": [{"repository_slug": "gntik-ui", "branch": branch, "head_sha": head}],
+        },
+        "publication_results": [
+            {
+                "repository_slug": "gntik-ui",
+                "head_sha": head,
+                "pr_state": "OPEN",
+                "pr_url": "https://github.com/gntik-ai/gntik-ui/pull/42",
+            }
+        ],
+        "change_evidence": _self_contained_evidence(head, deployment_floor=deployment_floor),
+        "agent_result": checker_result(),
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+    if not accepted:
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("delivery.persist_publication", request)
+        return
+    result = await handler.handle("delivery.persist_publication", request)
+    assert result["status"] == "SOURCE_PR"
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.source_pr_url == "https://github.com/gntik-ai/gntik-ui/pull/42"
+        assert change_set.deployment_pr_url is None
+        assert change_set.risk_class == "R1"
+        assert change_set.recovery_json["release_impact"]["risk_floor"] == "R1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("floor", "categories", "existing_risk", "expected"),
+    [
+        ("R1", [], "R1", None),  # a falcone-charts change claiming R1 is refused
+        ("R2", [], "R1", "R2"),  # its R2 floor raises the ChangeSet to R2
+        ("R3", ["secret_lifecycle"], "R1", "R3"),  # a matched category escalates to R3
+        ("R2", [], "R3", "R3"),  # an existing higher risk class is kept
+    ],
+)
+async def test_a_separate_deployment_change_still_floors_at_r2(
+    tmp_path: Path, floor: str, categories: list[str], existing_risk: str, expected: str | None
+) -> None:
+    # NEW-173: a falcone-charts change keeps its R2 floor and the risk aggregation.
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'separate.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id, run_id = uuid4(), uuid4()
+    source_head, deployment_head = "b" * 40, "d" * 40
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class=existing_risk,
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="falcone",
+                source_branch=None,
+                source_base_sha="a" * 40,
+                source_head_sha=None,
+                source_pr_url=None,
+                deployment_repository="falcone-charts",
+                deployment_branch=None,
+                deployment_base_sha="c" * 40,
+                deployment_head_sha=None,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-separate",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+    evidence = publication_evidence(source_head, deployment_head, deployment_changed=True)
+    deployment = evidence["deployment"]
+    assert isinstance(deployment, dict)
+    deployment["release_impact"] = release_impact(
+        "falcone-charts",
+        changed_paths=["values.yaml"],
+        diff_sha256="8" * 64,
+        risk_floor=floor,
+        categories=categories,
+    )
+    branch = f"agent/falcone/123/{change_set_id}"
+    request = {
+        "change_set_id": str(change_set_id),
+        "run_id": str(run_id),
+        "status": "SOURCE_PRS_CREATED",
+        "publication_plan": {
+            "change_set_id": str(change_set_id),
+            "publications": [
+                {"repository_slug": "falcone", "branch": branch, "head_sha": source_head},
+                {
+                    "repository_slug": "falcone-charts",
+                    "branch": branch,
+                    "head_sha": deployment_head,
+                },
+            ],
+        },
+        "publication_results": [
+            {
+                "repository_slug": "falcone",
+                "head_sha": source_head,
+                "pr_state": "OPEN",
+                "pr_url": "https://github.com/gntik-ai/falcone/pull/1",
+            },
+            {
+                "repository_slug": "falcone-charts",
+                "head_sha": deployment_head,
+                "pr_state": "OPEN",
+                "pr_url": "https://github.com/gntik-ai/falcone-charts/pull/2",
+            },
+        ],
+        "change_evidence": evidence,
+        "agent_result": checker_result(),
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+    if expected is None:
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("delivery.persist_publication", request)
+        return
+    assert (await handler.handle("delivery.persist_publication", request))["status"] == (
+        "SOURCE_PR"
+    )
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.risk_class == expected
+        assert change_set.recovery_json["release_impact"]["risk_floor"] == expected
