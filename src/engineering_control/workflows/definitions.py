@@ -3396,10 +3396,14 @@ def _provider_failure_type(cause: BaseException | None) -> str:
     if isinstance(cause, ActivityTimeoutError) and cause.type is not None:
         return f"TIMEOUT_{cause.type.name}"
     if isinstance(cause, ApplicationError) and cause.type:
-        if cause.type == "WorkerShutdown" and not _sdk_worker_shutdown(cause):
-            # NEW-166 review: application code reusing the SDK's type is not a shutdown.
+        code = _failure_code(cause.type)
+        if code == "WORKER_SHUTDOWN" and not (
+            cause.type == "WorkerShutdown" and _sdk_worker_shutdown(cause)
+        ):
+            # NEW-166 review: application code reusing the SDK's type, or any alias that
+            # normalizes to it, is not a worker shutdown.
             return "APPLICATION_WORKER_SHUTDOWN"
-        return _failure_code(cause.type)
+        return code
     return _failure_code(type(cause).__name__) if cause is not None else "UNKNOWN"
 
 

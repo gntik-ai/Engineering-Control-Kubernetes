@@ -397,6 +397,19 @@ def test_provider_failure_type_is_bounded() -> None:
     worded = _sdk_shutdown_failure()
     worded.message = "Worker is shutting down"
     assert _provider_failure_type(_decoded(worded)) == "APPLICATION_WORKER_SHUTDOWN"
+    # Review 2: aliases normalizing to the same code are not the SDK's failure either,
+    # even with the SDK's exact signature.
+    for alias in ("WORKER_SHUTDOWN", "worker_shutdown", "Worker_Shutdown", "workerShutdown"):
+        aliased = _sdk_shutdown_failure()
+        aliased.application_failure_info.type = alias
+        assert _provider_failure_type(_decoded(aliased)) == "APPLICATION_WORKER_SHUTDOWN"
+        try:
+            raise ApplicationError("disk full", type=alias, non_retryable=True)
+        except ApplicationError as raised:
+            assert _provider_failure_type(_decoded(_encoded(raised))) == (
+                "APPLICATION_WORKER_SHUTDOWN"
+            )
+    assert _provider_failure_type(None) == "UNKNOWN"
 
 
 _SDK_SHUTDOWN_MESSAGE = "Worker is shutting down and this activity did not complete in time"
@@ -420,7 +433,6 @@ def _encoded(error: BaseException) -> Failure:
     failure = Failure()
     converter.failure_converter.to_failure(error, converter.payload_converter, failure)
     return failure
-    assert _provider_failure_type(None) == "UNKNOWN"
 
 
 # -- NEW-137 review round 1 ---------------------------------------------------------------
