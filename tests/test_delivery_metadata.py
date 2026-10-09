@@ -1497,3 +1497,28 @@ def test_a_shared_worktree_deployment_maker_expects_the_source_makers_new_head(
         ]
         assert f"(HEAD {resumed_head}, on top of base" in separate
         assert "shared with the source repository portion" not in separate
+
+
+def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Path) -> None:
+    # NEW-171: falcone #975's deployment maker reported suites it could not run in the
+    # sandbox (EPERM, timeouts) as FAIL, blocking publication before the PR CI could judge.
+    handler, allocation = _lease_fixture(tmp_path)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-falcone-issue-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/falcone/issues/975",
+        "risk_class": "R2",
+        "project": "falcone",
+        "openspec_document": {"decision": "READY", "title": "invitations"},
+        "source_resumed_from_sha": None,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+    for deployment, key in ((False, "maker_request"), (True, "deployment_maker_request")):
+        prompt = handler._prepare_maker(payload, deployment=deployment)[key]["prompt"]
+        assert "Report a test as FAIL only when it ran and the code under test failed it" in prompt
+        assert "is SKIPPED with that exact reason" in prompt
+        assert "Never mark a real assertion failure as SKIPPED" in prompt

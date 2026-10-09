@@ -3627,6 +3627,16 @@ class MetadataActivityHandler:
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
             "repository tests, then create one local commit on the assigned branch. Preserve all "
             "existing safety gates.\n"
+            # NEW-171 (operator decision 2026-10-09): falcone #975's deployment maker fixed
+            # the chart contract (checker PASS) but reported two suites FAIL that it could
+            # not run in the sandbox (subprocess stdin EPERM, timeouts), which blocked
+            # publication although the pull request's CI runs them before any merge.
+            "Report a test as FAIL only when it ran and the code under test failed it. A "
+            "command this sandbox cannot run or complete (permission errors such as EPERM, "
+            "missing dependencies, no network, no database, subprocess or socket limits, a "
+            "stall or timeout caused by the environment) is SKIPPED with that exact reason in "
+            "the summary: the pull request's CI runs it before any merge. Never mark a real "
+            "assertion failure as SKIPPED.\n"
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.
