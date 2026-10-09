@@ -32,6 +32,10 @@ repository creation, or credential copy is performed by this repository's bootst
 - every controller, worker, bootstrap, upgrade, and end-to-end verification runs the fail-closed
   `scripts/verify-no-omniroute.sh` negative policy before acceptance.
 
+A lecture-style walkthrough of the whole platform (components, software choices, workflows,
+state machines, control surfaces, security gates, operations) lives in
+[`docs/architecture-course/README.md`](docs/architecture-course/README.md).
+
 See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
 `docs/OPERATOR-CHEATSHEET.md`. Exact PR/CI, signed candidate image, and digest-only deployment
 reconciliation is specified in `docs/CI-ARTIFACT-RECONCILIATION.md`.
