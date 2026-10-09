@@ -410,7 +410,7 @@ Instead of a hand-written SQL update, for an **issue-start** loop paused on that
 
 ```bash
 engineering-ctl change-reset <loop_workflow_id> <project> <repository> <issue_number> \
-  <change_set_id> RESET_CHANGESET_<first 8 hex of the ChangeSet ID, upper case> [--mode rebase]
+  <change_set_id> RESET_CHANGESET_<first 8 hex of the ChangeSet ID, upper case>
 
 # falcone #975
 engineering-ctl change-reset <loop_workflow_id> falcone falcone 975 \
@@ -418,33 +418,29 @@ engineering-ctl change-reset <loop_workflow_id> falcone falcone 975 \
 engineering-ctl backlog-retry <loop_workflow_id> falcone 975
 ```
 
-- `--mode retry` (default): the ChangeSet moves to `REQUEST_CHANGES` (version + 1) with
-  `recovery_json.correction_requested = {blocker: OPERATOR_RESET, actor, at}` (the stopped runs
-  stay listed), exactly the state NEW-137 records after a provider outage. The next
-  `backlog-retry` binds one more child of the **bounded** correction lineage; the reset grants
-  no attempt (`change-extend-correction` stays the only, separate, allowance).
-- `--mode rebase`: the ChangeSet is reset to its unstarted state (`CONFIRMED`, no branch or head
-  SHAs) on the heads of its finding's current-source revalidation
-  (`impact_json.revalidated_heads`, NEW-117), its unreleased worktree leases are released and its
-  `recovery_json.validation_findings` (about the old base's diff) dropped. The next child binds
-  as an unstarted retry, allocates the worktree on the new base (the old branch head does not
-  descend from it, so it is archived, not resumed) and runs the maker from scratch. The issue
-  approval custody, correction lineage, OpenSpec and any correction extension are kept. Only a
-  move the revalidation proves is a fast-forward is made: the ChangeSet must still sit on the
-  finding's import heads and the revalidated heads must differ. A ChangeSet already on its
-  revalidated heads (gntik-ui #25) is refused with `REVALIDATION_REQUIRED`: a CONFIRMED finding
-  is never revalidated again, so a newer base needs a fresh revalidation (a new `backlog-import`
-  + `issue-start`, which creates a new finding and ChangeSet). Allocation still requires the
-  base branch to be at (or resumable from) that base; if `main` moved on since the revalidation
-  the attempt stops with `base SHA mismatch` and the ChangeSet stays retryable.
+The ChangeSet moves to `REQUEST_CHANGES` (version + 1) with
+`recovery_json.correction_requested = {blocker: OPERATOR_RESET, actor, at}` (the stopped runs
+stay listed), exactly the state NEW-137 records after a provider outage. The next
+`backlog-retry` binds one more child of the **bounded** correction lineage; the reset grants no
+attempt (`change-extend-correction` stays the only, separate, allowance). The ChangeSet keeps its
+base, branch and worktree (the next attempt resumes the previous commits, NEW-52).
+
+`change-reset` never moves a ChangeSet to a newer base. A ChangeSet pinned to an old base (e.g.
+gntik-ui #25, ChangeSet 9ec2e871 on de2cdde) needs a **fresh `backlog-import` + `issue-start`**:
+a CONFIRMED finding is never revalidated again, and the new import creates a new finding and
+ChangeSet revalidated at the current heads.
 
 The API route is `POST /v1/change-sets/reset` (operator channel only). The loop's pause is
-proven like `issue-reapprove`'s; everything else is re-read in one transaction under the
-Finding and ChangeSet row locks (the order delivery children bind in), and the reset is audited
-as a `change_set_reset` dashboard event (also kept as `recovery_json.operator_reset`). Refusals
-(`CHANGE_RESET_*`):
+proven like `issue-reapprove`'s. The API then asks Temporal about every delivery run of the
+ChangeSet and of the loop (every Run bound to the ChangeSet or named `<loop>-issue-...`): each
+must be closed, whatever its projected Run status (a child reset and restarted in Temporal can
+run under a FAILED row); any observation error refuses. Everything else is re-read in one
+transaction under the Finding and ChangeSet row locks (the order delivery children bind in),
+including the set of delivery runs (one registered after the Temporal check refuses), and the
+reset is audited as a `change_set_reset` dashboard event (also kept as
+`recovery_json.operator_reset`). Refusals (`CHANGE_RESET_*`):
 
-- `CONFIRMATION_MISMATCH`, `MODE_INVALID`, `OPERATOR_REQUIRED`;
+- `CONFIRMATION_MISMATCH`, `OPERATOR_REQUIRED`;
 - `LOOP_INVALID` (not an issue-start loop of that project), `LOOP_NOT_PAUSED` (not `PAUSED` on
   that issue by its open run);
 - `CHANGESET_NOT_FOUND`, `APPROVAL_INVALID`, `TARGET_MISMATCH` (not that loop's issue
@@ -452,8 +448,10 @@ as a `change_set_reset` dashboard event (also kept as `recovery_json.operator_re
 - `PUBLISHED`: a PR URL, release artifacts, publication/CI/merge/release records, a publication
   intent/effect or a deployment exists: a published ChangeSet is never reset;
 - `STATE` (terminal/delivered or otherwise not resettable), `ALREADY_RETRYABLE` (already
-  `REQUEST_CHANGES` for retry, or unstarted), `LINEAGE_EXHAUSTED` (no correction attempt left);
-- `REVALIDATION_REQUIRED` (rebase only, see above).
+  `REQUEST_CHANGES`, or never started), `LINEAGE_EXHAUSTED` (no correction attempt left);
+- `DELIVERY_ACTIVE`: a delivery run not proven closed in Temporal (or more than 256 to check),
+  or an unreleased, unexpired worktree lease of the ChangeSet or component lease of one of its
+  delivery runs (wait for the release or the lease's expiry).
 
 ## Reconcile an uncertain publication effect (NEW-145)
 

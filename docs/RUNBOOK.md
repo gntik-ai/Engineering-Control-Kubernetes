@@ -262,23 +262,38 @@ rejected in the NEW-105 review: it walks a maker-controlled tree where symlink/r
 redirect the grant to the maker's own credentials. The correct fix needs root at runtime, and no
 privileged helper is built without an operator decision.
 
-**Operator recovery** (worker host, as root; `find` does not follow symlinks and `chown -h` does
-not dereference them):
+**Operator recovery** (worker host, as root). First make sure nothing writes in that worktree any
+more: the ChangeSet's loop is `PAUSED` and none of its delivery children runs (`backlog-status`;
+`change-reset` checks the same in Temporal), and no `codex-runner`/`claude-runner` process is left
+working there (`sudo pgrep -a -u codex-runner,claude-runner`). With the writers quiescent, nothing
+can swap a path component during the walk; `find` does not follow symlinks and `chown -h` does not
+dereference them. The whole remote command is quoted so the escaped parentheses reach `find`:
 
 ```bash
 WT=/srv/engineering/worktrees/<repository-slug>/<change_set_id>
-ssh -t 10.10.0.3 sudo find "$WT" -xdev \( -user codex-runner -o -user claude-runner \) \
-  -exec chown -h scan-runner:scan-runner {} +
+ssh -t 10.10.0.3 "sudo find '$WT' -xdev \( -user codex-runner -o -user claude-runner \) -exec chown -h scan-runner:scan-runner {} +"
 ```
 
 Then retry the stopped step (`backlog-retry`, or let the next cleanup run). The next allocation of
 that ChangeSet archives and cleans the worktree as `scan-runner`.
 
-**Proposed fix (not implemented).** A root-owned oneshot `engineering-worktree-reclaim@.service`
-started by a path unit (the `engineering-github-policy-reconciler.path` pattern): the scan worker
-writes a request naming one ChangeSet UUID after a `Permission denied`; the unit validates the
-UUID, resolves `/srv/engineering/worktrees/<slug>/<uuid>` with no symlink component, runs exactly
-the `find ... -exec chown -h` above and nothing else, and the scan worker retries its cleanup once.
+**Proposed fix: open design work, not implemented.** Any automatic root reclaim must not repeat
+the race that sank the maker-side repair: a path-based walk (`find`, `chown -h`) protects only the
+last component, so a writer still active in the tree can swap an intermediate directory for a
+symlink between the check and the change. A design is acceptable only with both of:
+
+1. verified writer quiescence, checked first and fail-closed: the ChangeSet's delivery children
+   closed in Temporal, its worktree and component leases released, and no runner process inside
+   the worktree; and
+2. descriptor-relative traversal: open the worktree root component by component with
+   `O_DIRECTORY | O_NOFOLLOW`, then walk only through directory descriptors (e.g. a small Python
+   helper on `os.fwalk(dir_fd=..., follow_symlinks=False)`, `os.chown(name, uid, gid,
+   dir_fd=..., follow_symlinks=False)`), never re-resolving a path string, staying on one device
+   and skipping symlinks.
+
+It would run as a root-owned oneshot unit triggered by a scan-worker request naming one ChangeSet
+UUID (the `engineering-github-policy-reconciler.path` pattern). Until such a design is reviewed,
+recovery stays the manual command above.
 
 ### Incident, 2026-09-20: an SSH hardening fix locked the operator out
 
