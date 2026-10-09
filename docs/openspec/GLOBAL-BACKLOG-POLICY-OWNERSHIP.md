@@ -40,6 +40,11 @@ global selector from continuing with an independent issue.
   the single global owner contract above unchanged.
 - The global backlog is exclusive: its capability and registration also require that no campaign
   outside its own inventories owns the policy.
+- An expired owner voids only its own project's inventory (every inventory under the single global
+  owner rule, and every inventory once no owner remains at all).
+- Every ownership change is serialized by the one ownership advisory lock: approval, release,
+  activation re-queue, global registration (held through its commit) and the root reconciler's
+  enable, disable and expiry, which re-read the campaign rows under it.
 - The single pending activation slot, the disable rule (the shared policy stays enabled while any
   verified owner remains) and the policy file shape are unchanged. Delivery writes are also bound
   to their project's repository pair (`REPOSITORY_OUTSIDE_PROJECT`).

@@ -379,7 +379,10 @@ project's repositories; its shape is unchanged) is now owned per project:
   (restart the API), then restore it after the global backlog ends.
 - Only one activation request is processed at a time (one `activate.json`): an approval while
   another campaign's activation is pending is still refused, except that `issue-start` now waits
-  for that slot (up to the activation timeout, polling) and retries the same approval.
+  for that slot (up to the activation timeout, polling) and retries the same approval. If its
+  approval commits while the root reconciler has not yet removed the previous `activate.json`, it
+  is not approved again: the activation request is re-queued once the file is gone.
+- An owner that expires voids only its own project's inventory approvals.
 - Disabling and expiry are unchanged: a campaign's terminal disable keeps the policy while any
   other verified owner (of any project) remains, and the policy turns off only when none does.
 - Write-time defence: issue delivery publication, final merges and issue comments/closure,
