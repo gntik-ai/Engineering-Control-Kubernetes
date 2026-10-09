@@ -637,3 +637,5 @@ def test_worker_memory_budget_fits_the_worker_host() -> None:
     bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
     assert "engineering-workers.slice engineering-workers-agents.slice" in bootstrap
     assert "50-memory.conf" in bootstrap
+    verify = (REPOSITORY_ROOT / "scripts" / "verify-worker.sh").read_text(encoding="utf-8")
+    assert "engineering-workers.slice engineering-workers-agents.slice" in verify

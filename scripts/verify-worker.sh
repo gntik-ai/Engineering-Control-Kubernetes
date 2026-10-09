@@ -31,8 +31,15 @@ done
   /opt/engineering-agent-pack/source/generators/generate.py --check
 /opt/engineering-control/venv/bin/python \
   /opt/engineering-agent-pack/source/generators/validate.py
-for unit in engineering-worker@.service engineering-release-worker.service; do
+for unit in engineering-workers.slice engineering-workers-agents.slice \
+  engineering-worker@.service engineering-release-worker.service; do
   cmp -s "/etc/engineering-control/systemd/${unit}" "/etc/systemd/system/${unit}"
+done
+# NEW-167: the workers' memory budget is in force (aggregate slice, nested agents slice).
+[[ $(systemctl show -p Slice --value engineering-worker@scan.service) == engineering-workers.slice ]]
+for agent in codex claude; do
+  [[ $(systemctl show -p Slice --value "engineering-worker@${agent}.service") == \
+    engineering-workers-agents.slice ]]
 done
 
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
