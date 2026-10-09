@@ -54,7 +54,6 @@ from engineering_control.operations.issue_reapproval import (
 from engineering_control.operations.publication_authority import (
     ATTEMPT_STEP,
     EFFECT_STEP,
-    INTENT_STEP,
 )
 
 RESET_EVENT_TYPE = "change_set_reset"
@@ -171,17 +170,22 @@ def _published(session: Session, change_set: ChangeSet) -> str | None:
     recorded = sorted(_PUBLISHED_RECOVERY_KEYS.intersection(change_set.recovery_json or {}))
     if recorded:
         return f"publication records exist ({', '.join(recorded)})"
-    publication = session.scalar(
-        select(Step.id)
+    # Review 3: a PREPARED intent alone (persisted before delivery.publish, e.g. a GitHub
+    # preflight then failed) is not publication, nor is an attempt or effect durably
+    # acknowledged NOT_ATTEMPTED (publication_authority's own proof that its command never
+    # ran). Anything else (COMPLETE, UNKNOWN, reconciled, claimed) may have published.
+    for name, status, result in session.execute(
+        select(Step.name, Step.status, Step.result_json)
         .join(Run, Run.id == Step.run_id)
         .where(
             Run.change_set_id == change_set.id,
-            Step.name.in_((INTENT_STEP, EFFECT_STEP, ATTEMPT_STEP)),
+            Step.name.in_((EFFECT_STEP, ATTEMPT_STEP)),
         )
-        .limit(1)
-    )
-    if publication is not None:
-        return "a publication intent or effect is recorded"
+    ):
+        receipt = result.get("receipt") if isinstance(result, dict) else None
+        outcome = receipt.get("outcome") if isinstance(receipt, dict) else None
+        if status != "NOT_ATTEMPTED" or (name == EFFECT_STEP and outcome != "NOT_ATTEMPTED"):
+            return "a publication effect or attempt is recorded"
     deployment = session.scalar(
         select(Deployment.id).where(Deployment.change_set_id == change_set.id).limit(1)
     )

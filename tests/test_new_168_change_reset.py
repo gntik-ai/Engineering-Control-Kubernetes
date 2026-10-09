@@ -340,6 +340,61 @@ async def test_a_held_lease_refuses_until_released_or_expired(tmp_path: Path, ki
     stuck.dispose()
 
 
+def _publication_step(stuck: _Stuck, name: str, status: str, result: dict[str, Any]) -> None:
+    with stuck.live.operations.sessions.begin() as session:
+        attempt = session.scalar(
+            select(Run).where(Run.workflow_id == f"{stuck.live.loop}-issue-1-attempt-1")
+        )
+        session.add(
+            Step(
+                run_id=attempt.id,
+                name=name,
+                ordinal=0,
+                status=status,
+                idempotency_key=f"publication-{uuid4()}",
+                attempt=1,
+                result_json=result,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "result", "allowed"),
+    [
+        ("delivery.publication_intent", "PREPARED", {}, True),
+        (
+            "delivery.publication_effect",
+            "NOT_ATTEMPTED",
+            {"receipt": {"outcome": "NOT_ATTEMPTED"}},
+            True,
+        ),
+        ("delivery.publication_attempt", "NOT_ATTEMPTED", {}, True),
+        (
+            "delivery.publication_effect",
+            "NOT_ATTEMPTED",
+            {"receipt": {"outcome": "COMPLETE"}},
+            False,
+        ),
+        ("delivery.publication_effect", "COMPLETE", {}, False),
+        ("delivery.publication_attempt", "CLAIMED", {}, False),
+    ],
+)
+async def test_only_proven_non_publication_steps_allow_the_reset(
+    tmp_path: Path, name: str, status: str, result: dict[str, Any], allowed: bool
+) -> None:
+    """Review 3: a PREPARED intent (persisted before a failed delivery.publish) and a
+    durably acknowledged NOT_ATTEMPTED attempt/effect prove nothing was published."""
+    stuck = await _stuck(tmp_path)
+    stuck.live.loop_state("PAUSED", blocker="DELIVERY_FAILED:FAILED")
+    _publication_step(stuck, name, status, result)
+    if allowed:
+        assert (await stuck.reset())["status"] == "CHANGESET_RESET"
+    else:
+        with pytest.raises(ChangeResetBlocked, match="CHANGE_RESET_PUBLISHED"):
+            await stuck.reset()
+    stuck.dispose()
+
+
 def _published_pr(stuck: _Stuck) -> None:
     stuck.change_set(source_pr_url="https://github.com/gntik-ai/falcone/pull/1")
 
