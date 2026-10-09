@@ -50,6 +50,9 @@ BACKLOG_RELEASE_OWNERSHIP_PHRASE = "RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP"
 # NEW-163: approval refusal while another campaign's policy activation holds the single
 # activate.json slot; issue-start waits for the slot instead of failing.
 BACKLOG_POLICY_ACTIVATION_PENDING = "another backlog campaign policy activation is pending"
+# NEW-163 review: the approval committed but activate.json still holds another request (the
+# root reconciler commits before it unlinks); the activation is re-queued, not re-approved.
+GITHUB_POLICY_REQUEST_SLOT_BUSY = "another GitHub policy request is pending; retry in a few seconds"
 BACKLOG_FIXED_OPERATOR_ACTORS = frozenset({"dashboard:reauthenticated", "cli:engineering-ctl"})
 ENGINEERING_CTL_OPERATOR_SUBJECT = "engineering-ctl:hermes"
 

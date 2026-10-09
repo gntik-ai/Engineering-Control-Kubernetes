@@ -47,6 +47,7 @@ from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
     _global_campaign_authorizes,
     _valid_r3_candidate,
+    lock_backlog_policy,
     require_alternative_issue_authority,
     unexpired_policy_owners,
 )
@@ -1149,6 +1150,10 @@ class EngineeringActivityHandler:
         temporal_run_id = str((payload.get("orchestration") or {}).get("workflow_run_id") or "")
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
+            # NEW-163 review: the ownership lock is held from the exclusivity check below
+            # through the commit of the global Run, so no outside owner can be approved or
+            # activated in between (approval and the root reconciler take the same lock).
+            lock_backlog_policy(session)
             backlogs = {
                 project: session.get(db.GitHubBacklogCampaign, value)
                 for project, value in campaign_ids.items()

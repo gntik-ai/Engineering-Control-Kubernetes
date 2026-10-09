@@ -29,6 +29,7 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.engineering.backlog_authority import (
     global_backlog_active,
+    lock_backlog_policy,
     verified_backlog_approval,
 )
 from engineering_control.operations.issue_approval import require_backlog_issue_approval
@@ -152,7 +153,16 @@ def validate_campaign(
     requested_by = request.get("requested_by")
     if not isinstance(requested_by, str) or not is_reauthenticated_backlog_operator(requested_by):
         raise ValueError("GitHub policy request lacks a typed reauthenticated operator")
-    campaign = session.get(GitHubBacklogCampaign, UUID(str(request["backlog_campaign_id"])))
+    # NEW-163 review: the API's ownership lock first, then every row the decision reads is
+    # re-read under it (FOR UPDATE, never a stale identity-map copy), so a release and
+    # replacement approval cannot interleave between this validation and the promotion.
+    lock_backlog_policy(session)
+    campaign = session.get(
+        GitHubBacklogCampaign,
+        UUID(str(request["backlog_campaign_id"])),
+        with_for_update=True,
+        populate_existing=True,
+    )
     if (
         campaign is None
         or campaign.project != request["project"]
@@ -168,10 +178,13 @@ def validate_campaign(
         raise ValueError("GitHub policy request campaign state is invalid")
     if request["action"] == "enable-existing-backlog":
         others = session.scalars(
-            select(GitHubBacklogCampaign).where(
+            select(GitHubBacklogCampaign)
+            .where(
                 GitHubBacklogCampaign.id != campaign.id,
                 GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"}),
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         ).all()
         if others:
             # NEW-163: one owner per project, at most the API's parallel project limit
@@ -289,10 +302,13 @@ def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) ->
     (2026-09-28: cancelling a stale falcone loop disabled the policy that the running
     falcone #1025 delivery owned, and its publication waited on POLICY_DISABLED)."""
     for candidate in session.scalars(
-        select(GitHubBacklogCampaign).where(
+        select(GitHubBacklogCampaign)
+        .where(
             GitHubBacklogCampaign.id != campaign_id,
             GitHubBacklogCampaign.status.in_(OWNER_STATUSES),
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).all():
         expires_at = verified_owner_expiry(candidate, now)
         if expires_at is not None and expires_at > now:
@@ -302,8 +318,10 @@ def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) ->
 
 def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     """Expire all approval rows and report whether shared policy must be disabled."""
+    lock_backlog_policy(session)  # NEW-163 review: first, as in validate_campaign
     active = session.scalars(
-        select(GitHubBacklogCampaign).where(
+        select(GitHubBacklogCampaign)
+        .where(
             GitHubBacklogCampaign.status.in_(
                 {
                     "APPROVED_POLICY_PENDING",
@@ -314,6 +332,8 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
                 }
             )
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).all()
     unexpired_owner = False
     for campaign in active:

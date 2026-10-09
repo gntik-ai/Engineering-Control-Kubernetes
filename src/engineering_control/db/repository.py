@@ -55,6 +55,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_POLICY_ACTIVATION_PENDING,
     BACKLOG_RELEASE_OWNERSHIP_PHRASE,
+    GITHUB_POLICY_REQUEST_SLOT_BUSY,
     BacklogApprovalBinding,
     approval_binding,
     canonical_sha256,
@@ -1143,7 +1144,7 @@ class SQLMetadataRepository:
             )
         ).all()
         active_owners: list[GitHubBacklogCampaign] = []
-        expired_owner = False
+        expired_projects: set[str] = set()
         for candidate in active_campaigns:
             if candidate.approval_json.get("policy_role") not in {None, "owner"}:
                 continue
@@ -1161,14 +1162,25 @@ class SQLMetadataRepository:
                 candidate_expiry = now
             if candidate_expiry <= now:
                 candidate.status = "EXPIRED"
-                expired_owner = True
+                expired_projects.add(candidate.project)
                 continue
             active_owners.append(candidate)
-        if expired_owner or not active_owners:
-            for candidate in active_campaigns:
-                if candidate.approval_json.get("policy_role") == "inventory":
-                    candidate.status = "EXPIRED"
-        active_owner = self._backlog_policy_owner(session, campaign, active_owners)
+        global_ownership = self.backlog_parallel_project_limit == 1 or global_backlog_active(
+            session
+        )
+        for candidate in active_campaigns:
+            # Inventory depends on its owner: under the single global owner every inventory
+            # does; NEW-163 review: per project only that project's (another project's live
+            # owner keeps its own inventory). No owner left at all orphans every inventory.
+            if candidate.approval_json.get("policy_role") == "inventory" and (
+                not active_owners
+                or (expired_projects and global_ownership)
+                or candidate.project in expired_projects
+            ):
+                candidate.status = "EXPIRED"
+        active_owner = self._backlog_policy_owner(
+            campaign, active_owners, global_ownership=global_ownership
+        )
         raw_binding = campaign.approval_json.get("binding")
         if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
             raise ValueError("existing-backlog approval candidate changed")
@@ -1202,9 +1214,10 @@ class SQLMetadataRepository:
 
     def _backlog_policy_owner(
         self,
-        session: Session,
         campaign: GitHubBacklogCampaign,
         active_owners: list[GitHubBacklogCampaign],
+        *,
+        global_ownership: bool,
     ) -> UUID | None:
         """NEW-163: the owner whose active policy the approved campaign joins as inventory,
         or None when it becomes its project's owner (refused beyond the parallel cap).
@@ -1213,7 +1226,7 @@ class SQLMetadataRepository:
         A limit of 1, or an open autonomous global backlog, keeps the pre-NEW-163 rule:
         one owner globally and every further approval is an inventory under it."""
         limit = self.backlog_parallel_project_limit
-        if limit == 1 or global_backlog_active(session):
+        if global_ownership:
             if len(active_owners) > 1:
                 raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
             return active_owners[0].id if active_owners else None
@@ -1424,9 +1437,7 @@ class SQLMetadataRepository:
             try:
                 os.link(temporary, target)
             except FileExistsError as error:
-                raise ValueError(
-                    "another GitHub policy request is pending; retry in a few seconds"
-                ) from error
+                raise ValueError(GITHUB_POLICY_REQUEST_SLOT_BUSY) from error
         finally:
             temporary.unlink(missing_ok=True)
 

@@ -27,6 +27,7 @@ from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.backlog import (
     BACKLOG_POLICY_ACTIVATION_PENDING,
+    GITHUB_POLICY_REQUEST_SLOT_BUSY,
     canonical_operator_approval_actor,
 )
 from engineering_control.operations.connections import ConnectionHealthProjector
@@ -376,7 +377,12 @@ class TypedCommandBus:
         """NEW-163: campaigns of different projects run in parallel, but the root
         reconciler takes one activation request at a time. While ANOTHER campaign's
         activation is pending, retry the same approval until the slot frees (bounded by
-        policy_activation_timeout_seconds); every other refusal propagates."""
+        policy_activation_timeout_seconds); every other refusal propagates.
+
+        NEW-163 review: the root reconciler commits APPROVED before it unlinks
+        activate.json, so this approval can commit as the pending owner and then find the
+        request file still taken. It is not approved again: the activation request is
+        re-queued through ensure_policy_activation within the same deadline."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy_activation_timeout_seconds
         while True:
@@ -385,9 +391,40 @@ class TypedCommandBus:
                     campaign_id, project, binding, actor
                 )
             except ValueError as error:
+                if str(error) == GITHUB_POLICY_REQUEST_SLOT_BUSY:
+                    return await self._requeue_committed_activation(
+                        campaign_id, binding, deadline, error
+                    )
                 if str(error) != BACKLOG_POLICY_ACTIVATION_PENDING or loop.time() >= deadline:
                     raise
             await asyncio.sleep(self.policy_activation_poll_seconds)
+
+    async def _requeue_committed_activation(
+        self, campaign_id: UUID, binding: str, deadline: float, error: ValueError
+    ) -> dict[str, Any]:
+        campaign = await self.metadata.get_backlog_campaign(campaign_id)
+        if (
+            campaign is None
+            or campaign.get("status") != "APPROVED_POLICY_PENDING"
+            or campaign.get("approval_binding") != binding
+        ):
+            raise error
+        loop = asyncio.get_running_loop()
+        # ACTIVATION_PENDING: activate.json still holds another request. Anything else is
+        # re-queued, or the campaign left pending (the activation wait then judges it).
+        while await self.metadata.ensure_policy_activation(campaign_id) == "ACTIVATION_PENDING":
+            if loop.time() >= deadline:
+                raise ValueError(
+                    "GitHub write policy activation did not complete; check "
+                    "engineering-github-policy-reconciler before starting"
+                )
+            await asyncio.sleep(self.policy_activation_poll_seconds)
+        return {
+            "status": "APPROVED_POLICY_PENDING",
+            "backlog_campaign_id": str(campaign_id),
+            "approval_binding": binding,
+            "policy_activation": "QUEUED_ROOT_RECONCILER",
+        }
 
     async def _execute(
         self,

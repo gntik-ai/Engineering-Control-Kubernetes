@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from engineering_control.api.schemas import ExistingBacklogLoopStart
@@ -75,6 +75,18 @@ POLICY_OWNER_CLAIM_STATUSES = frozenset(
     {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
 )
 GLOBAL_BACKLOG_ACTIVE_STATUSES = frozenset({*db.ACTIVE_OPERATION_STATUSES, "PAUSED", "BLOCKED"})
+
+
+# The advisory lock every backlog policy-ownership transaction takes (approval, release,
+# activation re-queue; NEW-163: the root reconciler and global registration too).
+BACKLOG_POLICY_LOCK = text("SELECT pg_advisory_xact_lock(706958327441)")
+
+
+def lock_backlog_policy(session: Session) -> None:
+    """NEW-163: serialize with every other policy-ownership change until this transaction
+    ends. Call it first, before reading any campaign row the decision depends on."""
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(BACKLOG_POLICY_LOCK)
 
 
 def global_backlog_active(session: Session) -> bool:

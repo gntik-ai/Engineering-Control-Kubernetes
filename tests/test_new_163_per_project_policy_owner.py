@@ -643,3 +643,240 @@ def test_the_pre_publication_recheck_keeps_the_project_pair(tmp_path: Path) -> N
     assert effect("falcone") == "done"
     with pytest.raises(PublicationAuthorityError, match="write policy changed"):
         effect("musematic")
+
+
+# --- review round 1 ------------------------------------------------------------------
+
+
+def _record_order(
+    monkeypatch: pytest.MonkeyPatch, engine: Any, target: dict[str, Any]
+) -> list[str]:
+    """Record the ownership lock call and every SQL statement in execution order."""
+    from sqlalchemy import event
+
+    order: list[str] = []
+    monkeypatch.setitem(target, "lock_backlog_policy", lambda session: order.append("LOCK"))
+
+    def statement(*args: Any) -> None:
+        order.append("SQL")
+
+    event.listen(engine, "before_cursor_execute", statement)
+    return order
+
+
+@pytest.mark.asyncio
+async def test_reconciler_takes_the_ownership_lock_before_reading_any_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 1: enable, disable and expiry lock first (the lock is the API's, so a
+    release and replacement approval cannot interleave with validation)."""
+    repository = _repository(tmp_path)
+    _, request = await _reconciler_case(repository, "falcone", "musematic")
+    order = _record_order(monkeypatch, repository.engine, VALIDATE_CAMPAIGN.__globals__)
+
+    with repository.sessions.begin() as session:
+        VALIDATE_CAMPAIGN(session, request, parallel_project_limit=2)
+    assert order[0] == "LOCK" and order.count("LOCK") == 1 and "SQL" in order
+
+    order.clear()
+    with repository.sessions.begin() as session:
+        EXPIRE(session, datetime.now(UTC))
+    assert order[0] == "LOCK" and order.count("LOCK") == 1 and "SQL" in order
+
+
+@pytest.mark.asyncio
+async def test_reconciler_validates_rows_reread_under_the_lock(tmp_path: Path) -> None:
+    """Finding 1: a campaign already loaded in the reconciler's session (a stale identity
+    map copy) is re-read, so a release committed meanwhile is seen."""
+    repository = _repository(tmp_path)
+    _, request = await _reconciler_case(repository, "falcone", "musematic")
+    with repository.sessions() as session:
+        stale = session.get(GitHubBacklogCampaign, _id(2))
+        assert stale is not None and stale.status == "APPROVED_POLICY_PENDING"
+        with repository.sessions.begin() as other:
+            released = other.get(GitHubBacklogCampaign, _id(2))
+            assert released is not None
+            released.status = "CANCELLED"
+        with pytest.raises(ValueError, match="campaign state is invalid"):
+            VALIDATE_CAMPAIGN(session, request, parallel_project_limit=2)
+        session.rollback()
+
+
+def test_global_registration_takes_the_ownership_lock_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: the lock is the registration transaction's first statement, so it is
+    held from the exclusivity check through the commit of the global Run."""
+    from test_global_backlog_convergence import FALCONE_ID, GLOBAL_ID, LLMWIKI_ID, MUSEMATIC_ID
+    from test_global_backlog_convergence import _campaign as global_campaign
+
+    import engineering_control.activities.engineering as engineering
+
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'global.db'}"
+    handler = engineering.EngineeringActivityHandler(Settings(database_url=database_url))
+    engine = handler.sessions.kw["bind"]
+    Base.metadata.create_all(engine)
+    with handler.sessions.begin() as session:
+        session.add_all(
+            [
+                global_campaign(FALCONE_ID, "falcone", status="APPROVED"),
+                global_campaign(MUSEMATIC_ID, "musematic", status="APPROVED"),
+                global_campaign(LLMWIKI_ID, "llmwiki", status="APPROVED"),
+            ]
+        )
+    order = _record_order(monkeypatch, engine, vars(engineering))
+
+    handler._register_global_backlog(
+        {
+            "campaign_id": str(GLOBAL_ID),
+            "backlog_campaign_ids": {
+                "falcone": str(FALCONE_ID),
+                "musematic": str(MUSEMATIC_ID),
+                "llmwiki": str(LLMWIKI_ID),
+            },
+            "policy_campaign_id": str(FALCONE_ID),
+            "orchestration": {"workflow_id": "global-lock-first"},
+        }
+    )
+
+    assert order[0] == "LOCK" and order.count("LOCK") == 1 and "SQL" in order
+
+
+def _expire_owner(repository: SQLMetadataRepository, campaign_id: UUID) -> None:
+    with repository.sessions.begin() as session:
+        row = session.get(GitHubBacklogCampaign, campaign_id)
+        assert row is not None
+        binding = dict(row.approval_json["binding"])
+        binding["expires_at"] = "2026-01-01T00:00:00+00:00"
+        row.approval_json = {**row.approval_json, "binding": binding}
+
+
+@pytest.mark.asyncio
+async def test_project_owners_expire_independently(tmp_path: Path) -> None:
+    """Finding 3: falcone's expired owner voids only falcone's inventory; musematic's live
+    owner keeps its own inventory when a replacement falcone campaign is approved."""
+    repository = _repository(tmp_path)
+    falcone = await _owner(repository, 1, "falcone")
+    await _owner(repository, 2, "musematic")
+    assert (await _approve(repository, _id(3), "musematic"))["status"] == "APPROVED_INVENTORY"
+    assert (await _approve(repository, _id(4), "falcone"))["status"] == "APPROVED_INVENTORY"
+    _expire_owner(repository, falcone)
+
+    replacement = await _approve(repository, _id(5), "falcone")
+
+    assert replacement["status"] == "APPROVED_POLICY_PENDING"
+    assert _status(repository, falcone)[0] == "EXPIRED"
+    assert _status(repository, _id(4))[0] == "EXPIRED"
+    assert _status(repository, _id(2)) == ("APPROVED", "owner")
+    assert _status(repository, _id(3)) == ("APPROVED_INVENTORY", "inventory")
+
+
+@pytest.mark.asyncio
+async def test_under_the_global_rule_an_expired_owner_voids_every_inventory(
+    tmp_path: Path,
+) -> None:
+    """Finding 3: limit 1 keeps the single global owner's dependent-inventory expiry."""
+    repository = _repository(tmp_path, limit=1)
+    approved = await _approve(repository, _id(1), "falcone")
+    assert approved["status"] == "APPROVED_POLICY_PENDING"
+    _reconcile(repository, _take_request(repository), limit=1)
+    assert (await _approve(repository, _id(2), "musematic"))["status"] == "APPROVED_INVENTORY"
+    _expire_owner(repository, _id(1))
+
+    replacement = await _approve(repository, _id(3), "llmwiki")
+
+    assert replacement["status"] == "APPROVED_POLICY_PENDING"
+    assert _status(repository, _id(2))[0] == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_issue_start_requeues_a_committed_approval_when_the_request_file_is_taken(
+    tmp_path: Path,
+) -> None:
+    """Finding 4: root committed falcone APPROVED but has not unlinked its activate.json
+    yet; musematic's approval commits as the pending owner, its request write collides,
+    and the activation is re-queued (never re-approved) once the slot frees."""
+    repository = _repository(tmp_path)
+    falcone = await _approve(repository, _id(1), "falcone")
+    assert falcone["status"] == "APPROVED_POLICY_PENDING"
+    falcone_request = repository.github_policy_request_root / "activate.json"
+    with repository.sessions.begin() as session:
+        VALIDATE_CAMPAIGN(
+            session,
+            json.loads(falcone_request.read_text(encoding="utf-8")),
+            parallel_project_limit=2,
+        ).status = "APPROVED"
+    assert falcone_request.exists()  # committed, not yet unlinked
+
+    from engineering_control.api.schemas import BacklogApprovalCandidateRequest
+
+    with repository.sessions.begin() as session:
+        session.add(_campaign(_id(2), "musematic"))
+    candidate = await repository.prepare_backlog_approval(
+        _id(2),
+        BacklogApprovalCandidateRequest(
+            project="musematic", delivery_mode="source-pr", maximum_risk="R2", maximum_items=1
+        ),
+    )
+    approvals = 0
+    approve = repository.approve_backlog_campaign
+    ensure = repository.ensure_policy_activation
+    ensured = 0
+
+    async def counted_approve(*args: Any) -> dict[str, Any]:
+        nonlocal approvals
+        approvals += 1
+        return await approve(*args)
+
+    async def slot_frees(campaign_id: UUID) -> str:
+        nonlocal ensured
+        ensured += 1
+        if ensured == 3:
+            falcone_request.unlink()  # the root reconciler finishes with falcone's request
+        return await ensure(campaign_id)
+
+    repository.approve_backlog_campaign = counted_approve  # type: ignore[method-assign]
+    repository.ensure_policy_activation = slot_frees  # type: ignore[method-assign]
+    bus = TypedCommandBus(Mock(), repository, Mock())  # type: ignore[arg-type]
+    bus.policy_activation_poll_seconds = 0
+    bus.policy_activation_timeout_seconds = 5
+
+    approval = await bus._approve_when_activation_slot_free(
+        _id(2), "musematic", candidate["approval_binding"], ACTOR
+    )
+
+    assert approvals == 1
+    assert ensured == 3
+    assert approval["status"] == "APPROVED_POLICY_PENDING"
+    assert approval["approval_binding"] == candidate["approval_binding"]
+    request = _take_request(repository)
+    assert (request["project"], request["backlog_campaign_id"]) == ("musematic", str(_id(2)))
+    assert request["approval_binding"] == candidate["approval_binding"]
+    assert _status(repository, _id(2)) == ("APPROVED_POLICY_PENDING", "owner")
+
+
+@pytest.mark.asyncio
+async def test_a_request_file_collision_times_out_without_reapproving(tmp_path: Path) -> None:
+    from engineering_control.engineering.backlog import GITHUB_POLICY_REQUEST_SLOT_BUSY
+
+    approve = AsyncMock(side_effect=ValueError(GITHUB_POLICY_REQUEST_SLOT_BUSY))
+    bus, control, metadata = _bus(approve)
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": "a" * 64}
+    )
+    metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
+    bus.policy_activation_timeout_seconds = 0
+
+    with pytest.raises(ValueError, match="activation did not complete"):
+        await bus._execute(_solve_issue(), operator_class="telegram:42", operation_id=_id(9))
+    assert approve.await_count == 1
+    control.start_existing_backlog_loop.assert_not_awaited()
+
+    # A collision for an approval that is not this binding's pending owner propagates.
+    approve.reset_mock()
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": "c" * 64}
+    )
+    with pytest.raises(ValueError, match="another GitHub policy request is pending"):
+        await bus._execute(_solve_issue(), operator_class="telegram:42", operation_id=_id(9))
+    assert approve.await_count == 1
