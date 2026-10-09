@@ -960,11 +960,10 @@ class DeliveryActivityHandler:
         custody; without one (promotion's distinct approval path) it runs directly.
         """
 
-        project = (
-            None
-            if publication_context is None
-            else self._write_project("delivery.publish", publication_context[1])
-        )
+        # NEW-163: the delivery.publish gate in handle() already denied a payload without
+        # its project; the re-check binds the effect to that same pair.
+        raw_project = None if publication_context is None else publication_context[1].get("project")
+        project = None if raw_project is None else str(raw_project)
 
         def guarded() -> _T:
             denial = self.write_policy.evaluate(lambda: (plan.repository,), project=project)

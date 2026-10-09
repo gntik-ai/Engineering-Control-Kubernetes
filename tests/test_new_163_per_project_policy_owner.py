@@ -621,3 +621,25 @@ def test_a_delivery_write_inside_its_project_pair_is_allowed(tmp_path: Path) -> 
     # Finding and enhancement publication stay bound by the shared allowlist only.
     assert handler._write_project("finding.publish", {"project": "falcone"}) is None
     assert handler._write_project("enhancement.publish", {"project": "falcone"}) is None
+
+
+def test_the_pre_publication_recheck_keeps_the_project_pair(tmp_path: Path) -> None:
+    from test_github_write_denial import write_payloads
+
+    from engineering_control.activities.delivery import RepositoryPublication
+    from engineering_control.adapters.publication_authority import PublicationAuthorityError
+
+    handler = _delivery_handler(tmp_path)
+    raw = write_payloads(tmp_path / "worktrees")["delivery.publish"]
+    plan = RepositoryPublication.model_validate(raw["publication_plan"]["publications"][0])
+    authority = Mock()
+    authority.execute = lambda **kwargs: kwargs["operation"]()
+
+    def effect(project: str) -> Any:
+        return handler._publication_effect(
+            plan, (authority, {"project": project}, {}), "pr_create", lambda: "done"
+        )
+
+    assert effect("falcone") == "done"
+    with pytest.raises(PublicationAuthorityError, match="write policy changed"):
+        effect("musematic")
