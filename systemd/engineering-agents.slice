@@ -1,9 +1,0 @@
-# NEW-167: the shared memory budget of the two agent workers (engineering-worker@codex,
-# engineering-worker@claude). Each may use up to 7G alone, but together they never take
-# more than 9G of the 15G worker host, which keeps ~6G for the OS and the other workers
-# (browser, scan, delivery: 3G caps; release: 1G; backup receiver).
-[Unit]
-Description=Engineering Control agent workers (shared memory budget)
-
-[Slice]
-MemoryMax=9G

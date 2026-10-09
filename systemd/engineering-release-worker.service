@@ -29,6 +29,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 ReadOnlyPaths=/srv/engineering/worktrees
 ReadWritePaths=/var/lib/engineering-control/workers/release /srv/engineering/runs/release /srv/engineering/evidence/release /srv/engineering/cache/release /srv/engineering/tmp/release
+# NEW-167: inside the workers\' aggregate memory budget (agents override to their slice).
+Slice=engineering-workers.slice
 MemoryMax=1G
 CPUQuota=100%
 TasksMax=256

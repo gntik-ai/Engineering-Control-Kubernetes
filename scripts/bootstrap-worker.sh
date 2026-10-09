@@ -438,13 +438,23 @@ else
   touch "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
 fi
 
-for unit in engineering-worker@.service engineering-release-worker.service; do
+# NEW-167: the workers' aggregate memory slice and the agents' nested slice come first.
+for unit in engineering-workers.slice engineering-workers-agents.slice \
+  engineering-worker@.service engineering-release-worker.service; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
     "${CONFIG_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
-systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
+for agent in codex claude; do
+  install -d -o root -g root -m 0755 "/etc/systemd/system/engineering-worker@${agent}.service.d"
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/systemd/engineering-worker@${agent}.service.d/50-memory.conf" \
+    "/etc/systemd/system/engineering-worker@${agent}.service.d/50-memory.conf"
+done
+systemd-analyze verify /etc/systemd/system/engineering-workers.slice \
+  /etc/systemd/system/engineering-workers-agents.slice \
+  /etc/systemd/system/engineering-worker@.service \
   /etc/systemd/system/engineering-release-worker.service
 "${INSTALL_ROOT}/venv/bin/python" \
   "${RELEASE_ROOT}/source/scripts/verify-worker-registry.py" --host worker
