@@ -1455,3 +1455,45 @@ def test_new_118_the_deployment_maker_step_records_whether_the_source_pr_merged(
         assert change_set is not None
         change_set.state = "SOURCE_MERGED"
     assert handler._prepare_maker(payload, deployment=True)["source_pr_merged"] is True
+
+
+def test_a_shared_worktree_deployment_maker_expects_the_source_makers_new_head(
+    tmp_path: Path,
+) -> None:
+    # NEW-169: gntik-ui #26's correction round: source and deployment are one repository
+    # and one worktree. The source maker committed on top of the allocation's HEAD, and the
+    # deployment maker refused because its prompt still named that older HEAD.
+    handler, allocation = _lease_fixture(tmp_path)
+    resumed_head = "d" * 40
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-gntik-ui-issue-1-attempt-2"},
+        "issue_url": "https://github.com/gntik-ai/gntik-ui/issues/26",
+        "risk_class": "R1",
+        "project": "gntik-ui",
+        "openspec_document": {"decision": "READY", "title": "pending activation"},
+        "source_resumed_from_sha": resumed_head,
+        "deployment_resumed_from_sha": resumed_head,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+    shared = {**payload, "deployment_worktree": payload["source_worktree"]}
+
+    prompt = handler._prepare_maker(shared, deployment=True)["deployment_maker_request"]["prompt"]
+    assert "shared with the source repository portion" in prompt
+    assert f"previous attempt's work (HEAD {resumed_head})" in prompt
+    assert "not a snapshot mismatch" in prompt
+    assert f"(HEAD {resumed_head}, on top of base" not in prompt
+    # The source maker's own prompt is unchanged.
+    source = handler._prepare_maker(shared, deployment=False)["maker_request"]["prompt"]
+    assert f"(HEAD {resumed_head}, on top of base" in source
+    assert "shared with the source repository portion" not in source
+    # Separate repositories keep the per-worktree resume wording.
+    if payload["source_worktree"] != payload["deployment_worktree"]:
+        separate = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+            "prompt"
+        ]
+        assert f"(HEAD {resumed_head}, on top of base" in separate
+        assert "shared with the source repository portion" not in separate
