@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import runpy
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 
+from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.api.schemas import BacklogApprovalCandidateRequest
 from engineering_control.config import Settings
@@ -725,3 +729,169 @@ async def test_postgresql_simultaneous_issue_starts_in_one_campaign_admit_one(
         await repository.finish(request.issue_operation_id, status="COMPLETED")
     metadata.engine.dispose()
     repository.engine.dispose()
+
+
+def _held_ownership_lock(
+    url: str, change: Callable[[Session], None], work: Callable[[], None]
+) -> tuple[float, float]:
+    """Hold the backlog ownership lock in one transaction, start ``work`` in a thread,
+    apply ``change`` and commit only after the thread is waiting. Returns the commit time
+    and the time ``work`` returned."""
+    engine = create_engine(url, pool_pre_ping=True)
+    finished: list[float] = []
+
+    def run() -> None:
+        try:
+            work()
+        finally:
+            finished.append(time.monotonic())
+
+    with Session(engine) as session, session.begin():
+        session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+        change(session)
+        session.flush()
+        worker = threading.Thread(target=run)
+        worker.start()
+        time.sleep(1.0)
+        assert not finished, "the transaction did not wait for the ownership lock"
+        committed = time.monotonic()
+    worker.join(timeout=30)
+    engine.dispose()
+    assert finished
+    return committed, finished[0]
+
+
+def _pg_campaign(campaign_id: UUID, project: str, status: str) -> GitHubBacklogCampaign:
+    source, deployment = {
+        "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
+        "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
+    }[project]
+    return GitHubBacklogCampaign(
+        id=campaign_id,
+        project=project,
+        source_repository=source,
+        deployment_repository=deployment,
+        imported_at=datetime.now(UTC),
+        issue_query="is:issue is:open",
+        import_filter="bugs-and-docs",
+        source_default_branch="main",
+        deployment_default_branch="main",
+        source_head_at_import="a" * 40,
+        deployment_head_at_import="b" * 40,
+        issue_count=0,
+        eligible_count=0,
+        deferred_count=0,
+        duplicate_count=0,
+        stale_count=0,
+        already_fixed_count=0,
+        existing_pr_count=0,
+        blocked_count=0,
+        dependency_graph_hash="c" * 64,
+        plan_hash="d" * 64,
+        approval_binding="e" * 64,
+        maximum_items=1,
+        maximum_concurrency=1,
+        status=status,
+        workflow_id=f"inert-new163-{campaign_id}",
+    )
+
+
+@pytest.mark.postgresql
+def test_postgresql_reconciler_validates_under_the_ownership_lock() -> None:
+    """NEW-163 review 1: the root reconciler waits for the API's ownership lock and then
+    validates against the rows committed meanwhile: a replacement same-project owner
+    approved while it waited refuses the enable (unserialized, the reconciler would not
+    see it and promote a second falcone owner)."""
+    url = _postgresql_url()
+    script = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts/reconcile-backlog-github-policy.py")
+    )
+    engine = create_engine(url, pool_pre_ping=True)
+    campaign_id = uuid4()
+    replacement_id = uuid4()
+    with Session(engine) as session, session.begin():
+        session.add(_pg_campaign(campaign_id, "falcone", "APPROVED_POLICY_PENDING"))
+    request = {
+        "action": "enable-existing-backlog",
+        "backlog_campaign_id": str(campaign_id),
+        "project": "falcone",
+        "approval_binding": "e" * 64,
+        "requested_by": "cli:engineering-ctl",
+    }
+    outcome: list[str] = []
+
+    def reconcile() -> None:
+        with Session(engine) as session, session.begin():
+            try:
+                script["validate_campaign"](session, request, parallel_project_limit=2)
+            except ValueError as error:
+                outcome.append(str(error))
+
+    def replace(session: Session) -> None:
+        session.add(_pg_campaign(replacement_id, "falcone", "APPROVED"))
+
+    committed, finished = _held_ownership_lock(url, replace, reconcile)
+
+    assert finished >= committed
+    assert outcome == ["another backlog campaign already owns GitHub write policy"]
+    with Session(engine) as session, session.begin():
+        for row_id in (campaign_id, replacement_id):
+            row = session.get(GitHubBacklogCampaign, row_id)
+            assert row is not None
+            row.status = "EXPIRED"
+    engine.dispose()
+
+
+@pytest.mark.postgresql
+def test_postgresql_global_registration_waits_for_an_outside_owner_approval() -> None:
+    """NEW-163 review 1: global registration holds the ownership lock from its exclusivity
+    check through its commit; an outside owner committed while it waited refuses it
+    (unserialized, registration would not see the uncommitted owner and register)."""
+    from test_global_backlog_convergence import _campaign as global_campaign
+
+    url = _postgresql_url()
+    engine = create_engine(url, pool_pre_ping=True)
+    ids = {project: uuid4() for project in ("falcone", "musematic", "llmwiki")}
+    with Session(engine) as session, session.begin():
+        for project, campaign_id in ids.items():
+            row = global_campaign(campaign_id, project, status="APPROVED")
+            row.workflow_id = f"inert-new163-{campaign_id}"
+            session.add(row)
+    outside_id = uuid4()
+    global_id = uuid4()
+    outcome: list[str] = []
+    handler = EngineeringActivityHandler(Settings(database_url=url))
+
+    def register() -> None:
+        try:
+            handler._register_global_backlog(
+                {
+                    "campaign_id": str(global_id),
+                    "backlog_campaign_ids": {key: str(value) for key, value in ids.items()},
+                    "policy_campaign_id": str(ids["falcone"]),
+                    "orchestration": {"workflow_id": f"inert-new163-global-{global_id}"},
+                }
+            )
+        except ValueError as error:
+            outcome.append(str(error))
+        else:
+            outcome.append("REGISTERED")
+
+    def approve_outside(session: Session) -> None:
+        owner = global_campaign(outside_id, "musematic", status="APPROVED")
+        owner.workflow_id = f"inert-new163-{outside_id}"
+        owner.status = "APPROVED"
+        owner.approval_json = {**owner.approval_json, "policy_role": "owner"}
+        session.add(owner)
+
+    committed, finished = _held_ownership_lock(url, approve_outside, register)
+
+    assert finished >= committed
+    assert outcome == ["global backlog requires one active exact GitHub write policy"]
+    with Session(engine) as session, session.begin():
+        for campaign_id in (outside_id, *ids.values()):
+            row = session.get(GitHubBacklogCampaign, campaign_id)
+            assert row is not None
+            row.status = "EXPIRED"
+    handler.sessions.kw["bind"].dispose()
+    engine.dispose()
