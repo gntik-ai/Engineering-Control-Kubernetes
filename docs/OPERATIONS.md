@@ -257,6 +257,16 @@ converted, whatever transient errors came before. No provider-owned signal means
 Policy, schema, auth, missing CLI, `PROVIDER_TIMEOUT` and any other activity error still need an
 operator decision.
 
+NEW-168: the provider worker's own pre-invocation stop `BLOCKED`/`AUTH_STATUS_TIMED_OUT_CODEX`
+(or `_CLAUDE`), written when its bounded `<cli> login status` probe exceeded its deadline (a
+CPU-starved worker), is converted too (`provider_error_kind` `AUTH_STATUS_TIMED_OUT`), bound to
+the request's provider and invocation. `MANUAL_AUTH_REQUIRED_*`, `PROVIDER_CLI_MISSING_*` and the
+other `AUTH_STATUS_*` probe failures are not. Such a pre-invocation `BLOCKED` result no longer
+carries the previous provider step's `agent_result`, so `agent.persist_result` records the
+invocation as `BLOCKED` instead of failing the child with a `PolicyViolation` (falcone #975). The
+loop workflow is unchanged: the child ends `BLOCKED` and an issue-start loop pauses with
+`BLOCKED`; `backlog-retry` then binds.
+
 ## Voided issue approval of an issue-start loop (NEW-143)
 
 > **Warning:** do not use `backlog-pause` on a loop started with `issue-start` (for example
@@ -390,6 +400,58 @@ project's repositories; its shape is unchanged) is now owned per project:
   project's repository pair; otherwise the step is denied with
   `BLOCKED_BY_POLICY`/`REPOSITORY_OUTSIDE_PROJECT` before any command. Finding and enhancement
   publication keep the shared allowlist only (a contract gap may target another project).
+
+## Reset a stuck, never-published ChangeSet (NEW-168)
+
+A delivery attempt that stopped without recording a correction state (a crashed or failed
+child, an older code path) leaves its ChangeSet `PLANNED`/`IMPLEMENTING`, and every
+`backlog-retry` is refused ("another delivery child requires an explicit correction state").
+Instead of a hand-written SQL update, for an **issue-start** loop paused on that issue:
+
+```bash
+engineering-ctl change-reset <loop_workflow_id> <project> <repository> <issue_number> \
+  <change_set_id> RESET_CHANGESET_<first 8 hex of the ChangeSet ID, upper case>
+
+# falcone #975
+engineering-ctl change-reset <loop_workflow_id> falcone falcone 975 \
+  7221c489-b899-511e-a0fc-c179d759a2e4 RESET_CHANGESET_7221C489
+engineering-ctl backlog-retry <loop_workflow_id> falcone 975
+```
+
+The ChangeSet moves to `REQUEST_CHANGES` (version + 1) with
+`recovery_json.correction_requested = {blocker: OPERATOR_RESET, actor, at}` (the stopped runs
+stay listed), exactly the state NEW-137 records after a provider outage. The next
+`backlog-retry` binds one more child of the **bounded** correction lineage; the reset grants no
+attempt (`change-extend-correction` stays the only, separate, allowance). The ChangeSet keeps its
+base, branch and worktree (the next attempt resumes the previous commits, NEW-52).
+
+`change-reset` never moves a ChangeSet to a newer base. A ChangeSet pinned to an old base (e.g.
+gntik-ui #25, ChangeSet 9ec2e871 on de2cdde) needs a **fresh `backlog-import` + `issue-start`**:
+a CONFIRMED finding is never revalidated again, and the new import creates a new finding and
+ChangeSet revalidated at the current heads.
+
+The API route is `POST /v1/change-sets/reset` (operator channel only). The loop's pause is
+proven like `issue-reapprove`'s. The API then asks Temporal about every delivery run of the
+ChangeSet and of the loop (every Run bound to the ChangeSet or named `<loop>-issue-...`): each
+must be closed, whatever its projected Run status (a child reset and restarted in Temporal can
+run under a FAILED row); any observation error refuses. Everything else is re-read in one
+transaction under the Finding and ChangeSet row locks (the order delivery children bind in),
+including the set of delivery runs (one registered after the Temporal check refuses), and the
+reset is audited as a `change_set_reset` dashboard event (also kept as
+`recovery_json.operator_reset`). Refusals (`CHANGE_RESET_*`):
+
+- `CONFIRMATION_MISMATCH`, `OPERATOR_REQUIRED`;
+- `LOOP_INVALID` (not an issue-start loop of that project), `LOOP_NOT_PAUSED` (not `PAUSED` on
+  that issue by its open run);
+- `CHANGESET_NOT_FOUND`, `APPROVAL_INVALID`, `TARGET_MISMATCH` (not that loop's issue
+  operation, campaign issue and finding);
+- `PUBLISHED`: a PR URL, release artifacts, publication/CI/merge/release records, a publication
+  intent/effect or a deployment exists: a published ChangeSet is never reset;
+- `STATE` (terminal/delivered or otherwise not resettable), `ALREADY_RETRYABLE` (already
+  `REQUEST_CHANGES`, or never started), `LINEAGE_EXHAUSTED` (no correction attempt left);
+- `DELIVERY_ACTIVE`: a delivery run not proven closed in Temporal (or more than 256 to check),
+  or an unreleased, unexpired worktree lease of the ChangeSet or component lease of one of its
+  delivery runs (wait for the release or the lease's expiry).
 
 ## Reconcile an uncertain publication effect (NEW-145)
 

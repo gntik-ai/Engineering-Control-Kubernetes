@@ -239,6 +239,62 @@ keep working while one identity waits for a human).
   field (`EXPIRED` means regenerate the candidate and re-approve) before assuming a stale error
   is something else.
 
+### Undeletable maker files in a ChangeSet worktree (NEW-168, design note)
+
+**Symptom.** The scan worker's `git clean -ffdX` (delivery toolchain cleanup,
+`activities/scan.py` `_clean_ignored_toolchain_artifacts`), a worktree reset or the nightly
+cleanup fails with `Permission denied` on directories the maker created: `openspec/changes/...`
+(2026-10-01), `node_modules/.vitest` (2026-10-09).
+
+**Cause.** A ChangeSet worktree is owned by `scan-runner`; allocation
+(`GitWorktreeManager._grant_access`) grants the maker `rwX` and `scan-runner` `rwX` through access
+and default ACLs. Inheritance covers only entries created inside with a permissive mode: a tool
+that creates a directory with an explicit mode (`mkdir 0755`, archive extraction, `chmod`)
+narrows the inherited ACL mask to `r-x`, and a directory renamed in from outside (a temp or cache
+directory) carries no inherited ACL at all (worker `UMask=0027`, other `---`). `scan-runner` can
+then no longer remove entries inside it, and only the owner or root can widen that ACL.
+
+**Why there is no in-repo fix.** A umask cannot help (an inherited ACL ignores it; the mask comes
+from the creating call's mode). Adding `scan-runner` to the runner groups does not help either
+(its named-user ACL entry wins and is masked) and would expose the runners' group-readable homes.
+A maker-side repair (the maker re-granting `scan-runner` on paths it owns after each run) was
+rejected in the NEW-105 review: it walks a maker-controlled tree where symlink/rename races can
+redirect the grant to the maker's own credentials. The correct fix needs root at runtime, and no
+privileged helper is built without an operator decision.
+
+**Operator recovery** (worker host, as root). First make sure nothing writes in that worktree any
+more: the ChangeSet's loop is `PAUSED` and none of its delivery children runs (`backlog-status`;
+`change-reset` checks the same in Temporal), and no `codex-runner`/`claude-runner` process is left
+working there (`sudo pgrep -a -u codex-runner,claude-runner`). With the writers quiescent, nothing
+can swap a path component during the walk; `find` does not follow symlinks and `chown -h` does not
+dereference them. The whole remote command is quoted so the escaped parentheses reach `find`:
+
+```bash
+WT=/srv/engineering/worktrees/<repository-slug>/<change_set_id>
+ssh -t 10.10.0.3 "sudo find '$WT' -xdev \( -user codex-runner -o -user claude-runner \) -exec chown -h scan-runner:scan-runner {} +"
+```
+
+Then retry the stopped step (`backlog-retry`, or let the next cleanup run). The next allocation of
+that ChangeSet archives and cleans the worktree as `scan-runner`.
+
+**Proposed fix: open design work, not implemented.** Any automatic root reclaim must not repeat
+the race that sank the maker-side repair: a path-based walk (`find`, `chown -h`) protects only the
+last component, so a writer still active in the tree can swap an intermediate directory for a
+symlink between the check and the change. A design is acceptable only with both of:
+
+1. verified writer quiescence, checked first and fail-closed: the ChangeSet's delivery children
+   closed in Temporal, its worktree and component leases released, and no runner process inside
+   the worktree; and
+2. descriptor-relative traversal: open the worktree root component by component with
+   `O_DIRECTORY | O_NOFOLLOW`, then walk only through directory descriptors (e.g. a small Python
+   helper on `os.fwalk(dir_fd=..., follow_symlinks=False)`, `os.chown(name, uid, gid,
+   dir_fd=..., follow_symlinks=False)`), never re-resolving a path string, staying on one device
+   and skipping symlinks.
+
+It would run as a root-owned oneshot unit triggered by a scan-worker request naming one ChangeSet
+UUID (the `engineering-github-policy-reconciler.path` pattern). Until such a design is reviewed,
+recovery stays the manual command above.
+
 ### Incident, 2026-09-20: an SSH hardening fix locked the operator out
 
 An agent session disabled `PasswordAuthentication` on the controller (closing an audit finding)

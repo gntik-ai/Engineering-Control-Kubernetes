@@ -54,6 +54,7 @@ from engineering_control.engineering.backlog import (
 from engineering_control.engineering.backlog_authority import unexpired_policy_owners
 from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
+from engineering_control.operations.change_reset import delivery_children, reset_change_set
 from engineering_control.operations.connection_budget import (
     install_diagnostic_sql_budget,
     joined_diagnostic_thread,
@@ -705,6 +706,26 @@ class OperationsRepository:
                 actor=actor,
                 current_workflow_run_id=current_workflow_run_id,
             )
+
+    async def change_reset_children(self, loop_workflow_id: str, change_set_id: UUID) -> list[str]:
+        """NEW-168: the delivery runs the API proves closed in Temporal before a reset."""
+        return await asyncio.to_thread(self._change_reset_children, loop_workflow_id, change_set_id)
+
+    def _change_reset_children(self, loop_workflow_id: str, change_set_id: UUID) -> list[str]:
+        with self.sessions() as session:
+            return delivery_children(session, loop_workflow_id, change_set_id)
+
+    async def reset_change_set(self, *, actor: str, **arguments: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._reset_change_set, actor, arguments)
+
+    def _reset_change_set(self, actor: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """NEW-168: reset a never-published ChangeSet; every precondition re-read durably."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("ChangeSet reset requires an allowlisted operator channel")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            return reset_change_set(session, actor=actor, **arguments)
 
     async def plan_issue_reapproval(self, *, actor: str, **arguments: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._plan_issue_reapproval, actor, arguments)

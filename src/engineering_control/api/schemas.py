@@ -287,6 +287,17 @@ class IssueReapprovalRequest(APIModel):
     confirmation_phrase: str = Field(pattern=r"^REAPPROVE_ISSUE_[A-F0-9]{8}$")
 
 
+class ChangeSetResetRequest(APIModel):
+    """NEW-168: reset a never-published ChangeSet of a paused issue-start loop."""
+
+    loop_workflow_id: str = Field(pattern=r"^backlog-loop-[A-Za-z0-9._:-]{1,227}$")
+    project: ProjectName
+    repository: RepositorySlug
+    issue_number: int = Field(ge=1, le=2_147_483_647)
+    change_set_id: UUID
+    confirmation_phrase: str = Field(pattern=r"^RESET_CHANGESET_[A-F0-9]{8}$")
+
+
 class PublicationReconcileRequest(APIModel):
     """NEW-145: reconcile one uncertain publication effect against the live PR heads."""
 

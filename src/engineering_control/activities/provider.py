@@ -469,9 +469,15 @@ class ProviderActivityHandler:
     ) -> dict[str, Any]:
         # NEW-146: every step's detail is bounded and redacted here, on the one path.
         detail = bounded_detail(detail, self.redactor) if detail else None
+        # NEW-168: a block before (or instead of) the provider call has no result of its
+        # own. The payload may still carry the PREVIOUS provider step's agent_result (e.g.
+        # the spec's into the maker), which agent.persist_result read as this invocation's
+        # result and refused ("provider result identity does not match its immutable
+        # request"): a PolicyViolation, a FAILED child and a PLANNED ChangeSet (falcone #975).
+        stale = ("agent_result", "observability", "handoff_hashes")
         safe = self.redactor.redact(
             {
-                **payload,
+                **{key: value for key, value in payload.items() if key not in stale},
                 "provider": self.provider.value,
                 "status": "BLOCKED",
                 "blocker": blocker,
