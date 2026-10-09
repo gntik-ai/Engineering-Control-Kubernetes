@@ -167,7 +167,7 @@ The worker is the **hands**: it runs model CLIs, scanners, browsers, and release
 
 The worker-step allowlist that each identity enforces is `ControlActivities._worker_steps` in `activities/core.py` (Lecture 3). The registry that binds kind → user → unit → queue is `workflows/worker_registry.py`, and `scripts/verify-worker-registry.py` fails the bootstrap if any unit file disagrees with it.
 
-A systemd template (`engineering-worker@.service`) produces the five role workers; each instance differs only by `%i` and its env drop-ins. The sandbox is strict: `ProtectHome=true`, `ProtectSystem=strict`, explicit `ReadWritePaths` limited to `/var/lib/engineering-control/{workers,identities}/%i*`, `/srv/engineering/{mirrors,worktrees,runs/%i,evidence/%i,cache/%i,tmp/%i}`. Codex and Claude instances get a `MemoryMax=5G` drop-in because makers run full project test suites. The release worker has `ReadOnlyPaths=/srv/engineering/worktrees` and no identities directory at all.
+A systemd template (`engineering-worker@.service`) produces the five role workers; each instance differs only by `%i` and its env drop-ins. The sandbox is strict: `ProtectHome=true`, `ProtectSystem=strict`, explicit `ReadWritePaths` limited to `/var/lib/engineering-control/{workers,identities}/%i*`, `/srv/engineering/{mirrors,worktrees,runs/%i,evidence/%i,cache/%i,tmp/%i}`. Codex and Claude instances get a `MemoryMax=7G` drop-in (5G until NEW-167) because makers run full project test suites. The release worker has `ReadOnlyPaths=/srv/engineering/worktrees` and no identities directory at all.
 
 ## 2.5 Ports and binds, and why wildcards are refused
 
