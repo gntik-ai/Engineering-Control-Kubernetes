@@ -639,3 +639,13 @@ def test_worker_memory_budget_fits_the_worker_host() -> None:
     assert "50-memory.conf" in bootstrap
     verify = (REPOSITORY_ROOT / "scripts" / "verify-worker.sh").read_text(encoding="utf-8")
     assert "engineering-workers.slice engineering-workers-agents.slice" in verify
+
+
+def test_worker_bootstrap_pre_creates_the_vitest_token_for_agent_identities() -> None:
+    # NEW-172: without a readable $HOME/.local/share/vitest token, vitest 5 writes a 0700
+    # node_modules/.vitest into the worktree that the scan worker's git clean cannot remove.
+    script = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert "for runner in codex-runner claude-runner; do" in script
+    assert "$HOME/.local/share/vitest" in script
+    assert '[ -s "$dir/.vitest-secret-token" ] ||' in script  # never overwritten
+    assert "umask 077" in script
