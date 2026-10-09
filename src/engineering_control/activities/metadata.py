@@ -123,6 +123,7 @@ from engineering_control.projects import (
     PROJECT_REPOSITORY_SLUGS,
     REPOSITORIES,
     REPOSITORY_SLUGS,
+    SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
     default_branch,
 )
 from engineering_control.quota.broker import QuotaBroker
@@ -4230,11 +4231,19 @@ class MetadataActivityHandler:
                 changed_paths_sha = hashlib.sha256(
                     "\n".join(path.lower() for path in changed_paths).encode()
                 ).hexdigest()
+                # NEW-173: the same rule as the scan worker's classifier (scan.py
+                # _classify_release_impact): only a separate deployment repository's change
+                # floors at R2. A self-contained repository (gntik-ui, llmwiki) is its own
+                # deployment side, so its classifier said R1 and every publication was
+                # refused as "deployment release impact is not diff-bound" (gntik-ui #26).
+                separate_deployment = expected_repository in frozenset(
+                    SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS
+                )
                 expected_floor = (
                     "R3"
                     if impact["categories"]
                     else "R2"
-                    if repository_role == "deployment" and changed_paths
+                    if repository_role == "deployment" and separate_deployment and changed_paths
                     else "R1"
                 )
                 if (
