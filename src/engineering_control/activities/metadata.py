@@ -3635,8 +3635,8 @@ class MetadataActivityHandler:
             "command this sandbox cannot run or complete (permission errors such as EPERM, "
             "missing dependencies, no network, no database, subprocess or socket limits, a "
             "stall or timeout caused by the environment) is SKIPPED with that exact reason in "
-            "the summary: the pull request's CI runs it before any merge. Never mark a real "
-            "assertion failure as SKIPPED.\n"
+            "the summary: the pull request's CI checks and merge gate decide on it. Never "
+            "mark a real assertion failure as SKIPPED.\n"
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.
