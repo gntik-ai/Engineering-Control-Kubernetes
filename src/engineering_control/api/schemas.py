@@ -296,7 +296,6 @@ class ChangeSetResetRequest(APIModel):
     issue_number: int = Field(ge=1, le=2_147_483_647)
     change_set_id: UUID
     confirmation_phrase: str = Field(pattern=r"^RESET_CHANGESET_[A-F0-9]{8}$")
-    mode: Literal["retry", "rebase"] = "retry"
 
 
 class PublicationReconcileRequest(APIModel):

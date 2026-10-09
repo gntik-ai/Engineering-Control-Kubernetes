@@ -4,36 +4,33 @@ A delivery attempt can stop with its ChangeSet in a state no bounded retry child
 start from (PLANNED/IMPLEMENTING), so every ``backlog-retry`` was refused with "another
 delivery child requires an explicit correction state" and the operator hand-wrote a
 guarded SQL UPDATE (ops-history db-fix-2026100*-cs*.log). ``change-reset`` replaces that
-UPDATE for an issue-start loop that is PAUSED on the ChangeSet's issue:
+UPDATE for an issue-start loop that is PAUSED on the ChangeSet's issue: it moves the
+ChangeSet to REQUEST_CHANGES (as NEW-137 does after a provider outage), so the loop's next
+backlog-retry binds a child counted in the bounded correction lineage (no bypass).
 
-- ``retry`` moves the ChangeSet to REQUEST_CHANGES (as NEW-137 does after a provider
-  outage), so the loop's next backlog-retry binds a child counted in the bounded
-  correction lineage (no bypass).
-- ``rebase`` resets it to its unstarted state (NEW-115 change_set_unstarted) on the
-  heads of its finding's current-source revalidation (NEW-117), with its worktree leases
-  released, so the next child allocates a fresh worktree there and the maker starts from
-  scratch. Only a move the revalidation proves is a fast-forward is made: anything else
-  is refused with CHANGE_RESET_REVALIDATION_REQUIRED (a newer base needs a new
-  revalidation, i.e. a fresh backlog import + issue-start).
+It never moves a ChangeSet's base: a ChangeSet pinned to an old base needs a fresh
+backlog import and issue-start (a new finding, revalidated at the current heads).
 
 Every precondition is re-read here from durable records under the Finding and ChangeSet
 row locks (the order delivery.load_confirmed_finding and publication custody use); the
-reset is audited as a DashboardEvent in the same transaction.
+caller additionally proves in Temporal that every delivery child is closed. The reset is
+audited as a DashboardEvent in the same transaction.
 """
 
 from __future__ import annotations
 
-import re
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import (
     BacklogIssueRecord,
     ChangeSet,
+    ComponentLease,
     DashboardEvent,
     Deployment,
     Finding,
@@ -62,21 +59,12 @@ from engineering_control.operations.publication_authority import (
 
 RESET_EVENT_TYPE = "change_set_reset"
 OPERATOR_RESET = "OPERATOR_RESET"
-RESET_MODES = ("retry", "rebase")
 RESET_RECORD_KEY = "operator_reset"
-# The states each mode may reset: only before any publication (REQUEST_CHANGES and an
-# unstarted CONFIRMED ChangeSet are already retryable, see below).
-_RESETTABLE_STATES = {
-    "retry": frozenset({ChangeSetState.PLANNED.value, ChangeSetState.IMPLEMENTING.value}),
-    "rebase": frozenset(
-        {
-            ChangeSetState.CONFIRMED.value,
-            ChangeSetState.PLANNED.value,
-            ChangeSetState.IMPLEMENTING.value,
-            ChangeSetState.REQUEST_CHANGES.value,
-        }
-    ),
-}
+# Only states before any publication (REQUEST_CHANGES and an unstarted CONFIRMED
+# ChangeSet are already retryable, see below).
+_RESETTABLE_STATES = frozenset({ChangeSetState.PLANNED.value, ChangeSetState.IMPLEMENTING.value})
+# The delivery children whose closure the caller must prove in Temporal (bounded).
+MAX_DELIVERY_CHILDREN = 256
 # recovery_json records written only from publication on (persist_publication, CI,
 # candidate/release, merge, staging, closure): any of them means work left the worktree.
 _PUBLISHED_RECOVERY_KEYS = frozenset(
@@ -99,7 +87,6 @@ _PUBLISHED_RECOVERY_KEYS = frozenset(
         "last_recovery_result",
     }
 )
-_SHA = re.compile(r"[a-f0-9]{40}")
 
 
 class ChangeResetBlocked(ValueError):
@@ -119,22 +106,58 @@ def _refuse(code: str, detail: str) -> ChangeResetBlocked:
     return ChangeResetBlocked(f"CHANGE_RESET_{code}", detail)
 
 
-def revalidated_delivery_heads(finding: Finding) -> tuple[str, str] | None:
-    """The heads the finding's current-source revalidation confirmed it at (NEW-117).
+def delivery_children(session: Session, loop_workflow_id: str, change_set_id: UUID) -> list[str]:
+    """The workflow IDs of every Run bound to this ChangeSet or started as one of the
+    loop's issue children; the caller proves each closed in Temporal (NEW-168 review).
 
-    The same record MetadataActivityHandler._delivery_base_heads starts a delivery from;
-    the scan worker verified there that they fast-forward from the import heads."""
-    heads = (finding.impact_json or {}).get("revalidated_heads")
-    if (
-        isinstance(heads, dict)
-        and heads.get("import_source_sha") == finding.affected_source_sha
-        and heads.get("import_deployment_sha") == finding.affected_deployment_sha
-        and isinstance(heads.get("source_sha"), str)
-        and isinstance(heads.get("deployment_sha"), str)
-        and _SHA.fullmatch(heads["source_sha"])
-        and _SHA.fullmatch(heads["deployment_sha"])
-    ):
-        return str(heads["source_sha"]), str(heads["deployment_sha"])
+    More than MAX_DELIVERY_CHILDREN cannot be verified and refuses (fail closed)."""
+    prefix = f"{loop_workflow_id}-issue-"
+    names = session.scalars(
+        select(Run.workflow_id)
+        .where(
+            or_(
+                Run.change_set_id == change_set_id,
+                Run.workflow_id.startswith(prefix, autoescape=True),
+            ),
+            Run.workflow_id != loop_workflow_id,
+        )
+        .distinct()
+        .limit(MAX_DELIVERY_CHILDREN + 1)
+    ).all()
+    if len(names) > MAX_DELIVERY_CHILDREN:
+        raise _refuse("DELIVERY_ACTIVE", "too many delivery runs to verify as closed")
+    return sorted(str(name) for name in names)
+
+
+def _active_leases(
+    session: Session, change_set_id: UUID, children: list[str], now: datetime
+) -> str | None:
+    """Why a lease of this ChangeSet or of its delivery runs is still held, or None."""
+    worktree = session.scalar(
+        select(WorktreeLease.id)
+        .where(
+            WorktreeLease.change_set_id == change_set_id,
+            WorktreeLease.released_at.is_(None),
+            WorktreeLease.expires_at > now,
+        )
+        .limit(1)
+    )
+    if worktree is not None:
+        return "a worktree lease of the ChangeSet is still held"
+    owners = select(Run.id).where(Run.workflow_id.in_(children)) if children else None
+    if owners is None:
+        return None
+    component = session.scalar(
+        select(ComponentLease.id)
+        .where(
+            ComponentLease.owner_run_id.in_(owners),
+            ComponentLease.released_at.is_(None),
+            ComponentLease.expires_at > now,
+        )
+        .limit(1)
+    )
+    if component is not None:
+        return "a component lease of a delivery run is still held"
     return None
 
 
@@ -175,22 +198,23 @@ def reset_change_set(
     issue_number: int,
     change_set_id: UUID,
     confirmation: str,
-    mode: str,
     actor: str | None,
     current_run_id: str | None,
     awaited_issue: str | None,
+    closed_children: Collection[str],
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Reset one never-published ChangeSet of a paused issue loop, or raise
     ChangeResetBlocked. Runs in the caller's transaction.
 
     ``current_run_id`` and ``awaited_issue`` are read from Temporal by the caller (the
-    loop's open run and its AWAITING_OPERATOR query), exactly as for issue-reapprove."""
+    loop's open run and its AWAITING_OPERATOR query), exactly as for issue-reapprove.
+    ``closed_children`` are the delivery_children the caller proved closed in Temporal
+    (whatever their projected Run status: a terminal row does not prove a child was not
+    reset and restarted); any other child refuses."""
     current_time = now or datetime.now(UTC)
     if actor is None:
         raise _refuse("OPERATOR_REQUIRED", "an operator identity is required")
-    if mode not in RESET_MODES:
-        raise _refuse("MODE_INVALID", f"mode must be one of {', '.join(RESET_MODES)}")
     if confirmation != reset_phrase(change_set_id):
         raise _refuse("CONFIRMATION_MISMATCH", f"confirm with {reset_phrase(change_set_id)}")
     identity = issue_loop_identity(loop_workflow_id, project)
@@ -261,14 +285,14 @@ def reset_change_set(
     published = _published(session, change_set)
     if published is not None:
         raise _refuse("PUBLISHED", f"{published}; a published ChangeSet is never reset")
-    if change_set.state == ChangeSetState.REQUEST_CHANGES.value and mode == "retry":
+    if change_set.state == ChangeSetState.REQUEST_CHANGES.value:
         raise _refuse("ALREADY_RETRYABLE", "the ChangeSet is already in REQUEST_CHANGES")
     if change_set_unstarted(change_set):
         raise _refuse(
             "ALREADY_RETRYABLE",
             "the ChangeSet never started (a retry starts it on its revalidated heads)",
         )
-    if change_set.state not in _RESETTABLE_STATES[mode]:
+    if change_set.state not in _RESETTABLE_STATES:
         raise _refuse("STATE", f"a {change_set.state} ChangeSet cannot be reset")
     if budget["remaining"] < 1:
         raise _refuse(
@@ -276,21 +300,19 @@ def reset_change_set(
             f"the ChangeSet used {budget['attempts_used']} of {budget['attempt_bound']} "
             "correction attempts; a reset adds none",
         )
-    previous_bases = (change_set.source_base_sha, change_set.deployment_base_sha)
-    new_bases = previous_bases
-    if mode == "rebase":
-        heads = revalidated_delivery_heads(finding)
-        imported = (finding.affected_source_sha, finding.affected_deployment_sha)
-        # Proven newer only when the ChangeSet still sits on the import heads and the
-        # revalidation moved past them (verified as a fast-forward by the scan worker).
-        if heads is None or heads == previous_bases or previous_bases != imported:
-            raise _refuse(
-                "REVALIDATION_REQUIRED",
-                "the finding's latest revalidation gives no heads proven newer than the "
-                "ChangeSet's base; start the issue from a fresh revalidation (backlog-import "
-                "+ issue-start), or reset with --mode retry on the current base",
-            )
-        new_bases = heads
+    # NEW-168 review: a paused parent does not prove its children stopped (a child reset
+    # and restarted in Temporal keeps running). Re-read under the locks: every delivery
+    # run must have been proven closed by the caller, and no lease may still be held.
+    children = delivery_children(session, loop_workflow_id, change_set.id)
+    unproven = [name for name in children if name not in set(closed_children)]
+    if unproven:
+        raise _refuse(
+            "DELIVERY_ACTIVE",
+            f"delivery run {unproven[0]} is not proven closed in Temporal",
+        )
+    held = _active_leases(session, change_set.id, children, current_time)
+    if held is not None:
+        raise _refuse("DELIVERY_ACTIVE", f"{held}; wait for its release or expiry")
     from_state = change_set.state
     recovery = dict(change_set.recovery_json or {})
     previous_request = recovery.get("correction_requested")
@@ -298,43 +320,20 @@ def reset_change_set(
     run_ids = [str(item) for item in previous.get("run_ids") or [] if item]
     if previous.get("run_id"):
         run_ids.append(str(previous["run_id"]))
-    released: list[str] = []
-    if mode == "retry":
-        change_set.state = ChangeSetState.REQUEST_CHANGES.value
-        # Same record a stopped attempt writes (NEW-128/137); the stopped runs stay listed
-        # so a delayed release of one of them never writes again.
-        recovery["correction_requested"] = {
-            "run_ids": list(dict.fromkeys(run_ids))[-128:],
-            "status": ChangeSetState.REQUEST_CHANGES.value,
-            "blocker": OPERATOR_RESET,
-            "actor": actor,
-            "at": current_time.isoformat(),
-            "recorded_at": current_time.isoformat(),
-        }
-    else:
-        # change_set_unstarted: the next child binds, allocates a fresh worktree on the
-        # new base (the old branch head does not descend from it, so it is archived, not
-        # resumed) and runs the maker from scratch.
-        change_set.state = ChangeSetState.CONFIRMED.value
-        change_set.source_branch = None
-        change_set.deployment_branch = None
-        change_set.source_head_sha = None
-        change_set.deployment_head_sha = None
-        change_set.source_base_sha, change_set.deployment_base_sha = new_bases
-        # Findings about the old base's diff would misdirect a from-scratch maker.
-        recovery.pop("validation_findings", None)
-        for lease in session.scalars(
-            select(WorktreeLease).where(
-                WorktreeLease.change_set_id == change_set.id,
-                WorktreeLease.released_at.is_(None),
-            )
-        ).all():
-            lease.released_at = current_time
-            released.append(str(lease.id))
+    change_set.state = ChangeSetState.REQUEST_CHANGES.value
     change_set.version += 1
+    # Same record a stopped attempt writes (NEW-128/137); the stopped runs stay listed so
+    # a delayed release of one of them never writes again.
+    recovery["correction_requested"] = {
+        "run_ids": list(dict.fromkeys(run_ids))[-128:],
+        "status": ChangeSetState.REQUEST_CHANGES.value,
+        "blocker": OPERATOR_RESET,
+        "actor": actor,
+        "at": current_time.isoformat(),
+        "recorded_at": current_time.isoformat(),
+    }
     prior = recovery.get(RESET_RECORD_KEY)
     record: dict[str, Any] = {
-        "mode": mode,
         "actor": actor,
         "at": current_time.isoformat(),
         "from_state": from_state,
@@ -343,9 +342,7 @@ def reset_change_set(
         "loop_workflow_id": loop_workflow_id,
         "origin_approval_id": reference["approval_id"],
         "lineage_length": len(lineage),
-        "previous_bases": list(previous_bases),
-        "bases": list(new_bases),
-        "released_worktree_leases": released,
+        "closed_delivery_runs": len(children),
         "count": (prior.get("count", 0) if isinstance(prior, dict) else 0) + 1,
     }
     recovery[RESET_RECORD_KEY] = record
@@ -365,22 +362,19 @@ def reset_change_set(
         entity_type="change_set",
         entity_id=str(change_set.id),
         current_phase="CHANGESET_RESET",
-        message=f"ChangeSet reset by operator ({mode})",
+        message="ChangeSet reset to REQUEST_CHANGES by operator",
         metadata_json={"issue_repository": issue_repository, **record},
     )
     session.add(event)
     session.flush()
     return {
         "status": "CHANGESET_RESET",
-        "mode": mode,
         "change_set_id": str(change_set.id),
         "loop_workflow_id": loop_workflow_id,
         "target": target,
         "from_state": from_state,
         "state": change_set.state,
         "version": change_set.version,
-        "bases": list(new_bases),
-        "released_worktree_leases": released,
         "attempts_remaining": budget["remaining"],
         "reset_by": actor,
         "audit_event_id": event.id,

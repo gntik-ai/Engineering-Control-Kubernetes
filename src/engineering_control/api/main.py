@@ -825,8 +825,10 @@ def create_app(
         """NEW-168: reset a never-published ChangeSet of a paused issue-start loop.
 
         Same trust model as /v1/change-sets/extend-correction. The loop's pause is proven
-        by its current open run, as for /v1/issues/reapprove; every other precondition is
-        re-read from durable records. The operator then resumes with backlog-retry."""
+        by its current open run, as for /v1/issues/reapprove, and every delivery run of
+        the ChangeSet and loop must be closed in Temporal (any observation error refuses);
+        every other precondition is re-read from durable records. The operator then
+        resumes with backlog-retry."""
         actor = approval_actor(subject)
         current_run_id = await service.current_open_run_id(body.loop_workflow_id)
         awaited_issue = (
@@ -834,6 +836,22 @@ def create_app(
             if current_run_id
             else None
         )
+        try:
+            children = await repository.change_reset_children(
+                body.loop_workflow_id, body.change_set_id
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        closed: list[str] = []
+        for child in children:
+            try:
+                if await service.workflow_id_closed(child):
+                    closed.append(child)
+            except Exception:  # noqa: BLE001 - an unknown child state refuses (fail closed)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"CHANGE_RESET_DELIVERY_ACTIVE: cannot verify {child} is closed",
+                ) from None
         try:
             return await repository.reset_change_set(
                 actor=actor,
@@ -843,9 +861,9 @@ def create_app(
                 issue_number=body.issue_number,
                 change_set_id=body.change_set_id,
                 confirmation=body.confirmation_phrase,
-                mode=body.mode,
                 current_run_id=current_run_id,
                 awaited_issue=awaited_issue,
+                closed_children=closed,
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
