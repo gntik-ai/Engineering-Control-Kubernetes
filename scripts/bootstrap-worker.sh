@@ -469,6 +469,21 @@ systemctl restart engineering-worker@codex.service engineering-worker@claude.ser
   engineering-worker@delivery.service \
   engineering-release-worker.service
 
+# NEW-172: vitest 5 keeps an API token at $HOME/.local/share/vitest/.vitest-secret-token.
+# The agent sandbox cannot write HOME, so vitest fell back to <worktree>/node_modules/
+# .vitest (created 0700/0600), which the scan worker's `git clean` cannot remove
+# (gntik-ui #25/#26). An existing token file is only read, so pre-create it once per
+# agent identity; an existing one is kept.
+for runner in codex-runner claude-runner; do
+  sudo -u "${runner}" -H env -i HOME="${STATE_ROOT}/identities/${runner}" \
+    PATH=/usr/local/bin:/usr/bin:/bin sh -c '
+      umask 077
+      dir="$HOME/.local/share/vitest"
+      mkdir -p "$dir"
+      [ -e "$dir/.vitest-secret-token" ] || cat /proc/sys/kernel/random/uuid >"$dir/.vitest-secret-token"
+    '
+done
+
 if sudo -u codex-runner -H env -i \
   HOME="${STATE_ROOT}/identities/codex-runner" PATH=/usr/local/bin:/usr/bin:/bin \
   /usr/local/bin/codex login status >/dev/null 2>&1; then
