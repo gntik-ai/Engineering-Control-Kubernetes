@@ -9,6 +9,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from temporalio.api.failure.v1 import Failure
+from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError, TimeoutError, TimeoutType
 from test_claude_adapter import _execute_with_events
 from test_issue_delivery_approval import _child, _dispose
@@ -379,9 +381,45 @@ def test_provider_failure_type_is_bounded() -> None:
     assert _provider_failure_type(closing) == "TIMEOUT_START_TO_CLOSE"
     assert _provider_failure_type(ApplicationError("x", type="NotConfigured")) == "NOT_CONFIGURED"
     assert _provider_failure_type(RuntimeError("x")) == "RUNTIME_ERROR"
-    # NEW-166: the type temporalio gives an activity whose worker shut down mid-run.
-    shutdown = ApplicationError("Worker is shutting down", type="WorkerShutdown")
-    assert _provider_failure_type(shutdown) == "WORKER_SHUTDOWN"
+    # NEW-166: only sdk-core's own worker_shutdown_failure is a WORKER_SHUTDOWN.
+    assert _provider_failure_type(_decoded(_sdk_shutdown_failure())) == "WORKER_SHUTDOWN"
+    # Application code reusing the type (raised: it carries its traceback) never is.
+    try:
+        raise ApplicationError(_SDK_SHUTDOWN_MESSAGE, type="WorkerShutdown")
+    except ApplicationError as raised:
+        reused = _decoded(_encoded(raised))
+    assert _provider_failure_type(reused) == "APPLICATION_WORKER_SHUTDOWN"
+    unencoded = ApplicationError(_SDK_SHUTDOWN_MESSAGE, type="WorkerShutdown")
+    assert _provider_failure_type(unencoded) == "APPLICATION_WORKER_SHUTDOWN"
+    final = _sdk_shutdown_failure()
+    final.application_failure_info.non_retryable = True
+    assert _provider_failure_type(_decoded(final)) == "APPLICATION_WORKER_SHUTDOWN"
+    worded = _sdk_shutdown_failure()
+    worded.message = "Worker is shutting down"
+    assert _provider_failure_type(_decoded(worded)) == "APPLICATION_WORKER_SHUTDOWN"
+
+
+_SDK_SHUTDOWN_MESSAGE = "Worker is shutting down and this activity did not complete in time"
+
+
+def _sdk_shutdown_failure() -> Failure:
+    """sdk-core's worker_shutdown_failure (crates/sdk-core/src/worker/activities.rs)."""
+    failure = Failure(message=_SDK_SHUTDOWN_MESSAGE)
+    failure.application_failure_info.type = "WorkerShutdown"
+    failure.application_failure_info.non_retryable = False
+    return failure
+
+
+def _decoded(failure: Failure) -> BaseException:
+    converter = DataConverter.default
+    return converter.failure_converter.from_failure(failure, converter.payload_converter)
+
+
+def _encoded(error: BaseException) -> Failure:
+    converter = DataConverter.default
+    failure = Failure()
+    converter.failure_converter.to_failure(error, converter.payload_converter, failure)
+    return failure
     assert _provider_failure_type(None) == "UNKNOWN"
 
 

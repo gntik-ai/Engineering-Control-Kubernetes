@@ -3374,11 +3374,31 @@ def _agent_failure_payload(started: dict[str, Any], cause: BaseException | None)
     return failed
 
 
+# NEW-166: sdk-core's worker_shutdown_failure (activities.rs): this exact message, no stack
+# trace, retryable. A Python exception always carries its traceback as the stack trace.
+_SDK_WORKER_SHUTDOWN_MESSAGE = "Worker is shutting down and this activity did not complete in time"
+
+
+def _sdk_worker_shutdown(cause: ApplicationError) -> bool:
+    failure = cause.failure
+    return (
+        failure is not None
+        and not cause.non_retryable
+        and failure.message == _SDK_WORKER_SHUTDOWN_MESSAGE
+        and failure.stack_trace == ""
+        and failure.source == ""
+        and not failure.HasField("cause")
+    )
+
+
 def _provider_failure_type(cause: BaseException | None) -> str:
     """NEW-137: bounded type of a provider activity failure (TIMEOUT_HEARTBEAT, ...)."""
     if isinstance(cause, ActivityTimeoutError) and cause.type is not None:
         return f"TIMEOUT_{cause.type.name}"
     if isinstance(cause, ApplicationError) and cause.type:
+        if cause.type == "WorkerShutdown" and not _sdk_worker_shutdown(cause):
+            # NEW-166 review: application code reusing the SDK's type is not a shutdown.
+            return "APPLICATION_WORKER_SHUTDOWN"
         return _failure_code(cause.type)
     return _failure_code(type(cause).__name__) if cause is not None else "UNKNOWN"
 
