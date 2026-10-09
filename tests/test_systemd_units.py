@@ -647,5 +647,6 @@ def test_worker_bootstrap_pre_creates_the_vitest_token_for_agent_identities() ->
     script = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
     assert "for runner in codex-runner claude-runner; do" in script
     assert "$HOME/.local/share/vitest" in script
-    assert '[ -s "$dir/.vitest-secret-token" ] ||' in script  # never overwritten
+    # An existing token, even an empty one, is kept.
+    assert '[ -e "$dir/.vitest-secret-token" ] ||' in script
     assert "umask 077" in script

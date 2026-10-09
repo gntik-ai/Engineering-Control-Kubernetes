@@ -480,7 +480,7 @@ for runner in codex-runner claude-runner; do
       umask 077
       dir="$HOME/.local/share/vitest"
       mkdir -p "$dir"
-      [ -s "$dir/.vitest-secret-token" ] || cat /proc/sys/kernel/random/uuid >"$dir/.vitest-secret-token"
+      [ -e "$dir/.vitest-secret-token" ] || cat /proc/sys/kernel/random/uuid >"$dir/.vitest-secret-token"
     '
 done
 
