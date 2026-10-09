@@ -1,0 +1,9 @@
+# NEW-167: the shared memory budget of the two agent workers (engineering-worker@codex,
+# engineering-worker@claude), nested in engineering-workers.slice (the name's prefix).
+# Each may use up to 7G alone; together never more than 9G, leaving the rest of the
+# workers' 13G for browser, scan, delivery and release.
+[Unit]
+Description=Engineering Control agent workers (shared memory budget)
+
+[Slice]
+MemoryMax=9G

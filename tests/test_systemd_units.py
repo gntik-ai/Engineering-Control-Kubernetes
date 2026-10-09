@@ -610,3 +610,32 @@ def test_mirror_bootstrap_creates_a_missing_root_with_a_traverse_only_mask(
     assert len(root_acl) == 1
     assert root_acl[0].startswith("setfacl -n --modify ")
     assert root_acl[0].split()[-2].endswith(",m::--x")
+
+
+def _unit_setting(text: str, key: str) -> list[str]:
+    return [line.split("=", 1)[1] for line in text.splitlines() if line.startswith(f"{key}=")]
+
+
+def test_worker_memory_budget_fits_the_worker_host() -> None:
+    # NEW-167: every worker shares one aggregate slice (13G of the 15G worker host); the
+    # two agent workers share a nested 9G slice and may each use 7G alone.
+    systemd = REPOSITORY_ROOT / "systemd"
+    workers = (systemd / "engineering-workers.slice").read_text(encoding="utf-8")
+    agents = (systemd / "engineering-workers-agents.slice").read_text(encoding="utf-8")
+    assert _unit_setting(workers, "MemoryMax") == ["13G"]
+    assert _unit_setting(agents, "MemoryMax") == ["9G"]
+    for unit in ("engineering-worker@.service", "engineering-release-worker.service"):
+        text = (systemd / unit).read_text(encoding="utf-8")
+        assert _unit_setting(text, "Slice") == ["engineering-workers.slice"], unit
+    for agent in ("codex", "claude"):
+        dropin = (systemd / f"engineering-worker@{agent}.service.d" / "50-memory.conf").read_text(
+            encoding="utf-8"
+        )
+        assert _unit_setting(dropin, "Slice") == ["engineering-workers-agents.slice"]
+        assert _unit_setting(dropin, "MemoryMax") == ["7G"]
+        assert _unit_setting(dropin, "MemoryHigh") == ["6G"]
+    bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert "engineering-workers.slice engineering-workers-agents.slice" in bootstrap
+    assert "50-memory.conf" in bootstrap
+    verify = (REPOSITORY_ROOT / "scripts" / "verify-worker.sh").read_text(encoding="utf-8")
+    assert "engineering-workers.slice engineering-workers-agents.slice" in verify

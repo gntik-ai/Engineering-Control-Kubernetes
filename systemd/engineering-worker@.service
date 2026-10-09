@@ -28,6 +28,8 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadWritePaths=/var/lib/engineering-control/workers/%i /var/lib/engineering-control/identities/%i-runner /var/lib/engineering-control/leases /srv/engineering/mirrors /srv/engineering/worktrees /srv/engineering/runs/%i /srv/engineering/evidence/%i /srv/engineering/cache/%i /srv/engineering/cache/scan/worktree-git /srv/engineering/tmp/%i
+# NEW-167: inside the workers\' aggregate memory budget (agents override to their slice).
+Slice=engineering-workers.slice
 MemoryMax=3G
 CPUQuota=250%
 TasksMax=512

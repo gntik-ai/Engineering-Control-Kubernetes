@@ -1,0 +1,9 @@
+# NEW-167: the aggregate memory budget of every Engineering Control worker on the worker
+# host (engineering-worker@{browser,scan,delivery,codex,claude}, the release worker).
+# 13G of the 15G host, so the OS and the backup receiver always keep ~2G. Per-unit caps
+# (3G browser/scan/delivery, 1G release, 7G agents) stay limits inside it.
+[Unit]
+Description=Engineering Control workers (aggregate memory budget)
+
+[Slice]
+MemoryMax=13G
