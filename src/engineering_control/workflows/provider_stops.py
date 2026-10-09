@@ -48,7 +48,12 @@ _TRANSIENT_RESULTS = frozenset(
 # covers every other activity error (NotConfigured, TypeError, ...), so it qualifies only
 # for a provider worker that stopped answering (heartbeat / schedule-to-start timeout
 # after the activity retry policy), recorded by the workflow as provider_failure_type.
-_TRANSIENT_ACTIVITY_FAILURES = frozenset({"TIMEOUT_HEARTBEAT", "TIMEOUT_SCHEDULE_TO_START"})
+# NEW-166: WORKER_SHUTDOWN is the SDK's own failure of an activity its worker stopped
+# running (gntik-ui #25, 2026-10-09: the Codex maker's worker shut down mid-run and the
+# ChangeSet stayed PLANNED, refusing every retry). Raised by temporalio, never by an adapter.
+_TRANSIENT_ACTIVITY_FAILURES = frozenset(
+    {"TIMEOUT_HEARTBEAT", "TIMEOUT_SCHEDULE_TO_START", "WORKER_SHUTDOWN"}
+)
 _PROVIDERS = frozenset({"claude", "codex"})
 
 

@@ -178,6 +178,12 @@ async def test_a_checker_529_records_provider_unavailable_and_the_retry_binds(
             ),
             id="worker-heartbeat-timeout",
         ),
+        pytest.param(
+            lambda loaded: _activity_failure(
+                loaded, "PROVIDER_ACTIVITY_FAILED", failure_type="WORKER_SHUTDOWN"
+            ),
+            id="worker-shutdown",  # NEW-166: gntik-ui #25's maker
+        ),
     ],
 )
 async def test_rate_limits_and_unavailable_workers_behave_the_same(
@@ -373,6 +379,9 @@ def test_provider_failure_type_is_bounded() -> None:
     assert _provider_failure_type(closing) == "TIMEOUT_START_TO_CLOSE"
     assert _provider_failure_type(ApplicationError("x", type="NotConfigured")) == "NOT_CONFIGURED"
     assert _provider_failure_type(RuntimeError("x")) == "RUNTIME_ERROR"
+    # NEW-166: the type temporalio gives an activity whose worker shut down mid-run.
+    shutdown = ApplicationError("Worker is shutting down", type="WorkerShutdown")
+    assert _provider_failure_type(shutdown) == "WORKER_SHUTDOWN"
     assert _provider_failure_type(None) == "UNKNOWN"
 
 
