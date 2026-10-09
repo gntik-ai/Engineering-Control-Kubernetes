@@ -25,7 +25,11 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
-from engineering_control.engineering.backlog import canonical_operator_approval_actor
+from engineering_control.engineering.backlog import (
+    BACKLOG_POLICY_ACTIVATION_PENDING,
+    GITHUB_POLICY_REQUEST_SLOT_BUSY,
+    canonical_operator_approval_actor,
+)
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.issue_approval import campaign_loop_prefix
 from engineering_control.operations.issue_reapproval import (
@@ -307,7 +311,10 @@ class TypedCommandBus:
             "production": False,
         }
         if plan["status"] == "ALREADY_APPROVED":
-            approval: dict[str, Any] = {"status": plan["campaign"]}
+            approval: dict[str, Any] = {
+                "status": plan["campaign"],
+                "approval_binding": plan["approval_binding"],
+            }
             result["status"] = "ALREADY_APPROVED"
         else:
             validated = {key: plan[key] for key in ("status", "campaign", "approval_binding")}
@@ -347,14 +354,23 @@ class TypedCommandBus:
         # enabled (NEW-26). Start only once the reconciler has promoted the campaign.
         if approval.get("status") != "APPROVED_POLICY_PENDING":
             return
+        # NEW-163 review 3: the wait belongs to this exact approval. A replacement approval
+        # is never re-queued or accepted as this one's activation.
+        binding = approval.get("approval_binding")
+        if not isinstance(binding, str):
+            raise ValueError("GitHub write policy activation lost its approval binding")
         # NEW-143 review: the approval commits before its activation request is written; a
         # failed write or a stopped process must not leave it waiting forever, so a missing
         # request is (re-)enqueued (a no-op while one is pending).
-        await self.metadata.ensure_policy_activation(campaign_id)
+        queued = await self.metadata.ensure_policy_activation(campaign_id, expected_binding=binding)
+        if queued == "APPROVAL_SUPERSEDED":
+            raise ValueError("the campaign approval was replaced before its activation")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy_activation_timeout_seconds
         while True:
             campaign = await self.metadata.get_backlog_campaign(campaign_id)
+            if campaign is not None and campaign.get("approval_binding") != binding:
+                raise ValueError("the campaign approval was replaced before its activation")
             if campaign is not None and campaign.get("status") in {
                 "APPROVED",
                 "APPROVED_INVENTORY",
@@ -366,6 +382,75 @@ class TypedCommandBus:
                     "engineering-github-policy-reconciler before starting"
                 )
             await asyncio.sleep(self.policy_activation_poll_seconds)
+
+    async def _approve_when_activation_slot_free(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        """NEW-163: campaigns of different projects run in parallel, but the root
+        reconciler takes one activation request at a time. While ANOTHER campaign's
+        activation is pending, retry the same approval until the slot frees (bounded by
+        policy_activation_timeout_seconds); every other refusal propagates.
+
+        NEW-163 review: the root reconciler commits APPROVED before it unlinks
+        activate.json, so this approval can commit as the pending owner and then find the
+        request file still taken. It is not approved again: the activation request is
+        re-queued through ensure_policy_activation within the same deadline."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy_activation_timeout_seconds
+        while True:
+            try:
+                return await self.metadata.approve_backlog_campaign(
+                    campaign_id, project, binding, actor
+                )
+            except ValueError as error:
+                if str(error) == GITHUB_POLICY_REQUEST_SLOT_BUSY:
+                    return await self._requeue_committed_activation(
+                        campaign_id, binding, deadline, error
+                    )
+                if str(error) != BACKLOG_POLICY_ACTIVATION_PENDING or loop.time() >= deadline:
+                    raise
+            await asyncio.sleep(self.policy_activation_poll_seconds)
+
+    async def _requeue_committed_activation(
+        self, campaign_id: UUID, binding: str, deadline: float, error: ValueError
+    ) -> dict[str, Any]:
+        campaign = await self.metadata.get_backlog_campaign(campaign_id)
+        if (
+            campaign is None
+            or campaign.get("status") != "APPROVED_POLICY_PENDING"
+            or campaign.get("approval_binding") != binding
+        ):
+            raise error
+        loop = asyncio.get_running_loop()
+        # Every attempt re-checks, under the ownership lock, that this exact approval is
+        # still the pending one (review 2: a replacement approval is never reported as
+        # ours). ACTIVATION_PENDING: activate.json still holds another request.
+        while True:
+            outcome = await self.metadata.ensure_policy_activation(
+                campaign_id, expected_binding=binding
+            )
+            if outcome == "ACTIVATION_REQUEUED":
+                break
+            if outcome == "APPROVED":
+                # The reconciler activated it meanwhile; it must still be this approval.
+                current = await self.metadata.get_backlog_campaign(campaign_id)
+                if current is None or current.get("approval_binding") != binding:
+                    raise error
+                break
+            if outcome != "ACTIVATION_PENDING":
+                raise error  # superseded, released or otherwise no longer this approval
+            if loop.time() >= deadline:
+                raise ValueError(
+                    "GitHub write policy activation did not complete; check "
+                    "engineering-github-policy-reconciler before starting"
+                )
+            await asyncio.sleep(self.policy_activation_poll_seconds)
+        return {
+            "status": "APPROVED_POLICY_PENDING",
+            "backlog_campaign_id": str(campaign_id),
+            "approval_binding": binding,
+            "policy_activation": "QUEUED_ROOT_RECONCILER",
+        }
 
     async def _execute(
         self,
@@ -397,7 +482,7 @@ class TypedCommandBus:
                 ),
                 issue_request=request,
             )
-            approval = await self.metadata.approve_backlog_campaign(
+            approval = await self._approve_when_activation_slot_free(
                 command.backlog_campaign_id,
                 command.project.value,
                 str(candidate["approval_binding"]),

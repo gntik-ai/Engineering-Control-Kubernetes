@@ -26,6 +26,7 @@ from engineering_control.api.schemas import (
     RollbackRequest,
     RuntimeVerificationStart,
 )
+from engineering_control.config import DEFAULT_BACKLOG_PARALLEL_PROJECT_LIMIT
 from engineering_control.coverage_outcome import coverage_outcome, truthful_campaign_status
 from engineering_control.db.models import (
     AgentInvocation,
@@ -52,13 +53,18 @@ from engineering_control.db.models import (
 from engineering_control.db.run_binding import bind_run_execution as bind_run_row
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
+    BACKLOG_POLICY_ACTIVATION_PENDING,
     BACKLOG_RELEASE_OWNERSHIP_PHRASE,
+    GITHUB_POLICY_REQUEST_SLOT_BUSY,
     BacklogApprovalBinding,
     approval_binding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
-from engineering_control.engineering.backlog_authority import require_alternative_issue_authority
+from engineering_control.engineering.backlog_authority import (
+    global_backlog_active,
+    require_alternative_issue_authority,
+)
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
@@ -183,7 +189,9 @@ class MetadataRepository(Protocol):
         validate: Callable[[Session], None],
         audit: Callable[[Session, dict[str, Any]], int],
     ) -> dict[str, Any]: ...
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str: ...
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str: ...
     async def validate_issue_operation_approval(
         self, request: ExistingBacklogLoopStart
     ) -> None: ...
@@ -235,6 +243,7 @@ class SQLMetadataRepository:
         github_policy_request_root: Path = Path(
             "/var/lib/engineering-control/github-policy-requests"
         ),
+        backlog_parallel_project_limit: int = DEFAULT_BACKLOG_PARALLEL_PROJECT_LIMIT,
     ) -> None:
         self.engine = create_engine(
             database_url,
@@ -245,6 +254,9 @@ class SQLMetadataRepository:
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.github_policy_request_root = github_policy_request_root
+        if backlog_parallel_project_limit < 1:
+            raise ValueError("backlog parallel project limit must be at least 1")
+        self.backlog_parallel_project_limit = backlog_parallel_project_limit
 
     async def create_campaign(
         self,
@@ -1123,7 +1135,7 @@ class SQLMetadataRepository:
             if pending_expiry.tzinfo is None:
                 pending_expiry = pending_expiry.replace(tzinfo=UTC)
             if pending_expiry > now:
-                raise ValueError("another backlog campaign policy activation is pending")
+                raise ValueError(BACKLOG_POLICY_ACTIVATION_PENDING)
             pending_owner.status = "EXPIRED"
         active_campaigns = session.scalars(
             select(GitHubBacklogCampaign).where(
@@ -1133,8 +1145,8 @@ class SQLMetadataRepository:
                 ),
             )
         ).all()
-        active_owners: list[UUID] = []
-        expired_owner = False
+        active_owners: list[GitHubBacklogCampaign] = []
+        expired_projects: set[str] = set()
         for candidate in active_campaigns:
             if candidate.approval_json.get("policy_role") not in {None, "owner"}:
                 continue
@@ -1152,16 +1164,27 @@ class SQLMetadataRepository:
                 candidate_expiry = now
             if candidate_expiry <= now:
                 candidate.status = "EXPIRED"
-                expired_owner = True
+                expired_projects.add(candidate.project)
                 continue
-            active_owners.append(candidate.id)
-        if expired_owner or not active_owners:
-            for candidate in active_campaigns:
-                if candidate.approval_json.get("policy_role") == "inventory":
-                    candidate.status = "EXPIRED"
-        if len(active_owners) > 1:
-            raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
-        active_owner = active_owners[0] if active_owners else None
+            active_owners.append(candidate)
+        global_ownership = self.backlog_parallel_project_limit == 1 or global_backlog_active(
+            session
+        )
+        live_projects = {owner.project for owner in active_owners}
+        for candidate in active_campaigns:
+            # Inventory depends on its owner: under the single global owner every inventory
+            # does; NEW-163 review: per project only that project's (another project's live
+            # owner keeps its own inventory). Review 2: an inventory whose project has no
+            # live owner is orphaned, even when that owner expired in an earlier pass.
+            if candidate.approval_json.get("policy_role") == "inventory" and (
+                not active_owners
+                or (expired_projects and global_ownership)
+                or (not global_ownership and candidate.project not in live_projects)
+            ):
+                candidate.status = "EXPIRED"
+        active_owner = self._backlog_policy_owner(
+            campaign, active_owners, global_ownership=global_ownership
+        )
         raw_binding = campaign.approval_json.get("binding")
         if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
             raise ValueError("existing-backlog approval candidate changed")
@@ -1192,6 +1215,42 @@ class SQLMetadataRepository:
             ),
         }
         return result, request
+
+    def _backlog_policy_owner(
+        self,
+        campaign: GitHubBacklogCampaign,
+        active_owners: list[GitHubBacklogCampaign],
+        *,
+        global_ownership: bool,
+    ) -> UUID | None:
+        """NEW-163: the owner whose active policy the approved campaign joins as inventory,
+        or None when it becomes its project's owner (refused beyond the parallel cap).
+
+        At most one owner per project, at most backlog_parallel_project_limit projects.
+        A limit of 1, or an open autonomous global backlog, keeps the pre-NEW-163 rule:
+        one owner globally and every further approval is an inventory under it."""
+        limit = self.backlog_parallel_project_limit
+        if global_ownership:
+            if len(active_owners) > 1:
+                raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
+            return active_owners[0].id if active_owners else None
+        by_project: dict[str, list[UUID]] = {}
+        for owner in active_owners:
+            by_project.setdefault(owner.project, []).append(owner.id)
+        for project, owners in sorted(by_project.items()):
+            if len(owners) > 1:
+                raise ValueError(
+                    f"multiple {project} backlog campaigns claim GitHub write policy ownership"
+                )
+        same_project = by_project.pop(campaign.project, None)
+        if same_project:
+            return same_project[0]
+        if len(by_project) >= limit:
+            raise ValueError(
+                f"backlog parallel project limit {limit} reached: GitHub write policy is "
+                f"owned by {', '.join(sorted(by_project))}; release or finish one first"
+            )
+        return None
 
     async def reissue_issue_approval(
         self,
@@ -1264,8 +1323,12 @@ class SQLMetadataRepository:
                 )
         return result
 
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
-        return await asyncio.to_thread(self._ensure_policy_activation, campaign_id)
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
+        return await asyncio.to_thread(
+            self._ensure_policy_activation, campaign_id, expected_binding=expected_binding
+        )
 
     def _ensure_policy_activation(
         self, campaign_id: UUID, *, expected_binding: str | None = None
@@ -1382,9 +1445,7 @@ class SQLMetadataRepository:
             try:
                 os.link(temporary, target)
             except FileExistsError as error:
-                raise ValueError(
-                    "another GitHub policy request is pending; retry in a few seconds"
-                ) from error
+                raise ValueError(GITHUB_POLICY_REQUEST_SLOT_BUSY) from error
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -2185,7 +2246,9 @@ class EmptyMetadataRepository:
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
 
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
         raise ValueError("backlog metadata store is unavailable")
 
     async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:

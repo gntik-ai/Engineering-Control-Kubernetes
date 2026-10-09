@@ -174,10 +174,12 @@ def publication_payload(root: Path) -> tuple[dict[str, Any], str, dict[str, str]
         )
     return (
         {
+            # NEW-163: a delivery write is bound to its project's repository pair.
+            "project": "falcone",
             "publication_plan": {
                 "change_set_id": str(change_set_id),
                 "publications": publications,
-            }
+            },
         },
         branch,
         heads,

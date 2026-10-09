@@ -350,7 +350,46 @@ Operator decision (2026-10-08): a campaign holds at most one open issue loop.
   campaign. Workflow patch `existing-backlog-loop-step-skip-closes-v1`, evaluated only when the
   skip arrives, so a loop paused before the deploy also closes cleanly.
 
-Campaigns of different projects running in parallel is NEW-163.
+Campaigns of different projects running in parallel is NEW-163 (next section).
+
+### Campaigns of different projects in parallel (NEW-163)
+
+Operator decision (2026-10-09): campaigns of different projects may run at the same time. The
+shared GitHub write policy (`github-issue-write-validation.yaml`, one switch listing every
+project's repositories; its shape is unchanged) is now owned per project:
+
+- At most one campaign per project owns the policy (`policy_role=owner`). A further approval of
+  the same project becomes `APPROVED_INVENTORY`, as before; an approval of a project with no
+  owner becomes that project's owner (`APPROVED_POLICY_PENDING`, then `APPROVED` by the root
+  reconciler) even while another project's owner is running.
+- At most `ENGINEERING_BACKLOG_PARALLEL_PROJECT_LIMIT` projects (control.env, default 2,
+  minimum 1) hold an owner at once. An approval beyond it is refused with
+  `backlog parallel project limit N reached: GitHub write policy is owned by <projects>`; finish,
+  cancel or `backlog-release-ownership` one of them first. The root reconciler reads the same setting
+  from the same control.env and refuses an enable beside a same-project owner or beyond the
+  limit. Changing the limit needs an API restart (the reconciler reads it per request).
+- `ENGINEERING_BACKLOG_PARALLEL_PROJECT_LIMIT=1` is the previous rule: one owner globally, every
+  other approval (any project) an inventory under it. While an autonomous global backlog run is
+  open (`RUNNING`, `PAUSED`, `BLOCKED`, ...) the same single global owner rule applies whatever
+  the limit.
+- The global backlog stays exclusive: `global-backlog-start` (`GITHUB_WRITE_POLICY_NOT_ACTIVE`)
+  and its registration refuse while any campaign outside its own three inventories owns the
+  policy. Its inventories are approved one after the other; with a limit of 2 or more the second
+  project's approval would become an owner, so set the global backlog up with the limit at 1
+  (restart the API), then restore it after the global backlog ends.
+- Only one activation request is processed at a time (one `activate.json`): an approval while
+  another campaign's activation is pending is still refused, except that `issue-start` now waits
+  for that slot (up to the activation timeout, polling) and retries the same approval. If its
+  approval commits while the root reconciler has not yet removed the previous `activate.json`, it
+  is not approved again: the activation request is re-queued once the file is gone.
+- An owner that expires voids only its own project's inventory approvals.
+- Disabling and expiry are unchanged: a campaign's terminal disable keeps the policy while any
+  other verified owner (of any project) remains, and the policy turns off only when none does.
+- Write-time defence: issue delivery publication, final merges and issue comments/closure,
+  promotion (when its payload names a project) and staging GitOps writes must target their own
+  project's repository pair; otherwise the step is denied with
+  `BLOCKED_BY_POLICY`/`REPOSITORY_OUTSIDE_PROJECT` before any command. Finding and enhancement
+  publication keep the shared allowlist only (a contract gap may target another project).
 
 ## Reconcile an uncertain publication effect (NEW-145)
 

@@ -140,6 +140,7 @@ def create_app(
                 else SQLMetadataRepository(
                     resolved.database_url.get_secret_value(),
                     github_policy_request_root=(resolved.state_root / "github-policy-requests"),
+                    backlog_parallel_project_limit=resolved.backlog_parallel_project_limit,
                 )
             )
         app.state.metadata_repository = resolved_repository

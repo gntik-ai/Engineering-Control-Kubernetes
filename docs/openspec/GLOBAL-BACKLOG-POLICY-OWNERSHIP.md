@@ -27,6 +27,28 @@ global selector from continuing with an independent issue.
 - The root reconciler accepts `STOPPED` as a terminal deactivation state and continues to enforce the
   exact repository allowlist, actor, binding, owner role, and secret-free request schema.
 
+## Per-project owners (NEW-163)
+
+- Outside an open autonomous global backlog, ownership is decided per project: at most one owner
+  per project, a further approval of that project is an inventory, and an approval of a project
+  without an owner becomes its owner beside the owners of other projects.
+- At most `backlog_parallel_project_limit` projects (Settings, default 2, minimum 1) hold an owner
+  at once; an approval beyond it is refused, naming the limit and the owning projects. The root
+  reconciler applies the same limit (same control.env) and refuses an enable beside an
+  `APPROVED`/`RUNNING`/`PAUSED` campaign of the same project.
+- A limit of 1, or an open autonomous global backlog run (active, `PAUSED` or `BLOCKED`), applies
+  the single global owner contract above unchanged.
+- The global backlog is exclusive: its capability and registration also require that no campaign
+  outside its own inventories owns the policy.
+- An expired owner voids only its own project's inventory (every inventory under the single global
+  owner rule, and every inventory once no owner remains at all).
+- Every ownership change is serialized by the one ownership advisory lock: approval, release,
+  activation re-queue, global registration (held through its commit) and the root reconciler's
+  enable, disable and expiry, which re-read the campaign rows under it.
+- The single pending activation slot, the disable rule (the shared policy stays enabled while any
+  verified owner remains) and the policy file shape are unchanged. Delivery writes are also bound
+  to their project's repository pair (`REPOSITORY_OUTSIDE_PROJECT`).
+
 ## Acceptance
 
 - The first exact approval queues one root policy request.

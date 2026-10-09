@@ -47,7 +47,9 @@ from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
     _global_campaign_authorizes,
     _valid_r3_candidate,
+    lock_backlog_policy,
     require_alternative_issue_authority,
+    unexpired_policy_owners,
 )
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
@@ -1148,6 +1150,10 @@ class EngineeringActivityHandler:
         temporal_run_id = str((payload.get("orchestration") or {}).get("workflow_run_id") or "")
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
+            # NEW-163 review: the ownership lock is held from the exclusivity check below
+            # through the commit of the global Run, so no outside owner can be approved or
+            # activated in between (approval and the root reconciler take the same lock).
+            lock_backlog_policy(session)
             backlogs = {
                 project: session.get(db.GitHubBacklogCampaign, value)
                 for project, value in campaign_ids.items()
@@ -1188,6 +1194,8 @@ class EngineeringActivityHandler:
                 or owner_ids != {policy_campaign_id}
                 or policy_campaign.status not in {"APPROVED", "RUNNING"}
                 or policy_campaign.approval_json.get("policy_role") not in {None, "owner"}
+                # NEW-163: exclusive; no owner outside the global campaign's own inventories.
+                or unexpired_policy_owners(session, now=now, exclude=set(campaign_ids.values()))
             ):
                 raise ValueError("global backlog requires one active exact GitHub write policy")
             inventory: list[dict[str, Any]] = []
@@ -1567,6 +1575,10 @@ class EngineeringActivityHandler:
         now = datetime.now(UTC)
         deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
+            # NEW-163 review 2: it updates the owner and inventory rows together, so it takes
+            # the ownership lock first like every other ownership change (the reconciler's
+            # locked expiry scan would otherwise deadlock with it).
+            lock_backlog_policy(session)
             campaign = session.get(db.Campaign, campaign_id)
             if campaign is None:
                 raise ValueError("global backlog campaign disappeared")

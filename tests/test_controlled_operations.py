@@ -77,6 +77,8 @@ from engineering_control.workflows.inputs import (
 
 CAMPAIGN_ID = UUID("11111111-1111-4111-8111-111111111111")
 AUDIT_CAMPAIGN_ID = UUID("22222222-2222-4222-8222-222222222222")
+# NEW-163 review 3: the activation wait is bound to the approval it waits for.
+BINDING = "a" * 64
 SESSION_A = "a" * 64
 SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
@@ -2450,13 +2452,16 @@ async def test_solve_waits_for_the_policy_reconciler_before_starting(tmp_path: P
 
     async def campaign(_: object) -> dict[str, str]:
         order.append("poll")
-        return {"status": "APPROVED" if order.count("poll") >= 2 else "APPROVED_POLICY_PENDING"}
+        return {
+            "status": "APPROVED" if order.count("poll") >= 2 else "APPROVED_POLICY_PENDING",
+            "approval_binding": BINDING,
+        }
 
     control.start_existing_backlog_loop = AsyncMock(side_effect=start)
     metadata = Mock()
     metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
     metadata.approve_backlog_campaign = AsyncMock(
-        return_value={"status": "APPROVED_POLICY_PENDING"}
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": BINDING}
     )
     # NEW-143 review: a missing activation request is re-enqueued before waiting.
     metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
@@ -2486,11 +2491,13 @@ async def test_solve_blocks_instead_of_starting_without_an_active_write_policy(
     metadata = Mock()
     metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
     metadata.approve_backlog_campaign = AsyncMock(
-        return_value={"status": "APPROVED_POLICY_PENDING"}
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": BINDING}
     )
     # NEW-143 review: a missing activation request is re-enqueued before waiting.
     metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
-    metadata.get_backlog_campaign = AsyncMock(return_value={"status": "APPROVED_POLICY_PENDING"})
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": BINDING}
+    )
     bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
     bus.policy_activation_timeout_seconds = 0
     bus.policy_activation_poll_seconds = 0

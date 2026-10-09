@@ -17,6 +17,12 @@ from engineering_control.workflows.worker_registry import (
     WorkerKind,
 )
 
+# NEW-163: how many projects may each hold one backlog campaign's GitHub write policy
+# ownership at the same time. 1 is the pre-NEW-163 single global owner rule. The API
+# (approval) and the root reconciler (scripts/reconcile-backlog-github-policy.py, same
+# control.env) both read Settings.backlog_parallel_project_limit.
+DEFAULT_BACKLOG_PARALLEL_PROJECT_LIMIT = 2
+
 
 def _default_toolchain_node_roots() -> dict[Literal["22", "24"], Path]:
     return {"22": Path("/usr/local"), "24": Path("/opt/engineering-toolchain/node-24")}
@@ -152,6 +158,9 @@ class Settings(BaseSettings):
     llmwiki_staging_bootstrap_enabled: bool = False
     application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH
+    backlog_parallel_project_limit: int = Field(
+        default=DEFAULT_BACKLOG_PARALLEL_PROJECT_LIMIT, ge=1, le=16
+    )
     github_registry_auth_file: Path | None = None
     # NEW-61: ChangeSet worktrees live on the worker host while every GitHub write stays
     # on the controller. delivery.publish fetches the exact validated branch from the

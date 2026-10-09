@@ -212,7 +212,10 @@ class DeliveryActivityHandler:
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step in self.write_capable_steps:
-            denial = self.write_policy.evaluate(lambda: self._write_repositories(step, payload))
+            denial = self.write_policy.evaluate(
+                lambda: self._write_repositories(step, payload),
+                project=self._write_project(step, payload),
+            )
             if denial is not None:
                 return denial.model_dump(mode="json")
         if step == "finding.dedupe":
@@ -957,8 +960,13 @@ class DeliveryActivityHandler:
         custody; without one (promotion's distinct approval path) it runs directly.
         """
 
+        # NEW-163: the delivery.publish gate in handle() already denied a payload without
+        # its project; the re-check binds the effect to that same pair.
+        raw_project = None if publication_context is None else publication_context[1].get("project")
+        project = None if raw_project is None else str(raw_project)
+
         def guarded() -> _T:
-            denial = self.write_policy.evaluate(lambda: (plan.repository,))
+            denial = self.write_policy.evaluate(lambda: (plan.repository,), project=project)
             if denial is not None:
                 raise PublicationAuthorityError(f"publication write policy changed before {action}")
             return operation()
@@ -1571,6 +1579,27 @@ class DeliveryActivityHandler:
             f"## Rollout strategy\n\n{payload.get('rollout_strategy')}\n\n"
             f"## Kill switch\n\n{payload.get('kill_switch') or 'Not applicable'}\n"
         )
+
+    @staticmethod
+    def _write_project(step: str, payload: dict[str, Any]) -> str | None:
+        """NEW-163: the project whose repository pair binds a delivery write ("" denies).
+
+        Issue delivery and final closure always carry their project; a promotion payload
+        is checked when it does. Finding and enhancement publication may legitimately
+        target another project's repository (e.g. a falcone contract gap), so they are
+        bound only by the shared allowlist."""
+        if step == "delivery.publish":
+            return str(payload.get("project") or "")
+        if step in {"final.merge_source", "final.merge_deployment"}:
+            plan = payload.get("final_closure_plan")
+            return str(plan.get("project") or "") if isinstance(plan, dict) else ""
+        if step in {"final.comment_issue", "final.close_issue"}:
+            plan = payload.get("final_issue_plan")
+            closure = plan.get("closure") if isinstance(plan, dict) else None
+            return str(closure.get("project") or "") if isinstance(closure, dict) else ""
+        if step == "reconcile.publish_promotion" and "project" in payload:
+            return str(payload.get("project") or "")
+        return None
 
     @staticmethod
     def _write_repositories(step: str, payload: dict[str, Any]) -> tuple[str, ...]:
