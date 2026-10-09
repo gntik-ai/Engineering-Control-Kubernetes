@@ -33,6 +33,7 @@ from engineering_control.api.schemas import (
     ChangeRequestPublication,
     ChangeRequestRejection,
     ChangeRequestRevision,
+    ChangeSetResetRequest,
     CorrectionExtensionRequest,
     DeliveryReconcile,
     DeliveryStart,
@@ -810,6 +811,41 @@ def create_app(
                 body.confirmation_phrase,
                 actor,
                 current_run_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/change-sets/reset")
+    async def change_set_reset(
+        body: ChangeSetResetRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, Any]:
+        """NEW-168: reset a never-published ChangeSet of a paused issue-start loop.
+
+        Same trust model as /v1/change-sets/extend-correction. The loop's pause is proven
+        by its current open run, as for /v1/issues/reapprove; every other precondition is
+        re-read from durable records. The operator then resumes with backlog-retry."""
+        actor = approval_actor(subject)
+        current_run_id = await service.current_open_run_id(body.loop_workflow_id)
+        awaited_issue = (
+            await service.awaited_operator_issue(body.loop_workflow_id, current_run_id)
+            if current_run_id
+            else None
+        )
+        try:
+            return await repository.reset_change_set(
+                actor=actor,
+                loop_workflow_id=body.loop_workflow_id,
+                project=body.project,
+                repository=body.repository,
+                issue_number=body.issue_number,
+                change_set_id=body.change_set_id,
+                confirmation=body.confirmation_phrase,
+                mode=body.mode,
+                current_run_id=current_run_id,
+                awaited_issue=awaited_issue,
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

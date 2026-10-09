@@ -83,7 +83,15 @@ def _refuse(code: str, detail: str) -> IssueReapprovalBlocked:
     return IssueReapprovalBlocked(f"ISSUE_REAPPROVE_{code}", detail)
 
 
-def _loop_paused_on(
+def issue_loop_identity(loop_workflow_id: str, project: str) -> tuple[UUID, UUID] | None:
+    """(campaign_id, operation_id) of an issue-start loop of ``project``, else None."""
+    match = _ISSUE_LOOP.fullmatch(loop_workflow_id)
+    if match is None or match["project"] != project:
+        return None
+    return UUID(match["campaign"]), UUID(match["operation"])
+
+
+def loop_paused_on(
     session: Session,
     loop_workflow_id: str,
     target: str,
@@ -193,7 +201,7 @@ def plan_issue_reapproval(
     expected = request.model_dump(mode="json")
     if any(record.result_json.get("request") != expected for record in recorded):
         raise _refuse("LOOP_REQUEST_MISMATCH", "the loop ran a different request")
-    _loop_paused_on(session, loop_workflow_id, target, current_run_id, awaited_issue)
+    loop_paused_on(session, loop_workflow_id, target, current_run_id, awaited_issue)
     campaign = session.get(GitHubBacklogCampaign, campaign_id)
     raw = campaign.approval_json.get("binding") if campaign is not None else None
     if campaign is None or campaign.project != project or not isinstance(raw, dict):

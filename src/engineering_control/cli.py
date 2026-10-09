@@ -218,6 +218,16 @@ def parser() -> argparse.ArgumentParser:
     extend_correction.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     extend_correction.add_argument("change_set_id", type=UUID)
     extend_correction.add_argument("confirmation_phrase")
+    # NEW-168: reset a never-published ChangeSet of a paused issue-start loop so a
+    # backlog-retry can bind (retry), or restart it on its revalidated heads (rebase).
+    change_reset = commands.add_parser("change-reset")
+    change_reset.add_argument("loop_workflow_id")
+    change_reset.add_argument("project", choices=PROJECTS)
+    change_reset.add_argument("repository", choices=_CHANGE_REPOSITORIES)
+    change_reset.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
+    change_reset.add_argument("change_set_id", type=UUID)
+    change_reset.add_argument("confirmation_phrase")
+    change_reset.add_argument("--mode", choices=("retry", "rebase"), default="retry")
     # NEW-143: re-create a voided per-issue approval for an issue loop's existing operation.
     issue_reapprove = commands.add_parser("issue-reapprove")
     issue_reapprove.add_argument("loop_workflow_id")
@@ -628,6 +638,20 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "issue_number": arguments.issue_number,
                 "change_set_id": str(arguments.change_set_id),
                 "confirmation_phrase": arguments.confirmation_phrase,
+            },
+        )
+    if command == "change-reset":
+        return client.request(
+            "POST",
+            "/v1/change-sets/reset",
+            {
+                "loop_workflow_id": arguments.loop_workflow_id,
+                "project": arguments.project,
+                "repository": arguments.repository,
+                "issue_number": arguments.issue_number,
+                "change_set_id": str(arguments.change_set_id),
+                "confirmation_phrase": arguments.confirmation_phrase,
+                "mode": arguments.mode,
             },
         )
     if command == "issue-reapprove":
