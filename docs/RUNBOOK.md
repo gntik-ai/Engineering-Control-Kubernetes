@@ -239,6 +239,47 @@ keep working while one identity waits for a human).
   field (`EXPIRED` means regenerate the candidate and re-approve) before assuming a stale error
   is something else.
 
+### Undeletable maker files in a ChangeSet worktree (NEW-168, design note)
+
+**Symptom.** The scan worker's `git clean -ffdX` (delivery toolchain cleanup,
+`activities/scan.py` `_clean_ignored_toolchain_artifacts`), a worktree reset or the nightly
+cleanup fails with `Permission denied` on directories the maker created: `openspec/changes/...`
+(2026-10-01), `node_modules/.vitest` (2026-10-09).
+
+**Cause.** A ChangeSet worktree is owned by `scan-runner`; allocation
+(`GitWorktreeManager._grant_access`) grants the maker `rwX` and `scan-runner` `rwX` through access
+and default ACLs. Inheritance covers only entries created inside with a permissive mode: a tool
+that creates a directory with an explicit mode (`mkdir 0755`, archive extraction, `chmod`)
+narrows the inherited ACL mask to `r-x`, and a directory renamed in from outside (a temp or cache
+directory) carries no inherited ACL at all (worker `UMask=0027`, other `---`). `scan-runner` can
+then no longer remove entries inside it, and only the owner or root can widen that ACL.
+
+**Why there is no in-repo fix.** A umask cannot help (an inherited ACL ignores it; the mask comes
+from the creating call's mode). Adding `scan-runner` to the runner groups does not help either
+(its named-user ACL entry wins and is masked) and would expose the runners' group-readable homes.
+A maker-side repair (the maker re-granting `scan-runner` on paths it owns after each run) was
+rejected in the NEW-105 review: it walks a maker-controlled tree where symlink/rename races can
+redirect the grant to the maker's own credentials. The correct fix needs root at runtime, and no
+privileged helper is built without an operator decision.
+
+**Operator recovery** (worker host, as root; `find` does not follow symlinks and `chown -h` does
+not dereference them):
+
+```bash
+WT=/srv/engineering/worktrees/<repository-slug>/<change_set_id>
+ssh -t 10.10.0.3 sudo find "$WT" -xdev \( -user codex-runner -o -user claude-runner \) \
+  -exec chown -h scan-runner:scan-runner {} +
+```
+
+Then retry the stopped step (`backlog-retry`, or let the next cleanup run). The next allocation of
+that ChangeSet archives and cleans the worktree as `scan-runner`.
+
+**Proposed fix (not implemented).** A root-owned oneshot `engineering-worktree-reclaim@.service`
+started by a path unit (the `engineering-github-policy-reconciler.path` pattern): the scan worker
+writes a request naming one ChangeSet UUID after a `Permission denied`; the unit validates the
+UUID, resolves `/srv/engineering/worktrees/<slug>/<uuid>` with no symlink component, runs exactly
+the `find ... -exec chown -h` above and nothing else, and the scan worker retries its cleanup once.
+
 ### Incident, 2026-09-20: an SSH hardening fix locked the operator out
 
 An agent session disabled `PasswordAuthentication` on the controller (closing an audit finding)
