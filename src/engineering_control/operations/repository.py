@@ -51,6 +51,7 @@ from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
     r3_approval_payload_matches,
 )
+from engineering_control.engineering.backlog_authority import unexpired_policy_owners
 from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
 from engineering_control.operations.connection_budget import (
@@ -1052,11 +1053,17 @@ class OperationsRepository:
                 if campaign is not None
                 and campaign.approval_json.get("policy_role") in {None, "owner"}
             }
+            # NEW-163: the global backlog stays exclusive; no other campaign (of any
+            # project) may own the shared policy beside its own policy campaign.
+            outside_owners = unexpired_policy_owners(
+                session, now=now, exclude=set(command.backlog_campaign_ids.values())
+            )
             if (
                 policy is None
                 or owner_ids != {command.policy_campaign_id}
                 or policy.status not in {"APPROVED", "RUNNING"}
                 or policy.approval_json.get("policy_role") not in {None, "owner"}
+                or outside_owners
             ):
                 blockers.append("GITHUB_WRITE_POLICY_NOT_ACTIVE")
             active = session.scalar(

@@ -27,7 +27,10 @@ from engineering_control.engineering.backlog import (
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
-from engineering_control.engineering.backlog_authority import verified_backlog_approval
+from engineering_control.engineering.backlog_authority import (
+    global_backlog_active,
+    verified_backlog_approval,
+)
 from engineering_control.operations.issue_approval import require_backlog_issue_approval
 from engineering_control.policy.github_write import GitHubWritePolicyDocument
 
@@ -143,7 +146,9 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
     return value
 
 
-def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklogCampaign:
+def validate_campaign(
+    session: Session, request: dict[str, Any], *, parallel_project_limit: int | None = None
+) -> GitHubBacklogCampaign:
     requested_by = request.get("requested_by")
     if not isinstance(requested_by, str) or not is_reauthenticated_backlog_operator(requested_by):
         raise ValueError("GitHub policy request lacks a typed reauthenticated operator")
@@ -162,14 +167,29 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     if campaign.status not in expected_statuses:
         raise ValueError("GitHub policy request campaign state is invalid")
     if request["action"] == "enable-existing-backlog":
-        other = session.scalar(
-            select(GitHubBacklogCampaign.id).where(
+        others = session.scalars(
+            select(GitHubBacklogCampaign).where(
                 GitHubBacklogCampaign.id != campaign.id,
                 GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"}),
             )
-        )
-        if other is not None:
-            raise ValueError("another backlog campaign already owns GitHub write policy")
+        ).all()
+        if others:
+            # NEW-163: one owner per project, at most the API's parallel project limit
+            # (Settings from the same control.env). A limit of 1 or an open global backlog
+            # keeps the single global owner rule.
+            limit = (
+                Settings().backlog_parallel_project_limit
+                if parallel_project_limit is None
+                else parallel_project_limit
+            )
+            if (
+                limit <= 1
+                or global_backlog_active(session)
+                or any(other.project == campaign.project for other in others)
+            ):
+                raise ValueError("another backlog campaign already owns GitHub write policy")
+            if len({other.project for other in others}) >= limit:
+                raise ValueError(f"backlog parallel project limit {limit} reached")
     evidence = campaign.approval_json
     if not isinstance(evidence, dict):
         raise ValueError("GitHub campaign approval evidence is incomplete")
@@ -560,7 +580,11 @@ def main() -> int:
         if json.loads(request_bytes.decode("utf-8")) != request:
             raise ValueError("GitHub policy request changed while it was read")
         with Session(engine) as session, session.begin():
-            campaign = validate_campaign(session, request)
+            campaign = validate_campaign(
+                session,
+                request,
+                parallel_project_limit=settings.backlog_parallel_project_limit,
+            )
             enable = request["action"] == "enable-existing-backlog"
             if not enable:
                 kept_for = other_unexpired_owner(session, campaign.id, datetime.now(UTC))

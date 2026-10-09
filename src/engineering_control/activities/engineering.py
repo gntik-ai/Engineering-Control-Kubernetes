@@ -48,6 +48,7 @@ from engineering_control.engineering.backlog_authority import (
     _global_campaign_authorizes,
     _valid_r3_candidate,
     require_alternative_issue_authority,
+    unexpired_policy_owners,
 )
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
@@ -1188,6 +1189,8 @@ class EngineeringActivityHandler:
                 or owner_ids != {policy_campaign_id}
                 or policy_campaign.status not in {"APPROVED", "RUNNING"}
                 or policy_campaign.approval_json.get("policy_role") not in {None, "owner"}
+                # NEW-163: exclusive; no owner outside the global campaign's own inventories.
+                or unexpired_policy_owners(session, now=now, exclude=set(campaign_ids.values()))
             ):
                 raise ValueError("global backlog requires one active exact GitHub write policy")
             inventory: list[dict[str, Any]] = []

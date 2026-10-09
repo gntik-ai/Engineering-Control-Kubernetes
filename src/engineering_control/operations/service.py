@@ -25,7 +25,10 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
-from engineering_control.engineering.backlog import canonical_operator_approval_actor
+from engineering_control.engineering.backlog import (
+    BACKLOG_POLICY_ACTIVATION_PENDING,
+    canonical_operator_approval_actor,
+)
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.issue_approval import campaign_loop_prefix
 from engineering_control.operations.issue_reapproval import (
@@ -367,6 +370,25 @@ class TypedCommandBus:
                 )
             await asyncio.sleep(self.policy_activation_poll_seconds)
 
+    async def _approve_when_activation_slot_free(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        """NEW-163: campaigns of different projects run in parallel, but the root
+        reconciler takes one activation request at a time. While ANOTHER campaign's
+        activation is pending, retry the same approval until the slot frees (bounded by
+        policy_activation_timeout_seconds); every other refusal propagates."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy_activation_timeout_seconds
+        while True:
+            try:
+                return await self.metadata.approve_backlog_campaign(
+                    campaign_id, project, binding, actor
+                )
+            except ValueError as error:
+                if str(error) != BACKLOG_POLICY_ACTIVATION_PENDING or loop.time() >= deadline:
+                    raise
+            await asyncio.sleep(self.policy_activation_poll_seconds)
+
     async def _execute(
         self,
         command: Command,
@@ -397,7 +419,7 @@ class TypedCommandBus:
                 ),
                 issue_request=request,
             )
-            approval = await self.metadata.approve_backlog_campaign(
+            approval = await self._approve_when_activation_slot_free(
                 command.backlog_campaign_id,
                 command.project.value,
                 str(candidate["approval_binding"]),

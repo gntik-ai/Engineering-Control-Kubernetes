@@ -11,6 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES, READ_ONLY_REPOSITORIES
+from engineering_control.projects import PROJECT_REPOSITORIES
 
 GITHUB_WRITE_POLICY_PATH = Path(
     "/etc/engineering-control/policy/github-issue-write-validation.yaml"
@@ -81,6 +82,9 @@ class GitHubWriteDenialReason(StrEnum):
     POLICY_DISABLED = "POLICY_DISABLED"
     EMPTY_SAFE_REPOSITORY_LIST = "EMPTY_SAFE_REPOSITORY_LIST"
     REPOSITORY_NOT_ALLOWLISTED = "REPOSITORY_NOT_ALLOWLISTED"
+    # NEW-163: the shared policy lists every project's repositories while owners of
+    # different projects run in parallel; a write must stay inside its own project's pair.
+    REPOSITORY_OUTSIDE_PROJECT = "REPOSITORY_OUTSIDE_PROJECT"
     POLICY_MISSING = "POLICY_MISSING"
     POLICY_UNREADABLE = "POLICY_UNREADABLE"
     POLICY_INVALID = "POLICY_INVALID"
@@ -148,8 +152,13 @@ class GitHubWritePolicyEvaluator:
         self.writes_enabled = writes_enabled
 
     def evaluate(
-        self, repository_resolver: Callable[[], tuple[str, ...]]
+        self,
+        repository_resolver: Callable[[], tuple[str, ...]],
+        *,
+        project: str | None = None,
     ) -> GitHubWritePolicyDenial | None:
+        """``project`` (NEW-163), when given, binds every target to that project's
+        repository pair; an empty or unregistered project denies."""
         loaded = self._load()
         if isinstance(loaded, GitHubWritePolicyDenial):
             return loaded
@@ -173,6 +182,13 @@ class GitHubWritePolicyEvaluator:
                 GitHubWriteDenialReason.REPOSITORY_NOT_ALLOWLISTED,
                 enabled=True,
             )
+        if project is not None:
+            pair = PROJECT_REPOSITORIES.get(project, ())
+            if not all(repository in pair for repository in repositories):
+                return self._denial(
+                    GitHubWriteDenialReason.REPOSITORY_OUTSIDE_PROJECT,
+                    enabled=True,
+                )
         return None
 
     def _load(self) -> GitHubWritePolicyDocument | GitHubWritePolicyDenial:

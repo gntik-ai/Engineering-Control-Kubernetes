@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -66,6 +67,62 @@ def verified_backlog_approval(
     ):
         return None
     return binding
+
+
+# NEW-163: a row in one of these states with policy_role owner (or none, pre-upgrade)
+# claims its project's GitHub write policy ownership until its binding expires.
+POLICY_OWNER_CLAIM_STATUSES = frozenset(
+    {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
+)
+GLOBAL_BACKLOG_ACTIVE_STATUSES = frozenset({*db.ACTIVE_OPERATION_STATUSES, "PAUSED", "BLOCKED"})
+
+
+def global_backlog_active(session: Session) -> bool:
+    """NEW-163: an autonomous global backlog run is open; it keeps the single global
+    policy owner rule (no per-project parallel owners while it runs)."""
+    return (
+        session.scalar(
+            select(db.Run.id)
+            .where(
+                db.Run.run_type == "autonomous-global-backlog",
+                db.Run.status.in_(tuple(GLOBAL_BACKLOG_ACTIVE_STATUSES)),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def unexpired_policy_owners(
+    session: Session, *, now: datetime, exclude: Collection[UUID] = ()
+) -> list[db.GitHubBacklogCampaign]:
+    """NEW-163: read-only list of rows claiming policy ownership whose binding has not
+    expired. A row whose expiry cannot be read counts (fail closed); the expiry pass and
+    the next approval mark it EXPIRED."""
+    owners: list[db.GitHubBacklogCampaign] = []
+    for candidate in session.scalars(
+        select(db.GitHubBacklogCampaign).where(
+            db.GitHubBacklogCampaign.status.in_(tuple(POLICY_OWNER_CLAIM_STATUSES))
+        )
+    ).all():
+        if candidate.id in exclude:
+            continue
+        evidence = candidate.approval_json
+        if not isinstance(evidence, dict):
+            owners.append(candidate)
+            continue
+        if evidence.get("policy_role") not in {None, "owner"}:
+            continue
+        raw_binding = evidence.get("binding")
+        binding = raw_binding if isinstance(raw_binding, dict) else evidence
+        try:
+            expires_at = _as_utc(datetime.fromisoformat(str(binding.get("expires_at"))))
+        except (TypeError, ValueError):
+            owners.append(candidate)
+            continue
+        if expires_at > now:
+            owners.append(candidate)
+    return owners
 
 
 def _current_backlog_approval(

@@ -670,6 +670,10 @@ async def test_release_ownership_frees_the_active_owner_slot_early(tmp_path) -> 
     repository = SQLMetadataRepository(
         f"sqlite:///{tmp_path / 'metadata.sqlite'}",
         github_policy_request_root=request_root,
+        # NEW-163: a musematic approval under the active falcone owner is an inventory only
+        # under the single global owner rule (limit 1, the global backlog's set-up mode);
+        # per-project owners (default limit 2) are covered in test_new_163_*.
+        backlog_parallel_project_limit=1,
     )
     Base.metadata.create_all(repository.engine)
     owner_id = UUID("11111111-1111-4111-8111-111111111111")
@@ -779,6 +783,10 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
     repository = SQLMetadataRepository(
         f"sqlite:///{tmp_path / 'metadata.sqlite'}",
         github_policy_request_root=request_root,
+        # NEW-163: a musematic approval under the active falcone owner is an inventory only
+        # under the single global owner rule (limit 1, the global backlog's set-up mode);
+        # per-project owners (default limit 2) are covered in test_new_163_*.
+        backlog_parallel_project_limit=1,
     )
     Base.metadata.create_all(repository.engine)
     falcone_id = UUID("11111111-1111-4111-8111-111111111111")

@@ -2347,9 +2347,11 @@ class GitOpsGitHubHandler:
         if step in self.write_capable_steps:
             try:
                 targets = self._write_repositories(step, payload)
+                project = StagingGitOpsPlan.model_validate(payload.get("plan")).project
             except (ValueError, ValidationError):
                 return {"status": "BLOCKED", "blocker": "STAGING_GITOPS_PLAN_INVALID"}
-            denial = self.write_policy.evaluate(lambda: targets)
+            # NEW-163: every target stays inside the plan project's repository pair.
+            denial = self.write_policy.evaluate(lambda: targets, project=project)
             if denial is not None:
                 return denial.model_dump(mode="json")
         try:
@@ -2581,7 +2583,7 @@ class GitOpsGitHubHandler:
                 return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_STALE"}
             if self.broker.last_reopened_at(repository, plan.source_pr_number) >= main_date:
                 return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_PENDING"}
-            self._require_baseline_write(repository)
+            self._require_baseline_write(repository, plan.project)
             self.broker.rerun_pull_request_ci(
                 repository=repository,
                 number=plan.source_pr_number,
@@ -2629,7 +2631,7 @@ class GitOpsGitHubHandler:
         if not existing:
             if not create:
                 return {"status": "BLOCKED", "blocker": "CI_BASELINE_MISSING"}
-            self._require_baseline_write(repository)
+            self._require_baseline_write(repository, plan.project)
             self._open_baseline(plan, branch, main, markers, binding)
             return {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
         baseline = self.broker.view_pull_request(repository, int(existing[0]["number"]))
@@ -2640,7 +2642,7 @@ class GitOpsGitHubHandler:
                 return {"status": "BLOCKED", "blocker": "CI_BASELINE_INCOMPLETE"}
             return {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_PENDING"}
         if baseline.get("state") == "OPEN" and create:
-            self._require_baseline_write(repository)
+            self._require_baseline_write(repository, plan.project)
             self.broker.close_baseline_pull_request(
                 repository=repository, number=int(baseline["number"]), change_binding=binding
             )
@@ -2702,9 +2704,10 @@ class GitOpsGitHubHandler:
                 excerpts[name] = excerpt
         return excerpts
 
-    def _require_baseline_write(self, repository: str) -> None:
-        """gitops.pr_checks is a read step; its baseline writes pass the write policy."""
-        if self.write_policy.evaluate(lambda: (repository,)) is not None:
+    def _require_baseline_write(self, repository: str, project: str) -> None:
+        """gitops.pr_checks is a read step; its baseline writes pass the write policy,
+        bound to the plan's project pair (NEW-163)."""
+        if self.write_policy.evaluate(lambda: (repository,), project=project) is not None:
             raise StagingFlowBlocked("CI_BASELINE_WRITE_DENIED")
 
     def _open_baseline(

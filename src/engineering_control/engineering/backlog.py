@@ -47,6 +47,9 @@ BACKLOG_SKIP_REASONS = frozenset(
 BACKLOG_DELIVERY_MODES = frozenset({"source-pr", "full-delivery"})
 BACKLOG_APPROVAL_PHRASE = "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"
 BACKLOG_RELEASE_OWNERSHIP_PHRASE = "RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP"
+# NEW-163: approval refusal while another campaign's policy activation holds the single
+# activate.json slot; issue-start waits for the slot instead of failing.
+BACKLOG_POLICY_ACTIVATION_PENDING = "another backlog campaign policy activation is pending"
 BACKLOG_FIXED_OPERATOR_ACTORS = frozenset({"dashboard:reauthenticated", "cli:engineering-ctl"})
 ENGINEERING_CTL_OPERATOR_SUBJECT = "engineering-ctl:hermes"
 
