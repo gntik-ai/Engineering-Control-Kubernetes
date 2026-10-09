@@ -4042,3 +4042,61 @@ async def test_new_155_environment_issue_explains_a_sealed_backend(tmp_path: Pat
     )
     comment = fake.issues[("gntik-ai/musematic", again["issue_number"])]["comments"][-1]
     assert "Secret backends sealed" not in comment["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_pin_to_a_later_release_containing_the_merge_delivers_it(tmp_path: Path) -> None:
+    # NEW-174: falcone #975's own release (v0.6.34) built, then an image hotfix shipped as
+    # v0.6.35 and argocd-image-updater pinned that release; the delivery stayed paused at
+    # IMAGE_NOT_PINNED although the pinned release contains the merge.
+    fake = ReleaseGh()
+    settings = _settings(
+        tmp_path,
+        project_config_root=_config_root(tmp_path, safe_repositories=SAFE),
+        github_writes_enabled=True,
+    )
+    handler = GitOpsGitHubHandler(settings, runner=fake)  # type: ignore[arg-type]
+    key = ("gntik-ai/musematic-deploy", "apps/musematic-platform/values.override.yaml")
+    repositories = [
+        "ghcr.io/gntik-ai/musematic/control-plane",
+        "ghcr.io/gntik-ai/musematic/runtime-controller",
+        "ghcr.io/gntik-ai/musematic/reasoning-engine",
+        "ghcr.io/gntik-ai/musematic/simulation-controller",
+        "ghcr.io/gntik-ai/musematic/sandbox-manager",
+        "ghcr.io/gntik-ai/musematic/web",
+    ]
+    later_tag = f"sha-{RELEASE_SHA[:7]}"
+
+    def values(tags: list[str]) -> str:
+        return "".join(
+            f"c{index}:\n  image:\n    repository: {repository}\n    tag: {tag}\n"
+            for index, (repository, tag) in enumerate(zip(repositories, tags, strict=True))
+        )
+
+    fake.tags = [
+        {"ref": "refs/tags/v0.0.108", "sha": MERGE_SHA, "type": "commit"},
+        {"ref": "refs/tags/v0.0.109", "sha": RELEASE_SHA, "type": "commit"},
+    ]
+    payload = {"plan": _plan(), "merge_sha": MERGE_SHA}
+
+    fake.files[key] = values([later_tag] * len(repositories))
+    pinned = await handler.handle("gitops.image_pin", payload)
+    assert pinned["status"] == "PINNED"
+    assert (pinned["release_tag"], pinned["release_sha"]) == ("v0.0.109", RELEASE_SHA)
+    assert pinned["image_tag"] == later_tag
+    assert pinned["missing_repositories"] == []
+
+    # A later tag that does not contain the merge never counts.
+    fake.contains = False
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    fake.contains = True
+    # Mixed pins (one image still on another tag) are not one later release.
+    fake.files[key] = values([later_tag] * (len(repositories) - 1) + ["sha-1111111"])
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    # A pinned tag with no release tag behind it never counts either.
+    fake.files[key] = values(["sha-2222222"] * len(repositories))
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    # The delivered merge's own tag keeps the previous result shape (no release fields).
+    fake.files[key] = values([EXPECTED_TAG] * len(repositories))
+    own = await handler.handle("gitops.image_pin", payload)
+    assert own["status"] == "PINNED" and "release_sha" not in own
