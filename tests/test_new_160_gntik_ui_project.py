@@ -1101,9 +1101,9 @@ def _self_contained_publication(
             "status_sha256": "3" * 64,
             "diff_sha256": "2" * 64,
             "diff_redacted_sha256": "4" * 64,
-            "release_impact": _release_impact(
-                slug, paths, "2" * 64, "R2" if role == "deployment" else "R1"
-            ),
+            # NEW-173: the scan worker floors only a separate deployment repository's change
+            # at R2; a self-contained repository's deployment side is its own source diff (R1).
+            "release_impact": _release_impact(slug, paths, "2" * 64, "R1"),
         }
         for role in ("source", "deployment")
     }

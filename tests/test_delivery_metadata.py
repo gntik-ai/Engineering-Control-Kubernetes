@@ -35,6 +35,7 @@ def release_impact(
     changed_paths: list[str],
     diff_sha256: str,
     risk_floor: str = "R1",
+    categories: list[str] | None = None,
 ) -> dict[str, object]:
     impact: dict[str, object] = {
         "version": 1,
@@ -43,8 +44,8 @@ def release_impact(
             "\n".join(path.lower() for path in changed_paths).encode()
         ).hexdigest(),
         "diff_sha256": diff_sha256,
-        "categories": [],
-        "migration": False,
+        "categories": list(categories or []),
+        "migration": "migration" in (categories or []),
         "risk_floor": risk_floor,
     }
     impact["sha256"] = hashlib.sha256(
@@ -1632,11 +1633,24 @@ async def test_a_self_contained_publication_uses_the_scan_workers_release_floor(
         assert change_set is not None
         assert change_set.source_pr_url == "https://github.com/gntik-ai/gntik-ui/pull/42"
         assert change_set.deployment_pr_url is None
+        assert change_set.risk_class == "R1"
+        assert change_set.recovery_json["release_impact"]["risk_floor"] == "R1"
 
 
 @pytest.mark.asyncio
-async def test_a_separate_deployment_change_still_floors_at_r2(tmp_path: Path) -> None:
-    # NEW-173: a falcone-charts change keeps its R2 floor; claiming R1 there is refused.
+@pytest.mark.parametrize(
+    ("floor", "categories", "existing_risk", "expected"),
+    [
+        ("R1", [], "R1", None),  # a falcone-charts change claiming R1 is refused
+        ("R2", [], "R1", "R2"),  # its R2 floor raises the ChangeSet to R2
+        ("R3", ["secret_lifecycle"], "R1", "R3"),  # a matched category escalates to R3
+        ("R2", [], "R3", "R3"),  # an existing higher risk class is kept
+    ],
+)
+async def test_a_separate_deployment_change_still_floors_at_r2(
+    tmp_path: Path, floor: str, categories: list[str], existing_risk: str, expected: str | None
+) -> None:
+    # NEW-173: a falcone-charts change keeps its R2 floor and the risk aggregation.
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'separate.sqlite'}")
     )
@@ -1650,7 +1664,7 @@ async def test_a_separate_deployment_change_still_floors_at_r2(tmp_path: Path) -
                 finding_id=uuid4(),
                 issue_id=None,
                 project="falcone",
-                risk_class="R1",
+                risk_class=existing_risk,
                 state="IMPLEMENTING",
                 version=1,
                 source_repository="falcone",
@@ -1682,7 +1696,11 @@ async def test_a_separate_deployment_change_still_floors_at_r2(tmp_path: Path) -
     deployment = evidence["deployment"]
     assert isinstance(deployment, dict)
     deployment["release_impact"] = release_impact(
-        "falcone-charts", changed_paths=["values.yaml"], diff_sha256="8" * 64, risk_floor="R1"
+        "falcone-charts",
+        changed_paths=["values.yaml"],
+        diff_sha256="8" * 64,
+        risk_floor=floor,
+        categories=categories,
     )
     branch = f"agent/falcone/123/{change_set_id}"
     request = {
@@ -1719,5 +1737,15 @@ async def test_a_separate_deployment_change_still_floors_at_r2(tmp_path: Path) -
         "maker_provider": "codex",
         "checker_provider": "claude",
     }
-    with pytest.raises(Exception, match="invalid metadata activity input"):
-        await handler.handle("delivery.persist_publication", request)
+    if expected is None:
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("delivery.persist_publication", request)
+        return
+    assert (await handler.handle("delivery.persist_publication", request))["status"] == (
+        "SOURCE_PR"
+    )
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.risk_class == expected
+        assert change_set.recovery_json["release_impact"]["risk_floor"] == expected
