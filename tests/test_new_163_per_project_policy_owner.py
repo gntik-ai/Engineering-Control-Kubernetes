@@ -477,7 +477,9 @@ def _bus(approve: AsyncMock) -> tuple[TypedCommandBus, Any, Any]:
     metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "a" * 64})
     metadata.approve_backlog_campaign = approve
     metadata.ensure_policy_activation = AsyncMock()
-    metadata.get_backlog_campaign = AsyncMock(return_value={"status": "APPROVED"})
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED", "approval_binding": "a" * 64}
+    )
     operations = Mock()
     operations.operation = AsyncMock(return_value=SimpleNamespace(binding_hash="b" * 64))
     operations.open_campaign_loops = AsyncMock(return_value=[])
@@ -1007,3 +1009,35 @@ def test_global_finalization_takes_the_ownership_lock_first(
     with pytest.raises(ValueError, match="global backlog campaign disappeared"):
         handler._finalize_global_backlog({"campaign_id": str(_id(99))})
     assert order[0] == "LOCK" and order.count("LOCK") == 1 and "SQL" in order
+
+
+@pytest.mark.asyncio
+async def test_the_activation_wait_never_accepts_a_replacement_approval() -> None:
+    """Review 3: after its approval, the activation wait re-queues and polls only under
+    that approval's binding; a replacement approval refuses the start."""
+    approve = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING", "approval_binding": "a" * 64}
+    )
+    bus, control, metadata = _bus(approve)
+    metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED", "approval_binding": "c" * 64}
+    )
+    with pytest.raises(ValueError, match="replaced before its activation"):
+        await bus._execute(_solve_issue(), operator_class="telegram:42", operation_id=_id(9))
+    metadata.ensure_policy_activation.assert_awaited_with(_id(2), expected_binding="a" * 64)
+    control.start_existing_backlog_loop.assert_not_awaited()
+
+    metadata.ensure_policy_activation = AsyncMock(return_value="APPROVAL_SUPERSEDED")
+    with pytest.raises(ValueError, match="replaced before its activation"):
+        await bus._execute(_solve_issue(), operator_class="telegram:42", operation_id=_id(9))
+    control.start_existing_backlog_loop.assert_not_awaited()
+
+    metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
+    metadata.get_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED", "approval_binding": "a" * 64}
+    )
+    assert (
+        await bus._execute(_solve_issue(), operator_class="telegram:42", operation_id=_id(9))
+        == "started"
+    )

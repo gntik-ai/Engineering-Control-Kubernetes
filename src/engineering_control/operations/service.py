@@ -311,7 +311,10 @@ class TypedCommandBus:
             "production": False,
         }
         if plan["status"] == "ALREADY_APPROVED":
-            approval: dict[str, Any] = {"status": plan["campaign"]}
+            approval: dict[str, Any] = {
+                "status": plan["campaign"],
+                "approval_binding": plan["approval_binding"],
+            }
             result["status"] = "ALREADY_APPROVED"
         else:
             validated = {key: plan[key] for key in ("status", "campaign", "approval_binding")}
@@ -351,14 +354,23 @@ class TypedCommandBus:
         # enabled (NEW-26). Start only once the reconciler has promoted the campaign.
         if approval.get("status") != "APPROVED_POLICY_PENDING":
             return
+        # NEW-163 review 3: the wait belongs to this exact approval. A replacement approval
+        # is never re-queued or accepted as this one's activation.
+        binding = approval.get("approval_binding")
+        if not isinstance(binding, str):
+            raise ValueError("GitHub write policy activation lost its approval binding")
         # NEW-143 review: the approval commits before its activation request is written; a
         # failed write or a stopped process must not leave it waiting forever, so a missing
         # request is (re-)enqueued (a no-op while one is pending).
-        await self.metadata.ensure_policy_activation(campaign_id)
+        queued = await self.metadata.ensure_policy_activation(campaign_id, expected_binding=binding)
+        if queued == "APPROVAL_SUPERSEDED":
+            raise ValueError("the campaign approval was replaced before its activation")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy_activation_timeout_seconds
         while True:
             campaign = await self.metadata.get_backlog_campaign(campaign_id)
+            if campaign is not None and campaign.get("approval_binding") != binding:
+                raise ValueError("the campaign approval was replaced before its activation")
             if campaign is not None and campaign.get("status") in {
                 "APPROVED",
                 "APPROVED_INVENTORY",
