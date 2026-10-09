@@ -128,11 +128,13 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
     assert [command.argv for command in manifest.toolchain.prepare] == [
         ["pnpm", "install", "--frozen-lockfile"]
     ]
+    # NEW-170: the sandbox gate covers the library packages; the Next.js apps' build and
+    # the mcp CLI tests run in the PR CI that gates the merge.
     assert [command.argv for command in manifest.toolchain.test_commands] == [
-        ["pnpm", "build"],
+        ["pnpm", "-r", "--filter", "./packages/**", "build"],
         ["pnpm", "lint"],
         ["pnpm", "typecheck"],
-        ["pnpm", "test"],
+        ["pnpm", "-r", "--filter", "./packages/**", "--filter", "!@gntik-ai/gntik-ui-mcp", "test"],
         ["pnpm", "registry:check"],
         ["node", "apps/musematic/scripts/check-kit-only.mjs"],
         ["node", "apps/falcone/scripts/check-kit-only.mjs"],
@@ -140,6 +142,11 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
     assert manifest.maker_rules is not None and any(
         ".changeset/" in rule for rule in manifest.maker_rules.source
     )
+    assert any(
+        "PR CI" in rule or "pull request's CI" in rule for rule in manifest.maker_rules.source
+    )
+    # The PR CI the merge gate requires still runs the full build and test.
+    assert manifest.merge_delivery() is not None
 
 
 def _staging_flow() -> dict[str, Any]:
