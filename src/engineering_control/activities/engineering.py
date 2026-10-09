@@ -1575,6 +1575,10 @@ class EngineeringActivityHandler:
         now = datetime.now(UTC)
         deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
+            # NEW-163 review 2: it updates the owner and inventory rows together, so it takes
+            # the ownership lock first like every other ownership change (the reconciler's
+            # locked expiry scan would otherwise deadlock with it).
+            lock_backlog_policy(session)
             campaign = session.get(db.Campaign, campaign_id)
             if campaign is None:
                 raise ValueError("global backlog campaign disappeared")

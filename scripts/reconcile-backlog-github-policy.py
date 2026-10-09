@@ -316,7 +316,9 @@ def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) ->
     return None
 
 
-def expire_campaign_approvals(session: Session, now: datetime) -> bool:
+def expire_campaign_approvals(
+    session: Session, now: datetime, *, parallel_project_limit: int | None = None
+) -> bool:
     """Expire all approval rows and report whether shared policy must be disabled."""
     lock_backlog_policy(session)  # NEW-163 review: first, as in validate_campaign
     active = session.scalars(
@@ -336,6 +338,7 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
         .execution_options(populate_existing=True)
     ).all()
     unexpired_owner = False
+    live_projects: set[str] = set()
     for campaign in active:
         if not isinstance(campaign.approval_json, dict):
             # Review: malformed evidence must not crash the fail-safe expiry pass.
@@ -363,13 +366,27 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
                 campaign.status = "EXPIRED"
                 continue
             unexpired_owner = True
-    if not unexpired_owner:
-        for campaign in active:
-            if (
-                isinstance(campaign.approval_json, dict)
-                and campaign.approval_json.get("policy_role") == "inventory"
-            ):
-                campaign.status = "EXPIRED"
+            live_projects.add(campaign.project)
+    limit = (
+        Settings().backlog_parallel_project_limit
+        if parallel_project_limit is None
+        else parallel_project_limit
+    )
+    # NEW-163 review 2: under the single global owner (limit 1 or an open global backlog)
+    # every inventory depends on that owner; per project, an inventory depends on its own
+    # project's owner, so it is orphaned once that project has no live owner.
+    global_ownership = limit == 1 or global_backlog_active(session)
+    for campaign in active:
+        if (
+            campaign.status != "EXPIRED"
+            and isinstance(campaign.approval_json, dict)
+            and campaign.approval_json.get("policy_role") == "inventory"
+            and (
+                not unexpired_owner
+                or (not global_ownership and campaign.project not in live_projects)
+            )
+        ):
+            campaign.status = "EXPIRED"
     return not unexpired_owner
 
 
@@ -585,7 +602,11 @@ def main() -> int:
         return 0
     if args.expire_only:
         with Session(engine) as session, session.begin():
-            if expire_campaign_approvals(session, datetime.now(UTC)):
+            if expire_campaign_approvals(
+                session,
+                datetime.now(UTC),
+                parallel_project_limit=settings.backlog_parallel_project_limit,
+            ):
                 policy = GitHubWritePolicyDocument.model_validate(
                     yaml.safe_load(args.policy.read_text(encoding="utf-8"))
                 )

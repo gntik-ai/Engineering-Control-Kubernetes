@@ -189,7 +189,9 @@ class MetadataRepository(Protocol):
         validate: Callable[[Session], None],
         audit: Callable[[Session, dict[str, Any]], int],
     ) -> dict[str, Any]: ...
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str: ...
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str: ...
     async def validate_issue_operation_approval(
         self, request: ExistingBacklogLoopStart
     ) -> None: ...
@@ -1168,14 +1170,16 @@ class SQLMetadataRepository:
         global_ownership = self.backlog_parallel_project_limit == 1 or global_backlog_active(
             session
         )
+        live_projects = {owner.project for owner in active_owners}
         for candidate in active_campaigns:
             # Inventory depends on its owner: under the single global owner every inventory
             # does; NEW-163 review: per project only that project's (another project's live
-            # owner keeps its own inventory). No owner left at all orphans every inventory.
+            # owner keeps its own inventory). Review 2: an inventory whose project has no
+            # live owner is orphaned, even when that owner expired in an earlier pass.
             if candidate.approval_json.get("policy_role") == "inventory" and (
                 not active_owners
                 or (expired_projects and global_ownership)
-                or candidate.project in expired_projects
+                or (not global_ownership and candidate.project not in live_projects)
             ):
                 candidate.status = "EXPIRED"
         active_owner = self._backlog_policy_owner(
@@ -1319,8 +1323,12 @@ class SQLMetadataRepository:
                 )
         return result
 
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
-        return await asyncio.to_thread(self._ensure_policy_activation, campaign_id)
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
+        return await asyncio.to_thread(
+            self._ensure_policy_activation, campaign_id, expected_binding=expected_binding
+        )
 
     def _ensure_policy_activation(
         self, campaign_id: UUID, *, expected_binding: str | None = None
@@ -2238,7 +2246,9 @@ class EmptyMetadataRepository:
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
 
-    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
+    async def ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
         raise ValueError("backlog metadata store is unavailable")
 
     async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:

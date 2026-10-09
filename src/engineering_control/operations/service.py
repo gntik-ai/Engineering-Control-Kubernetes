@@ -410,9 +410,23 @@ class TypedCommandBus:
         ):
             raise error
         loop = asyncio.get_running_loop()
-        # ACTIVATION_PENDING: activate.json still holds another request. Anything else is
-        # re-queued, or the campaign left pending (the activation wait then judges it).
-        while await self.metadata.ensure_policy_activation(campaign_id) == "ACTIVATION_PENDING":
+        # Every attempt re-checks, under the ownership lock, that this exact approval is
+        # still the pending one (review 2: a replacement approval is never reported as
+        # ours). ACTIVATION_PENDING: activate.json still holds another request.
+        while True:
+            outcome = await self.metadata.ensure_policy_activation(
+                campaign_id, expected_binding=binding
+            )
+            if outcome == "ACTIVATION_REQUEUED":
+                break
+            if outcome == "APPROVED":
+                # The reconciler activated it meanwhile; it must still be this approval.
+                current = await self.metadata.get_backlog_campaign(campaign_id)
+                if current is None or current.get("approval_binding") != binding:
+                    raise error
+                break
+            if outcome != "ACTIVATION_PENDING":
+                raise error  # superseded, released or otherwise no longer this approval
             if loop.time() >= deadline:
                 raise ValueError(
                     "GitHub write policy activation did not complete; check "
