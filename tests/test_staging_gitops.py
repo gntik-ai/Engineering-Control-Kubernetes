@@ -4077,9 +4077,19 @@ async def test_a_pin_to_a_later_release_containing_the_merge_delivers_it(tmp_pat
         {"ref": "refs/tags/v0.0.108", "sha": MERGE_SHA, "type": "commit"},
         {"ref": "refs/tags/v0.0.109", "sha": RELEASE_SHA, "type": "commit"},
     ]
+    build = {
+        "databaseId": 7,
+        "headSha": RELEASE_SHA,
+        "status": "completed",
+        "conclusion": "failure",
+    }
+    fake.runs = [build]
     payload = {"plan": _plan(), "merge_sha": MERGE_SHA}
 
     fake.files[key] = values([later_tag] * len(repositories))
+    # Review: the later release's own image build must have succeeded (as NEW-68 requires).
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    build["conclusion"] = "success"
     pinned = await handler.handle("gitops.image_pin", payload)
     assert pinned["status"] == "PINNED"
     assert (pinned["release_tag"], pinned["release_sha"]) == ("v0.0.109", RELEASE_SHA)
@@ -4096,6 +4106,22 @@ async def test_a_pin_to_a_later_release_containing_the_merge_delivers_it(tmp_pat
     # A pinned tag with no release tag behind it never counts either.
     fake.files[key] = values(["sha-2222222"] * len(repositories))
     assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    # Review: a repository with contradictory occurrences (old tag too) is not uniform.
+    fake.files[key] = (
+        values([later_tag] * len(repositories))
+        + f"extra:\n  image:\n    repository: {repositories[-1]}\n    tag: sha-1111111\n"
+    )
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    fake.files[key] = values([later_tag] * len(repositories))
+    # Review: a short tag shared by two release commits is ambiguous.
+    twin = RELEASE_SHA[:7] + "f" * 33
+    fake.tags.append({"ref": "refs/tags/v0.0.110", "sha": twin, "type": "commit"})
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    fake.tags.pop()
+    # Review: only canonical release versions count (no leading zeros).
+    fake.tags[-1] = {"ref": "refs/tags/v00.0.109", "sha": RELEASE_SHA, "type": "commit"}
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    fake.tags[-1] = {"ref": "refs/tags/v0.0.109", "sha": RELEASE_SHA, "type": "commit"}
     # The delivered merge's own tag keeps the previous result shape (no release fields).
     fake.files[key] = values([EXPECTED_TAG] * len(repositories))
     own = await handler.handle("gitops.image_pin", payload)

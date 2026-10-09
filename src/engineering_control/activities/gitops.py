@@ -3045,33 +3045,55 @@ class GitOpsGitHubHandler:
         observed: Mapping[str, Iterable[str]],
     ) -> tuple[str, str, str] | None:
         """NEW-174: (release tag, full commit, image tag) when every flow image is pinned to
-        one image tag that is a later release tag's commit containing the merge; else None.
-        Only real release tags count (full SHAs from the tag refs), never a bare image tag."""
-        common: set[str] | None = None
+        exactly one image tag that maps to exactly one later release commit containing the
+        merge, whose configured image build succeeded; else None (fail closed). Only real,
+        canonical release tags count (full SHAs from the tag refs), never a bare image tag.
+        """
+        tags: set[str] = set()
         for repository in flow.image_repositories:
-            tags = set(observed.get(repository) or ())
-            common = tags if common is None else common & tags
-        if not common or len(common) != 1:
+            pinned = set(observed.get(repository) or ())
+            if len(pinned) != 1:
+                return None  # missing, or contradictory occurrences of one repository
+            tags |= pinned
+        if len(tags) != 1 or flow.image_workflow is None:
             return None
-        (tag,) = common
+        (tag,) = tags
         prefix = flow.release_tag.prefix
-        pattern = re.compile(rf"{re.escape(prefix)}[0-9]+\.[0-9]+\.[0-9]+")
-        for ref in self.broker.list_tag_refs(plan.source_repository, prefix):
-            name = ref["ref"].removeprefix("refs/tags/")
-            sha = str(ref.get("sha") or "")
-            if (
-                not pattern.fullmatch(name)
-                or ref.get("type") != "commit"
-                or sha == merge_sha
-                or not _SHA.fullmatch(sha)
-                or expected_image_tag(flow, sha) != tag
-            ):
-                continue
-            if self.broker.commit_contains(
-                plan.source_repository, ancestor=merge_sha, descendant=sha
-            ):
-                return name, sha, tag
-        return None
+        pattern = re.compile(
+            rf"{re.escape(prefix)}(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        )
+        candidates = {
+            (ref["ref"].removeprefix("refs/tags/"), str(ref.get("sha") or ""))
+            for ref in self.broker.list_tag_refs(plan.source_repository, prefix)
+            if ref.get("type") == "commit"
+            and pattern.fullmatch(ref["ref"].removeprefix("refs/tags/"))
+            and _SHA.fullmatch(str(ref.get("sha") or ""))
+            and expected_image_tag(flow, str(ref.get("sha"))) == tag
+        }
+        # A short image tag shared by two release commits is ambiguous: the images could
+        # come from either, and runtime verification sees only the short tag.
+        if len({sha for _, sha in candidates}) != 1:
+            return None
+        name, sha = sorted(candidates)[0]
+        if sha == merge_sha or not self.broker.commit_contains(
+            plan.source_repository, ancestor=merge_sha, descendant=sha
+        ):
+            return None
+        runs = [
+            run
+            for run in self.broker.list_workflow_runs(
+                plan.source_repository, workflow_name=flow.image_workflow, commit_sha=sha
+            )
+            if run.get("headSha") == sha
+        ]
+        # The release pipeline must have passed for that exact commit (as NEW-68 requires).
+        if not any(
+            str(run.get("status") or "").lower() == "completed"
+            and str(run.get("conclusion") or "").lower() == "success"
+            for run in runs
+        ):
+            return None
+        return name, sha, tag
 
     # -- 4. environment issue ----------------------------------------------------------
 
