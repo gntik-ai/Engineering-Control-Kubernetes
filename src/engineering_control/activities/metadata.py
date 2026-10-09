@@ -3604,6 +3604,24 @@ class MetadataActivityHandler:
             if resumed_from
             else ""
         )
+        if deployment and payload["source_worktree"] == payload["deployment_worktree"]:
+            # NEW-169: one repository is both source and deployment (gntik-ui, llmwiki), so
+            # the source maker of this round has just committed in this same worktree. Its
+            # HEAD is newer than the allocation's; gntik-ui #26's deployment maker refused
+            # with "expected HEAD <allocation>, actual HEAD <source maker's commit>".
+            resume_instruction = (
+                "This worktree is shared with the source repository portion of the "
+                "ChangeSet, which the source maker has just completed and committed in this "
+                "round"
+                + (
+                    f" on top of the previous attempt's work (HEAD {resumed_from})"
+                    if resumed_from
+                    else ""
+                )
+                + ". Its HEAD is therefore that newer source commit: that is expected, not a "
+                "snapshot mismatch. Do not revert or redo the source work; make only the "
+                "deployment portion's changes (often none) on top of it.\n"
+            )
         prompt = (
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
