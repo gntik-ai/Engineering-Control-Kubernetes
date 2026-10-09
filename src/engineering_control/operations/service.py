@@ -27,6 +27,7 @@ from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.operations.connections import ConnectionHealthProjector
+from engineering_control.operations.issue_approval import campaign_loop_prefix
 from engineering_control.operations.issue_reapproval import (
     plan_issue_reapproval,
     record_issue_reapproval,
@@ -242,6 +243,18 @@ class TypedCommandBus:
             return 0
         return 1
 
+    async def _close_ended_campaign_loops(self, prefix: str, *, exclude: str | None) -> None:
+        """NEW-162: an issue-start or issue-reapprove admits no sibling loop, so a loop Run
+        left open by a workflow closed outside Hermes (terminated, or its last state write
+        lost) would fence the campaign forever. Close only Runs whose closure Temporal
+        confirms and that did not change meanwhile; an observation failure propagates (the
+        start fails closed)."""
+        for workflow_id, status, updated_at in await self.operations.open_campaign_loops(
+            prefix, exclude=exclude
+        ):
+            if await self.control.workflow_id_closed(workflow_id):
+                await self.operations.close_ended_loop_run(workflow_id, status, updated_at)
+
     policy_activation_timeout_seconds = 60.0
     policy_activation_poll_seconds = 2.0
 
@@ -277,6 +290,9 @@ class TypedCommandBus:
             "current_run_id": current_run_id,
             "awaited_issue": awaited_issue,
         }
+        loop_prefix, separator, _ = loop_workflow_id.partition("-operation-")
+        if separator and loop_prefix.startswith(f"backlog-loop-{project}-"):
+            await self._close_ended_campaign_loops(loop_prefix, exclude=loop_workflow_id)
         plan = await self.operations.plan_issue_reapproval(actor=actor, **arguments)
         request: ExistingBacklogLoopStart = plan["request"]
         campaign_id = request.backlog_campaign_id
@@ -367,6 +383,10 @@ class TypedCommandBus:
             if operation is None:
                 raise ValueError("issue operation disappeared before durable handoff")
             request = issue_start_request(command, operation_id, operation.binding_hash)
+            await self._close_ended_campaign_loops(
+                campaign_loop_prefix(command.project.value, command.backlog_campaign_id),
+                exclude=issue_workflow_id(request),
+            )
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
                 BacklogApprovalCandidateRequest(

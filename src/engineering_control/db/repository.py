@@ -65,6 +65,7 @@ from engineering_control.operations.dispatch_receipts import record_dispatch_rec
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
+    require_no_open_sibling_loop,
 )
 from engineering_control.projects import GLOBAL_PROJECTS, REPOSITORIES
 from engineering_control.retention_limits import (
@@ -965,6 +966,15 @@ class SQLMetadataRepository:
         issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
+            # NEW-162 review: the same approval and campaign locks as issue-reapprove, so two
+            # preparations never both see the campaign free (require_no_open_sibling_loop).
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+            session.scalar(
+                select(GitHubBacklogCampaign)
+                .where(GitHubBacklogCampaign.id == campaign_id)
+                .with_for_update()
+            )
             return self._prepare_backlog_approval_in(
                 session, campaign_id, request, issue_request=issue_request
             )
@@ -990,6 +1000,12 @@ class SQLMetadataRepository:
         campaign = session.get(GitHubBacklogCampaign, campaign_id)
         if campaign is None or campaign.project != request.project:
             raise ValueError("backlog approval campaign does not exist")
+        require_no_open_sibling_loop(
+            session,
+            campaign,
+            request.project,
+            issue_request.issue_operation_id if issue_request is not None else None,
+        )
         binding = approval_binding(
             campaign_id=str(campaign.id),
             project=request.project,

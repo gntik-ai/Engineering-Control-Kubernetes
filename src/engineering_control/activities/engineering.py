@@ -2091,6 +2091,10 @@ class EngineeringActivityHandler:
                 if run is not None:
                     previous_status = run.status
                     run.status = status
+                    # NEW-162 review 3: every accepted loop-state write advances the Run,
+                    # even with an unchanged status (a reset recording RUNNING again), so
+                    # the closed-loop closer's (status, updated_at) snapshot sees it.
+                    run.updated_at = datetime.now(UTC)
                     if run.run_type == "existing-backlog-loop":
                         # NEW-133: the issue the loop is paused on, for operator grants.
                         record_loop_pause_target(session, run, status, payload)

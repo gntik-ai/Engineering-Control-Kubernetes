@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -59,6 +59,8 @@ class _Live:
         self.control = Mock()
         self.control.current_open_run_id = AsyncMock(return_value=RUN)
         self.control.awaited_operator_issue = AsyncMock(return_value=None)
+        # NEW-162: every other recorded-open loop is still running in Temporal.
+        self.control.workflow_id_closed = AsyncMock(return_value=False)
         self.bus = TypedCommandBus(self.control, metadata, operations)
         self.bus.policy_activation_poll_seconds = 0
         self.bus.policy_activation_timeout_seconds = 5
@@ -215,16 +217,19 @@ async def _voided(
         delivered(live, first)  # NEW-144: the first child loads and delivers its ChangeSet
     # backlog-pause during the GitHub outage voids the campaign approval.
     live.loop_state("PAUSED", blocker="OPERATOR_PAUSE")
-    # The operator re-approves through the general backlog-approve (R2, max 5).
-    candidate = await metadata.prepare_backlog_approval(
-        CAMPAIGN_ID,
-        BacklogApprovalCandidateRequest(
-            project="falcone",
-            delivery_mode=request.delivery_mode,
-            maximum_risk=request.maximum_risk,
-            maximum_items=5,
-        ),
-    )
+    # The operator re-approves through the general backlog-approve (R2, max 5). That was
+    # admitted before NEW-162 (one open loop per campaign refuses it now, see
+    # test_new_162_one_open_loop_per_campaign); the fixture recreates the #972 history.
+    with patch("engineering_control.db.repository.require_no_open_sibling_loop"):
+        candidate = await metadata.prepare_backlog_approval(
+            CAMPAIGN_ID,
+            BacklogApprovalCandidateRequest(
+                project="falcone",
+                delivery_mode=request.delivery_mode,
+                maximum_risk=request.maximum_risk,
+                maximum_items=5,
+            ),
+        )
     await metadata.approve_backlog_campaign(
         CAMPAIGN_ID, "falcone", candidate["approval_binding"], "cli:engineering-ctl"
     )
@@ -374,6 +379,31 @@ def _bound_to_another_open_operation(live: _Live) -> None:
             "issue_approval": {"operation_id": str(other.id), "binding_sha256": "e" * 64},
         }
         campaign.approval_json = {**campaign.approval_json, "binding": binding}
+
+
+async def test_a_sibling_whose_loop_ended_no_longer_blocks_the_reapproval(
+    tmp_path: Path,
+) -> None:
+    # NEW-162 review: the approval names another issue operation still STARTED (it is
+    # closed lazily) whose loop Run has ended; it no longer holds the campaign.
+    live = await _voided(tmp_path)
+    _bound_to_another_open_operation(live)
+    with live.operations.sessions.begin() as session:
+        campaign = session.get(GitHubBacklogCampaign, CAMPAIGN_ID)
+        other_id = campaign.approval_json["binding"]["issue_approval"]["operation_id"]
+        other = session.get(OperationRequest, UUID(other_id))
+        other.status = "STARTED"
+        other.workflow_id = f"backlog-loop-falcone-{CAMPAIGN_ID}-operation-{other_id}"
+        session.add(
+            Run(
+                workflow_id=other.workflow_id,
+                run_type="existing-backlog-loop",
+                status="COMPLETE",
+                project="falcone",
+            )
+        )
+    assert (await live.reapprove())["status"] == "REAPPROVED"
+    live.dispose()
 
 
 def _loop_ran_another_request(live: _Live) -> None:
@@ -542,15 +572,18 @@ async def test_a_newer_campaign_approval_after_the_check_is_never_overwritten(
     live = await _voided(tmp_path)
 
     async def approve_r1() -> None:
-        candidate = await live.metadata.prepare_backlog_approval(
-            CAMPAIGN_ID,
-            BacklogApprovalCandidateRequest(
-                project="falcone",
-                delivery_mode=live.request.delivery_mode,
-                maximum_risk=RiskClass.R1,
-                maximum_items=5,
-            ),
-        )
+        # NEW-162 refuses this general approval while the loop is open; the reapproval must
+        # still never overwrite a campaign approval that changed after its check.
+        with patch("engineering_control.db.repository.require_no_open_sibling_loop"):
+            candidate = await live.metadata.prepare_backlog_approval(
+                CAMPAIGN_ID,
+                BacklogApprovalCandidateRequest(
+                    project="falcone",
+                    delivery_mode=live.request.delivery_mode,
+                    maximum_risk=RiskClass.R1,
+                    maximum_items=5,
+                ),
+            )
         await live.metadata.approve_backlog_campaign(
             CAMPAIGN_ID, "falcone", candidate["approval_binding"], "cli:engineering-ctl"
         )

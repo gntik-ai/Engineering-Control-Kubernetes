@@ -315,6 +315,43 @@ campaign approval for the operation and loop. The move is recorded once in the C
 `recovery_json.issue_execution_approval_reissued` (from/to binding, audit event); correction and
 CI-repair bounds keep counting the whole lineage.
 
+### One open issue loop per campaign (NEW-162)
+
+A campaign approval names exactly one issue operation, and every loop of the campaign reports
+its state into the one campaign status. On falcone campaign `31c772b3` (2026-10-08) an
+`issue-start` of another issue while #978's loop was paused replaced that approval, so #978's
+next delivery child was refused ("direct child campaign approval differs from its operation");
+the loops' pause and end states overwrote each other's campaign status (one end disabled the
+GitHub write policy); and the final `backlog-skip` of #978 re-raised the step error and failed
+the campaign.
+
+Operator decision (2026-10-08): a campaign holds at most one open issue loop.
+
+- `issue-start` (and `issue-reapprove`, for anything but the paused loop's own operation) is
+  refused with `ISSUE_START_CAMPAIGN_IN_USE` while another loop of the campaign is open
+  (`QUEUED`, `RUNNING`, `PAUSED`, `BLOCKED`, `RATE_LIMITED`), or while the current approval
+  names another issue operation that is still dispatching or has not registered its loop yet.
+  The refusal names the open loop or operation and changes nothing. Finish, `backlog-skip` or
+  `backlog-cancel` that loop first; a skipped or cancelled issue is started again later with
+  `issue-start` (its revalidation runs again).
+- An `issue-start` is also refused while a campaign-wide loop of the campaign is open or its
+  `backlog-start` is still being handed off. A campaign-wide `backlog-approve`/`backlog-start` is
+  refused while an issue loop of the campaign is open (it used to replace the paused loop's issue
+  approval, #972); a campaign-wide loop can still renew its own approval.
+- Every approval preparation takes the campaign approval lock and the campaign row lock, so two
+  simultaneous starts never both see the campaign free.
+- A loop Run still recorded open whose workflow was closed outside Hermes (e.g. terminated with
+  `temporal workflow terminate`) would fence its campaign. Before preparing, `issue-start` and
+  `issue-reapprove` ask Temporal about every other open loop of the campaign and close
+  (`CANCELLED`, dashboard event `backlog.loop_run_closed`) only those Temporal reports closed
+  and whose Run did not change since it was read; an unknown state fails the start.
+- `backlog-skip` of an issue paused on a failed loop step records the skip and completes its loop
+  (`COMPLETE_NOTHING_DELIVERED` when nothing was delivered); it no longer fails the loop or the
+  campaign. Workflow patch `existing-backlog-loop-step-skip-closes-v1`, evaluated only when the
+  skip arrives, so a loop paused before the deploy also closes cleanly.
+
+Campaigns of different projects running in parallel is NEW-163.
+
 ## Reconcile an uncertain publication effect (NEW-145)
 
 A publication whose outcome Hermes could not observe leaves its

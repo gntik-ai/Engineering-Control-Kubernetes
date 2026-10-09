@@ -41,6 +41,7 @@ from engineering_control.operations.correction_extension import (
 )
 from engineering_control.operations.issue_approval import (
     current_issue_approval_binding,
+    operation_holds_campaign,
     require_issue_request_approval,
 )
 from engineering_control.operations.issue_delivery_approval import (
@@ -247,7 +248,8 @@ def plan_issue_reapproval(
         return _unchanged(plan, campaign, validated)
     if reference is not None and reference.operation_id != str(operation.id):
         other = session.get(OperationRequest, UUID(reference.operation_id))
-        if other is not None and other.status in _OPEN_OPERATION_STATES:
+        # NEW-162 review: a STARTED sibling whose loop has ended no longer holds the campaign.
+        if other is not None and operation_holds_campaign(session, other):
             raise _refuse(
                 "CAMPAIGN_BOUND_TO_OTHER_ISSUE",
                 f"the campaign approval belongs to the open issue operation {other.id}",

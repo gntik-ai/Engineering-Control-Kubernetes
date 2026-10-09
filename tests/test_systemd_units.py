@@ -1,6 +1,10 @@
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 def test_migration_unit_remains_active_after_success() -> None:
@@ -301,6 +305,53 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     assert "rm -" not in script
 
 
+def test_every_shell_script_is_executable_and_parses() -> None:
+    # NEW-162: bootstrap-mirrors.sh was committed 100644 (the documented `sudo ./scripts/...`
+    # failed); every script must be executable and bash -n clean.
+    for script in sorted((REPOSITORY_ROOT / "scripts").glob("*.sh")):
+        assert os.access(script, os.X_OK), script.name
+        subprocess.run([BASH, "-n", str(script)], check=True)  # noqa: S603 - fixed interpreter
+
+
+def test_mirror_bootstrap_never_reowns_the_worker_mirror_layout() -> None:
+    # NEW-162: `install -d -o hermes -g scan-runner -m 0770 /srv/engineering/mirrors`
+    # re-owned the live worker's scan-runner mirror root to hermes and removed scan-runner's
+    # access; every falcone revalidation then failed "canonical mirror does not exist".
+    script = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
+    lines = [line.strip() for line in script.splitlines()]
+
+    # The root is only ever created (as bootstrap-worker.sh does), never re-owned or re-moded.
+    create = lines.index("if [[ ! -e ${MIRROR_ROOT} ]]; then")
+    assert lines[create + 1] == (
+        'install -d -o scan-runner -g scan-runner -m 0700 "${MIRROR_ROOT}"'
+    )
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert 'install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"' in worker
+    assert sum("${MIRROR_ROOT}" in line and "install" in line for line in lines) == 1
+    assert not any("MIRROR_ROOT" in line and line.startswith(("chown", "chmod")) for line in lines)
+    assert "-o hermes -g scan-runner" not in script
+    assert "chown -R hermes" not in script
+    # A new mirror is staged and verified as hermes, then handed to scan-runner with the
+    # worker ACL layout; ownership and ACLs change only inside the new-mirror branch.
+    branch = lines.index("if [[ ! -e ${target} ]]; then")
+    end = lines.index("fi", branch)
+    for line in lines:
+        if line.startswith(("chown", "chmod", "setfacl -R", "find ")):
+            assert branch < lines.index(line) < end, line
+    new_mirror = lines[branch:end]
+    assert 'chown -R scan-runner:scan-runner "${target}"' in new_mirror
+    assert 'chmod -R u+rwX,go-rwx "${target}"' in new_mirror
+    assert 'setfacl -R --modify "${mirror_acl}" "${target}"' in new_mirror
+    assert 'find "${target}" -type d -exec setfacl --modify "${default_acl}" {} +' in new_mirror
+    assert 'mirror_acl="u:scan-runner:rwX,u:hermes:rwX,g::---,o::---"' in lines
+    assert "READERS=(delivery-runner claude-runner codex-runner)" in lines
+    assert "d:u:release-runner:r-x" in script and "d:g::---,d:o::---" in script
+    # Existing mirrors are verified per command, without any git configuration change.
+    assert 'git -c "safe.directory=${target}" -C "${target}" "$@"' in lines
+    assert "--global" not in script and "--system" not in script
+    assert "stat -c %U" in script
+
+
 def test_bootstrap_reruns_restart_services_after_installing_new_code() -> None:
     controller = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
         encoding="utf-8"
@@ -422,3 +473,140 @@ def test_github_worker_cannot_read_database_or_other_identity_credentials() -> N
     assert "EnvironmentFile=/etc/engineering-control/env/github-worker.env" in unit
     assert "EnvironmentFile=/etc/engineering-control/env/control.env" not in unit
     assert "DATABASE_URL" not in unit
+
+
+_STUBS = {
+    # Ownership, modes and ACLs are recorded, never applied (the dry run is unprivileged).
+    "install": 'echo "install $*" >>"$FAKE/calls"; for last; do :; done; mkdir -p "$last"',
+    "setfacl": 'echo "setfacl $*" >>"$FAKE/calls"',
+    "chown": 'echo "chown $*" >>"$FAKE/calls"',
+    "chmod": 'echo "chmod $*" >>"$FAKE/calls"',
+    "find": 'echo "find $*" >>"$FAKE/calls"',
+    "id": "exit 0",
+    "stat": "echo scan-runner",
+    "runuser": r"""
+shift 3  # -u hermes --
+while [[ $1 == env || $1 == *=* ]]; do shift; done
+case "$1" in
+  test)
+    # hermes traverses a directory only through a recorded named-user ACL entry.
+    grep -E "^setfacl .*u:hermes:--x.* $3\$" "$FAKE/calls" >/dev/null ;;
+  mktemp) mktemp -d "$3" ;;
+  gh) [[ $2 == repo ]] && mkdir -p "$5"; exit 0 ;;
+  git)
+    shift
+    while [[ $1 == -c || $1 == -C ]]; do last=$2; shift 2; done
+    case "$1" in
+      rev-parse) echo true ;;
+      remote) name=${last##*/}; echo "https://github.com/gntik-ai/${name%.git}.git" ;;
+    esac ;;
+esac
+""",
+}
+
+
+def _dry_run(tmp_path: Path, script: str) -> subprocess.CompletedProcess[str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in _STUBS.items():
+        stub = bin_dir / name
+        stub.write_text(f"#!{BASH}\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+    text = script.replace("${EUID} -ne 0", "0 -ne 0").replace(
+        "/srv/engineering", str(tmp_path / "srv/engineering")
+    )
+    return subprocess.run(  # noqa: S603 - fixed interpreter, generated test script
+        [BASH, "-c", text],
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_documented_worker_then_mirror_bootstrap_order_dry_run(tmp_path: Path) -> None:
+    # NEW-162 review: bootstrap-worker.sh creates the mirror root first, so the traversal
+    # ACLs must come from it; bootstrap-mirrors.sh never changes an existing root.
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    lines = worker.splitlines()
+    start = lines.index(
+        'install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"'
+    )
+    end = next(
+        i for i in range(start + 1, len(lines)) if lines[i].endswith('"${PLATFORM_ROOT}/mirrors"')
+    )
+    mirrors = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
+    calls = tmp_path / "calls"
+    calls.write_text("", encoding="utf-8")
+
+    # Without bootstrap-worker's ACLs on the (existing) root, the mirror bootstrap refuses.
+    (tmp_path / "srv/engineering/mirrors").mkdir(parents=True)
+    refused = _dry_run(tmp_path, mirrors)
+    assert refused.returncode == 1
+    assert "run bootstrap-worker.sh first" in refused.stderr
+    assert "install" not in calls.read_text(encoding="utf-8")
+
+    calls.write_text("", encoding="utf-8")
+    block = "\n".join(lines[start : end + 1])
+    worker_run = _dry_run(tmp_path, f"set -euo pipefail\nPLATFORM_ROOT=/srv/engineering\n{block}\n")
+    assert worker_run.returncode == 0, worker_run.stderr
+    root = tmp_path / "srv/engineering/mirrors"
+    for identity in (
+        "hermes",
+        "release-runner",
+        "delivery-runner",
+        "claude-runner",
+        "codex-runner",
+    ):
+        assert f"u:{identity}:--x" in calls.read_text(encoding="utf-8")
+    # Review 2: an explicit traverse-only mask, never a recalculated one.
+    root_acl = [
+        line for line in calls.read_text(encoding="utf-8").splitlines() if "u:hermes" in line
+    ]
+    assert root_acl and all(line.startswith("setfacl -n ") for line in root_acl)
+    assert all(line.split()[-2].endswith(",m::--x") for line in root_acl)
+    before = len(calls.read_text(encoding="utf-8").splitlines())
+    mirror_run = _dry_run(tmp_path, mirrors)
+    assert mirror_run.returncode == 0, mirror_run.stderr
+    recorded = calls.read_text(encoding="utf-8").splitlines()[before:]
+    # The existing root is neither re-created, re-owned, re-moded nor re-ACLed.
+    assert not any(line.split()[-1] == str(root) for line in recorded)
+    for repository in (
+        "falcone",
+        "falcone-charts",
+        "musematic",
+        "musematic-deploy",
+        "llmwiki",
+        "gntik-ui",
+    ):
+        target = root / f"{repository}.git"
+        assert target.is_dir()
+        assert f"chown -R scan-runner:scan-runner {target}" in recorded
+    # Rerun: idempotent, every mirror exists, nothing is re-owned.
+    calls.write_text("", encoding="utf-8")
+    rerun = _dry_run(tmp_path, f"setfacl --modify u:hermes:--x /srv/engineering/mirrors\n{mirrors}")
+    assert rerun.returncode == 0, rerun.stderr
+    assert not any(
+        line.startswith(("chown", "chmod", "install"))
+        for line in calls.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_mirror_bootstrap_creates_a_missing_root_with_a_traverse_only_mask(
+    tmp_path: Path,
+) -> None:
+    # NEW-162 review 2: the missing-root branch sets the same explicit --x mask as
+    # bootstrap-worker.sh (a recalculated mask re-enables broader inherited entries).
+    mirrors = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
+    (tmp_path / "calls").write_text("", encoding="utf-8")
+    run = _dry_run(tmp_path, mirrors)
+    assert run.returncode == 0, run.stderr
+    root = tmp_path / "srv/engineering/mirrors"
+    root_acl = [
+        line
+        for line in (tmp_path / "calls").read_text(encoding="utf-8").splitlines()
+        if line.startswith("setfacl") and line.endswith(f" {root}")
+    ]
+    assert len(root_acl) == 1
+    assert root_acl[0].startswith("setfacl -n --modify ")
+    assert root_acl[0].split()[-2].endswith(",m::--x")

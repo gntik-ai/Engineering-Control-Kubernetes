@@ -241,6 +241,13 @@ install -d -o root -g delivery-runner -m 0750 \
 install -d -o root -g scan-runner -m 0750 "${CONFIG_ROOT}/env/scan"
 install -d -o release-runner -g release-runner -m 0700 "${CONFIG_ROOT}/env/release"
 install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
+# NEW-162: the identities that read canonical mirrors (bootstrap-mirrors.sh, worktree
+# allocation, delivery, release) may only traverse the root. Re-applied on every run (the
+# mode above resets the ACL mask). -n with an explicit --x mask: a recalculated mask would
+# re-enable any older group or named-user write entry left on the root.
+setfacl -n --modify \
+  u:hermes:--x,u:release-runner:--x,u:delivery-runner:--x,u:claude-runner:--x,u:codex-runner:--x,m::--x \
+  "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
