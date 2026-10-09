@@ -238,6 +238,26 @@ async def test_retry_reset_lets_the_next_backlog_retry_bind(tmp_path: Path) -> N
     stuck.dispose()
 
 
+async def test_a_local_handoff_is_not_publication_evidence(tmp_path: Path) -> None:
+    """Review 2: _persist_delivery_handoff writes provider_chain and leaves the ChangeSet
+    IMPLEMENTING before any publication (no PR, publication Step or Deployment); that
+    never-published ChangeSet must still be resettable."""
+    stuck = await _stuck(tmp_path)
+    stuck.change_set(
+        state="IMPLEMENTING",
+        recovery_json={
+            **stuck.change_set().recovery_json,
+            "provider_chain": {"maker": "codex", "checker": "claude"},
+        },
+    )
+    stuck.live.loop_state("PAUSED", blocker="SOURCE_CHANGES_NOT_COMMITTED")
+
+    result = await stuck.reset()
+
+    assert result["status"] == "CHANGESET_RESET"
+    assert (result["from_state"], result["state"]) == ("IMPLEMENTING", "REQUEST_CHANGES")
+
+
 async def test_a_retry_reset_counts_toward_the_correction_limit(tmp_path: Path) -> None:
     stuck = await _stuck(tmp_path)
     limit = stuck.live.request.correction_limit + 1

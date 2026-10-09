@@ -67,9 +67,10 @@ _RESETTABLE_STATES = frozenset({ChangeSetState.PLANNED.value, ChangeSetState.IMP
 MAX_DELIVERY_CHILDREN = 256
 # recovery_json records written only from publication on (persist_publication, CI,
 # candidate/release, merge, staging, closure): any of them means work left the worktree.
+# Review 2: not provider_chain, which the local handoff (_persist_delivery_handoff, e.g.
+# SOURCE_CHANGES_NOT_COMMITTED) also writes before any publication.
 _PUBLISHED_RECOVERY_KEYS = frozenset(
     {
-        "provider_chain",
         "independent_review",
         "change_evidence",
         "release_impact",
