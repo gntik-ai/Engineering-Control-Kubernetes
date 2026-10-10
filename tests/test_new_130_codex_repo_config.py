@@ -216,6 +216,9 @@ class _Manager:
         self.changed = changed
         self.granted = False
 
+    def whitespace_check_failed(self, path: Path, *, base_sha: str) -> bool:
+        return False
+
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
         paths = self.changed[path.name]
         return {"changed_file_count": len(paths), "changed_paths": paths}, "+x\n"
@@ -454,6 +457,9 @@ def test_git_ordinary_change_beside_shipped_agent_config_passes(tmp_path: Path) 
 
 def test_validation_uses_the_manager_git_agent_config_report(tmp_path: Path) -> None:
     class Reporting(_Manager):
+        def whitespace_check_failed(self, path: Path, *, base_sha: str) -> bool:
+            return False
+
         def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
             summary, diff = super().change_evidence(path, base_sha=base_sha)
             # git C-quotes this name in changed_paths; the manager reports it raw.

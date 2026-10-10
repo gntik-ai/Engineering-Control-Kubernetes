@@ -490,6 +490,9 @@ class BaselineScanner:
 
 
 class ChangeManager:
+    def whitespace_check_failed(self, path: Path, *, base_sha: str) -> bool:
+        return False
+
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
         return (
             {"changed_file_count": 1, "changed_paths": ["app/service.py"]},
@@ -607,6 +610,25 @@ def test_postchecks_block_findings_the_change_introduces(
     assert source["diff_withheld"] is withheld
     [finding] = validated["validation_findings"]
     assert finding.startswith("source: ") and str(added[0]) in finding
+
+
+def test_whitespace_errors_go_back_to_the_maker_as_a_correction(tmp_path: Path) -> None:
+    # NEW-180: `git diff --check` problems become a correction request for the next maker
+    # round instead of failing the delivery as a non-retryable policy violation.
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+    handler._delivery_prechecks(payload)
+    handler.manager.whitespace_check_failed = (  # type: ignore[method-assign]
+        lambda path, *, base_sha: Path(path).name == "source"
+    )
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "REQUEST_CHANGES"
+    assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    [finding] = validated["validation_findings"]
+    assert finding.startswith(f"source: `git diff --check {'a' * 40}` reports whitespace")
+    assert "change_evidence" not in validated
 
 
 def test_postchecks_fail_closed_to_absolute_gate_without_a_baseline(tmp_path: Path) -> None:

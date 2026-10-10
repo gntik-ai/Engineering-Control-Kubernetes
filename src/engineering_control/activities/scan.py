@@ -3069,6 +3069,21 @@ class ScanActivityHandler(UiPlanScanSteps):
                 # prechecks baseline; scanning them would flag thousands of "introduced"
                 # findings. git clean -X never touches tracked or non-ignored files.
                 self._clean_ignored_toolchain_artifacts(worktree)
+            base_sha = str(payload[base_key])
+            if self.manager.whitespace_check_failed(worktree, base_sha=base_sha):
+                # NEW-180: the next correction round's maker is told to fix it instead of
+                # the delivery failing as a policy violation inside change_evidence's own
+                # `git diff --check`. Git's output (names, offending lines) is not relayed.
+                return {
+                    **payload,
+                    "status": "REQUEST_CHANGES",
+                    "blocker": "CHANGESET_VALIDATION_FINDINGS",
+                    "validation_findings": [
+                        f"{name}: `git diff --check {base_sha}` reports whitespace errors or "
+                        "conflict markers in the change; run it in the worktree and fix "
+                        "every reported line, generated files such as test snapshots included"
+                    ],
+                }
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
             reported = summary.get("agent_config_paths")
             refused = sorted(

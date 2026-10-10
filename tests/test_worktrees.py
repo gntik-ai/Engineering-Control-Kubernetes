@@ -191,6 +191,84 @@ def test_change_evidence_includes_tracked_and_untracked_files(tmp_path: Path) ->
     ]
 
 
+def _whitespace_allocation(tmp_path: Path) -> tuple[GitWorktreeManager, Path, str]:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    allocation = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="180",
+        change_set_id=uuid4(),
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    return manager, allocation.path, sha
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("a b/__snapshots__/Plan.snap", b"ok\n  Renews \n"),
+        ("+file", b" \tvalue \n"),
+        ("victim.py:5: trailing whitespace.\n+", b"<<<<<<< HEAD\n"),
+        ("blank.txt", b"x\n\n"),
+    ],
+)
+def test_whitespace_check_reports_problems_without_parsing_output(
+    tmp_path: Path, name: str, content: bytes
+) -> None:
+    # NEW-180: gntik-ui #16 failed as a policy violation because a generated snapshot
+    # kept rendered trailing spaces. The check only reports that problems exist; Git's
+    # output (verbatim names and offending lines) is never parsed or relayed.
+    manager, worktree, sha = _whitespace_allocation(tmp_path)
+    assert manager.whitespace_check_failed(worktree, base_sha=sha) is False
+    target = worktree / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    git(["add", "-A"], worktree)
+
+    assert manager.whitespace_check_failed(worktree, base_sha=sha) is True
+    with pytest.raises(ValueError, match="full Git SHA"):
+        manager.whitespace_check_failed(worktree, base_sha="main")
+    with pytest.raises(WorktreeError):
+        manager.whitespace_check_failed(worktree, base_sha="f" * 40)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (0, b"a:1: trailing whitespace.\n", b""),
+        (0, b"", b"warning\n"),
+        (2, b"", b""),
+        (2, b"a:1: trailing whitespace.\n", b"warning\n"),
+        (1, b"a:1: trailing whitespace.\n", b""),
+        (128, b"", b"fatal: bad revision\n"),
+    ],
+)
+def test_whitespace_check_fails_closed_on_unexpected_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    manager, worktree, sha = _whitespace_allocation(tmp_path)
+    real_run = subprocess.run
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        if "--check" in args:
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        return real_run(args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    with pytest.raises(WorktreeError, match="unexpected git diff --check"):
+        manager.whitespace_check_failed(worktree, base_sha=sha)
+
+
 def test_maker_and_checker_must_be_independent() -> None:
     with pytest.raises(ValueError, match="must differ"):
         WorktreeAccess("codex-runner", "codex-runner")
