@@ -328,6 +328,9 @@ class RecordingScanner:
 
 
 class ChangeManager:
+    def whitespace_check_failed(self, path: Path, *, base_sha: str) -> bool:
+        return False
+
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
         return {"changed_file_count": 1, "changed_paths": ["app.py"]}, "+fixed\n"
 

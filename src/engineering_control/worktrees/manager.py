@@ -884,6 +884,36 @@ class GitWorktreeManager:
             raise WorktreeError(f"snapshot has no directory {relative} at {expected_sha}")
         return tree
 
+    def whitespace_check_failed(self, path: Path, *, base_sha: str) -> bool:
+        """NEW-180: True when `git diff --check` reports whitespace or conflict-marker
+        problems in the change, False when it is clean.
+
+        Whitespace errors are the maker's to fix in a correction round, not a policy
+        violation (gntik-ui #16: a generated snapshot kept rendered trailing spaces).
+        The output is never parsed or returned: Git prints file names and offending
+        lines verbatim. Exit 2 with silent stderr is Git's "problems found" result;
+        anything else (errors, unexpected output) fails closed.
+        """
+        root = self.worktree_root.resolve()
+        resolved = path.resolve()
+        if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
+            raise WorktreeError("whitespace check escaped the bounded worktree root")
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("whitespace check base must be a full Git SHA")
+        self._run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], resolved)
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            ["git", "diff", "--no-color", "--no-ext-diff", "--check", base_sha, "--"],  # noqa: S607
+            cwd=resolved,
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+        if result.returncode == 0 and not result.stdout and not result.stderr:
+            return False
+        if result.returncode == 2 and result.stdout and not result.stderr:
+            return True
+        raise WorktreeError(f"unexpected git diff --check result ({result.returncode})")
+
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, object], str]:
         root = self.worktree_root.resolve()
         resolved = path.resolve()
