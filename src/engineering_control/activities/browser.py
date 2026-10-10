@@ -188,6 +188,12 @@ class BrowserActivityHandler:
                         admin.destroy_ephemeral_secrets()
             except ApplicationError as error:
                 blockers[project] = error.type or "SUPERADMIN_UNAVAILABLE"
+            except httpx.HTTPError:
+                # NEW-175: musematic staging stopped answering its login (2026-10-09/10, a
+                # stale Redis cluster address); the ReadTimeout escaped, failed the activity
+                # and blocked every project's cleanup. An unreachable product is a blocker
+                # of that project only, as identity.superadmin_attest already treats it.
+                blockers[project] = "BLOCKED_BY_RUNTIME_HEALTH"
         return {
             **payload,
             "status": "BLOCKED" if blockers else "PASS",

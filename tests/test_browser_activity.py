@@ -100,6 +100,50 @@ async def test_superadmin_attestation_maps_product_timeout_to_runtime_health_blo
     }
 
 
+@pytest.mark.asyncio
+async def test_an_unreachable_product_blocks_only_its_own_identity_inspection(
+    tmp_path: Path,
+) -> None:
+    # NEW-175: musematic staging stopped answering its login (2026-10-09/10). The ReadTimeout
+    # escaped identity.inspect_stale and blocked every project's nightly cleanup.
+    credential_root = tmp_path / "credentials"
+    credential = credential_root / "musematic" / "superadmin.env"
+    credential.parent.mkdir(parents=True)
+    credential.write_text(
+        "\n".join(
+            (
+                "AUTH_METHOD=username_password",
+                "BASE_URL=https://api.musematic.ai",
+                "USERNAME=bounded-test-user",
+                f"PASSWORD={secrets.token_urlsafe(32)}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("bounded product runtime timeout", request=request)
+
+    handler = BrowserActivityHandler(
+        Settings(
+            project_config_root=ROOT / "config/projects",
+            persona_config_root=ROOT / "config/personas",
+            flow_config_root=ROOT / "config/flows",
+            browser_credential_root=credential_root,
+        ),
+        api_transport=httpx.MockTransport(timeout),
+    )
+
+    result = await handler.handle("identity.inspect_stale", {"stale_identity_candidates": {}})
+
+    assert result["status"] == "BLOCKED"
+    assert result["identity_recovery_blockers"]["musematic"] == "BLOCKED_BY_RUNTIME_HEALTH"
+    # falcone has no credential here: its own blocker, independent of musematic's timeout.
+    assert set(result["identity_recovery_blockers"]) == {"falcone", "musematic"}
+    assert result["identity_recovery_blockers"]["falcone"] != "BLOCKED_BY_RUNTIME_HEALTH"
+
+
 def write_schema(path: Path) -> None:
     path.write_text(
         json.dumps(
