@@ -816,9 +816,12 @@ _R3_KEYWORDS = re.compile(r"(?<![a-z0-9])(?:" + "|".join(_R3_KEYWORD_ROOTS) + r"
 def _risk(
     issue_type: BacklogIssueType, severity: str, text: str
 ) -> Literal["R0", "R1", "R2", "R3"]:
-    if _R3_KEYWORDS.search(text) is not None:
+    # NEW-179 (operator decision 2026-10-10): a security defect needs the operator's R3
+    # approval before work starts. The release-impact floor cannot stand in for this: it
+    # rates most falcone diffs R3, and falcone's flow merges R3 without a stop.
+    if _R3_KEYWORDS.search(text) is not None or issue_type is BacklogIssueType.SECURITY_DEFECT:
         return "R3"
-    if issue_type is BacklogIssueType.SECURITY_DEFECT or severity in {"critical", "high"}:
+    if severity in {"critical", "high"}:
         return "R2"
     if issue_type in {
         BacklogIssueType.DOCUMENTATION_DEFECT,

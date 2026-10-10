@@ -515,7 +515,7 @@ def test_classification_matches_the_substring_classifier_except_false_positives(
             ]
         ]
     assert new == old
-    assert new[0][0] is BacklogIssueType.SECURITY_DEFECT and new[0][2] == "R2"
+    assert new[0][0] is BacklogIssueType.SECURITY_DEFECT and new[0][2] == "R3"
     assert new[1][1] == "critical"
     assert new[2][2] == "R3"
     assert dropped[0][2] == "R3"  # the substring false positive
@@ -674,3 +674,36 @@ def test_r3_gate_keeps_every_inflection_of_its_roots(text: str) -> None:
 )
 def test_r3_gate_ignores_roots_inside_other_words(text: str) -> None:
     assert calculated_issue_risk("gntik-ai/falcone", ("bug",), "API returns 500", text) == "R1"
+
+
+@pytest.mark.parametrize(
+    ("labels", "body"),
+    [
+        (("bug", "security", "severity:high"), "Five roles are inert on every structural route."),
+        (("type:security",), "Roles are ignored."),
+        (("bug",), "A tenant isolation gap lets one tenant read another's workspace."),
+        (("bug",), "This is an authorization bypass on the executor."),
+    ],
+)
+def test_security_defects_need_operator_r3_approval(labels: tuple[str, ...], body: str) -> None:
+    # NEW-179: falcone #1008 (labels bug/security/severity:high) imported as R2 and merged
+    # without an operator decision; a security defect is now R3 at import.
+    assert calculated_issue_risk("gntik-ai/falcone", labels, "bug: roles are inert", body) == "R3"
+
+
+def test_high_severity_and_security_enhancements_keep_their_risk() -> None:
+    # Only security defects are raised: severity alone stays R2, and a security-labelled
+    # enhancement without defect evidence stays an enhancement (not R3).
+    assert (
+        calculated_issue_risk("gntik-ai/falcone", ("bug", "severity:high"), "bug: slow", "Slow.")
+        == "R2"
+    )
+    assert (
+        calculated_issue_risk(
+            "gntik-ai/falcone",
+            ("enhancement", "security"),
+            "enhancement(worker-profile): isolated worker profile",
+            "Adds a worker profile.",
+        )
+        == "R1"
+    )
