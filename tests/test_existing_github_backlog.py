@@ -421,7 +421,10 @@ Objective: collect a licensed test corpus.
     assert deployment_enhancement.issue_type is BacklogIssueType.ENHANCEMENT
     assert deployment_enhancement.eligibility_reason == "ENHANCEMENT_DEFERRED"
     assert confirmed_defect.issue_type is BacklogIssueType.SECURITY_DEFECT
-    assert confirmed_defect.eligibility_status == "ELIGIBLE_FOR_REVALIDATION"
+    # NEW-179: a confirmed security defect is R3 and waits for the operator's approval.
+    assert confirmed_defect.calculated_risk == "R3"
+    assert confirmed_defect.eligibility_status == "DEFERRED"
+    assert confirmed_defect.eligibility_reason == "R3_REQUIRES_OPERATOR"
 
 
 def test_dependency_and_existing_pr_adoption_are_typed() -> None:
