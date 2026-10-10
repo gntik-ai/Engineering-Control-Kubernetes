@@ -27,7 +27,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -3001,8 +3001,9 @@ class GitOpsGitHubHandler:
     # -- 5. image pin ------------------------------------------------------------------
 
     def _image_pin(self, payload: dict[str, Any]) -> dict[str, Any]:
-        _, flow = self._context(payload)
-        expected = expected_image_tag(flow, self._merge_sha(payload))
+        plan, flow = self._context(payload)
+        merge_sha = self._merge_sha(payload)
+        expected = expected_image_tag(flow, merge_sha)
         text = self.broker.repository_file_text(
             flow.deploy_repository, flow.deploy_values_file, flow.deploy_branch
         )
@@ -3011,13 +3012,88 @@ class GitOpsGitHubHandler:
         # NEW-93: argocd-image-updater commits images as their builds appear; falcone #956
         # synced after 5 of 6 pins, leaving web-console (the changed image) on the old tag.
         missing = sorted(set(flow.image_repositories) - set(pinned))
+        observed_tags = {key: sorted(set(value)) for key, value in observed.items()}
+        if missing:
+            later = self._later_release_pin(plan, flow, merge_sha, observed)
+            if later is not None:
+                # NEW-174: a later release containing this merge was pinned instead (falcone
+                # #975: an image hotfix merged after the delivery shipped as v0.6.35). That
+                # release delivers the change; sync and verification follow its commit.
+                name, sha, tag = later
+                return {
+                    "status": "PINNED",
+                    "image_tag": tag,
+                    "pinned_repositories": sorted(flow.image_repositories),
+                    "missing_repositories": [],
+                    "observed_tags": observed_tags,
+                    "release_tag": name,
+                    "release_sha": sha,
+                }
         return {
             "status": "PIN_PENDING" if missing else "PINNED",
             "image_tag": expected,
             "pinned_repositories": pinned,
             "missing_repositories": missing,
-            "observed_tags": {key: sorted(set(value)) for key, value in observed.items()},
+            "observed_tags": observed_tags,
         }
+
+    def _later_release_pin(
+        self,
+        plan: Any,
+        flow: StagingFlowPolicy,
+        merge_sha: str,
+        observed: Mapping[str, Iterable[str]],
+    ) -> tuple[str, str, str] | None:
+        """NEW-174: (release tag, full commit, image tag) when every flow image is pinned to
+        exactly one image tag that maps to exactly one later release commit containing the
+        merge, whose configured image build succeeded; else None (fail closed). Only real,
+        canonical release tags count (full SHAs from the tag refs), never a bare image tag.
+        """
+        tags: set[str] = set()
+        for repository in flow.image_repositories:
+            pinned = set(observed.get(repository) or ())
+            if len(pinned) != 1:
+                return None  # missing, or contradictory occurrences of one repository
+            tags |= pinned
+        if len(tags) != 1 or flow.image_workflow is None:
+            return None
+        (tag,) = tags
+        prefix = flow.release_tag.prefix
+        pattern = re.compile(
+            rf"{re.escape(prefix)}(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        )
+        candidates = {
+            (ref["ref"].removeprefix("refs/tags/"), str(ref.get("sha") or ""))
+            for ref in self.broker.list_tag_refs(plan.source_repository, prefix)
+            if ref.get("type") == "commit"
+            and pattern.fullmatch(ref["ref"].removeprefix("refs/tags/"))
+            and _SHA.fullmatch(str(ref.get("sha") or ""))
+            and expected_image_tag(flow, str(ref.get("sha"))) == tag
+        }
+        # A short image tag shared by two release commits is ambiguous: the images could
+        # come from either, and runtime verification sees only the short tag.
+        if len({sha for _, sha in candidates}) != 1:
+            return None
+        name, sha = sorted(candidates)[0]
+        if sha == merge_sha or not self.broker.commit_contains(
+            plan.source_repository, ancestor=merge_sha, descendant=sha
+        ):
+            return None
+        runs = [
+            run
+            for run in self.broker.list_workflow_runs(
+                plan.source_repository, workflow_name=flow.image_workflow, commit_sha=sha
+            )
+            if run.get("headSha") == sha
+        ]
+        # The release pipeline must have passed for that exact commit (as NEW-68 requires).
+        if not any(
+            str(run.get("status") or "").lower() == "completed"
+            and str(run.get("conclusion") or "").lower() == "success"
+            for run in runs
+        ):
+            return None
+        return name, sha, tag
 
     # -- 4. environment issue ----------------------------------------------------------
 

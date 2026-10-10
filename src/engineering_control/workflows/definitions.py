@@ -2559,6 +2559,11 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     _MERGE_ROUNDS = 20
     _REMEDIATION_ROUNDS = 3
 
+    def _later_release_pin_patched(self) -> bool:
+        # NEW-174: asked only when the pin step reports a later release, so a history
+        # recorded before this change (no release_sha in its pin result) replays unchanged.
+        return workflow.patched("gitops-later-release-pin-v1")
+
     def _notify_merged_patched(self) -> bool:
         # NEW-127: histories recorded before this marker have no notify_merged step.
         return workflow.patched("gitops-notify-merged-v1")
@@ -2789,6 +2794,13 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             return {"status": "BLOCKED", "blocker": "IMAGE_NOT_PINNED"}
         if pin.get("status") != "PINNED":
             return self._blocked(pin, "IMAGE_NOT_PINNED")
+        if pin.get("release_sha") and self._later_release_pin_patched():
+            # NEW-174: a later release containing the merge was pinned (an image hotfix
+            # after the delivery); sync and verification follow its commit, as NEW-68 does
+            # for a later release found while waiting for the image build.
+            deployed_base = {**deployed_base, "merge_sha": str(pin["release_sha"])}
+            evidence["release_tag"] = pin.get("release_tag")
+            evidence["release_sha"] = str(pin["release_sha"])
         evidence["image_tag"] = pin.get("image_tag")
         evidence["pinned_repositories"] = list(pin.get("pinned_repositories") or [])
 
