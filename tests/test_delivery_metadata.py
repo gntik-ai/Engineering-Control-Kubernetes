@@ -1548,6 +1548,8 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         "node --experimental-loader ./tests/helpers/l.mjs tests/a.test.mjs",
         "node --test tests/.hidden/a.test.mjs",  # no part starting with '.', as stated
         "node --test 'tests/auth login.test.mjs'",  # no spaces, as stated
+        "node --test tests//a.test.mjs",  # single '/' separators, as stated
+        "cd apps//web && node --test test/a.test.mjs",
     ):
         assert parse_node_test_command(command, prefixes=prefixes) is None, command
 
