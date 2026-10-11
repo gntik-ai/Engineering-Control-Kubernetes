@@ -1523,6 +1523,8 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         assert "Report a test as FAIL only when it ran and the code under test failed it" in prompt
         assert "is SKIPPED with that exact reason" in prompt
         assert "Never mark a real assertion failure as SKIPPED" in prompt
+        # NEW-184: a red-before-green run is never a test result row.
+        assert "The tests list holds only the results of your final commit" in prompt
         # NEW-177: FAILs must be in the shape the base-commit rerun accepts.
         assert "exactly `[cd <relative directory> &&] node --test <test file>`: no flags" in prompt
         assert "one failing test file per command" in prompt
