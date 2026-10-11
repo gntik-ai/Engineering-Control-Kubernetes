@@ -3642,16 +3642,20 @@ class MetadataActivityHandler:
             # failed, because the maker reported it through a /tmp loader, without --test or
             # through a wrapper script, which the base-commit rerun (NEW-161) cannot run.
             "The platform reruns each reported FAIL at the base commit to tell a failure "
-            "main already has from one this change caused. It can rerun only a project "
-            "test command it already knows or a plain `node --test [node:test flags such as "
-            "--test-name-pattern] <test files>` run from the repository root with test file "
-            f"paths under {' or '.join(self.settings.node_test_path_prefixes)}. Report every "
-            "failing JavaScript suite in that plain shape, naming the failing test files "
-            "themselves (several files may share one command; use at most three such "
-            "commands): never a wrapper (such as `bash tests/blackbox/run.sh` or "
-            "`pnpm test`), a `--loader` or `--import` hook, or a helper file outside the "
-            "repository (such as /tmp). A FAIL reported any other way blocks the delivery "
-            "even when main fails the same way.\n"
+            "main already has from one this change caused, and it can rerun only two shapes. "
+            "A failure of a project test command it already knows (for example a configured "
+            "Vitest or pytest command) is reported exactly as configured. A failing node:test "
+            "suite is reported as `[cd <relative directory> &&] node --test [flags] <test "
+            "files>`, with the test file paths relative to that directory and under "
+            f"{' or '.join(self.settings.node_test_path_prefixes)}, and with no flags other "
+            "than --test-name-pattern=<pattern>, --test-isolation=none|process, "
+            "--test-concurrency=<n> and --test-timeout=<ms> (always written with '='). Name "
+            "the failing test files themselves, never a wrapper (such as `bash "
+            "tests/blackbox/run.sh` or `pnpm test`), a `--loader` or `--import` hook, or a "
+            "helper file outside the repository (such as /tmp). The two makers of one "
+            "delivery share a budget of three node:test commands, so put all of your failing "
+            "node:test files (up to 32) in a single command. A FAIL the platform cannot "
+            "rerun blocks the delivery even when main fails the same way.\n"
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.
