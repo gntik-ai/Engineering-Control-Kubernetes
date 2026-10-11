@@ -176,6 +176,9 @@ delivery_control:
 # fe6ccc0 and main de2cdde only versions, changelogs and the release workflow changed. The
 # digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-de2cdde (main after
 # the 0.2.0 registry regeneration). Pre-pull it on the worker before the next kit snapshot.
+# Operator decision 2026-10-11: one bump after gntik-ui#17 shipped, from 0.2.0 to 0.4.0
+# (0.3.0 released 10-11 at e7c40ba, 0.4.0 at 20579e2 with the flow-builder extensions).
+# The digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-20579e2.
 ui_migration:
   legacy_app: apps/web-console
   target_app: apps/web-console-next
@@ -183,10 +186,10 @@ ui_migration:
   gntik_ui:
     registry: npm.pkg.github.com
     scope: "@gntik-ai"
-    version: 0.2.0
+    version: 0.4.0
   mcp:
     image: ghcr.io/gntik-ai/gntik-ui-mcp
-    digest: sha256:c6b0d08975006af334c73a18ccd3c291d01be478f2821d21b89d852f205f900b
+    digest: sha256:6b892c6ee288886dd7aed840f6d0819d180fcdf32c79e79de166ebe9ec395ecf
     socket: /run/gntik-ui-mcp/mcp.sock
   route_tables:
     control_plane_routes: apps/control-plane/routes.mjs

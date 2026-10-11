@@ -99,10 +99,10 @@ def test_falcone_manifest_declares_a_pinned_ui_migration_block() -> None:
     assert policy.api_package == "packages/console-api"
     assert policy.gntik_ui.registry == "npm.pkg.github.com"
     assert policy.gntik_ui.scope == "@gntik-ai"
-    assert policy.gntik_ui.version == "0.2.0"
+    assert policy.gntik_ui.version == "0.4.0"
     assert policy.mcp.reference() == (
         "ghcr.io/gntik-ai/gntik-ui-mcp@sha256:"
-        "c6b0d08975006af334c73a18ccd3c291d01be478f2821d21b89d852f205f900b"
+        "6b892c6ee288886dd7aed840f6d0819d180fcdf32c79e79de166ebe9ec395ecf"
     )
     assert policy.route_tables.control_plane_routes == "apps/control-plane/routes.mjs"
     assert policy.route_tables.gateway_config == "deploy/kind/apisix/apisix.yaml"
