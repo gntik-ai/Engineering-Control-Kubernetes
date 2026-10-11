@@ -2696,10 +2696,10 @@ class ScanActivityHandler(UiPlanScanSteps):
             and isinstance(files, list)
             and all(isinstance(item, str) for item in files)
             and isinstance(value.get("output_tail"), str)
-            and (
-                value.get("test_failures") is None
-                or (counts(value.get("test_failures")) and counts(value.get("other_failures")))
-            )
+            # NEW-186: an entry without a report (cached before NEW-186 when the sandbox
+            # never started) is rerun, never trusted.
+            and counts(value.get("test_failures"))
+            and counts(value.get("other_failures"))
         )
 
     def _node_test_base_result(
@@ -2804,10 +2804,17 @@ class ScanActivityHandler(UiPlanScanSteps):
         text = str(SecretRedactor().redact_text(f"{visible}\n{run.stderr}").value)
         result["exit_code"] = run.return_code
         result["output_tail"] = text.strip()[-_BASELINE_OUTPUT_TAIL:]
-        if report is not None:
-            result["test_failures"] = dict(sorted(report.test_failures.items()))
-            result["other_failures"] = dict(sorted(report.other_failures.items()))
-            result["passed"] = report.passed
+        if report is None:
+            # NEW-186: no report block means the sandbox or node never ran the suite
+            # (falcone #1099: bwrap could not mount /proc). Fail visibly as a baseline
+            # error and never cache it, instead of a silent "not pre-existing".
+            raise ValueError(
+                f"node test sandbox produced no report (exit {run.return_code}): "
+                f"{result['output_tail'][-300:]}"
+            )
+        result["test_failures"] = dict(sorted(report.test_failures.items()))
+        result["other_failures"] = dict(sorted(report.other_failures.items()))
+        result["passed"] = report.passed
         return result
 
     @staticmethod

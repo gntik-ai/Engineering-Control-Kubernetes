@@ -267,7 +267,7 @@ def _fail(
 
 
 def _block(*lines: str, passed: int = 1, nonce: str = NONCE) -> str:
-    begin = f"{nonce} BEGIN " + json.dumps({"hermes": 3, "passed": passed, "truncated": False})
+    begin = f"{nonce} BEGIN " + json.dumps({"hermes": 4, "passed": passed, "truncated": False})
     count = sum(" FAIL " in line for line in lines)
     return "\n".join([begin, *lines, f"{nonce} END {count}"])
 
@@ -313,7 +313,7 @@ def test_reporter_output_needs_this_runs_complete_block() -> None:
         _block(_fail("x")).rsplit("\n", 1)[0],  # no END marker: truncated tail
         _block(f"{NONCE} FAIL not json"),
         _block(f"{NONCE} FAIL []"),
-        f"{NONCE} BEGIN " + json.dumps({"hermes": 3, "passed": 0, "truncated": True}),
+        f"{NONCE} BEGIN " + json.dumps({"hermes": 4, "passed": 0, "truncated": True}),
         f"{NONCE} BEGIN " + json.dumps({"hermes": 1, "passed": 0, "truncated": False}),
     ]:
         assert parse_reporter_output(text, NONCE, FILES, ".") is None
@@ -354,6 +354,9 @@ def test_sandbox_is_read_only_but_a_size_capped_tmpfs(tmp_path: Path) -> None:
     assert "--share-net" not in arguments
     # The only writable mount is a 256 MiB tmpfs; no host path is bound writable.
     assert "--bind" not in arguments and "--overlay-src" not in arguments
+    # NEW-186: no /proc at all (a fresh procfs is refused under the worker's
+    # ProtectKernelTunables; the worker's own /proc would expose other processes' argv).
+    assert "--proc" not in arguments and "/proc" not in arguments
     index = arguments.index("--size")
     assert arguments[index : index + 4] == ["--size", str(256 * 1024 * 1024), "--tmpfs", "/tmp"]  # noqa: S108
     assert arguments.count("--tmpfs") == 1
@@ -648,7 +651,39 @@ def test_unparseable_report_still_blocks(tmp_path: Path) -> None:
     runner.write_report = False  # no block for this run's nonce
     handler, payload = _setup(tmp_path, runner)
 
-    assert handler._validate_changeset(payload)["blocker"] == "MAKER_TEST_FAILURE"
+    validated = handler._validate_changeset(payload)
+    assert validated["blocker"] == "MAKER_TEST_FAILURE"
+    # NEW-186: a run without a report is a visible baseline error, never cached.
+    assert "produced no report" in validated["baseline_error"]
+    root = _baseline_root(tmp_path, payload["source_base_sha"])
+    assert (
+        not (root / "results.json").exists()
+        or json.loads((root / "results.json").read_text()) == {}
+    )
+    runner.write_report = True
+    assert handler._validate_changeset({**payload})["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(runner.calls) == 2
+
+
+def test_a_cached_entry_without_a_report_is_rerun_new_186(tmp_path: Path) -> None:
+    """falcone #1099 (2026-10-11): before NEW-186 the base run's sandbox could not mount
+    /proc, so a report-less result (test_failures None) was cached and trusted."""
+    runner = SandboxRunner(FAILING_098)
+    handler, payload = _setup(tmp_path, runner)
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    root = _baseline_root(tmp_path, payload["source_base_sha"])
+    cached = json.loads((root / "results.json").read_text())
+    [key] = cached
+    cached[key].update(
+        test_failures=None,
+        other_failures=None,
+        passed=0,
+        output_tail="bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+    )
+    (root / "results.json").write_text(json.dumps(cached))
+
+    assert handler._validate_changeset({**payload})["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(runner.calls) == 2
 
 
 def test_ineligible_commands_never_run_anything(tmp_path: Path) -> None:
@@ -761,7 +796,7 @@ def test_base_result_is_cached(tmp_path: Path) -> None:
         "cwd": ".",
         "kind": "node_test",
         "prepare": None,
-        "reporter": 3,
+        "reporter": 4,
     }
     assert value["exit_code"] == 1 and len(value["test_failures"]) == 9
     assert (root / "prepared").read_text() == f"{payload['source_base_sha']} unprepared\n"
@@ -937,7 +972,40 @@ def test_real_sandbox_tmpfs_is_capped_and_the_checkout_read_only(tmp_path: Path)
     assert not os.listdir(checkout / "tests" / "integration" / "098-plan-base-limits")[1:]
 
 
-@pytest.mark.parametrize("code", ["EROFS", "ENOSPC", "EACCES", "EPERM", "EDQUOT", "ENOTFOUND"])
+@REAL_SANDBOX
+def test_real_sandbox_has_no_proc_and_proc_failures_are_not_evidence_new_186(
+    tmp_path: Path,
+) -> None:
+    """NEW-186: the base runs without /proc, so no other process is visible, and a base
+    failure that only names /proc is sandbox-caused, never pre-existing evidence."""
+    node = _real_node()
+    assert node is not None
+    prelude = (
+        "import { existsSync, readFileSync } from 'node:fs';\n"
+        "test('reads proc', () => { readFileSync('/proc/self/status', 'utf8'); });\n"
+        "test('native memory usage', () => { process.memoryUsage(); });\n"
+        "test('sees no foreign process', () => {"
+        " if (existsSync('/proc/1/cmdline')) throw new Error('foreign process visible'); });\n"
+    )
+    handler, payload = _setup(
+        tmp_path, None, settings=_settings(tmp_path, node.parent.parent), prelude=prelude
+    )
+
+    validated = handler._validate_changeset(payload)
+
+    [evidence] = validated["preexisting_test_failures"]
+    assert f"{LIMITS}#0: reads proc" not in evidence["base_failing_tests"]
+    assert f"{LIMITS}#0: sees no foreign process" not in evidence["base_failing_tests"]
+    assert f"{LIMITS}#0: reads proc" in evidence["base_other_failures"]
+    # NEW-186 review 2: a native API that reads /proc fails with ENOENT, not evidence.
+    assert f"{LIMITS}#0: native memory usage" not in evidence["base_failing_tests"]
+    assert evidence["base_failing_tests"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["EROFS", "ENOSPC", "EACCES", "EPERM", "EDQUOT", "ENOTFOUND", "EHERMESPROC", "ENOENT"],
+)
 def test_review_2_sandbox_error_codes_are_never_test_level(code: str) -> None:
     text = _block(_fail("writes", codes=(code,)), _fail("real"))
     report = parse_reporter_output(text, NONCE, ["tests/a.test.mjs"], ".")
