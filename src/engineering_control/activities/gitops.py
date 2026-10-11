@@ -45,6 +45,7 @@ from engineering_control.adapters.github.client import (
     GhCliBroker,
     GhCliPolicyError,
     pull_request_head_repository,
+    same_repository_pull_request,
 )
 from engineering_control.config import Settings
 from engineering_control.db import models as db
@@ -2627,7 +2628,18 @@ class GitOpsGitHubHandler:
         digest = hashlib.sha256("\n".join(markers).encode()).hexdigest()[:8]
         branch = f"hermes/ci-baseline/{main[:12]}-{digest}"
         binding = f"changeset:{plan.change_set_id}"
-        existing = self.broker.list_pull_requests(repository, head=branch, state="all")
+        try:
+            # NEW-181 review: `--head` also matches a fork's branch of the same name, whose
+            # failing checks would excuse a real regression; only this repository's own
+            # baseline branch (write access, like Hermes) into the base branch counts.
+            existing = [
+                pull
+                for pull in self.broker.list_pull_requests(repository, head=branch, state="all")
+                if same_repository_pull_request(pull, repository)
+                and pull.get("baseRefName") == plan.source_base_branch
+            ]
+        except GhCliPolicyError:
+            return {"status": "BLOCKED", "blocker": "CI_BASELINE_UNVERIFIED"}
         if not existing:
             if not create:
                 return {"status": "BLOCKED", "blocker": "CI_BASELINE_MISSING"}
@@ -2635,6 +2647,19 @@ class GitOpsGitHubHandler:
             self._open_baseline(plan, branch, main, markers, binding)
             return {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
         baseline = self.broker.view_pull_request(repository, int(existing[0]["number"]))
+        try:
+            verified = (
+                same_repository_pull_request(baseline, repository)
+                and baseline.get("headRefName") == branch
+                and baseline.get("baseRefName") == plan.source_base_branch
+            )
+        except GhCliPolicyError:
+            verified = False
+        if not verified:
+            return {"status": "BLOCKED", "blocker": "CI_BASELINE_UNVERIFIED"}
+        # NEW-181 review: the PR's continue-on-error checks are ignored, so the baseline's
+        # are too; a still-running visual job must not hold back the regression verdict.
+        baseline = without_checks(baseline, _non_blocking(flow))
         baseline_states = _check_states(baseline)
         if not baseline_states or any(value == "PENDING" for value in baseline_states.values()):
             if baseline.get("state") != "OPEN":

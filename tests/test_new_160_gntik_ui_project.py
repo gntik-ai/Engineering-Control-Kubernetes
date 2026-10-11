@@ -599,6 +599,9 @@ class _BaselineMergeGh(_MergeGh, BaselineGh):
                 "number": 900,
                 "headRefName": head,
                 "headRefOid": self.branches[head],
+                "headRepository": {"name": "gntik-ui"},
+                "headRepositoryOwner": {"login": "gntik-ai"},
+                "isCrossRepository": False,
             }
             return f"https://github.com/{REPOSITORY}/pull/900\n"
         return super()._answer(args)
@@ -1343,3 +1346,44 @@ async def test_a_legacy_duplicate_deployment_binding_is_ignored_for_a_self_conta
     assert prepared["plan"]["deployment_pr_number"] is None
     with pytest.raises(ValidationError, match="self-contained plan has no deployment PR"):
         _plan(deployment_pr_number=41, deployment_pr_url=PR_URL, deployment_head_sha=HEAD_SHA)
+
+
+async def test_the_baseline_ignores_its_continue_on_error_jobs_new_181(tmp_path: Path) -> None:
+    """NEW-181 review: a still-running baseline visual job never delays the verdict."""
+    handler, baseline = _baseline_github(
+        tmp_path, [GREEN[0], _check("a11y", "FAILURE"), _check("visual", "SUCCESS")], CHANGED
+    )
+    await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    baseline.finish_baseline(
+        [_check("checks", "SUCCESS"), _check("a11y", "SUCCESS"), _check("visual", None)]
+    )
+    failed = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert failed["blocker"] == "SOURCE_PR_CI_REGRESSION" and failed["failed_checks"] == ["a11y"]
+
+
+async def test_a_fork_branch_named_like_the_baseline_never_excuses_failures_new_181(
+    tmp_path: Path,
+) -> None:
+    """NEW-181 review: `gh pr list --head` also matches forks; their checks never count."""
+    handler, baseline = _baseline_github(
+        tmp_path, [GREEN[0], _check("a11y", "FAILURE"), _check("visual", "SUCCESS")], CHANGED
+    )
+    await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    [branch] = baseline.branches
+    own = baseline.pull_requests.pop((REPOSITORY, 900))
+    baseline.pull_requests[(REPOSITORY, 901)] = {
+        **own,
+        "number": 901,
+        "state": "CLOSED",
+        "headRepositoryOwner": {"login": "attacker"},
+        "isCrossRepository": True,
+        "statusCheckRollup": [_check("checks", "SUCCESS"), _check("a11y", "FAILURE")],
+    }
+    baseline.branches.clear()
+    again = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    # The fork's failing a11y is ignored; Hermes opens its own baseline instead.
+    assert again == {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
+    assert list(baseline.branches) == [branch]
+    blocked = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert blocked["status"] == "BLOCKED"
+    assert not any(call[:2] == ["pr", "merge"] for call in baseline.calls)
