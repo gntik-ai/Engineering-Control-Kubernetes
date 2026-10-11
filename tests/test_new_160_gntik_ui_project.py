@@ -27,7 +27,9 @@ from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_staging_gitops import (
+    MAIN_SHA,
     MERGE_SHA,
+    BaselineGh,
     FakeGh,
     FakeKubectl,
     _config_root,
@@ -117,6 +119,12 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
     merge = manifest.merge_delivery()
     assert merge is not None and merge.enabled and merge.source_ci_workflow == "ci"
     assert merge.non_blocking_checks == ("visual",)
+    # NEW-181: PR CI failures that main does not share go back to the maker for repair.
+    assert merge.ci_baseline.enabled
+    assert {marker.path for marker in merge.ci_baseline.markers} == {".hermes-ci-baseline"}
+    scopes = {marker.scope for marker in merge.ci_baseline.markers}
+    assert {"apps/", "packages/", "blocks/", ".changeset/", "pnpm-"} <= scopes
+    assert not any(scope.startswith(".github") for scope in scopes)
     assert merge.changeset.enabled and merge.changeset.package_paths == ("packages/", "blocks/")
     assert ".github/" in merge.protected_paths
     assert manifest.merge_delivery_blockers() == []
@@ -557,12 +565,75 @@ async def test_the_continue_on_error_visual_job_never_blocks(tmp_path: Path) -> 
         assert merged["status"] == "MERGED" and merged["merge_sha"] == MERGE_SHA
         assert [call[:2] for call in fake.mutations] == [["pr", "ready"], ["pr", "merge"]]
     # Every other check still blocks.
-    handler, fake = _github(tmp_path / "a11y", [GREEN[0], _check("a11y", "FAILURE")], CHANGED)
+    handler, baseline = _baseline_github(
+        tmp_path / "a11y", [GREEN[0], _check("a11y", "FAILURE")], CHANGED
+    )
+    started = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert started == {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
+    baseline.finish_baseline([_check("checks", "SUCCESS"), _check("a11y", "SUCCESS")])
     failed = await handler.handle("gitops.pr_checks", {"plan": _plan()})
-    assert failed["blocker"] == "SOURCE_PR_CI_FAILED" and failed["failed_checks"] == ["a11y"]
-    pending = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
-    assert pending["status"] == "MERGE_PENDING"
-    assert ["pr", "merge"] not in [call[:2] for call in fake.mutations]
+    assert failed["blocker"] == "SOURCE_PR_CI_REGRESSION" and failed["failed_checks"] == ["a11y"]
+    blocked = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert blocked["status"] == "BLOCKED"
+    assert not any(call[:2] == ["pr", "merge"] for call in baseline.calls)
+
+
+class _BaselineMergeGh(_MergeGh, BaselineGh):
+    """_MergeGh's file listing and changesets plus BaselineGh's baseline branch and PR."""
+
+    def __init__(self, changed: list[str]) -> None:
+        BaselineGh.__init__(self, [])
+        self.changed = _MergeGh(changed).changed
+        self.absent_at_head = set()
+
+    def _answer(self, args: list[str]) -> str:
+        if args[0] == "api" and args[1].endswith("/pulls/41/files") and ".status" not in args[-1]:
+            # The baseline's listing (filename and previous name only).
+            return "\n".join(
+                "\t".join(entry.split("\t")[::2]).rstrip("\t") for entry in self.changed
+            )
+        if args[:2] == ["pr", "create"]:
+            head = args[args.index("--head") + 1]
+            self.pull_requests[(REPOSITORY, 900)] = {
+                **_pull_request([]),
+                "number": 900,
+                "headRefName": head,
+                "headRefOid": self.branches[head],
+            }
+            return f"https://github.com/{REPOSITORY}/pull/900\n"
+        return super()._answer(args)
+
+    def finish_baseline(self, checks: list[dict[str, Any]]) -> None:
+        self.pull_requests[(REPOSITORY, 900)]["statusCheckRollup"] = checks
+
+
+def _baseline_github(
+    tmp_path: Path, checks: list[dict[str, Any]], changed: list[str]
+) -> tuple[GitOpsGitHubHandler, _BaselineMergeGh]:
+    fake = _BaselineMergeGh(changed)
+    settings = _settings(
+        tmp_path,
+        project_config_root=_config_root(tmp_path, safe_repositories=SAFE),
+        github_writes_enabled=True,
+    )
+    fake.pull_requests[(REPOSITORY, 41)] = _pull_request(checks)
+    return GitOpsGitHubHandler(settings, runner=fake), fake  # type: ignore[arg-type]
+
+
+async def test_a_ci_failure_main_shares_is_preexisting_new_181(tmp_path: Path) -> None:
+    """NEW-181: the root marker reruns every job on main; only new failures block."""
+    handler, baseline = _baseline_github(
+        tmp_path, [GREEN[0], _check("a11y", "FAILURE"), _check("visual", "SUCCESS")], CHANGED
+    )
+    await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    [branch] = baseline.branches
+    assert branch.startswith(f"hermes/ci-baseline/{MAIN_SHA[:12]}-")
+    assert baseline.markers == [(branch, ".hermes-ci-baseline")]
+    baseline.finish_baseline([_check("checks", "SUCCESS"), _check("a11y", "FAILURE")])
+    passed = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert passed["status"] == "CHECKS_PASSED"
+    assert passed["ci_baseline"]["preexisting_failures"] == ["a11y"]
+    assert baseline.pull_requests[(REPOSITORY, 900)]["state"] == "CLOSED"
 
 
 @pytest.mark.parametrize(
