@@ -94,8 +94,12 @@ _TEST_LEVEL_FAILURES = frozenset({"testCodeFailure", "testTimeoutFailure"})
 # dropped privileges). A base failure carrying one is never evidence of a real failure.
 SANDBOX_ERROR_CODES = frozenset(
     {
-        # NEW-186: the sandbox has no /proc; the v4 reporter tags errors naming it.
+        # NEW-186: the sandbox has no /proc; the v4 reporter tags errors naming it, and
+        # node's native APIs that read it fail with ENOENT without naming it
+        # (process.memoryUsage(): "ENOENT ... uv_resident_set_memory"). Fail closed: an
+        # ENOENT base failure is never pre-existing evidence.
         "EHERMESPROC",
+        "ENOENT",
         "EROFS",
         "ENOSPC",
         "EDQUOT",
@@ -468,8 +472,10 @@ def sandbox_argv(
         # read-only mounts over /proc subtrees, so the kernel refuses a fresh procfs in
         # bwrap's unprivileged namespace ("Can't mount proc on /newroot/proc"), and
         # binding the worker's /proc would expose other processes' command lines to the
-        # base code. node runs without it; failures naming /proc are sandbox-caused
-        # (EHERMESPROC, never pre-existing evidence).
+        # base code. node runs without it; failures naming /proc (EHERMESPROC) or
+        # carrying ENOENT are sandbox-caused, never pre-existing evidence. Residual: APIs
+        # that degrade silently without /proc (os.cpus() returns []) can still fail a
+        # base test; the checker and the pull request's CI still gate the merge.
         "--dev",
         "/dev",
         "--size",

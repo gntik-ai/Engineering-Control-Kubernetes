@@ -983,6 +983,7 @@ def test_real_sandbox_has_no_proc_and_proc_failures_are_not_evidence_new_186(
     prelude = (
         "import { existsSync, readFileSync } from 'node:fs';\n"
         "test('reads proc', () => { readFileSync('/proc/self/status', 'utf8'); });\n"
+        "test('native memory usage', () => { process.memoryUsage(); });\n"
         "test('sees no foreign process', () => {"
         " if (existsSync('/proc/1/cmdline')) throw new Error('foreign process visible'); });\n"
     )
@@ -996,11 +997,14 @@ def test_real_sandbox_has_no_proc_and_proc_failures_are_not_evidence_new_186(
     assert f"{LIMITS}#0: reads proc" not in evidence["base_failing_tests"]
     assert f"{LIMITS}#0: sees no foreign process" not in evidence["base_failing_tests"]
     assert f"{LIMITS}#0: reads proc" in evidence["base_other_failures"]
+    # NEW-186 review 2: a native API that reads /proc fails with ENOENT, not evidence.
+    assert f"{LIMITS}#0: native memory usage" not in evidence["base_failing_tests"]
     assert evidence["base_failing_tests"]
 
 
 @pytest.mark.parametrize(
-    "code", ["EROFS", "ENOSPC", "EACCES", "EPERM", "EDQUOT", "ENOTFOUND", "EHERMESPROC"]
+    "code",
+    ["EROFS", "ENOSPC", "EACCES", "EPERM", "EDQUOT", "ENOTFOUND", "EHERMESPROC", "ENOENT"],
 )
 def test_review_2_sandbox_error_codes_are_never_test_level(code: str) -> None:
     text = _block(_fail("writes", codes=(code,)), _fail("real"))
