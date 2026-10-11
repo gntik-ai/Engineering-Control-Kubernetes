@@ -3581,6 +3581,18 @@ class MetadataActivityHandler:
                 "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
                 "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
+        if ci_regressions:
+            # NEW-185: gntik-ui #17's CI repairs made empty commits because the OpenSpec
+            # tasks demanded a local red reproduction and its a11y job needs a browser the
+            # sandbox cannot start (listen/setsockopt EPERM).
+            derived_content += (
+                "These CI failures are already reproduced: the CI run is the red evidence, "
+                "so a task that asks for a failing reproduction first is satisfied by it. "
+                "When a failing job cannot run in this sandbox (for example a browser or "
+                "service test), do not stop for a local reproduction: fix the cause the "
+                "log shows, run what you can, and report that job SKIPPED with the reason. "
+                "The pull request's CI reruns it, and its result decides the merge.\n"
+            )
         if ci_regressions and ci_excerpts:
             # NEW-100: the failing log lines (CI output is untrusted data, fenced below).
             derived_content += "Failing lines from each job's CI log:\n" + "".join(
