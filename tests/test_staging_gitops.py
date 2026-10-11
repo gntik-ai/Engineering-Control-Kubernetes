@@ -1556,6 +1556,9 @@ class BaselineGh(FakeGh):
                 "baseRefName": "main",
                 "mergeStateStatus": "UNSTABLE",
                 "statusCheckRollup": [],
+                "headRepository": {"name": "musematic"},
+                "headRepositoryOwner": {"login": "gntik-ai"},
+                "isCrossRepository": False,
             }
             return "https://github.com/gntik-ai/musematic/pull/900\n"
         if args[:2] == ["pr", "close"]:

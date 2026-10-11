@@ -50,6 +50,31 @@ delivery_control:
     # ci.yml's `visual` job is continue-on-error (baselines are recorded on the CI
     # runner); its result never blocks the merge. Every other check must pass.
     non_blocking_checks: [visual]
+    # NEW-181: without a baseline, a PR CI failure only paused the loop (SOURCE_PR_CI_FAILED,
+    # gntik-ui#17) and a retry re-read the same red checks; the maker never got a repair round.
+    # With it, jobs failing in the PR but not on a baseline PR from main are attributed to the
+    # ChangeSet (SOURCE_PR_CI_REGRESSION) and handed back to the maker with their log excerpts
+    # (NEW-64/NEW-100). ci.yml has no path filters, so one root marker runs every job; the
+    # scopes cover every top-level entry except the protected paths (.github/ never gets the
+    # baseline, and .claude/, AGENTS.md and CLAUDE.md are refused before publication).
+    ci_baseline:
+      enabled: true
+      markers:
+        - {scope: .changeset/, path: .hermes-ci-baseline}
+        - {scope: .gitignore, path: .hermes-ci-baseline}
+        - {scope: .nvmrc, path: .hermes-ci-baseline}
+        - {scope: INVENTORY.md, path: .hermes-ci-baseline}
+        - {scope: README.md, path: .hermes-ci-baseline}
+        - {scope: apps/, path: .hermes-ci-baseline}
+        - {scope: blocks/, path: .hermes-ci-baseline}
+        - {scope: docs/, path: .hermes-ci-baseline}
+        - {scope: eslint.config.js, path: .hermes-ci-baseline}
+        - {scope: kit-registry.json, path: .hermes-ci-baseline}
+        - {scope: package.json, path: .hermes-ci-baseline}
+        - {scope: packages/, path: .hermes-ci-baseline}
+        - {scope: pnpm-, path: .hermes-ci-baseline}
+        - {scope: registry.json, path: .hermes-ci-baseline}
+        - {scope: vercel.json, path: .hermes-ci-baseline}
     # Every PR that touches a published package carries a changeset.
     changeset:
       enabled: true
