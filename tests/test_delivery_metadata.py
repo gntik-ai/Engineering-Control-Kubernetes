@@ -1524,25 +1524,24 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         assert "is SKIPPED with that exact reason" in prompt
         assert "Never mark a real assertion failure as SKIPPED" in prompt
         # NEW-177: FAILs must be in the shape the base-commit rerun accepts.
-        assert "`[cd <relative directory> &&] node --test [flags] <test files>`" in prompt
+        assert "`[cd <relative directory> &&] node --test [flags] <test file>`" in prompt
+        assert "one failing test file per command" in prompt
         assert "under tests/ or test/" in prompt
-        assert "never a wrapper (such as `bash tests/blackbox/run.sh`" in prompt
-        assert "share a budget of three node:test commands" in prompt
+        assert "Never report a wrapper (such as `bash tests/blackbox/run.sh`" in prompt
+        assert "share a budget of three such node:test commands" in prompt
         assert "reported exactly as configured" in prompt
     # NEW-177 review: every shape and flag the prompt names is one the base rerun parses.
     from engineering_control.activities.scan import _NODE_TEST_MAX_COMMANDS
-    from engineering_control.engineering.node_test_baseline import (
-        MAX_PATH_ARGUMENTS,
-        parse_node_test_command,
-    )
+    from engineering_control.engineering.node_test_baseline import parse_node_test_command
 
-    assert _NODE_TEST_MAX_COMMANDS == 3 and MAX_PATH_ARGUMENTS == 32  # as the prompt states
+    assert _NODE_TEST_MAX_COMMANDS == 3  # the shared budget the prompt states
     prefixes = ("tests/", "test/")
     for command in (
-        "node --test tests/blackbox/a.test.mjs tests/unit/b.test.mjs",
+        "node --test tests/blackbox/a.test.mjs",
         "cd apps/web-console && node --test test/x.test.mjs",
         "node --test --test-name-pattern=bbx-1 --test-isolation=none "
-        "--test-concurrency=1 --test-timeout=60000 tests/a.test.mjs",
+        "--test-concurrency=99 --test-timeout=60000 tests/a.test.mjs",
+        "node --test '--test-name-pattern=^bbx (auth)? [1-9]*' tests/a.test.mjs",
     ):
         assert parse_node_test_command(command, prefixes=prefixes) is not None, command
     for command in (
@@ -1550,6 +1549,8 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         "node --loader /tmp/stub.mjs --test tests/a.test.mjs",
         "bash tests/blackbox/run.sh",
         "node tests/a.test.mjs",
+        "node --test '--test-name-pattern=^auth$' tests/a.test.mjs",  # '$' as stated
+        "node --test --test-concurrency=100 tests/a.test.mjs",  # 1-99 as stated
     ):
         assert parse_node_test_command(command, prefixes=prefixes) is None, command
 
