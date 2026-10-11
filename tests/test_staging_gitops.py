@@ -3722,6 +3722,43 @@ def test_failure_excerpt_names_every_failing_test_first() -> None:
     assert len(many.splitlines()) <= 60
 
 
+def test_failure_excerpt_reads_playwright_list_output_new_183() -> None:
+    """NEW-183: gntik-ui#17's a11y excerpt (2026-10-11) was 4000 characters of Vite asset
+    rows ("error-XbIx.js") and passing "✓ … block:error-panel" lines with no failing-test
+    header, so three CI repairs never saw the target-size violation."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    assets = "".join(
+        f"apps/docs build: dist/assets/error-{n:04d}.js   0.16 kB │ gzip:   0.13 kB\n"
+        for n in range(80)
+    )
+    passing = "".join(
+        f"  ✓  {n} e2e/compositions.a11y.spec.js:41:3 › block:error-panel--dark (918ms)\n"
+        for n in range(100, 180)
+    )
+    failing = (
+        "  ✘   51 e2e/builders.a11y.spec.js:125:7 › flow-builder edit axe dark (746ms)\n"
+        "  ✘   49 e2e/builders.a11y.spec.js:10:1 › consumer YAML diagnostics (30.0s)\n"
+    )
+    detail = (
+        "  1) e2e/builders.a11y.spec.js:125:7 › flow-builder edit axe dark ───────\n\n"
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n"
+        '    +     "id": "target-size",\n'
+    )
+    excerpt = failure_excerpt(assets + passing + failing + detail)
+    head = excerpt.splitlines()
+    assert head[:3] == [
+        "Failing tests (2):",
+        "✘   51 e2e/builders.a11y.spec.js:125:7 › flow-builder edit axe dark (746ms)",
+        "✘   49 e2e/builders.a11y.spec.js:10:1 › consumer YAML diagnostics (30.0s)",
+    ]
+    assert '"id": "target-size"' in excerpt
+    assert "dist/assets/" not in excerpt and "block:error-panel" not in excerpt
+    # An asset row is only noise when it is a size listing; a real error naming a file stays.
+    kept = failure_excerpt("Error: cannot read dist/assets/app.js\n")
+    assert "cannot read dist/assets/app.js" in kept
+
+
 # -- NEW-155: staging environment recovery ----------------------------------------------
 
 ESO_FUNCTION_INVOCATION = {

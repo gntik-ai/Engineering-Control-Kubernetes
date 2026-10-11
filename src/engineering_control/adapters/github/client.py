@@ -1305,10 +1305,18 @@ _AUDIT_PACKAGE_ROW = re.compile(r"^\s*│\s*Package\s*│")
 _AUDIT_SEVERITY_ROW = re.compile(r"^\s*│\s*(?:info|low|moderate|high|critical)\s*│", re.IGNORECASE)
 _AUDIT_TABLE_ROWS = 24
 _TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
-_PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
+# NEW-183: Playwright's list reporter marks a passing test "✓  N file › name"; such a line
+# (e.g. "› block:error-panel--dark") is never a failure marker.
+_PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:|✓\s+\d+\s)")
+# NEW-183: a bundler's asset listing ("dist/assets/error-XbIx.js  0.16 kB │ gzip: 0.13 kB")
+# names files, not failures; gntik-ui#17's a11y excerpt was filled with them.
+_BUILD_ASSET_LINE = re.compile(
+    r"\S+\.(?:[cm]?js|css|map|html|json|svg|wasm|woff2?|ttf|png|jpe?g|webp)\s+[\d.,]+\s*[kKM]?B\b"
+)
 # NEW-153: TAP "not ok N - name" (top level only), pytest "FAILED path::test" and go test
-# "--- FAIL: name" lines name one failing test each.
-_FAILING_TEST_LINE = re.compile(r"^(?:not ok \d+ - \S|FAILED \S|--- FAIL: \S)")
+# "--- FAIL: name" lines name one failing test each. NEW-183: so does Playwright's
+# "✘  N file:line:col › name".
+_FAILING_TEST_LINE = re.compile(r"^(?:not ok \d+ - \S|FAILED \S|--- FAIL: \S|\s*✘\s+\d+\s+\S)")
 _FAILING_TEST_SUMMARY_LINES = 25
 
 
@@ -1338,7 +1346,11 @@ def failure_excerpt(
                 ):
                     keep.append(row)
                     row += 1
-        elif _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
+        elif (
+            _FAILURE_LINE.search(line)
+            and not _PASSING_LINE.match(line)
+            and not _BUILD_ASSET_LINE.search(line)
+        ):
             keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
     # NEW-153: every failing test first, by name, so a log whose earlier failure-looking
     # lines (curl --fail, "0 chart(s) failed") fill the context budget still names them all.
