@@ -41,12 +41,12 @@ SANDBOX_REPORTER = "/run/hermes-node-test/reporter.mjs"
 SANDBOX_TMP = "/tmp"  # noqa: S108 - a private size-capped tmpfs inside the sandbox
 NONCE_VARIABLE = "HERMES_NODE_TEST_NONCE"
 
-REPORTER_VERSION = 3
+REPORTER_VERSION = 4
 # Buffers one JSON line per failed test and prints them, between nonce markers, to
 # stdout when the run ends (so the block survives a bounded output tail). It keeps what
 # separates a test failure from a file-level one (import, syntax, process exit, hooks).
 REPORTER_SOURCE = """\
-// Hermes NEW-161 node:test reporter v3 (scan worker, base-only pre-existing baseline).
+// Hermes NEW-161 node:test reporter v4 (scan worker, base-only pre-existing baseline).
 // Review 2: error codes along the cause chain let sandbox-induced failures be excluded.
 const ERRNO = /\\b(E[A-Z]{2,15})\\b/g;
 function errorCodes(error) {
@@ -55,6 +55,7 @@ function errorCodes(error) {
   for (let depth = 0; current && depth < 6 && codes.size < 8; depth += 1) {
     if (typeof current.code === 'string') codes.add(current.code.slice(0, 40));
     const text = typeof current.message === 'string' ? current.message.slice(0, 2000) : '';
+    if (/\\/proc(\\/|\\b)/.test(text)) codes.add('EHERMESPROC');
     for (const match of text.matchAll(ERRNO)) { if (codes.size < 8) codes.add(match[1]); }
     current = current.cause;
   }
@@ -82,7 +83,7 @@ export default async function* hermesReporter(source) {
       error_codes: errorCodes(error),
     }));
   }
-  yield `${nonce} BEGIN ${JSON.stringify({ hermes: 3, passed, truncated })}\\n`;
+  yield `${nonce} BEGIN ${JSON.stringify({ hermes: 4, passed, truncated })}\\n`;
   for (const line of lines) yield `${nonce} FAIL ${line}\\n`;
   yield `${nonce} END ${lines.length}\\n`;
 }
@@ -93,6 +94,8 @@ _TEST_LEVEL_FAILURES = frozenset({"testCodeFailure", "testTimeoutFailure"})
 # dropped privileges). A base failure carrying one is never evidence of a real failure.
 SANDBOX_ERROR_CODES = frozenset(
     {
+        # NEW-186: the sandbox has no /proc; the v4 reporter tags errors naming it.
+        "EHERMESPROC",
         "EROFS",
         "ENOSPC",
         "EDQUOT",
@@ -461,13 +464,12 @@ def sandbox_argv(
         "--new-session",
         *_system_binds(),
         *binds,
-        # NEW-186: the scan worker unit's ProtectKernelTunables leaves read-only mounts
-        # over /proc/sys and friends, so the kernel refuses a fresh procfs in bwrap's
-        # unprivileged namespace ("Can't mount proc on /newroot/proc") and every base
-        # run failed before node started. Bind the worker's /proc read-only instead.
-        "--ro-bind",
-        "/proc",
-        "/proc",
+        # NEW-186: no /proc. The scan worker unit's ProtectKernelTunables leaves
+        # read-only mounts over /proc subtrees, so the kernel refuses a fresh procfs in
+        # bwrap's unprivileged namespace ("Can't mount proc on /newroot/proc"), and
+        # binding the worker's /proc would expose other processes' command lines to the
+        # base code. node runs without it; failures naming /proc are sandbox-caused
+        # (EHERMESPROC, never pre-existing evidence).
         "--dev",
         "/dev",
         "--size",
