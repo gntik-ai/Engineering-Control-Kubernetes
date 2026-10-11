@@ -3638,6 +3638,20 @@ class MetadataActivityHandler:
             "stall or timeout caused by the environment) is SKIPPED with that exact reason in "
             "the summary: the pull request's CI checks and merge gate decide on it. Never "
             "mark a real assertion failure as SKIPPED.\n"
+            # NEW-177: falcone #1008, #967 and #1099 each blocked on a suite main already
+            # failed, because the maker reported it through a /tmp loader, without --test or
+            # through a wrapper script, which the base-commit rerun (NEW-161) cannot run.
+            "The platform reruns each reported FAIL at the base commit to tell a failure "
+            "main already has from one this change caused. It can rerun only a project "
+            "test command it already knows or a plain `node --test [node:test flags such as "
+            "--test-name-pattern] <test files>` run from the repository root with test file "
+            f"paths under {' or '.join(self.settings.node_test_path_prefixes)}. Report every "
+            "failing JavaScript suite in that plain shape, naming the failing test files "
+            "themselves (several files may share one command; use at most three such "
+            "commands): never a wrapper (such as `bash tests/blackbox/run.sh` or "
+            "`pnpm test`), a `--loader` or `--import` hook, or a helper file outside the "
+            "repository (such as /tmp). A FAIL reported any other way blocks the delivery "
+            "even when main fails the same way.\n"
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.

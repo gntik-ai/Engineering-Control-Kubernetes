@@ -1523,6 +1523,10 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         assert "Report a test as FAIL only when it ran and the code under test failed it" in prompt
         assert "is SKIPPED with that exact reason" in prompt
         assert "Never mark a real assertion failure as SKIPPED" in prompt
+        # NEW-177: FAILs must be in the shape the base-commit rerun accepts.
+        assert "plain `node --test [node:test flags" in prompt
+        assert "paths under tests/ or test/" in prompt
+        assert "never a wrapper (such as `bash tests/blackbox/run.sh`" in prompt
 
 
 def _self_contained_evidence(head: str, *, deployment_floor: str) -> dict[str, object]:
