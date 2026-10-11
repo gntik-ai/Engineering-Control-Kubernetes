@@ -3638,6 +3638,26 @@ class MetadataActivityHandler:
             "stall or timeout caused by the environment) is SKIPPED with that exact reason in "
             "the summary: the pull request's CI checks and merge gate decide on it. Never "
             "mark a real assertion failure as SKIPPED.\n"
+            # NEW-177: falcone #1008, #967 and #1099 each blocked on a suite main already
+            # failed, because the maker reported it through a /tmp loader, without --test or
+            # through a wrapper script, which the base-commit rerun (NEW-161) cannot run.
+            "The platform reruns each reported FAIL at the base commit to tell a failure "
+            "main already has from one this change caused, and it can rerun only two shapes. "
+            "A failure of a project test command it already knows (for example a configured "
+            "Vitest or pytest command) is reported exactly as configured. A failing node:test "
+            "suite is reported as exactly `[cd <relative directory> &&] node --test <test "
+            "file>`: no flags, one failing test file per command (the base rerun judges a "
+            "command as a whole, so files never share one), the path relative to that "
+            f"directory, under {' or '.join(self.settings.node_test_path_prefixes)} and made "
+            "only of letters, digits, '.', '_', '-' and single '/' separators between "
+            "non-empty parts, none starting with '.' or '-' (the directory alike). Run the "
+            "file that way yourself "
+            "before reporting it. Never report a wrapper (such as `bash "
+            "tests/blackbox/run.sh` or `pnpm test`), a `--loader` or `--import` hook, or a "
+            "helper file outside the repository (such as /tmp). The two makers of one "
+            "delivery share a budget of three such commands. A real failure that cannot be "
+            "reported in these shapes is still reported as FAIL, as you ran it: it blocks "
+            "the delivery even when main fails the same way.\n"
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.
