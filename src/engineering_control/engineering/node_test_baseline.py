@@ -461,7 +461,12 @@ def sandbox_argv(
         "--new-session",
         *_system_binds(),
         *binds,
-        "--proc",
+        # NEW-186: the scan worker unit's ProtectKernelTunables leaves read-only mounts
+        # over /proc/sys and friends, so the kernel refuses a fresh procfs in bwrap's
+        # unprivileged namespace ("Can't mount proc on /newroot/proc") and every base
+        # run failed before node started. Bind the worker's /proc read-only instead.
+        "--ro-bind",
+        "/proc",
         "/proc",
         "--dev",
         "/dev",

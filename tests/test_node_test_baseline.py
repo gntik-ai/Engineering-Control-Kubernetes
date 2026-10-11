@@ -354,6 +354,11 @@ def test_sandbox_is_read_only_but_a_size_capped_tmpfs(tmp_path: Path) -> None:
     assert "--share-net" not in arguments
     # The only writable mount is a 256 MiB tmpfs; no host path is bound writable.
     assert "--bind" not in arguments and "--overlay-src" not in arguments
+    # NEW-186: no fresh procfs (the worker's ProtectKernelTunables forbids it); the
+    # worker's /proc is bound read-only.
+    assert "--proc" not in arguments
+    index = arguments.index("/proc")
+    assert arguments[index - 1 : index + 2] == ["--ro-bind", "/proc", "/proc"]
     index = arguments.index("--size")
     assert arguments[index : index + 4] == ["--size", str(256 * 1024 * 1024), "--tmpfs", "/tmp"]  # noqa: S108
     assert arguments.count("--tmpfs") == 1
@@ -648,7 +653,39 @@ def test_unparseable_report_still_blocks(tmp_path: Path) -> None:
     runner.write_report = False  # no block for this run's nonce
     handler, payload = _setup(tmp_path, runner)
 
-    assert handler._validate_changeset(payload)["blocker"] == "MAKER_TEST_FAILURE"
+    validated = handler._validate_changeset(payload)
+    assert validated["blocker"] == "MAKER_TEST_FAILURE"
+    # NEW-186: a run without a report is a visible baseline error, never cached.
+    assert "produced no report" in validated["baseline_error"]
+    root = _baseline_root(tmp_path, payload["source_base_sha"])
+    assert (
+        not (root / "results.json").exists()
+        or json.loads((root / "results.json").read_text()) == {}
+    )
+    runner.write_report = True
+    assert handler._validate_changeset({**payload})["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(runner.calls) == 2
+
+
+def test_a_cached_entry_without_a_report_is_rerun_new_186(tmp_path: Path) -> None:
+    """falcone #1099 (2026-10-11): before NEW-186 the base run's sandbox could not mount
+    /proc, so a report-less result (test_failures None) was cached and trusted."""
+    runner = SandboxRunner(FAILING_098)
+    handler, payload = _setup(tmp_path, runner)
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    root = _baseline_root(tmp_path, payload["source_base_sha"])
+    cached = json.loads((root / "results.json").read_text())
+    [key] = cached
+    cached[key].update(
+        test_failures=None,
+        other_failures=None,
+        passed=0,
+        output_tail="bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+    )
+    (root / "results.json").write_text(json.dumps(cached))
+
+    assert handler._validate_changeset({**payload})["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(runner.calls) == 2
 
 
 def test_ineligible_commands_never_run_anything(tmp_path: Path) -> None:
