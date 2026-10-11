@@ -3632,6 +3632,11 @@ class MetadataActivityHandler:
             # the chart contract (checker PASS) but reported two suites FAIL that it could
             # not run in the sandbox (subprocess stdin EPERM, timeouts), which blocked
             # publication although the pull request's CI runs them before any merge.
+            # NEW-184: falcone #1118's deployment maker listed its red-before-green run
+            # ("… (pre-fix)") as a FAIL row twice, blocking a checker-PASS ChangeSet.
+            "The tests list holds only the results of your final commit. A run made before "
+            "your fix to show the failure (red before green) is described in the summary, "
+            "never listed as a test result.\n"
             "Report a test as FAIL only when it ran and the code under test failed it. A "
             "command this sandbox cannot run or complete (permission errors such as EPERM, "
             "missing dependencies, no network, no database, subprocess or socket limits, a "
