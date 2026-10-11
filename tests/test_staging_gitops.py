@@ -3757,6 +3757,9 @@ def test_failure_excerpt_reads_playwright_list_output_new_183() -> None:
     # An asset row is only noise when it is a size listing; a real error naming a file stays.
     kept = failure_excerpt("Error: cannot read dist/assets/app.js\n")
     assert "cannot read dist/assets/app.js" in kept
+    # NEW-183 review: a failure diagnostic that names an asset and its size is kept too.
+    budget = "# Error: dist/assets/app.js 501 kB exceeds the 400 kB budget"
+    assert budget in failure_excerpt("ok 1 - x\n" * 30 + budget + "\n" + "ok 2 - y\n" * 30)
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
