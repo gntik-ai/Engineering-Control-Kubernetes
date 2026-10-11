@@ -3581,6 +3581,21 @@ class MetadataActivityHandler:
                 "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
                 "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
+        # NEW-185: gntik-ui #17's CI repairs made empty commits because the OpenSpec tasks
+        # demanded a local red reproduction and its a11y job needs a browser the sandbox
+        # cannot start (listen/setsockopt EPERM). Platform policy, so it goes in the trusted
+        # prompt; the CI log lines stay inside the untrusted fence.
+        ci_repair_instruction = (
+            "This is a CI repair. The failing CI jobs listed in the content below are already "
+            "reproduced: their CI run is the red evidence, so a task that asks for a failing "
+            "reproduction first is satisfied by it. When such a job cannot run in this "
+            "sandbox (for example a browser or service test), do not stop for a local "
+            "reproduction: fix the cause its CI log shows, run what you can, and report that "
+            "job SKIPPED with the reason. The pull request's CI reruns it, and its result "
+            "decides the merge.\n"
+            if ci_regressions
+            else ""
+        )
         if ci_regressions and ci_excerpts:
             # NEW-100: the failing log lines (CI output is untrusted data, fenced below).
             derived_content += "Failing lines from each job's CI log:\n" + "".join(
@@ -3663,6 +3678,7 @@ class MetadataActivityHandler:
             "delivery share a budget of three such commands. A real failure that cannot be "
             "reported in these shapes is still reported as FAIL, as you ran it: it blocks "
             "the delivery even when main fails the same way.\n"
+            + ci_repair_instruction
             + resume_instruction
             + (
                 # NEW-75: makers have no network, so they cannot regenerate lockfiles.
