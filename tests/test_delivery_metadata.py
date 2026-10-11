@@ -1524,11 +1524,11 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
         assert "is SKIPPED with that exact reason" in prompt
         assert "Never mark a real assertion failure as SKIPPED" in prompt
         # NEW-177: FAILs must be in the shape the base-commit rerun accepts.
-        assert "`[cd <relative directory> &&] node --test [flags] <test file>`" in prompt
+        assert "exactly `[cd <relative directory> &&] node --test <test file>`: no flags" in prompt
         assert "one failing test file per command" in prompt
         assert "under tests/ or test/" in prompt
         assert "Never report a wrapper (such as `bash tests/blackbox/run.sh`" in prompt
-        assert "share a budget of three such node:test commands" in prompt
+        assert "share a budget of three such commands" in prompt
         assert "reported exactly as configured" in prompt
     # NEW-177 review: every shape and flag the prompt names is one the base rerun parses.
     from engineering_control.activities.scan import _NODE_TEST_MAX_COMMANDS
@@ -1538,19 +1538,16 @@ def test_makers_report_sandbox_limited_commands_as_skipped_not_fail(tmp_path: Pa
     prefixes = ("tests/", "test/")
     for command in (
         "node --test tests/blackbox/a.test.mjs",
-        "cd apps/web-console && node --test test/x.test.mjs",
-        "node --test --test-name-pattern=bbx-1 --test-isolation=none "
-        "--test-concurrency=99 --test-timeout=60000 tests/a.test.mjs",
-        "node --test '--test-name-pattern=^bbx (auth)? [1-9]*' tests/a.test.mjs",
+        "cd apps/web-console && node --test test/x_y-z.test.mjs",
     ):
         assert parse_node_test_command(command, prefixes=prefixes) is not None, command
     for command in (
-        "node --test --test-name-pattern bbx-1 tests/a.test.mjs",  # no '='
-        "node --loader /tmp/stub.mjs --test tests/a.test.mjs",
         "bash tests/blackbox/run.sh",
         "node tests/a.test.mjs",
-        "node --test '--test-name-pattern=^auth$' tests/a.test.mjs",  # '$' as stated
-        "node --test --test-concurrency=100 tests/a.test.mjs",  # 1-99 as stated
+        "node --loader /tmp/stub.mjs --test tests/a.test.mjs",
+        "node --experimental-loader ./tests/helpers/l.mjs tests/a.test.mjs",
+        "node --test tests/.hidden/a.test.mjs",  # no part starting with '.', as stated
+        "node --test 'tests/auth login.test.mjs'",  # no spaces, as stated
     ):
         assert parse_node_test_command(command, prefixes=prefixes) is None, command
 
