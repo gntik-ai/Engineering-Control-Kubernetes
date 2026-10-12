@@ -451,6 +451,10 @@ for agent in codex claude; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/engineering-worker@${agent}.service.d/50-memory.conf" \
     "/etc/systemd/system/engineering-worker@${agent}.service.d/50-memory.conf"
+  # NEW-188: per-run agent cgroups.
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/systemd/engineering-worker@${agent}.service.d/60-cgroup-delegation.conf" \
+    "/etc/systemd/system/engineering-worker@${agent}.service.d/60-cgroup-delegation.conf"
 done
 systemd-analyze verify /etc/systemd/system/engineering-workers.slice \
   /etc/systemd/system/engineering-workers-agents.slice \
