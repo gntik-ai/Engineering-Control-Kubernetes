@@ -395,6 +395,52 @@ def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) ->
         manager.grant_release_read("falcone-charts", tmp_path)
 
 
+def test_default_acls_never_follow_a_symlinked_directory(tmp_path: Path) -> None:
+    # NEW-191: falcone #1087's retry failed with "setfacl: .../node_modules/yaml:
+    # Read-only file system"; is_dir() followed the maker's pnpm link into a store.
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "falcone" / str(uuid4())
+    (target / "node_modules" / ".pnpm" / "yaml").mkdir(parents=True)
+    store = tmp_path / "read-only-store" / "yaml"
+    store.mkdir(parents=True)
+    (target / "node_modules" / "yaml").symlink_to(store, target_is_directory=True)
+    (target / "node_modules" / "local").symlink_to(
+        target / "node_modules" / ".pnpm" / "yaml", target_is_directory=True
+    )
+    metadata = tmp_path / "cache" / "scan" / "worktree-git" / "falcone" / f"{target.name}.git"
+    (metadata / "objects").mkdir(parents=True)
+    (metadata / "linked").symlink_to(store, target_is_directory=True)
+    canonical = tmp_path / "mirrors" / "falcone.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=tmp_path / "cache" / "scan" / "worktree-git",
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+
+    touched = {command[-1] for command in commands if command[0] == "setfacl"}
+    assert str(target / "node_modules" / ".pnpm" / "yaml") in touched  # real directory
+    assert str(metadata / "objects") in touched
+    for link in (
+        target / "node_modules" / "yaml",
+        target / "node_modules" / "local",
+        metadata / "linked",
+    ):
+        assert str(link) not in touched
+    assert not any(str(store) in argument for command in commands for argument in command)
+
+
 def test_retry_archives_and_resets_a_stopped_attempts_worktree(tmp_path: Path) -> None:
     # NEW-38: musematic #1026's Codex maker left 9 uncommitted files; every later retry
     # then failed at allocation ("existing worktree is dirty and will not be reused").
