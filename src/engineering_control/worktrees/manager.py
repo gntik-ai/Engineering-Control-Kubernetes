@@ -59,6 +59,18 @@ class WorktreeAccess:
             raise ValueError("maker and checker identities must differ")
 
 
+def _real_directories(root: Path) -> list[Path]:
+    """NEW-191: root and every directory below it, never through a symlink.
+
+    ``Path.is_dir()`` follows symlinks, so a maker's ``node_modules/<pkg>`` link into a
+    read-only package store made ``setfacl --modify`` act on (and fail at) the store.
+    ``setfacl --recursive`` itself already skips symlinks met during its walk."""
+    return [
+        root,
+        *(item for item in root.rglob("*") if item.is_dir() and not item.is_symlink()),
+    ]
+
+
 class GitWorktreeManager:
     _repositories = REPOSITORY_SLUG_SET
     _deployment_repositories = frozenset(DEPLOYMENT_REPOSITORY_SLUGS)
@@ -459,7 +471,7 @@ class GitWorktreeManager:
             resolved_target,
         )
         self._run(["setfacl", "--recursive", "--modify", access_acl, str(target)], target)
-        for directory in (target, *(item for item in target.rglob("*") if item.is_dir())):
+        for directory in _real_directories(target):
             self._run(["setfacl", "--modify", default_acl, str(directory)], target)
 
         identities = (access.maker_identity, access.checker_identity)
@@ -477,7 +489,7 @@ class GitWorktreeManager:
             )
             self._grant_metadata_traverse(metadata, (transport,))
         self._run(["setfacl", "--recursive", "--modify", metadata_acl, str(metadata)], metadata)
-        for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
+        for directory in _real_directories(metadata):
             self._run(["setfacl", "--modify", metadata_default_acl, str(directory)], metadata)
         self._grant_canonical_read(canonical_mirror, identities)
         if transport is not None:
@@ -559,7 +571,7 @@ class GitWorktreeManager:
         self._grant_metadata_traverse(metadata, (transport,))
         self._grant_tree_read_access(metadata, (transport,), cwd=metadata)
         default_acl = f"d:u:{transport}:r-x"
-        for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
+        for directory in _real_directories(metadata):
             self._setfacl_readable(["setfacl", "--modify", default_acl, str(directory)], metadata)
         self._grant_transport_canonical(mirror, transport)
 
@@ -663,10 +675,7 @@ class GitWorktreeManager:
             ["setfacl", "--modify", traverse_acl, str(resolved_target.parent)],
             resolved_target,
         )
-        for directory in (
-            resolved_target,
-            *(item for item in resolved_target.rglob("*") if item.is_dir()),
-        ):
+        for directory in _real_directories(resolved_target):
             self._setfacl_readable(
                 ["setfacl", "--modify", default_acl, str(directory)], resolved_target
             )
