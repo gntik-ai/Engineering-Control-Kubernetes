@@ -212,3 +212,11 @@ maker_rules:
       `hasKey`) in templates and in templates/validate.yaml, so a release installed
       before this change still renders. Run the reuse-values upgrade test
       (bbx-temporal-bootstrap-048 in tests/blackbox/temporal-bootstrap) before finishing.
+    - >-
+      Hermes moves the falcone FALCONE_CHARTS_REF pins to your final commit only after
+      you finish, so a check comparing those pins with the charts checkout (e.g.
+      "both workflow pins match the deployment checkout" in
+      tests/blackbox/mongo-gateway-route.test.mjs) fails until then. Report only that
+      check as SKIPPED ("pin converges after the deployment maker; PR CI runs it").
+      Run the file with FALCONE_CHART_PATH=<charts worktree>/charts/in-falcone; every
+      other assertion in it must pass.
