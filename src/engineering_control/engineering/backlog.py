@@ -666,6 +666,13 @@ def _mentions(text: str, *terms: str) -> bool:
     return any(_keyword_pattern(term).search(text) is not None for term in terms)
 
 
+# NEW-189: "reviews the proposal only" scopes a review; it is not an undecided proposal.
+# Change-request review summaries say it, which deferred falcone#1070 as SPEC_DECISION.
+_REVIEWED_PROPOSAL_ONLY = re.compile(
+    r"(?i)(?<![a-z0-9])review(?:s|ed|ing)?\s+the\s+proposal\s+only(?![a-z0-9])"
+)
+
+
 def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogIssueType:
     label_text = " ".join(labels)
     title = text.splitlines()[0].strip()
@@ -709,7 +716,10 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
     ):
         return BacklogIssueType.SECURITY_DEFECT
     if _mentions(label_text, "needs-decision", "product-decision", "rfc") or _mentions(
-        text, "needs product decision", "decision required", "proposal only"
+        _REVIEWED_PROPOSAL_ONLY.sub(" ", text),
+        "needs product decision",
+        "decision required",
+        "proposal only",
     ):
         return BacklogIssueType.SPEC_DECISION
     if enhancement_metadata:
