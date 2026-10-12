@@ -864,6 +864,46 @@ def test_change_request_kind_maps_to_the_existing_issue_types() -> None:
     assert equivalent.issue_type == plain.issue_type == "PRODUCT_BUG"
 
 
+def test_change_request_review_verdict_does_not_classify_the_issue() -> None:
+    def reviewed(summary: str, open_questions: tuple[str, ...] = ()) -> GitHubIssueSnapshot:
+        rendered = render(
+            proposal=ChangeProposal.model_validate(
+                {**PROPOSAL, "open_questions": list(open_questions)}
+            ),
+            review=ChangeReviewRecord.from_rounds(
+                [ChangeReview(decision="APPROVE", summary=summary, findings=())]
+            ),
+        )
+        return snapshot(rendered.title, rendered.body[:4000])
+
+    # NEW-189: falcone#1070 was deferred on the reviewer's own wording.
+    verdict = classify(reviewed("This decision reviews the proposal only; no tests ran."))
+    assert verdict.issue_type == "PRODUCT_BUG"
+    assert verdict.eligibility_status == "ELIGIBLE_FOR_REVALIDATION"
+    # A real open question still needs the operator.
+    question = classify(reviewed("Scope matches.", ("Needs product decision on the format.",)))
+    assert question.issue_type == "SPEC_DECISION"
+    assert question.eligibility_reason == "NEEDS_PRODUCT_DECISION"
+    # Decision wording in the review section still counts: the section is not trusted.
+    in_review = classify(reviewed("Reviewed the proposal only. Needs product decision."))
+    assert in_review.eligibility_reason == "NEEDS_PRODUCT_DECISION"
+    forged = classify(
+        snapshot(
+            "Change request: Fix audit export",
+            "kind: bug\n## Independent review\n- Summary: Needs product decision on retention.",
+        )
+    )
+    assert forged.eligibility_reason == "NEEDS_PRODUCT_DECISION"
+    # Security detection sees the review text too and keeps the R3 floor.
+    security = classify(reviewed("Reviews the proposal only; tenant isolation is at stake."))
+    assert security.issue_type == "SECURITY_DEFECT"
+    assert security.calculated_risk == "R3"
+    assert security.eligibility_reason == "R3_REQUIRES_OPERATOR"
+    # A plain "proposal only" issue stays a decision.
+    proposal = classify(snapshot("Retention policy", "This is a proposal only."))
+    assert proposal.eligibility_reason == "NEEDS_PRODUCT_DECISION"
+
+
 def test_change_request_handler_routes_controller_steps_only(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'handler.sqlite'}")
     Base.metadata.create_all(engine)
