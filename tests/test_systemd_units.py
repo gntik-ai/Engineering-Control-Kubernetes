@@ -650,3 +650,25 @@ def test_worker_bootstrap_pre_creates_the_vitest_token_for_agent_identities() ->
     # An existing token, even an empty one, is kept.
     assert '[ -e "$dir/.vitest-secret-token" ] ||' in script
     assert "umask 077" in script
+
+
+def test_agent_workers_delegate_a_private_cgroup_subtree_for_run_cgroups() -> None:
+    from engineering_control.adapters.process import DELEGATED_SUBGROUP
+
+    bootstrap = (REPOSITORY_ROOT / "scripts/bootstrap-worker.sh").read_text()
+    for agent in ("codex", "claude"):
+        drop_in = (
+            REPOSITORY_ROOT
+            / f"systemd/engineering-worker@{agent}.service.d/60-cgroup-delegation.conf"
+        )
+        settings = {
+            line.split("=", 1)[0]: line.split("=", 1)[1]
+            for line in drop_in.read_text().splitlines()
+            if "=" in line and not line.startswith("#")
+        }
+        assert settings == {
+            "Delegate": "yes",
+            "DelegateSubgroup": DELEGATED_SUBGROUP,
+            "ProtectControlGroups": "private",
+        }
+    assert "60-cgroup-delegation.conf" in bootstrap
