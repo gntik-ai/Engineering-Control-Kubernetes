@@ -179,7 +179,7 @@ def test_musematic_manifest_declares_a_valid_toolchain_and_real_test_command() -
     )
     assert ["make", "test"] not in manifest.source_test_commands
     assert "pytest" in manifest.source_test_commands[0][0]
-    assert load_toolchain_policy(PROJECTS, "falcone") is None
+    assert load_toolchain_policy(PROJECTS, "llmwiki") is None
 
 
 # -- prepare --------------------------------------------------------------------------
@@ -290,7 +290,7 @@ def test_prepare_is_skipped_when_the_project_has_no_enabled_toolchain(tmp_path: 
     runner = FakeToolchainRunner()
     handler = _handler(tmp_path, runner)
 
-    result = handler._prepare_toolchain({"project": "falcone", "source_worktree": "/nonexistent"})
+    result = handler._prepare_toolchain({"project": "llmwiki", "source_worktree": "/nonexistent"})
 
     assert result["status"] == "TOOLCHAIN_SKIPPED"
     assert runner.calls == []
@@ -400,9 +400,9 @@ def test_postchecks_remove_only_ignored_toolchain_files_before_scanning(tmp_path
 
 
 def test_postchecks_do_not_clean_when_the_toolchain_is_disabled(tmp_path: Path) -> None:
-    handler, scanner, repo = _validation(tmp_path, "falcone")
+    handler, scanner, repo = _validation(tmp_path, "llmwiki")
 
-    handler._validate_changeset(_validation_payload(repo, "falcone"))
+    handler._validate_changeset(_validation_payload(repo, "llmwiki"))
 
     assert scanner.seen == {str(repo): True}
     assert (repo / "node_modules" / "a.js").exists()

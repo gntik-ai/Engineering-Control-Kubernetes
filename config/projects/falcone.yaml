@@ -204,6 +204,17 @@ ui_migration:
 # Standing maker rules (2026-10-04): falcone-charts #15, #16 and #17 each needed a CI
 # repair round because new values keys broke `helm upgrade --reuse-values` of existing
 # releases (test bbx-temporal-bootstrap-048).
+toolchain:
+  # NEW-196: prepared by the scan worker (delivery.prepare_toolchain) in the source
+  # worktree before the maker runs; makers and the checker have no network. Without it
+  # a maker has no node_modules: falcone #1071 (adopt the @gntik-ai kit from npm) stopped
+  # because it could not read the kit's installed APIs. Node 22 and the worker's pnpm,
+  # as falcone's CI and the web-console image (node:22-alpine) use.
+  enabled: true
+  prepare:
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1800
 maker_rules:
   deployment:
     - >-
