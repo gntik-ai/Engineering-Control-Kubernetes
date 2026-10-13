@@ -2,7 +2,7 @@
 
 This is a companion to the [architecture course](../README.md). The course goes deep, one component at a time. This overview stays at a **higher level of abstraction** and answers the questions people ask first when they see the platform:
 
-* What is "Hermes", and how does it work together with Temporal?
+* What is the Hermes Agent framework, and how does it work alongside Temporal?
 * How is the backlog built from GitHub issues?
 * Who orchestrates the workflows, and how?
 * How are workflows and agents defined? Who defines the agents? Where do they run?
@@ -23,7 +23,7 @@ You can present only the first layer of every chapter and still tell a complete,
 | # | Chapter | The question it answers |
 |---|---|---|
 | 1 | [The big picture](01-the-big-picture.md) | What are the moving parts, and what does "Hermes" actually mean? |
-| 2 | [Hermes and Temporal working together](02-hermes-and-temporal-together.md) | Who does what, how a chat command becomes durable work, and how answers come back. |
+| 2 | [The Hermes Agent framework alongside Temporal](02-hermes-and-temporal-together.md) | Agent framework versus workflow engine; the anatomy of Hermes Agent; its two installations; the integration contract; the three paths through the gateway; Hermes sub-agents versus Temporal steps; how the relationship evolved. |
 | 3 | [From GitHub issues to the backlog](03-from-github-issues-to-the-backlog.md) | How open issues are read, classified, ordered, approved, and selected. |
 | 4 | [Who orchestrates the workflows](04-who-orchestrates-the-workflows.md) | How a workflow is defined, who starts it, who runs it, and how it reaches the right machine. |
 | 5 | [Agents, skills, and tools](05-agents-skills-and-tools.md) | What an agent is here, what it is made of, who defines it, where it runs, and which tools it may touch. |

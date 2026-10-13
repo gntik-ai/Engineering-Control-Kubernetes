@@ -8,14 +8,14 @@ This chapter first tells the generic journey in `full-delivery` mode for a proje
 
 ## 6.1 The story in plain words
 
-1. The operator asks Hermes to take a photograph of the project's open issues. Rules sort them into a queue. *(No AI.)*
-2. The operator says "work on issue 993, all the way to staging". Hermes checks the request, records the permission, and opens a 24-hour window for GitHub writes. *(No AI.)*
+1. The operator asks, through Hermes on Telegram, for a photograph of the project's open issues. Rules sort them into a queue. *(No AI.)*
+2. The operator says "work on issue 993, all the way to staging". The platform checks the request, records the permission, and opens a 24-hour window for GitHub writes. *(No AI.)*
 3. Two AI reproductions check that the problem still exists in today's code. *(AI, read-only.)*
-4. Hermes prepares two clean copies of the code, scans them, installs dependencies, and asks an AI architect to write a precise change specification. *(Mostly no AI; one AI step.)*
+4. The platform prepares two clean copies of the code, scans them, installs dependencies, and asks an AI architect to write a precise change specification. *(Mostly no AI; one AI step.)*
 5. One AI (the maker) changes the code. Another AI from a different vendor (the checker) reviews it. If the checker asks for changes, the maker tries again with the checker's findings. *(AI.)*
 6. Fixed rules decide whether the change is acceptable: the checker said PASS, no new security findings, no secrets, failing tests already failed before, and so on. The risk class may go up, never down. *(No AI.)*
-7. Hermes pushes the branch and opens draft pull requests through the guarded GitHub door. *(No AI.)*
-8. Hermes waits for CI, merges, tags a release, waits for the image to be built, checks the staging environment, waits for Argo CD to pick up the new image, syncs, verifies the workloads, and closes the issue with a comment listing every artifact. *(No AI. Bounded automatic repair rounds use AI only to fix CI regressions.)*
+7. The platform pushes the branch and opens draft pull requests through the guarded GitHub door. *(No AI.)*
+8. The platform waits for CI, merges, tags a release, waits for the image to be built, checks the staging environment, waits for Argo CD to pick up the new image, syncs, verifies the workloads, and closes the issue with a comment listing every artifact. *(No AI. Bounded automatic repair rounds use AI only to fix CI regressions.)*
 
 ## 6.2 The cast
 

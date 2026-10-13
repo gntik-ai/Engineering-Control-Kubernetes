@@ -1,16 +1,18 @@
 # Chapter 3 — From GitHub issues to the backlog
 
-> **The idea in one sentence.** The Hermes backlog is a **frozen, classified, ordered photograph** of a project's open GitHub issues, taken when the operator asks for it, built entirely by deterministic code (no AI), and turned into work only after a human approves a bounded plan.
+> **The idea in one sentence.** The backlog (often called "the Hermes backlog") is a **frozen, classified, ordered photograph** of a project's open GitHub issues, taken when the operator asks for it, built entirely by deterministic code (no AI), and turned into work only after a human approves a bounded plan.
 
 ---
 
 ## 3.1 In plain words
 
+**Where the backlog lives.** Although people call it "the Hermes backlog", it is not stored or built by the Hermes Agent framework. Hermes is only where the operator types the import command (`/loop import …`); the hook forwards it, and the Engineering Control harness builds the backlog in PostgreSQL through a Temporal workflow. The Hermes model never reads or edits it.
+
 Think of a hospital emergency department. Patients (issues) arrive through the door (GitHub). A **triage nurse** looks at each one, writes down what kind of problem it seems to be, how serious it is, and whether it depends on something else, and gives it a place in the queue. A **senior doctor** then signs off how many patients the team may treat today and at what risk level. Before anyone operates, a doctor **examines the patient again**, because the symptoms may have changed since triage.
 
-In Hermes:
+In the platform:
 
-| Hospital | Hermes | Who or what does it |
+| Hospital | Platform | Who or what does it |
 |---|---|---|
 | Patients arriving | Open issues in the project's GitHub repositories | GitHub |
 | Taking in the patients | **Import**: read the open issues and pull requests | `GitHubBacklogImportWorkflow`, GitHub broker (read-only) |

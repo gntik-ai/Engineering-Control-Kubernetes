@@ -1,6 +1,6 @@
 # Chapter 1 — The big picture
 
-> **The idea in one sentence.** Hermes is an AI software-engineering operation in which **Temporal runs the process**, **deterministic code makes every decision that matters**, **AI coding agents do bounded pieces of thinking and typing**, and **a human approves anything risky**, all driven from a Telegram chat.
+> **The idea in one sentence.** An operator talks to the **Hermes Agent framework** on Telegram; behind it, **Temporal runs the process**, the **Engineering Control harness** makes every decision that matters in deterministic code, **Codex and Claude coding agents** do bounded pieces of thinking and typing, and **a human approves anything risky**.
 
 ---
 
@@ -11,16 +11,16 @@ Before anything else, clear up the name. In this project the word **Hermes** is 
 | When people say… | They mean | What it really is | Where it lives |
 |---|---|---|---|
 | "**Hermes** delivered issue #993", "Hermes opened the PR", the `hermes/ci-baseline/…` branches, issues titled "Hermes staging Argo CD sync failed…" | **The platform as a whole.** | The deterministic harness built in this repository (its technical name is **Engineering Control**) together with Temporal, the workers, and the AI agents it drives. | Two hosts named `hermes-control` (10.10.0.2) and `hermes-worker` (10.10.0.3). |
-| "the Hermes gateway", "send it to Hermes on Telegram" | **Hermes Agent**, a third-party AI agent runtime. | An open agent framework (Hermes Agent v0.21.0 on the controller) with its own model loop, skills, tools, memory, and a Telegram gateway. This platform uses **only its gateway**, as a chat front door and a message deliverer. | `hermes-gateway.service`, running as the isolated user `hermes-gateway`. |
+| "the Hermes gateway", "send it to Hermes on Telegram", "Hermes skills" | **Hermes Agent**, a third-party AI agent framework. | An agent framework (Hermes Agent v0.21.0 on the controller) with its own model loop, skills, tool sets, sub-agent delegation, memory, plugins, hooks, and a messaging gateway. In the production path the platform uses its **gateway, a hook, a plugin, and a webhook route** as the chat front door and message deliverer (Chapter 2). | `hermes-gateway.service` (isolated user `hermes-gateway`); the operator's interactive copy under `/home/hermes/.hermes`. |
 | "run it as `hermes`", "the `hermes` GitHub login" | **The `hermes` Unix user.** | The operator's own account on the controller. It owns the GitHub CLI login that the platform's GitHub broker uses, and it is the only account allowed to run the `engineering-ctl` command-line tool. | `/home/hermes` on `hermes-control`. |
 
-In this overview, **"the Hermes harness"** means the first sense: the Engineering Control code plus the infrastructure around it. **"The Hermes gateway"** means the Hermes Agent front door. When the `hermes` user matters, we say "the `hermes` user".
+In this overview, **"Hermes"** means the **Hermes Agent framework** (the second sense), and **"the platform"** or **"Engineering Control"** means the deterministic harness with Temporal, the workers, and the Codex and Claude agents (the first sense). When the `hermes` user matters, we say "the `hermes` user". Chapter 2 is about how the first two work alongside each other.
 
 ```mermaid
 flowchart TB
-    subgraph PLATFORM["'Hermes' = the platform (Engineering Control harness)"]
+    subgraph PLATFORM["The platform, often called 'Hermes' as a whole"]
         direction TB
-        GW["Hermes gateway<br/>(third-party Hermes Agent,<br/>used only as the chat front door)"]
+        GW["Hermes Agent framework<br/>(its gateway is the chat front door<br/>and message deliverer)"]
         HARNESS["Engineering Control harness<br/>API · command bus · policies ·<br/>workflow code · step handlers · workers"]
         TEMP["Temporal<br/>(durable workflow engine)"]
         AGENTS["AI agents<br/>(Codex CLI, Claude Code CLI)"]
@@ -31,7 +31,7 @@ flowchart TB
     USER["hermes Unix user<br/>(operator account, owns the GitHub login)"] -. "runs engineering-ctl,<br/>its gh login is used in place by the GitHub broker" .-> HARNESS
 ```
 
-> **For architects.** The repository's own `docs/ARCHITECTURE.md` puts it precisely: "Hermes is a Telegram client of that API; it is neither a workflow store nor a release principal." The colloquial use of "Hermes" for the whole platform comes from the project's history. In mid-August 2026 the Hermes Agent itself still ran audits and fixes through its own skills (Chapter 2, §2.6). From late August the authority moved into Engineering Control and Temporal, but the name stayed.
+> **For architects.** The repository's own `docs/ARCHITECTURE.md` puts it precisely: "Hermes is a Telegram client of that API; it is neither a workflow store nor a release principal." The colloquial use of "Hermes" for the whole platform comes from the project's history. In mid-August 2026 the Hermes Agent framework itself still ran audits and fixes through its own skills (Chapter 2, §2.9). From late August the authority moved into Engineering Control and Temporal, but the name stayed.
 
 ## 1.2 An analogy for non-technical audiences
 
@@ -114,9 +114,9 @@ Most misunderstandings come from attributing to one component a job that belongs
 
 | Component | It is **not**… | Because… |
 |---|---|---|
-| Hermes gateway | …the brain, the scheduler, or the place where AI runs on Telegram. | Engineering commands are answered by a hook **without any model turn**, and the gateway's Telegram tool set is empty (Chapter 2). |
+| Hermes Agent framework | …the brain, the scheduler, or the engine that does the engineering work. | Engineering commands are answered by a hook **without any model turn**; free-text chat reaches its model but with an empty Telegram tool set; the AI work inside workflows is done by Codex and Claude CLIs, not by Hermes sub-agents (Chapter 2). |
 | Temporal | …an AI orchestrator that "decides" what to do. | It replays code. Every branch it takes is written in the workflow code. |
-| AI agents | …autonomous actors with credentials. | They get a directory, a task, a tool list, and an output form. No GitHub token, no kubeconfig, no API key, no network to the products. |
+| AI agents | …autonomous actors with credentials. | They get a directory, a task, a tool list, and an output form. No GitHub token, no kubeconfig, no API key, no credentials for the products. |
 | The backlog | …a live mirror of GitHub, or something the AI writes. | It is a frozen, deterministic snapshot taken when the operator asks for an import (Chapter 3). |
 | Skills | …scripts that start workflows. | In this platform a skill is an instruction contract given to an agent. No skill can start a workflow (Chapter 5). |
 | The operator | …someone who has to babysit every step. | Low-risk steps run on their own. The operator is needed for approvals, high-risk work, and real blockers. |
@@ -159,6 +159,6 @@ Chapter 6 follows this path in full detail for one real issue. Chapters 2 to 5 e
 
 **Key takeaways**
 
-* "Hermes" is the platform. The *Hermes gateway* is only its chat front door; the `hermes` user is the operator account.
+* "Hermes" names three things. In this overview it means the Hermes Agent framework, whose gateway is the platform's chat front door and messenger; the platform itself is Engineering Control; the `hermes` user is the operator account.
 * Temporal provides memory and patience. The workflow code provides the procedure. The harness provides the hands and the rules. The agents provide bounded intelligence. The operator provides authority.
 * No component does two of those jobs. That separation is the design.

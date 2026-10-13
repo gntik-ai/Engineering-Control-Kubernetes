@@ -6,13 +6,15 @@
 
 ## 4.1 In plain words: an orchestra
 
-| Orchestra | Hermes | Who |
+| Orchestra | Platform | Who |
 |---|---|---|
 | The **score**, written in advance, saying who plays what and when | The **workflow code**: an ordered list of named steps with branches, waits, and retries | Platform engineers, in `src/engineering_control/workflows/definitions.py`, reviewed and released like any code |
 | The **conductor**, who follows the score, keeps time, and remembers which bar the orchestra is at, even after an interruption | **Temporal** plus the controller's **workflow worker**, which executes the workflow code and records every step | Infrastructure on the controller host |
 | The **musicians**, each playing their own instrument | **Role workers**: one per Unix identity (scan, codex, claude, browser, delivery, release, github) | Services on the worker host (and the GitHub broker on the controller) |
 | A **soloist** given a short passage to play from a sheet | An **AI agent**: one Codex or Claude invocation inside one step | A role worker launches it; it ends when the passage ends |
 | Whoever **decides that tonight's concert happens** | The **operator** (through Telegram, CLI, or dashboard), **schedules**, or a **parent workflow** | People and timers, never AI |
+
+And the Hermes Agent framework? It is the **box office**: it takes the audience's request and announces news, but it neither conducts nor plays. Its gateway hook forwards typed commands to the API; its own model loop, skills, and `delegate_task` sub-agents take no part in running workflows (Chapter 2).
 
 The soloist does not conduct, does not choose the next piece, and does not hire other musicians. In the agent pack every shipped role has `recursion_depth: 0`: agents cannot spawn agents. "Temporal owns orchestration; agents do not spawn an uncontrolled topology" (`docs/AGENTS-AND-SKILLS.md`).
 

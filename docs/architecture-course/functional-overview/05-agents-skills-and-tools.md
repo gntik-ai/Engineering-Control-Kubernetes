@@ -1,6 +1,6 @@
 # Chapter 5 — Agents, skills, and tools
 
-> **The idea in one sentence.** In Hermes an **agent** is not a robot that lives somewhere. It is **one run of a vendor's coding tool** (Codex CLI or Claude Code CLI), started by a workflow step, given a job description and a work contract from the **agent pack**, a bounded task, a short list of **tools**, a locked copy of the code, and a form it must fill in. It then exits.
+> **The idea in one sentence.** In this platform an **agent** is not a robot that lives somewhere. It is **one run of a vendor's coding tool** (Codex CLI or Claude Code CLI), started by a workflow step, given a job description and a work contract from the **agent pack**, a bounded task, a short list of **tools**, a locked copy of the code, and a form it must fill in. It then exits.
 
 ---
 
@@ -119,7 +119,7 @@ The pack also defines roles that **no step uses today**, such as `campaign-plann
 
 ### What a skill is here
 
-In Hermes, an **agent-pack skill** is an **instruction contract for one kind of job**: a `SKILL.md` (what to do, step by step), a `references/contract.md` (inputs, obligations, prohibitions), and a `references/output.schema.json` (the shape of the answer). A skill is **text given to the agent**, not code, and it cannot start anything by itself.
+In the platform, an **agent-pack skill** is an **instruction contract for one kind of job**: a `SKILL.md` (what to do, step by step), a `references/contract.md` (inputs, obligations, prohibitions), and a `references/output.schema.json` (the shape of the answer). A skill is **text given to the agent**, not code, and it cannot start anything by itself.
 
 The skill is chosen **by the step name, not by the model** (`agents/instructions.py`):
 

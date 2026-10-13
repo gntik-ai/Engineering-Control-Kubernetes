@@ -10,7 +10,7 @@ This chapter is for the presenter. It offers session plans for different audienc
 
 | Minute | Say | Show |
 |---|---|---|
-| 0–2 | "Hermes lets AI coding tools fix real issues in our products, under rules a machine enforces and approvals a human gives." | Chapter 1, §1.2 (the workshop analogy table) |
+| 0–2 | "We talk to an AI agent framework, Hermes, on Telegram. Behind it, a workflow engine, Temporal, lets AI coding tools fix real issues in our products, under rules a machine enforces and approvals a human gives." | Chapter 1, §1.2 (the workshop analogy table) |
 | 2–5 | The five golden rules: AI proposes, code disposes; nothing important lives in a chat; the builder never approves its own work; writes need a live permit; when in doubt, stop. | Chapter 1, §1.6 |
 | 5–8 | The journey of one issue, in plain words. | Chapter 6, §6.1 |
 | 8–10 | Proof that it works, and that it stops when it should: #993. | Chapter 6, §6.6 (the timeline, read the "What it illustrates" column) |
@@ -20,7 +20,7 @@ This chapter is for the presenter. It offers session plans for different audienc
 | Minute | Topic | Show |
 |---|---|---|
 | 0–5 | What "Hermes" means (three senses) and the building blocks | Chapter 1, §1.1 and §1.3 diagrams |
-| 5–12 | Hermes and Temporal: front desk versus foreman's memory; the inbound and outbound paths | Chapter 2, §2.1 and §2.3 diagrams |
+| 5–12 | The Hermes Agent framework and Temporal: assistant versus production line; the three gateway paths; how the relationship evolved | Chapter 2, §2.1, §2.5, and §2.9 diagrams |
 | 12–18 | How the backlog is built from GitHub issues | Chapter 3, §3.3 sequence and §3.5 worked example |
 | 18–25 | One issue end to end | Chapter 6, §6.4 diagram |
 | 25–30 | Questions | §7.4 below |
@@ -29,7 +29,7 @@ This chapter is for the presenter. It offers session plans for different audienc
 
 | Block | Topic | Material |
 |---|---|---|
-| 1 (15 min) | Big picture, naming, responsibilities | Chapters 1 and 2 |
+| 1 (15 min) | Big picture, naming, the Hermes Agent framework alongside Temporal | Chapters 1 and 2 |
 | 2 (15 min) | Backlog: import, classification, plan, approval, write policy | Chapter 3 |
 | 3 (20 min) | Orchestration: workflow anatomy, step routing, starters, family tree, human-in-the-loop | Chapter 4 |
 | 4 (20 min) | Agents: anatomy, agent pack, roles, skills, tools, where they run | Chapter 5 |
@@ -53,7 +53,7 @@ For a hands-on workshop, follow this overview with lectures 3 (Temporal), 4 (age
 
 | You may hear… | Correct it with… |
 |---|---|
-| "Hermes is an AI that runs our engineering." | "Hermes is the platform. The AI is in bounded steps; the decisions are in code; the authority is the operator's." |
+| "Hermes is an AI that runs our engineering." | "Hermes is an agent framework we use as the chat front end and messenger. The AI that does the work runs in bounded Codex and Claude steps inside Temporal workflows; the decisions are in code; the authority is the operator's." |
 | "The Hermes bot on Telegram decides what to do." | "The Telegram commands are handled by a hook with no model turn. It parses about thirty fixed commands and calls the API." |
 | "Temporal is the AI orchestrator." | "Temporal replays code that engineers wrote. It never chooses a step." |
 | "The AI reads GitHub and builds the backlog." | "A read-only import and fixed rules build it. AI first sees an issue when it is asked to reproduce it on today's code." |
@@ -69,10 +69,25 @@ For a hands-on workshop, follow this overview with lectures 3 (Temporal), 4 (age
 ### Hermes and Temporal
 
 **Is Hermes the same as Temporal?**
-No. Temporal is the workflow engine that keeps long procedures alive. "Hermes" is the name of the whole platform; the Hermes *gateway* is its Telegram front door. Chapter 1, §1.1.
+No. Hermes Agent is an agent framework (a model decides each turn); Temporal is a workflow engine (code decides each step, and the engine makes it durable). Hermes's gateway is the platform's Telegram front door; Temporal runs the work. Chapter 2, §2.1.
 
 **Does the Hermes gateway run any AI when I send a command?**
-Not for the engineering commands. The hook answers them directly and the gateway's Telegram tool set is empty. Notifications are delivered through a deliver-only webhook route, also without an agent run.
+Not for the engineering commands. The hook answers them directly, without a model turn. Notifications are delivered through a deliver-only webhook route, also without an agent run. Only free-text (non-command) messages reach the Hermes model, and by policy it has no tools or skills on Telegram.
+
+**Hermes is an AI agent framework. Why doesn't it do the coding itself?**
+Because an agent framework's controls are mostly instructions to a model, and the platform needs controls a model cannot bypass: durable state, fixed procedures, separate identities for credentials, schema-validated output, and a checker from another vendor. That is what Temporal workflows with bounded Codex and Claude steps provide. Until mid-August 2026 Hermes skills did run audits and fixes directly; that path was retired and its privileged skills removed from the gateway (Chapter 2, §2.9).
+
+**Can I ask Hermes in plain language to fix an issue?**
+No. Plain-language messages reach the Hermes model, which can converse but cannot call the API or start workflows. Work starts only through the fixed commands (`/loop issue-start …`), the CLI, or the dashboard.
+
+**Which model does Hermes itself use?**
+In the operator's configuration, `gpt-5.6-terra` through the `openai-codex` provider with the `codex_app_server` runtime, which runs the Codex CLI as a subprocess under the operator's subscription login (finding F-04 moved it off direct HTTP calls). This is independent of the models used by the platform's agents (Chapter 5, §5.4).
+
+**Hermes has its own sub-agents (`delegate_task`). Why not use them?**
+They inherit the parent's tools and credentials, return free text, and do not survive a crash. Platform agent steps get a pinned instruction bundle, an explicit tool list, no credentials, a validated JSON result, an independent checker, and durable bookkeeping (Chapter 2, §2.8).
+
+**Are the Hermes skills on the controller's disk a risk?**
+The operator's personal Hermes profile still contains legacy skills that describe direct `kubectl`, GitHub, or browser actions. They are usable only in the operator's own interactive sessions; they cannot start workflows, and the four privileged ones were removed from the production gateway on 2026-09-21. Treat them as historical, and keep the operator's interactive sessions under human supervision.
 
 **What happens if Telegram or the gateway is down?**
 Nothing in flight is lost. Workflows keep running in Temporal. Notifications queue in the outbox and are retried with backoff. The operator can use `engineering-ctl` or the dashboard, which reach the same command bus.
@@ -157,11 +172,13 @@ Text or diff signals for production, data migrations, destructive changes, crede
 8. A checker returns `REQUEST_CHANGES`. What does the loop do?
 9. The import classified an issue R1, but the diff adds a database migration. What happens?
 10. Which workflows can be started without a human command?
+11. What is the essential difference between an agent framework such as Hermes Agent and a workflow engine such as Temporal?
+12. A free-text Telegram message reaches the Hermes model. What can that model do?
 
 <details>
 <summary>Answers</summary>
 
-1. The platform as a whole (Engineering Control and everything it drives); the Hermes Agent gateway (Telegram front door); the `hermes` Unix user (operator account, owner of the GitHub login).
+1. The platform as a whole (Engineering Control and everything it drives); the Hermes Agent framework (whose gateway is the Telegram front door and messenger); the `hermes` Unix user (operator account, owner of the GitHub login).
 2. Temporal (execution history), with the workflow code replayed by the controller's workflow worker.
 3. No. AI first touches an issue during revalidation (`finding.reproduce`, twice).
 4. Engineering Control code, by step name (`agents/instructions.py`); the content of the skill comes from the agent pack.
@@ -171,6 +188,8 @@ Text or diff signals for production, data migrations, destructive changes, crede
 8. It starts another `IssueDeliveryWorkflow` attempt whose maker prompt includes the checker's findings, up to the correction limit.
 9. Deterministic validation raises the ChangeSet's risk floor to R3; merging then needs the project's explicit permission for R3 merges or an operator decision.
 10. The scheduled ones (`QuotaRefreshWorkflow`, `ConnectionsRefreshWorkflow`, `CleanupWorkflow`) and children started by parent workflows.
+11. In an agent framework a model decides the next action at run time; in a workflow engine code decides, and the engine makes every step durable and replayable.
+12. Converse only. By policy it has no tools or skills on Telegram, it has no way to use the API token, and it cannot start or signal workflows.
 
 </details>
 
@@ -197,6 +216,7 @@ WHO                         WHAT                                       WHERE
 Operator                    starts, approves, decides, unblocks         Telegram · engineering-ctl · dashboard
 Hermes gateway + hook       parses 30 fixed commands, no AI; delivers   controller, user hermes-gateway
                             notifications (deliver-only webhook)
+Hermes agent loop           free-text chat only; no tools on Telegram   controller, user hermes-gateway
 Engineering API + bus       validates, records, admits, starts/signals  controller :8740
 Temporal + workflow worker  remembers, waits, routes steps, resumes     controller :7233, queue engineering-control
 Workflow code               the procedures (31 workflows, ~220 steps)   workflows/definitions.py
