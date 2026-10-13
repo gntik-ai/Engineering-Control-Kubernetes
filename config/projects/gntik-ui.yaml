@@ -46,7 +46,11 @@ delivery_control:
     enabled: true
     kind: protected-merge
     source_ci_workflow: ci
-    allow_r3_merge: false
+    # NEW-193 (operator 2026-10-13): the path classifier floors any packages/*/src/auth/
+    # block at R3 (gntik-ui#28 sign-up form), so R3 changes merge here too, after the
+    # independent checker and CI (merge-only delivery has no runtime reviewers). R3 issues
+    # still need r3-approve before they start; releases stay operator-merged.
+    allow_r3_merge: true
     # ci.yml's `visual` job is continue-on-error (baselines are recorded on the CI
     # runner); its result never blocks the merge. Every other check must pass.
     non_blocking_checks: [visual]
