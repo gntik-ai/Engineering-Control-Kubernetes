@@ -1518,7 +1518,7 @@ class BaselineGh(FakeGh):
             if ".commit.committer.date" in args:
                 return MAIN_DATE + "\n"
             return json.dumps({"sha": MAIN_SHA, "tree": "f" * 40})
-        if args[0] == "api" and args[1].endswith("/issues/77/events"):
+        if args[0] == "api" and args[1].endswith(("/issues/77/events", "/issues/9/events")):
             return "".join(f"{value}\n" for value in self.reopened)
         if args[:2] == ["pr", "reopen"]:
             self.pull_requests[(args[4], int(args[2]))]["state"] = "OPEN"
@@ -1785,6 +1785,63 @@ async def test_stale_pr_ci_is_rerun_on_current_main_before_the_baseline(tmp_path
 
     merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_STALE"}
+
+
+@pytest.mark.asyncio
+async def test_stale_deployment_pr_ci_is_rerun_on_current_main(tmp_path: Path) -> None:
+    # NEW-195: falcone #1087's charts PR failed a test before falcone-charts#72 fixed it on
+    # main; the repair maker then rewrote the fixed test from that stale failure and the PR
+    # conflicted. A deployment failure older than main reruns on current main first.
+    deployment_head = "e" * 40
+    handler, fake = _baseline_handler(tmp_path, [], [])
+    plan = _plan(
+        deployment_pr_number=9,
+        deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        deployment_head_sha=deployment_head,
+    )
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)] = _pull_request(
+        number=9,
+        url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        headRefOid=deployment_head,
+        statusCheckRollup=[_check("validate", "FAILURE", started="2026-09-26T07:56:00Z")],
+    )
+
+    rerun = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert rerun == {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CI_RERUN_STARTED"}
+    reruns = [call for call in fake.calls if call[:2] in (["pr", "close"], ["pr", "reopen"])]
+    assert [(call[:3], call[4]) for call in reruns] == [
+        (["pr", "close", "9"], "gntik-ai/musematic-deploy"),
+        (["pr", "reopen", "9"], "gntik-ai/musematic-deploy"),
+    ]
+
+    waiting = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert waiting == {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CI_RERUN_PENDING"}
+    assert len(fake.reopened) == 1
+
+    # NEW-195 review: a fresh job elsewhere must not make the old failure look current;
+    # the rerun's replacement results are awaited (bounded by the CI poll).
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)]["statusCheckRollup"] = [
+        _check("validate", "FAILURE", started="2026-09-26T07:56:00Z"),
+        _check("lint", None),
+    ]
+    mixed = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert mixed == {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CI_RERUN_PENDING"}
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)]["statusCheckRollup"] = [
+        _check("validate", "FAILURE", started="2026-09-26T07:56:00Z"),
+        _check("lint", "SUCCESS", started="2026-09-26T12:01:00Z"),
+    ]
+    # The rerun finished without replacing the failing check: it stays a failure.
+    unreplaced = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert unreplaced["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+    assert len(fake.reopened) == 1
+
+    # A failure from a run on current main is a regression for the bounded repair.
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)]["statusCheckRollup"] = [
+        _check("validate", "FAILURE")
+    ]
+    failed = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert failed["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+    assert len(fake.reopened) == 1
 
 
 RELEASE_SHA = "e" * 40

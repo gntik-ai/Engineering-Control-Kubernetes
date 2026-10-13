@@ -4358,6 +4358,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         repair_round = 0
         repair_pending = False
         restore_pending = False
+        # NEW-195: an operator retry of a CI regression rechecks first; this grants the
+        # one repair that retry used to start directly, even at the automatic limit.
+        operator_repair_grant = False
         while True:
             staged: dict[str, Any] | None = None
             if restore_pending and change_set_id:
@@ -4453,11 +4456,18 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                 )
                 and gate is not None
-                and repair_round < self._CI_REPAIR_ROUNDS
-                and workflow.patched("existing-backlog-gitops-ci-repair-v1")
+                and (
+                    # The operator's grant never depends on the automatic-repair marker,
+                    # which a pre-NEW-64 history replays as False (NEW-195 review).
+                    operator_repair_grant
+                    or (repair_round < self._CI_REPAIR_ROUNDS and self._gitops_ci_repair_patched())
+                )
             ):
+                operator_repair_grant = False
                 repair_pending = True
                 continue
+            # A grant covers only the recheck its retry started; any pause ends it.
+            operator_repair_grant = False
             paused_state = {
                 **_backlog_execution_payload(request),
                 "loop_status": "PAUSED",
@@ -4491,6 +4501,24 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     gitops_round += 1
                     if self._repair_restores_published_patched(ordinal):
                         restore_pending = True
+                elif (
+                    gate is not None
+                    and (
+                        blocker == "SOURCE_PR_CI_REGRESSION"
+                        or (
+                            blocker == "DEPLOYMENT_PR_CI_REGRESSION"
+                            and self._deployment_ci_repair_patched(ordinal)
+                        )
+                    )
+                    and self._regression_retry_rechecks_patched(ordinal)
+                ):
+                    # NEW-195: the regression's CI evidence may predate a fix on main
+                    # (falcone #1087 repaired a test that main had already fixed). Re-check
+                    # first: a stale failure reruns on current main (NEW-67 for source PRs,
+                    # NEW-195 for deployment PRs). A still-failing check repairs once with
+                    # fresh evidence, even at the automatic limit.
+                    operator_repair_grant = True
+                    gitops_round += 1
                 elif gate is not None and (
                     blocker == "SOURCE_PR_CI_REGRESSION"
                     or blocker.startswith("CI_REPAIR_")
@@ -4561,6 +4589,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
 
     def _repair_restores_published_patched(self, ordinal: int) -> bool:
         return workflow.patched(f"existing-backlog-ci-repair-restores-published-v1-{ordinal}")
+
+    def _gitops_ci_repair_patched(self) -> bool:
+        return workflow.patched("existing-backlog-gitops-ci-repair-v1")
+
+    def _regression_retry_rechecks_patched(self, ordinal: int) -> bool:
+        return workflow.patched(f"existing-backlog-regression-retry-rechecks-v1-{ordinal}")
 
     def _repair_retry_rechecks_patched(self, ordinal: int) -> bool:
         # Temporal memoizes a patch per workflow, so the decision is scoped to the issue:

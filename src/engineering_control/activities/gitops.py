@@ -2521,6 +2521,30 @@ class GitOpsGitHubHandler:
                 # The configured CI never ran (or only skipped jobs): not a pass.
                 return {"status": "CHECKS_PENDING", "reason": "REQUIRED_DEPLOYMENT_CI_MISSING"}
             return {"status": "CHECKS_PASSED", "check_count": len(states)}
+        # NEW-195: a failure from a run older than the base branch head is stale evidence.
+        # The PR's CI builds the PR merged with its base, so rerun it on current main (as
+        # NEW-67 does for source PRs) before a repair: falcone #1087's maker rewrote a test
+        # that falcone-charts#72 had already fixed on main, and the PR then conflicted.
+        # Each failing check is judged by its own start: a fresh job elsewhere in the run
+        # must not make an old failure look current.
+        main_date = self.broker.commit_date(repository, plan.deployment_base_branch)
+        if any(start < main_date for start in _failed_check_starts(pull_request).values()):
+            reopened = self.broker.last_reopened_at(repository, plan.deployment_pr_number)
+            if reopened < main_date:
+                self._require_baseline_write(repository, plan.project)
+                self.broker.rerun_pull_request_ci(
+                    repository=repository,
+                    number=plan.deployment_pr_number,
+                    expected_head_sha=plan.deployment_head_sha,
+                    change_binding=f"changeset:{plan.change_set_id}",
+                )
+                return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CI_RERUN_STARTED"}
+            if _latest_check_start(pull_request) < reopened or any(
+                value == "PENDING" for value in states.values()
+            ):
+                # Wait for the rerun to start and finish; the CI poll bounds the wait.
+                return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CI_RERUN_PENDING"}
+            # The rerun finished: a failing check it did not replace stays a failure.
         return {
             "status": "BLOCKED",
             "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
@@ -3471,18 +3495,35 @@ def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:
     for raw in raw_checks:
         if not isinstance(raw, dict):
             raise ValueError("GitHub PR check result is invalid")
-        name = str(raw.get("name") or raw.get("context") or "")[:200]
-        state = str(raw.get("status") or raw.get("state") or "").upper()
-        conclusion = str(raw.get("conclusion") or raw.get("state") or "").upper()
-        if state in {"QUEUED", "PENDING", "IN_PROGRESS", "REQUESTED", "WAITING"} or not conclusion:
-            value = "PENDING"
-        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
-            value = "PASSED"
-        else:
-            value = "FAILED"
+        name, value = _check_name(raw), _check_state(raw)
         if rank[value] >= rank.get(states.get(name, "PASSED"), 0):
             states[name] = value
     return states
+
+
+def _check_name(raw: dict[str, Any]) -> str:
+    return str(raw.get("name") or raw.get("context") or "")[:200]
+
+
+def _check_state(raw: dict[str, Any]) -> str:
+    state = str(raw.get("status") or raw.get("state") or "").upper()
+    conclusion = str(raw.get("conclusion") or raw.get("state") or "").upper()
+    if state in {"QUEUED", "PENDING", "IN_PROGRESS", "REQUESTED", "WAITING"} or not conclusion:
+        return "PENDING"
+    if conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+        return "PASSED"
+    return "FAILED"
+
+
+def _failed_check_starts(pull_request: dict[str, Any]) -> dict[str, str]:
+    """NEW-195: failing check name -> ISO start of its newest failing run ('' if unknown)."""
+    raw_checks = pull_request.get("statusCheckRollup")
+    starts: dict[str, str] = {}
+    for raw in raw_checks if isinstance(raw_checks, list) else []:
+        if isinstance(raw, dict) and _check_state(raw) == "FAILED":
+            name, start = _check_name(raw), str(raw.get("startedAt") or raw.get("createdAt") or "")
+            starts[name] = max(starts.get(name, ""), start)
+    return starts
 
 
 def _latest_check_start(pull_request: dict[str, Any]) -> str:
