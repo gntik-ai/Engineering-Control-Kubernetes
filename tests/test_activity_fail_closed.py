@@ -155,7 +155,7 @@ async def test_delivery_prepare_toolchain_is_wired_to_the_scan_worker(
     )
 
     result = await activities.execute_control_step(
-        {"step": step, "payload": {"project": "falcone", "source_worktree": "/nonexistent"}}
+        {"step": step, "payload": {"project": "llmwiki", "source_worktree": "/nonexistent"}}
     )
 
     assert result["status"] == "TOOLCHAIN_SKIPPED"

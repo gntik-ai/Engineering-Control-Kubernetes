@@ -544,6 +544,7 @@ def _setup(
         ),  # type: ignore[arg-type]
         scanner=Scanner(),  # type: ignore[arg-type]
         publisher=Publisher(),  # type: ignore[arg-type]
+        toolchain_runner=_NoInstall(),  # type: ignore[arg-type]
         baseline_runner=runner,
     )
     payload = {
@@ -567,6 +568,17 @@ def _setup(
         "deployment_maker_result": {"structured_result": {"tests": []}},
     }
     return handler, payload
+
+
+class _NoInstall:
+    """NEW-196: falcone now prepares its pnpm workspace; these fixtures have none to install."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path]] = []
+
+    def run(self, executable: str, arguments: Any, *, cwd: Path, **_: Any) -> CommandResult:
+        self.calls.append((executable, cwd))
+        return CommandResult(0, "", "")
 
 
 def _baseline_root(tmp_path: Path, sha: str, *parts: str) -> Path:
@@ -795,11 +807,14 @@ def test_base_result_is_cached(tmp_path: Path) -> None:
         ],
         "cwd": ".",
         "kind": "node_test",
-        "prepare": None,
+        # NEW-196: falcone's base worktree is prepared with its pnpm install first.
+        "prepare": [
+            {"argv": ["pnpm", "install", "--frozen-lockfile"], "cwd": ".", "timeout_seconds": 1800}
+        ],
         "reporter": 4,
     }
     assert value["exit_code"] == 1 and len(value["test_failures"]) == 9
-    assert (root / "prepared").read_text() == f"{payload['source_base_sha']} unprepared\n"
+    assert (root / "prepared").read_text() == f"{payload['source_base_sha']}\n"
     # A torn cache entry is recomputed, never trusted.
     cached[key]["test_failures"] = ["not", "a", "mapping"]
     (root / "results.json").write_text(json.dumps(cached))
