@@ -184,7 +184,7 @@ Each attempt runs in a `0700` temporary directory under `/srv/engineering/tmp/co
 `adapters/process.py:165-272` (`run_jsonl_process`) is common to both adapters:
 
 1. The prompt is **redacted** before it is written to stdin. (Yes: the platform scrubs secrets from what it sends to the model, too.)
-2. The child is spawned with `start_new_session=True` so that a timeout can kill the whole process group, and with a 2 MiB per-line limit.
+2. The child is spawned with `start_new_session=True` so that a timeout can kill the whole process group, and with a 2 MiB per-line limit. Since NEW-188, where the Codex and Claude worker units delegate their cgroup, each run is also placed in its own `agent-run-*` cgroup that the kernel kills as a whole (`cgroup.kill`) when the run ends, so test processes started in other sessions cannot outlive it; a `/proc`-based tracker is the fallback where no cgroup is delegated.
 3. Every stdout line passes through `redact_json_line`; every stderr line through `redact_text` (stderr is capped at 256 kB).
 4. Timeout → SIGTERM to the group, 10 s grace, SIGKILL. Temporal cancellation → the same, then the cancellation is re-raised.
 

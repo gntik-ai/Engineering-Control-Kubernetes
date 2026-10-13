@@ -155,10 +155,10 @@ No. Every shipped role has `recursion_depth: 0`. Only workflows compose work.
 A SHA-256 binding over the precise content: commits, plan hash, risk bound, item count, mode, expiry, and for deployments digests, targets, and evidence. If anything changes, the approval no longer matches.
 
 **What is the GitHub write policy?**
-A root-owned file that says whether GitHub writes are enabled and for which allowlisted repositories. It is enabled only by a root reconciler after an approved campaign requests it, expires after at most 24 hours, and is checked by the broker before every mutating command. The component that enables writes (root) is not the one that performs them (`hermes`) nor the one that decides what to perform (`engineering-control`).
+A root-owned file that says whether GitHub writes are enabled and for which allowlisted repositories. It is enabled only by a root reconciler after an approved campaign requests it (one owner campaign per project, at most two projects at once), expires after at most 24 hours, and is checked by the broker before every mutating command. The component that enables writes (root) is not the one that performs them (`hermes`) nor the one that decides what to perform (`engineering-control`).
 
 **What makes something R3?**
-Text or diff signals for production, data migrations, destructive changes, credential rotation, secret lifecycle, or cluster roles. R3 requires a human's typed approval bound to the specific issue or change, and cross-provider verification.
+Text or diff signals for production, data migrations, destructive changes, credential rotation, secret lifecycle, or cluster roles; and, since NEW-179, every issue classified as a security defect. R3 requires a human's typed approval bound to the specific issue or change, and cross-provider verification.
 
 ## 7.5 Check your understanding
 

@@ -26,7 +26,7 @@ Three facts people often get wrong:
 
 * **The backlog is not live.** It reflects GitHub at the moment of import. The platform never polls GitHub for new issues on its own; there is no scheduled import. A new import creates a new campaign.
 * **The backlog is not written by AI.** Every field of every backlog record comes from GitHub data and fixed rules. The AI first sees an issue when the loop asks it to reproduce that issue on current code.
-* **Labels help, but they cannot hide the highest risk.** The issue's *type* and *severity* use GitHub labels when present (plus some title and text patterns), and they influence the R0–R2 risk. The **R3** (highest-risk) rule reads only the issue text, so no label can stop an issue that mentions, for example, production or a data migration from requiring a human's explicit approval.
+* **Labels help, but they cannot hide the highest risk.** The issue's *type* and *severity* use GitHub labels when present (plus some title and text patterns), and they influence the R0–R2 risk. The **R3** (highest-risk) keyword rule reads only the issue text, so no label can stop an issue that mentions, for example, production or a data migration from requiring a human's explicit approval. Security defects are R3 as well.
 
 ## 3.2 The objects involved
 
@@ -113,7 +113,7 @@ The GitHub broker runs fixed, structured `gh` commands. It cannot run arbitrary 
 |---|---|---|
 | **Issue type** | `PRODUCT_BUG`, `SECURITY_DEFECT`, `DEPLOYMENT_DEFECT`, `DOCUMENTATION_DEFECT`, `OPERATIONS_DEFECT`, `ENHANCEMENT`, `SPEC_DECISION`, `QUESTION`, `META_TOOLING`, `DUPLICATE`, `STALE`, `ALREADY_FIXED`, `SUPERSEDED`, `INVALID_OR_UNREPRODUCIBLE` | An ordered cascade; the first match wins. (1) Housekeeping labels: `duplicate` (or the text "duplicate of #N"), `already-fixed`, `superseded`, `stale`, `invalid` / `wontfix` / `not reproducible`. (2) **Enhancement** when an enhancement label (`enhancement`, `feature`, …), a `kind: enhancement` line, or a title prefix such as `feature request:` is present, unless there is independent defect evidence (a `bug` label, a `bug:` title prefix…). (3) **Security** when labelled `security` or the text mentions "vulnerability", "tenant isolation", or "authorization bypass". (4) **Spec decision** for decision labels or text such as "needs product decision". (5) **Deployment** for issues in the deployment repository or with deployment/Helm/Argo CD/GitOps labels. (6) **Documentation** for documentation labels or text starting with `docs:`. (7) Operations and tooling labels. (8) **Question** for a `question` label or a title ending in "?". (9) Otherwise **product bug**. Issues created by the platform's change-request flow carry a `kind:` line that maps directly to a type. |
 | **Severity** | `critical`, `high`, `medium`, `low`, `unspecified` | A `severity:<level>` or `severity/<level>` label if present. Otherwise text such as "critical severity", "remote code execution", or "data loss" means `critical`. Otherwise `unspecified`. |
-| **Risk** | `R0`–`R3` | **R3** if the text contains a word starting with `data migrat…`, `destructiv…`, `credential rotat…`, `secret lifecycle`, `production…`, or `clusterrole…`. **R2** for security defects or critical/high severity. **R0** for documentation, questions, and tooling. **R1** otherwise. A `Risk: Rn` line in a change-request issue can only *raise* the risk. |
+| **Risk** | `R0`–`R3` | **R3** if the text contains a word starting with `data migrat…`, `destructiv…`, `credential rotat…`, `secret lifecycle`, `production…`, or `clusterrole…`, **or the issue is a security defect** (NEW-179, operator decision 2026-10-10). **R2** for critical/high severity. **R0** for documentation, questions, and tooling. **R1** otherwise. A `Risk: Rn` line in a change-request issue can only *raise* the risk. |
 | **Reproduction mode** | `DOCUMENTATION_REQUIRED`, `DEPLOYMENT_REQUIRED`, `RUNTIME_REQUIRED`, `STATIC_PLUS_TEST`, `SOURCE_ONLY` | How the issue must be proven: from docs, from the deployment repository (or text about Helm, Argo CD, GitOps), on a running system (text about login, HTTP 401/404, runtime, staging, browser), with tests (labels `unit-test`, `regression`), or from source alone. |
 | **Dependencies** | references like `gntik-ai/musematic#12` | Phrases such as "blocked by" or "depends on" pointing at an issue in the allowlisted repositories. The import then fills the reverse list (`issues_blocked`). |
 | **Linked pull requests** | `ADOPTABLE_ACTIVE_PR`, `STALE_PR`, `CONFLICTING_PR`, `ALREADY_MERGED`, `CLOSED_WITHOUT_MERGE`, `UNRELATED_PR` | An open PR that mentions the issue (URL, closing keyword, or the number in the branch name). An active human PR blocks delivery until it is reconciled, so the platform never duplicates someone's work. |
@@ -152,13 +152,13 @@ An import with filter `all` of six issues in the `musematic` repository:
 | Issue | Title (labels) | Type | Severity | Risk | Reproduction | Wave | Depends on | Order and eligibility |
 |---|---|---|---|---|---|---|---|---|
 | #40 | "Login fails with HTTP 401 after token refresh" (none) | PRODUCT_BUG | unspecified | R1 | RUNTIME_REQUIRED | **W0** ("login") | — | **1**, eligible |
-| #52 | "Remote code execution in upload handler" (`security`) | SECURITY_DEFECT | critical ("remote code execution") | R2 | SOURCE_ONLY | **W1** | — | **2**, eligible |
+| #52 | "Remote code execution in upload handler" (`security`) | SECURITY_DEFECT | critical ("remote code execution") | **R3** (security defect) | SOURCE_ONLY | **W1** | — | **2**, **deferred** `R3_REQUIRES_OPERATOR` |
 | #61 | "Export button broken, blocked by #40" (none) | PRODUCT_BUG | unspecified | R1 | SOURCE_ONLY | **W2** (has a dependency) | musematic#40 | **3**, eligible |
 | #80 | "Rotate the production database credentials" (`operations`) | OPERATIONS_DEFECT | unspecified | **R3** ("production") | SOURCE_ONLY | **W3** | — | **4**, **deferred** `R3_REQUIRES_OPERATOR` |
 | #70 | "docs: typo in README install section" (none) | DOCUMENTATION_DEFECT (starts with `docs:`) | unspecified | R0 | DOCUMENTATION_REQUIRED | **W4** | — | **5**, eligible |
 | #75 | "Add dark mode" (`enhancement`) | ENHANCEMENT | unspecified | R1 | SOURCE_ONLY | **W5** | — | **6**, eligible (the filter is `all`) |
 
-The example uses invented issue texts to illustrate the rules; it is not a real campaign. Notice three things: the wave dominates the order; #80 keeps its place in the plan but cannot be worked without its own R3 approval; and if #40 were missing from the import, #61 would still be ordered, because only dependencies inside the imported set constrain the order.
+The example uses invented issue texts to illustrate the rules; it is not a real campaign. Notice three things: the wave dominates the order; #52 and #80 keep their places in the plan but cannot be worked without their own R3 approval; and if #40 were missing from the import, #61 would still be ordered, because only dependencies inside the imported set constrain the order.
 
 The persisted campaign is **idempotent**. If the same campaign id is persisted again (for example after a Temporal retry), the project, plan hash, and both heads must be identical, or the step fails with "backlog import idempotency binding changed".
 
@@ -176,7 +176,7 @@ There are two ways to approve, both ending in the same records:
 Approval does three things:
 
 1. It freezes the binding: heads at import, plan hash, delivery mode, maximum risk, maximum items, the allowed GitHub operations, `production=false`, correction limits, and an expiry.
-2. It decides the **write-policy role**. The first approved campaign becomes the **policy owner**: a non-secret request file is written, and a root-only reconciler enables GitHub writes for the allowlisted repositories, for at most 24 hours. Campaigns approved while an owner is active become **inventory** campaigns and never touch the policy ([Lecture 9](../09-security-policy-and-fail-closed-gates.md) explains the policy path).
+2. It decides the **write-policy role**. Ownership is **per project** (NEW-163): the first approved campaign of a project becomes that project's **policy owner**, a non-secret request file is written, and a root-only reconciler enables GitHub writes for the allowlisted repositories, for at most 24 hours. Further approvals of the same project become **inventory** campaigns and never touch the policy. At most two projects (`ENGINEERING_BACKLOG_PARALLEL_PROJECT_LIMIT`, default 2) may hold an owner at the same time; an approval beyond the limit is refused. Delivery writes are additionally bound to their own project's repository pair (`REPOSITORY_OUTSIDE_PROJECT`). While the global cross-project selector runs, the older single-global-owner rule applies ([Lecture 9](../09-security-policy-and-fail-closed-gates.md) explains the policy path).
 3. It moves the campaign through these states:
 
 ```mermaid
@@ -184,8 +184,8 @@ stateDiagram-v2
     [*] --> IMPORTED : backlog.persist_import
     IMPORTED --> PLANNED : backlog.plan
     PLANNED --> AWAITING_APPROVAL : approval candidate prepared
-    AWAITING_APPROVAL --> APPROVED_POLICY_PENDING : approved, becomes policy owner
-    AWAITING_APPROVAL --> APPROVED_INVENTORY : approved while another owner is active
+    AWAITING_APPROVAL --> APPROVED_POLICY_PENDING : approved, becomes its project's policy owner
+    AWAITING_APPROVAL --> APPROVED_INVENTORY : approved while its project already has an owner
     APPROVED_POLICY_PENDING --> APPROVED : root reconciler enabled the write policy
     APPROVED --> RUNNING : loop started
     APPROVED_INVENTORY --> RUNNING : loop started
@@ -266,6 +266,6 @@ flowchart LR
 **Key takeaways**
 
 * The backlog is built **on demand**, **read-only**, and **without AI**, from a frozen snapshot of the repository pair.
-* Classification is rule-based on the issue text; the R3 rule deliberately over-matches; R3 issues always need their own human approval.
-* Approval turns a plan into a 24-hour, content-bound permission, and the first approved campaign owns the GitHub write policy.
+* Classification is rule-based on labels and text; the R3 rule deliberately over-matches and includes every security defect; R3 issues always need their own human approval.
+* Approval turns a plan into a 24-hour, content-bound permission, and the first approved campaign of each project owns the GitHub write policy for that project (at most two projects at once).
 * AI enters only at revalidation, and every issue must be reproduced twice on current code before it can be changed.

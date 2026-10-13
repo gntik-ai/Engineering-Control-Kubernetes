@@ -216,8 +216,8 @@ flowchart TB
 
 * **Machine.** All agents run on the worker host `hermes-worker`. The controller never runs a model.
 * **Identity.** Codex runs as `codex-runner`, Claude as `claude-runner`. Each has its own home with its own subscription login, unreadable to the others. Provider workers have **no database access**; they report through Temporal results and the evidence ingest service.
-* **Process.** Each agent is a child process of its role worker, in its own process group (so a timeout kills everything it started), with every API-key, base-URL, proxy, and credential-directory variable stripped from its environment.
-* **Resources.** The role worker unit is sandboxed by systemd (`ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, explicit writable paths only) and capped (`CPUQuota=250%`; memory 5 GB for the Codex and Claude workers, because makers and checkers run full test suites).
+* **Process.** Each agent is a child process of its role worker, in its own process group and, on the agent workers, in its own `agent-run-*` cgroup that the kernel kills as a whole when the run ends (NEW-188), so nothing the agent started can outlive it, with every API-key, base-URL, proxy, and credential-directory variable stripped from its environment.
+* **Resources.** The role worker unit is sandboxed by systemd (`ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, explicit writable paths only) and capped (`CPUQuota=250%`; each agent worker up to 7 GB, with reclaim pressure from 6 GB, inside a shared 9 GB slice for both agent workers, itself inside a 13 GB slice for all workers on the 15 GB host, because makers and checkers run full test suites; NEW-167).
 * **Place in the code.** Exactly one leased worktree per ChangeSet, at an exact commit, under `/srv/engineering/worktrees`. File ACLs give the maker write access and the checker read-only access.
 
 ## 5.9 The lifecycle of one invocation

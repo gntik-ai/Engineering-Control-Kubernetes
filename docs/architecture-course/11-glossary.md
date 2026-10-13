@@ -31,7 +31,7 @@
 | **Mirror** | A canonical bare Git repository under `/srv/engineering/mirrors`, refreshed only by the GitHub worker. |
 | **Mission** | One of the three product functions: issue resolution, product audit, enhancement discovery. |
 | **Operation** | One row of `operation_requests`: a typed command from any surface with one active owner per target and an atomic dispatch receipt. |
-| **Policy owner** | The one approved backlog campaign whose approval enabled the shared GitHub write policy. |
+| **Policy owner** | The approved backlog campaign whose approval enabled the shared GitHub write policy for its project. Since NEW-163 there is at most one per project and at most two projects at once (one globally while the global backlog runs). |
 | **Preset** | A named audit configuration: `snapshot`, `static-full`, `e2e-smoke`, `full-e2e`, `security`, `ux`, `deployment`, `falcone-intensive`. |
 | **Provider** | `codex` or `claude`. |
 | **Publication intent / effect** | Durable `steps` records binding a publication plan hash and each admitted `git_push` / `pr_create` effect with a `COMPLETE` / `UNKNOWN` / `NOT_ATTEMPTED` receipt. |
