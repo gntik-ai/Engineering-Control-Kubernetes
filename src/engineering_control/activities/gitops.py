@@ -2507,6 +2507,9 @@ class GitOpsGitHubHandler:
             return {"status": "CHECKS_PASSED", "already_merged": True}
         if pull_request.get("state") != "OPEN":
             return {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_NOT_OPEN"}
+        conflict = _merge_conflict(pull_request, "deployment")
+        if conflict is not None:
+            return conflict
         states = _check_states(pull_request)
         failed = sorted(name for name, value in states.items() if value == "FAILED")
         if not failed:
@@ -2546,6 +2549,9 @@ class GitOpsGitHubHandler:
             return {"status": "CHECKS_PASSED", "already_merged": True}
         if pull_request.get("state") != "OPEN":
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_NOT_OPEN"}
+        conflict = _merge_conflict(pull_request, "source")
+        if conflict is not None:
+            return conflict
         result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
         if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
             return self._baseline_gate(
@@ -3440,6 +3446,19 @@ def _workflow_succeeded(pull_request: dict[str, Any], workflow: str) -> bool:
         and str(raw.get("conclusion") or "").upper() == "SUCCESS"
         for raw in (raw_checks if isinstance(raw_checks, list) else [])
     )
+
+
+def _merge_conflict(pull_request: dict[str, Any], target: str) -> dict[str, Any] | None:
+    """NEW-194: block at once on a PR that conflicts with its base branch.
+
+    GitHub starts no pull_request CI for a conflicting PR, so the CI poll waited out its
+    whole bound for checks that never come (falcone #1087: the charts PR conflicted with a
+    test fix on main, 90 minutes, then DEPLOYMENT_PR_CI_TIMEOUT). Hermes never rebases an
+    agent branch, so a conflict needs the operator now, not after the timeout.
+    """
+    if str(pull_request.get("mergeStateStatus") or "") == "DIRTY":
+        return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_CONFLICT"}
+    return None
 
 
 def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:

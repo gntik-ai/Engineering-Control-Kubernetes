@@ -127,6 +127,15 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "DEPLOYMENT_PR_CI_TIMEOUT": "the deployment PR's CI did not finish within its bound",
     "SOURCE_PR_MERGE_BLOCKED": "the source PR could not be merged within its bound",
     "DEPLOYMENT_PR_MERGE_BLOCKED": "the deployment PR could not be merged within its bound",
+    # NEW-194: Hermes never rebases an agent branch; a retry finds the same conflict.
+    "SOURCE_PR_MERGE_CONFLICT": (
+        "the source PR conflicts with its base branch, so its CI cannot run; close its "
+        "PRs, cancel the loop, then re-import and restart the issue"
+    ),
+    "DEPLOYMENT_PR_MERGE_CONFLICT": (
+        "the deployment PR conflicts with its base branch, so its CI cannot run; close its "
+        "PRs, cancel the loop, then re-import and restart the issue"
+    ),
     "PROTECTED_MERGE_FAILED": "the protected merge failed",
     "R3_MERGE_REQUIRES_APPROVAL": "an R3 change needs explicit operator approval to merge",
     "CHANGE_SET_STATE_NOT_DELIVERABLE": "the ChangeSet is not in a deliverable state",

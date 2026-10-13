@@ -2136,6 +2136,43 @@ async def test_deployment_pr_checks_gate_the_merge_of_both_prs(tmp_path: Path) -
     assert merged["status"] == "CHECKS_PASSED" and merged["already_merged"] is True
 
 
+@pytest.mark.asyncio
+async def test_pr_checks_block_at_once_on_a_merge_conflict(tmp_path: Path) -> None:
+    # NEW-194: GitHub runs no pull_request CI for a conflicting PR; falcone #1087's charts
+    # PR waited 90 minutes for checks that never came, then DEPLOYMENT_PR_CI_TIMEOUT.
+    deployment_head = "e" * 40
+    handler, fake = _baseline_handler(tmp_path, [], [])
+    plan = _plan(
+        deployment_pr_number=9,
+        deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        deployment_head_sha=deployment_head,
+    )
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request(
+        mergeStateStatus="DIRTY", statusCheckRollup=[]
+    )
+    source = await handler.handle("gitops.pr_checks", {"plan": plan})
+    assert source == {"status": "BLOCKED", "blocker": "SOURCE_PR_MERGE_CONFLICT"}
+
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)] = _pull_request(
+        number=9,
+        url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        headRefOid=deployment_head,
+        mergeStateStatus="DIRTY",
+        statusCheckRollup=[],
+    )
+    deployment = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert deployment == {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_MERGE_CONFLICT"}
+
+    # The binding and merged checks still come first; any other merge state is unchanged.
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)]["state"] = "MERGED"
+    merged = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert merged["status"] == "CHECKS_PASSED" and merged["already_merged"] is True
+    fake.pull_requests[("gntik-ai/musematic", 77)]["mergeStateStatus"] = "UNKNOWN"
+    unknown = await handler.handle("gitops.pr_checks", {"plan": plan})
+    assert unknown == {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_NOT_REPORTED"}
+    assert fake.mutations == []
+
+
 # -- NEW-113: Argo CD sync failure diagnosis, remediation and escalation --------------
 
 # The operator's report for gntik-ai/falcone#980, verbatim (Kubernetes adds backticks).
