@@ -34,7 +34,10 @@ repository creation, or credential copy is performed by this repository's bootst
 
 A lecture-style walkthrough of the whole platform (components, software choices, workflows,
 state machines, control surfaces, security gates, operations) lives in
-[`docs/architecture-course/README.md`](docs/architecture-course/README.md).
+[`docs/architecture-course/README.md`](docs/architecture-course/README.md). A higher-level
+companion for presenting the platform to mixed audiences (Hermes and Temporal, the GitHub
+backlog, orchestration, agents, skills, and tools) is
+[`docs/architecture-course/functional-overview/README.md`](docs/architecture-course/functional-overview/README.md).
 
 See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
 `docs/OPERATOR-CHEATSHEET.md`. Exact PR/CI, signed candidate image, and digest-only deployment
