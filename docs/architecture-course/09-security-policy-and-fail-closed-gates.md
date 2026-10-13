@@ -164,7 +164,7 @@ The redactor (Lecture 4) is applied at every edge, but the important property is
 | `candidate_build.enabled` | `false` per project | `config/projects/*.yaml` | pre-merge signed-artifact reconciliation |
 | `immutable_promotion.enabled` | `true` only for falcone | project manifest | digest-only chart promotion |
 | `staging_flow.enabled` | `true` for falcone, musematic | project manifest | post-merge GitOps delivery |
-| `allow_r3_merge` | `true` falcone/musematic, `false` gntik-ui | project manifest | GitOps merge of an R3 ChangeSet |
+| `allow_r3_merge` | `true` falcone/musematic/gntik-ui (gntik-ui since NEW-193) | project manifest | GitOps merge of an R3 ChangeSet |
 | Mutation steps' `dry_run` | `True` unless the payload says `false` | `activities/core.py` | `*.deploy`, `recovery.execute`, `cleanup.execute_*`, `reconcile.apply/publish_promotion`, `final.merge_*`, `final.close_issue`, … |
 | `production` | literal `False` in every schema | typed command and policy models | production is **not modelled**; a `true` is a validation error |
 

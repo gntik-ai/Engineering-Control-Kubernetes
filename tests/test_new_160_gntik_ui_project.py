@@ -119,6 +119,8 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
     merge = manifest.merge_delivery()
     assert merge is not None and merge.enabled and merge.source_ci_workflow == "ci"
     assert merge.non_blocking_checks == ("visual",)
+    # NEW-193: R3 ChangeSets (e.g. auth blocks floored by the path classifier) merge too.
+    assert merge.allow_r3_merge is True
     # NEW-181: PR CI failures that main does not share go back to the maker for repair.
     assert merge.ci_baseline.enabled
     assert {marker.path for marker in merge.ci_baseline.markers} == {".hermes-ci-baseline"}
