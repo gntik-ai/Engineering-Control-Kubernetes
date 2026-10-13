@@ -3856,6 +3856,59 @@ def test_failure_excerpt_reads_playwright_list_output_new_183() -> None:
     assert budget in failure_excerpt("ok 1 - x\n" * 30 + budget + "\n" + "ok 2 - y\n" * 30)
 
 
+def test_failure_excerpt_keeps_a_playwright_assertion_diff_new_198() -> None:
+    """NEW-198: gntik-ui#30's a11y excerpt (2026-10-13) was 4000 characters of Playwright
+    "A snapshot doesn't exist …, writing actual." lines (\\bactual\\b is a marker), and the
+    8-line context cut the axe diff before its rule ID, so two CI repairs never saw it."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    stamp = "2026-10-13T22:42:37.9579903Z "
+    snapshots = "".join(
+        f"{stamp}A snapshot doesn't exist at /tmp/gntik-table-labels-MN3j0A/snapshots/"
+        f"issue30-table-state-{n}-dark.png, writing actual.\n"
+        for n in range(120)
+    )
+    failing = f"{stamp}  ✘  3 e2e/table-labels.spec.js:20:7 › table matrix default/dark (6.4s)\n"
+    diff = (
+        "  1) e2e/table-labels.spec.js:20:7 › table matrix default/dark ──────\n\n"
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n"
+        "    - Expected  -  1\n    + Received  + 13\n\n"
+        "    - Array []\n    + Array [\n    +   Object {\n"
+        '    +     "id": "aria-hidden-focus",\n'
+        '    +     "nodes": Array [\n    +       Array [\n'
+        '    +         "span[data-base-ui-focus-guard=\\"\\"][aria-hidden=\\"true\\"]",\n'
+        "    +       ],\n    +     ],\n    +   },\n    + ]\n\n"
+        "      61 |           }, SELECT_LISTBOX_79);\n"
+        "    > 62 |           expect(violations).toEqual([]);\n"
+        "         |                              ^\n"
+        "        at checkpoint (/home/runner/work/apps/docs/e2e/table-labels.spec.js:62:30)\n\n"
+        "    attachment #1: issue30-table-initial-dark (image/png) ──────\n"
+        "    Expected: ../../tmp/gntik-table-labels-MN3j0A/snapshots/issue30-initial-dark.png\n"
+        "    Received: test-results/table-labels-dark/issue30-table-initial-dark-actual.png\n"
+        "    Error Context: test-results/table-labels-dark/error-context.md\n"
+    )
+    stamped = "".join(stamp + line + "\n" for line in diff.splitlines())
+    excerpt = failure_excerpt(snapshots + failing + stamped)
+    assert excerpt.splitlines()[:2] == [
+        "Failing tests (1):",
+        "✘  3 e2e/table-labels.spec.js:20:7 › table matrix default/dark (6.4s)",
+    ]
+    assert '"id": "aria-hidden-focus"' in excerpt
+    assert "data-base-ui-focus-guard" in excerpt
+    assert "> 62 |" in excerpt
+    assert "writing actual" not in excerpt
+    assert len(excerpt.splitlines()) <= 60 and len(excerpt) <= 4000
+    # The diff is bounded: an assertion without a code frame keeps at most 30 lines after it.
+    unbounded = "Error: expect(received).toBe(expected)\n" + "".join(
+        f"+ line {n}\n" for n in range(100)
+    )
+    kept = failure_excerpt(unbounded)
+    assert "+ line 29" in kept and "+ line 31" not in kept
+    # A snapshot comparison that really fails is still a marker.
+    mismatch = "    Error: expect(page).toHaveScreenshot(expected) failed\n"
+    assert "toHaveScreenshot(expected) failed" in failure_excerpt("ok 1 - x\n" * 30 + mismatch)
+
+
 # -- NEW-155: staging environment recovery ----------------------------------------------
 
 ESO_FUNCTION_INVOCATION = {

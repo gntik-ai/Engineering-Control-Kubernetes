@@ -1321,6 +1321,20 @@ _BUILD_ASSET_LINE = re.compile(
 # "✘  N file:line:col › name".
 _FAILING_TEST_LINE = re.compile(r"^(?:not ok \d+ - \S|FAILED \S|--- FAIL: \S|\s*✘\s+\d+\s+\S)")
 _FAILING_TEST_SUMMARY_LINES = 25
+# NEW-198: Playwright's screenshot bookkeeping ("A snapshot doesn't exist at …, writing
+# actual.", an attachment's "Expected:/Received:/Diff: <file>" paths, "Error Context: <file>")
+# names files, not failures; gntik-ui#30's a11y excerpt (2026-10-13) was 4000 characters of
+# them, so two CI repairs never saw the axe rule that failed.
+_PLAYWRIGHT_NOISE_LINE = re.compile(
+    r"^\s*(?:A snapshot doesn't exist at \S+, writing actual\.?"
+    r"|(?:Expected|Received|Diff|Previous|Error Context):\s+\S+\.(?:png|jpe?g|webm|zip|txt|md))$"
+)
+# NEW-198: a Playwright assertion ("Error: expect(received).toEqual(expected)") prints its
+# Expected/Received diff before the code frame; the diff is the evidence, so it is kept whole
+# up to the frame's failing line ("> 62 |"), within a bound.
+_PLAYWRIGHT_ASSERTION = re.compile(r"^\s*Error: expect\(")
+_CODE_FRAME_FAILING_LINE = re.compile(r"^\s*>\s*\d+\s*\|")
+_ASSERTION_DIFF_LINES = 30
 
 
 def failure_excerpt(
@@ -1353,8 +1367,20 @@ def failure_excerpt(
             _FAILURE_LINE.search(line)
             and not _PASSING_LINE.match(line)
             and not _BUILD_ASSET_LINE.match(line)
+            and not _PLAYWRIGHT_NOISE_LINE.match(line)
         ):
-            keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
+            end = index + context
+            if _PLAYWRIGHT_ASSERTION.match(line):
+                bound = min(len(lines) - 1, index + _ASSERTION_DIFF_LINES)
+                end = next(
+                    (
+                        row
+                        for row in range(index + 1, bound + 1)
+                        if _CODE_FRAME_FAILING_LINE.match(lines[row])
+                    ),
+                    bound,
+                )
+            keep.extend(range(max(0, index - 1), min(len(lines), end + 1)))
     # NEW-153: every failing test first, by name, so a log whose earlier failure-looking
     # lines (curl --fail, "0 chart(s) failed") fill the context budget still names them all.
     failing = [line.strip() for line in lines if _FAILING_TEST_LINE.match(line)]
