@@ -3576,8 +3576,11 @@ class MetadataActivityHandler:
                 "of the existing commits and run the matching repository test commands (for "
                 "example web lint and the OpenAPI snapshot regeneration) before committing. "
                 # NEW-66: a stale govulncheck failure was "fixed" by narrowing its CI gate.
-                "Never change CI workflows, CI tests or security/supply-chain gates to make a "
-                "job pass, and revert any such change already on this branch; if a job fails "
+                # NEW-200: the rule covers what exists at the base; tests this ChangeSet
+                # added follow the CI repair rules in the trusted prompt.
+                "Never change CI workflows, pre-existing CI tests or security/supply-chain "
+                "gates to make a job pass, and revert any such change already on this branch; "
+                "test files this ChangeSet added follow the CI repair rules; if a job fails "
                 "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
                 "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
@@ -3585,6 +3588,18 @@ class MetadataActivityHandler:
         # demanded a local red reproduction and its a11y job needs a browser the sandbox
         # cannot start (listen/setsockopt EPERM). Platform policy, so it goes in the trusted
         # prompt; the CI log lines stay inside the untrusted fence.
+        # NEW-200: gntik-ui #30's repairs BLOCKED twice because a test the ChangeSet itself
+        # added was wrong (it required a hidden Base UI listbox to leave the DOM) and the
+        # NEW-66 rule read as forbidding any CI test edit. A test absent at the base is
+        # part of the change; only correcting it, never weakening it, is allowed.
+        base_sha = payload.get(f"{target}_base_sha")
+        base = base_sha if isinstance(base_sha, str) and self._is_git_sha(base_sha) else None
+        added = (
+            f"absent at base {base}; list them with `git diff --find-renames "
+            f"--find-copies --diff-filter=A --name-only {base} HEAD`"
+            if base
+            else "absent at the base commit"
+        )
         ci_repair_instruction = (
             "This is a CI repair. The failing CI jobs listed in the content below are already "
             "reproduced: their CI run is the red evidence, so a task that asks for a failing "
@@ -3593,6 +3608,15 @@ class MetadataActivityHandler:
             "reproduction: fix the cause its CI log shows, run what you can, and report that "
             "job SKIPPED with the reason. The pull request's CI reruns it, and its result "
             "decides the merge.\n"
+            f"Test files this ChangeSet added ({added}) are part of this change, not "
+            "pre-existing CI tests. A test renamed, moved, copied or split from a file that "
+            "exists at the base stays a pre-existing test, even where git lists it as added. "
+            "When a failing job's log shows that a newly written test is itself "
+            "wrong (for example it asserts behaviour the acceptance criteria do not require), "
+            "correct the test, and explain each correction in your summary. Never weaken, "
+            "remove or narrow an assertion the acceptance criteria require, and never change "
+            "pre-existing tests, CI workflows or security/supply-chain gates to make a job "
+            "pass.\n"
             if ci_regressions
             else ""
         )
