@@ -33,13 +33,13 @@ The manifest also carries maker rules (free-text rules appended to maker and che
 
 `GitHubBacklogImportWorkflow` runs three steps: `backlog.github_import` on the **GitHub worker** (read-only `gh issue list` and `gh pr list` over the authoritative repository pair, snapshotting title, body excerpt, labels, comments, PR links), then `backlog.persist_import` and `backlog.plan` on the controller.
 
-`persist_import` is where the **deterministic classifier** lives (`engineering/backlog.py:classify_issue`). It is keyword-based and label-independent on purpose, so a mislabelled issue is still classified by its text:
+`persist_import` is where the **deterministic classifier** lives (`engineering/backlog.py:classify_issue`). It combines normalised labels with whole-word text rules. Labels drive the type and severity when present, and through them the R0–R2 risk; the **R3 keyword rule reads only the text**, so no label can take an issue below R3 when its text mentions production, a data migration, a destructive change, credential rotation, secret lifecycle, or cluster roles (the repository's `EXISTING-GITHUB-BACKLOG.md` calls the classification "independent of labels", which is only true of that R3 floor):
 
 | Dimension | How it is decided |
 |---|---|
-| `issue_type` | an ordered keyword cascade: DUPLICATE → ALREADY_FIXED → SUPERSEDED → STALE → INVALID_OR_UNREPRODUCIBLE → enhancement vs independent-defect evidence → SECURITY_DEFECT → SPEC_DECISION → ENHANCEMENT → DEPLOYMENT_DEFECT → DOCUMENTATION_DEFECT → OPERATIONS_DEFECT → META_TOOLING → QUESTION → PRODUCT_BUG. Whole-word matching with regular plurals, so "source-reproduction" no longer matches "production". |
+| `issue_type` | an ordered cascade, first match wins: DUPLICATE (label, or text "duplicate of #N") → ALREADY_FIXED → SUPERSEDED → STALE → INVALID_OR_UNREPRODUCIBLE (labels) → ENHANCEMENT when enhancement metadata (label, `kind:` line, title prefix) has no independent defect evidence → SECURITY_DEFECT (`security` label or text "vulnerability", "tenant isolation", "authorization bypass") → SPEC_DECISION (labels or text) → ENHANCEMENT → DEPLOYMENT_DEFECT (deployment repository or labels) → DOCUMENTATION_DEFECT (labels or a `docs:` prefix) → OPERATIONS_DEFECT → META_TOOLING (labels) → QUESTION (label or a title ending in "?") → PRODUCT_BUG. Whole-word matching with regular plurals, so "source-reproduction" no longer matches "production". |
 | `severity` | `severity:` labels, else text such as "remote code execution" or "data loss" → critical. |
-| `calculated_risk` | **R3** on word roots `data migrat`, `destructiv`, `credential rotat`, `secret lifecycle`, `production`, `clusterrole` ("must over-match, never under-match"); R2 for security defects or critical/high severity; R0 for docs/questions/meta; else R1. A `Risk:` line can only raise it. |
+| `calculated_risk` | **R3** on word roots `data migrat`, `destructiv`, `credential rotat`, `secret lifecycle`, `production`, `clusterrole` ("must over-match, never under-match"), and every security defect (NEW-179); R2 for critical/high severity; R0 for docs/questions/meta; else R1. A `Risk:` line can only raise it. |
 | `reproduction_mode` | DOCUMENTATION_REQUIRED, DEPLOYMENT_REQUIRED, RUNTIME_REQUIRED (login, 401, 404, browser, staging), STATIC_PLUS_TEST, or SOURCE_ONLY. |
 | `dependencies` | `blocked by / depends on … [repo]#N` references within the allowlist. |
 | `wave` | W0 blockers (login, build blocker, degraded), W1 security/high, W2 dependent, W3 default, W4 docs/meta, W5 enhancements. |
@@ -56,7 +56,7 @@ Linked PRs are detected by issue URL, closing keywords, or the issue number in t
 /loop approve musematic <campaign> <binding> APPROVE_EXISTING_GITHUB_BACKLOG_LOOP
 ```
 
-The candidate binding (Lecture 6) freezes heads-at-import, plan hash, mode, limits, and allowed GitHub operations for **24 hours**. Approval requires the typed phrase and a re-authenticated actor (`telegram:<id>`, `cli:engineering-ctl`, `dashboard:reauthenticated`). The first approved campaign becomes the **policy owner** and triggers the GitHub write-policy enablement path (Lecture 9); further inventories are approved as `inventory` role and never touch the policy.
+The candidate binding (Lecture 6) freezes heads-at-import, plan hash, mode, limits, and allowed GitHub operations for **24 hours**. Approval requires the typed phrase and a re-authenticated actor (`telegram:<id>`, `cli:engineering-ctl`, `dashboard:reauthenticated`). The first approved campaign **of each project** becomes that project's **policy owner** and triggers the GitHub write-policy enablement path (Lecture 9); further approvals of the same project are `inventory` campaigns and never touch the policy. Since NEW-163 at most `ENGINEERING_BACKLOG_PARALLEL_PROJECT_LIMIT` projects (default 2) hold an owner at once, delivery writes must target their own project's repository pair (`REPOSITORY_OUTSIDE_PROJECT`), and an open global backlog run restores the single-global-owner rule.
 
 ### 7.2.3 Start one issue
 
@@ -150,6 +150,7 @@ sequenceDiagram
 Notable protections:
 
 * **CI baseline gate (NEW-63).** A PR failure is a regression only if the same job passes on a baseline branch `hermes/ci-baseline/<main12>-<markers8>` opened as a draft PR with marker files; pre-existing failures are excused, but a PR touching `.github/` never gets the exemption.
+* **Later releases count.** If a later release whose commit contains the merge is built or pinned first (for example an image hotfix), the flow accepts it, provided every image carries that one canonical release tag and its image workflow succeeded, then syncs and verifies that commit (NEW-68, NEW-174).
 * **Merge semantics.** `gh pr merge --merge --match-head-commit <sha>`; `DIRTY` → conflict blocker; `UNSTABLE` allowed only when every failing check is excused.
 * **Automatic CI repair.** `SOURCE_PR_CI_REGRESSION` or `DEPLOYMENT_PR_CI_REGRESSION` triggers up to two repair rounds: a fresh `IssueDeliveryWorkflow` with the failing job excerpts in the maker prompt, then a new GitOps child.
 * **Argo remediation is bounded and never prunes.** Diagnoses are classified `PATCH_CONFLICT`, `JOB_IMMUTABLE`, `TRANSIENT`, `SCOPE_INHERITED`, `PRUNE_REQUIRED`; a remediation write is `SINGLE_ATTEMPT` because an unknown outcome must escalate, not repeat.
@@ -250,4 +251,4 @@ The repository's own September inventory is a useful reality check: `IssueDelive
 
 ## 7.8 Summary
 
-All three missions share the spine of Lecture 1, but Mission 1 is the one that touches the outside world, so it carries the most gates: a label-independent classifier, a 24-hour content-bound approval, revalidation by the opposite provider on current heads, a sixteen-step delivery with a deterministic validator before any push, a write-policy gate on every GitHub mutation, a CI-baseline gate before merge, bounded Argo remediation, and a closing comment that lists every artifact the platform produced. Mission 2 produces evidence and candidate findings; Mission 3 produces proposals; both feed Mission 1 only through an approval.
+All three missions share the spine of Lecture 1, but Mission 1 is the one that touches the outside world, so it carries the most gates: a deterministic classifier whose R3 rule no label can override, a 24-hour content-bound approval, revalidation by the opposite provider on current heads, a sixteen-step delivery with a deterministic validator before any push, a write-policy gate on every GitHub mutation, a CI-baseline gate before merge, bounded Argo remediation, and a closing comment that lists every artifact the platform produced. Mission 2 produces evidence and candidate findings; Mission 3 produces proposals; both feed Mission 1 only through an approval.

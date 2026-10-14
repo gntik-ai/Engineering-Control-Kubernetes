@@ -4,6 +4,8 @@ This directory is a lecture-style walkthrough of the Engineering Control platfor
 
 The intended reader is an engineer or architect who knows Git, CI/CD, Kubernetes, and LLM coding assistants, but has never seen this codebase.
 
+> **New to the platform, or presenting it to a mixed audience?** Start with the companion [**Functional Overview: Hermes and Temporal at Work**](functional-overview/README.md). It explains, at a higher level of abstraction and in layers for different audiences, what "Hermes" means, how it works together with Temporal, how the backlog is built from GitHub issues, who orchestrates the workflows, and how agents, skills, and tools are defined and where they run. It also contains a teaching guide, an FAQ, and a quiz.
+
 ## Syllabus
 
 | # | Lecture | What you will learn |

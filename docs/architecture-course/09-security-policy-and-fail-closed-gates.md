@@ -106,7 +106,7 @@ flowchart TD
     V["campaign terminal (COMPLETE/STOPPED/CANCELLED)"] --> W["disable request → same path unit;<br/>kept if another owner still holds an unexpired approval"]
 ```
 
-Consequences worth stating aloud: writes are enabled for at most 24 hours per approval; exactly one campaign owns the policy at a time; the component that enables writes (root) is not the component that performs them (`hermes`) or the one that decides what to perform (`engineering-control`); and an acceptance workflow (`GitHubWriteDenialAcceptanceWorkflow`) exists to prove the denial path returns `PASS_DENIAL_ENFORCED` with zero external effect.
+Consequences worth stating aloud: writes are enabled for at most 24 hours per approval; at most one campaign per project owns the policy, and at most two projects at once (NEW-163; a limit of 1, or an open global backlog run, restores one global owner), while each delivery write must target its own project's repositories; the component that enables writes (root) is not the component that performs them (`hermes`) or the one that decides what to perform (`engineering-control`); and an acceptance workflow (`GitHubWriteDenialAcceptanceWorkflow`) exists to prove the denial path returns `PASS_DENIAL_ENFORCED` with zero external effect.
 
 ## 9.5 Deterministic validation before any push
 
