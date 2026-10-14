@@ -755,13 +755,16 @@ async def test_amend_and_delivery_startup_interleave_safely(tmp_path: Path) -> N
         "body_sha256": _sha(EDITED),
         "updated_at": "2026-10-03T10:00:00+00:00",
     }
-    # 5. A ChangeSet that produced work is never amended.
+    # 5. A ChangeSet that published work is never amended (NEW-201: a started but
+    # never-published one is, see test_new_201_amend_keep_work).
     handler._release_delivery_leases(
         {"run_id": reloaded["run_id"], "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL"}
     )
     with operations.sessions.begin() as session:
-        session.scalar(select(ChangeSet)).state = "PLANNED"
-    with pytest.raises(IssueAmendBlocked, match="already produced work"):
+        change_set = session.scalar(select(ChangeSet))
+        change_set.state = "PLANNED"
+        change_set.source_pr_url = "https://github.com/gntik-ai/falcone/pull/1"
+    with pytest.raises(IssueAmendBlocked, match="already published work"):
         await _amend(operations, await _refresh(tmp_path, EDITED + "\nx"), None)
     _dispose(values)
 

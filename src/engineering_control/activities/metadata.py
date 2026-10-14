@@ -109,6 +109,11 @@ from engineering_control.models.reconciliation import (
     PromotionPublication,
 )
 from engineering_control.observability.agent import normalize_agent_role
+from engineering_control.operations.change_set_publication import (
+    amendment_cutoff,
+    parse_time,
+    recorded_after,
+)
 from engineering_control.operations.issue_amend import record_consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
@@ -3399,6 +3404,10 @@ class MetadataActivityHandler:
             record = dict((change_set.recovery_json or {}) if change_set else {}).get(
                 "validation_findings"
             )
+            cutoff = amendment_cutoff(change_set)
+        if not recorded_after(record, cutoff):
+            # NEW-201: findings of the work before an issue amendment are stale context.
+            return []
         findings = record.get("findings") if isinstance(record, dict) else None
         return [str(item) for item in findings if isinstance(item, str)] if findings else []
 
@@ -3416,6 +3425,11 @@ class MetadataActivityHandler:
             record = dict((change_set.recovery_json or {}) if change_set else {}).get(
                 "staging_gitops"
             )
+            cutoff = amendment_cutoff(change_set)
+        if not recorded_after(record, cutoff):
+            # NEW-201: an amended ChangeSet never published before its cut-off (issue_amend
+            # refuses a published one), so this only drops a record older than it.
+            return [], None, {}, "source"
         if not isinstance(record, dict) or record.get("blocker") not in {
             "SOURCE_PR_CI_REGRESSION",
             "DEPLOYMENT_PR_CI_REGRESSION",
@@ -3446,10 +3460,14 @@ class MetadataActivityHandler:
         )
 
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
-        """Findings of the latest checker that requested changes on an earlier attempt."""
+        """Findings of the latest checker that requested changes on an earlier attempt.
+
+        NEW-201: a checker that started before the ChangeSet's latest issue amendment
+        reviewed the previous issue text; its findings are not carried forward."""
         with self.sessions() as session:
+            cutoff = amendment_cutoff(session.get(ChangeSet, change_set_id))
             row = session.execute(
-                select(AgentInvocation.structured_result)
+                select(AgentInvocation.structured_result, AgentInvocation.started_at)
                 .join(Run, AgentInvocation.run_id == Run.id)
                 .where(
                     Run.change_set_id == change_set_id,
@@ -3459,6 +3477,10 @@ class MetadataActivityHandler:
                 .order_by(AgentInvocation.started_at.desc())
                 .limit(1)
             ).first()
+        if row is not None and cutoff is not None:
+            started = parse_time(row[1])
+            if started is None or started <= cutoff:
+                return []
         structured = row[0] if row is not None and isinstance(row[0], dict) else {}
         if structured.get("decision") != "REQUEST_CHANGES":
             return []
@@ -3473,6 +3495,60 @@ class MetadataActivityHandler:
             bounded.append(item[:budget])
             budget -= len(item)
         return bounded
+
+    # The deterministic maker invocation ids (AgentRequest.run_id in _prepare_maker): one
+    # per target, workflow and ChangeSet, plus one per dependency round (source only).
+    _MAKER_DEPENDENCY_ROUNDS = 8
+
+    def _amended_since_resumed_work(
+        self, change_set_id: UUID, workflow_id: str, targets: tuple[str, ...]
+    ) -> bool:
+        """NEW-201: whether the ChangeSet's issue was amended in place after its kept work
+        and no maker of ``targets`` in a later attempt completed against the amended text.
+
+        Review: per target, from the maker's deterministic invocation id (never its role
+        alone): a completed source maker does not cover deployment commits made before the
+        amendment, also in a shared worktree (gntik-ui, llmwiki; NEW-169)."""
+        with self.sessions() as session:
+            cutoff = amendment_cutoff(session.get(ChangeSet, change_set_id))
+            if cutoff is None:
+                return False
+            rows = session.execute(
+                select(
+                    AgentInvocation.id,
+                    AgentInvocation.structured_result,
+                    AgentInvocation.started_at,
+                    Run.workflow_id,
+                )
+                .join(Run, AgentInvocation.run_id == Run.id)
+                .where(
+                    Run.change_set_id == change_set_id,
+                    Run.workflow_id != workflow_id,
+                    AgentInvocation.role == "implementer",
+                )
+            ).all()
+        for invocation_id, structured, started_at, run_workflow in rows:
+            started = parse_time(started_at)
+            if (
+                started is None
+                or started <= cutoff
+                or not isinstance(structured, dict)
+                or structured.get("decision") != "COMPLETE"
+            ):
+                continue
+            identities = {
+                uuid5(
+                    NAMESPACE_URL, f"delivery-{target}-maker:{run_workflow}:{change_set_id}{suffix}"
+                )
+                for target in targets
+                for suffix in [
+                    "",
+                    *(f":deps-{round_}" for round_ in range(1, self._MAKER_DEPENDENCY_ROUNDS + 1)),
+                ]
+            }
+            if invocation_id in identities:
+                return False
+        return True
 
     def _prepare_maker(self, payload: dict[str, Any], *, deployment: bool) -> dict[str, Any]:
         provider = Provider(str(payload["maker_provider"]))
@@ -3644,6 +3720,24 @@ class MetadataActivityHandler:
             if resumed_from
             else ""
         )
+        # Per portion, also in a shared worktree (NEW-169): only this portion's own maker
+        # completing after the amendment covers its pre-amendment commits.
+        amended = bool(resumed_from) and self._amended_since_resumed_work(
+            change_set_id, workflow_id, (target,)
+        )
+        if amended:
+            # NEW-201: the operator amended the issue in place (issue-amend) after these
+            # commits were made; the OpenSpec below was regenerated from the amended text.
+            resume_instruction = (
+                f"This {target} worktree already contains committed work for this ChangeSet "
+                f"(HEAD {resumed_from}, on top of base {payload.get(f'{target}_base_sha')}), "
+                "but the operator amended the issue after those commits were made, and the "
+                "OpenSpec below was regenerated from the amended issue. Review the existing "
+                "commits against the regenerated OpenSpec: keep what still fits, change or "
+                "revert what the amendment changed, and implement anything it added. Record "
+                "every change as additional local commits on the assigned branch; never "
+                "rewrite, squash or drop the existing commits.\n"
+            )
         if deployment and payload["source_worktree"] == payload["deployment_worktree"]:
             # NEW-169: one repository is both source and deployment (gntik-ui, llmwiki), so
             # the source maker of this round has just committed in this same worktree. Its
@@ -3662,6 +3756,17 @@ class MetadataActivityHandler:
                 "snapshot mismatch. Do not revert or redo the source work; make only the "
                 "deployment portion's changes (often none) on top of it.\n"
             )
+            if amended:
+                # NEW-201 review: composed with, never replaced by, the NEW-169 guidance.
+                resume_instruction += (
+                    "The operator amended the issue after the previous attempt's commits "
+                    f"(HEAD {resumed_from}) were made, and the OpenSpec below was regenerated "
+                    "from the amended issue. Review the deployment portion of those commits "
+                    "against the regenerated OpenSpec: keep what still fits, change or revert "
+                    "what the amendment changed, and implement anything it added. Record every "
+                    "change as additional local commits on the assigned branch; never "
+                    "rewrite, squash or drop the existing commits.\n"
+                )
         prompt = (
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "

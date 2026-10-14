@@ -32,14 +32,18 @@ from engineering_control.db.models import (
     ChangeSet,
     ComponentLease,
     DashboardEvent,
-    Deployment,
     Finding,
     Run,
-    Step,
     WorktreeLease,
 )
 from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS
 from engineering_control.models.enums import ChangeSetState
+from engineering_control.operations.change_set_publication import (
+    CORRECTABLE_STATES,
+    PUBLISHED_RECOVERY_KEYS,
+    published_reason,
+    request_changes,
+)
 from engineering_control.operations.issue_amend import change_set_unstarted
 from engineering_control.operations.issue_delivery_approval import (
     correction_attempt_budget,
@@ -51,42 +55,19 @@ from engineering_control.operations.issue_reapproval import (
     issue_loop_identity,
     loop_paused_on,
 )
-from engineering_control.operations.publication_authority import (
-    ATTEMPT_STEP,
-    EFFECT_STEP,
-)
 
 RESET_EVENT_TYPE = "change_set_reset"
 OPERATOR_RESET = "OPERATOR_RESET"
 RESET_RECORD_KEY = "operator_reset"
 # Only states before any publication (REQUEST_CHANGES and an unstarted CONFIRMED
 # ChangeSet are already retryable, see below).
-_RESETTABLE_STATES = frozenset({ChangeSetState.PLANNED.value, ChangeSetState.IMPLEMENTING.value})
+_RESETTABLE_STATES = CORRECTABLE_STATES
 # The delivery children whose closure the caller must prove in Temporal (bounded).
 MAX_DELIVERY_CHILDREN = 256
-# recovery_json records written only from publication on (persist_publication, CI,
-# candidate/release, merge, staging, closure): any of them means work left the worktree.
-# Review 2: not provider_chain, which the local handoff (_persist_delivery_handoff, e.g.
-# SOURCE_CHANGES_NOT_COMMITTED) also writes before any publication.
-_PUBLISHED_RECOVERY_KEYS = frozenset(
-    {
-        "independent_review",
-        "change_evidence",
-        "release_impact",
-        "ci",
-        "ci_repair_restore",
-        "candidate",
-        "source_merge",
-        "promotion",
-        "promotion_component_lease",
-        "staging_gitops",
-        "release_evidence",
-        "release_plan_review",
-        "rollback_plan",
-        "final_closure",
-        "last_recovery_result",
-    }
-)
+# NEW-201: the publication proof moved to change_set_publication (shared with the
+# in-place issue amendment); kept here by name.
+_PUBLISHED_RECOVERY_KEYS = PUBLISHED_RECOVERY_KEYS
+_published = published_reason
 
 
 class ChangeResetBlocked(ValueError):
@@ -158,39 +139,6 @@ def _active_leases(
     )
     if component is not None:
         return "a component lease of a delivery run is still held"
-    return None
-
-
-def _published(session: Session, change_set: ChangeSet) -> str | None:
-    """Why the ChangeSet may have published work, or None when nothing was published."""
-    if change_set.source_pr_url is not None or change_set.deployment_pr_url is not None:
-        return "a pull request was published"
-    if change_set.image_digests or change_set.chart_version is not None:
-        return "release artifacts are recorded"
-    recorded = sorted(_PUBLISHED_RECOVERY_KEYS.intersection(change_set.recovery_json or {}))
-    if recorded:
-        return f"publication records exist ({', '.join(recorded)})"
-    # Review 3: a PREPARED intent alone (persisted before delivery.publish, e.g. a GitHub
-    # preflight then failed) is not publication, nor is an attempt or effect durably
-    # acknowledged NOT_ATTEMPTED (publication_authority's own proof that its command never
-    # ran). Anything else (COMPLETE, UNKNOWN, reconciled, claimed) may have published.
-    for name, status, result in session.execute(
-        select(Step.name, Step.status, Step.result_json)
-        .join(Run, Run.id == Step.run_id)
-        .where(
-            Run.change_set_id == change_set.id,
-            Step.name.in_((EFFECT_STEP, ATTEMPT_STEP)),
-        )
-    ):
-        receipt = result.get("receipt") if isinstance(result, dict) else None
-        outcome = receipt.get("outcome") if isinstance(receipt, dict) else None
-        if status != "NOT_ATTEMPTED" or (name == EFFECT_STEP and outcome != "NOT_ATTEMPTED"):
-            return "a publication effect or attempt is recorded"
-    deployment = session.scalar(
-        select(Deployment.id).where(Deployment.change_set_id == change_set.id).limit(1)
-    )
-    if deployment is not None:
-        return "a deployment is recorded"
     return None
 
 
@@ -318,25 +266,8 @@ def reset_change_set(
     held = _active_leases(session, change_set.id, children, current_time)
     if held is not None:
         raise _refuse("DELIVERY_ACTIVE", f"{held}; wait for its release or expiry")
-    from_state = change_set.state
+    from_state = request_changes(change_set, blocker=OPERATOR_RESET, actor=actor, now=current_time)
     recovery = dict(change_set.recovery_json or {})
-    previous_request = recovery.get("correction_requested")
-    previous = previous_request if isinstance(previous_request, dict) else {}
-    run_ids = [str(item) for item in previous.get("run_ids") or [] if item]
-    if previous.get("run_id"):
-        run_ids.append(str(previous["run_id"]))
-    change_set.state = ChangeSetState.REQUEST_CHANGES.value
-    change_set.version += 1
-    # Same record a stopped attempt writes (NEW-128/137); the stopped runs stay listed so
-    # a delayed release of one of them never writes again.
-    recovery["correction_requested"] = {
-        "run_ids": list(dict.fromkeys(run_ids))[-128:],
-        "status": ChangeSetState.REQUEST_CHANGES.value,
-        "blocker": OPERATOR_RESET,
-        "actor": actor,
-        "at": current_time.isoformat(),
-        "recorded_at": current_time.isoformat(),
-    }
     prior = recovery.get(RESET_RECORD_KEY)
     record: dict[str, Any] = {
         "actor": actor,

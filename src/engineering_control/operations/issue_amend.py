@@ -33,6 +33,7 @@ from engineering_control.db.models import (
     OperationRequest,
     Run,
     Step,
+    WorktreeLease,
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
@@ -40,6 +41,13 @@ from engineering_control.engineering.backlog import (
     canonical_sha256,
 )
 from engineering_control.models.enums import ChangeSetState
+from engineering_control.operations.change_set_publication import (
+    AMENDMENT_BLOCKER,
+    AMENDMENT_CUTOFF_KEY,
+    CORRECTABLE_STATES,
+    request_changes,
+    started_unpublished_blocker,
+)
 from engineering_control.operations.issue_start import (
     backlog_issue_signal_blocker,
     issue_request_from_operation,
@@ -261,13 +269,21 @@ def resolve_amend_target(
             f"{target} is already delivered or closed; open a new issue or change request",
         )
     if change_set is not None:
-        if not change_set_unstarted(change_set):
-            # Only a delivery stopped before any work (CONFIRMED, e.g. blocked by
-            # ISSUE_BODY_CHANGED_SINCE_APPROVAL at the body refresh) is amended.
+        # NEW-115: a delivery stopped before any work (CONFIRMED, e.g. blocked by
+        # ISSUE_BODY_CHANGED_SINCE_APPROVAL at the body refresh) is amended. NEW-201: so is
+        # one that started (PLANNED, IMPLEMENTING, REQUEST_CHANGES) but never published;
+        # its commits are kept and reviewed against the amended text by the next maker.
+        unpublished = (
+            None
+            if change_set_unstarted(change_set)
+            else started_unpublished_blocker(session, change_set)
+        )
+        if unpublished is not None:
             raise IssueAmendBlocked(
                 "ISSUE_AMEND_DELIVERY_ACTIVE",
-                f"the delivery of {target} already produced work (ChangeSet "
-                f"{change_set.state}); re-import the backlog and start the issue again",
+                f"the delivery of {target} already published work (ChangeSet "
+                f"{change_set.state}: {unpublished}); re-import the backlog and start the "
+                "issue again",
             )
         current = now or datetime.now(UTC)
         projected = session.execute(
@@ -290,10 +306,34 @@ def resolve_amend_target(
             )
             .limit(1)
         )
-        if running is not None or leased is not None:
+        # NEW-201 review: the worktree lease too (as change_reset): a started ChangeSet's
+        # worktree may still be held by a delivery that no Run projection shows.
+        worktree = session.scalar(
+            select(WorktreeLease.id)
+            .where(
+                WorktreeLease.change_set_id == change_set.id,
+                WorktreeLease.released_at.is_(None),
+                WorktreeLease.expires_at > current,
+            )
+            .limit(1)
+        )
+        if running is not None or leased is not None or worktree is not None:
             raise IssueAmendBlocked(
                 "ISSUE_AMEND_DELIVERY_ACTIVE",
                 f"a delivery of {target} is running; amend it after it stops",
+            )
+        if (
+            not change_set_unstarted(change_set)
+            and paused_issue_loop(session, change_set, issue) is None
+        ):
+            # NEW-201: kept work is resumed only by the same loop (backlog-retry of the
+            # loop paused on this issue binds the same ChangeSet under its own custody).
+            # A cancelled loop's ChangeSet is never handed to another operation; that
+            # case still needs a re-import and a new issue-start (NEW-202).
+            raise IssueAmendBlocked(
+                "ISSUE_AMEND_NO_PAUSED_LOOP",
+                f"no backlog loop is paused on {target}, so its kept work could not be "
+                "resumed; re-import the backlog and start the issue again",
             )
     return issue, campaign, finding, change_set
 
@@ -424,7 +464,7 @@ def amend_issue(
             # A rerun after an unknown outcome (e.g. a client timeout) reconciles: the
             # recorded amendment is this revision, so a requested retry is still sent.
             result["amended_by"] = amendment.get("amended_by")
-            result["retry_workflow_id"] = retry_workflow_id(session, change_set, issue)
+            result["retry_workflow_id"] = _retry_target(session, change_set, issue)
             result["retry_key"] = str(amendment.get("binding_sha256", ""))[:32]
         return result
     excerpt = str(observed["body_excerpt"])
@@ -490,6 +530,13 @@ def amend_issue(
         ),
     }
     value["binding_sha256"] = _amendment_binding(issue, value)
+    # NEW-201: a started, never-published ChangeSet keeps its commits. Checked before any
+    # write; the cut-off, the REQUEST_CHANGES move and the amendment commit together.
+    cutoff = (
+        _record_amendment_cutoff(session, change_set, value, actor, current_time, target)
+        if change_set is not None and not change_set_unstarted(change_set)
+        else None
+    )
     snapshot["body_excerpt"] = excerpt[:SNAPSHOT_EXCERPT_LIMIT]
     snapshot[AMENDMENT_KEY] = value
     issue.github_snapshot_json = snapshot
@@ -523,21 +570,89 @@ def amend_issue(
             "github_updated_at": value["github_updated_at"],
             "base_body_sha256": issue.body_sha256,
             "binding_sha256": value["binding_sha256"],
+            **({"change_set_cutoff": cutoff} if cutoff is not None else {}),
         },
     )
     session.add(event)
     session.flush()
     return {
         **base,
+        **({"change_set_cutoff": cutoff} if cutoff is not None else {}),
         "status": "AMENDED",
         "change": change,
         "amended_by": actor,
         "reason": AMEND_REASON,
         "previous_body_sha256": approved_sha256,
         "audit_event_id": event.id,
-        "retry_workflow_id": retry_workflow_id(session, change_set, issue),
+        "retry_workflow_id": _retry_target(session, change_set, issue),
         "retry_key": value["binding_sha256"][:32],
     }
+
+
+def _record_amendment_cutoff(
+    session: Session,
+    change_set: ChangeSet,
+    amendment: dict[str, Any],
+    actor: str,
+    now: datetime,
+    target: str,
+) -> dict[str, Any]:
+    """NEW-201: amend in place a started, never-published ChangeSet (re-proven by
+    resolve_amend_target under the Finding/ChangeSet locks).
+
+    A PLANNED/IMPLEMENTING ChangeSet moves to REQUEST_CHANGES exactly as a NEW-168 reset
+    does (version bump, the next child counted in the bounded correction lineage, refused
+    when the lineage has no attempt left), so the next delivery child of the same paused
+    loop (backlog-retry) may bind it under its existing custody. The cut-off is recorded
+    on the ChangeSet: checker and validation context recorded before it is never shown to
+    a later maker, and the next resumed maker is told to review the kept commits against
+    the regenerated OpenSpec."""
+    # issue_delivery_approval imports this module (change_set_unstarted).
+    from engineering_control.operations.issue_delivery_approval import (
+        correction_attempt_budget,
+        validate_change_set_issue_approval,
+    )
+
+    from_state = change_set.state
+    if from_state in CORRECTABLE_STATES:
+        try:
+            if validate_change_set_issue_approval(session, change_set.id, current=False) is None:
+                raise ValueError("ChangeSet has no backlog issue approval")
+            budget = correction_attempt_budget(session, change_set)
+        except (KeyError, TypeError, ValueError) as error:
+            raise IssueAmendBlocked(
+                "ISSUE_AMEND_APPROVAL_INVALID",
+                f"the delivery approval of {target} is not valid ({str(error)[:160]}); "
+                "re-import the backlog and start the issue again",
+            ) from error
+        if budget["remaining"] < 1:
+            raise IssueAmendBlocked(
+                "ISSUE_AMEND_LINEAGE_EXHAUSTED",
+                f"the delivery of {target} used {budget['attempts_used']} of "
+                f"{budget['attempt_bound']} correction attempts; an amendment adds none",
+            )
+        request_changes(change_set, blocker=AMENDMENT_BLOCKER, actor=actor, now=now)
+    else:
+        # REQUEST_CHANGES already lets the next child bind; the new basis still bumps the
+        # version so no stale writer of the previous basis matches it.
+        change_set.version += 1
+    recovery = dict(change_set.recovery_json or {})
+    prior = recovery.get(AMENDMENT_CUTOFF_KEY)
+    record: dict[str, Any] = {
+        "version": 1,
+        "at": now.isoformat(),
+        "amendment_binding_sha256": amendment["binding_sha256"],
+        "body_sha256": amendment["body_sha256"],
+        "previous_body_sha256": amendment["previous_body_sha256"],
+        "amended_by": actor,
+        "from_state": from_state,
+        "to_state": change_set.state,
+        "change_set_version": change_set.version,
+        "count": (int(prior.get("count", 0)) if isinstance(prior, dict) else 0) + 1,
+    }
+    recovery[AMENDMENT_CUTOFF_KEY] = record
+    change_set.recovery_json = recovery
+    return record
 
 
 def consumed_issue_revision(
@@ -719,6 +834,66 @@ def retry_workflow_id(
     if recorded is not None and _loop_holds_issue(session, recorded, issue):
         return recorded
     return None
+
+
+def paused_issue_loop(
+    session: Session, change_set: ChangeSet, issue: BacklogIssueRecord
+) -> str | None:
+    """NEW-201: the loop that holds this ChangeSet's validated custody, if it is recorded
+    PAUSED (not finished) on exactly this issue; else None.
+
+    Only that loop's backlog-retry can bind the ChangeSet again (any other operation's
+    child is refused by custody), so it is also the retry target. Review 3: the custody
+    parent (the latest recorded delivery child's loop, after the custody validates), never
+    another operation of the same issue; and the loop's durable pause target
+    (backlog.loop_pause_target) must name this repository and issue (a missing or other
+    target refuses: a campaign loop may be paused on another issue's revalidation)."""
+    # Both import this module (issue_delivery_approval directly, correction_extension
+    # through it).
+    from engineering_control.operations.correction_extension import (
+        LOOP_PAUSE_TARGET_STEP,
+        loop_pause_target_id,
+    )
+    from engineering_control.operations.issue_delivery_approval import (
+        validate_change_set_issue_approval,
+    )
+
+    try:
+        if validate_change_set_issue_approval(session, change_set.id, current=False) is None:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    loop = _change_set_loop(session, change_set)
+    if loop is None:
+        return None
+    runs = session.scalars(
+        select(Run).where(Run.workflow_id == loop, Run.run_type == _LOOP_RUN_TYPE).limit(2)
+    ).all()
+    if len(runs) != 1 or runs[0].status != "PAUSED" or runs[0].finished_at is not None:
+        return None
+    pause = session.get(Step, loop_pause_target_id(runs[0].id))
+    value = pause.result_json if pause is not None else None
+    if (
+        pause is None
+        or pause.name != LOOP_PAUSE_TARGET_STEP
+        or pause.run_id != runs[0].id
+        or not isinstance(value, dict)
+        or value.get("loop_status") != "PAUSED"
+        or value.get("issue") != f"{issue.repository}#{issue.issue_number}"
+        or not _loop_holds_issue(session, loop, issue)
+    ):
+        return None
+    return loop
+
+
+def _retry_target(
+    session: Session, change_set: ChangeSet | None, issue: BacklogIssueRecord
+) -> str | None:
+    """The loop an amendment's --retry signals: for kept work (a started ChangeSet) only
+    the paused custody loop (NEW-201), otherwise the NEW-128 resolution."""
+    if change_set is not None and not change_set_unstarted(change_set):
+        return paused_issue_loop(session, change_set, issue)
+    return retry_workflow_id(session, change_set, issue)
 
 
 def _change_set_loop(session: Session, change_set: ChangeSet | None) -> str | None:
