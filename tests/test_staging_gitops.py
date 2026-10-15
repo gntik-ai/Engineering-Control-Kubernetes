@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -41,6 +42,10 @@ from engineering_control.models.reconciliation import DeliveryControlPolicy, Sta
 ROOT = Path(__file__).parents[1]
 MERGE_SHA = "d" * 40
 HEAD_SHA = "a" * 40
+# NEW-205 review: the delivered issue's approved body, re-read live at every merge.
+ISSUE_BODY = "Delivered issue fixture"
+ISSUE_BODY_SHA = hashlib.sha256(ISSUE_BODY.encode()).hexdigest()
+ISSUE_UPDATED_AT = "2026-09-26T12:00:00Z"
 OLD_CHART_REVISION = "663c0611" + "0" * 32
 EXPECTED_TAG = "sha-ddddddd"
 IMAGES = (
@@ -120,6 +125,8 @@ def _plan(**changes: Any) -> dict[str, Any]:
         "deployment_base_branch": "main",
         "issue_repository": "gntik-ai/musematic",
         "issue_number": 1026,
+        "issue_body_sha256": ISSUE_BODY_SHA,
+        "issue_updated_at": ISSUE_UPDATED_AT,
     }
     value.update(changes)
     return StagingGitOpsPlan.model_validate(value).model_dump(mode="json")
@@ -969,6 +976,10 @@ class FakeGh:
             or "POST" in call
         ]
 
+    # NEW-205 review: the delivered issues of the plan fixtures (musematic and NEW-160's
+    # gntik-ui), answered with the approved fixture revision unless a test seeds them.
+    delivered_issues = frozenset({("gntik-ai/musematic", 1026), ("gntik-ai/gntik-ui", 12)})
+
     def _answer(self, args: list[str]) -> str:
         if args[:2] == ["auth", "status"]:
             return ""
@@ -1026,7 +1037,23 @@ class FakeGh:
             }
             return f"https://github.com/{repository}/issues/{number}\n"
         if args[:2] == ["issue", "view"]:
-            return json.dumps(self.issues[(args[4], int(args[2]))])
+            repository, number = args[4], int(args[2])
+            delivered = {
+                "number": number,
+                "url": f"https://github.com/{repository}/issues/{number}",
+                "state": "OPEN",
+                "title": "Delivered issue",
+                "body": ISSUE_BODY,
+                "updatedAt": ISSUE_UPDATED_AT,
+                "labels": [],
+                "comments": [],
+            }
+            if (repository, number) not in self.issues and (
+                repository,
+                number,
+            ) not in self.delivered_issues:
+                raise KeyError((repository, number))
+            return json.dumps({**delivered, **self.issues.get((repository, number), {})})
         if args[:2] == ["issue", "comment"]:
             issue = self.issues[(args[4], int(args[2]))]
             body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
