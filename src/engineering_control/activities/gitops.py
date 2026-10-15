@@ -57,6 +57,8 @@ from engineering_control.delivery_notifications import (
 from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.models.reconciliation import MergeDeliveryPolicy, StagingFlowPolicy
+from engineering_control.operations.change_set_publication import published_amendment_pending
+from engineering_control.operations.issue_amend import effective_issue_revision
 from engineering_control.policy.github_write import (
     GITOPS_READ_ONLY_GITHUB_STEPS,
     GITOPS_WRITE_CAPABLE_GITHUB_STEPS,
@@ -131,6 +133,17 @@ class StagingGitOpsPlan(BaseModel):
     deployment_base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
     issue_repository: str = Field(pattern=_REPOSITORY)
     issue_number: int = Field(ge=1)
+    # NEW-205: the issue was amended after these PRs were published and no publication of
+    # the amended text happened since: they are re-delivered by a CI repair, never merged.
+    # Dumped only when true, so every other plan payload is unchanged.
+    issue_amendment_pending: bool = False
+    # NEW-205 review: the approved issue revision when the plan was prepared: the raw body's
+    # sha256 and GitHub updatedAt, as publication custody binds them. Every merge attempt and
+    # the issue close compare it with the live issue, so a plan recorded before an amendment
+    # (e.g. replayed by a child reset in Temporal) never merges or closes, even when the old
+    # text is put back (that moves updatedAt).
+    issue_body_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    issue_updated_at: datetime | None = None
 
     @model_validator(mode="after")
     def bound_pull_requests(self) -> StagingGitOpsPlan:
@@ -152,6 +165,47 @@ class StagingGitOpsPlan(BaseModel):
             ):
                 raise ValueError("deployment PR binding is incomplete")
         return self
+
+
+# NEW-205: the issue was amended after the ChangeSet's PRs were published.
+AMENDED_AFTER_PUBLICATION = "ISSUE_AMENDED_AFTER_PUBLICATION"
+
+
+def _approved_issue_revision(
+    session: Any, change_set: db.ChangeSet, repository: str, number: int
+) -> dict[str, Any]:
+    """NEW-205 review: the approved revision of the delivered backlog issue (the latest
+    campaign's record of this Finding); none when there is none (merges then refuse)."""
+    issue = session.scalar(
+        select(db.BacklogIssueRecord)
+        .join(
+            db.GitHubBacklogCampaign,
+            db.GitHubBacklogCampaign.id == db.BacklogIssueRecord.backlog_campaign_id,
+        )
+        .where(
+            db.BacklogIssueRecord.finding_id == change_set.finding_id,
+            db.BacklogIssueRecord.repository == repository,
+            db.BacklogIssueRecord.issue_number == number,
+        )
+        .order_by(db.GitHubBacklogCampaign.imported_at.desc())
+        .limit(1)
+    )
+    if issue is None:
+        return {}
+    # A malformed amendment raises ValueError: gitops.prepare then blocks (fail closed).
+    body_sha256, updated_at = effective_issue_revision(issue)
+    return {"issue_body_sha256": body_sha256, "issue_updated_at": updated_at}
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _plan_payload(plan: StagingGitOpsPlan) -> dict[str, Any]:
+    """The plan as an activity payload; NEW-205's flag only when set (unchanged otherwise)."""
+    return plan.model_dump(
+        mode="json", exclude=None if plan.issue_amendment_pending else {"issue_amendment_pending"}
+    )
 
 
 def load_project_contract(
@@ -754,6 +808,11 @@ class GitOpsControllerHandler:
         }:
             raise StagingFlowBlocked("DELIVERED_ISSUE_REPOSITORY_OUTSIDE_PROJECT")
         with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                # NEW-205 review: one snapshot for the ChangeSet (pending amendment) and the
+                # issue record (approved revision); an amendment committing between the two
+                # reads could otherwise pair "not pending" with the amended revision.
+                session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
             change_set = session.get(db.ChangeSet, change_set_id)
             if change_set is None or change_set.project != project:
                 raise StagingFlowBlocked("CHANGE_SET_BINDING_MISSING")
@@ -805,13 +864,17 @@ class GitOpsControllerHandler:
                 deployment_base_branch=manifest.repositories.deployment.default_branch,
                 issue_repository=issue_repository,
                 issue_number=int(payload.get("issue_number", 0)),
+                issue_amendment_pending=published_amendment_pending(change_set),
+                **_approved_issue_revision(
+                    session, change_set, issue_repository, int(payload.get("issue_number", 0))
+                ),
             )
             if change_set.source_repository != plan.source_repository.rsplit("/", 1)[-1]:
                 raise StagingFlowBlocked("CHANGE_SET_SOURCE_REPOSITORY_MISMATCH")
         if isinstance(flow, MergeDeliveryPolicy):
             return {
                 "status": "READY",
-                "plan": plan.model_dump(mode="json"),
+                "plan": _plan_payload(plan),
                 # NEW-160: no release tag, image build, environment, Argo CD or runtime step.
                 "staging_flow": {
                     "merge_only": True,
@@ -824,7 +887,7 @@ class GitOpsControllerHandler:
             }
         return {
             "status": "READY",
-            "plan": plan.model_dump(mode="json"),
+            "plan": _plan_payload(plan),
             "staging_flow": {
                 "argo_application": flow.argo_application,
                 "main_ci_workflow": flow.main_ci_workflow,
@@ -2570,6 +2633,9 @@ class GitOpsGitHubHandler:
         ):
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_BINDING_CHANGED"}
         if pull_request.get("state") == "MERGED":
+            if plan.issue_amendment_pending:
+                # NEW-205: merged outside Hermes with work made for the previous issue text.
+                return {"status": "BLOCKED", "blocker": AMENDED_AFTER_PUBLICATION}
             return {"status": "CHECKS_PASSED", "already_merged": True}
         if pull_request.get("state") != "OPEN":
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_NOT_OPEN"}
@@ -2578,9 +2644,21 @@ class GitOpsGitHubHandler:
             return conflict
         result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
         if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
-            return self._baseline_gate(
+            result = self._baseline_gate(
                 plan, flow, pull_request, create=True, excerpt_deadline=excerpt_deadline
             )
+        if plan.issue_amendment_pending and result.get("status") == "CHECKS_PASSED":
+            # NEW-205: green CI does not cover the amended text. The loop treats this as a
+            # source regression and repairs (NEW-64): the repair maker reviews the PR
+            # against the amended OpenSpec (NEW-201). Real CI failures keep their evidence.
+            return {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "failed_checks": [],
+                "preexisting_checks": [],
+                "reason": AMENDED_AFTER_PUBLICATION,
+                "failure_excerpts": {},
+            }
         return result
 
     # -- NEW-63: baseline-aware CI gate -----------------------------------------------------
@@ -2811,6 +2889,9 @@ class GitOpsGitHubHandler:
 
     def _merge(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan, flow = self._gate(payload)
+        if plan.issue_amendment_pending:
+            # NEW-205: defence in depth; _pr_checks already refused these PRs.
+            return {"status": "BLOCKED", "blocker": AMENDED_AFTER_PUBLICATION}
         if plan.risk_class == "R3" and not flow.allow_r3_merge:
             return {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
         target = str(payload.get("target"))
@@ -2840,6 +2921,9 @@ class GitOpsGitHubHandler:
             )
         else:
             return {"status": "BLOCKED", "blocker": "MERGE_TARGET_INVALID"}
+        refused = self._issue_revision_gate(plan, repository, number)
+        if refused is not None:
+            return refused
         binding = f"changeset:{plan.change_set_id}"
         current = self.broker.mark_pull_request_ready(
             repository=repository,
@@ -2890,6 +2974,50 @@ class GitOpsGitHubHandler:
             "merge_sha": result["merge_sha"],
             "merge": result,
         }
+
+    def _issue_revision_gate(
+        self, plan: StagingGitOpsPlan, repository: str, number: int
+    ) -> dict[str, Any] | None:
+        """NEW-205 review: read the live issue at every merge attempt, before any write.
+
+        The merge runs only while the issue is the revision the plan was prepared for. A
+        recorded plan cannot be trusted alone: a child reset in Temporal may replay one
+        prepared before an issue amendment. A PR already merged (a retried attempt) stays
+        merged; nothing new is written for it, and gitops.close_issue checks again."""
+        blocker = self._issue_revision_blocker(plan)
+        if blocker is None:
+            return None
+        if self.broker.view_pull_request(repository, number).get("state") == "MERGED":
+            return None
+        return {"status": "BLOCKED", "blocker": blocker}
+
+    def _issue_revision_blocker(
+        self, plan: StagingGitOpsPlan, *, closing_marker: str | None = None
+    ) -> str | None:
+        """None when the live issue is the revision the plan was prepared for.
+
+        Only a close (``closing_marker``) accepts an issue that is closed already (a
+        retried close: closing moves updatedAt, and closing again writes nothing), or one
+        whose updatedAt moved while its body is unchanged and Hermes's own delivery
+        comment is present (a close stopped between its comment and the close; the
+        comment moved updatedAt). A merge always needs the approved revision."""
+        if plan.issue_body_sha256 is None or plan.issue_updated_at is None:
+            return "ISSUE_REVISION_UNBOUND"
+        observed = self.broker.observe_issue_revision(plan.issue_repository, plan.issue_number)
+        if closing_marker is not None and observed.state != "OPEN":
+            return None
+        if observed.body_sha256 != plan.issue_body_sha256:
+            return "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+        if _as_utc(observed.updated_at) == _as_utc(plan.issue_updated_at):
+            return None
+        if closing_marker is not None and any(
+            isinstance(comment, dict) and closing_marker in str(comment.get("body") or "")
+            for comment in self.broker.view_issue(plan.issue_repository, plan.issue_number)[
+                "comments"
+            ]
+        ):
+            return None
+        return "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
 
     def _merge_only_files_gate(
         self, plan: StagingGitOpsPlan, gate: MergeDeliveryPolicy
@@ -3328,6 +3456,11 @@ class GitOpsGitHubHandler:
         plan, gate = self._gate(payload)
         merge_sha = self._merge_sha(payload)
         marker = f"<!-- engineering-control-staging-gitops:delivered:{plan.change_set_id} -->"
+        # NEW-205 review: a merge reported for a PR merged outside Hermes skips the merge
+        # gate; the delivered issue is closed only while it is the plan's approved revision.
+        blocker = self._issue_revision_blocker(plan, closing_marker=marker)
+        if blocker is not None:
+            return {"status": "BLOCKED", "blocker": blocker}
         if isinstance(gate, MergeDeliveryPolicy):
             # NEW-160: merged after the maker, the independent checker and green CI.
             return self._comment_and_close(

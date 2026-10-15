@@ -111,10 +111,15 @@ from engineering_control.models.reconciliation import (
 from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.operations.change_set_publication import (
     amendment_cutoff,
+    clear_published_amendment,
     parse_time,
+    published_amendment_pending,
     recorded_after,
 )
-from engineering_control.operations.issue_amend import record_consumed_issue_revision
+from engineering_control.operations.issue_amend import (
+    ISSUE_BODY_REVISION_KEY,
+    record_consumed_issue_revision,
+)
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
     expired_unreferenced_reissue_event_ids,
@@ -3427,8 +3432,8 @@ class MetadataActivityHandler:
             )
             cutoff = amendment_cutoff(change_set)
         if not recorded_after(record, cutoff):
-            # NEW-201: an amended ChangeSet never published before its cut-off (issue_amend
-            # refuses a published one), so this only drops a record older than it.
+            # NEW-201: a record older than the cut-off judged the previous text. NEW-205: a
+            # published amendment's retry rechecks CI first, so the repair gets a newer one.
             return [], None, {}, "source"
         if not isinstance(record, dict) or record.get("blocker") not in {
             "SOURCE_PR_CI_REGRESSION",
@@ -4477,6 +4482,13 @@ class MetadataActivityHandler:
             }
             # NEW-76: a published head passed validation; earlier findings are resolved.
             recovery.pop("validation_findings", None)
+            # NEW-205: a publication by a run that loaded the amended issue text delivers a
+            # published amendment; until then the PRs never merge.
+            consumed = recovery.get(ISSUE_BODY_REVISION_KEY)
+            if isinstance(consumed, dict) and consumed.get("run_id") == str(run.id):
+                clear_published_amendment(
+                    recovery, str(run.id), consumed.get("body_sha256"), datetime.now(UTC)
+                )
             change_set.recovery_json = recovery
             change_set.state = (
                 ChangeSetState.SOURCE_MERGED.value
@@ -4597,6 +4609,9 @@ class MetadataActivityHandler:
             }
             if change_set.state not in closure_states:
                 raise ValueError("final closure is not in a resumable verified state")
+            if published_amendment_pending(change_set):
+                # NEW-205: the delivered PRs predate an amendment of the issue text.
+                raise ValueError("the issue was amended after its pull requests were published")
             if (
                 issue.state != "OPEN"
                 or issue.documentation_impact

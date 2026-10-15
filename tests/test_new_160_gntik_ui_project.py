@@ -9,6 +9,7 @@ GitOps, release tag, image build or runtime verification; releases stay the oper
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import runpy
@@ -26,7 +27,10 @@ from sqlalchemy import select
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
+from test_new_114_bundle import _backlog_campaign, _issue_record
 from test_staging_gitops import (
+    ISSUE_BODY_SHA,
+    ISSUE_UPDATED_AT,
     MAIN_SHA,
     MERGE_SHA,
     BaselineGh,
@@ -469,6 +473,8 @@ def _plan(**changes: Any) -> dict[str, Any]:
         "deployment_base_branch": "main",
         "issue_repository": REPOSITORY,
         "issue_number": 12,
+        "issue_body_sha256": ISSUE_BODY_SHA,
+        "issue_updated_at": ISSUE_UPDATED_AT,
     }
     value.update(changes)
     return StagingGitOpsPlan.model_validate(value).model_dump(mode="json")
@@ -718,7 +724,6 @@ async def test_close_issue_records_the_merge_evidence(tmp_path: Path) -> None:
         "number": 12,
         "title": "Button loses its focus ring",
         "state": "OPEN",
-        "body": "",
         "comments": [],
         "url": "https://github.com/gntik-ai/gntik-ui/issues/12",
         "closedAt": None,
@@ -1265,6 +1270,16 @@ async def test_a_published_gntik_ui_change_merges_and_is_delivered_without_a_dep
         assert change_set is not None and change_set.source_pr_url == PR_URL
         assert change_set.deployment_pr_url is None
         assert change_set.state == "SOURCE_PR"
+        finding_id = change_set.finding_id
+    # NEW-205 review: the delivered backlog issue's approved revision, which the plan binds
+    # and every merge re-reads live (the empty body seeded below, at its GitHub time).
+    with metadata.sessions.begin() as session:
+        session.add(_backlog_campaign())
+        record = _issue_record(REPOSITORY, 12)
+        record.finding_id = finding_id
+        record.body_sha256 = hashlib.sha256(b"").hexdigest()
+        record.github_updated_at = datetime(2026, 9, 26, 12, tzinfo=UTC)
+        session.add(record)
     controller = _controller(tmp_path / "controller", FakeKubectl(), database_url=database)
     prepared = await controller.handle(
         "gitops.prepare",

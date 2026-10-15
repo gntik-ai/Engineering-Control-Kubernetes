@@ -45,6 +45,7 @@ from engineering_control.operations.change_set_publication import (
     AMENDMENT_BLOCKER,
     AMENDMENT_CUTOFF_KEY,
     CORRECTABLE_STATES,
+    published_repairable_blocker,
     request_changes,
     started_unpublished_blocker,
 )
@@ -79,6 +80,23 @@ _DELIVERED_STATES = frozenset(
         ChangeSetState.RUNTIME_VERIFIED.value,
         ChangeSetState.ISSUE_CLOSED.value,
     }
+)
+# NEW-205: the loop pauses after which backlog-retry re-delivers a published ChangeSet by a
+# CI repair (issue_delivery_approval.CI_REPAIR_REGRESSIONS, plus every CI_REPAIR_* stop;
+# that module imports this one), or rechecks it (a merge refused because the issue body
+# changed, gitops._issue_revision_gate; the recheck then repairs the pending amendment).
+_CI_REPAIR_PAUSES = frozenset(
+    {
+        "SOURCE_PR_CI_REGRESSION",
+        "DEPLOYMENT_PR_CI_REGRESSION",
+        "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+    }
+)
+_CI_REPAIR_PAUSE_PREFIX = "CI_REPAIR_"
+# Runs that can no longer use a worktree lease they still hold (metadata's NEW-64 set): a
+# published ChangeSet keeps its publishing run's worktree lease for the release path.
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"SUCCESS", "FAILED", "CANCELLED", "TIMED_OUT", "BLOCKED", "RATE_LIMITED"}
 )
 
 
@@ -278,12 +296,17 @@ def resolve_amend_target(
             if change_set_unstarted(change_set)
             else started_unpublished_blocker(session, change_set)
         )
-        if unpublished is not None:
+        # NEW-205: published work still only in its open PRs is amended too, but only for
+        # a loop paused on a CI repair (checked below): the next repair re-delivers the PRs
+        # against the amended text, and nothing merges before it (published_amendment).
+        published = unpublished is not None
+        repairable = published_repairable_blocker(session, change_set) if published else None
+        if repairable is not None:
             raise IssueAmendBlocked(
                 "ISSUE_AMEND_DELIVERY_ACTIVE",
                 f"the delivery of {target} already published work (ChangeSet "
-                f"{change_set.state}: {unpublished}); re-import the backlog and start the "
-                "issue again",
+                f"{change_set.state}: {unpublished}) and {repairable}; re-import the backlog "
+                "and start the issue again",
             )
         current = now or datetime.now(UTC)
         projected = session.execute(
@@ -307,8 +330,10 @@ def resolve_amend_target(
             .limit(1)
         )
         # NEW-201 review: the worktree lease too (as change_reset): a started ChangeSet's
-        # worktree may still be held by a delivery that no Run projection shows.
-        worktree = session.scalar(
+        # worktree may still be held by a delivery that no Run projection shows. NEW-205: a
+        # published ChangeSet keeps its publishing run's lease for the release path
+        # (NEW-32/64); only a lease whose owner run has not ended blocks it.
+        worktree_query = (
             select(WorktreeLease.id)
             .where(
                 WorktreeLease.change_set_id == change_set.id,
@@ -317,24 +342,38 @@ def resolve_amend_target(
             )
             .limit(1)
         )
+        if published:
+            worktree_query = worktree_query.join(Run, Run.id == WorktreeLease.owner_run_id).where(
+                Run.status.not_in(_TERMINAL_RUN_STATUSES)
+            )
+        worktree = session.scalar(worktree_query)
         if running is not None or leased is not None or worktree is not None:
             raise IssueAmendBlocked(
                 "ISSUE_AMEND_DELIVERY_ACTIVE",
                 f"a delivery of {target} is running; amend it after it stops",
             )
-        if (
-            not change_set_unstarted(change_set)
-            and paused_issue_loop(session, change_set, issue) is None
-        ):
-            # NEW-201: kept work is resumed only by the same loop (backlog-retry of the
-            # loop paused on this issue binds the same ChangeSet under its own custody).
-            # A cancelled loop's ChangeSet is never handed to another operation; that
-            # case still needs a re-import and a new issue-start (NEW-202).
-            raise IssueAmendBlocked(
-                "ISSUE_AMEND_NO_PAUSED_LOOP",
-                f"no backlog loop is paused on {target}, so its kept work could not be "
-                "resumed; re-import the backlog and start the issue again",
-            )
+        if not change_set_unstarted(change_set):
+            loop = paused_issue_loop(session, change_set, issue, lock=lock)
+            pause = _loop_pause_blocker(session, loop) if published and loop else None
+            if published and not _ci_repair_pause(pause):
+                # NEW-205: only the paused loop's CI-repair retry re-delivers published PRs.
+                raise IssueAmendBlocked(
+                    "ISSUE_AMEND_DELIVERY_ACTIVE",
+                    f"the delivery of {target} already published work; it is amended only "
+                    "while its loop is paused on a CI repair ("
+                    + (f"paused on {pause}" if pause else "no loop is paused on this issue")
+                    + "); re-import the backlog and start the issue again",
+                )
+            if loop is None:
+                # NEW-201: kept work is resumed only by the same loop (backlog-retry of the
+                # loop paused on this issue binds the same ChangeSet under its own custody).
+                # A cancelled loop's ChangeSet is never handed to another operation; that
+                # case still needs a re-import and a new issue-start (NEW-202).
+                raise IssueAmendBlocked(
+                    "ISSUE_AMEND_NO_PAUSED_LOOP",
+                    f"no backlog loop is paused on {target}, so its kept work could not be "
+                    "resumed; re-import the backlog and start the issue again",
+                )
     return issue, campaign, finding, change_set
 
 
@@ -533,7 +572,17 @@ def amend_issue(
     # NEW-201: a started, never-published ChangeSet keeps its commits. Checked before any
     # write; the cut-off, the REQUEST_CHANGES move and the amendment commit together.
     cutoff = (
-        _record_amendment_cutoff(session, change_set, value, actor, current_time, target)
+        _record_amendment_cutoff(
+            session,
+            change_set,
+            value,
+            actor,
+            current_time,
+            target,
+            # NEW-205: resolve_amend_target admitted published work only for a loop paused
+            # on a CI repair.
+            published=started_unpublished_blocker(session, change_set) is not None,
+        )
         if change_set is not None and not change_set_unstarted(change_set)
         else None
     )
@@ -596,6 +645,8 @@ def _record_amendment_cutoff(
     actor: str,
     now: datetime,
     target: str,
+    *,
+    published: bool = False,
 ) -> dict[str, Any]:
     """NEW-201: amend in place a started, never-published ChangeSet (re-proven by
     resolve_amend_target under the Finding/ChangeSet locks).
@@ -606,7 +657,11 @@ def _record_amendment_cutoff(
     loop (backlog-retry) may bind it under its existing custody. The cut-off is recorded
     on the ChangeSet: checker and validation context recorded before it is never shown to
     a later maker, and the next resumed maker is told to review the kept commits against
-    the regenerated OpenSpec."""
+    the regenerated OpenSpec.
+
+    NEW-205: a ``published`` ChangeSet (its PRs open, its loop paused on a CI repair) keeps
+    its state and lineage; the record also names the published heads and stays
+    ``publication_pending`` until a publication of the amended text."""
     # issue_delivery_approval imports this module (change_set_unstarted).
     from engineering_control.operations.issue_delivery_approval import (
         correction_attempt_budget,
@@ -614,7 +669,12 @@ def _record_amendment_cutoff(
     )
 
     from_state = change_set.state
-    if from_state in CORRECTABLE_STATES:
+    if published:
+        # NEW-205: published PRs keep their state; the loop's CI-repair retry restores them
+        # (NEW-102) and re-delivers them against the amended text. publication_pending
+        # holds every merge until a publication of that text clears it (published_amendment).
+        change_set.version += 1
+    elif from_state in CORRECTABLE_STATES:
         try:
             if validate_change_set_issue_approval(session, change_set.id, current=False) is None:
                 raise ValueError("ChangeSet has no backlog issue approval")
@@ -650,6 +710,15 @@ def _record_amendment_cutoff(
         "change_set_version": change_set.version,
         "count": (int(prior.get("count", 0)) if isinstance(prior, dict) else 0) + 1,
     }
+    if published:
+        record.update(
+            published=True,
+            publication_pending=True,
+            source_pr_url=change_set.source_pr_url,
+            source_head_sha=change_set.source_head_sha,
+            deployment_pr_url=change_set.deployment_pr_url,
+            deployment_head_sha=change_set.deployment_head_sha,
+        )
     recovery[AMENDMENT_CUTOFF_KEY] = record
     change_set.recovery_json = recovery
     return record
@@ -837,7 +906,7 @@ def retry_workflow_id(
 
 
 def paused_issue_loop(
-    session: Session, change_set: ChangeSet, issue: BacklogIssueRecord
+    session: Session, change_set: ChangeSet, issue: BacklogIssueRecord, *, lock: bool = False
 ) -> str | None:
     """NEW-201: the loop that holds this ChangeSet's validated custody, if it is recorded
     PAUSED (not finished) on exactly this issue; else None.
@@ -866,9 +935,14 @@ def paused_issue_loop(
     loop = _change_set_loop(session, change_set)
     if loop is None:
         return None
-    runs = session.scalars(
-        select(Run).where(Run.workflow_id == loop, Run.run_type == _LOOP_RUN_TYPE).limit(2)
-    ).all()
+    query = select(Run).where(Run.workflow_id == loop, Run.run_type == _LOOP_RUN_TYPE).limit(2)
+    if lock:
+        # NEW-205 review: hold the loop's Run row (after the Finding, issue and ChangeSet
+        # locks) until the amendment commits. A concurrent resume records RUNNING on this
+        # row (backlog.record_loop_state) before it restores, rechecks or merges anything,
+        # so it either waits for the amendment or is seen here and refused.
+        query = query.with_for_update().execution_options(populate_existing=True)
+    runs = session.scalars(query).all()
     if len(runs) != 1 or runs[0].status != "PAUSED" or runs[0].finished_at is not None:
         return None
     pause = session.get(Step, loop_pause_target_id(runs[0].id))
@@ -884,6 +958,30 @@ def paused_issue_loop(
     ):
         return None
     return loop
+
+
+def _loop_pause_blocker(session: Session, loop: str) -> str | None:
+    """The blocker recorded with the PAUSED loop's durable pause target (NEW-133), if any.
+
+    Called only for a loop paused_issue_loop has just proven PAUSED on the issue."""
+    from engineering_control.operations.correction_extension import loop_pause_target_id
+
+    run = session.scalar(
+        select(Run).where(Run.workflow_id == loop, Run.run_type == _LOOP_RUN_TYPE).limit(1)
+    )
+    pause = session.get(Step, loop_pause_target_id(run.id)) if run is not None else None
+    value = pause.result_json if pause is not None else None
+    blocker = value.get("blocker") if isinstance(value, dict) else None
+    return blocker if isinstance(blocker, str) and blocker else None
+
+
+def _ci_repair_pause(blocker: str | None) -> bool:
+    """NEW-205: whether the loop's backlog-retry re-delivers its published PRs by a CI
+    repair: a recorded PR CI regression, or a stopped CI repair (CI_REPAIR_*), whose retry
+    rechecks CI first (NEW-101)."""
+    return blocker is not None and (
+        blocker in _CI_REPAIR_PAUSES or blocker.startswith(_CI_REPAIR_PAUSE_PREFIX)
+    )
 
 
 def _retry_target(

@@ -588,6 +588,59 @@ body/title hashes, previous approved and consumed times, new time):
 A rerun reports `NO_CHANGE`. The next publication claim of the current loop then passes; no
 retry is sent (resume a paused loop with `backlog-retry` as usual).
 
+## Amend the issue of a published delivery paused on a CI repair (NEW-205)
+
+`issue-amend` re-approves an edited issue body. Before NEW-205 it refused once a PR was
+published ("re-import the backlog and start the issue again"), so clarifying the spec of a
+delivery whose PR CI keeps failing (gntik-ui #30, PR #86) meant throwing away the PR. It now
+also amends a published ChangeSet when **all** of these hold:
+
+- the loop that holds its custody is recorded `PAUSED` on this issue with a CI-repair blocker:
+  `SOURCE_PR_CI_REGRESSION`, `DEPLOYMENT_PR_CI_REGRESSION` or any `CI_REPAIR_*`;
+- the work is still only its open PRs: state `SOURCE_PR`, `CI_VALIDATED`, or `PLANNED`,
+  `IMPLEMENTING`, `REQUEST_CHANGES` after a stopped repair; a source PR is recorded; no merge,
+  candidate, promotion, release or final-closure record, image digest, chart version or
+  deployment;
+- nothing runs: no `RUNNING` delivery run, no live component lease, and no live worktree lease
+  whose owner run has not ended (the publishing run's lease is kept for the release path).
+
+```bash
+gh issue edit 30 -R gntik-ai/gntik-ui --body-file amended.md   # append the amendment
+engineering-ctl issue-amend gntik-ui gntik-ui 30                  # preview: diff + hash
+engineering-ctl issue-amend gntik-ui gntik-ui 30 --confirm <hash12> --retry
+# a CI_REPAIR_* pause rechecks CI first and pauses on the regression at the automatic limit:
+engineering-ctl backlog-retry <loop_workflow_id> gntik-ui 30
+```
+
+The ChangeSet keeps its state, PRs, heads and correction lineage (version + 1). Its
+`recovery_json.issue_amendment_cutoff` records `published: true`, the published PR URLs and
+heads, and `publication_pending: true`. The retry rechecks CI, so the repair gets current
+failures (a CI record from before the amendment is never shown to a maker), and the repair maker
+is told to review the existing commits against the regenerated OpenSpec (NEW-201).
+
+While the amendment is pending, nothing merges work made for the previous text:
+`gitops.prepare` flags the plan; `gitops.pr_checks` turns green CI into a
+`SOURCE_PR_CI_REGRESSION` with reason `ISSUE_AMENDED_AFTER_PUBLICATION` and no failing jobs
+(so the loop repairs, automatically or on the operator's retry), reports a PR merged outside
+Hermes as `ISSUE_AMENDED_AFTER_PUBLICATION`, and `gitops.merge` and `final.prepare` refuse. The
+first publication by a run that loaded the amended text (its `issue_body_revision`, which
+publication custody already proved equal to the live issue) clears it
+(`publication_pending: false`, `republished_by_run_id`).
+
+A recorded plan alone is never trusted for the merge: a staging child reset in Temporal can
+replay a plan prepared before the amendment. `gitops.prepare` reads the ChangeSet and the issue
+record in one snapshot (REPEATABLE READ) and binds the approved issue revision
+(`issue_body_sha256` and `issue_updated_at`, the effective approved revision, as publication
+custody binds it). Every `gitops.merge` attempt, before any write, and `gitops.close_issue`
+read the live issue: another body or GitHub `updatedAt` blocks with
+`ISSUE_BODY_CHANGED_SINCE_APPROVAL` (putting the old text back moves `updatedAt` too), a plan
+without the binding (prepared before NEW-205) with `ISSUE_REVISION_UNBOUND`. A PR already
+merged stays merged; an already closed issue stays closed. So any issue edit or comment between
+the plan and the close holds the delivery until it is amended (`issue-amend`, accepted for
+this pause too) or touch-refreshed (`issue-touch-refresh`) and retried. The confirm also locks
+the paused loop's Run row after the Finding, issue record and ChangeSet locks, so a concurrent
+resume (which records `RUNNING` on that row first) either waits for the amendment or is refused.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

@@ -105,6 +105,54 @@ def started_unpublished_blocker(session: Session, change_set: ChangeSet) -> str 
     return published_reason(session, change_set)
 
 
+# NEW-205: a published ChangeSet whose PRs wait for a CI repair: SOURCE_PR (where a CI-repair
+# child binds, issue_delivery_approval._CI_REPAIR_START_STATES), or moved back by a CI-repair
+# attempt that stopped (NEW-66), which the loop's retry restores to SOURCE_PR (NEW-102,
+# activities/engineering._REPAIR_INTERMEDIATE_STATES) before its recheck. CI_VALIDATED is
+# neither: no repair child binds from it and the restore refuses it.
+CI_REPAIRABLE_STATES = frozenset({ChangeSetState.SOURCE_PR.value, *STARTED_UNPUBLISHED_STATES})
+# recovery_json records that mean published work went past its open PRs: merged,
+# promoted, released or closed. A later issue amendment cannot change that work.
+PAST_PULL_REQUEST_KEYS = frozenset(
+    {
+        "candidate",
+        "source_merge",
+        "promotion",
+        "promotion_component_lease",
+        "release_evidence",
+        "release_plan_review",
+        "rollback_plan",
+        "final_closure",
+    }
+)
+
+
+def published_repairable_blocker(session: Session, change_set: ChangeSet) -> str | None:
+    """NEW-205: None for a published ChangeSet whose work is still only its open PRs,
+    which a CI repair re-delivers; otherwise why it is not one."""
+    if change_set.state not in CI_REPAIRABLE_STATES:
+        return f"the ChangeSet is {change_set.state}"
+    if change_set.source_pr_url is None:
+        return "no source pull request is recorded"
+    if change_set.image_digests or change_set.chart_version is not None:
+        return "release artifacts are recorded"
+    recovery = change_set.recovery_json or {}
+    recorded = sorted(PAST_PULL_REQUEST_KEYS.intersection(recovery))
+    if recorded:
+        return f"the work went past its pull requests ({', '.join(recorded)})"
+    staging = recovery.get("staging_gitops")
+    if isinstance(staging, dict) and (
+        staging.get("merge_sha") or staging.get("status") in {"STAGING_VERIFIED", "MERGE_DELIVERED"}
+    ):
+        return "the work was merged"
+    deployment = session.scalar(
+        select(Deployment.id).where(Deployment.change_set_id == change_set.id).limit(1)
+    )
+    if deployment is not None:
+        return "a deployment is recorded"
+    return None
+
+
 def request_changes(change_set: ChangeSet, *, blocker: str, actor: str, now: datetime) -> str:
     """Move a PLANNED/IMPLEMENTING ChangeSet to REQUEST_CHANGES as an operator correction
     (NEW-168 reset, NEW-201 amendment); returns the state it left.
@@ -163,6 +211,53 @@ def amendment_cutoff(change_set: ChangeSet | None) -> datetime | None:
     if at is None or not isinstance(record, dict) or record.get("version") != 1:
         raise ValueError("ChangeSet issue amendment cut-off is malformed")
     return at
+
+
+def published_amendment_pending(change_set: ChangeSet) -> bool:
+    """NEW-205: whether the issue was amended after the ChangeSet's PRs were published and
+    no publication of the amended text has happened since. Such PRs carry work made for
+    the previous text: they must be re-delivered by a CI repair, never merged.
+
+    A malformed record fails closed (pending)."""
+    return _amendment_pending((change_set.recovery_json or {}).get(AMENDMENT_CUTOFF_KEY))
+
+
+def _amendment_pending(record: Any) -> bool:
+    if record is None:
+        return False
+    if not isinstance(record, dict) or record.get("version") != 1:
+        return True
+    if "published" not in record:
+        # A NEW-201 cut-off: the ChangeSet had published nothing when it was amended.
+        return False
+    # Anything but an exact NEW-205 record (booleans, pending unless explicitly delivered)
+    # fails closed, an explicit null included.
+    return record["published"] is not True or record.get("publication_pending") is not False
+
+
+def clear_published_amendment(
+    recovery: dict[str, Any], run_id: str, consumed_body_sha256: Any, now: datetime
+) -> bool:
+    """NEW-205: in ``recovery`` (a ChangeSet's recovery_json being written), mark a pending
+    published amendment delivered when the publishing run ``run_id`` loaded exactly the
+    amended text (``consumed_body_sha256``; publication custody proved it equal to the
+    live issue). Returns whether it did."""
+    record = recovery.get(AMENDMENT_CUTOFF_KEY)
+    if (
+        not _amendment_pending(record)
+        or not isinstance(record, dict)
+        or record.get("version") != 1
+        or not isinstance(consumed_body_sha256, str)
+        or record.get("body_sha256") != consumed_body_sha256
+    ):
+        return False
+    recovery[AMENDMENT_CUTOFF_KEY] = {
+        **record,
+        "publication_pending": False,
+        "republished_by_run_id": run_id,
+        "republished_at": now.isoformat(),
+    }
+    return True
 
 
 def recorded_after(record: Any, cutoff: datetime | None) -> bool:
