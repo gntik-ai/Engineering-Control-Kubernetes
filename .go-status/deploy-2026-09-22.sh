@@ -51,7 +51,15 @@ echo "=== Pre-flight: full local verification (refuses to deploy if any of this 
 # starved Hermes of memory on 2026-10-02/03. Use a private basetemp and delete it.
 PYTEST_BASETEMP=$(mktemp -d /tmp/engineering-control-preflight.XXXXXX)
 trap 'rm -rf "$PYTEST_BASETEMP"' EXIT
-.venv/bin/pytest tests/ -q -p no:cacheprovider --basetemp="$PYTEST_BASETEMP"
+# NEW-212: with pytest-xdist installed (pip install -e '.[dev]'), the suite runs on
+# PREFLIGHT_WORKERS processes (default 4 of the controller's 8 CPUs), one file per worker
+# at a time; each worker gets its own directory under the private basetemp. Without it the
+# run stays serial.
+PYTEST_PARALLEL=()
+if .venv/bin/python -c 'import xdist' 2>/dev/null; then
+  PYTEST_PARALLEL=(-n "${PREFLIGHT_WORKERS:-4}" --dist loadfile)
+fi
+.venv/bin/pytest tests/ -q -p no:cacheprovider --basetemp="$PYTEST_BASETEMP" "${PYTEST_PARALLEL[@]}"
 rm -rf "$PYTEST_BASETEMP"
 
 RELEASE_DIR="$RELEASES_ROOT/$HASH"

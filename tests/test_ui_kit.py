@@ -777,10 +777,12 @@ class _SocketService:
             connection.close()
 
     def _silent(self, connection: _socket.socket) -> None:
-        with connection:
-            while connection.recv(65536):
-                pass
-        self.eof.set()
+        try:
+            with connection, contextlib.suppress(OSError):
+                while connection.recv(65536):
+                    pass
+        finally:
+            self.eof.set()
 
     def _stall(self, connection: _socket.socket) -> None:
         with connection:
@@ -802,13 +804,21 @@ class _SocketService:
         self.eof.set()
 
     def _oversize(self, connection: _socket.socket) -> None:
-        with connection:
-            connection.recv(65536)
-            with contextlib.suppress(OSError):
-                connection.sendall(b'{"jsonrpc":"2.0","id":1,"x":"' + b"x" * (5 << 20) + b'"}\n')
-            while connection.recv(65536):
-                pass
-        self.eof.set()
+        try:
+            with connection:
+                connection.recv(65536)
+                with contextlib.suppress(OSError):
+                    connection.sendall(
+                        b'{"jsonrpc":"2.0","id":1,"x":"' + b"x" * (5 << 20) + b'"}\n'
+                    )
+                # The client refuses the oversize line and closes with unread data, so the
+                # kernel may answer with a reset: that is the end of stream this test waits
+                # for, not a server error (it used to kill this thread before eof was set).
+                with contextlib.suppress(OSError):
+                    while connection.recv(65536):
+                        pass
+        finally:
+            self.eof.set()
 
     def stop(self) -> None:
         self.release.set()
