@@ -320,31 +320,49 @@ MANIFESTS_87 = {
 }
 
 
-def test_new_209_only_files_a_package_publishes_need_a_changeset() -> None:
+def test_new_209_only_unpublished_test_files_and_private_packages_skip_the_changeset() -> None:
     gate = ChangesetGatePolicy(enabled=True, package_paths=("packages/", "blocks/"))
     # Without manifests every package path still counts (the previous behaviour).
     assert gate.touches_packages(PR_87_FILES)
     assert not gate.touches_packages(PR_87_FILES, MANIFESTS_87)
-    templates = {"packages/templates/": {"name": "@gntik-ai/templates", "files": ["dist", "src"]}}
+    # A private package needs no changeset for any file.
+    assert not gate.touches_packages(["packages/mcp/src/server.ts"], MANIFESTS_87)
+    # Source compiled into a published dist/ is a release change (Codex review 2).
+    ui = {"packages/ui/": {"files": ["dist", "src/styles.css"]}}
+    cli = {"packages/cli/": {"files": ["dist"], "bin": {"gntik-ui": "dist/index.js"}}}
+    assert gate.touches_packages(["packages/ui/src/components/Button/Button.tsx"], ui)
+    assert gate.touches_packages(["packages/cli/src/index.ts"], cli)
+    # A test file outside the published entries needs none.
+    assert not gate.touches_packages(["packages/ui/src/components/Button/Button.test.tsx"], ui)
     # A fixtures directory inside a published src/ tree is published (Codex review 1).
+    templates = {"packages/templates/": {"name": "@gntik-ai/templates", "files": ["dist", "src"]}}
     assert gate.touches_packages(
         ["packages/templates/src/settings-profile/fixtures/editable.snap"], templates
     )
-    ui = {"packages/ui/": {"files": ["dist", "src/styles.css"]}}
-    assert gate.touches_packages(["packages/ui/src/styles.css"], ui)
-    assert not gate.touches_packages(["packages/ui/src/button.test.tsx"], ui)
-    # npm always publishes package.json, README, LICENSE and CHANGELOG.
-    for name in ("package.json", "README.md", "LICENSE", "CHANGELOG.md"):
-        assert gate.touches_packages([f"packages/ui/{name}"], ui), name
-    # Globs match the path or a parent directory; negations are ignored (still counted).
-    globbed = {"packages/x/": {"files": ["lib/*.js", "!lib/secret.js", "types/**"]}}
-    assert gate.touches_packages(["packages/x/lib/a.js"], globbed)
-    assert gate.touches_packages(["packages/x/lib/secret.js"], globbed)
-    assert not gate.touches_packages(["packages/x/test/a.js"], globbed)
+    # Any pattern in files (glob, brace, negation) is not interpreted (Codex review 2).
+    for files in (["src/**/*"], ["{src,lib}/**"], ["dist", "!test/a.mjs"]):
+        assert gate.touches_packages(
+            ["packages/x/test/a.test.mjs"], {"packages/x/": {"files": files}}
+        )
+    # main, module, types, browser and bin targets are always published (Codex review 2).
+    for field in ("main", "module", "types", "typings", "browser"):
+        manifest = {"packages/x/": {"files": [], field: "./test/entry.js"}}
+        assert gate.touches_packages(["packages/x/test/entry.js"], manifest), field
+    assert gate.touches_packages(
+        ["packages/x/test/cli.js"], {"packages/x/": {"files": [], "bin": "test/cli.js"}}
+    )
+    assert gate.touches_packages(
+        ["packages/x/test/a.js"], {"packages/x/": {"files": [], "browser": {"a": "b"}}}
+    )
     # Unknown or unreadable manifests, or no "files", keep the path counted.
     assert gate.touches_packages(["packages/tokens/test/a.mjs"], {})
     assert gate.touches_packages(["packages/tokens/test/a.mjs"], {"packages/tokens/": None})
     assert gate.touches_packages(["packages/tokens/test/a.mjs"], {"packages/tokens/": {}})
+    # "contest" or "testing" are not test directories; a package named "test" is a package.
+    tokens = {"packages/tokens/": {"files": ["src", "dist"]}, "packages/test/": {"files": ["dist"]}}
+    assert gate.touches_packages(["packages/tokens/contest/a.mjs"], tokens)
+    assert gate.touches_packages(["packages/tokens/testing/a.mjs"], tokens)
+    assert gate.touches_packages(["packages/test/index.ts"], tokens)
     # Paths outside an npm package directory (blocks/<file>) always count.
     assert gate.touches_packages(["blocks/Login.html"], MANIFESTS_87)
     assert gate.package_directory("packages/tokens/test/a.mjs") == "packages/tokens/"

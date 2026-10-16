@@ -3064,7 +3064,7 @@ class GitOpsGitHubHandler:
         self, plan: StagingGitOpsPlan, changeset: ChangesetGatePolicy, paths: list[str]
     ) -> dict[str, dict[str, Any] | None] | None:
         """NEW-209: each touched package's package.json at the bound head, so the changeset
-        gate counts only files the package publishes. A manifest the PR itself changes is
+        gate can skip private packages and unpublished test files. A manifest the PR changes is
         not trusted (the PR could make its package private or shrink ``files``), and an
         unreadable one is None: both keep every path of that package counted."""
         directories = sorted({d for path in paths if (d := changeset.package_directory(path))})
