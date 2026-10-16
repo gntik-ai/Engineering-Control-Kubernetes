@@ -1950,8 +1950,9 @@ async def test_issue_delivery_keeps_the_imported_body_when_the_refresh_fails() -
 
 
 async def test_r3_issue_delivery_keeps_the_approved_issue_body_and_replays() -> None:
-    """NEW-95 review: an R3 delivery works only from the issue text its R3 approval bound
-    (the imported copy); a later edit to the live issue must not reach the maker."""
+    """NEW-95 review: an R3 delivery works only from the issue text its R3 approval bound;
+    without an approved body hash to check a re-read against (NEW-210), it keeps the
+    imported copy and a later edit to the live issue must not reach the maker."""
     script = {
         **_DELIVERY_TO_SPEC_SCRIPT,
         "delivery.ensure_issue": {
@@ -1978,6 +1979,76 @@ async def test_r3_issue_delivery_keeps_the_approved_issue_body_and_replays() -> 
     requests = _scheduled_steps(history)
     leases = next(r for r in requests if r["step"] == "delivery.acquire_leases")
     assert leases["payload"]["actual_behavior"] == "Approved issue body"
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_r3_issue_delivery_reads_the_full_approved_body_and_replays() -> None:
+    """NEW-210: an R3 delivery bound to an approved body hash re-reads the full issue
+    (amendments appended past the imported 4000 characters reach the maker), and only
+    under that hash."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/falcone",
+            "issue_number": 953,
+            "actual_behavior": "Approved issue body (first 4000 characters)",
+            "approved_issue_body_sha256": "a" * 64,
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": _REFRESHED_BODY,
+            "body_sha256": "0" * 64,
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R3", dry_run=False)
+
+    history, _ = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    requests = _scheduled_steps(history)
+    refresh = next(r for r in requests if r["step"] == "delivery.refresh_issue_body")
+    assert refresh["payload"]["approved_issue_body_sha256"] == "a" * 64
+    leases = next(r for r in requests if r["step"] == "delivery.acquire_leases")
+    assert leases["payload"]["actual_behavior"] == _REFRESHED_BODY
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_r3_issue_delivery_stops_when_its_approved_body_changed_and_replays() -> None:
+    """NEW-210: an R3 issue edited after approval still never reaches the maker."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/falcone",
+            "issue_number": 953,
+            "actual_behavior": "Approved issue body",
+            "approved_issue_body_sha256": "a" * 64,
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker_detail": "re-import and re-approve",
+            "approved_body_sha256": "a" * 64,
+            "current_body_sha256": "b" * 64,
+        },
+        "delivery.release_leases": {"status": "NO_RUN_TO_RELEASE_LEASES_FOR"},
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R3", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["context"]["blocker"] == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+    assert result["context"]["actual_behavior"] == "Approved issue body"
+    assert "delivery.acquire_leases" not in _scheduled_step_names(history)
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
