@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -267,11 +268,49 @@ class ChangesetGatePolicy(ReconciliationModel):
             raise ValueError("an enabled changeset gate requires package paths")
         return self
 
-    def touches_packages(self, paths: list[str]) -> bool:
-        """True when any changed path (a rename's previous path included) is in a package."""
-        return self.enabled and any(
-            path.startswith(prefix) for path in paths for prefix in self.package_paths
-        )
+    def touches_packages(
+        self,
+        paths: list[str],
+        manifests: Mapping[str, Mapping[str, Any] | None] | None = None,
+    ) -> bool:
+        """True when any changed path (a rename's previous path included) is a package file
+        that needs a changeset.
+
+        NEW-209: with ``manifests`` (package directory -> its package.json at the PR head,
+        None when unreadable or changed by the PR), a path needs no changeset when its
+        package is private, or when it is a test or support file (a test, tests,
+        __tests__, e2e, fixtures, __fixtures__ or __snapshots__ directory, or a *.test.* /
+        *.spec.* name) that the package does not publish: outside every ``files`` entry and
+        not its main, module, types, typings, browser or bin target. Source compiled into
+        dist/ is a release change, so only test and support files are ever exempt. An
+        unknown package, an unreadable manifest, a missing ``files`` list or any pattern in
+        it (glob, brace, negation) keeps the path counted, as does a path outside any npm
+        package (gntik-ui #32: PR #87 changed only tests of the private mcp package and of
+        tokens, which publishes src/ and dist/)."""
+        return self.enabled and any(self._published(path, manifests) for path in paths)
+
+    def package_directory(self, path: str) -> str | None:
+        """``<prefix><name>/`` for a path inside a package directory, else None."""
+        for prefix in self.package_paths:
+            rest = path.removeprefix(prefix) if path.startswith(prefix) else None
+            if rest and "/" in rest:
+                return f"{prefix}{rest.split('/', 1)[0]}/"
+        return None
+
+    def _published(
+        self, path: str, manifests: Mapping[str, Mapping[str, Any] | None] | None
+    ) -> bool:
+        if not any(path.startswith(prefix) for prefix in self.package_paths):
+            return False
+        directory = self.package_directory(path)
+        if manifests is None or directory is None:
+            return True
+        manifest = manifests.get(directory)
+        if not isinstance(manifest, Mapping):
+            return True
+        if manifest.get("private") is True:
+            return False
+        return not _unpublished_test_file(path.removeprefix(directory), manifest)
 
     def changeset_candidates(self, changes: list[dict[str, str]]) -> list[str]:
         """Changeset files the PR adds or modifies (a rename or copy counts by its new path).
@@ -296,6 +335,48 @@ class ChangesetGatePolicy(ReconciliationModel):
 
 
 _CHANGESET_STATUSES = frozenset({"added", "modified", "changed", "renamed", "copied"})
+
+# NEW-209: package-relative locations of tests and test support files.
+_TEST_DIRECTORIES = frozenset(
+    {"test", "tests", "__tests__", "e2e", "fixtures", "__fixtures__", "__snapshots__"}
+)
+_TEST_FILE = re.compile(r"\.(?:test|spec)\.[A-Za-z0-9]+$")
+_ENTRY_FIELDS = ("main", "module", "types", "typings", "browser")
+# A plain relative path: no glob or extglob syntax, no "." or ".." segment, no empty
+# segment, no leading "/". Anything else in files or an entry target is not interpreted.
+_CANONICAL_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+
+
+def _canonical_path(value: str) -> str | None:
+    text = value.removeprefix("./")
+    text = text[:-1] if text.endswith("/") else text
+    return text if _CANONICAL_PATH.fullmatch(text) else None
+
+
+def _unpublished_test_file(relative: str, manifest: Mapping[str, Any]) -> bool:
+    """A test or support file (``relative`` to the package directory) that the public
+    package provably does not publish. Anything uncertain returns False (counted)."""
+    parts = relative.split("/")
+    if not (any(part in _TEST_DIRECTORIES for part in parts[:-1]) or _TEST_FILE.search(parts[-1])):
+        return False
+    files = manifest.get("files")
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        return False
+    entries = [_canonical_path(item) for item in files]
+    if any(entry is None for entry in entries):
+        return False
+    if any(relative == entry or relative.startswith(f"{entry}/") for entry in entries):
+        return False
+    targets: list[Any] = [manifest.get(field) for field in _ENTRY_FIELDS]
+    binaries = manifest.get("bin")
+    targets.extend(binaries.values() if isinstance(binaries, Mapping) else [binaries])
+    for target in targets:
+        if target is None:
+            continue
+        canonical = _canonical_path(target) if isinstance(target, str) else None
+        if canonical is None or relative == canonical:
+            return False  # not interpreted (object form, non-canonical) or the target itself
+    return True
 
 
 class MergeDeliveryPolicy(ReconciliationModel):

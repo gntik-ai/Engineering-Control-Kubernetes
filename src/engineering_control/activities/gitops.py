@@ -56,7 +56,11 @@ from engineering_control.delivery_notifications import (
 )
 from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.enums import ChangeSetState
-from engineering_control.models.reconciliation import MergeDeliveryPolicy, StagingFlowPolicy
+from engineering_control.models.reconciliation import (
+    ChangesetGatePolicy,
+    MergeDeliveryPolicy,
+    StagingFlowPolicy,
+)
 from engineering_control.operations.change_set_publication import published_amendment_pending
 from engineering_control.operations.issue_amend import effective_issue_revision
 from engineering_control.policy.github_write import (
@@ -93,6 +97,8 @@ GITOPS_GITHUB_STEPS = GITOPS_READ_ONLY_GITHUB_STEPS | GITOPS_WRITE_CAPABLE_GITHU
 ARGO_SYNC_USERNAME = "hermes-engineering"
 UNHEALTHY_POD_REASONS = frozenset({"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "Error"})
 MAXIMUM_POD_DELETIONS = 25
+# NEW-209: a PR touching more packages than this keeps every package path counted.
+_MAX_PACKAGE_MANIFESTS = 64
 _SHA = re.compile(r"[a-f0-9]{40}")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 # NEW-145b: the head branches a publication reconciliation may list PRs for.
@@ -3040,7 +3046,12 @@ class GitOpsGitHubHandler:
         ]
         if any(gate.protected(path) for path in touched):
             return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}
-        if gate.changeset.touches_packages(touched) and not any(
+        manifests = (
+            self._package_manifests(plan, gate.changeset, touched)
+            if gate.changeset.enabled
+            else None
+        )
+        if gate.changeset.touches_packages(touched, manifests) and not any(
             self._exists_at(plan.source_repository, path, plan.source_head_sha)
             for path in gate.changeset.changeset_candidates(changes)
         ):
@@ -3048,6 +3059,32 @@ class GitOpsGitHubHandler:
             # counts; a removed or renamed-away changeset never does.
             return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
         return None
+
+    def _package_manifests(
+        self, plan: StagingGitOpsPlan, changeset: ChangesetGatePolicy, paths: list[str]
+    ) -> dict[str, dict[str, Any] | None] | None:
+        """NEW-209: each touched package's package.json at the bound head, so the changeset
+        gate can skip private packages and unpublished test files. A manifest the PR changes is
+        not trusted (the PR could make its package private or shrink ``files``), and an
+        unreadable one is None: both keep every path of that package counted."""
+        directories = sorted({d for path in paths if (d := changeset.package_directory(path))})
+        if len(directories) > _MAX_PACKAGE_MANIFESTS:
+            return None
+        manifests: dict[str, dict[str, Any] | None] = {}
+        for directory in directories:
+            manifest_path = f"{directory}package.json"
+            value: Any = None
+            if manifest_path not in paths:
+                try:
+                    value = json.loads(
+                        self.broker.repository_file_text(
+                            plan.source_repository, manifest_path, plan.source_head_sha
+                        )
+                    )
+                except (CommandFailure, GhCliPolicyError, ValueError):
+                    value = None
+            manifests[directory] = value if isinstance(value, dict) else None
+        return manifests
 
     def _exists_at(self, repository: str, path: str, ref: str) -> bool:
         """NEW-160: ``path`` exists at commit ``ref`` (the PR's bound head)."""

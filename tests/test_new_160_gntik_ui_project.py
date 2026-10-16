@@ -148,7 +148,17 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
         ["pnpm", "-r", "--filter", "./packages/**", "build"],
         ["pnpm", "lint"],
         ["pnpm", "typecheck"],
-        ["pnpm", "-r", "--filter", "./packages/**", "--filter", "!@gntik-ai/gntik-ui-mcp", "test"],
+        [
+            "pnpm",
+            "-r",
+            "--filter",
+            "./packages/**",
+            "--filter",
+            "!@gntik-ai/gntik-ui-mcp",
+            "--filter",
+            "!@gntik-ai/evals",
+            "test",
+        ],
         ["pnpm", "registry:check"],
         ["node", "apps/musematic/scripts/check-kit-only.mjs"],
         ["node", "apps/falcone/scripts/check-kit-only.mjs"],
@@ -291,6 +301,103 @@ def test_the_changeset_gate_applies_only_to_package_changes() -> None:
     assert gate.touches_packages(["blocks/login/index.tsx"])
     assert not gate.touches_packages(["apps/docs/pages/index.mdx", ".changeset/x.md"])
     assert not ChangesetGatePolicy().touches_packages(["packages/ui/src/button.tsx"])
+
+
+# gntik-ui PR #87 (#32): only README, registry.json and package tests and fixtures changed.
+PR_87_FILES = [
+    "README.md",
+    "packages/mcp/test/kit.test.mjs",
+    "packages/tokens/test/fixtures/mirror-consumer/package.json",
+    "packages/tokens/test/fixtures/mirror-consumer/pnpm-lock.yaml",
+    "packages/tokens/test/mirror-install.test.mjs",
+    "registry.json",
+]
+
+
+MANIFESTS_87 = {
+    "packages/mcp/": {"name": "@gntik-ai/gntik-ui-mcp", "private": True, "files": ["dist"]},
+    "packages/tokens/": {"name": "@gntik-ai/tokens", "files": ["src", "dist"]},
+}
+
+
+def test_new_209_only_unpublished_test_files_and_private_packages_skip_the_changeset() -> None:
+    gate = ChangesetGatePolicy(enabled=True, package_paths=("packages/", "blocks/"))
+    # Without manifests every package path still counts (the previous behaviour).
+    assert gate.touches_packages(PR_87_FILES)
+    assert not gate.touches_packages(PR_87_FILES, MANIFESTS_87)
+    # A private package needs no changeset for any file.
+    assert not gate.touches_packages(["packages/mcp/src/server.ts"], MANIFESTS_87)
+    # Source compiled into a published dist/ is a release change (Codex review 2).
+    ui = {"packages/ui/": {"files": ["dist", "src/styles.css"]}}
+    cli = {"packages/cli/": {"files": ["dist"], "bin": {"gntik-ui": "dist/index.js"}}}
+    assert gate.touches_packages(["packages/ui/src/components/Button/Button.tsx"], ui)
+    assert gate.touches_packages(["packages/cli/src/index.ts"], cli)
+    # A test file outside the published entries needs none.
+    assert not gate.touches_packages(["packages/ui/src/components/Button/Button.test.tsx"], ui)
+    # A fixtures directory inside a published src/ tree is published (Codex review 1).
+    templates = {"packages/templates/": {"name": "@gntik-ai/templates", "files": ["dist", "src"]}}
+    assert gate.touches_packages(
+        ["packages/templates/src/settings-profile/fixtures/editable.snap"], templates
+    )
+    # Any pattern in files (glob, brace, negation) is not interpreted (Codex review 2).
+    for files in (["src/**/*"], ["{src,lib}/**"], ["dist", "!test/a.mjs"]):
+        assert gate.touches_packages(
+            ["packages/x/test/a.test.mjs"], {"packages/x/": {"files": files}}
+        )
+    # main, module, types, browser and bin targets are always published (Codex review 2).
+    for field in ("main", "module", "types", "typings", "browser"):
+        manifest = {"packages/x/": {"files": [], field: "./test/entry.js"}}
+        assert gate.touches_packages(["packages/x/test/entry.js"], manifest), field
+    assert gate.touches_packages(
+        ["packages/x/test/cli.js"], {"packages/x/": {"files": [], "bin": "test/cli.js"}}
+    )
+    assert gate.touches_packages(
+        ["packages/x/test/a.js"], {"packages/x/": {"files": [], "browser": {"a": "b"}}}
+    )
+    # Extglobs and non-canonical paths are not interpreted either (Codex review 3).
+    for files in (
+        ["dist", "test/@(helpers.ts|setup.ts)"],
+        ["dist", "test/+(a|b).ts"],
+        ["/test"],
+        ["src/../test"],
+        ["test//x"],
+        [".hidden"],
+    ):
+        manifest = {"packages/x/": {"files": files}}
+        assert gate.touches_packages(["packages/x/test/helpers.ts"], manifest), files
+    for target in ("test/../test/helpers.ts", "test//helpers.ts", "/test/helpers.ts"):
+        assert gate.touches_packages(
+            ["packages/x/test/helpers.ts"], {"packages/x/": {"files": ["dist"], "main": target}}
+        ), target
+        assert gate.touches_packages(
+            ["packages/x/test/helpers.ts"],
+            {"packages/x/": {"files": ["dist"], "bin": {"example": target}}},
+        ), target
+    # Whitespace-padded entries and targets are not canonical (Codex review 4).
+    assert gate.touches_packages(
+        ["packages/x/test/helpers.ts"], {"packages/x/": {"files": [" dist"]}}
+    )
+    assert gate.touches_packages(
+        ["packages/x/test/helpers.test.ts"],
+        {"packages/x/": {"files": ["dist"], "main": " test/helpers.test.ts"}},
+    )
+    # Canonical forms with "./" and a trailing "/" are understood.
+    assert not gate.touches_packages(
+        ["packages/x/test/helpers.ts"], {"packages/x/": {"files": ["./dist/", "./src"]}}
+    )
+    # Unknown or unreadable manifests, or no "files", keep the path counted.
+    assert gate.touches_packages(["packages/tokens/test/a.mjs"], {})
+    assert gate.touches_packages(["packages/tokens/test/a.mjs"], {"packages/tokens/": None})
+    assert gate.touches_packages(["packages/tokens/test/a.mjs"], {"packages/tokens/": {}})
+    # "contest" or "testing" are not test directories; a package named "test" is a package.
+    tokens = {"packages/tokens/": {"files": ["src", "dist"]}, "packages/test/": {"files": ["dist"]}}
+    assert gate.touches_packages(["packages/tokens/contest/a.mjs"], tokens)
+    assert gate.touches_packages(["packages/tokens/testing/a.mjs"], tokens)
+    assert gate.touches_packages(["packages/test/index.ts"], tokens)
+    # Paths outside an npm package directory (blocks/<file>) always count.
+    assert gate.touches_packages(["blocks/Login.html"], MANIFESTS_87)
+    assert gate.package_directory("packages/tokens/test/a.mjs") == "packages/tokens/"
+    assert gate.package_directory("blocks/Login.html") is None
 
 
 # -- the registry: a self-contained pair outside the global campaign ------------------------
@@ -506,6 +613,8 @@ class _MergeGh(FakeGh):
             for entry in changed
         ]
         self.absent_at_head: set[str] = set()
+        # NEW-209: package manifests at the head, read by the changeset gate.
+        self.head_files: dict[str, str] = {}
 
     def _answer(self, args: list[str]) -> str:
         if args[0] == "api" and args[1].endswith("/pulls/41/files"):
@@ -514,6 +623,9 @@ class _MergeGh(FakeGh):
         if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
             path = args[3].split("/contents/", 1)[1]
             assert f"ref={HEAD_SHA}" in args  # proven at the bound head commit
+            head_files: dict[str, str] = getattr(self, "head_files", {})
+            if path in head_files:
+                return head_files[path]
             present = {
                 entry.split("\t")[0] for entry in self.changed if entry.split("\t")[1] != "removed"
             } - self.absent_at_head
@@ -680,6 +792,44 @@ async def test_the_merge_requires_a_changeset_and_no_protected_path(
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": blocker}
     assert fake.mutations == []
+
+
+def _manifest_files(manifests: dict[str, Any]) -> dict[str, str]:
+    return {f"{directory}package.json": json.dumps(value) for directory, value in manifests.items()}
+
+
+async def test_new_209_a_test_only_package_change_merges_without_a_changeset(
+    tmp_path: Path,
+) -> None:
+    handler, fake = _github(tmp_path, GREEN, PR_87_FILES)
+    fake.head_files = _manifest_files(MANIFESTS_87)
+    merged = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merged["status"] == "MERGED"
+
+
+async def test_new_209_published_files_and_changed_manifests_still_need_a_changeset(
+    tmp_path: Path,
+) -> None:
+    # A file under a published src/ tree, even in a fixtures directory.
+    handler, fake = _github(
+        tmp_path / "src", GREEN, ["packages/templates/src/settings-profile/fixtures/editable.snap"]
+    )
+    fake.head_files = _manifest_files(
+        {"packages/templates/": {"name": "@gntik-ai/templates", "files": ["dist", "src"]}}
+    )
+    refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+    # A PR that changes its own package.json cannot exempt itself (e.g. by going private).
+    handler, fake = _github(
+        tmp_path / "manifest", GREEN, ["packages/tokens/package.json", "packages/tokens/test/a.mjs"]
+    )
+    fake.head_files = _manifest_files({"packages/tokens/": {"private": True}})
+    refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+    # An unreadable manifest keeps the path counted.
+    handler, fake = _github(tmp_path / "missing", GREEN, ["packages/tokens/test/a.mjs"])
+    refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
 
 
 @pytest.mark.parametrize(
