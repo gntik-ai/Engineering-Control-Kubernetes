@@ -100,7 +100,7 @@ def test_missing_run_rejected(session):
         NIL,
         "not-a-uuid",
         "01234567-89AB-4CDE-8FAB-0123456789ABC",
-        " " + str(uuid4()),
+        " 3c64ab90-e1d0-4916-aa98-a46d03d4b1de",  # fixed: xdist workers must collect equal ids
         None,
         1,
         "x" * 36,

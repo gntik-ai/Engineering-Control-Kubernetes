@@ -17,8 +17,10 @@ from temporalio.testing import ActivityEnvironment
 from engineering_control.db import runtime_binding
 from engineering_control.db.models import Base, Run
 
-CURRENT = str(uuid4())
-FIRST = str(uuid4())
+# Fixed run ids: FIRST.upper() parametrizes a test, and pytest-xdist workers must collect
+# identical test ids (NEW-212).
+CURRENT = "1b50086a-d899-44d3-8d30-d393cacc9abb"
+FIRST = "4ea50575-fdc9-4dbf-b031-94c15e9f0957"
 
 
 def _Info(workflow_id="wf-1", workflow_run_id=CURRENT, namespace="ns-a"):
