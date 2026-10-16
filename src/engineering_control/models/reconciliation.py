@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import re
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -267,18 +269,47 @@ class ChangesetGatePolicy(ReconciliationModel):
             raise ValueError("an enabled changeset gate requires package paths")
         return self
 
-    def touches_packages(self, paths: list[str]) -> bool:
-        """True when any changed path (a rename's previous path included) is a published
-        file of a package.
+    def touches_packages(
+        self,
+        paths: list[str],
+        manifests: Mapping[str, Mapping[str, Any] | None] | None = None,
+    ) -> bool:
+        """True when any changed path (a rename's previous path included) is a package file.
 
-        NEW-209: tests, fixtures and snapshots inside a package are not published, so a PR
-        that changes only those needs no changeset (gntik-ui #32, PR #87). A rename still
-        counts both paths, so moving a file out of a published location still needs one."""
-        return self.enabled and any(
-            path.startswith(prefix) and not _unpublished_package_path(path.removeprefix(prefix))
-            for path in paths
-            for prefix in self.package_paths
-        )
+        NEW-209: with ``manifests`` (package directory -> its package.json at the PR head,
+        None when unreadable), a path counts only when that package publishes it: a
+        private package publishes nothing, and a ``files`` list publishes only what it
+        names plus package.json, README, LICENSE and CHANGELOG. An unknown package, an
+        unreadable manifest or a missing ``files`` list keeps the path counted, as does a
+        path outside any npm package (gntik-ui #32: PR #87 changed only tests of the
+        private mcp package and of tokens, which publishes src/ and dist/)."""
+        return self.enabled and any(self._published(path, manifests) for path in paths)
+
+    def package_directory(self, path: str) -> str | None:
+        """``<prefix><name>/`` for a path inside a package directory, else None."""
+        for prefix in self.package_paths:
+            rest = path.removeprefix(prefix) if path.startswith(prefix) else None
+            if rest and "/" in rest:
+                return f"{prefix}{rest.split('/', 1)[0]}/"
+        return None
+
+    def _published(
+        self, path: str, manifests: Mapping[str, Mapping[str, Any] | None] | None
+    ) -> bool:
+        if not any(path.startswith(prefix) for prefix in self.package_paths):
+            return False
+        directory = self.package_directory(path)
+        if manifests is None or directory is None:
+            return True
+        manifest = manifests.get(directory)
+        if not isinstance(manifest, Mapping):
+            return True
+        if manifest.get("private") is True:
+            return False
+        files = manifest.get("files")
+        if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+            return True
+        return _published_by_files(path.removeprefix(directory), files)
 
     def changeset_candidates(self, changes: list[dict[str, str]]) -> list[str]:
         """Changeset files the PR adds or modifies (a rename or copy counts by its new path).
@@ -304,21 +335,30 @@ class ChangesetGatePolicy(ReconciliationModel):
 
 _CHANGESET_STATUSES = frozenset({"added", "modified", "changed", "renamed", "copied"})
 
-# NEW-209: package-relative locations that a package never publishes.
-_UNPUBLISHED_DIRECTORIES = frozenset(
-    {"test", "tests", "__tests__", "fixtures", "__fixtures__", "__snapshots__", "e2e"}
+# NEW-209: files npm always publishes from a package root, whatever ``files`` says.
+_ALWAYS_PUBLISHED = re.compile(
+    r"(?i)^(?:package\.json|readme(?:\..*)?|licen[cs]e(?:\..*)?|changelog(?:\..*)?)$"
 )
-_UNPUBLISHED_FILE = re.compile(r"\.(?:test|spec)\.[A-Za-z0-9]+$")
 
 
-def _unpublished_package_path(relative: str) -> bool:
-    """A path inside a package (relative to the package prefix) that is a test, fixture or
-    snapshot. The first segment is the package directory itself and is never matched."""
-    parts = relative.split("/")
-    directories, name = parts[1:-1], parts[-1]
-    return any(part in _UNPUBLISHED_DIRECTORIES for part in directories) or bool(
-        _UNPUBLISHED_FILE.search(name)
-    )
+def _published_by_files(relative: str, files: list[str]) -> bool:
+    """Whether npm publishes ``relative`` (a path inside the package) under ``files``.
+
+    Conservative: a negated entry is ignored (the file still counts as published), and a
+    glob entry matches through fnmatch on the path and on each of its parent directories."""
+    if "/" not in relative and _ALWAYS_PUBLISHED.match(relative):
+        return True
+    parents = [relative.rsplit("/", depth)[0] for depth in range(1, relative.count("/") + 1)]
+    for raw in files:
+        entry = raw.strip().removeprefix("./").rstrip("/")
+        if not entry or entry.startswith("!"):
+            continue
+        if any(char in entry for char in "*?["):
+            if any(fnmatch.fnmatchcase(candidate, entry) for candidate in (relative, *parents)):
+                return True
+        elif relative == entry or relative.startswith(f"{entry}/"):
+            return True
+    return False
 
 
 class MergeDeliveryPolicy(ReconciliationModel):
