@@ -268,9 +268,16 @@ class ChangesetGatePolicy(ReconciliationModel):
         return self
 
     def touches_packages(self, paths: list[str]) -> bool:
-        """True when any changed path (a rename's previous path included) is in a package."""
+        """True when any changed path (a rename's previous path included) is a published
+        file of a package.
+
+        NEW-209: tests, fixtures and snapshots inside a package are not published, so a PR
+        that changes only those needs no changeset (gntik-ui #32, PR #87). A rename still
+        counts both paths, so moving a file out of a published location still needs one."""
         return self.enabled and any(
-            path.startswith(prefix) for path in paths for prefix in self.package_paths
+            path.startswith(prefix) and not _unpublished_package_path(path.removeprefix(prefix))
+            for path in paths
+            for prefix in self.package_paths
         )
 
     def changeset_candidates(self, changes: list[dict[str, str]]) -> list[str]:
@@ -296,6 +303,22 @@ class ChangesetGatePolicy(ReconciliationModel):
 
 
 _CHANGESET_STATUSES = frozenset({"added", "modified", "changed", "renamed", "copied"})
+
+# NEW-209: package-relative locations that a package never publishes.
+_UNPUBLISHED_DIRECTORIES = frozenset(
+    {"test", "tests", "__tests__", "fixtures", "__fixtures__", "__snapshots__", "e2e"}
+)
+_UNPUBLISHED_FILE = re.compile(r"\.(?:test|spec)\.[A-Za-z0-9]+$")
+
+
+def _unpublished_package_path(relative: str) -> bool:
+    """A path inside a package (relative to the package prefix) that is a test, fixture or
+    snapshot. The first segment is the package directory itself and is never matched."""
+    parts = relative.split("/")
+    directories, name = parts[1:-1], parts[-1]
+    return any(part in _UNPUBLISHED_DIRECTORIES for part in directories) or bool(
+        _UNPUBLISHED_FILE.search(name)
+    )
 
 
 class MergeDeliveryPolicy(ReconciliationModel):

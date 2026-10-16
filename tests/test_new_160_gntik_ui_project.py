@@ -148,7 +148,17 @@ def test_gntik_ui_is_a_self_contained_project_without_a_runtime() -> None:
         ["pnpm", "-r", "--filter", "./packages/**", "build"],
         ["pnpm", "lint"],
         ["pnpm", "typecheck"],
-        ["pnpm", "-r", "--filter", "./packages/**", "--filter", "!@gntik-ai/gntik-ui-mcp", "test"],
+        [
+            "pnpm",
+            "-r",
+            "--filter",
+            "./packages/**",
+            "--filter",
+            "!@gntik-ai/gntik-ui-mcp",
+            "--filter",
+            "!@gntik-ai/evals",
+            "test",
+        ],
         ["pnpm", "registry:check"],
         ["node", "apps/musematic/scripts/check-kit-only.mjs"],
         ["node", "apps/falcone/scripts/check-kit-only.mjs"],
@@ -291,6 +301,40 @@ def test_the_changeset_gate_applies_only_to_package_changes() -> None:
     assert gate.touches_packages(["blocks/login/index.tsx"])
     assert not gate.touches_packages(["apps/docs/pages/index.mdx", ".changeset/x.md"])
     assert not ChangesetGatePolicy().touches_packages(["packages/ui/src/button.tsx"])
+
+
+# gntik-ui PR #87 (#32): only README, registry.json and package tests and fixtures changed.
+PR_87_FILES = [
+    "README.md",
+    "packages/mcp/test/kit.test.mjs",
+    "packages/tokens/test/fixtures/mirror-consumer/package.json",
+    "packages/tokens/test/fixtures/mirror-consumer/pnpm-lock.yaml",
+    "packages/tokens/test/mirror-install.test.mjs",
+    "registry.json",
+]
+
+
+def test_new_209_unpublished_package_files_need_no_changeset() -> None:
+    gate = ChangesetGatePolicy(enabled=True, package_paths=("packages/", "blocks/"))
+    assert not gate.touches_packages(PR_87_FILES)
+    for path in (
+        "packages/ui/src/__tests__/button.tsx",
+        "packages/ui/src/button.test.tsx",
+        "packages/ui/src/button.spec.ts",
+        "packages/blocks/e2e/login.spec.js",
+        "packages/ui/src/__snapshots__/button.snap",
+        "blocks/login/__fixtures__/user.json",
+    ):
+        assert not gate.touches_packages([path]), path
+    # A published file next to a test still needs one.
+    assert gate.touches_packages([*PR_87_FILES, "packages/tokens/src/brand.css"])
+    # A package whose own directory is named like a test directory is still a package.
+    assert gate.touches_packages(["packages/test/src/index.ts"])
+    # A rename counts both paths: moving a source file into a test directory changes it.
+    assert gate.touches_packages(["packages/ui/test/button.tsx", "packages/ui/src/button.tsx"])
+    # "contest" or "testing" are not test directories.
+    assert gate.touches_packages(["packages/ui/src/contest/button.tsx"])
+    assert gate.touches_packages(["packages/ui/testing/helpers.ts"])
 
 
 # -- the registry: a self-contained pair outside the global campaign ------------------------
@@ -680,6 +724,14 @@ async def test_the_merge_requires_a_changeset_and_no_protected_path(
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": blocker}
     assert fake.mutations == []
+
+
+async def test_new_209_a_test_only_package_change_merges_without_a_changeset(
+    tmp_path: Path,
+) -> None:
+    handler, fake = _github(tmp_path, GREEN, PR_87_FILES)
+    merged = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merged["status"] == "MERGED"
 
 
 @pytest.mark.parametrize(

@@ -27,13 +27,13 @@ deployment:
     registry: npm.pkg.github.com
     publisher: operator
 # NEW-170 (operator decision 2026-10-09): the sandbox gate builds and tests the library
-# packages; the full `pnpm build` (Next.js apps under apps/) and the mcp CLI tests run in
+# packages; the full `pnpm build` (Next.js apps under apps/), the mcp CLI and evals tests run in
 # the PR CI, which merge_delivery requires green before Hermes merges.
 source_test_commands:
   - [pnpm, -r, --filter, "./packages/**", build]
   - [pnpm, lint]
   - [pnpm, typecheck]
-  - [pnpm, -r, --filter, "./packages/**", --filter, "!@gntik-ai/gntik-ui-mcp", test]
+  - [pnpm, -r, --filter, "./packages/**", --filter, "!@gntik-ai/gntik-ui-mcp", --filter, "!@gntik-ai/evals", test]
   - [pnpm, registry:check]
   - [node, apps/musematic/scripts/check-kit-only.mjs]
   - [node, apps/falcone/scripts/check-kit-only.mjs]
@@ -112,8 +112,8 @@ toolchain:
       argv: [pnpm, typecheck]
       description: TypeScript type check of every package
     - cwd: "."
-      argv: [pnpm, -r, --filter, "./packages/**", --filter, "!@gntik-ai/gntik-ui-mcp", test]
-      description: unit tests of every library package (keyboard and axe contracts); the mcp CLI tests run in PR CI
+      argv: [pnpm, -r, --filter, "./packages/**", --filter, "!@gntik-ai/gntik-ui-mcp", --filter, "!@gntik-ai/evals", test]
+      description: unit tests of every library package (keyboard and axe contracts); the mcp CLI and evals tests run in PR CI
     - cwd: "."
       argv: [pnpm, registry:check]
       description: registry.json and kit-registry.json are up to date (run pnpm registry to regenerate)
@@ -127,7 +127,8 @@ maker_rules:
   source:
     - >-
       Do not run the full monorepo `pnpm build` or `pnpm test` in the sandbox: the Next.js
-      apps under apps/ and the @gntik-ai/gntik-ui-mcp CLI tests do not run reliably there,
+      apps under apps/, the @gntik-ai/gntik-ui-mcp CLI tests and the @gntik-ai/evals tests
+      (which spawn tsc, refused in the sandbox) do not run reliably there,
       and the pull request's CI runs them before Hermes may merge. Run the listed toolchain
       commands (library packages, lint, typecheck, registry:check, kit-only checks); report
       anything else you could not run as SKIPPED with the reason, never as FAIL.
@@ -136,7 +137,8 @@ maker_rules:
       changeset file .changeset/<short-kebab-name>.md naming each changed package
       (e.g. "@gntik-ai/ui": patch) with a one-line user-facing summary. Use patch for
       fixes, minor for new components or props, and never major unless the issue asks
-      for a breaking change. Hermes refuses to merge a package change without it.
+      for a breaking change. Hermes refuses to merge a package change without it. Changes only to
+      tests, fixtures or snapshots need none; never mix the private mcp package with public ones.
     - >-
       When components, blocks or their documented items change, regenerate the kit
       registry with `pnpm registry` and commit the updated registry.json and

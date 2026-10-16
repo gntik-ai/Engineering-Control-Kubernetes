@@ -112,8 +112,9 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "SOURCE_PR_CI_FAILED": "the source PR's CI failed",
     # NEW-160: merge-only delivery (projects without a runtime, e.g. gntik-ui).
     "CHANGESET_MISSING": (
-        "the PR changes a published package but carries no .changeset/*.md; add one with a "
-        "backlog-retry correction or skip the issue"
+        "the PR changes a published package file but carries no .changeset/*.md; "
+        "backlog-retry only re-runs the merge checks, so the changeset must reach the PR "
+        "branch first (or skip the issue)"
     ),
     "MERGE_DELIVERY_PROTECTED_PATH_CHANGED": (
         "the PR touches a protected path (CI configuration); Hermes never merges it"
