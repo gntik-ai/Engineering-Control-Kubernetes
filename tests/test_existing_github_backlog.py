@@ -32,6 +32,7 @@ from engineering_control.engineering.backlog import (
     GitHubRepositoryBacklogSnapshot,
     ReproductionMode,
     approval_binding,
+    calculated_issue_risk,
     canonical_sha256,
     classify_issue,
     evaluate_final_closure,
@@ -425,6 +426,34 @@ Objective: collect a licensed test corpus.
     assert confirmed_defect.calculated_risk == "R3"
     assert confirmed_defect.eligibility_status == "DEFERRED"
     assert confirmed_defect.eligibility_reason == "R3_REQUIRES_OPERATOR"
+
+
+def test_new_211_operator_label_imports_an_r3_issue_as_r1() -> None:
+    body = "kind: enhancement\nIndependently confirmed defect in the current runtime."
+    title = "bug(security): existing payloads leak credentials"
+    labels = ("bug", "enhancement", "security")
+    gated = classify_issue(
+        issue(14, title=title, labels=labels, body=body),
+        (),
+        project="falcone",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
+    overridden = classify_issue(
+        issue(14, title=title, labels=(*labels, "Hermes:Risk-R1"), body=body),
+        (),
+        project="falcone",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
+    assert gated.calculated_risk == "R3"
+    assert overridden.issue_type is BacklogIssueType.SECURITY_DEFECT
+    assert overridden.calculated_risk == "R1"
+    assert overridden.eligibility_reason != "R3_REQUIRES_OPERATOR"
+    # Keyword R3 (and the amend check's classifier) honour the same label.
+    keyword = "Drop the legacy tenant table in a data migration."
+    assert calculated_issue_risk("gntik-ai/falcone", [], "Cleanup", keyword) == "R3"
+    assert calculated_issue_risk("gntik-ai/falcone", ["hermes:risk-r1"], "Cleanup", keyword) == "R1"
 
 
 def test_dependency_and_existing_pr_adoption_are_typed() -> None:

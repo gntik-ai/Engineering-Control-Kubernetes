@@ -37,6 +37,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
+    OPERATOR_R1_LABEL,
     calculated_issue_risk,
     canonical_sha256,
 )
@@ -237,7 +238,16 @@ def locate_issue_target(
         )
         .limit(1)
     )
-    if issue.calculated_risk == "R3" or finding.risk_class == "R3" or r3_approved is not None:
+    # NEW-211: a historical R3 approval no longer binds an issue the operator relabelled
+    # hermes:risk-r1 and re-imported as R1 (its current record and finding say R1).
+    overridden = OPERATOR_R1_LABEL in {
+        str(label).strip().lower() for label in (issue.labels_json or [])
+    }
+    if (
+        issue.calculated_risk == "R3"
+        or finding.risk_class == "R3"
+        or (r3_approved is not None and not overridden)
+    ):
         raise IssueAmendBlocked(
             f"{code}_R3_REQUIRES_REAPPROVAL",
             f"{target} is R3 (approved for its exact text); re-import the backlog, then "

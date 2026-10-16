@@ -1365,13 +1365,20 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
         # step existed carry no marker and replay without it.
         if context.get("persona") != "existing-github-issue" or not context.get("issue_number"):
             return context
-        if getattr(self, "_risk_class", None) == "R3" and workflow.patched(
-            "delivery-r3-approved-issue-body-v1"
-        ):
-            # NEW-95 review: an R3 delivery works only from the issue text the operator
-            # approved (the imported copy bound by its R3 candidate); a later edit must be
-            # re-imported and re-approved rather than reaching the maker unapproved.
-            return context
+        if getattr(self, "_risk_class", None) == "R3":
+            if workflow.patched("delivery-r3-approved-full-body-v1"):
+                # NEW-210: the imported copy keeps only the issue's first 4000 characters,
+                # so amendments appended to a long R3 issue never reached its spec/maker.
+                # An R3 delivery now re-reads the body only under its approved hash: the
+                # refresh refuses any other text (ISSUE_BODY_CHANGED_SINCE_APPROVAL), so the
+                # maker still works only from the exact text the operator approved.
+                if context.get("approved_issue_body_sha256") is None:
+                    return context
+            elif workflow.patched("delivery-r3-approved-issue-body-v1"):
+                # NEW-95 review: an R3 delivery works only from the issue text the operator
+                # approved (the imported copy bound by its R3 candidate); a later edit must
+                # be re-imported and re-approved rather than reaching the maker unapproved.
+                return context
         if not workflow.patched("delivery-refresh-issue-body-v1"):
             return context
         refresh_request: dict[str, Any] = {

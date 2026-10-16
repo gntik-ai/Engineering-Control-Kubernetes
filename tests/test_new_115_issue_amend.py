@@ -267,6 +267,40 @@ async def test_refused_targets_never_read_github_or_change_state(
 
 
 @pytest.mark.asyncio
+async def test_new_211_relabelled_r1_issue_is_amendable_despite_an_old_r3_approval(
+    tmp_path: Path,
+) -> None:
+    values = await _approved(tmp_path)
+    operations = values[0]
+    with operations.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        issue.labels_json = [*(issue.labels_json or []), "hermes:risk-r1"]
+        now = datetime.now(UTC)
+        session.add(
+            ActionCandidate(
+                action="r3_issue_approval",
+                project="falcone",
+                target_type="github_issue",
+                target_id="gntik-ai/falcone#42",
+                payload_json={},
+                capability_status="AVAILABLE",
+                blockers_json=[],
+                binding_hash="f" * 64,
+                confirmation_phrase="APPROVE_R3_FALCONE_42_FFFFFFFFFFFFFFFF",
+                session_binding_hash="e" * 64,
+                created_at=now - timedelta(days=2),
+                expires_at=now - timedelta(days=1),
+                used_at=now - timedelta(days=2),
+            )
+        )
+    # The old approval is ignored; an R3 record or finding still refuses (above).
+    await operations.issue_amend_precheck("falcone", "falcone", 42)
+    preview = await _amend(operations, await _refresh(tmp_path, EDITED), None)
+    assert preview["status"] == "PREVIEW"
+    _dispose(values)
+
+
+@pytest.mark.asyncio
 async def test_empty_or_retitled_issue_and_non_operators_are_refused(tmp_path: Path) -> None:
     values = await _approved(tmp_path)
     operations = values[0]

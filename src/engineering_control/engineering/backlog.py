@@ -417,6 +417,10 @@ def is_hermes_operational_issue(title: str, body: str) -> bool:
     )
 
 
+# NEW-211: the operator's per-issue override (GitHub label, compared lowercased).
+OPERATOR_R1_LABEL = "hermes:risk-r1"
+
+
 def _classified_risk(
     repository: str, labels: tuple[str, ...], text: str
 ) -> tuple[
@@ -432,6 +436,12 @@ def _classified_risk(
     risk = _risk(issue_type, severity, text)
     if change_kind is not None:
         risk = _declared_risk_floor(risk, text)
+    if OPERATOR_R1_LABEL in labels:
+        # NEW-211 (operator decision 2026-10-16): an issue the operator labels
+        # hermes:risk-r1 imports as R1 whatever its keywords, security label or declared
+        # floor, so it runs in an ordinary campaign without a per-issue R3 approval. The
+        # maker/independent-checker/CI gates are unchanged; only the pre-start stop goes.
+        risk = "R1"
     return issue_type, severity, risk
 
 
