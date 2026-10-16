@@ -348,7 +348,7 @@ _CANONICAL_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(?:/[A-Za-z0-9_][A-Za-
 
 
 def _canonical_path(value: str) -> str | None:
-    text = value.strip().removeprefix("./")
+    text = value.removeprefix("./")
     text = text[:-1] if text.endswith("/") else text
     return text if _CANONICAL_PATH.fullmatch(text) else None
 

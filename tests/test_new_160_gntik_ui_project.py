@@ -373,6 +373,14 @@ def test_new_209_only_unpublished_test_files_and_private_packages_skip_the_chang
             ["packages/x/test/helpers.ts"],
             {"packages/x/": {"files": ["dist"], "bin": {"example": target}}},
         ), target
+    # Whitespace-padded entries and targets are not canonical (Codex review 4).
+    assert gate.touches_packages(
+        ["packages/x/test/helpers.ts"], {"packages/x/": {"files": [" dist"]}}
+    )
+    assert gate.touches_packages(
+        ["packages/x/test/helpers.test.ts"],
+        {"packages/x/": {"files": ["dist"], "main": " test/helpers.test.ts"}},
+    )
     # Canonical forms with "./" and a trailing "/" are understood.
     assert not gate.touches_packages(
         ["packages/x/test/helpers.ts"], {"packages/x/": {"files": ["./dist/", "./src"]}}
