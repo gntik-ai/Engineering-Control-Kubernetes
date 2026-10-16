@@ -354,6 +354,29 @@ def test_new_209_only_unpublished_test_files_and_private_packages_skip_the_chang
     assert gate.touches_packages(
         ["packages/x/test/a.js"], {"packages/x/": {"files": [], "browser": {"a": "b"}}}
     )
+    # Extglobs and non-canonical paths are not interpreted either (Codex review 3).
+    for files in (
+        ["dist", "test/@(helpers.ts|setup.ts)"],
+        ["dist", "test/+(a|b).ts"],
+        ["/test"],
+        ["src/../test"],
+        ["test//x"],
+        [".hidden"],
+    ):
+        manifest = {"packages/x/": {"files": files}}
+        assert gate.touches_packages(["packages/x/test/helpers.ts"], manifest), files
+    for target in ("test/../test/helpers.ts", "test//helpers.ts", "/test/helpers.ts"):
+        assert gate.touches_packages(
+            ["packages/x/test/helpers.ts"], {"packages/x/": {"files": ["dist"], "main": target}}
+        ), target
+        assert gate.touches_packages(
+            ["packages/x/test/helpers.ts"],
+            {"packages/x/": {"files": ["dist"], "bin": {"example": target}}},
+        ), target
+    # Canonical forms with "./" and a trailing "/" are understood.
+    assert not gate.touches_packages(
+        ["packages/x/test/helpers.ts"], {"packages/x/": {"files": ["./dist/", "./src"]}}
+    )
     # Unknown or unreadable manifests, or no "files", keep the path counted.
     assert gate.touches_packages(["packages/tokens/test/a.mjs"], {})
     assert gate.touches_packages(["packages/tokens/test/a.mjs"], {"packages/tokens/": None})

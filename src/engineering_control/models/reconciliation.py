@@ -342,7 +342,15 @@ _TEST_DIRECTORIES = frozenset(
 )
 _TEST_FILE = re.compile(r"\.(?:test|spec)\.[A-Za-z0-9]+$")
 _ENTRY_FIELDS = ("main", "module", "types", "typings", "browser")
-_FILES_PATTERN = re.compile(r"[*?\[\]{}!]")
+# A plain relative path: no glob or extglob syntax, no "." or ".." segment, no empty
+# segment, no leading "/". Anything else in files or an entry target is not interpreted.
+_CANONICAL_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+
+
+def _canonical_path(value: str) -> str | None:
+    text = value.strip().removeprefix("./")
+    text = text[:-1] if text.endswith("/") else text
+    return text if _CANONICAL_PATH.fullmatch(text) else None
 
 
 def _unpublished_test_file(relative: str, manifest: Mapping[str, Any]) -> bool:
@@ -354,8 +362,8 @@ def _unpublished_test_file(relative: str, manifest: Mapping[str, Any]) -> bool:
     files = manifest.get("files")
     if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
         return False
-    entries = [item.strip().removeprefix("./").rstrip("/") for item in files]
-    if any(not entry or _FILES_PATTERN.search(entry) for entry in entries):
+    entries = [_canonical_path(item) for item in files]
+    if any(entry is None for entry in entries):
         return False
     if any(relative == entry or relative.startswith(f"{entry}/") for entry in entries):
         return False
@@ -365,10 +373,9 @@ def _unpublished_test_file(relative: str, manifest: Mapping[str, Any]) -> bool:
     for target in targets:
         if target is None:
             continue
-        if not isinstance(target, str):
-            return False  # an object-form browser field or similar: not interpreted
-        if relative == target.strip().removeprefix("./"):
-            return False
+        canonical = _canonical_path(target) if isinstance(target, str) else None
+        if canonical is None or relative == canonical:
+            return False  # not interpreted (object form, non-canonical) or the target itself
     return True
 
 
