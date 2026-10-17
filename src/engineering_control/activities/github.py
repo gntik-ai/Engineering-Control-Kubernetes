@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -18,10 +19,14 @@ from engineering_control.adapters.llmwiki import LLMWikiBootstrapPlanner
 from engineering_control.config import Settings
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
+    IMPORT_SNAPSHOT_ENCODING,
+    MAXIMUM_IMPORT_RESULT_BYTES,
     GitHubBacklogImportSnapshot,
     GitHubIssueSnapshot,
     GitHubPullRequestSnapshot,
     GitHubRepositoryBacklogSnapshot,
+    encode_import_snapshot,
+    valid_issue_label,
 )
 from engineering_control.projects import PROJECT_REPOSITORY_SLUGS, ProjectName
 from engineering_control.projects import default_branch as project_default_branch
@@ -302,6 +307,14 @@ class GitHubActivityHandler:
                 non_retryable=True,
             )
         try:
+            label = valid_issue_label(payload.get("issue_label"))
+        except ValueError as error:
+            raise ApplicationError(
+                "GitHub backlog import label is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from error
+        try:
             repositories_for_project = tuple(dict.fromkeys(pair))
             self.broker.preflight(repositories_for_project)
             repositories: list[GitHubRepositoryBacklogSnapshot] = []
@@ -318,9 +331,10 @@ class GitHubActivityHandler:
                         non_retryable=True,
                     )
                 head = self.broker.branch_commit(repository, expected_branch)
-                raw_issues = self.broker.list_open_issues(repository)
+                raw_issues = self._open_issues(repository, label)
                 issues = tuple(
-                    self._issue_snapshot(repository, value) for value in raw_issues[:remaining]
+                    self._issue_snapshot(repository, value)
+                    for value in _oldest_first_selection(raw_issues, remaining)
                 )
                 remaining -= len(issues)
                 listed_pull_requests = self.broker.list_repository_pull_requests(repository)
@@ -351,17 +365,45 @@ class GitHubActivityHandler:
             imported_at=datetime.now(UTC),
             repositories=tuple(repositories),
         )
-        return {
+        issue_count = sum(len(repository.issues) for repository in snapshot.repositories)
+        # NEW-215: the snapshot travels encoded (Temporal payload limit). The whole result is
+        # also the next step's input, so an import whose result is still too large fails
+        # here with counts instead of a Temporal payload error.
+        result = {
             **payload,
             "status": "IMPORTED_READ_ONLY",
-            "snapshot": snapshot.model_dump(mode="json"),
-            "issue_count": sum(len(repository.issues) for repository in snapshot.repositories),
+            "snapshot_encoding": IMPORT_SNAPSHOT_ENCODING,
+            "snapshot_encoded": encode_import_snapshot(snapshot.model_dump(mode="json")),
+            "issue_count": issue_count,
             "existing_pr_count": sum(
                 pull_request.state == "OPEN"
                 for repository in snapshot.repositories
                 for pull_request in repository.pull_requests
             ),
         }
+        size = len(json.dumps(result, separators=(",", ":"), default=str).encode())
+        if size > MAXIMUM_IMPORT_RESULT_BYTES:
+            raise ApplicationError(
+                f"BACKLOG_IMPORT_TOO_LARGE: {issue_count} issues encode to a {size}-byte"
+                f" result (limit {MAXIMUM_IMPORT_RESULT_BYTES}); import fewer items"
+                " (--max-items) or one label (--label)",
+                type="BACKLOG_IMPORT_TOO_LARGE",
+                non_retryable=True,
+            )
+        return result
+
+    def _open_issues(self, repository: str, label: str | None) -> list[dict[str, Any]]:
+        """NEW-215: the open issues an import selects from.
+
+        GitHub lists newest first and at most _OPEN_ISSUE_LIST_LIMIT, so when the list is
+        full the oldest issues may be missing. Then list again oldest first, so the
+        oldest-first selection sees them. A repository below the limit is listed once,
+        as before."""
+        scope: dict[str, Any] = {"label": label} if label is not None else {}
+        listed = self.broker.list_open_issues(repository, **scope)
+        if len(listed) < _OPEN_ISSUE_LIST_LIMIT:
+            return listed
+        return self.broker.list_open_issues(repository, **scope, oldest_first=True)
 
     @staticmethod
     def _issue_snapshot(repository: str, value: dict[str, Any]) -> GitHubIssueSnapshot:
@@ -450,3 +492,23 @@ class GitHubActivityHandler:
     @staticmethod
     def _optional_timestamp(value: object) -> datetime | None:
         return GitHubActivityHandler._timestamp(value) if value else None
+
+
+# The `gh issue list --limit` of GitHubCliClient.list_open_issues.
+_OPEN_ISSUE_LIST_LIMIT = 1000
+
+
+def _oldest_first_selection(
+    raw_issues: list[dict[str, Any]], remaining: int
+) -> list[dict[str, Any]]:
+    """NEW-215: the issues an import keeps when more are open than it may take.
+
+    GitHub lists newest first, so a plain prefix would always drop the oldest issues. Keep
+    the `remaining` lowest issue numbers instead, in the listed order; an import that fits
+    is unchanged."""
+    if remaining <= 0:
+        return []
+    if len(raw_issues) <= remaining:
+        return list(raw_issues)
+    kept = set(sorted(int(value["number"]) for value in raw_issues)[:remaining])
+    return [value for value in raw_issues if int(value["number"]) in kept]

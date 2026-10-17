@@ -60,6 +60,7 @@ from engineering_control.engineering.backlog import (
     approval_binding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
+    issue_label_from_query,
 )
 from engineering_control.engineering.backlog_authority import (
     global_backlog_active,
@@ -1029,6 +1030,7 @@ class SQLMetadataRepository:
             maximum_items=request.maximum_items,
             delivery_mode=request.delivery_mode,
             include_enhancements=campaign.import_filter == "enhancements",
+            issue_label=issue_label_from_query(campaign.issue_query),
         )
         if issue_request is not None:
             binding = BacklogApprovalBinding.model_validate(

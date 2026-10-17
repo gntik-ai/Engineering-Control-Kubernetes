@@ -39,9 +39,13 @@ from engineering_control.engineering.backlog import (
     approval_binding,
     canonical_sha256,
     classify_issue,
+    decode_import_snapshot,
     is_hermes_operational_issue,
     is_reauthenticated_backlog_operator,
+    issue_label_from_query,
+    issue_query_for,
     plan_records,
+    valid_issue_label,
 )
 from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
@@ -549,7 +553,8 @@ class EngineeringActivityHandler:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
         import_filter = str(payload["import_filter"])
         maximum_items = int(payload.get("maximum_items", 500))
-        snapshot = GitHubBacklogImportSnapshot.model_validate(payload.get("snapshot"))
+        issue_label = valid_issue_label(payload.get("issue_label"))
+        snapshot = GitHubBacklogImportSnapshot.model_validate(decode_import_snapshot(payload))
         pull_requests = tuple(
             pull_request
             for repository in snapshot.repositories
@@ -683,7 +688,7 @@ class EngineeringActivityHandler:
                 source_repository=pair[0],
                 deployment_repository=pair[1],
                 imported_at=snapshot.imported_at,
-                issue_query="state:open is:issue paired-repositories",
+                issue_query=issue_query_for(issue_label),
                 import_filter=import_filter,
                 source_default_branch=repositories[0].default_branch,
                 deployment_default_branch=deployment_snapshot.default_branch,
@@ -764,10 +769,17 @@ class EngineeringActivityHandler:
                         github_snapshot_json=record.github_snapshot,
                     )
                 )
+        # NEW-215: the snapshot is persisted; later steps read the campaign rows, so it is
+        # not carried on (it would be the largest value in every later payload).
+        carried = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"snapshot", "snapshot_encoded", "snapshot_encoding"}
+        }
         return self._envelope(
             "backlog.persist_import",
             {
-                **payload,
+                **carried,
                 "backlog_campaign_id": str(campaign_id),
                 "dependency_graph_hash": graph_hash,
                 "plan_hash": plan_hash,
@@ -890,6 +902,7 @@ class EngineeringActivityHandler:
                 maximum_items=maximum_items,
                 delivery_mode=delivery_mode,  # type: ignore[arg-type]
                 include_enhancements=campaign.import_filter == "enhancements",
+                issue_label=issue_label_from_query(campaign.issue_query),
             )
             digest = binding.sha256()
             campaign.approval_binding = digest
@@ -2742,6 +2755,7 @@ class EngineeringActivityHandler:
             "deployment_repository": campaign.deployment_repository,
             "imported_at": campaign.imported_at.isoformat(),
             "import_filter": campaign.import_filter,
+            "issue_label": issue_label_from_query(campaign.issue_query),
             "source_head_at_import": campaign.source_head_at_import,
             "deployment_head_at_import": campaign.deployment_head_at_import,
             "issue_count": campaign.issue_count,

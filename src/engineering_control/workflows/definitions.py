@@ -2416,6 +2416,11 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
         return {"status": finalized.get("status", "COMPLETE"), "results": results}
 
 
+# NEW-215: the label scope of a backlog import (same pattern as
+# engineering.backlog.ISSUE_LABEL_PATTERN; a test keeps them equal).
+_BACKLOG_IMPORT_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}$")
+
+
 @workflow.defn(name="GitHubBacklogImportWorkflow")
 class GitHubBacklogImportWorkflow(ControlledWorkflow):
     """Read and persist one paired existing-issue backlog without any GitHub write."""
@@ -2442,6 +2447,15 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
             )
         if not 1 <= request.maximum_items <= 500:
             raise ValueError("backlog maximum-items bound is invalid")
+        if request.issue_label is not None and (
+            not isinstance(request.issue_label, str)
+            or _BACKLOG_IMPORT_LABEL.fullmatch(request.issue_label) is None
+        ):
+            raise ApplicationError(
+                "backlog import label is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
         context = asdict(request)
         for step in ("backlog.github_import", "backlog.persist_import", "backlog.plan"):
             if not await self._checkpoint(step.upper().replace(".", "_")):
