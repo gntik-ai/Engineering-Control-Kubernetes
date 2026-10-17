@@ -102,9 +102,9 @@ _DEPENDENCY_EXCLUSION = re.compile(
 _DEPENDENCY_CONTRAST = re.compile(
     r";|\.(?:\s|$)|(?<![a-z0-9_`-])(?:but(?!\s+also)|however|whereas)(?![a-z0-9_`-])"
 )
-_DEPENDENCY_LIST_START = re.compile(
-    rf"^\s*[:\-]?\s*(?:(?:gntik-ai/)?(?:{REPOSITORY_SLUG_ALTERNATION}))?#[1-9]"
-)
+# Whether a list starts with a reference; the repository is validated afterwards
+# (_REFERENCE and _REPOSITORY), so a generic slug suffices here.
+_DEPENDENCY_LIST_START = re.compile(r"^\s*[:\-]?\s*(?:(?:gntik-ai/)?[a-z0-9][a-z0-9-]*)?#[1-9]")
 _DEPENDENCY_HEADING = re.compile(
     r"^[\s#>*_]*(?:blocked\s+by|depends\s+on|dependencies|dependency)[\s*_:]*$"
 )
