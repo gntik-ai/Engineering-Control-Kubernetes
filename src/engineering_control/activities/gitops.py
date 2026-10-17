@@ -103,6 +103,11 @@ _MAX_PACKAGE_MANIFESTS = 64
 # before it (a rename's previous path is handled separately).
 _PRESENT_AFTER_MERGE = frozenset({"added", "modified", "changed", "renamed", "copied"})
 _PRESENT_BEFORE_MERGE = frozenset({"removed", "modified", "changed"})
+# NEW-219: a changeset file: YAML front matter whose lines release packages.
+_CHANGESET_FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
+_CHANGESET_RELEASE = re.compile(
+    r"""(?:"[@A-Za-z0-9._/-]+"|'[@A-Za-z0-9._/-]+'|[@A-Za-z0-9._/-]+)\s*:\s*(?:major|minor|patch)"""
+)
 
 
 def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -3000,6 +3005,12 @@ class GitOpsGitHubHandler:
             change_binding=binding,
             allow_unstable=allow_unstable,
         )
+        if gate_base_sha is not None and isinstance(flow, MergeDeliveryPolicy):
+            raced = self._changeset_after_merge(
+                repository, flow.changeset, str(result["merge_sha"]), gate_base_sha
+            )
+            if raced is not None:
+                return raced
         return {
             "status": "MERGED",
             "target": target,
@@ -3109,10 +3120,18 @@ class GitOpsGitHubHandler:
         base_sha = self.broker.branch_commit(repository, plan.source_base_branch)["sha"]
         if self.broker.commit_parents(repository, merge_sha) != [base_sha, plan.source_head_sha]:
             return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
+        refused = self._changeset_verdict(repository, changeset, base_sha, merge_sha)
+        return (refused, None) if refused is not None else (None, base_sha)
+
+    def _changeset_verdict(
+        self, repository: str, changeset: ChangesetGatePolicy, base_sha: str, merge_sha: str
+    ) -> dict[str, Any] | None:
+        """NEW-219: the changeset rule on the diff from ``base_sha`` to the merge commit
+        ``merge_sha`` (see ``_changeset_gate``); None when it holds."""
         try:
             merged = self.broker.compare_file_changes(repository, base_sha, merge_sha)
         except GhCliPolicyError:
-            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}, None
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
         after = [
             change["path"]
             for change in merged
@@ -3136,13 +3155,55 @@ class GitOpsGitHubHandler:
             before, self._manifests_at(repository, changeset, before, base_sha)
         )
         if needed and not any(
-            self._exists_at(repository, path, merge_sha)
+            self._is_changeset(repository, path, merge_sha)
             for path in changeset.changeset_candidates(merged)
         ):
             # Only a .changeset/<name>.md the merge adds or modifies counts; a removed or
             # renamed-away changeset never does.
-            return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}, None
-        return None, base_sha
+            return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+        return None
+
+    def _is_changeset(self, repository: str, path: str, ref: str) -> bool:
+        """NEW-219: ``path`` at ``ref`` reads as a changeset that releases at least one
+        package (front matter of ``'<package>': major|minor|patch`` lines). A dangling
+        symlink, whose contents read returns no such file, or an empty changeset never
+        counts."""
+        try:
+            text = self.broker.repository_file_text(repository, path, ref)
+        except (CommandFailure, GhCliPolicyError):
+            return False
+        match = _CHANGESET_FRONT_MATTER.match(text)
+        return match is not None and any(
+            _CHANGESET_RELEASE.fullmatch(line.strip())
+            for line in match.group(1).splitlines()
+            if line.strip()
+        )
+
+    def _changeset_after_merge(
+        self,
+        repository: str,
+        changeset: ChangesetGatePolicy,
+        merge_sha: str,
+        gate_base_sha: str,
+    ) -> dict[str, Any] | None:
+        """NEW-219: GitHub's merge binds only the head, so the base can still move between
+        the verdict and the merge. A merge commit whose first parent is not the judged base
+        is judged again on what it actually merged; when that needs a changeset it lacks,
+        the delivery stops with CHANGESET_MISSING_AFTER_MERGE for the operator. A retry
+        sees the PR merged and goes on, so the operator decides."""
+        parents = self.broker.commit_parents(repository, merge_sha)
+        if parents[:1] == [gate_base_sha]:
+            return None
+        if not parents:
+            return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING_AFTER_MERGE"}
+        refused = self._changeset_verdict(repository, changeset, parents[0], merge_sha)
+        if refused is None:
+            return None
+        return {
+            "status": "BLOCKED",
+            "blocker": "CHANGESET_MISSING_AFTER_MERGE",
+            "merge_sha": merge_sha,
+        }
 
     def _manifests_at(
         self, repository: str, changeset: ChangesetGatePolicy, paths: list[str], ref: str
@@ -3165,14 +3226,6 @@ class GitOpsGitHubHandler:
                 value = None
             manifests[directory] = value if isinstance(value, dict) else None
         return manifests
-
-    def _exists_at(self, repository: str, path: str, ref: str) -> bool:
-        """NEW-160: ``path`` exists at commit ``ref`` (the PR's bound head)."""
-        try:
-            self.broker.repository_file_text(repository, path, ref)
-        except (CommandFailure, GhCliPolicyError):
-            return False
-        return True
 
     # -- 3. release tag + workflow runs ------------------------------------------------
 

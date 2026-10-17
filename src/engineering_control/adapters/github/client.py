@@ -966,15 +966,24 @@ class GhCliBroker:
         repository = self._batch(repository)
         if not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(head_sha):
             raise GhCliPolicyError("compare SHA is invalid")
+        # The first line is the number of files GitHub returned, so a missing or null
+        # ``files`` (never an empty diff) and a lost entry are both refused.
         raw = self._run(
             [
                 "api",
                 f"repos/{repository}/compare/{base_sha}...{head_sha}?per_page=1",
                 "--jq",
-                '.files[]? | [.filename, .status, (.previous_filename // "")] | @tsv',
+                'if (.files | type) == "array" then (.files | length | tostring), '
+                '(.files[] | [.filename, .status, (.previous_filename // "")] | @tsv) '
+                'else "INVALID" end',
             ]
         ).stdout
-        entries = [line for line in raw.splitlines() if line.strip()]
+        lines = raw.splitlines()
+        if not lines or not lines[0].isdigit():
+            raise GhCliPolicyError("compare file listing is malformed")
+        entries = [line for line in lines[1:] if line.strip()]
+        if len(entries) != int(lines[0]):
+            raise GhCliPolicyError("compare file listing is malformed")
         if len(entries) >= self.COMPARE_FILE_CAP:
             raise GhCliPolicyError("compare file listing reached the GitHub cap")
         changes: list[dict[str, str]] = []
@@ -982,6 +991,8 @@ class GhCliBroker:
             parts = entry.split("\t")
             if len(parts) != 3 or not parts[0] or parts[1] not in self.PULL_REQUEST_FILE_STATUSES:
                 raise GhCliPolicyError("compare file listing is malformed")
+            if parts[1] in {"renamed", "copied"} and not parts[2]:
+                raise GhCliPolicyError("compare file listing names no rename source")
             changes.append({"path": parts[0], "status": parts[1], "previous_path": parts[2]})
         return changes
 

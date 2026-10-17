@@ -116,6 +116,12 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
         "backlog-retry only re-runs the merge checks, so the changeset must reach the PR "
         "branch first (or skip the issue)"
     ),
+    # NEW-219: the base moved between the changeset verdict and GitHub's merge.
+    "CHANGESET_MISSING_AFTER_MERGE": (
+        "the base branch moved while Hermes merged, and the actual merge changes a "
+        "published package without a .changeset/*.md; add the changeset on main, then "
+        "backlog-retry (the merged PR is not judged again)"
+    ),
     "MERGE_DELIVERY_PROTECTED_PATH_CHANGED": (
         "the PR touches a protected path (CI configuration); Hermes never merges it"
     ),

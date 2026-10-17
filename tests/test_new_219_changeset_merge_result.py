@@ -72,6 +72,9 @@ class _GitGh(_MergeGh):
         self.repo = repo
         self.head = _git(repo, "rev-parse", "pr").stdout.strip()
         self.moved_base_after_gate = False
+        # Files main changes just before the merge call (after the verdict): a raced base.
+        self.race_on_merge: dict[str, str | dict[str, Any] | None] | None = None
+        self.race_renames: list[tuple[str, str]] = []
 
     def _base(self) -> str:
         return _git(self.repo, "rev-parse", "main").stdout.strip()
@@ -101,6 +104,16 @@ class _GitGh(_MergeGh):
         if args[0] == "api" and args[1].endswith("/pulls/41/files"):
             return self._changes(f"{self._base()}...{self.head}")
         if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/pulls/41":
+            pull = self.pull_requests[(REPOSITORY, 41)]
+            if pull["state"] == "MERGED":
+                return json.dumps(
+                    {
+                        "mergeable": None,
+                        "merged": True,
+                        "merge_commit_sha": pull["mergeCommit"]["oid"],
+                        "head_sha": self.head,
+                    }
+                )
             merge = self._test_merge()
             return json.dumps(
                 {
@@ -117,13 +130,27 @@ class _GitGh(_MergeGh):
             )
         if args[0] == "api" and args[1].startswith(f"repos/{REPOSITORY}/compare/"):
             base, merge = args[1].split("/compare/", 1)[1].split("?", 1)[0].split("...")
-            return self._changes(base, merge)
+            changes = self._changes(base, merge)
+            return "\n".join([str(len(changes.splitlines())), changes])
         if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/commits/main":
             if self.moved_base_after_gate and any(
                 call[:2] == ["pr", "ready"] for call in self.calls
             ):
                 return json.dumps({"sha": "9" * 40, "tree": "f" * 40})
             return json.dumps({"sha": self._base(), "tree": "f" * 40})
+        if args[:2] == ["pr", "merge"]:
+            pull = self.pull_requests[(args[4], int(args[2]))]
+            assert args[args.index("--match-head-commit") + 1] == pull["headRefOid"] == self.head
+            if self.race_on_merge is not None or self.race_renames:
+                for old, new in self.race_renames:
+                    (self.repo / new).parent.mkdir(parents=True, exist_ok=True)
+                    _git(self.repo, "mv", old, new)
+                _write(self.repo, self.race_on_merge or {})
+                _commit(self.repo, "main moves during the merge")
+            _git(self.repo, "merge", "-q", "--no-ff", "--no-edit", "pr")
+            merge = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+            pull.update(state="MERGED", mergeCommit={"oid": merge})
+            return ""
         if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
             path = args[3].split("/contents/", 1)[1]
             ref = next(a.removeprefix("ref=") for a in args if a.startswith("ref="))
@@ -354,6 +381,72 @@ async def test_a_merge_diff_at_the_compare_cap_is_refused(tmp_path: Path) -> Non
     # GitHub's compare lists at most 300 files: a listing that reaches it may be truncated.
     changed = [f"packages/mcp/src/file{n}.ts" for n in range(300)]
     handler, fake = _github(tmp_path, GREEN, changed)
+    refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert refused == {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
+    assert fake.mutations == []
+
+
+async def test_a_base_that_moves_during_the_merge_call_is_judged_on_the_actual_merge(
+    tmp_path: Path,
+) -> None:
+    """GitHub's merge binds only the head: main may still move between the last base read
+    and the merge call. The actual merge commit is judged again, and a raced move of the
+    PR's private edit into a published package stops for the operator."""
+    lines = "".join(f"export const line{n} = {n}\n" for n in range(30))
+    base = {**BASE, "packages/mcp/src/tool.ts": lines}
+    edit = {"packages/mcp/src/tool.ts": lines.replace("line5 = 5", "line5 = 55")}
+    repo = _repository(tmp_path / "raced", base, edit)
+    handler, fake = _handler(tmp_path / "raced", repo)
+    fake.race_renames = [("packages/mcp/src/tool.ts", "packages/ui/src/tool.ts")]
+    stopped = await _merge(handler, fake)
+    assert stopped["status"] == "BLOCKED"
+    assert stopped["blocker"] == "CHANGESET_MISSING_AFTER_MERGE"
+    assert stopped["merge_sha"] == _git(repo, "rev-parse", "main").stdout.strip()
+    # A retry finds the PR merged and goes on: the operator added the changeset on main.
+    assert (await _merge(handler, fake))["status"] == "MERGED"
+    # A race that leaves the PR's change private is no reason to stop.
+    repo = _repository(tmp_path / "harmless", base, edit)
+    handler, fake = _handler(tmp_path / "harmless", repo)
+    fake.race_on_merge = {"packages/mcp/README.md": "notes\n"}
+    assert (await _merge(handler, fake))["status"] == "MERGED"
+
+
+async def test_a_dangling_symlink_or_an_empty_changeset_never_counts(tmp_path: Path) -> None:
+    edit = {"packages/ui/src/button.tsx": "export const Button = 2\n"}
+    repo = _repository(tmp_path / "link", BASE, edit)
+    _git(repo, "switch", "-q", "pr")
+    (repo / ".changeset").mkdir()
+    (repo / ".changeset" / "release.md").symlink_to("missing.md")
+    _commit(repo, "a dangling changeset link")
+    _git(repo, "switch", "-q", "main")
+    handler, fake = _handler(tmp_path / "link", repo)
+    refused = await _merge(handler, fake)
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+    empty = {**edit, ".changeset/brave-ducks.md": "---\n---\nNothing released.\n"}
+    repo = _repository(tmp_path / "empty", BASE, empty)
+    handler, fake = _handler(tmp_path / "empty", repo)
+    refused = await _merge(handler, fake)
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "INVALID",  # files missing or null: never an empty diff
+        "2\npackages/ui/src/button.tsx\tmodified\t",  # an entry lost
+        "1\npackages/mcp/src/tool.ts\trenamed\t",  # a rename without its source
+    ],
+)
+async def test_a_malformed_merge_diff_is_refused(tmp_path: Path, listing: str) -> None:
+    handler, fake = _github(tmp_path, GREEN, CHANGED)
+    original = fake._answer
+
+    def answer(args: list[str]) -> str:
+        if args[0] == "api" and "/compare/" in args[1]:
+            return listing
+        return original(args)
+
+    fake._answer = answer  # type: ignore[method-assign]
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
     assert fake.mutations == []

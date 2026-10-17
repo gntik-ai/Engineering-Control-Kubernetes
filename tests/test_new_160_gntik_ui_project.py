@@ -628,6 +628,10 @@ class _MergeGh(FakeGh):
         }
         self.base_sha = MERGE_SHA
         self.merge_parents = [MERGE_SHA, HEAD_SHA]
+        # The parents of the merge Hermes makes (MERGE_SHA); None: the judged base and head.
+        self.actual_merge_parents: list[str] | None = None
+        # NEW-219: a base that moves between the verdict and the merge (the change it merges).
+        self.raced_changes: list[str] | None = None
 
     def _answer(self, args: list[str]) -> str:
         if args[0] == "api" and args[1].endswith("/pulls/41/files"):
@@ -637,16 +641,29 @@ class _MergeGh(FakeGh):
             return json.dumps(self.preview)
         if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/git/commits/{TEST_MERGE_SHA}":
             return json.dumps(self.merge_parents)
+        if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/git/commits/{MERGE_SHA}":
+            actual = getattr(self, "actual_merge_parents", None)
+            return json.dumps(actual or [getattr(self, "base_sha", MERGE_SHA), HEAD_SHA])
+        if args[:2] == ["api", f"repos/{REPOSITORY}/commits/main"] and args[-1] == (
+            "{sha: .sha, tree: .commit.tree.sha}"
+        ):
+            return json.dumps({"sha": getattr(self, "base_sha", MERGE_SHA), "tree": "f" * 40})
         if args[0] == "api" and args[1].startswith(f"repos/{REPOSITORY}/compare/"):
-            # The merge result's diff against the base: the PR's changes in these fixtures.
+            # The merge result's diff against the base: the PR's changes in these fixtures
+            # (or, after a raced merge, what the actual merge changed).
             base = getattr(self, "base_sha", MERGE_SHA)
-            assert args[1] == f"repos/{REPOSITORY}/compare/{base}...{TEST_MERGE_SHA}?per_page=1"
-            return "\n".join(self.changed)
+            judged = f"repos/{REPOSITORY}/compare/{base}...{TEST_MERGE_SHA}?per_page=1"
+            raced = getattr(self, "raced_changes", None)
+            lines = self.changed if args[1] == judged else raced
+            assert lines is not None, args[1]
+            return "\n".join([str(len(lines)), *lines])
         if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
             path = args[3].split("/contents/", 1)[1]
             # Read in the merge result or, for paths that existed before it, at the base.
-            at_base = f"ref={getattr(self, 'base_sha', MERGE_SHA)}" in args
-            assert at_base or f"ref={TEST_MERGE_SHA}" in args
+            ref = next(arg.removeprefix("ref=") for arg in args if arg.startswith("ref="))
+            raced = getattr(self, "actual_merge_parents", None)
+            at_base = ref in {getattr(self, "base_sha", MERGE_SHA), *(raced or [])[:1]}
+            assert at_base or ref in {TEST_MERGE_SHA, MERGE_SHA}, ref
             head_files: dict[str, str] = getattr(self, "head_files", {})
             base_files = getattr(self, "base_files", None)
             files = head_files if not at_base or base_files is None else base_files
