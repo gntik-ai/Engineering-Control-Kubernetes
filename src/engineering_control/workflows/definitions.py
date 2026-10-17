@@ -281,6 +281,15 @@ class ControlledWorkflow:
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
+        if (
+            step == "backlog.record_loop_state"
+            and self._pipelined
+            and payload.get("loop_status") == "CANCELLED"
+            and _SLOT_ISSUE.get() is not None
+        ):
+            # NEW-214b: the BACK slot recorded the loop CANCELLED (also on a path that
+            # then raises, e.g. a cancelled failed bookkeeping step).
+            self._back_cancelled = True
         if step == "backlog.register_child_run" and workflow.patched("child-run-start-memo-v1"):
             status = result.get("status")
             result_child_id = result.get("child_workflow_id")
@@ -5036,15 +5045,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         """NEW-214b: one issue's CI, merge and staging, as a task beside the FRONT slot."""
         _SLOT_ISSUE.set(issue_ref)  # this task's own context only
         try:
-            staged = await self._staging_gitops_delivery(**arguments)
+            return await self._staging_gitops_delivery(**arguments)
         except _LoopIssueSkipped as skipped:
             # A skipped bookkeeping step ends only this slot's issue (NEW-162 closes a
             # sequential loop, which has no other issue in flight).
             arguments["results"].append(skipped.skipped)
             return "SKIPPED", ""
-        if staged[0] == "CANCELLED":
-            self._back_cancelled = True  # it recorded the loop CANCELLED itself
-        return staged
 
     async def _finish_back_slot(self) -> BaseException | None:
         """NEW-214b: a loop never ends while its BACK slot still runs.

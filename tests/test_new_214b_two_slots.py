@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
@@ -144,12 +145,13 @@ async def _run(
     script: dict[str, dict[str, Any]],
     *,
     concurrency: int,
-    signals: list[tuple[str, str]] | None = None,
+    signals: list[tuple[str, str | None]] | None = None,
     hook: Hook = None,
     refill: list[dict[str, Any]] | None = None,
     driver: Any = None,
     maximum_items: int = 2,
     continue_after_blocked: bool = False,
+    expect_failure: bool = False,
 ) -> tuple[Any, Any]:
     activity_fn = _executor(script, hook=hook, refill=refill)
     async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
@@ -190,9 +192,17 @@ async def _run(
                     if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
                         break
                     await asyncio.sleep(0.1)
-                await handle.signal(name, argument)
+                if argument is None:
+                    await handle.signal(name)
+                else:
+                    await handle.signal(name, argument)
                 await asyncio.sleep(0.5)
-            result = await handle.result()
+            try:
+                result = await handle.result()
+            except WorkflowFailureError:
+                if not expect_failure:
+                    raise
+                result = None
             history = await handle.fetch_history()
     return history, result
 
@@ -483,6 +493,35 @@ async def test_a_skipped_back_bookkeeping_step_ends_only_its_own_issue() -> None
     events = _child_events(history)
     assert ("completed", "2-staging-gitops") in events
     assert ("started", "1-staging-gitops") not in events
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_back_slot_cancel_is_not_overwritten_by_a_later_failure() -> None:
+    # Review: a cancelled failed BACK bookkeeping step records CANCELLED and then raises;
+    # the loop's failure handler must not record FAILED over it.
+    _SlowStaging.first_outcome = None
+
+    async def hook(step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        child = str(payload.get("child_workflow_id") or "")
+        if step == "backlog.register_child_run" and child.endswith("-1-staging-gitops"):
+            raise ApplicationError("register_child_run binding changed", non_retryable=True)
+        return None
+
+    history, result = await _run(
+        _script(),
+        concurrency=2,
+        hook=hook,
+        signals=[("cancel", None)],
+        expect_failure=True,
+    )
+
+    assert result is None
+    statuses = [
+        request["payload"]["loop_status"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+    ]
+    assert statuses[-2:] == ["PAUSED", "CANCELLED"]
     await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
 
 
