@@ -289,6 +289,11 @@ def parser() -> argparse.ArgumentParser:
         choices=("bugs", "bugs-and-docs", "security", "enhancements", "all"),
     )
     backlog_import.add_argument("--max-items", type=int, default=500, choices=range(1, 501))
+    backlog_import.add_argument(
+        "--label",
+        default=None,
+        help="import only the open issues carrying this GitHub label (NEW-215)",
+    )
     backlog_inventory = commands.add_parser("backlog-inventory")
     backlog_inventory.add_argument("campaign_id")
     backlog_inventory.add_argument("--limit", type=int, default=20, choices=range(1, 201))
@@ -819,6 +824,7 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "source": "github-open",
                 "import_filter": arguments.import_filter,
                 "maximum_items": arguments.max_items,
+                **({"issue_label": arguments.label} if arguments.label is not None else {}),
             },
         )
     if command == "backlog-inventory":

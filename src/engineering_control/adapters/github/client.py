@@ -137,9 +137,12 @@ class GhCliBroker:
         )
         return self._list(value, "issue search")
 
-    def list_open_issues(self, repository: str) -> list[dict[str, Any]]:
-        """Return the bounded structured fields required by backlog import."""
+    def list_open_issues(self, repository: str, label: str | None = None) -> list[dict[str, Any]]:
+        """Return the bounded structured fields required by backlog import.
+
+        NEW-215: `label` (already validated by the caller) scopes the list to one label."""
         repository = self._batch(repository)
+        scope = ["--label", label] if label is not None else []
         value = self._json(
             self._run(
                 [
@@ -149,6 +152,7 @@ class GhCliBroker:
                     repository,
                     "--state",
                     "open",
+                    *scope,
                     "--json",
                     "number,title,body,labels,milestone,assignees,comments,url,state,updatedAt",
                     "--limit",

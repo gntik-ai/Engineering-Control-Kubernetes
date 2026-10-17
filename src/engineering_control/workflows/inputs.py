@@ -153,6 +153,8 @@ class GitHubBacklogImportInput:
     source: str = "github-open"
     import_filter: str = "bugs"
     maximum_items: int = 500
+    # NEW-215: scope the import to one GitHub label (None: every open issue).
+    issue_label: str | None = None
 
 
 @dataclass

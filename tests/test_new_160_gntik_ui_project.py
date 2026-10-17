@@ -544,7 +544,9 @@ async def test_backlog_import_and_plan_for_gntik_ui(tmp_path: Path) -> None:
             "project": "gntik-ui",
             "import_filter": "bugs",
             "maximum_items": 1,
-            "snapshot": imported["snapshot"],
+            # NEW-215: the GitHub activity hands the snapshot on encoded.
+            "snapshot_encoding": imported["snapshot_encoding"],
+            "snapshot_encoded": imported["snapshot_encoded"],
         },
     )
     assert persisted["status"] == "IMPORTED"

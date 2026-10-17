@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import lzma
 import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -208,6 +210,67 @@ class GitHubBacklogImportSnapshot(BacklogModel):
         return self
 
 
+# NEW-215: a backlog import may be scoped to one GitHub label (`backlog-import --label`).
+ISSUE_LABEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}$"
+_ISSUE_LABEL = re.compile(ISSUE_LABEL_PATTERN)
+ISSUE_QUERY_BASE = "state:open is:issue paired-repositories"
+_ISSUE_QUERY_LABEL = " label:"
+
+
+def valid_issue_label(value: Any) -> str | None:
+    """The validated label scope of an import, or None for an unscoped import."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or _ISSUE_LABEL.fullmatch(value) is None:
+        raise ValueError("backlog import label is invalid")
+    return value
+
+
+def issue_query_for(label: str | None) -> str:
+    """The campaign's recorded issue query: the unscoped query is unchanged."""
+    return ISSUE_QUERY_BASE if label is None else f"{ISSUE_QUERY_BASE}{_ISSUE_QUERY_LABEL}{label}"
+
+
+def issue_label_from_query(issue_query: str) -> str | None:
+    """The label a campaign was imported with, read back from its recorded issue query."""
+    prefix = f"{ISSUE_QUERY_BASE}{_ISSUE_QUERY_LABEL}"
+    if not issue_query.startswith(prefix):
+        return None
+    return valid_issue_label(issue_query[len(prefix) :])
+
+
+# NEW-215: the import snapshot crosses Temporal (GitHub activity result, persist activity
+# input) as xz+base64. 500 issues of ~14 KB are ~3.3 MB of JSON, over Temporal's 2 MB
+# payload limit, and ~0.83 MB encoded. Larger snapshots fail with BACKLOG_IMPORT_TOO_LARGE.
+IMPORT_SNAPSHOT_ENCODING = "xz+base64"
+MAXIMUM_ENCODED_IMPORT_SNAPSHOT_BYTES = 1_500_000
+_MAXIMUM_DECODED_IMPORT_SNAPSHOT_BYTES = 64 * 1024 * 1024
+
+
+def encode_import_snapshot(snapshot: dict[str, Any]) -> str:
+    raw = json.dumps(snapshot, separators=(",", ":"), sort_keys=True).encode()
+    return base64.b64encode(lzma.compress(raw, preset=9)).decode("ascii")
+
+
+def decode_import_snapshot(payload: dict[str, Any]) -> Any:
+    """The snapshot of a backlog.github_import result, in either encoding.
+
+    Results recorded before NEW-215 carry the plain `snapshot`; later ones the encoded
+    `snapshot_encoded`. Decoding is bounded so a malformed value cannot exhaust memory."""
+    encoded = payload.get("snapshot_encoded")
+    if encoded is None:
+        return payload.get("snapshot")
+    if payload.get("snapshot_encoding") != IMPORT_SNAPSHOT_ENCODING or not isinstance(encoded, str):
+        raise ValueError("backlog import snapshot encoding is not supported")
+    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+    raw = decompressor.decompress(
+        base64.b64decode(encoded, validate=True), max_length=_MAXIMUM_DECODED_IMPORT_SNAPSHOT_BYTES
+    )
+    if not decompressor.eof:
+        raise ValueError("backlog import snapshot is truncated or too large")
+    return json.loads(raw)
+
+
 class LinkedPullRequest(BacklogModel):
     repository: str
     number: int = Field(ge=1)
@@ -294,12 +357,16 @@ class BacklogApprovalBinding(BacklogModel):
     issue_close_policy: Literal["verified-final-runtime", "never"]
     expires_at: datetime
     issue_approval: IssueApprovalReference | None = None
+    # NEW-215: the label an import was scoped to, so an approval names its scope.
+    issue_label: str | None = Field(default=None, pattern=ISSUE_LABEL_PATTERN)
 
     @model_serializer(mode="wrap")
     def preserve_legacy_binding(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         value: dict[str, Any] = handler(self)
         if self.issue_approval is None:
             value.pop("issue_approval", None)
+        if self.issue_label is None:
+            value.pop("issue_label", None)
         return value
 
     @model_validator(mode="after")
@@ -600,6 +667,7 @@ def approval_binding(
     delivery_mode: Literal["source-pr", "full-delivery"],
     include_enhancements: bool,
     now: datetime | None = None,
+    issue_label: str | None = None,
 ) -> BacklogApprovalBinding:
     if not _SHA.fullmatch(source_head) or not _SHA.fullmatch(deployment_head):
         raise ValueError("backlog approval requires immutable repository heads")
@@ -647,6 +715,7 @@ def approval_binding(
             "verified-final-runtime" if delivery_mode == "full-delivery" else "never"
         ),
         expires_at=(now or datetime.now(UTC)) + timedelta(hours=24),
+        issue_label=valid_issue_label(issue_label),
     )
 
 
