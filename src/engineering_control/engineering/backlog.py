@@ -79,11 +79,19 @@ _DEPENDENCY_KEYWORD = re.compile(
     r"|requires|dependency|dependencies)(?![a-z0-9])"
 )
 _WEAK_DEPENDENCY_KEYWORDS = frozenset({"requires", "dependency", "dependencies"})
-_DEPENDENCY_NEGATION = re.compile(r"(?<![a-z0-9])(?:not|no|never|without)\s+(?:\S+\s+)?$|n't\s+$")
-_DEPENDENCY_CLAUSE_END = re.compile(
-    r";|\.(?:\s|$)|(?<![a-z0-9])(?:feeds?|builds?\s+on|blocks|unblocks|unlike|independent"
-    r"|not|except|without|unrelated|instead|supersedes|replaces|but)(?![a-z0-9])"
+# A negation anywhere between the previous clause end and the keyword ("does not directly
+# depend on", "no open dependencies"); "not only" is emphasis, not negation.
+_DEPENDENCY_NEGATION = re.compile(
+    r"(?<![a-z0-9_`-])(?:not(?!\s+only)|no|never|without)(?![a-z0-9_`-])|n't(?![a-z0-9])"
 )
+# Searched on text whose `code` spans and (parentheses) are blanked, so identifiers such
+# as `add-not-found-page` and asides like "(not yet merged)" never end a clause.
+_DEPENDENCY_CLAUSE_END = re.compile(
+    r";|\.(?:\s|$)|(?<![a-z0-9_`-])(?:feeds?|builds?\s+on|blocks|unblocks|unlike|independent"
+    r"|not(?!\s+only)|except|without|unrelated|instead|supersedes|replaces|but(?!\s+also))"
+    r"(?![a-z0-9_`-])"
+)
+_DEPENDENCY_ASIDE = re.compile(r"`[^`\n]*`|\([^()\n]*\)")
 _DEPENDENCY_LIST_START = re.compile(
     rf"^\s*[:\-]?\s*(?:(?:gntik-ai/)?(?:{REPOSITORY_SLUG_ALTERNATION}))?#[1-9]"
 )
@@ -1069,9 +1077,21 @@ def _filter_eligibility(
     return False, "FILTER_EXCLUDED"
 
 
+def _blank_asides(text: str) -> str:
+    """The text with `code` spans and (parenthesised) asides blanked, same length."""
+    return _DEPENDENCY_ASIDE.sub(lambda match: " " * len(match.group(0)), text)
+
+
 def _dependency_clause(rest: str) -> str:
-    end = _DEPENDENCY_CLAUSE_END.search(rest)
+    end = _DEPENDENCY_CLAUSE_END.search(_blank_asides(rest))
     return rest[: end.start()] if end else rest
+
+
+def _negated(before: str) -> bool:
+    """Whether the keyword's own clause, up to the keyword, is negated."""
+    blanked = _blank_asides(before)
+    starts = [match.end() for match in re.finditer(r";|\.(?:\s|$)", blanked)]
+    return _DEPENDENCY_NEGATION.search(blanked[starts[-1] if starts else 0 :]) is not None
 
 
 def _dependency_clauses(text: str) -> list[str]:
@@ -1087,15 +1107,19 @@ def _dependency_clauses(text: str) -> list[str]:
                 following = following[1:]
             for position, item in enumerate(following):
                 bullet = _DEPENDENCY_LIST_ITEM.match(item)
-                if bullet:
-                    clauses.append(_dependency_clause(item[bullet.end() :]))
+                entry = item[bullet.end() :] if bullet else item
+                # Only entries that start with a reference declare one; a bullet such as
+                # "Optional integration with #30" under the heading does not.
+                if (bullet or position == 0) and _DEPENDENCY_LIST_START.match(entry.lstrip("*_ ")):
+                    clauses.append(_dependency_clause(entry.lstrip("*_ ")))
+                    if bullet:
+                        continue
+                elif bullet:
                     continue
-                if position == 0 and _DEPENDENCY_LIST_START.match(item):
-                    clauses.append(_dependency_clause(item))
                 break
             continue
         for match in _DEPENDENCY_KEYWORD.finditer(line):
-            if _DEPENDENCY_NEGATION.search(line[max(0, match.start() - 24) : match.start()]):
+            if _negated(line[: match.start()]):
                 continue
             rest = line[match.end() :]
             if match.group("keyword") in _WEAK_DEPENDENCY_KEYWORDS and not (
@@ -1129,6 +1153,9 @@ _OPENSPEC_DEPENDS_ON = re.compile(
     r"(?im)^[ \t]*[-*]?[ \t]*depends[ \t]+on[ \t]*:[ \t]*([^\n]{0,600})"
 )
 _OPENSPEC_NAME = re.compile(r"`([a-z0-9][a-z0-9-]{0,99})`")
+_OPENSPEC_LEADING_NAMES = re.compile(
+    r"`[a-z0-9][a-z0-9-]{0,99}`(?:[ \t]*(?:,|and|or|,[ \t]*and)?[ \t]*`[a-z0-9][a-z0-9-]{0,99}`)*"
+)
 
 
 def openspec_change_fields(body: str) -> tuple[str | None, tuple[str, ...]]:
@@ -1138,7 +1165,10 @@ def openspec_change_fields(body: str) -> tuple[str | None, tuple[str, ...]]:
     change_id = (found.group(1) or found.group(2)) if found else None
     names: list[str] = []
     for line in _OPENSPEC_DEPENDS_ON.findall(lowered):
-        for name in _OPENSPEC_NAME.findall(line):
+        # Only the list the line starts with: "`a`, `b` and `c`". "none (see `a`)" or
+        # "`a`; feeds `b`" stop at the first token that is not a listed name.
+        listed = _OPENSPEC_LEADING_NAMES.match(line)
+        for name in _OPENSPEC_NAME.findall(listed.group(0) if listed else ""):
             if name != change_id and name not in names:
                 names.append(name)
     return change_id, tuple(names[:20])

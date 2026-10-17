@@ -101,6 +101,22 @@ def dependencies(body: str, number: int = 999) -> tuple[str, ...]:
         # A clause never crosses a newline outside a heading list.
         ("Depends on `a`\n#55 is unrelated.", ()),
         ("Depends on #999 and #5.", ("gntik-ai/falcone#5",)),
+        # Review round 1: identifiers and asides never end a clause.
+        ("Depends on `add-not-found-page` (#30).", ("gntik-ai/falcone#30",)),
+        (
+            "Depends on #30 (not yet merged) and #31.",
+            ("gntik-ai/falcone#30", "gntik-ai/falcone#31"),
+        ),
+        ("This does not directly or indirectly depend on #30.", ()),
+        (
+            "This not only depends on #30 but also on #31.",
+            ("gntik-ai/falcone#30", "gntik-ai/falcone#31"),
+        ),
+        ("## Dependencies\n- Optional integration with #30 (can ship independently).", ()),
+        (
+            "## Depends on\n- **#41** (merged)\n- Related reading: #42\n- #43",
+            ("gntik-ai/falcone#41", "gntik-ai/falcone#43"),
+        ),
     ],
 )
 def test_dependency_clauses(body: str, expected: tuple[str, ...]) -> None:
@@ -122,6 +138,19 @@ def test_openspec_change_fields_read_both_forms() -> None:
     )
     assert openspec_change_fields("- Change id: `add-x`\n- Depends on: none.") == ("add-x", ())
     assert openspec_change_fields("No OpenSpec section.") == (None, ())
+    # Review round 1: only the list the line starts with.
+    assert openspec_change_fields(
+        "- Change id: `add-c`\n- Depends on: `add-a`; feeds `add-b`."
+    ) == (
+        "add-c",
+        ("add-a",),
+    )
+    assert openspec_change_fields(
+        "- Change id: `add-c`\n- Depends on: none (see `add-a` for related work)."
+    ) == ("add-c", ())
+    assert openspec_change_fields(
+        "- Change id: `add-c`\n- Depends on: `add-a`, `add-b` and `add-d`."
+    ) == ("add-c", ("add-a", "add-b", "add-d"))
 
 
 def test_issue_snapshot_reads_openspec_fields_past_the_excerpt() -> None:
