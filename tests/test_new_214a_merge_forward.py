@@ -30,7 +30,12 @@ from test_delivery_activity import (
     _with_intent,
     publication_payload,
 )
-from test_delivery_metadata import _lease_fixture, _self_contained_evidence, checker_result
+from test_delivery_metadata import (
+    _lease_fixture,
+    _self_contained_evidence,
+    checker_result,
+    publication_evidence,
+)
 from test_staging_gitops import SAFE, FakeGh, _config_root, _plan, _pull_request, _settings
 from test_workflow_replay import (
     _GITOPS_PLAN,
@@ -595,6 +600,168 @@ async def test_a_self_contained_merge_forward_persists_its_new_base(
     assert [(item["from_sha"], item["base_sha"], item["head_sha"]) for item in history] == [
         (published, tip, head)
     ]
+
+
+def _published_by_merged_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slug: str,
+    change_set_id: UUID,
+    head: str,
+    pr_url: str,
+    merge_forward: dict[str, str],
+) -> dict[str, Any]:
+    """The source result _publish really returns for a merged retry (GitHub stubbed)."""
+    project = "gntik-ui" if slug == "gntik-ui" else "falcone"
+    plan = RepositoryPublication(
+        repository=f"gntik-ai/{slug}",
+        repository_slug=slug,
+        working_directory=tmp_path,
+        branch=f"agent/{project}/26/{change_set_id}",
+        head_sha=head,
+        title="t",
+        body="b",
+    )
+    handler = DeliveryActivityHandler(Settings(run_root=tmp_path / "runs"))
+    merged_pr = {"headRefOid": head, "baseRefName": "main", "state": "MERGED"}
+    monkeypatch.setattr(handler.broker, "list_pull_requests", lambda *a, **k: [merged_pr])
+    monkeypatch.setattr(handler, "_own_pull_request", lambda item, plan: True)
+    monkeypatch.setattr(
+        handler,
+        "_bind_pull_request",
+        lambda plan, context: {
+            "repository_slug": slug,
+            "head_sha": head,
+            "pr_state": "MERGED",
+            "pr_url": pr_url,
+        },
+    )
+    monkeypatch.setattr(handler.broker, "commit_contains", lambda *a, **k: True)
+    payload = {"merge_forward": merge_forward}
+    return handler._publish(plan, change_set_id, publication_context=(None, payload, {}))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("shape", ["self-contained", "paired", "deferred"])
+@pytest.mark.asyncio
+async def test_a_merged_retry_persists_through_publication_for_every_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    # Review 3: real _publish output, not an injected flag, for all three repository shapes.
+    handler = MetadataActivityHandler(Settings(database_url=f"sqlite:///{tmp_path / 'e2e.sqlite'}"))
+    Base.metadata.create_all(handler.engine)
+    change_set_id, run_id = uuid4(), uuid4()
+    tip, published, head, deployment_head = "e" * 40, "d" * 40, "b" * 40, "c" * 40
+    slug = "gntik-ui" if shape == "self-contained" else "falcone"
+    deployment_slug = "gntik-ui" if shape == "self-contained" else "falcone-charts"
+    pr_url = f"https://github.com/gntik-ai/{slug}/pull/42"
+    deployment_url = "https://github.com/gntik-ai/falcone-charts/pull/7"
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="gntik-ui" if shape == "self-contained" else "falcone",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository=slug,
+                source_branch=None,
+                source_base_sha="a" * 40,
+                source_head_sha=published,
+                source_pr_url=pr_url,
+                deployment_repository=deployment_slug,
+                deployment_branch=None,
+                deployment_base_sha="a" * 40 if shape == "self-contained" else deployment_head,
+                deployment_head_sha=deployment_head if shape == "paired" else None,
+                deployment_pr_url=deployment_url if shape == "paired" else None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-e2e",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="gntik-ui" if shape == "self-contained" else "falcone",
+            )
+        )
+    merge_forward = {"target": "source", "repository": slug, "base_sha": tip, "from_sha": published}
+    source_record = _published_by_merged_retry(
+        tmp_path,
+        monkeypatch,
+        slug=slug,
+        change_set_id=change_set_id,
+        head=head,
+        pr_url=pr_url,
+        merge_forward=merge_forward,
+    )
+    project = "gntik-ui" if shape == "self-contained" else "falcone"
+    branch = f"agent/{project}/26/{change_set_id}"
+    publications = [{"repository_slug": slug, "branch": branch, "head_sha": head}]
+    results = [source_record]
+    plan: dict[str, Any] = {"change_set_id": str(change_set_id), "publications": publications}
+    if shape == "self-contained":
+        evidence = _self_contained_evidence(head, deployment_floor="R1")
+        for side in ("source", "deployment"):
+            evidence[side] = {**evidence[side], "base_sha": tip}  # type: ignore[dict-item]
+        bases = {"source_base_sha": tip, "deployment_base_sha": tip}
+    else:
+        evidence = publication_evidence(head, deployment_head, deployment_changed=shape == "paired")
+        evidence["source"] = {**evidence["source"], "base_sha": tip}  # type: ignore[dict-item]
+        bases = {"source_base_sha": tip}
+        if shape == "paired":
+            publications.append(
+                {"repository_slug": "falcone-charts", "branch": branch, "head_sha": deployment_head}
+            )
+            results.append(
+                {
+                    "repository_slug": "falcone-charts",
+                    "head_sha": deployment_head,
+                    "pr_state": "OPEN",
+                    "pr_url": deployment_url,
+                }
+            )
+        else:
+            plan["deferred_deployment"] = {
+                "repository_slug": "falcone-charts",
+                "branch": branch,
+                "head_sha": deployment_head,
+                "base_sha": deployment_head,
+                "reason": "AWAITING_IMMUTABLE_ARTIFACT",
+            }
+
+    result = await handler.handle(
+        "delivery.persist_publication",
+        {
+            "change_set_id": str(change_set_id),
+            "run_id": str(run_id),
+            "status": "SOURCE_PRS_CREATED",
+            **bases,
+            "merge_forward": merge_forward,
+            "publication_plan": plan,
+            "publication_results": results,
+            "change_evidence": evidence,
+            "agent_result": checker_result(),
+            "maker_provider": "codex",
+            "checker_provider": "claude",
+        },
+    )
+
+    assert source_record["merge_forward_verified"] is True
+    assert result["status"] == "SOURCE_PR"
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.source_base_sha == tip
+        expected_deployment_base = tip if shape == "self-contained" else deployment_head
+        assert change_set.deployment_base_sha == expected_deployment_base
+        assert [item["head_sha"] for item in change_set.recovery_json["merge_forwards"]] == [head]
 
 
 # -- the loop -----------------------------------------------------------------------------
