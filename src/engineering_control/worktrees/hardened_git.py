@@ -92,6 +92,7 @@ HARDENED_CONFIGURATION: tuple[str, ...] = (
     "status.submoduleSummary=false",
     "submodule.recurse=false",
     "fetch.recurseSubmodules=false",
+    "push.recurseSubmodules=no",
     "protocol.allow=never",
     "gc.auto=0",
     "maintenance.auto=false",
