@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -19,7 +20,7 @@ from engineering_control.config import Settings
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
     IMPORT_SNAPSHOT_ENCODING,
-    MAXIMUM_ENCODED_IMPORT_SNAPSHOT_BYTES,
+    MAXIMUM_IMPORT_RESULT_BYTES,
     GitHubBacklogImportSnapshot,
     GitHubIssueSnapshot,
     GitHubPullRequestSnapshot,
@@ -330,11 +331,7 @@ class GitHubActivityHandler:
                         non_retryable=True,
                     )
                 head = self.broker.branch_commit(repository, expected_branch)
-                raw_issues = (
-                    self.broker.list_open_issues(repository, label=label)
-                    if label is not None
-                    else self.broker.list_open_issues(repository)
-                )
+                raw_issues = self._open_issues(repository, label)
                 issues = tuple(
                     self._issue_snapshot(repository, value)
                     for value in _oldest_first_selection(raw_issues, remaining)
@@ -369,22 +366,14 @@ class GitHubActivityHandler:
             repositories=tuple(repositories),
         )
         issue_count = sum(len(repository.issues) for repository in snapshot.repositories)
-        # NEW-215: the snapshot travels encoded (Temporal payload limit), and an import too
-        # large even encoded fails here with counts instead of a Temporal payload error.
-        encoded = encode_import_snapshot(snapshot.model_dump(mode="json"))
-        if len(encoded) > MAXIMUM_ENCODED_IMPORT_SNAPSHOT_BYTES:
-            raise ApplicationError(
-                f"BACKLOG_IMPORT_TOO_LARGE: {issue_count} issues encode to {len(encoded)} bytes"
-                f" (limit {MAXIMUM_ENCODED_IMPORT_SNAPSHOT_BYTES}); import fewer items"
-                " (--max-items) or one label (--label)",
-                type="BACKLOG_IMPORT_TOO_LARGE",
-                non_retryable=True,
-            )
-        return {
+        # NEW-215: the snapshot travels encoded (Temporal payload limit). The whole result is
+        # also the next step's input, so an import whose result is still too large fails
+        # here with counts instead of a Temporal payload error.
+        result = {
             **payload,
             "status": "IMPORTED_READ_ONLY",
             "snapshot_encoding": IMPORT_SNAPSHOT_ENCODING,
-            "snapshot_encoded": encoded,
+            "snapshot_encoded": encode_import_snapshot(snapshot.model_dump(mode="json")),
             "issue_count": issue_count,
             "existing_pr_count": sum(
                 pull_request.state == "OPEN"
@@ -392,6 +381,29 @@ class GitHubActivityHandler:
                 for pull_request in repository.pull_requests
             ),
         }
+        size = len(json.dumps(result, separators=(",", ":"), default=str).encode())
+        if size > MAXIMUM_IMPORT_RESULT_BYTES:
+            raise ApplicationError(
+                f"BACKLOG_IMPORT_TOO_LARGE: {issue_count} issues encode to a {size}-byte"
+                f" result (limit {MAXIMUM_IMPORT_RESULT_BYTES}); import fewer items"
+                " (--max-items) or one label (--label)",
+                type="BACKLOG_IMPORT_TOO_LARGE",
+                non_retryable=True,
+            )
+        return result
+
+    def _open_issues(self, repository: str, label: str | None) -> list[dict[str, Any]]:
+        """NEW-215: the open issues an import selects from.
+
+        GitHub lists newest first and at most _OPEN_ISSUE_LIST_LIMIT, so when the list is
+        full the oldest issues may be missing. Then list again oldest first, so the
+        oldest-first selection sees them. A repository below the limit is listed once,
+        as before."""
+        scope: dict[str, Any] = {"label": label} if label is not None else {}
+        listed = self.broker.list_open_issues(repository, **scope)
+        if len(listed) < _OPEN_ISSUE_LIST_LIMIT:
+            return listed
+        return self.broker.list_open_issues(repository, **scope, oldest_first=True)
 
     @staticmethod
     def _issue_snapshot(repository: str, value: dict[str, Any]) -> GitHubIssueSnapshot:
@@ -480,6 +492,10 @@ class GitHubActivityHandler:
     @staticmethod
     def _optional_timestamp(value: object) -> datetime | None:
         return GitHubActivityHandler._timestamp(value) if value else None
+
+
+# The `gh issue list --limit` of GitHubCliClient.list_open_issues.
+_OPEN_ISSUE_LIST_LIMIT = 1000
 
 
 def _oldest_first_selection(

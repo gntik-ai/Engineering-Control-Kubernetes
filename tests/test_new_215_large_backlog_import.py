@@ -79,6 +79,7 @@ class _Broker:
     def __init__(self, issues: list[dict[str, Any]]) -> None:
         self.issues = issues
         self.labels: list[str | None] = []
+        self.listings: list[bool] = []
 
     def preflight(self, repositories: tuple[str, ...]) -> None:
         assert repositories == (REPOSITORY,)
@@ -89,13 +90,19 @@ class _Broker:
     def branch_commit(self, repository: str, branch: str) -> dict[str, str]:
         return {"sha": HEAD_SHA, "tree": "f" * 40}
 
-    def list_open_issues(self, repository: str, label: str | None = None) -> list[dict[str, Any]]:
+    def list_open_issues(
+        self, repository: str, label: str | None = None, *, oldest_first: bool = False
+    ) -> list[dict[str, Any]]:
+        # Like `gh issue list --limit 1000`: newest first unless sorted oldest first.
         self.labels.append(label)
-        return [
+        self.listings.append(oldest_first)
+        scoped = [
             issue
             for issue in self.issues
             if label is None or label in {item["name"] for item in issue["labels"]}
         ]
+        ordered = sorted(scoped, key=lambda issue: issue["number"], reverse=not oldest_first)
+        return ordered[:1000]
 
     def list_repository_pull_requests(self, repository: str) -> list[dict[str, Any]]:
         return []
@@ -363,3 +370,54 @@ async def test_an_unscoped_import_workflow_replays_and_a_bad_label_runs_nothing(
         _recording_import_steps(refused),
     )
     assert failed is None and refused == []
+
+
+async def test_a_full_newest_first_list_is_relisted_oldest_first(tmp_path: Path) -> None:
+    # 1,200 open: GitHub's newest-first list stops at 1,000 (#201-1200), so the activity
+    # lists again oldest first and keeps #1-500, never #701-1200.
+    broker = _Broker([_issue(number, f"Issue {number}.") for number in range(1200, 0, -1)])
+    imported = await _github(tmp_path, broker).handle(
+        "backlog.github_import",
+        {"backlog_campaign_id": CAMPAIGN_ID, "project": "gntik-ui", "maximum_items": 500},
+    )
+    assert broker.listings == [False, True]
+    snapshot = decode_import_snapshot(imported)
+    numbers = sorted(issue["number"] for issue in snapshot["repositories"][0]["issues"])
+    assert numbers == list(range(1, 501))
+
+
+async def test_a_short_list_is_read_once_in_the_default_order(tmp_path: Path) -> None:
+    broker = _Broker([_issue(number, f"Issue {number}.") for number in range(40, 0, -1)])
+    imported = await _github(tmp_path, broker).handle(
+        "backlog.github_import",
+        {"backlog_campaign_id": CAMPAIGN_ID, "project": "gntik-ui", "maximum_items": 500},
+    )
+    assert broker.listings == [False]
+    snapshot = decode_import_snapshot(imported)
+    assert [issue["number"] for issue in snapshot["repositories"][0]["issues"]] == list(
+        range(40, 0, -1)
+    )
+
+
+def test_a_stream_declaring_a_huge_dictionary_is_refused_within_the_memory_limit() -> None:
+    import lzma
+    import struct
+    import zlib
+
+    stream = bytearray(
+        lzma.compress(
+            b"{}", format=lzma.FORMAT_XZ, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 4096}]
+        )
+    )
+    header_size = (stream[12] + 1) * 4
+    header = stream[12 : 12 + header_size]
+    position = header.index(bytes([0x21, 0x01])) + 2  # LZMA2 filter, 1 property byte
+    header[position] = 40  # the largest dictionary-size code (4 GiB - 1)
+    header[-4:] = struct.pack("<I", zlib.crc32(bytes(header[:-4])))
+    stream[12 : 12 + header_size] = header
+    payload = {
+        "snapshot_encoding": IMPORT_SNAPSHOT_ENCODING,
+        "snapshot_encoded": base64.b64encode(bytes(stream)).decode(),
+    }
+    with pytest.raises(ValueError):
+        decode_import_snapshot(payload)

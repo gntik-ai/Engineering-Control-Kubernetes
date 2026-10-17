@@ -241,15 +241,21 @@ def issue_label_from_query(issue_query: str) -> str | None:
 
 # NEW-215: the import snapshot crosses Temporal (GitHub activity result, persist activity
 # input) as xz+base64. 500 issues of ~14 KB are ~3.3 MB of JSON, over Temporal's 2 MB
-# payload limit, and ~0.83 MB encoded. Larger snapshots fail with BACKLOG_IMPORT_TOO_LARGE.
+# payload limit, and ~0.84 MB encoded. A result whose complete serialized payload exceeds
+# MAXIMUM_IMPORT_RESULT_BYTES fails with BACKLOG_IMPORT_TOO_LARGE.
 IMPORT_SNAPSHOT_ENCODING = "xz+base64"
-MAXIMUM_ENCODED_IMPORT_SNAPSHOT_BYTES = 1_500_000
+MAXIMUM_IMPORT_RESULT_BYTES = 1_000_000
 _MAXIMUM_DECODED_IMPORT_SNAPSHOT_BYTES = 64 * 1024 * 1024
+# Preset 6 (8 MiB dictionary) compresses these snapshots as well as preset 9 and decodes
+# within the decoder memory limit below, which also bounds a malformed stream's dictionary.
+_IMPORT_SNAPSHOT_XZ_PRESET = 6
+_IMPORT_SNAPSHOT_XZ_MEMLIMIT = 64 * 1024 * 1024
 
 
 def encode_import_snapshot(snapshot: dict[str, Any]) -> str:
     raw = json.dumps(snapshot, separators=(",", ":"), sort_keys=True).encode()
-    return base64.b64encode(lzma.compress(raw, preset=9)).decode("ascii")
+    compressed = lzma.compress(raw, format=lzma.FORMAT_XZ, preset=_IMPORT_SNAPSHOT_XZ_PRESET)
+    return base64.b64encode(compressed).decode("ascii")
 
 
 def decode_import_snapshot(payload: dict[str, Any]) -> Any:
@@ -262,10 +268,16 @@ def decode_import_snapshot(payload: dict[str, Any]) -> Any:
         return payload.get("snapshot")
     if payload.get("snapshot_encoding") != IMPORT_SNAPSHOT_ENCODING or not isinstance(encoded, str):
         raise ValueError("backlog import snapshot encoding is not supported")
-    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
-    raw = decompressor.decompress(
-        base64.b64decode(encoded, validate=True), max_length=_MAXIMUM_DECODED_IMPORT_SNAPSHOT_BYTES
+    decompressor = lzma.LZMADecompressor(
+        format=lzma.FORMAT_XZ, memlimit=_IMPORT_SNAPSHOT_XZ_MEMLIMIT
     )
+    try:
+        raw = decompressor.decompress(
+            base64.b64decode(encoded, validate=True),
+            max_length=_MAXIMUM_DECODED_IMPORT_SNAPSHOT_BYTES,
+        )
+    except lzma.LZMAError as error:
+        raise ValueError("backlog import snapshot cannot be decoded within its bounds") from error
     if not decompressor.eof:
         raise ValueError("backlog import snapshot is truncated or too large")
     return json.loads(raw)
