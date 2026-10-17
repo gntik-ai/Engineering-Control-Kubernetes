@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from engineering_control.engineering.backlog import ISSUE_LABEL_PATTERN
+from engineering_control.engineering.backlog import ISSUE_LABEL_PATTERN, valid_issue_label
 from engineering_control.models.enums import AuditLens, Project, RiskClass
 from engineering_control.projects import (
     GLOBAL_PROJECTS,
@@ -176,6 +176,11 @@ class GitHubBacklogImportRequest(APIModel):
     maximum_items: int = Field(default=500, ge=1, le=500)
     # NEW-215: import only the open issues carrying this one GitHub label.
     issue_label: str | None = Field(default=None, pattern=ISSUE_LABEL_PATTERN)
+
+    @field_validator("issue_label")
+    @classmethod
+    def _issue_label_is_listable(cls, value: str | None) -> str | None:
+        return valid_issue_label(value)
 
 
 class BacklogApprovalCandidateRequest(APIModel):

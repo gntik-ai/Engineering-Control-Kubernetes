@@ -217,12 +217,19 @@ ISSUE_QUERY_BASE = "state:open is:issue paired-repositories"
 _ISSUE_QUERY_LABEL = " label:"
 
 
+# The gh CLI broker refuses any argument equal to one of these (adapters/github/client.py
+# `_run`), so a label that spells one could never be listed; refuse it up front instead.
+_GH_PROHIBITED_TOKENS = frozenset({"secret", "environment", "variable", "collaborator"})
+
+
 def valid_issue_label(value: Any) -> str | None:
     """The validated label scope of an import, or None for an unscoped import."""
     if value is None:
         return None
     if not isinstance(value, str) or _ISSUE_LABEL.fullmatch(value) is None:
         raise ValueError("backlog import label is invalid")
+    if value.lower() in _GH_PROHIBITED_TOKENS:
+        raise ValueError("backlog import label is a word the GitHub broker prohibits")
     return value
 
 

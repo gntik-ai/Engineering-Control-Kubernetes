@@ -421,3 +421,49 @@ def test_a_stream_declaring_a_huge_dictionary_is_refused_within_the_memory_limit
     }
     with pytest.raises(ValueError):
         decode_import_snapshot(payload)
+
+
+class _RecordingRunner:
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    def run(self, executable: str, arguments: list[str], *, cwd: Path, **kwargs: Any) -> Any:
+        from engineering_control.adapters.command import CommandResult
+
+        assert executable == "gh"
+        if arguments[:2] == ["auth", "status"]:
+            return CommandResult(0, "", "")
+        if arguments[:2] == ["api", "user"]:
+            return CommandResult(0, '{"login":"fixture","type":"User"}', "")
+        if arguments[:2] == ["repo", "view"]:
+            return CommandResult(
+                0,
+                json.dumps({"nameWithOwner": REPOSITORY, "defaultBranchRef": {"name": "main"}}),
+                "",
+            )
+        assert arguments[:2] == ["issue", "list"]
+        self.commands.append(arguments)
+        return CommandResult(0, "[]", "")
+
+
+def test_the_real_broker_passes_a_label_and_the_oldest_first_sort_as_values(
+    tmp_path: Path,
+) -> None:
+    from engineering_control.adapters.github.client import GhCliBroker
+
+    runner = _RecordingRunner()
+    broker = GhCliBroker(runner, tmp_path, authenticated_home=tmp_path)  # type: ignore[arg-type]
+    assert broker.list_open_issues(REPOSITORY, label="batch:3", oldest_first=True) == []
+    assert broker.list_open_issues(REPOSITORY) == []
+    scoped, unscoped = runner.commands
+    assert scoped[scoped.index("--label") + 1] == "batch:3"
+    assert scoped[scoped.index("--search") + 1] == "sort:created-asc"
+    assert "--label" not in unscoped and "--search" not in unscoped
+
+
+@pytest.mark.parametrize("label", ["secret", "Environment", "variable", "collaborator"])
+def test_a_label_the_broker_would_refuse_is_refused_up_front(label: str) -> None:
+    with pytest.raises(ValidationError):
+        GitHubBacklogImportRequest.model_validate(
+            {"project": "gntik-ui", "import_filter": "all", "issue_label": label}
+        )
