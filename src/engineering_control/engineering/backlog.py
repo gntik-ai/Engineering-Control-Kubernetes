@@ -1157,8 +1157,10 @@ def _dependencies(issue: GitHubIssueSnapshot, text: str) -> tuple[str, ...]:
     for clause in _dependency_clauses(text):
         for match in _REFERENCE.finditer(clause):
             before = clause[match.start() - 1] if match.start() else " "
-            if match.group("repo") is None and (before.isalnum() or before in "-_/"):
-                continue  # "foo#12": an unknown prefix, not a reference to this repository
+            if before.isalnum() or before in "-_/":
+                # "foo#12" or "foo-falcone#12": an unknown repository prefix, not this
+                # repository's or falcone's issue.
+                continue
             slug = match.group("repo") or default_slug
             reference = f"gntik-ai/{slug}#{match.group('number')}"
             if reference != f"{issue.repository}#{issue.number}" and _REPOSITORY.fullmatch(

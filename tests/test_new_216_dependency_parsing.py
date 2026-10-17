@@ -97,6 +97,12 @@ def dependencies(body: str, number: int = 999) -> tuple[str, ...]:
         ("Requires: foo#12", ()),
         ("Depends on foo#12 and #13.", ("gntik-ai/falcone#13",)),
         ("## Depends on\n- unknown-repo#5", ()),
+        ("Requires: foo-falcone#12", ()),
+        ("## Depends on\n- unknown-falcone#5", ()),
+        (
+            "Depends on gntik-ai/falcone-charts#62 and (#940).",
+            ("gntik-ai/falcone#940", "gntik-ai/falcone-charts#62"),
+        ),
         (
             "## Dependencies\n\n- #937 (connections) and #940. Both are closed.\n"
             "- gntik-ai/falcone-charts#62 (hook).\nSomething else #99.",
