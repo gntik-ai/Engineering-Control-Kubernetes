@@ -2902,7 +2902,65 @@ class GitOpsGitHubHandler:
                 continue
             if excerpt:
                 excerpts[name] = excerpt
+        # NEW-218: CodeQL and other checks report findings only as check-run annotations;
+        # without them the CI-repair maker fixed blind.
+        for name, block in self._annotation_blocks(
+            repository, pull_request, names, deadline, attempts
+        ).items():
+            if name not in excerpts and len(excerpts) >= _MAX_EXCERPT_JOBS:
+                continue
+            excerpts[name] = _with_annotations(block, excerpts.get(name, ""))
         return excerpts
+
+    def _annotation_blocks(
+        self,
+        repository: str,
+        pull_request: dict[str, Any],
+        names: list[str],
+        deadline: float,
+        attempts: int,
+    ) -> dict[str, str]:
+        """NEW-218: bounded check-run annotations per regressed check (best effort).
+
+        One listing of the head commit's annotated failing runs, then one read per
+        regressed check, all within the same deadline and attempt budget as the logs.
+        """
+        sha = str(pull_request.get("headRefOid") or "")
+        if not names or not re.fullmatch(r"[a-f0-9]{40}", sha):
+            return {}
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1 or attempts >= _MAX_EXCERPT_ATTEMPTS:
+            return {}
+        attempts += 1
+        try:
+            runs = self.broker.annotated_check_runs(
+                repository, sha, timeout_seconds=min(15, remaining)
+            )
+        except (CommandFailure, GhCliPolicyError, OSError, subprocess.TimeoutExpired):
+            return {}
+        blocks: dict[str, str] = {}
+        for name in names:
+            run_id = runs.get(name)
+            if run_id is None:
+                continue
+            remaining = int(deadline - time.monotonic())
+            if (
+                len(blocks) >= _MAX_EXCERPT_JOBS
+                or attempts >= _MAX_EXCERPT_ATTEMPTS
+                or remaining < 1
+            ):
+                break
+            attempts += 1
+            try:
+                annotations = self.broker.check_run_annotations(
+                    repository, run_id, timeout_seconds=min(15, remaining)
+                )
+            except (CommandFailure, GhCliPolicyError, OSError, subprocess.TimeoutExpired):
+                continue
+            block = _annotation_block(annotations)
+            if block:
+                blocks[name] = block
+        return blocks
 
     def _require_baseline_write(self, repository: str, project: str) -> None:
         """gitops.pr_checks is a read step; its baseline writes pass the write policy,
@@ -3767,6 +3825,41 @@ _MAX_EXCERPT_ATTEMPTS = 10
 # 2 minutes and each read is capped at 15 s, so they finish within about 90 s of entry.
 _EXCERPT_DEADLINE_SECONDS = 75
 _JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
+
+
+# NEW-218: the annotation part of one check's excerpt when a log excerpt follows it.
+_ANNOTATION_BLOCK_CHARS = 1500
+_EXCERPT_CHARS = 4000
+
+
+def _annotation_block(annotations: list[dict[str, Any]]) -> str:
+    """NEW-218: check-run annotations as bounded, redacted text for the CI-repair maker."""
+    lines: list[str] = []
+    for item in annotations:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        start, end = item.get("start_line"), item.get("end_line")
+        where = path
+        if isinstance(start, int):
+            where += f":{start}" + (f"-{end}" if isinstance(end, int) and end != start else "")
+        level = str(item.get("level") or "")
+        title = str(item.get("title") or "")
+        message = " ".join(str(item.get("message") or "").split())
+        text = f"- {where} [{level}] " + (f"{title}: " if title else "") + message
+        lines.append(text[:500])
+    if not lines:
+        return ""
+    block = f"Check-run annotations ({len(lines)}):\n" + "\n".join(lines)
+    return str(SecretRedactor().redact_text(block).value)[:_EXCERPT_CHARS]
+
+
+def _with_annotations(block: str, log: str) -> str:
+    """NEW-218: annotations first, then as much of the log excerpt as still fits."""
+    if not log:
+        return block[:_EXCERPT_CHARS]
+    head = block[:_ANNOTATION_BLOCK_CHARS]
+    return (head + "\nLog excerpt:\n" + log)[:_EXCERPT_CHARS]
 
 
 def _excerpts(value: Any) -> dict[str, str]:

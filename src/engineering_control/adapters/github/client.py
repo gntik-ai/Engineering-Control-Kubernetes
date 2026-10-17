@@ -1021,6 +1021,93 @@ class GhCliBroker:
         ).stdout
         return failure_excerpt(raw)
 
+    def annotated_check_runs(
+        self, repository: str, sha: str, *, timeout_seconds: int = 15
+    ) -> dict[str, int]:
+        """NEW-218: failing check-run name -> ID for one commit, only for runs that carry
+        annotations (CodeQL and other annotation-only failures have no useful log).
+
+        Read-only and bounded; the caller's gate already preflighted this repository.
+        """
+        repository = self._repository(repository)
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            raise GhCliPolicyError("check-run commit is not an exact SHA")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    f"repos/{repository}/commits/{sha}/check-runs?per_page=100",
+                    "--jq",
+                    "[.check_runs[] | {id, name, conclusion, "
+                    "annotations: .output.annotations_count}]",
+                ],
+                max_output_bytes=CHECK_RUN_LISTING_BYTES,
+                timeout_seconds=timeout_seconds,
+            ).stdout,
+            "check runs",
+        )
+        runs: dict[str, int] = {}
+        for item in value if isinstance(value, list) else []:
+            if not isinstance(item, dict):
+                continue
+            conclusion = str(item.get("conclusion") or "").lower()
+            if conclusion not in _ANNOTATED_FAILURE_CONCLUSIONS:
+                continue
+            identifier, name, count = item.get("id"), item.get("name"), item.get("annotations")
+            if (
+                isinstance(identifier, int)
+                and identifier > 0
+                and isinstance(name, str)
+                and name
+                and isinstance(count, int)
+                and count > 0
+            ):
+                runs.setdefault(name[:200], identifier)
+        return runs
+
+    def check_run_annotations(
+        self, repository: str, check_run_id: int, *, timeout_seconds: int = 15
+    ) -> list[dict[str, Any]]:
+        """NEW-218: the first annotations of one check run, bounded (untrusted text)."""
+        repository = self._repository(repository)
+        if check_run_id < 1:
+            raise GhCliPolicyError("check-run ID is invalid")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    f"repos/{repository}/check-runs/{check_run_id}/annotations"
+                    f"?per_page={MAX_CHECK_RUN_ANNOTATIONS}",
+                    "--jq",
+                    "[.[] | {path, start_line, end_line, annotation_level, title, message}]",
+                ],
+                max_output_bytes=CHECK_RUN_ANNOTATION_BYTES,
+                timeout_seconds=timeout_seconds,
+            ).stdout,
+            "check-run annotations",
+        )
+        annotations: list[dict[str, Any]] = []
+        for item in value if isinstance(value, list) else []:
+            if not isinstance(item, dict):
+                continue
+            annotations.append(
+                {
+                    "path": str(item.get("path") or "")[:300],
+                    "start_line": item.get("start_line")
+                    if isinstance(item.get("start_line"), int)
+                    else None,
+                    "end_line": item.get("end_line")
+                    if isinstance(item.get("end_line"), int)
+                    else None,
+                    "level": str(item.get("annotation_level") or "")[:20],
+                    "title": str(item.get("title") or "")[:200],
+                    "message": str(item.get("message") or "")[:400],
+                }
+            )
+            if len(annotations) >= MAX_CHECK_RUN_ANNOTATIONS:
+                break
+        return annotations
+
     def create_baseline_branch(
         self, *, repository: str, branch: str, sha: str, change_binding: str
     ) -> None:
@@ -1406,6 +1493,12 @@ class GhCliBroker:
 
 # NEW-100: only the tail of a job log is read (failures and the final error are last).
 JOB_LOG_TAIL_BYTES = 2_000_000
+# NEW-218: check-run annotations for the CI-repair maker (CodeQL and similar checks
+# report findings only as annotations, never in a job log).
+CHECK_RUN_LISTING_BYTES = 500_000
+CHECK_RUN_ANNOTATION_BYTES = 200_000
+MAX_CHECK_RUN_ANNOTATIONS = 20
+_ANNOTATED_FAILURE_CONCLUSIONS = frozenset({"failure", "timed_out", "action_required"})
 _LOG_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[0-9:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAILURE_LINE = re.compile(
