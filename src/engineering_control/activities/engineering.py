@@ -45,6 +45,7 @@ from engineering_control.engineering.backlog import (
     issue_label_from_query,
     issue_query_for,
     plan_records,
+    resolve_openspec_dependencies,
     valid_issue_label,
 )
 from engineering_control.engineering.backlog_authority import (
@@ -571,6 +572,11 @@ class EngineeringActivityHandler:
             for repository in snapshot.repositories
             for issue in repository.issues
         ]
+        # NEW-216: OpenSpec change-id dependencies between issues of this import.
+        records = resolve_openspec_dependencies(
+            records,
+            [issue for repository in snapshot.repositories for issue in repository.issues],
+        )
         title_groups: dict[str, list[BacklogIssueRecord]] = {}
         for record in records:
             normalized = " ".join(re.findall(r"[a-z0-9]+", record.title.lower()))

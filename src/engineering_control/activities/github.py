@@ -26,6 +26,7 @@ from engineering_control.engineering.backlog import (
     GitHubPullRequestSnapshot,
     GitHubRepositoryBacklogSnapshot,
     encode_import_snapshot,
+    openspec_change_fields,
     valid_issue_label,
 )
 from engineering_control.projects import PROJECT_REPOSITORY_SLUGS, ProjectName
@@ -408,6 +409,7 @@ class GitHubActivityHandler:
     @staticmethod
     def _issue_snapshot(repository: str, value: dict[str, Any]) -> GitHubIssueSnapshot:
         body = str(value.get("body") or "")
+        change_id, change_dependencies = openspec_change_fields(body)
         labels = value.get("labels")
         assignees = value.get("assignees")
         comments = value.get("comments")
@@ -419,6 +421,8 @@ class GitHubActivityHandler:
             title=str(value["title"])[:300],
             body_excerpt=body[:6000],
             body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+            openspec_change_id=change_id,
+            openspec_depends_on=change_dependencies,
             state="OPEN",
             labels=tuple(
                 str(item.get("name", ""))[:120]
