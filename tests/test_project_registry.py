@@ -333,11 +333,13 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
     "src/engineering_control/dashboard/schemas.py": {
         "ActivityEventInput": ["f:@PROJECT_ALTERNATION@|platform"],
     },
+    # NEW-222: gntik-ui's R3 keyword exemptions are a single-project feature
     "src/engineering_control/engineering/backlog.py": {
         "<module>": [
             "f:@REPOSITORY_SLUG_ALTERNATION@",
             "f:@REPOSITORY_SLUG_ALTERNATION@",
             "f:@REPOSITORY_SLUG_ALTERNATION@",
+            "keys:(gntik-ui)",
         ],
     },
     # UI-kit repositories per project
@@ -787,6 +789,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "engineering.backlog:BACKLOG_REPOSITORIES": ["{REPOSITORIES}"],
     "engineering.backlog:BacklogApprovalBinding.project": ["enum:PROJECTS"],
     "engineering.backlog:GitHubBacklogImportSnapshot.project": ["enum:PROJECTS"],
+    "engineering.backlog:PROJECT_R3_KEYWORD_EXEMPTIONS": ["keys:(gntik-ui)"],
     "engineering.backlog:_ISSUE_URL": ["re:REPOSITORY_SLUGS"],
     "engineering.backlog:_REFERENCE": ["re:REPOSITORY_SLUGS"],
     "engineering.backlog:_REPOSITORY": ["re:REPOSITORY_SLUGS"],
