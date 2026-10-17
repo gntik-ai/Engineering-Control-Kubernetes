@@ -8,8 +8,9 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -24,6 +25,8 @@ from engineering_control.worktrees.hardened_git import (
     HardenedGitError,
     changeset_location,
     metadata_location,
+    needs_index,
+    private_index,
     seal_metadata,
     verify_local_objects,
 )
@@ -182,25 +185,37 @@ class GitWorktreeManager:
         except (HardenedGitError, OSError) as error:
             raise WorktreeError(str(error)) from error
 
-    @staticmethod
+    @contextmanager
+    def _indexed(self, location: GitLocation) -> Iterator[GitLocation]:
+        """NEW-221: ``location`` with a private index built from HEAD, for an operation of
+        several commands; the maker's own index is never read."""
+        if location.index_file is not None:
+            yield location
+            return
+        try:
+            with private_index(location) as indexed:
+                yield indexed
+        except HardenedGitError as error:
+            raise WorktreeError(str(error)) from error
+
     def _git_process(
+        self,
         location: GitLocation,
         args: list[str],
         *,
         timeout: int = 300,
-        index_file: Path | None = None,
         stdin: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        environment = location.environment()
-        if index_file is not None:
-            environment["GIT_INDEX_FILE"] = str(index_file)
+        if location.work_tree is not None and location.index_file is None and needs_index(args):
+            with self._indexed(location) as indexed:
+                return self._git_process(indexed, args, timeout=timeout, stdin=stdin)
         return subprocess.run(  # noqa: S603 - argument vector only; shell is never used
             ["git", *location.arguments(args)],  # noqa: S607
             cwd=location.work_tree or location.git_dir,
             check=False,
             capture_output=True,
             timeout=timeout,
-            env=environment,
+            env=location.environment(),
             input=stdin,
         )
 
@@ -210,13 +225,10 @@ class GitWorktreeManager:
         args: list[str],
         *,
         timeout: int = 300,
-        index_file: Path | None = None,
         stdin: bytes | None = None,
     ) -> bytes:
         """Raw stdout (NUL-delimited records, unquoted non-ASCII paths)."""
-        result = self._git_process(
-            location, args, timeout=timeout, index_file=index_file, stdin=stdin
-        )
+        result = self._git_process(location, args, timeout=timeout, stdin=stdin)
         if result.returncode:
             error = str(SecretRedactor().redact_text(os.fsdecode(result.stderr)).value)
             raise WorktreeError(f"Git command failed ({result.returncode}): {error[-4000:]}")
@@ -228,9 +240,8 @@ class GitWorktreeManager:
         args: list[str],
         *,
         timeout: int = 300,
-        index_file: Path | None = None,
     ) -> str:
-        result = self._git_process(location, args, timeout=timeout, index_file=index_file)
+        result = self._git_process(location, args, timeout=timeout)
         stdout = result.stdout.decode("utf-8", "surrogateescape")
         if result.returncode:
             output = stdout + result.stderr.decode("utf-8", "replace")
@@ -927,22 +938,17 @@ class GitWorktreeManager:
             # inside the maker's nested repository. update-index only hashes the paths it
             # is given and records a gitlink's commit as data. The archive commit (parent:
             # HEAD) holds every tracked and untracked, not ignored, file.
-            with tempfile.TemporaryDirectory(prefix="archive-index-") as scratch:
-                index = Path(scratch) / "index"
-                self._git(location, ["read-tree", "HEAD"], index_file=index)
-                paths = self._git_bytes(location, ["ls-files", "-z"], index_file=index)
+            with self._indexed(location) as indexed:
+                paths = self._git_bytes(indexed, ["ls-files", "-z"])
                 paths += self._git_bytes(
-                    location,
-                    ["ls-files", "-z", "--others", "--exclude-standard"],
-                    index_file=index,
+                    indexed, ["ls-files", "-z", "--others", "--exclude-standard"]
                 )
                 self._git_bytes(
-                    location,
+                    indexed,
                     ["update-index", "--add", "--remove", "-z", "--stdin"],
-                    index_file=index,
                     stdin=paths,
                 )
-                tree = self._git(location, ["write-tree"], index_file=index)
+                tree = self._git(indexed, ["write-tree"])
                 archived = self._git(
                     location,
                     [
@@ -961,6 +967,10 @@ class GitWorktreeManager:
             self._git(location, ["update-ref", f"{prefix}-worktree", archived])
         self._git(location, ["reset", "--hard", destination])
         self._git(location, ["clean", "-ffdx"])
+        # The maker's next attempt uses its real index: rebuild it from the reset HEAD.
+        self._git(
+            replace(location, index_file=location.git_dir / "index"), ["read-tree", destination]
+        )
         if self._dirty(location) or self._git(location, ["rev-parse", "HEAD"]) != destination:
             raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
@@ -991,9 +1001,10 @@ class GitWorktreeManager:
             raise WorktreeError(
                 f"snapshot inspection SHA mismatch: expected {expected_sha}, got {actual}"
             )
-        if self._dirty(location):
-            raise WorktreeError("snapshot inspection found a dirty protected worktree")
-        tracked = self._git(location, ["ls-files", "-z"])
+        with self._indexed(location) as indexed:
+            if self._dirty(indexed):
+                raise WorktreeError("snapshot inspection found a dirty protected worktree")
+            tracked = self._git(indexed, ["ls-files", "-z"])
         files = [item for item in tracked.split("\0") if item]
         canonical = json.dumps(files, separators=(",", ":"), ensure_ascii=True).encode()
         return {
@@ -1083,7 +1094,12 @@ class GitWorktreeManager:
             raise WorktreeError("change evidence escaped the bounded worktree root")
         if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
             raise ValueError("change evidence base must be a full Git SHA")
-        location = self._worktree_git(resolved)
+        with self._indexed(self._worktree_git(resolved)) as location:
+            return self._change_evidence(resolved, location, base_sha=base_sha)
+
+    def _change_evidence(
+        self, resolved: Path, location: GitLocation, *, base_sha: str
+    ) -> tuple[dict[str, object], str]:
         diff_options = ["--no-color", "--no-ext-diff", "--no-textconv", SUBMODULES]
         self._git(location, ["cat-file", "-e", f"{base_sha}^{{commit}}"])
         self._git(location, ["diff", *diff_options, "--check", base_sha, "--"])

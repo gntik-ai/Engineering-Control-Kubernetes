@@ -25,8 +25,13 @@ So every privileged invocation built here:
   automatic gc and every transport but HTTPS when asked for, and never looks inside a
   nested repository (``SUBMODULES``), in a minimal environment.
 
-What the maker still writes is data Git parses: refs, the index and the worktree files,
-whose attributes can only name drivers that the sealed configuration never defines, and
+The maker's index is never read: its entries (stat data matching a file, but another blob)
+and its cache-tree (a directory recorded as unchanged) would make Git skip changes. Every
+command that reads an index uses a private one, built from HEAD by Git and refreshed once
+(``private_index``).
+
+What the maker still writes is data Git parses: refs and the worktree files, whose
+attributes can only name drivers that the sealed configuration never defines, and
 objects. Git does not check an object's content against its name when it reads one, and a
 local object shadows the canonical mirror's (alternate) copy, so every local loose object
 and pack is verified first (``verify_local_objects``): a maker cannot make validation read
@@ -43,9 +48,11 @@ import secrets
 import shutil
 import stat
 import subprocess
+import tempfile
 import zlib
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID
 
@@ -129,6 +136,8 @@ class GitLocation:
     git_dir: Path
     common_dir: Path
     work_tree: Path | None = None
+    # A private index (``private_index``); the maker's own index is never read.
+    index_file: Path | None = None
 
     def arguments(self, arguments: Sequence[str], *, https: bool = False) -> list[str]:
         """Git's argument vector (without the executable): hardening, then ``arguments``."""
@@ -166,7 +175,76 @@ class GitLocation:
             environment["GIT_COMMON_DIR"] = str(self.common_dir)
         if self.work_tree is not None:
             environment["GIT_WORK_TREE"] = str(self.work_tree)
+        if self.index_file is not None:
+            environment["GIT_INDEX_FILE"] = str(self.index_file)
         return environment
+
+
+# Git subcommands that never read an index (any other one gets a private index).
+_INDEX_FREE_COMMANDS = frozenset(
+    {
+        "branch",
+        "cat-file",
+        "commit-tree",
+        "fetch",
+        "for-each-ref",
+        "log",
+        "ls-tree",
+        "merge-base",
+        "push",
+        "rev-list",
+        "rev-parse",
+        "show",
+        "show-ref",
+        "symbolic-ref",
+        "update-ref",
+        "verify-pack",
+        "worktree",
+    }
+)
+
+
+def needs_index(arguments: Sequence[str]) -> bool:
+    """Whether the Git command line may read (or write) an index: any subcommand outside
+    ``_INDEX_FREE_COMMANDS``, or an index revision (``:path``, ``:0:path``)."""
+    items = list(arguments)
+    position = 0
+    while position < len(items) and items[position].startswith("-"):
+        position += 2 if items[position] in {"-c", "-C"} else 1
+    if position >= len(items) or items[position] not in _INDEX_FREE_COMMANDS:
+        return True
+    return any(item.startswith(":") for item in items[position + 1 :])
+
+
+def _run(
+    location: GitLocation, arguments: Sequence[str], *, timeout: int = 900
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+        ["git", *location.arguments(arguments)],  # noqa: S607
+        cwd=location.work_tree or location.git_dir,
+        check=False,
+        capture_output=True,
+        timeout=timeout,
+        env=location.environment(),
+    )
+
+
+@contextmanager
+def private_index(location: GitLocation) -> Iterator[GitLocation]:
+    """``location`` with a private index: HEAD's entries and cache-tree, as Git builds
+    them from the (verified) objects, then refreshed once from the worktree files. Changes
+    a maker staged but did not commit therefore show as worktree changes or untracked
+    files, never through the maker's index."""
+    if location.work_tree is None:
+        raise HardenedGitError("only a worktree location has an index")
+    with tempfile.TemporaryDirectory(prefix="hermes-index-") as scratch:
+        indexed = replace(location, index_file=Path(scratch) / "index")
+        built = _run(indexed, ["read-tree", "HEAD"])
+        if built.returncode:
+            raise HardenedGitError("a private index could not be built from HEAD")
+        # Exit 1 only reports files that differ from HEAD; the stat data is stored anyway.
+        _run(indexed, ["update-index", "-q", "--ignore-submodules", "--refresh"])
+        yield indexed
 
 
 def sealed_configuration(origin: Path) -> bytes:
@@ -399,7 +477,11 @@ def _file_key(info: os.stat_result) -> tuple[int, int, int, int]:
 
 
 def _verify_loose_object(path: Path, name: str) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    current = _lstat(path)
+    if current is None or not stat.S_ISREG(current.st_mode):
+        # A FIFO or device here would block or never end a read.
+        raise HardenedGitError(f"object {name} is not a regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
@@ -433,16 +515,8 @@ def _verify_pack(metadata: Path, index: Path) -> None:
     index_key, pack_key = _file_key(index_info), _file_key(pack_info)
     if _VERIFIED.get(str(index)) == index_key and _VERIFIED.get(str(pack)) == pack_key:
         return
-    location = metadata_location(metadata)
     # index-pack --verify (through verify-pack) re-hashes every object in the pack.
-    result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
-        ["git", *location.arguments(["verify-pack", str(index)])],  # noqa: S607
-        cwd=metadata,
-        check=False,
-        capture_output=True,
-        timeout=900,
-        env=location.environment(),
-    )
+    result = _run(metadata_location(metadata), ["verify-pack", str(index)])
     if result.returncode:
         raise HardenedGitError(f"pack {index.stem} does not verify")
     _VERIFIED[str(index)] = index_key

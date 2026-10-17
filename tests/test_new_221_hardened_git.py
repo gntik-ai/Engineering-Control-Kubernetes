@@ -8,9 +8,11 @@ marker file is never created) and the results are still those of a clean reposit
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
+import threading
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +22,7 @@ from test_worktrees import GIT, create_mirror
 from engineering_control.worktrees.hardened_git import (
     HardenedGitError,
     changeset_location,
+    needs_index,
     seal_metadata,
     sealed_configuration,
     verify_metadata,
@@ -199,7 +202,6 @@ def test_a_nested_repository_is_never_entered(tmp_path: Path) -> None:
     (nested / ".gitattributes").write_text("* filter=planted\n", encoding="utf-8")
     _git(nested, "-c", "filter.planted.clean=cat", "add", "-A")
     _git(nested, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "n")
-    _config(nested / ".git" / "config", ("filter.planted.clean", str(program)))
     _config(nested / ".git" / "config", ("core.fsmonitor", str(program)))
     # The maker records it as a gitlink and asks every submodule to be inspected.
     (allocation.path / ".gitmodules").write_text(
@@ -207,14 +209,18 @@ def test_a_nested_repository_is_never_entered(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     _git(allocation.path, "add", ".gitmodules", "vendor/nested")
+    _git(allocation.path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "g")
+    # Planted after the maker's own (unhardened) commit, which would itself run it.
+    _config(nested / ".git" / "config", ("filter.planted.clean", str(program)))
     (nested / "data").write_text("dirty inside the nested repository\n", encoding="utf-8")
 
     evidence, _diff = manager.change_evidence(allocation.path, base_sha=base)
     dirty = manager.is_dirty(allocation.path)
 
     assert not marker.exists()
-    assert dirty is True
-    # The gitlink itself stays visible to validation ("all" would hide it).
+    # Changes inside the nested repository's own worktree are never inspected (that would
+    # mean running Git there); the committed gitlink stays visible ("all" would hide it).
+    assert dirty is False
     assert "vendor/nested" in evidence["changed_paths"]
 
 
@@ -480,3 +486,120 @@ def test_deployment_pin_ancestry_ignores_a_redirected_git_file(tmp_path: Path) -
 
     assert handler._is_ancestor(allocation.path, base) is True  # noqa: SLF001
     assert handler._is_ancestor(allocation.path, decoy_pin) is False  # noqa: SLF001
+
+
+def _forge_cache_tree(index: Path, directory: bytes, tree: str) -> None:
+    """Rewrite the cache-tree (TREE extension) record of ``directory`` to ``tree`` and
+    recompute the index checksum, as a maker could: the entries stay honest."""
+    data = bytearray(index.read_bytes())
+    version = int.from_bytes(data[4:8], "big")
+    offset = 12
+    for _ in range(int.from_bytes(data[8:12], "big")):
+        flags = int.from_bytes(data[offset + 60 : offset + 62], "big")
+        extended = 2 if version >= 3 and flags & 0x4000 else 0
+        offset += (62 + extended + (flags & 0xFFF) + 8) // 8 * 8
+    end = len(data) - 20
+    while offset < end:
+        size = int.from_bytes(data[offset + 4 : offset + 8], "big")
+        if data[offset : offset + 4] == b"TREE":
+            position = offset + 8
+            while position < offset + 8 + size:
+                nul = data.index(b"\0", position)
+                path = bytes(data[position:nul])
+                newline = data.index(b"\n", nul)
+                entries = int(data[nul + 1 : newline].split(b" ")[0])
+                position = newline + 1
+                if entries < 0:
+                    continue
+                if path == directory:
+                    data[position : position + 20] = bytes.fromhex(tree)
+                    data[end:] = hashlib.sha1(data[:end]).digest()  # noqa: S324 - Git's index
+                    index.write_bytes(bytes(data))
+                    return
+                position += 20
+        offset += 8 + size
+    raise AssertionError(f"no cache-tree record for {directory!r}")
+
+
+def test_a_forged_index_cache_tree_cannot_hide_committed_changes(tmp_path: Path) -> None:
+    """The maker's index is never read: a cache-tree recording a changed directory as
+    unchanged made Git skip it in status, diff and diff --check (codex review 2)."""
+    manager, allocation, _metadata, _base, _marker = _setup(tmp_path)
+    worktree = allocation.path
+    (worktree / "d").mkdir()
+    (worktree / "d" / "f").write_text("before\n", encoding="utf-8")
+    _git(worktree, "add", "-A")
+    _git(worktree, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first")
+    first = _git(worktree, "rev-parse", "HEAD").strip()
+    (worktree / "d" / "f").write_text("committed change\n", encoding="utf-8")
+    _git(worktree, "add", "-A")
+    _git(worktree, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "second")
+    _git(worktree, "write-tree")
+    index = worktree / _git(worktree, "rev-parse", "--git-path", "index").strip()
+    _forge_cache_tree(index, b"d", _git(worktree, "rev-parse", f"{first}:d").strip())
+    # The forgery works on Git reading the maker's index.
+    assert _git(worktree, "diff", "--name-only", first, "--") == ""
+
+    evidence, diff = manager.change_evidence(worktree, base_sha=first)
+
+    assert evidence["changed_paths"] == ["d/f"]
+    assert "+committed change" in diff
+    assert manager.is_dirty(worktree) is False
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_index_flags_a_maker_sets_cannot_hide_an_uncommitted_change(
+    tmp_path: Path, flag: str
+) -> None:
+    manager, allocation, _metadata, base, _marker = _setup(tmp_path)
+    _git(allocation.path, "update-index", flag, "README.md")
+    (allocation.path / "README.md").write_text("hidden from the maker index\n", encoding="utf-8")
+    assert _git(allocation.path, "status", "--porcelain") == ""
+
+    assert manager.is_dirty(allocation.path) is True
+    evidence, _ = manager.change_evidence(allocation.path, base_sha=base)
+    assert evidence["changed_paths"] == ["README.md"]
+
+
+def test_a_fifo_in_the_object_store_is_refused_without_blocking(tmp_path: Path) -> None:
+    """A FIFO named like a loose object must not block verification (codex review 2)."""
+    manager, allocation, metadata, _base, _marker = _setup(tmp_path)
+    directory = metadata / "objects" / "aa"
+    directory.mkdir(exist_ok=True)
+    fifo = directory / ("b" * 38)
+    os.mkfifo(fifo)
+    outcome: dict[str, str] = {}
+
+    def verify() -> None:
+        try:
+            manager.is_dirty(allocation.path)
+        except WorktreeError as error:
+            outcome["error"] = str(error)
+
+    worker = threading.Thread(target=verify, daemon=True)
+    worker.start()
+    worker.join(60)
+    if worker.is_alive():
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(60)
+        pytest.fail("object verification blocked on a FIFO")
+    assert "not a regular file" in outcome["error"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["rev-parse", "HEAD"], False),
+        (["-c", "user.name=x", "show", "-s", "HEAD"], False),
+        (["rev-parse", ":README.md"], True),
+        (["cat-file", "-p", ":0:README.md"], True),
+        (["status", "--porcelain=v1"], True),
+        (["-C", "elsewhere", "diff-index", "HEAD"], True),
+        (["describe", "--dirty"], True),
+        ([], True),
+    ],
+)
+def test_only_known_index_free_commands_skip_the_private_index(
+    arguments: list[str], expected: bool
+) -> None:
+    assert needs_index(arguments) is expected

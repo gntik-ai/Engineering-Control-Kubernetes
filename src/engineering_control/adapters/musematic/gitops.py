@@ -9,7 +9,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from engineering_control.adapters.command import SafeCommandRunner
-from engineering_control.worktrees.hardened_git import SUBMODULES, GitLocation
+from engineering_control.worktrees.hardened_git import (
+    SUBMODULES,
+    GitLocation,
+    needs_index,
+    private_index,
+)
 
 
 class MusematicPromotion(BaseModel):
@@ -62,6 +67,15 @@ class MusematicGitOpsAdapter:
         if self.git_location is None:
             return self.runner.run("git", list(arguments), cwd=repository).stdout
         location = self.git_location(repository)
+        if needs_index(arguments):
+            # NEW-221: a private index from HEAD, never the maker's own.
+            with private_index(location) as indexed:
+                return self.runner.run(
+                    "git",
+                    indexed.arguments(arguments),
+                    cwd=indexed.work_tree or repository,
+                    environment=indexed.environment(),
+                ).stdout
         return self.runner.run(
             "git",
             location.arguments(arguments),

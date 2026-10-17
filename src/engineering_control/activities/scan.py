@@ -16,7 +16,8 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -102,6 +103,8 @@ from engineering_control.worktrees.hardened_git import (
     GitLocation,
     HardenedGitError,
     changeset_location,
+    needs_index,
+    private_index,
 )
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
@@ -449,10 +452,12 @@ class ScanActivityHandler(UiPlanScanSteps):
 
     def _apply_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = PromotionPlan.model_validate(payload.get("promotion_plan"))
+        stack = ExitStack()
         try:
             worktree = self._promotion_worktree(plan)
-            # NEW-221: the ChangeSet worktree is maker-writable; never let Git discover it.
-            location = self._changeset_git(worktree)
+            # NEW-221: the ChangeSet worktree is maker-writable; never let Git discover it,
+            # and use a private index (the maker's is rebuilt from the new HEAD afterwards).
+            location = stack.enter_context(self._committing(worktree))
 
             def git(*arguments: str) -> str:
                 return self.promotion_runner.run(
@@ -543,6 +548,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "error_type": type(error).__name__,
                 "worktree_preserved": True,
             }
+        finally:
+            stack.close()
 
     def _promotion_worktree(self, plan: PromotionPlan) -> Path:
         root = self.settings.worktree_root.resolve()
@@ -1874,12 +1881,50 @@ class ScanActivityHandler(UiPlanScanSteps):
         except (HardenedGitError, OSError) as error:
             raise WorktreeError(str(error)) from error
 
-    def _git(self, worktree: Path, arguments: list[str], *, timeout_seconds: int = 300) -> str:
+    @contextmanager
+    def _committing(self, worktree: Path) -> Iterator[GitLocation]:
+        """NEW-221: a private index for a sequence that stages and commits as this identity;
+        the maker's real index (never read) is then rebuilt from the resulting HEAD."""
+        location = self._changeset_git(worktree)
+        try:
+            with private_index(location) as indexed:
+                yield indexed
+        except HardenedGitError as error:
+            raise WorktreeError(str(error)) from error
+        finally:
+            # Only for the maker's next attempt (Hermes never reads that index), so a
+            # failure here neither blocks nor masks the outcome; the next reset rebuilds it.
+            with contextlib.suppress(CommandFailure, OSError):
+                self._git(
+                    worktree,
+                    ["read-tree", "HEAD"],
+                    location=replace(location, index_file=location.git_dir / "index"),
+                )
+
+    def _git(
+        self,
+        worktree: Path,
+        arguments: list[str],
+        *,
+        timeout_seconds: int = 300,
+        location: GitLocation | None = None,
+    ) -> str:
         root = self.settings.worktree_root.resolve()
         if worktree.resolve().is_relative_to(root):
             # NEW-221: a ChangeSet worktree (or snapshot) is maker-writable: Git must not
-            # discover its repository, configuration or hooks from it.
-            location = self._changeset_git(worktree)
+            # discover its repository, configuration or hooks from it, nor read its index.
+            location = location or self._changeset_git(worktree)
+            if location.index_file is None and needs_index(arguments):
+                try:
+                    with private_index(location) as indexed:
+                        return self._git(
+                            worktree,
+                            arguments,
+                            timeout_seconds=timeout_seconds,
+                            location=indexed,
+                        )
+                except HardenedGitError as error:
+                    raise WorktreeError(str(error)) from error
             return self.git_runner.run(
                 "git",
                 location.arguments(arguments),
@@ -2082,17 +2127,19 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         commit = None
         if changed:
-            self._git(worktree, ["add", "--", *changed])
-            self._git(
-                worktree,
-                [
-                    "commit",
-                    "--quiet",
-                    "--no-verify",
-                    "-m",
-                    "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
-                ],
-            )
+            with self._committing(worktree) as location:
+                self._git(worktree, ["add", "--", *changed], location=location)
+                self._git(
+                    worktree,
+                    [
+                        "commit",
+                        "--quiet",
+                        "--no-verify",
+                        "-m",
+                        "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
+                    ],
+                    location=location,
+                )
             commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
         prepared = self._prepare_toolchain(payload)
         if prepared.get("status") == "BLOCKED":
@@ -2219,13 +2266,15 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         before = self._git(source, ["rev-parse", "HEAD"]).strip()
         changed = sorted(rewrites)
+        committing = ExitStack()
+        location = committing.enter_context(self._committing(source))
         try:
             for path, _, updated in rewrites.values():
                 path.write_bytes(updated)
             if sorted(self._git_status(source, ignored=False)) != changed:
                 raise ValueError("pin convergence changed files outside its configured files")
             name, email = self._PIN_IDENTITY
-            self._git(source, ["add", "--", *changed])
+            self._git(source, ["add", "--", *changed], location=location)
             self._git(
                 source,
                 [
@@ -2240,12 +2289,15 @@ class ScanActivityHandler(UiPlanScanSteps):
                     f"chore(ci): pin {evidence['deployment_repository']} to "
                     f"{deployment_head[:12]} (Hermes pin convergence)",
                 ],
+                location=location,
             )
         except (OSError, ValueError, CommandFailure):
             for path, original, _ in rewrites.values():
                 path.write_bytes(original)
-            self._git(source, ["reset", "--quiet", "--", *changed])
+            self._git(source, ["reset", "--quiet", "--", *changed], location=location)
             raise
+        finally:
+            committing.close()
         commit = self._git(source, ["rev-parse", "HEAD"]).strip()
         parent = self._git(source, ["rev-parse", "HEAD^"]).strip()
         # Exactly the pin lines, one removed and one added each, nothing else committed.

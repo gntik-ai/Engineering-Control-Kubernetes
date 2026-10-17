@@ -10,6 +10,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import UUID
@@ -66,6 +67,8 @@ from engineering_control.worktrees.hardened_git import (
     GitLocation,
     HardenedGitError,
     changeset_location,
+    needs_index,
+    private_index,
 )
 
 _T = TypeVar("_T")
@@ -725,6 +728,10 @@ class DeliveryActivityHandler:
                 if fetched != result.merge_tree_sha:
                     raise ValueError("final merge tree changed during synchronization")
                 self._git(location, "reset", "--hard", result.merge_sha)
+                # The reset used a private index; the worktree's own one follows the new HEAD.
+                self._git(
+                    replace(location, index_file=location.git_dir / "index"), "read-tree", "HEAD"
+                )
                 final_head = self._git(location, "rev-parse", "HEAD").strip()
                 final_status = self._git(location, "status", "--porcelain=v1", SUBMODULES)
                 if final_head != result.merge_sha or final_status:
@@ -1200,6 +1207,18 @@ class DeliveryActivityHandler:
         the broker's home and its own global configuration, which holds the credential
         helper; nothing else ever reads a global or system configuration."""
         assert location.work_tree is not None
+        if location.index_file is None and needs_index(arguments):
+            # NEW-221: never read the maker's index; a private one is built from HEAD.
+            try:
+                with private_index(location) as indexed:
+                    return self._git(
+                        indexed,
+                        *arguments,
+                        timeout_seconds=timeout_seconds,
+                        authenticated=authenticated,
+                    )
+            except HardenedGitError as error:
+                raise ValueError(str(error)) from error
         home = self.broker.authenticated_home if authenticated else None
         return self.runner.run(
             "git",

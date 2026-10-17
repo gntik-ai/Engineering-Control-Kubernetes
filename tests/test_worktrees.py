@@ -230,6 +230,9 @@ def test_whitespace_check_reports_problems_without_parsing_output(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
     git(["add", "-A"], worktree)
+    # NEW-221: privileged checks never read the maker's index, so what counts is committed
+    # (or a change to a committed file); a staged-only file is untracked to them.
+    git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "maker"], worktree)
 
     assert manager.whitespace_check_failed(worktree, base_sha=sha) is True
     with pytest.raises(ValueError, match="full Git SHA"):
