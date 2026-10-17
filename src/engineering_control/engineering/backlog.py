@@ -1095,15 +1095,17 @@ def _blank_asides(text: str) -> str:
 def _dependency_clause(rest: str) -> str:
     end = _DEPENDENCY_CLAUSE_END.search(_blank_asides(rest))
     clause = rest[: end.start()] if end else rest
-    # References inside an excluding aside ("#30 (not #31)") are not dependencies.
-    return _DEPENDENCY_PAREN_ASIDE.sub(
-        lambda match: (
-            " " * len(match.group(0))
-            if _DEPENDENCY_EXCLUSION.search(match.group(0))
-            else match.group(0)
-        ),
-        clause,
-    )
+    # References after an exclusion inside an aside are not dependencies: "#30 (not #31)"
+    # drops #31, while "(#30, not yet merged)" keeps the references before "not".
+    return _DEPENDENCY_PAREN_ASIDE.sub(_blank_excluded_tail, clause)
+
+
+def _blank_excluded_tail(match: re.Match[str]) -> str:
+    aside = match.group(0)
+    exclusion = _DEPENDENCY_EXCLUSION.search(aside)
+    if exclusion is None:
+        return aside
+    return aside[: exclusion.start()] + " " * (len(aside) - exclusion.start())
 
 
 def _negated(before: str) -> bool:

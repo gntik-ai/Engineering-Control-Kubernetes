@@ -115,6 +115,9 @@ def dependencies(body: str, number: int = 999) -> tuple[str, ...]:
         ("## Dependencies\n- Optional integration with #30 (can ship independently).", ()),
         # Review round 2: excluding asides and contrastive clauses.
         ("Depends on #30 (not #31).", ("gntik-ai/falcone#30",)),
+        # Review round 3: a negated status annotation keeps the references before it.
+        ("Depends on `add-not-found-page` (#30, not yet merged).", ("gntik-ai/falcone#30",)),
+        ("Depends on #30 (merged, unlike #31).", ("gntik-ai/falcone#30",)),
         (
             "Depends on #30 (merged in #29's release).",
             ("gntik-ai/falcone#29", "gntik-ai/falcone#30"),
