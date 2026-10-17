@@ -23,6 +23,7 @@ BASELINE_MARKER_CONTENT = (
     "# Lives only on hermes/ci-baseline/* branches; never merged.\n"
 )
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
+_SHA = re.compile(r"[a-f0-9]{40}")
 STAGING_GITOPS_MARKER = re.compile(
     r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
 )
@@ -909,6 +910,98 @@ class GhCliBroker:
             parts = entry.split("\t")
             if len(parts) != 3 or not parts[0] or parts[1] not in self.PULL_REQUEST_FILE_STATUSES:
                 raise GhCliPolicyError("pull request file listing is malformed")
+            changes.append({"path": parts[0], "status": parts[1], "previous_path": parts[2]})
+        return changes
+
+    # NEW-219: GitHub's compare API returns at most 300 files; a listing that reaches the
+    # cap may be truncated, so it is refused rather than evaluated.
+    COMPARE_FILE_CAP = 300
+
+    def pull_request_merge_preview(self, repository: str, number: int) -> dict[str, Any]:
+        """NEW-219: GitHub's test merge of one pull request into its current base:
+        ``mergeable`` (True, False or None while GitHub computes it), the test merge commit,
+        the head commit and whether the PR is merged already."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    f"repos/{repository}/pulls/{number}",
+                    "--jq",
+                    "{mergeable: .mergeable, merged: .merged, "
+                    "merge_commit_sha: .merge_commit_sha, head_sha: .head.sha}",
+                ]
+            ).stdout,
+            "pull request merge preview",
+        )
+        if not isinstance(value, dict) or value.get("mergeable") not in (True, False, None):
+            raise GhCliPolicyError("pull request merge preview is malformed")
+        for key in ("merge_commit_sha", "head_sha"):
+            sha = value.get(key)
+            if sha is not None and (not isinstance(sha, str) or not _SHA.fullmatch(sha)):
+                raise GhCliPolicyError("pull request merge preview SHA is invalid")
+        return {
+            "mergeable": value.get("mergeable"),
+            "merged": value.get("merged") is True,
+            "merge_commit_sha": value.get("merge_commit_sha"),
+            "head_sha": value.get("head_sha"),
+        }
+
+    def commit_parents(self, repository: str, sha: str) -> list[str]:
+        """NEW-219: the parent commits of one exact commit, in order."""
+        repository = self._batch(repository)
+        if not _SHA.fullmatch(sha):
+            raise GhCliPolicyError("commit SHA is invalid")
+        value = self._json(
+            self._run(
+                ["api", f"repos/{repository}/git/commits/{sha}", "--jq", "[.parents[].sha]"]
+            ).stdout,
+            "commit parents",
+        )
+        if not isinstance(value, list) or not all(
+            isinstance(parent, str) and _SHA.fullmatch(parent) for parent in value
+        ):
+            raise GhCliPolicyError("commit parents are malformed")
+        return list(value)
+
+    def compare_file_changes(
+        self, repository: str, base_sha: str, head_sha: str
+    ) -> list[dict[str, str]]:
+        """NEW-219: every file that differs between two exact commits, with GitHub's status
+        and, for a rename or copy, its previous path (the same shape as
+        ``pull_request_file_changes``)."""
+        repository = self._batch(repository)
+        if not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(head_sha):
+            raise GhCliPolicyError("compare SHA is invalid")
+        # The first line is the number of files GitHub returned, so a missing or null
+        # ``files`` (never an empty diff) and a lost entry are both refused.
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/compare/{base_sha}...{head_sha}?per_page=1",
+                "--jq",
+                'if (.files | type) == "array" then (.files | length | tostring), '
+                '(.files[] | [.filename, .status, (.previous_filename // "")] | @tsv) '
+                'else "INVALID" end',
+            ]
+        ).stdout
+        lines = raw.splitlines()
+        if not lines or not lines[0].isdigit():
+            raise GhCliPolicyError("compare file listing is malformed")
+        entries = [line for line in lines[1:] if line.strip()]
+        if len(entries) != int(lines[0]):
+            raise GhCliPolicyError("compare file listing is malformed")
+        if len(entries) >= self.COMPARE_FILE_CAP:
+            raise GhCliPolicyError("compare file listing reached the GitHub cap")
+        changes: list[dict[str, str]] = []
+        for entry in entries:
+            parts = entry.split("\t")
+            if len(parts) != 3 or not parts[0] or parts[1] not in self.PULL_REQUEST_FILE_STATUSES:
+                raise GhCliPolicyError("compare file listing is malformed")
+            if parts[1] in {"renamed", "copied"} and not parts[2]:
+                raise GhCliPolicyError("compare file listing names no rename source")
             changes.append({"path": parts[0], "status": parts[1], "previous_path": parts[2]})
         return changes
 

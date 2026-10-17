@@ -276,8 +276,9 @@ class ChangesetGatePolicy(ReconciliationModel):
         """True when any changed path (a rename's previous path included) is a package file
         that needs a changeset.
 
-        NEW-209: with ``manifests`` (package directory -> its package.json at the PR head,
-        None when unreadable or changed by the PR), a path needs no changeset when its
+        NEW-209: with ``manifests`` (package directory -> its package.json at the commit the
+        paths are judged at, None when unreadable; NEW-219 judges a merge's paths with the
+        merge result's manifests and with the base's), a path needs no changeset when its
         package is private, or when it is a test or support file (a test, tests,
         __tests__, e2e, fixtures, __fixtures__ or __snapshots__ directory, or a *.test.* /
         *.spec.* name) that the package does not publish: outside every ``files`` entry and

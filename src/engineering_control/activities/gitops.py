@@ -99,6 +99,25 @@ UNHEALTHY_POD_REASONS = frozenset({"CrashLoopBackOff", "ImagePullBackOff", "ErrI
 MAXIMUM_POD_DELETIONS = 25
 # NEW-209: a PR touching more packages than this keeps every package path counted.
 _MAX_PACKAGE_MANIFESTS = 64
+# NEW-219: compare statuses of a path that exists after the merge, and of one that existed
+# before it (a rename's previous path is handled separately).
+_PRESENT_AFTER_MERGE = frozenset({"added", "modified", "changed", "renamed", "copied"})
+_PRESENT_BEFORE_MERGE = frozenset({"removed", "modified", "changed"})
+# NEW-219: a changeset file: YAML front matter whose lines release packages.
+_CHANGESET_FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
+_CHANGESET_PACKAGE = re.compile(r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*")
+_CHANGESET_BUMPS = frozenset({"major", "minor", "patch", "none"})
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """NEW-219: a package.json with a repeated key is unreadable (fail closed); readers may
+    disagree on which value of a repeated key wins."""
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key in package.json")
+    return dict(pairs)
+
+
 _SHA = re.compile(r"[a-f0-9]{40}")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 # NEW-145b: the head branches a publication reconciliation may list PRs for.
@@ -2904,9 +2923,11 @@ class GitOpsGitHubHandler:
         if isinstance(flow, MergeDeliveryPolicy):
             if target != "source":
                 return {"status": "BLOCKED", "blocker": "MERGE_TARGET_INVALID"}
-            refused = self._merge_only_files_gate(plan, flow)
+            refused, gate_base_sha = self._merge_only_files_gate(plan, flow)
             if refused is not None:
                 return refused
+        else:
+            gate_base_sha = None
         if target == "source":
             repository, number, head, base = (
                 plan.source_repository,
@@ -2966,6 +2987,15 @@ class GitOpsGitHubHandler:
                 allow_unstable = True
             elif merge_state != "CLEAN":
                 return {"status": "MERGE_PENDING", "target": target, "merge_state": merge_state}
+        if (
+            gate_base_sha is not None
+            and current.get("state") != "MERGED"
+            and self.broker.branch_commit(repository, base)["sha"] != gate_base_sha
+        ):
+            # NEW-219: the changeset gate judged the merge into this base commit; a base
+            # that moved since is judged again on the next attempt. GitHub's merge API binds
+            # only the head, so the window left is this read and the merge call.
+            return {"status": "MERGE_PENDING", "target": target, "merge_state": "BASE_MOVED"}
         result = self.broker.merge_pull_request(
             repository=repository,
             number=number,
@@ -2974,6 +3004,12 @@ class GitOpsGitHubHandler:
             change_binding=binding,
             allow_unstable=allow_unstable,
         )
+        if isinstance(flow, MergeDeliveryPolicy) and flow.changeset.enabled:
+            raced = self._changeset_after_merge(
+                repository, flow.changeset, str(result["merge_sha"]), gate_base_sha
+            )
+            if raced is not None:
+                return raced
         return {
             "status": "MERGED",
             "target": target,
@@ -3027,72 +3063,182 @@ class GitOpsGitHubHandler:
 
     def _merge_only_files_gate(
         self, plan: StagingGitOpsPlan, gate: MergeDeliveryPolicy
-    ) -> dict[str, Any] | None:
-        """NEW-160: before the merge, the PR's files carry a changeset when they touch a
-        published package, and never touch a protected path (CI or agent configuration)."""
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """NEW-160: before the merge, the PR's files never touch a protected path (CI or
+        agent configuration), and the merge carries a changeset when it changes a published
+        package. Returns the refusal (or None) and, when the changeset gate ran, the base
+        commit its verdict holds for (NEW-219)."""
         if not gate.changeset.enabled and not gate.protected_paths:
-            return None
+            return None, None
         try:
             changes = self.broker.pull_request_file_changes(
                 plan.source_repository, plan.source_pr_number
             )
         except GhCliPolicyError:
             # A listing at GitHub's file cap (or a malformed one) cannot prove either rule.
-            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}, None
         # A rename's previous path counts as touched (moving a file out of .github/ or out
         # of a package is a change there).
         touched = [
             path for change in changes for path in (change["path"], change["previous_path"]) if path
         ]
         if any(gate.protected(path) for path in touched):
-            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}
-        manifests = (
-            self._package_manifests(plan, gate.changeset, touched)
-            if gate.changeset.enabled
-            else None
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}, None
+        if not gate.changeset.enabled:
+            return None, None
+        return self._changeset_gate(plan, gate.changeset)
+
+    def _changeset_gate(
+        self, plan: StagingGitOpsPlan, changeset: ChangesetGatePolicy
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """NEW-219: judge the changeset rule on the merge result, never on the PR head
+        against an old base.
+
+        The changed paths are the diff between the current base commit and GitHub's test
+        merge of the PR into it (its first parent must be that base and its second the bound
+        head), so edits that a base-side rename moves into a published package are seen
+        where they land. A path that exists after the merge is judged by its package's
+        package.json in the merge result; a path that existed before it (a modified or
+        removed file, a rename's previous path) also by the one at the base. Either one
+        that publishes the path requires a changeset, so a package that becomes private or
+        public in the PR, or is deleted, still counts. An unreadable manifest keeps every
+        path of its package counted. A merge GitHub cannot compute yet, or one that
+        conflicts, defers to the merge-state handling, never to CHANGESET_MISSING."""
+        repository = plan.source_repository
+        target = {"status": "MERGE_PENDING", "target": "source"}
+        preview = self.broker.pull_request_merge_preview(repository, plan.source_pr_number)
+        if preview["merged"]:
+            return None, None  # a retried merge: nothing is merged again
+        if preview["head_sha"] != plan.source_head_sha:
+            return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
+        if preview["mergeable"] is False:
+            return {"status": "BLOCKED", "blocker": "SOURCE_PR_MERGE_CONFLICT"}, None
+        merge_sha = preview["merge_commit_sha"]
+        if preview["mergeable"] is not True or merge_sha is None:
+            return {**target, "merge_state": "MERGE_RESULT_PENDING"}, None
+        base_sha = self.broker.branch_commit(repository, plan.source_base_branch)["sha"]
+        if self.broker.commit_parents(repository, merge_sha) != [base_sha, plan.source_head_sha]:
+            return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
+        refused = self._changeset_verdict(repository, changeset, base_sha, merge_sha)
+        return (refused, None) if refused is not None else (None, base_sha)
+
+    def _changeset_verdict(
+        self, repository: str, changeset: ChangesetGatePolicy, base_sha: str, merge_sha: str
+    ) -> dict[str, Any] | None:
+        """NEW-219: the changeset rule on the diff from ``base_sha`` to the merge commit
+        ``merge_sha`` (see ``_changeset_gate``); None when it holds."""
+        try:
+            merged = self.broker.compare_file_changes(repository, base_sha, merge_sha)
+        except GhCliPolicyError:
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
+        after = [
+            change["path"]
+            for change in merged
+            if change["status"] in _PRESENT_AFTER_MERGE and change["path"]
+        ]
+        before = [
+            path
+            for change in merged
+            for path in (
+                (change["previous_path"],)
+                if change["status"] == "renamed"
+                else (change["path"],)
+                if change["status"] in _PRESENT_BEFORE_MERGE
+                else ()
+            )
+            if path
+        ]
+        needed = changeset.touches_packages(
+            after, self._manifests_at(repository, changeset, after, merge_sha)
+        ) or changeset.touches_packages(
+            before, self._manifests_at(repository, changeset, before, base_sha)
         )
-        if gate.changeset.touches_packages(touched, manifests) and not any(
-            self._exists_at(plan.source_repository, path, plan.source_head_sha)
-            for path in gate.changeset.changeset_candidates(changes)
+        if needed and not any(
+            self._is_changeset(repository, path, merge_sha)
+            for path in changeset.changeset_candidates(merged)
         ):
-            # Only an added or modified .changeset/<name>.md present at the bound head
-            # counts; a removed or renamed-away changeset never does.
+            # Only a .changeset/<name>.md the merge adds or modifies counts; a removed or
+            # renamed-away changeset never does.
             return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
         return None
 
-    def _package_manifests(
-        self, plan: StagingGitOpsPlan, changeset: ChangesetGatePolicy, paths: list[str]
+    def _is_changeset(self, repository: str, path: str, ref: str) -> bool:
+        """NEW-219: ``path`` at ``ref`` reads as a changeset that releases at least one
+        package: YAML front matter that is a flat mapping of package names to ``major``,
+        ``minor``, ``patch`` (or ``none``), with one release at least. A dangling symlink
+        (whose contents read returns no such file), an empty changeset, nested mappings
+        and block text never count."""
+        try:
+            text = self.broker.repository_file_text(repository, path, ref)
+        except (CommandFailure, GhCliPolicyError):
+            return False
+        match = _CHANGESET_FRONT_MATTER.match(text)
+        if match is None:
+            return False
+        try:
+            releases = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            return False
+        return (
+            isinstance(releases, dict)
+            and all(
+                isinstance(name, str)
+                and _CHANGESET_PACKAGE.fullmatch(name) is not None
+                and isinstance(bump, str)
+                and bump in _CHANGESET_BUMPS
+                for name, bump in releases.items()
+            )
+            and any(bump != "none" for bump in releases.values())
+        )
+
+    def _changeset_after_merge(
+        self,
+        repository: str,
+        changeset: ChangesetGatePolicy,
+        merge_sha: str,
+        gate_base_sha: str | None,
+    ) -> dict[str, Any] | None:
+        """NEW-219: GitHub's merge binds only the head, so the base can still move between
+        the verdict and the merge. The merge commit is judged on what it actually merged
+        (its first parent to itself) unless that parent is the base this attempt judged,
+        whose test merge it then equals. Every attempt on a merged PR (an automatic retry
+        after a lost result included) judges it, so a merge that needs a changeset it lacks
+        keeps stopping with CHANGESET_MISSING_AFTER_MERGE until the operator acts."""
+        parents = self.broker.commit_parents(repository, merge_sha)
+        if gate_base_sha is not None and parents[:1] == [gate_base_sha]:
+            return None
+        if not parents:
+            return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING_AFTER_MERGE"}
+        refused = self._changeset_verdict(repository, changeset, parents[0], merge_sha)
+        if refused is None:
+            return None
+        return {
+            "status": "BLOCKED",
+            "blocker": "CHANGESET_MISSING_AFTER_MERGE",
+            "merge_sha": merge_sha,
+        }
+
+    def _manifests_at(
+        self, repository: str, changeset: ChangesetGatePolicy, paths: list[str], ref: str
     ) -> dict[str, dict[str, Any] | None] | None:
-        """NEW-209: each touched package's package.json at the bound head, so the changeset
-        gate can skip private packages and unpublished test files. A manifest the PR changes is
-        not trusted (the PR could make its package private or shrink ``files``), and an
-        unreadable one is None: both keep every path of that package counted."""
+        """NEW-209/219: each touched package's package.json at commit ``ref``, so the
+        changeset gate can skip private packages and unpublished test files. An unreadable
+        or duplicate-key manifest is None, which keeps every path of that package counted;
+        more packages than the bound keep every path counted."""
         directories = sorted({d for path in paths if (d := changeset.package_directory(path))})
         if len(directories) > _MAX_PACKAGE_MANIFESTS:
             return None
         manifests: dict[str, dict[str, Any] | None] = {}
         for directory in directories:
-            manifest_path = f"{directory}package.json"
-            value: Any = None
-            if manifest_path not in paths:
-                try:
-                    value = json.loads(
-                        self.broker.repository_file_text(
-                            plan.source_repository, manifest_path, plan.source_head_sha
-                        )
-                    )
-                except (CommandFailure, GhCliPolicyError, ValueError):
-                    value = None
+            try:
+                value = json.loads(
+                    self.broker.repository_file_text(repository, f"{directory}package.json", ref),
+                    object_pairs_hook=_unique_keys,
+                )
+            except (CommandFailure, GhCliPolicyError, ValueError):
+                value = None
             manifests[directory] = value if isinstance(value, dict) else None
         return manifests
-
-    def _exists_at(self, repository: str, path: str, ref: str) -> bool:
-        """NEW-160: ``path`` exists at commit ``ref`` (the PR's bound head)."""
-        try:
-            self.broker.repository_file_text(repository, path, ref)
-        except (CommandFailure, GhCliPolicyError):
-            return False
-        return True
 
     # -- 3. release tag + workflow runs ------------------------------------------------
 

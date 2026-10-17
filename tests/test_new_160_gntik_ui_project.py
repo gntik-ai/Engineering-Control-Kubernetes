@@ -90,6 +90,7 @@ from engineering_control.workflows.worker_registry import CONTROL_TASK_QUEUE, GI
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD_SHA = "a" * 40
+TEST_MERGE_SHA = "e" * 40  # NEW-219: GitHub's test merge of the PR
 CHANGE_SET = str(UUID(int=160))
 PR_URL = "https://github.com/gntik-ai/gntik-ui/pull/41"
 REPOSITORY = "gntik-ai/gntik-ui"
@@ -615,23 +616,67 @@ class _MergeGh(FakeGh):
             for entry in changed
         ]
         self.absent_at_head: set[str] = set()
-        # NEW-209: package manifests at the head, read by the changeset gate.
+        # NEW-209: package manifests in the merge result, read by the changeset gate, and
+        # (NEW-219) at the base commit; the base has the same manifests unless a test says.
         self.head_files: dict[str, str] = {}
+        self.base_files: dict[str, str] | None = None
+        # NEW-219: GitHub's test merge of the PR into the base (FakeGh answers every branch
+        # read with MERGE_SHA, so that is the base commit here).
+        self.preview: dict[str, Any] = {
+            "mergeable": True,
+            "merged": False,
+            "merge_commit_sha": TEST_MERGE_SHA,
+            "head_sha": HEAD_SHA,
+        }
+        self.base_sha = MERGE_SHA
+        self.merge_parents = [MERGE_SHA, HEAD_SHA]
+        # The parents of the merge Hermes makes (MERGE_SHA); None: the judged base and head.
+        self.actual_merge_parents: list[str] | None = None
+        # NEW-219: a base that moves between the verdict and the merge (the change it merges).
+        self.raced_changes: list[str] | None = None
 
     def _answer(self, args: list[str]) -> str:
         if args[0] == "api" and args[1].endswith("/pulls/41/files"):
             assert '.[] | [.filename, .status, (.previous_filename // "")] | @tsv' in args
             return "\n".join(self.changed)
+        if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/pulls/41":
+            return json.dumps(self.preview)
+        if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/git/commits/{TEST_MERGE_SHA}":
+            return json.dumps(self.merge_parents)
+        if args[0] == "api" and args[1] == f"repos/{REPOSITORY}/git/commits/{MERGE_SHA}":
+            actual = getattr(self, "actual_merge_parents", None)
+            return json.dumps(actual or [getattr(self, "base_sha", MERGE_SHA), HEAD_SHA])
+        if args[:2] == ["api", f"repos/{REPOSITORY}/commits/main"] and args[-1] == (
+            "{sha: .sha, tree: .commit.tree.sha}"
+        ):
+            return json.dumps({"sha": getattr(self, "base_sha", MERGE_SHA), "tree": "f" * 40})
+        if args[0] == "api" and args[1].startswith(f"repos/{REPOSITORY}/compare/"):
+            # The merge result's diff against the base: the PR's changes in these fixtures
+            # (or, after a raced merge, what the actual merge changed).
+            base = getattr(self, "base_sha", MERGE_SHA)
+            judged = {
+                f"repos/{REPOSITORY}/compare/{base}...{merge}?per_page=1"
+                for merge in (TEST_MERGE_SHA, MERGE_SHA)
+            }
+            raced = getattr(self, "raced_changes", None)
+            lines = self.changed if args[1] in judged or raced is None else raced
+            return "\n".join([str(len(lines)), *lines])
         if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
             path = args[3].split("/contents/", 1)[1]
-            assert f"ref={HEAD_SHA}" in args  # proven at the bound head commit
+            # Read in the merge result or, for paths that existed before it, at the base.
+            ref = next(arg.removeprefix("ref=") for arg in args if arg.startswith("ref="))
+            raced = getattr(self, "actual_merge_parents", None)
+            at_base = ref in {getattr(self, "base_sha", MERGE_SHA), *(raced or [])[:1]}
+            assert at_base or ref in {TEST_MERGE_SHA, MERGE_SHA}, ref
             head_files: dict[str, str] = getattr(self, "head_files", {})
-            if path in head_files:
-                return head_files[path]
+            base_files = getattr(self, "base_files", None)
+            files = head_files if not at_base or base_files is None else base_files
+            if path in files:
+                return files[path]
             present = {
                 entry.split("\t")[0] for entry in self.changed if entry.split("\t")[1] != "removed"
             } - self.absent_at_head
-            if path not in present:
+            if at_base or path not in present:
                 raise CommandFailure("gh api failed: 404")
             return "---\n'@gntik-ai/ui': patch\n---\nFix.\n"
         if args[:2] == ["pr", "ready"]:
@@ -705,8 +750,13 @@ class _BaselineMergeGh(_MergeGh, BaselineGh):
 
     def __init__(self, changed: list[str]) -> None:
         BaselineGh.__init__(self, [])
-        self.changed = _MergeGh(changed).changed
+        merge = _MergeGh(changed)
+        self.changed = merge.changed
         self.absent_at_head = set()
+        self.head_files, self.base_files = merge.head_files, merge.base_files
+        # BaselineGh answers the base branch with MAIN_SHA.
+        self.preview, self.base_sha = merge.preview, MAIN_SHA
+        self.merge_parents = [MAIN_SHA, HEAD_SHA]
 
     def _answer(self, args: list[str]) -> str:
         if args[0] == "api" and args[1].endswith("/pulls/41/files") and ".status" not in args[-1]:
@@ -821,11 +871,15 @@ async def test_new_209_published_files_and_changed_manifests_still_need_a_change
     )
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
-    # A PR that changes its own package.json cannot exempt itself (e.g. by going private).
+    # A PR that changes its own package.json cannot exempt itself (e.g. by going private):
+    # NEW-219 also judges the base's manifest, which still publishes the package.
     handler, fake = _github(
         tmp_path / "manifest", GREEN, ["packages/tokens/package.json", "packages/tokens/test/a.mjs"]
     )
     fake.head_files = _manifest_files({"packages/tokens/": {"private": True}})
+    fake.base_files = _manifest_files(
+        {"packages/tokens/": {"name": "@gntik-ai/tokens", "files": ["dist", "src"]}}
+    )
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
     # An unreadable manifest keeps the path counted.
