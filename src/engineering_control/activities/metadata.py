@@ -3057,6 +3057,10 @@ class MetadataActivityHandler:
             "maker_provider": maker.primary.value,
             "checker_provider": maker.checker.value,
         }
+        merge_forward = self._merge_forward_requirement(UUID(str(payload["change_set_id"])))
+        if merge_forward is not None:
+            # NEW-214a: this repair round has the maker merge that PR's moved base in.
+            allocation["merge_forward"] = merge_forward["target"]
         base_heads = payload.get("base_heads")
         if isinstance(base_heads, dict):
             # NEW-117: the approved import heads the delivery base must fast-forward from.
@@ -3070,6 +3074,8 @@ class MetadataActivityHandler:
             "checker_provider": maker.checker.value,
             "routing_reason": f"maker={maker.reason};spec={spec.reason}",
             "allocation_request": allocation,
+            # NEW-214a: completed by the allocation with the base tip, else None.
+            "merge_forward": merge_forward,
         }
 
     def _persist_worktree_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3416,6 +3422,85 @@ class MetadataActivityHandler:
         findings = record.get("findings") if isinstance(record, dict) else None
         return [str(item) for item in findings if isinstance(item, str)] if findings else []
 
+    def _apply_merge_forward(
+        self,
+        change_set: ChangeSet,
+        payload: dict[str, Any],
+        merge_forward: Any,
+        results: dict[str, Any],
+    ) -> None:
+        if not isinstance(merge_forward, dict) or merge_forward.get("target") not in {
+            "source",
+            "deployment",
+        }:
+            raise ValueError("merge-forward evidence is invalid")
+        target = str(merge_forward["target"])
+        base, origin = merge_forward.get("base_sha"), merge_forward.get("from_sha")
+        repository = (
+            change_set.source_repository if target == "source" else change_set.deployment_repository
+        )
+        head = change_set.source_head_sha if target == "source" else change_set.deployment_head_sha
+        published = results.get(repository)
+        if (
+            not isinstance(base, str)
+            or not self._is_git_sha(base)
+            or not isinstance(origin, str)
+            or not self._is_git_sha(origin)
+            or merge_forward.get("repository") != repository
+            or payload.get(f"{target}_base_sha") != base
+            or not isinstance(published, dict)
+            or published.get("merge_forward_verified") is not True
+            or published.get("head_sha") != head
+        ):
+            raise ValueError("merge-forward publication is not verified")
+        self_contained = change_set.source_repository == change_set.deployment_repository
+        if target == "source" or self_contained:
+            change_set.source_base_sha = base
+        if target == "deployment" or self_contained:
+            change_set.deployment_base_sha = base
+        recovery = dict(change_set.recovery_json or {})
+        history = [item for item in recovery.get("merge_forwards") or [] if isinstance(item, dict)]
+        if not any(item.get("head_sha") == head for item in history):
+            history.append(
+                {
+                    "target": target,
+                    "repository": repository,
+                    "from_sha": origin,
+                    "base_sha": base,
+                    "head_sha": head,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                }
+            )
+        recovery["merge_forwards"] = history[-20:]
+        change_set.recovery_json = recovery
+
+    def _merge_forward_requirement(self, change_set_id: UUID) -> dict[str, str] | None:
+        """NEW-214a: the side whose PR the staging gates found behind its base, if any.
+
+        Its published head comes from the ChangeSet record (never the maker's worktree): the
+        merged result must still contain it.
+        """
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                return None
+            record = dict(change_set.recovery_json or {}).get("staging_gitops")
+            cutoff = amendment_cutoff(change_set)
+            heads = {
+                "source": change_set.source_head_sha,
+                "deployment": change_set.deployment_head_sha,
+            }
+        if not isinstance(record, dict) or not recorded_after(record, cutoff):
+            return None
+        target = {
+            "SOURCE_PR_BEHIND_BASE": "source",
+            "DEPLOYMENT_PR_BEHIND_BASE": "deployment",
+        }.get(str(record.get("blocker")))
+        published = heads.get(target) if target is not None else None
+        if target is None or not isinstance(published, str) or not self._is_git_sha(published):
+            return None
+        return {"target": target, "from_sha": published}
+
     def _ci_regressions(
         self, change_set_id: UUID
     ) -> tuple[list[str], str | None, dict[str, str], str]:
@@ -3598,6 +3683,26 @@ class MetadataActivityHandler:
                     "(the worktree was reset to base; address every finding):\n"
                 )
             ) + "".join(f"- {item}\n" for item in correction)
+        merge_forward = payload.get("merge_forward")
+        if (
+            isinstance(merge_forward, dict)
+            and merge_forward.get("target") == target
+            and merge_forward.get("base_sha")
+        ):
+            # NEW-214a: the pull request fell behind its base; the maker merges it in.
+            base = merge_forward["base_sha"]
+            derived_content += (
+                "This round exists because the pull request fell behind its base branch. "
+                f"First run `git merge --no-ff --no-edit {base}` in this worktree to merge the "
+                f"current base (commit {base}, already available locally) into this branch. "
+                "If it conflicts, resolve every conflict so both the base's changes and this "
+                "ChangeSet's intent are kept, then commit the merge. Never rebase, reset, amend "
+                f"or force-push: the published head {merge_forward.get('from_sha')} and the base "
+                f"commit {base} must both stay ancestors of HEAD, or the round is refused. Then "
+                "check that the ChangeSet still builds, its tests pass and the issue's "
+                "acceptance criteria still hold on the new base, fixing only breakage the merge "
+                "introduced, as further commits.\n"
+            )
         # NEW-76: findings the platform validation attributed to the previous attempt.
         # NEW-133: each maker gets its own repository's findings ("deployment: ..." go to
         # the deployment maker; falcone #1053's only finding was a falcone-charts
@@ -4101,6 +4206,16 @@ class MetadataActivityHandler:
             f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
             f"Latest maker result: {json.dumps(source_result, sort_keys=True, default=str)}\n"
         )
+        merge_forward = payload.get("merge_forward")
+        if isinstance(merge_forward, dict) and merge_forward.get("base_sha"):
+            # NEW-214a: the diff is measured from the merged base; the merge must be present.
+            derived_content += (
+                f"This round merged the base commit {merge_forward['base_sha']} into the "
+                f"{merge_forward.get('target')} branch (published head "
+                f"{merge_forward.get('from_sha')}); the diff is measured from that base. HEAD "
+                "must contain both commits. Request changes if the merge is missing, history "
+                "was rewritten, or either side's changes were dropped.\n"
+            )
         prompt = (
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
@@ -4332,6 +4447,11 @@ class MetadataActivityHandler:
                 if raw_deployment is not None
                 else None
             )
+            merge_forward = payload.get("merge_forward")
+            if merge_forward is not None:
+                # NEW-214a: the published head was verified to contain the base tip from a
+                # trusted clone; only now does the ChangeSet build on that base.
+                self._apply_merge_forward(change_set, payload, merge_forward, results)
             expected_results: list[tuple[dict[str, Any], str]] = [
                 (source, str(change_set.source_head_sha or ""))
             ]

@@ -1,0 +1,444 @@
+"""NEW-214a: a PR behind its base is merged forward by the repair maker, never rebased.
+
+With strict up-to-date branch protection, GitHub reports a PR whose base moved as BEHIND
+and refuses to merge it. For a project with ``merge_forward`` enabled:
+- the staging gates report SOURCE/DEPLOYMENT_PR_BEHIND_BASE, and the loop starts a
+  CI-repair round after refreshing the canonical mirrors;
+- the allocation only reports the mirror's base tip (Hermes runs no new git in the
+  maker-writable repository);
+- the sandboxed maker merges that tip in and resolves any conflict, and the checker
+  reviews the diff from the tip;
+- publication verifies, in its own controller-side clone, that the head contains both the
+  tip and the published head before the non-force push;
+- only then does persist_publication move the ChangeSet to the new base.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from temporalio import activity, workflow
+from temporalio.worker import Replayer
+from test_delivery_activity import (
+    FakePublicationRunner,
+    _controller_publisher,
+    _remove_local_worktrees,
+    _with_intent,
+    publication_payload,
+)
+from test_delivery_metadata import _lease_fixture
+from test_staging_gitops import SAFE, FakeGh, _config_root, _plan, _pull_request, _settings
+from test_workflow_replay import (
+    _GITOPS_PLAN,
+    _LOOP_WORKFLOWS,
+    _full_delivery_loop_script,
+    _run_loop,
+    _scheduled_steps,
+    _scripted_execute_control_step,
+)
+from test_worktrees import _advance_main, _resume_fixture, git
+
+from engineering_control.activities.gitops import GitOpsGitHubHandler
+from engineering_control.activities.scan import ScanActivityHandler
+from engineering_control.adapters.command import CommandFailure, CommandResult
+from engineering_control.config import Settings
+from engineering_control.db.models import ChangeSet
+from engineering_control.operations.issue_delivery_approval import CI_REPAIR_REGRESSIONS
+from engineering_control.workflows.definitions import (
+    ExistingGitHubBacklogLoopWorkflow,
+    IssueDeliveryInput,
+    StagingGitOpsDeliveryWorkflow,
+)
+from engineering_control.worktrees.manager import WorktreeAllocation
+
+# -- worktree manager: reports the tip, never merges --------------------------------------
+
+
+def test_a_resumed_allocation_reports_the_moved_base_tip_without_merging(tmp_path: Path) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    published = git(["rev-parse", "HEAD"], path)
+    moved = _advance_main(tmp_path)
+
+    allocation = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert (allocation.base_sha, allocation.resumed_from_sha) == (sha, published)
+    assert allocation.base_tip_sha == moved
+    # Nothing ran in the worktree beyond the existing resume: HEAD is untouched.
+    assert git(["rev-parse", "HEAD"], path) == published
+    assert not (path / "CHANGELOG.md").exists()
+
+
+def test_an_unmoved_base_reports_no_tip(tmp_path: Path) -> None:
+    manager, request, _path, _sha = _resume_fixture(tmp_path)
+
+    allocation = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert allocation.base_tip_sha is None
+
+
+# -- scan worker allocation ---------------------------------------------------------------
+
+
+class _TipManager:
+    def __init__(self, root: Path, *, tip: str | None = "e" * 40) -> None:
+        self.root = root
+        self.tip = tip
+
+    def allocate(self, **kwargs: Any) -> WorktreeAllocation:
+        repository = kwargs["repository"]
+        source = repository == "musematic"
+        return WorktreeAllocation(
+            repository=repository,
+            path=self.root / repository,
+            branch=f"agent/{repository}",
+            base_sha=kwargs["expected_base_sha"],
+            change_set_id=kwargs["change_set_id"],
+            resumed_from_sha="f" * 40 if source else None,
+            base_tip_sha=self.tip if source else None,
+        )
+
+
+def _allocation_payload(merge_forward: str | None) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "change_set_id": str(uuid4()),
+        "project": "musematic",
+        "issue": "993",
+        "source_repository": "musematic",
+        "source_base_sha": "a" * 40,
+        "deployment_repository": "musematic-deploy",
+        "deployment_base_sha": "b" * 40,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+    payload: dict[str, Any] = {"allocation_request": request}
+    if merge_forward is not None:
+        request["merge_forward"] = merge_forward
+        payload["merge_forward"] = {"target": merge_forward, "from_sha": "d" * 40}
+    return payload
+
+
+def test_allocation_completes_the_requirement_with_the_mirror_tip(tmp_path: Path) -> None:
+    handler = ScanActivityHandler(
+        Settings(delivery_resume_prior_commits=True), _TipManager(tmp_path)
+    )  # type: ignore[arg-type]
+
+    allocated = handler._allocate(_allocation_payload("source"))
+
+    assert allocated["status"] == "WORKTREES_ALLOCATED"
+    assert allocated["merge_forward"] == {
+        "target": "source",
+        "repository": "musematic",
+        "base_sha": "e" * 40,
+        "from_sha": "d" * 40,
+    }
+    # Every later step (prechecks baseline, validation, checker range) measures from the tip.
+    assert allocated["source_base_sha"] == "e" * 40
+    assert "deployment_base_sha" not in allocated  # only the behind side moves
+
+
+def test_an_unmoved_base_asks_for_no_merge(tmp_path: Path) -> None:
+    handler = ScanActivityHandler(  # type: ignore[arg-type]
+        Settings(delivery_resume_prior_commits=True), _TipManager(tmp_path, tip=None)
+    )
+
+    allocated = handler._allocate(_allocation_payload("source"))
+
+    assert allocated["merge_forward"] is None
+    assert "source_base_sha" not in allocated  # the delivery keeps its recorded base
+
+
+def test_allocation_without_merge_forward_is_unchanged(tmp_path: Path) -> None:
+    handler = ScanActivityHandler(
+        Settings(delivery_resume_prior_commits=True), _TipManager(tmp_path)
+    )  # type: ignore[arg-type]
+
+    allocated = handler._allocate(_allocation_payload(None))
+
+    assert "merge_forward" not in allocated
+    assert "source_base_sha" not in allocated
+
+
+# -- staging gates ------------------------------------------------------------------------
+
+
+def _merge_forward_github(tmp_path: Path, *, enabled: bool) -> tuple[GitOpsGitHubHandler, FakeGh]:
+    projects = _config_root(tmp_path, safe_repositories=SAFE)
+    path = projects / "musematic.yaml"
+    text = path.read_text(encoding="utf-8")
+    marker = "  staging_flow:\n    enabled: true\n"
+    assert marker in text
+    if enabled:
+        path.write_text(text.replace(marker, marker + "    merge_forward: true\n"), "utf-8")
+    settings = _settings(tmp_path, project_config_root=projects, github_writes_enabled=True)
+    fake = FakeGh()
+    return GitOpsGitHubHandler(settings, runner=fake), fake  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_pr_behind_its_base_blocks_its_checks_and_merge_when_enabled(
+    tmp_path: Path,
+) -> None:
+    handler, fake = _merge_forward_github(tmp_path, enabled=True)
+    deployment_head = "e" * 40
+    plan = _plan(
+        deployment_pr_number=9,
+        deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        deployment_head_sha=deployment_head,
+    )
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request(mergeStateStatus="BEHIND")
+    fake.pull_requests[("gntik-ai/musematic-deploy", 9)] = _pull_request(
+        number=9,
+        url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        headRefOid=deployment_head,
+        mergeStateStatus="BEHIND",
+    )
+
+    source = await handler.handle("gitops.pr_checks", {"plan": plan})
+    deployment = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    fake.pull_requests[("gntik-ai/musematic", 77)]["isDraft"] = False
+    merge = await handler.handle("gitops.merge", {"plan": plan, "target": "source"})
+
+    assert source == {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}
+    assert deployment == {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_BEHIND_BASE"}
+    assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}
+    assert not any("merge" in " ".join(call) for call in fake.mutations)
+
+
+@pytest.mark.asyncio
+async def test_a_behind_pr_is_unchanged_without_merge_forward(tmp_path: Path) -> None:
+    handler, fake = _merge_forward_github(tmp_path, enabled=False)
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request(
+        mergeStateStatus="BEHIND", isDraft=False
+    )
+
+    merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+
+    assert merge == {"status": "MERGE_PENDING", "target": "source", "merge_state": "BEHIND"}
+
+
+def test_merge_forward_blockers_authorize_a_repair_round() -> None:
+    assert {"SOURCE_PR_BEHIND_BASE", "DEPLOYMENT_PR_BEHIND_BASE"} <= CI_REPAIR_REGRESSIONS
+
+
+# -- publication: verified from the controller's own clone -----------------------------
+
+
+class _AncestryRunner(FakePublicationRunner):
+    def __init__(self, branch: str, heads: dict[str, str], *, missing: set[str]) -> None:
+        super().__init__(branch, heads)
+        self.missing = missing
+        self.ancestry: list[tuple[Path, str, str]] = []
+
+    def run(
+        self, executable: str, arguments: list[str], *, cwd: Path, **kwargs: Any
+    ) -> CommandResult:
+        if executable == "git" and arguments[:2] == ["merge-base", "--is-ancestor"]:
+            self.ancestry.append((cwd, arguments[2], arguments[3]))
+            if arguments[2] in self.missing:
+                raise CommandFailure("not an ancestor")
+            return CommandResult(0, "", "")
+        return super().run(executable, arguments, cwd=cwd, **kwargs)
+
+
+def _merge_forward_publication(tmp_path: Path, missing: set[str]) -> tuple[Any, ...]:
+    payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
+    _remove_local_worktrees(payload)
+    (tmp_path / "mirrors/falcone.git/objects").mkdir(parents=True)
+    payload["merge_forward"] = {
+        "target": "source",
+        "repository": "falcone",
+        "base_sha": "1" * 40,
+        "from_sha": "2" * 40,
+    }
+    runner = _AncestryRunner(branch, heads, missing=missing)
+    return payload, heads, runner, _controller_publisher(tmp_path, runner)
+
+
+@pytest.mark.asyncio
+async def test_publication_verifies_the_merge_in_its_own_clone_then_pushes(
+    tmp_path: Path,
+) -> None:
+    payload, heads, runner, handler = _merge_forward_publication(tmp_path, set())
+
+    result = await handler.handle("delivery.publish", payload)
+
+    assert result["status"] == "SOURCE_PRS_CREATED"
+    assert runner.pushes == ["falcone", "falcone-charts"]
+    # Both ancestors are checked against the validated head, in the controller scratch clone.
+    assert [(base, head) for _cwd, base, head in runner.ancestry] == [
+        ("1" * 40, heads["falcone"]),
+        ("2" * 40, heads["falcone"]),
+    ]
+    scratch = tmp_path / "runs/delivery/publications"
+    assert all(cwd.is_relative_to(scratch) for cwd, _base, _head in runner.ancestry)
+    verified = {
+        item["repository_slug"]: item.get("merge_forward_verified")
+        for item in result["publication_results"]
+    }
+    assert verified == {"falcone": True, "falcone-charts": None}
+
+
+@pytest.mark.parametrize("missing", ["1" * 40, "2" * 40])
+@pytest.mark.asyncio
+async def test_a_head_missing_either_ancestor_is_never_pushed(tmp_path: Path, missing: str) -> None:
+    payload, _heads, runner, handler = _merge_forward_publication(tmp_path, {missing})
+
+    result = await handler.handle("delivery.publish", payload)
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "SOURCE_PR_MERGE_FORWARD_NOT_MERGED"
+    assert "falcone" not in runner.pushes
+
+
+# -- metadata: the base moves only for a verified publication ----------------------------
+
+
+def _merge_forward_change_set(tmp_path: Path) -> tuple[Any, ChangeSet, dict[str, Any]]:
+    handler, allocation = _lease_fixture(tmp_path)
+    change_set = ChangeSet(
+        source_repository="musematic",
+        deployment_repository="musematic-deploy",
+        source_base_sha="a" * 40,
+        deployment_base_sha="c" * 40,
+        source_head_sha="f" * 40,
+        deployment_head_sha="c" * 40,
+        recovery_json={},
+    )
+    merge_forward = {
+        "target": "source",
+        "repository": "musematic",
+        "base_sha": "e" * 40,
+        "from_sha": "d" * 40,
+    }
+    return handler, change_set, merge_forward
+
+
+def test_a_verified_merge_forward_moves_the_change_set_base(tmp_path: Path) -> None:
+    handler, change_set, merge_forward = _merge_forward_change_set(tmp_path)
+    results = {"musematic": {"head_sha": "f" * 40, "merge_forward_verified": True}}
+
+    handler._apply_merge_forward(change_set, {"source_base_sha": "e" * 40}, merge_forward, results)
+    handler._apply_merge_forward(change_set, {"source_base_sha": "e" * 40}, merge_forward, results)
+
+    assert change_set.source_base_sha == "e" * 40
+    assert change_set.deployment_base_sha == "c" * 40
+    history = change_set.recovery_json["merge_forwards"]
+    assert [(item["from_sha"], item["base_sha"], item["head_sha"]) for item in history] == [
+        ("d" * 40, "e" * 40, "f" * 40)
+    ]
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        {"musematic": {"head_sha": "f" * 40}},
+        {"musematic": {"head_sha": "9" * 40, "merge_forward_verified": True}},
+        {},
+    ],
+)
+def test_an_unverified_merge_forward_never_moves_the_base(
+    tmp_path: Path, results: dict[str, Any]
+) -> None:
+    handler, change_set, merge_forward = _merge_forward_change_set(tmp_path)
+
+    with pytest.raises(ValueError, match="not verified"):
+        handler._apply_merge_forward(
+            change_set, {"source_base_sha": "e" * 40}, merge_forward, results
+        )
+
+    assert change_set.source_base_sha == "a" * 40
+
+
+# -- the loop -----------------------------------------------------------------------------
+
+_BEHIND = {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}
+
+
+async def test_a_pr_behind_its_base_is_merged_forward_by_repair_rounds() -> None:
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": _BEHIND}),
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-ci-repair-1-attempt-1",
+        "1-staging-gitops-retry-1",
+        "1-ci-repair-2-attempt-1",
+        "1-staging-gitops-retry-2",
+    ]
+    steps = _scheduled_steps(history)
+    paused = [
+        request["payload"]["blocker"]
+        for request in steps
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == ["SOURCE_PR_BEHIND_BASE"]
+    names = [request["step"] for request in steps]
+    repairs = [index for index, name in enumerate(names) if name == "backlog.record_ci_repair"]
+    assert len(repairs) == 2
+    # Each round refreshes the canonical mirrors first: the maker merges the new tip.
+    for position in repairs:
+        assert names[position + 1 : position + 3] == [
+            "github.refresh_mirrors",
+            "backlog.register_child_run",
+        ]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _UnmergedRepairStub:
+    """IssueDeliveryWorkflow whose merge-forward round was refused at publication."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        if "-ci-repair-" in workflow.info().workflow_id:
+            return {
+                "status": "BLOCKED",
+                "context": {"status": "BLOCKED", "blocker": "SOURCE_PR_MERGE_FORWARD_NOT_MERGED"},
+            }
+        return {"status": "SOURCE_PR", "context": {"change_set_id": _GITOPS_PLAN["change_set_id"]}}
+
+
+async def test_an_unmerged_round_pauses_with_its_named_blocker() -> None:
+    workflows = [
+        ExistingGitHubBacklogLoopWorkflow,
+        _UnmergedRepairStub,
+        StagingGitOpsDeliveryWorkflow,
+    ]
+    script = _full_delivery_loop_script(**{"gitops.pr_checks": _BEHIND})
+    scripted = _scripted_execute_control_step(script)
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        if request["step"] == "backlog.restore_published_change_set":
+            if request["payload"]["phase"] == "plan":
+                return {"status": "READY", "version": 1, "pull_requests": [{"url": "u"}]}
+            return {"status": "RESTORED"}
+        if request["step"] == "gitops.pr_heads":
+            return {"status": "OK", "heads": [{"url": "u"}]}
+        return await scripted(request)
+
+    history, result, _children = await _run_loop(
+        script,
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+        workflows=workflows,
+        activity_fn=execute_control_step,
+    )
+
+    assert result["status"] == "COMPLETE"
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == ["CI_REPAIR_SOURCE_PR_MERGE_FORWARD_NOT_MERGED"]
+    await Replayer(workflows=workflows).replay_workflow(history)

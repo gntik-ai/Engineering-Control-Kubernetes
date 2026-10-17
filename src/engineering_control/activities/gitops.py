@@ -2598,6 +2598,9 @@ class GitOpsGitHubHandler:
         conflict = _merge_conflict(pull_request, "deployment")
         if conflict is not None:
             return conflict
+        behind = _behind_base(pull_request, "deployment", flow)
+        if behind is not None:
+            return behind
         states = _check_states(pull_request)
         failed = sorted(name for name, value in states.items() if value == "FAILED")
         if not failed:
@@ -2667,6 +2670,9 @@ class GitOpsGitHubHandler:
         conflict = _merge_conflict(pull_request, "source")
         if conflict is not None:
             return conflict
+        behind = _behind_base(pull_request, "source", flow)
+        if behind is not None:
+            return behind
         result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
         if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
             result = self._baseline_gate(
@@ -2963,6 +2969,10 @@ class GitOpsGitHubHandler:
             merge_state = str(current.get("mergeStateStatus") or "UNKNOWN")
             if merge_state == "DIRTY":
                 return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_CONFLICT"}
+            behind = _behind_base(current, target, flow)
+            if behind is not None:
+                # NEW-214a: the base moved after the checks passed; merge forward again.
+                return behind
             filtered = without_checks(current, _non_blocking(flow))
             if (
                 merge_state == "UNSTABLE"
@@ -3798,6 +3808,20 @@ def _merge_conflict(pull_request: dict[str, Any], target: str) -> dict[str, Any]
     """
     if str(pull_request.get("mergeStateStatus") or "") == "DIRTY":
         return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_CONFLICT"}
+    return None
+
+
+def _behind_base(
+    pull_request: dict[str, Any], target: str, gate: DeliveryGate
+) -> dict[str, Any] | None:
+    """NEW-214a: block at once on a PR whose base moved, when merge-forward is enabled.
+
+    Under strict up-to-date protection GitHub reports BEHIND and refuses the merge, and the
+    PR's CI no longer covers what would merge. The loop merges the current base into the
+    ChangeSet branch in a repair round, then CI gates the merged head.
+    """
+    if gate.merge_forward and str(pull_request.get("mergeStateStatus") or "") == "BEHIND":
+        return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_BEHIND_BASE"}
     return None
 
 
