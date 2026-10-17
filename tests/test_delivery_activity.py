@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from changeset_worktree import sealed_changeset_worktree
 from publication_fixture import approved_publication
 from sqlalchemy import select
 
@@ -537,6 +538,13 @@ async def test_local_worktree_publication_remains_available_behind_the_setting(
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
     _with_intent(payload)
+    # NEW-221: the local path reads only exactly sealed ChangeSet Git metadata.
+    for publication in payload["publication_plan"]["publications"]:
+        sealed_changeset_worktree(
+            Path(publication["working_directory"]),
+            metadata_root=tmp_path / "cache/scan/worktree-git",
+            mirror_root=tmp_path / "mirrors",
+        )
     runner = FakePublicationRunner(branch, heads)
     handler = _controller_publisher(tmp_path, runner, publication_fetch_from_worker=False)
 

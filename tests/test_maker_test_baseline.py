@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from changeset_worktree import link_changeset_worktree
 
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
@@ -152,6 +153,7 @@ def _setup(
     source = worktrees / "musematic" / str(uuid4())
     source.parent.mkdir(parents=True)
     _git(tmp_path, "clone", "-q", str(mirror), str(source))
+    link_changeset_worktree(source, tmp_path / "worktree-git")
     manager = Manager(mirror)
     prepare = PrepareRunner()
     baseline = BaselineRunner(exit_codes)
@@ -179,6 +181,7 @@ def _handler(
     return ScanActivityHandler(
         Settings(
             worktree_root=tmp_path / "worktrees",
+            worktree_metadata_root=tmp_path / "worktree-git",
             evidence_root=tmp_path / "evidence",
             project_config_root=PROJECTS,
             toolchain_cache_root=tmp_path / "cache" / "toolchain",

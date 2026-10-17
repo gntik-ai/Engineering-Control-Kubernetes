@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 import yaml
+from changeset_worktree import link_changeset_worktree
 from pydantic import ValidationError
 
 from engineering_control.activities.metadata import MetadataActivityHandler
@@ -93,8 +94,12 @@ def _setup(
     if deployment_commit:
         (deployment / "values.yaml").write_text("replicas: 2\n", encoding="utf-8")
         _commit(deployment, "deployment maker change")
+    metadata_root = tmp_path / "worktree-git"
+    link_changeset_worktree(source, metadata_root)
+    link_changeset_worktree(deployment, metadata_root)
     settings = Settings(
         worktree_root=root,
+        worktree_metadata_root=metadata_root,
         evidence_root=tmp_path / "evidence",
         project_config_root=PROJECTS,
         toolchain_cache_root=tmp_path / "cache",

@@ -16,7 +16,8 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -97,6 +98,14 @@ from engineering_control.projects import (
 )
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.agent_config import is_agent_config_path
+from engineering_control.worktrees.hardened_git import (
+    SUBMODULES,
+    GitLocation,
+    HardenedGitError,
+    changeset_location,
+    needs_index,
+    private_index,
+)
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -443,18 +452,25 @@ class ScanActivityHandler(UiPlanScanSteps):
 
     def _apply_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = PromotionPlan.model_validate(payload.get("promotion_plan"))
+        stack = ExitStack()
         try:
             worktree = self._promotion_worktree(plan)
-            git_arguments = ["-c", f"safe.directory={worktree}"]
-            branch = self.promotion_runner.run(
-                "git", [*git_arguments, "branch", "--show-current"], cwd=worktree
-            ).stdout.strip()
-            head = self.promotion_runner.run(
-                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
-            ).stdout.strip()
-            status = self.promotion_runner.run(
-                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
-            ).stdout
+            # NEW-221: the ChangeSet worktree is maker-writable; never let Git discover it,
+            # and use a private index (the maker's is rebuilt from the new HEAD afterwards).
+            location = stack.enter_context(self._committing(worktree))
+
+            def git(*arguments: str) -> str:
+                return self.promotion_runner.run(
+                    "git",
+                    location.arguments(arguments),
+                    cwd=worktree,
+                    environment=location.environment(),
+                ).stdout
+
+            diff_options = ("--no-ext-diff", "--no-textconv", SUBMODULES)
+            branch = git("branch", "--show-current").strip()
+            head = git("rev-parse", "HEAD").strip()
+            status = git("status", "--porcelain=v1", SUBMODULES)
             if branch != plan.branch or head != plan.expected_head_sha or status:
                 raise ValueError("promotion worktree identity, head, or cleanliness changed")
             deployment_file = self._promotion_file(worktree, plan.deployment_file)
@@ -472,43 +488,26 @@ class ScanActivityHandler(UiPlanScanSteps):
                     value = value[key]
                 if value != plan.image_digests[component]:
                     raise ValueError("promoted digest does not match the candidate manifest")
-            changed = self.promotion_runner.run(
-                "git", [*git_arguments, "diff", "--name-only"], cwd=worktree
-            ).stdout.splitlines()
+            changed = git("diff", *diff_options, "--name-only").splitlines()
             if changed != [plan.deployment_file]:
                 raise ValueError("promotion changed files outside the allowlisted values file")
-            self.promotion_runner.run("git", [*git_arguments, "diff", "--check"], cwd=worktree)
+            git("diff", *diff_options, "--check")
             lint_sha, rendered_sha, manifest_count, chart_version = self._validate_promoted_chart(
                 plan, worktree
             )
-            diff = self.promotion_runner.run(
-                "git",
-                [*git_arguments, "diff", "--unified=0", "--", plan.deployment_file],
-                cwd=worktree,
-            ).stdout
-            self.promotion_runner.run(
-                "git", [*git_arguments, "add", "--", plan.deployment_file], cwd=worktree
+            diff = git("diff", *diff_options, "--unified=0", "--", plan.deployment_file)
+            git("add", "--", plan.deployment_file)
+            git(
+                "-c",
+                "user.name=Engineering Control",
+                "-c",
+                "user.email=engineering-control@local.invalid",
+                "commit",
+                "-m",
+                f"promote immutable candidate for {plan.change_set_id}",
             )
-            self.promotion_runner.run(
-                "git",
-                [
-                    *git_arguments,
-                    "-c",
-                    "user.name=Engineering Control",
-                    "-c",
-                    "user.email=engineering-control@local.invalid",
-                    "commit",
-                    "-m",
-                    f"promote immutable candidate for {plan.change_set_id}",
-                ],
-                cwd=worktree,
-            )
-            promoted_head = self.promotion_runner.run(
-                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
-            ).stdout.strip()
-            final_status = self.promotion_runner.run(
-                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
-            ).stdout
+            promoted_head = git("rev-parse", "HEAD").strip()
+            final_status = git("status", "--porcelain=v1", SUBMODULES)
             if not re.fullmatch(r"[a-f0-9]{40}", promoted_head) or final_status:
                 raise ValueError("promotion commit is not an exact clean Git head")
             evidence = {
@@ -549,6 +548,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "error_type": type(error).__name__,
                 "worktree_preserved": True,
             }
+        finally:
+            stack.close()
 
     def _promotion_worktree(self, plan: PromotionPlan) -> Path:
         root = self.settings.worktree_root.resolve()
@@ -677,9 +678,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                 protected.append({**record, "protection": "NOT_A_DIRECTORY"})
                 continue
             try:
-                branch = self.manager._run(["git", "branch", "--show-current"], path)
-                head = self.manager._run(["git", "rev-parse", "HEAD"], path)
-                dirty = self.manager.is_dirty(path)
+                branch, head, dirty = self.manager.worktree_identity(path)
             except WorktreeError:
                 protected.append({**record, "protection": "GIT_IDENTITY_UNPROVEN"})
                 continue
@@ -1868,7 +1867,72 @@ class ScanActivityHandler(UiPlanScanSteps):
             raise ValueError("toolchain worktree escaped its bounded root")
         return worktree
 
-    def _git(self, worktree: Path, arguments: list[str], *, timeout_seconds: int = 300) -> str:
+    def _changeset_git(self, worktree: Path) -> GitLocation:
+        """NEW-221: the hardened Git location of a bounded, maker-writable worktree; this
+        (scan) identity owns its metadata repository and seals it first."""
+        try:
+            return changeset_location(
+                worktree,
+                worktree_root=self.settings.worktree_root,
+                metadata_root=self.settings.worktree_metadata_root,
+                mirror_root=self.settings.mirror_root,
+                seal=True,
+            )
+        except (HardenedGitError, OSError) as error:
+            raise WorktreeError(str(error)) from error
+
+    @contextmanager
+    def _committing(self, worktree: Path) -> Iterator[GitLocation]:
+        """NEW-221: a private index for a sequence that stages and commits as this identity;
+        the maker's real index (never read) is then rebuilt from the resulting HEAD."""
+        location = self._changeset_git(worktree)
+        try:
+            with private_index(location) as indexed:
+                yield indexed
+        except HardenedGitError as error:
+            raise WorktreeError(str(error)) from error
+        finally:
+            # Only for the maker's next attempt (Hermes never reads that index), so a
+            # failure here neither blocks nor masks the outcome; the next reset rebuilds it.
+            with contextlib.suppress(CommandFailure, OSError):
+                self._git(
+                    worktree,
+                    ["read-tree", "HEAD"],
+                    location=replace(location, index_file=location.git_dir / "index"),
+                )
+
+    def _git(
+        self,
+        worktree: Path,
+        arguments: list[str],
+        *,
+        timeout_seconds: int = 300,
+        location: GitLocation | None = None,
+    ) -> str:
+        root = self.settings.worktree_root.resolve()
+        if worktree.resolve().is_relative_to(root):
+            # NEW-221: a ChangeSet worktree (or snapshot) is maker-writable: Git must not
+            # discover its repository, configuration or hooks from it, nor read its index.
+            location = location or self._changeset_git(worktree)
+            if location.index_file is None and needs_index(arguments):
+                try:
+                    with private_index(location) as indexed:
+                        return self._git(
+                            worktree,
+                            arguments,
+                            timeout_seconds=timeout_seconds,
+                            location=indexed,
+                        )
+                except HardenedGitError as error:
+                    raise WorktreeError(str(error)) from error
+            return self.git_runner.run(
+                "git",
+                location.arguments(arguments),
+                cwd=worktree.resolve(),
+                timeout_seconds=timeout_seconds,
+                environment=location.environment(),
+            ).stdout
+        # A baseline checkout cloned here from the canonical mirror (never maker-written).
         return self.git_runner.run(
             "git",
             ["-c", f"safe.directory={worktree}", *arguments],
@@ -1883,7 +1947,7 @@ class ScanActivityHandler(UiPlanScanSteps):
 
     def _git_status(self, worktree: Path, *, ignored: bool) -> dict[str, str]:
         """Map each porcelain path to its XY code ('??' untracked, '!!' ignored)."""
-        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal", SUBMODULES]
         if ignored:
             arguments.append("--ignored=traditional")
         tokens = self._git(worktree, arguments).split("\0")
@@ -2063,17 +2127,19 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         commit = None
         if changed:
-            self._git(worktree, ["add", "--", *changed])
-            self._git(
-                worktree,
-                [
-                    "commit",
-                    "--quiet",
-                    "--no-verify",
-                    "-m",
-                    "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
-                ],
-            )
+            with self._committing(worktree) as location:
+                self._git(worktree, ["add", "--", *changed], location=location)
+                self._git(
+                    worktree,
+                    [
+                        "commit",
+                        "--quiet",
+                        "--no-verify",
+                        "-m",
+                        "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
+                    ],
+                    location=location,
+                )
             commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
         prepared = self._prepare_toolchain(payload)
         if prepared.get("status") == "BLOCKED":
@@ -2200,13 +2266,15 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         before = self._git(source, ["rev-parse", "HEAD"]).strip()
         changed = sorted(rewrites)
+        committing = ExitStack()
+        location = committing.enter_context(self._committing(source))
         try:
             for path, _, updated in rewrites.values():
                 path.write_bytes(updated)
             if sorted(self._git_status(source, ignored=False)) != changed:
                 raise ValueError("pin convergence changed files outside its configured files")
             name, email = self._PIN_IDENTITY
-            self._git(source, ["add", "--", *changed])
+            self._git(source, ["add", "--", *changed], location=location)
             self._git(
                 source,
                 [
@@ -2221,19 +2289,32 @@ class ScanActivityHandler(UiPlanScanSteps):
                     f"chore(ci): pin {evidence['deployment_repository']} to "
                     f"{deployment_head[:12]} (Hermes pin convergence)",
                 ],
+                location=location,
             )
         except (OSError, ValueError, CommandFailure):
             for path, original, _ in rewrites.values():
                 path.write_bytes(original)
-            self._git(source, ["reset", "--quiet", "--", *changed])
+            self._git(source, ["reset", "--quiet", "--", *changed], location=location)
             raise
+        finally:
+            committing.close()
         commit = self._git(source, ["rev-parse", "HEAD"]).strip()
         parent = self._git(source, ["rev-parse", "HEAD^"]).strip()
         # Exactly the pin lines, one removed and one added each, nothing else committed.
         numstat = sorted(
             tuple(line.split("\t"))
             for line in self._git(
-                source, ["diff", "--numstat", "--no-renames", "HEAD^", "HEAD"]
+                source,
+                [
+                    "diff",
+                    "--numstat",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    SUBMODULES,
+                    "HEAD^",
+                    "HEAD",
+                ],
             ).splitlines()
             if line
         )
@@ -2325,12 +2406,14 @@ class ScanActivityHandler(UiPlanScanSteps):
     def _is_ancestor(self, worktree: Path, sha: str) -> bool:
         if not re.fullmatch(r"[a-f0-9]{40}", sha):
             return False
+        # NEW-221: the deployment worktree is maker-writable; never discover from it.
+        location = self._changeset_git(worktree)
         result = self.git_runner.run(
             "git",
-            ["-c", f"safe.directory={worktree}", "merge-base", "--is-ancestor", sha, "HEAD"],
-            cwd=worktree,
+            location.arguments(["merge-base", "--is-ancestor", sha, "HEAD"]),
+            cwd=worktree.resolve(),
             timeout_seconds=300,
-            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+            environment=location.environment(),
             check=False,
         )
         return result.return_code == 0

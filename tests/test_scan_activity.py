@@ -146,6 +146,9 @@ class FakeCleanupManager:
     def is_dirty(self, path: Path) -> bool:
         return self.dirty
 
+    def worktree_identity(self, path: Path) -> tuple[str, str, bool]:
+        return self.branch, "b" * 40, self.dirty
+
     def cleanup(
         self, allocation: Any, *, evidence_captured: bool, archive_dirty: bool = False
     ) -> None:

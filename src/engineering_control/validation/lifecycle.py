@@ -112,13 +112,14 @@ class AcceptanceActivities:
         )
         target = Path(str(payload["worktree_root"])) / "fixture" / str(change_set_id)
         if target.exists():
-            if manager._run(["git", "rev-parse", "HEAD"], target) != payload["source_sha"]:
+            # NEW-221: read through the hardened location, never by discovery.
+            branch, head, dirty = manager.worktree_identity(target)
+            if head != payload["source_sha"]:
                 raise WorktreeError("existing acceptance worktree has the wrong base")
-            if manager.is_dirty(target):
+            if dirty:
                 expected = target / "synthetic-change.txt"
                 if not expected.is_file():
                     raise WorktreeError("existing acceptance worktree is unexpectedly dirty")
-            branch = manager._run(["git", "branch", "--show-current"], target)
         else:
             allocation = manager.allocate(
                 repository="fixture",

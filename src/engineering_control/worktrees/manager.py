@@ -8,7 +8,9 @@ import re
 import shutil
 import stat
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -17,6 +19,17 @@ from engineering_control.leases.file_lease import FileLease
 from engineering_control.projects import DEPLOYMENT_REPOSITORY_SLUGS, REPOSITORY_SLUG_SET
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.agent_config import is_agent_config_path, overlaps
+from engineering_control.worktrees.hardened_git import (
+    SUBMODULES,
+    GitLocation,
+    HardenedGitError,
+    changeset_location,
+    metadata_location,
+    needs_index,
+    private_index,
+    seal_metadata,
+    verify_local_objects,
+)
 
 
 class WorktreeError(RuntimeError):
@@ -144,6 +157,98 @@ class GitWorktreeManager:
         # for this exact Unix identity. Engineering Control never extracts a token.
         return {"GIT_TERMINAL_PROMPT": "0"}
 
+    # NEW-221: every Git command in a ChangeSet worktree or metadata repository (both
+    # maker-writable) runs through these, never through _run, which lets Git discover the
+    # repository and load whatever configuration and hooks the maker left there.
+    def _sealed(self, repository: str, metadata: Path) -> Path:
+        try:
+            seal_metadata(metadata, origin=self.mirror_path(repository))
+            verify_local_objects(metadata)
+        except (HardenedGitError, OSError) as error:
+            raise WorktreeError(f"ChangeSet Git metadata could not be sealed: {error}") from error
+        return metadata
+
+    def _metadata_git(self, repository: str, metadata: Path) -> GitLocation:
+        return metadata_location(self._sealed(repository, metadata))
+
+    def _worktree_git(self, path: Path) -> GitLocation:
+        """The hardened location of one bounded worktree (a ChangeSet's, or an audit
+        snapshot's), with its metadata repository sealed first."""
+        try:
+            return changeset_location(
+                path,
+                worktree_root=self.worktree_root,
+                metadata_root=self.metadata_root,
+                mirror_root=self.mirror_root,
+                seal=True,
+            )
+        except (HardenedGitError, OSError) as error:
+            raise WorktreeError(str(error)) from error
+
+    @contextmanager
+    def _indexed(self, location: GitLocation) -> Iterator[GitLocation]:
+        """NEW-221: ``location`` with a private index built from HEAD, for an operation of
+        several commands; the maker's own index is never read."""
+        if location.index_file is not None:
+            yield location
+            return
+        try:
+            with private_index(location) as indexed:
+                yield indexed
+        except HardenedGitError as error:
+            raise WorktreeError(str(error)) from error
+
+    def _git_process(
+        self,
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        stdin: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if location.work_tree is not None and location.index_file is None and needs_index(args):
+            with self._indexed(location) as indexed:
+                return self._git_process(indexed, args, timeout=timeout, stdin=stdin)
+        return subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            ["git", *location.arguments(args)],  # noqa: S607
+            cwd=location.work_tree or location.git_dir,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+            env=location.environment(),
+            input=stdin,
+        )
+
+    def _git_bytes(
+        self,
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        stdin: bytes | None = None,
+    ) -> bytes:
+        """Raw stdout (NUL-delimited records, unquoted non-ASCII paths)."""
+        result = self._git_process(location, args, timeout=timeout, stdin=stdin)
+        if result.returncode:
+            error = str(SecretRedactor().redact_text(os.fsdecode(result.stderr)).value)
+            raise WorktreeError(f"Git command failed ({result.returncode}): {error[-4000:]}")
+        return result.stdout
+
+    def _git(
+        self,
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+    ) -> str:
+        result = self._git_process(location, args, timeout=timeout)
+        stdout = result.stdout.decode("utf-8", "surrogateescape")
+        if result.returncode:
+            output = stdout + result.stderr.decode("utf-8", "replace")
+            output = str(SecretRedactor().redact_text(output).value)
+            raise WorktreeError(f"Git command failed ({result.returncode}): {output[-4000:]}")
+        return stdout.strip()
+
     def mirror_path(self, repository: str) -> Path:
         return self.mirror_root / f"{self._slug(repository)}.git"
 
@@ -182,14 +287,13 @@ class GitWorktreeManager:
                 canonical_mirror,
                 timeout=900,
             )
-        if (
-            not metadata.is_dir()
-            or self._run(["git", "rev-parse", "--is-bare-repository"], metadata) != "true"
-        ):
+        if not metadata.is_dir() or metadata.is_symlink():
             raise WorktreeError("ChangeSet Git metadata repository is not bare")
-        origin = Path(self._run(["git", "remote", "get-url", "origin"], metadata)).resolve()
-        if origin != canonical_mirror.resolve():
-            raise WorktreeError("ChangeSet Git metadata origin changed after allocation")
+        # NEW-221: sealing rewrites the configuration (origin included) from trusted values,
+        # so the maker-writable origin is no longer read back and compared.
+        location = self._metadata_git(repository, metadata)
+        if self._git(location, ["rev-parse", "--is-bare-repository"]) != "true":
+            raise WorktreeError("ChangeSet Git metadata repository is not bare")
         return metadata
 
     def fetch(self, repository: str) -> None:
@@ -276,20 +380,17 @@ class GitWorktreeManager:
                 resume_prior_commits and self._descends_from(mirror, expected_base_sha, actual)
             ):
                 raise mismatch
+            # NEW-40: the sealed configuration (NEW-221) carries the platform's commit
+            # identity, so a maker that stages a change can always commit it.
             metadata = self._ensure_metadata_mirror(repository, change_set_id, mirror)
-            # NEW-40: a maker could implement and stage a change yet fail to commit
-            # ("Git has no configured author identity"). Give the ChangeSet's repository
-            # the same identity the platform uses for its own commits.
-            self._run(["git", "config", "user.name", "Engineering Control"], metadata)
-            self._run(
-                ["git", "config", "user.email", "engineering-control@local.invalid"], metadata
-            )
+            metadata_git = metadata_location(metadata)
             repo_slug = self._slug(repository)
             target = self.worktree_root / repo_slug / str(change_set_id)
             branch = f"agent/{self._slug(project)}/{self._slug(issue)}/{str(change_set_id)}"
-            if target.exists():
-                actual_head = self._run(["git", "rev-parse", "HEAD"], target)
-                actual_branch = self._run(["git", "branch", "--show-current"], target)
+            if target.exists() or target.is_symlink():
+                location = self._worktree_git(target)
+                actual_head = self._git(location, ["rev-parse", "HEAD"])
+                actual_branch = self._git(location, ["branch", "--show-current"])
                 if actual_branch != branch:
                     raise WorktreeError(
                         f"existing worktree does not match the ChangeSet allocation: {target}"
@@ -297,7 +398,7 @@ class GitWorktreeManager:
                 if (
                     resume_prior_commits
                     and actual_head != expected_base_sha
-                    and self._descends_from(target, expected_base_sha, actual_head)
+                    and self._descends_from(location, expected_base_sha, actual_head)
                 ):
                     # NEW-52: musematic #993 churned through 11 rounds because every
                     # correction re-implemented the feature from the base. Keep the
@@ -327,43 +428,45 @@ class GitWorktreeManager:
                 return WorktreeAllocation(repository, target, branch, actual, change_set_id)
             # NEW-85: the cleanup may have removed this ChangeSet's worktree while its
             # branch (and any archived work) stays in the metadata repository.
-            self._run(["git", "worktree", "prune"], metadata)
-            existing_head = self._branch_head(metadata, branch)
+            self._git(metadata_git, ["worktree", "prune"])
+            existing_head = self._branch_head(metadata_git, branch)
             resumed_from: str | None = None
             if (
                 existing_head is not None
                 and resume_prior_commits
-                and self._descends_from(metadata, expected_base_sha, existing_head)
+                and self._descends_from(metadata_git, expected_base_sha, existing_head)
             ):
                 resumed_from = existing_head
             elif base_moved:
                 raise mismatch
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             if resumed_from is not None:
-                add = ["git", "worktree", "add", str(target), branch]
+                add = ["worktree", "add", str(target), branch]
             elif existing_head is not None:
                 if existing_head != expected_base_sha:
                     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-                    self._run(
+                    self._git(
+                        metadata_git,
                         [
-                            "git",
                             "update-ref",
                             f"refs/archive/{change_set_id}/{stamp}-head",
                             existing_head,
                         ],
-                        metadata,
                     )
-                add = ["git", "worktree", "add", "-B", branch, str(target), expected_base_sha]
+                add = ["worktree", "add", "-B", branch, str(target), expected_base_sha]
             else:
-                add = ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha]
-            self._run(add, metadata, timeout=900)
+                add = ["worktree", "add", "-b", branch, str(target), expected_base_sha]
+            self._git(metadata_git, add, timeout=900)
             if self.is_dirty(target):
                 raise WorktreeError("newly allocated worktree is unexpectedly dirty")
             if access is not None:
                 try:
                     self._grant_access(target, metadata, mirror, access, repository=repository)
+                    # The recursive grant reset every ACL mask: seal again so the maker
+                    # keeps write on objects/, refs/, logs/ and its admin directory only.
+                    self._sealed(repository, metadata)
                 except Exception:
-                    self._run(["git", "worktree", "remove", str(target)], metadata)
+                    self._git(metadata_git, ["worktree", "remove", "--force", str(target)])
                     raise
             return WorktreeAllocation(
                 repository,
@@ -405,19 +508,21 @@ class GitWorktreeManager:
                     f"got {actual}"
                 )
             metadata = self._ensure_metadata_mirror(repository, campaign_id, mirror)
+            metadata_git = metadata_location(metadata)
             target = self.worktree_root / self._slug(repository) / str(campaign_id)
-            if target.exists():
-                if self._run(["git", "rev-parse", "HEAD"], target) != expected_base_sha:
+            if target.exists() or target.is_symlink():
+                location = self._worktree_git(target)
+                if self._git(location, ["rev-parse", "HEAD"]) != expected_base_sha:
                     raise WorktreeError("existing audit snapshot has the wrong immutable SHA")
-                if self._run(["git", "branch", "--show-current"], target):
+                if self._git(location, ["branch", "--show-current"]):
                     raise WorktreeError("existing audit snapshot is not detached")
                 if self.is_dirty(target):
                     raise WorktreeError("existing audit snapshot is dirty and protected")
                 return AuditSnapshotAllocation(repository, target, actual, campaign_id)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
-            self._run(
-                ["git", "worktree", "add", "--detach", str(target), expected_base_sha],
-                metadata,
+            self._git(
+                metadata_git,
+                ["worktree", "add", "--detach", str(target), expected_base_sha],
                 timeout=900,
             )
             if self.is_dirty(target):
@@ -429,8 +534,9 @@ class GitWorktreeManager:
                     mirror,
                     ("codex-runner", "claude-runner"),
                 )
+                self._sealed(repository, metadata)
             except Exception:
-                self._run(["git", "worktree", "remove", str(target)], metadata)
+                self._git(metadata_git, ["worktree", "remove", "--force", str(target)])
                 raise
             return AuditSnapshotAllocation(repository, target, actual, campaign_id)
 
@@ -539,6 +645,8 @@ class GitWorktreeManager:
         self._grant_bounded_read_access(resolved_target, ("release-runner",))
         self._grant_metadata_traverse(metadata, ("release-runner",))
         self._grant_tree_read_access(metadata, ("release-runner",), cwd=metadata)
+        # NEW-221: the recursive grant recalculated the ACL masks; seal again.
+        self._sealed(repository, metadata)
         self._grant_canonical_read(mirror, ("release-runner",))
 
     def grant_delivery_read(self, repository: str, target: Path) -> None:
@@ -561,6 +669,8 @@ class GitWorktreeManager:
         self._grant_tree_read_access(metadata, ("delivery-runner",), cwd=metadata)
         self._grant_canonical_read(mirror, ("delivery-runner",))
         self._grant_publication_transport_read(metadata, mirror)
+        # NEW-221: the recursive grants recalculated the ACL masks; seal again.
+        self._sealed(repository, metadata)
 
     def _grant_publication_transport_read(self, metadata: Path, mirror: Path) -> None:
         """NEW-61: let the controller's GitHub worker fetch the validated branch over SSH.
@@ -780,19 +890,25 @@ class GitWorktreeManager:
             for identity in identities
         )
 
-    def _branch_head(self, metadata: Path, branch: str) -> str | None:
+    def _branch_head(self, metadata: GitLocation, branch: str) -> str | None:
         try:
-            head = self._run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], metadata)
+            head = self._git(metadata, ["rev-parse", "--verify", f"refs/heads/{branch}"])
         except WorktreeError:
             return None
         return head if re.fullmatch(r"[a-f0-9]{40}", head) else None
 
-    def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
-        """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""
+    def _descends_from(self, where: Path | GitLocation, base_sha: str, head: str) -> bool:
+        """True when head is a strict descendant of base_sha (NEW-52 resume guard).
+
+        ``where`` is the canonical mirror (never maker-writable) or a hardened location."""
         if not re.fullmatch(r"[a-f0-9]{40}", head) or head == base_sha:
             return False
+        arguments = ["merge-base", "--is-ancestor", base_sha, head]
         try:
-            self._run(["git", "merge-base", "--is-ancestor", base_sha, head], target)
+            if isinstance(where, GitLocation):
+                self._git(where, arguments)
+            else:
+                self._run(["git", *arguments], where)
         except WorktreeError:
             return False  # not an ancestor (exit 1) or unknown history: reset to base
         return True
@@ -811,48 +927,84 @@ class GitWorktreeManager:
         destination = reset_to or base_sha
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         prefix = f"refs/archive/{change_set_id}/{stamp}"
-        head = self._run(["git", "rev-parse", "HEAD"], target)
+        location = self._worktree_git(target)
+        head = self._git(location, ["rev-parse", "HEAD"])
         if head != base_sha:
-            self._run(["git", "update-ref", f"{prefix}-head", head], target)
-        if self.is_dirty(target):
-            self._run(
-                [
-                    "git",
-                    "-c",
-                    "user.name=engineering-control",
-                    "-c",
-                    "user.email=engineering-control@localhost",
-                    "stash",
-                    "push",
-                    "--include-untracked",
-                    "--message",
-                    f"archived stopped delivery attempt {stamp}",
-                ],
-                target,
-            )
-            stash = self._run(["git", "rev-parse", "refs/stash"], target)
-            self._run(["git", "update-ref", f"{prefix}-worktree", stash], target)
-        self._run(["git", "reset", "--hard", destination], target)
-        self._run(["git", "clean", "-ffdx"], target)
-        if self.is_dirty(target) or self._run(["git", "rev-parse", "HEAD"], target) != destination:
+            self._git(location, ["update-ref", f"{prefix}-head", head])
+        if self._dirty(location):
+            # NEW-221: plumbing into a private index, never `git stash` or `git add`: their
+            # internal diffs take no --ignore-submodules, so a tracked gitlink with
+            # `.gitmodules` `ignore = none` would make them run Git (and its filters)
+            # inside the maker's nested repository. update-index only hashes the paths it
+            # is given and records a gitlink's commit as data. The archive commit (parent:
+            # HEAD) holds every tracked and untracked, not ignored, file.
+            with self._indexed(location) as indexed:
+                paths = self._git_bytes(indexed, ["ls-files", "-z"])
+                paths += self._git_bytes(
+                    indexed, ["ls-files", "-z", "--others", "--exclude-standard"]
+                )
+                self._git_bytes(
+                    indexed,
+                    ["update-index", "--add", "--remove", "-z", "--stdin"],
+                    stdin=paths,
+                )
+                tree = self._git(indexed, ["write-tree"])
+                archived = self._git(
+                    location,
+                    [
+                        "-c",
+                        "user.name=engineering-control",
+                        "-c",
+                        "user.email=engineering-control@localhost",
+                        "commit-tree",
+                        tree,
+                        "-p",
+                        head,
+                        "-m",
+                        f"archived stopped delivery attempt {stamp}",
+                    ],
+                )
+            self._git(location, ["update-ref", f"{prefix}-worktree", archived])
+        self._git(location, ["reset", "--hard", destination])
+        self._git(location, ["clean", "-ffdx"])
+        # The maker's next attempt uses its real index: rebuild it from the reset HEAD.
+        self._git(
+            replace(location, index_file=location.git_dir / "index"), ["read-tree", destination]
+        )
+        if self._dirty(location) or self._git(location, ["rev-parse", "HEAD"]) != destination:
             raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
+    def _dirty(self, location: GitLocation) -> bool:
+        return bool(self._git(location, ["status", "--porcelain=v1", SUBMODULES]))
+
     def is_dirty(self, path: Path) -> bool:
-        return bool(self._run(["git", "status", "--porcelain=v1"], path))
+        return self._dirty(self._worktree_git(path))
+
+    def worktree_identity(self, path: Path) -> tuple[str, str, bool]:
+        """NEW-221: (branch, head, dirty) of a bounded worktree, read without letting Git
+        discover anything from it."""
+        location = self._worktree_git(path)
+        return (
+            self._git(location, ["branch", "--show-current"]),
+            self._git(location, ["rev-parse", "HEAD"]),
+            self._dirty(location),
+        )
 
     def inspect_snapshot(self, path: Path, *, expected_sha: str) -> dict[str, str | int]:
         root = self.worktree_root.resolve()
         resolved = path.resolve()
         if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
             raise WorktreeError("snapshot inspection escaped the bounded worktree root")
-        actual = self._run(["git", "rev-parse", "HEAD"], resolved)
+        location = self._worktree_git(resolved)
+        actual = self._git(location, ["rev-parse", "HEAD"])
         if actual != expected_sha:
             raise WorktreeError(
                 f"snapshot inspection SHA mismatch: expected {expected_sha}, got {actual}"
             )
-        if self.is_dirty(resolved):
-            raise WorktreeError("snapshot inspection found a dirty protected worktree")
-        tracked = self._run(["git", "ls-files", "-z"], resolved)
+        with self._indexed(location) as indexed:
+            if self._dirty(indexed):
+                raise WorktreeError("snapshot inspection found a dirty protected worktree")
+            tracked = self._git(indexed, ["ls-files", "-z"])
         files = [item for item in tracked.split("\0") if item]
         canonical = json.dumps(files, separators=(",", ":"), ensure_ascii=True).encode()
         return {
@@ -861,7 +1013,7 @@ class GitWorktreeManager:
             "tracked_files_sha256": hashlib.sha256(canonical).hexdigest(),
         }
 
-    def _snapshot_object(self, path: Path, expected_sha: str, relative: str) -> Path:
+    def _snapshot_object(self, path: Path, expected_sha: str, relative: str) -> GitLocation:
         root = self.worktree_root.resolve()
         resolved = path.resolve()
         if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
@@ -872,28 +1024,28 @@ class GitWorktreeManager:
             r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", relative
         ) or ".." in relative.split("/"):
             raise ValueError(f"snapshot tree path is invalid: {relative}")
-        return resolved
+        return self._worktree_git(resolved)
 
     def snapshot_object_type(self, path: Path, *, expected_sha: str, relative: str) -> str | None:
         """NEW-136 review: the Git object type of `relative` at the snapshot commit ('tree',
         'blob' -- a symlink is a blob -- ...), or None when it does not resolve (absent, or
         below a symlink, which Git never follows)."""
-        resolved = self._snapshot_object(path, expected_sha, relative)
+        location = self._snapshot_object(path, expected_sha, relative)
         try:
-            return self._run(["git", "cat-file", "-t", f"{expected_sha}:{relative}"], resolved)
+            return self._git(location, ["cat-file", "-t", f"{expected_sha}:{relative}"])
         except WorktreeError:
             return None
 
     def snapshot_tree(self, path: Path, *, expected_sha: str, relative: str) -> str:
         """NEW-136: the Git tree id of `relative` (a directory) at the snapshot commit,
         read from the object store (independent of the checked-out files)."""
-        resolved = self._snapshot_object(path, expected_sha, relative)
-        tree = self._run(
-            ["git", "rev-parse", "--verify", "--quiet", f"{expected_sha}:{relative}"], resolved
+        location = self._snapshot_object(path, expected_sha, relative)
+        tree = self._git(
+            location, ["rev-parse", "--verify", "--quiet", f"{expected_sha}:{relative}"]
         )
         if (
             not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", tree)
-            or self._run(["git", "cat-file", "-t", tree], resolved) != "tree"
+            or self._git(location, ["cat-file", "-t", tree]) != "tree"
         ):
             raise WorktreeError(f"snapshot has no directory {relative} at {expected_sha}")
         return tree
@@ -914,13 +1066,20 @@ class GitWorktreeManager:
             raise WorktreeError("whitespace check escaped the bounded worktree root")
         if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
             raise ValueError("whitespace check base must be a full Git SHA")
-        self._run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], resolved)
-        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
-            ["git", "diff", "--no-color", "--no-ext-diff", "--check", base_sha, "--"],  # noqa: S607
-            cwd=resolved,
-            check=False,
-            capture_output=True,
-            timeout=300,
+        location = self._worktree_git(resolved)
+        self._git(location, ["cat-file", "-e", f"{base_sha}^{{commit}}"])
+        result = self._git_process(
+            location,
+            [
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                SUBMODULES,
+                "--check",
+                base_sha,
+                "--",
+            ],
         )
         if result.returncode == 0 and not result.stdout and not result.stderr:
             return False
@@ -935,14 +1094,21 @@ class GitWorktreeManager:
             raise WorktreeError("change evidence escaped the bounded worktree root")
         if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
             raise ValueError("change evidence base must be a full Git SHA")
-        self._run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], resolved)
-        self._run(["git", "diff", "--check", base_sha, "--"], resolved)
-        status = self._run(["git", "status", "--porcelain=v1"], resolved)
-        diff = self._run(["git", "diff", "--binary", base_sha, "--"], resolved)
+        with self._indexed(self._worktree_git(resolved)) as location:
+            return self._change_evidence(resolved, location, base_sha=base_sha)
+
+    def _change_evidence(
+        self, resolved: Path, location: GitLocation, *, base_sha: str
+    ) -> tuple[dict[str, object], str]:
+        diff_options = ["--no-color", "--no-ext-diff", "--no-textconv", SUBMODULES]
+        self._git(location, ["cat-file", "-e", f"{base_sha}^{{commit}}"])
+        self._git(location, ["diff", *diff_options, "--check", base_sha, "--"])
+        status = self._git(location, ["status", "--porcelain=v1", SUBMODULES])
+        diff = self._git(location, ["diff", *diff_options, "--binary", base_sha, "--"])
         committed_or_tracked = {
             item
-            for item in self._run(
-                ["git", "diff", "--name-only", base_sha, "--"], resolved
+            for item in self._git(
+                location, ["diff", *diff_options, "--name-only", base_sha, "--"]
             ).splitlines()
             if item
         }
@@ -971,29 +1137,20 @@ class GitWorktreeManager:
         changed_paths = sorted(committed_or_tracked.union(str(item["path"]) for item in untracked))
         summary: dict[str, object] = {
             "base_sha": base_sha,
-            "head_sha": self._run(["git", "rev-parse", "HEAD"], resolved),
+            "head_sha": self._git(location, ["rev-parse", "HEAD"]),
             "changed_entries": len(status.splitlines()),
             "changed_file_count": len(changed_paths),
             "changed_paths": changed_paths,
             "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
             "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
             "untracked": untracked,
-            "agent_config_paths": self._agent_config_changes(resolved, base_sha=base_sha),
+            "agent_config_paths": self._agent_config_changes(resolved, location, base_sha=base_sha),
         }
         return summary, diff
 
-    @staticmethod
-    def _git_bytes(args: list[str], cwd: Path) -> bytes:
-        """Raw stdout (NUL-delimited records, unquoted non-ASCII paths)."""
-        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
-            args, cwd=cwd, check=False, capture_output=True, timeout=300
-        )
-        if result.returncode:
-            error = str(SecretRedactor().redact_text(os.fsdecode(result.stderr)).value)
-            raise WorktreeError(f"Git command failed ({result.returncode}): {error[-4000:]}")
-        return result.stdout
-
-    def _agent_config_changes(self, worktree: Path, *, base_sha: str) -> list[str]:
+    def _agent_config_changes(
+        self, worktree: Path, location: GitLocation, *, base_sha: str
+    ) -> list[str]:
         """NEW-130: every way a ChangeSet touches agent configuration (.codex, .claude,
         .mcp.json at any depth): a changed, added, deleted or renamed path (renames are
         split into deletion + addition), a symlink it adds, changes or deletes whose
@@ -1007,7 +1164,7 @@ class GitWorktreeManager:
 
         def link_target(sha: str, path: bytes) -> str | None:
             if set(sha) != {"0"}:
-                return display(self._git_bytes(["git", "cat-file", "blob", sha], worktree))
+                return display(self._git_bytes(location, ["cat-file", "blob", sha]))
             on_disk = worktree / os.fsdecode(path)
             return display(os.fsencode(os.readlink(on_disk))) if on_disk.is_symlink() else None
 
@@ -1059,8 +1216,19 @@ class GitWorktreeManager:
                 refused.add(f"{name} -> {inside}")
 
         tokens = self._git_bytes(
-            ["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base_sha, "--"],
-            worktree,
+            location,
+            [
+                "diff",
+                "--raw",
+                "-z",
+                "--no-renames",
+                "--no-abbrev",
+                "--no-ext-diff",
+                "--no-textconv",
+                SUBMODULES,
+                base_sha,
+                "--",
+            ],
         ).split(b"\0")
         index = 0
         while index + 1 < len(tokens):
@@ -1078,7 +1246,7 @@ class GitWorktreeManager:
             if dst_mode == "120000":
                 check_symlink(path, link_target(dst_sha, path))
         for path in self._git_bytes(
-            ["git", "ls-files", "-z", "--others", "--exclude-standard"], worktree
+            location, ["ls-files", "-z", "--others", "--exclude-standard"]
         ).split(b"\0"):
             if not path:
                 continue
@@ -1092,7 +1260,7 @@ class GitWorktreeManager:
         if changed:
             # The resulting tree: an agent-config path that resolves through a symlink
             # (pre-existing or not) onto a path this ChangeSet changed.
-            for record in self._git_bytes(["git", "ls-files", "-z", "-s"], worktree).split(b"\0"):
+            for record in self._git_bytes(location, ["ls-files", "-z", "-s"]).split(b"\0"):
                 if b"\t" not in record:
                     continue
                 path = record.split(b"\t", 1)[1]
@@ -1168,14 +1336,15 @@ class GitWorktreeManager:
                     "kind": "SNAPSHOT",
                 }
                 try:
-                    if self._run(["git", "branch", "--show-current"], target):
+                    if self._git(self._worktree_git(target), ["branch", "--show-current"]):
                         continue  # a ChangeSet worktree: lease-based cleanup only
                     metadata = self.metadata_path(slug, identity)
                     if dry_run:
                         removed.append(record)
                         continue
-                    self._run(["git", "worktree", "remove", "--force", str(target)], metadata)
-                    remaining = self._run(["git", "worktree", "list", "--porcelain"], metadata)
+                    metadata_git = self._metadata_git(slug, metadata)
+                    self._git(metadata_git, ["worktree", "remove", "--force", str(target)])
+                    remaining = self._git(metadata_git, ["worktree", "list", "--porcelain"])
                     if remaining.count("worktree ") <= 1 and metadata.is_dir():
                         shutil.rmtree(metadata)
                     removed.append(record)
@@ -1201,11 +1370,12 @@ class GitWorktreeManager:
         resolved = allocation.path.resolve()
         if resolved != expected or not resolved.is_dir():
             raise WorktreeError("cleanup target does not match its bounded ChangeSet path")
-        actual_branch = self._run(["git", "branch", "--show-current"], resolved)
+        location = self._worktree_git(resolved)
+        actual_branch = self._git(location, ["branch", "--show-current"])
         if actual_branch != allocation.branch:
             raise WorktreeError("cleanup target branch changed after authorization")
         metadata = self._metadata_for_target(allocation.repository, resolved)
-        if self.is_dirty(allocation.path):
+        if self._dirty(location):
             if not archive_dirty:
                 if not evidence_captured:
                     raise WorktreeError("dirty worktree is protected until evidence is captured")
@@ -1214,8 +1384,11 @@ class GitWorktreeManager:
                 )
             # NEW-85: an abandoned attempt's uncommitted work is kept under
             # refs/archive/<changeset>/ in its git metadata before the worktree goes.
-            head = self._run(["git", "rev-parse", "HEAD"], resolved)
+            head = self._git(location, ["rev-parse", "HEAD"])
             self._archive_and_reset(
                 resolved, allocation.base_sha, allocation.change_set_id, reset_to=head
             )
-        self._run(["git", "worktree", "remove", "--force", str(allocation.path)], metadata)
+        self._git(
+            self._metadata_git(allocation.repository, metadata),
+            ["worktree", "remove", "--force", str(allocation.path)],
+        )

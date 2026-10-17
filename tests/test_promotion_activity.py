@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 import yaml
+from changeset_worktree import link_changeset_worktree
 
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
@@ -21,15 +22,18 @@ class PromotionRunner:
         arguments: list[str],
         *,
         cwd: Path,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> CommandResult:
         if executable == "git":
+            # As SafeCommandRunner: a fixed base environment plus the caller's (NEW-221).
+            environment = kwargs.get("environment")
             process = subprocess.run(  # noqa: S603 - fixed Git executable in test harness
                 ["/usr/bin/git", *arguments],
                 cwd=cwd,
                 check=False,
                 capture_output=True,
                 text=True,
+                env={"PATH": "/usr/bin:/bin", **environment} if environment else None,
             )
             if process.returncode:
                 raise ValueError(process.stderr)
@@ -99,6 +103,7 @@ def create_promotion_repository(root: Path, change_set_id: Any) -> tuple[Path, s
         capture_output=True,
         text=True,
     ).stdout.strip()
+    link_changeset_worktree(worktree, root.parent / "worktree-git")
     return worktree, branch, head
 
 
@@ -143,6 +148,7 @@ async def test_promotion_changes_only_allowlisted_digests_and_commits_clean_head
     handler = ScanActivityHandler(
         Settings(
             worktree_root=worktree_root,
+            worktree_metadata_root=tmp_path / "worktree-git",
             evidence_root=tmp_path / "evidence",
         ),
         promotion_runner=PromotionRunner(),  # type: ignore[arg-type]
