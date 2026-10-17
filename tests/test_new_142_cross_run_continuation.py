@@ -426,11 +426,13 @@ def test_part_ids_are_unchanged() -> None:
     # NEW-149 (2026-10-07) deliberately changed the operator decisions and seed findings
     # (gntik-ui stable 0.2.0 replaces the canary pin), so part ids of FUTURE plans change;
     # the approved blueprint is final data and its fan-out never recomputes part ids.
+    # NEW-213 (2026-10-17) changed them again (the kit comes from public npm, not GitHub
+    # Packages, and blocks 0.7.0 adds DataTable server pagination): new values below.
     provenance = ui_plan.part_provenance("p" * 64)
-    assert provenance == "f913a843f1baf9376bf876720e7aa5024c647bda5cf414075337e5b222c47a20"
+    assert provenance == "1ef311261573d4dd569dcff43d145e0bab49a8d4cc0e9b390065b8ae5ab1d58c"
     assert frame_part_id("c" * 64, "k" * 64, ["a-page", "b-page"], provenance) == (
-        "frame-2f38a18b6a93c05e"
+        "frame-2ce21affa81c8618"
     )
     assert batch_part_id(1, "c" * 64, "k" * 64, ["a-page"], "f" * 64, provenance) == (
-        "b001-9b508acf616d7c28"
+        "b001-0bfc488679e8283d"
     )
