@@ -11,7 +11,7 @@ Approved 2026-10-17: three stages, three reviewed PRs. Merges and deploys are al
 - **gntik-ui** is `merge_only`, with no staging deploy: issues close at merge.
 
 ## Prerequisite for concurrency of 2 or more (operator)
-Each merge target repository needs strict "require up-to-date" branch protection, or a GitHub merge queue, so a merge on a moved base is refused atomically. Hermes checks this at `backlog-start` and refuses concurrency above 1 without it.
+Each merge target repository needs strict "require up-to-date" branch protection (decision 1), so a merge on a moved base is refused atomically. Hermes checks this at `backlog-start` and refuses concurrency above 1 without it.
 
 ## Stage 1a (PR 1): merge-forward
 - **When.** In BACK, when an open PR (source or deployment) is BEHIND. A MERGED PR is never advanced (delivery.py:1009).
@@ -48,13 +48,13 @@ Each merge target repository needs strict "require up-to-date" branch protection
 - **Authority.** The new publication kinds `batch-revert` and `batch-reapply` need `revert-pr-create` in the approved operations, and are fenced and reconciled like merge-forward. One budget per batch; no RecoveryWorkflow. Merged source branches are never advanced.
 - **Replay.** `workflow.patched("existing-backlog-batched-staging-v1")`; global children stay at 1.
 
-## Operator decisions
-1. Enable strict up-to-date protection or a merge queue on each repository: required for N of 2 or more.
-2. The N cap per project (proposal: 2 for falcone, 3 for gntik-ui).
-3. Provider maker concurrency and quota floors.
-4. Implementation lease capacity per project and worker slots per role.
-5. The batch size and window (proposal ≤3, ≤10 min).
-6. A gntik-ui docs-site staging contract (Pages deploy of a commit plus per-issue checks), or merge-only.
+## Operator decisions (2026-10-17)
+1. Strict up-to-date branch protection, not a merge queue. The operator enables it before concurrency above 1 is used.
+2. Caps: falcone 2, gntik-ui 3.
+3. At most 2 concurrent makers per provider, and no new FRONT below 25% remaining provider quota.
+4. Leases and worker slots come from the current worker config, revisited after Stage 2.
+5. Batches of up to 3 PRs within 10 min.
+6. gntik-ui stays merge-only, and Stage 3 starts with falcone.
 
 ## Sizes
 1a ~700 lines plus a migration; 1b ~600; Stage 2 ~300; Stage 3 ~900.
