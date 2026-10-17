@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from changeset_worktree import link_changeset_worktree
 
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
@@ -510,6 +511,7 @@ def _settings(tmp_path: Path, node_root: Path | None = None) -> Settings:
         (node_root / "bin" / "node").write_text("#!/bin/sh\n")
     return Settings(
         worktree_root=tmp_path / "worktrees",
+        worktree_metadata_root=tmp_path / "worktree-git",
         evidence_root=tmp_path / "evidence",
         project_config_root=PROJECTS,
         toolchain_cache_root=tmp_path / "cache" / "toolchain",
@@ -534,6 +536,8 @@ def _setup(
     deployment.parent.mkdir(parents=True)
     _git(tmp_path, "clone", "-q", str(tmp_path / "mirrors" / "falcone"), str(source))
     _git(tmp_path, "clone", "-q", str(tmp_path / "mirrors" / "falcone-charts"), str(deployment))
+    link_changeset_worktree(source, tmp_path / "worktree-git")
+    link_changeset_worktree(deployment, tmp_path / "worktree-git")
     handler = ScanActivityHandler(
         settings or _settings(tmp_path),
         Manager(

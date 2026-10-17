@@ -21,6 +21,7 @@ from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.projects import PROJECT_SET
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.hardened_git import changeset_location
 
 
 class ReleaseActivityHandler:
@@ -56,7 +57,16 @@ class ReleaseActivityHandler:
         )
         self.runner = runner
         self.helm = helm or FalconeHelmAdapter(runner)
-        self.gitops = gitops or MusematicGitOpsAdapter(runner)
+        self.gitops = gitops or MusematicGitOpsAdapter(
+            runner,
+            git_location=lambda worktree: changeset_location(
+                worktree,
+                worktree_root=settings.worktree_root,
+                metadata_root=settings.worktree_metadata_root,
+                mirror_root=settings.mirror_root,
+                seal=False,
+            ),
+        )
         self.redactor = SecretRedactor()
         self.catalog = EngineeringCatalog(
             project_root=settings.project_config_root,

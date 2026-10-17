@@ -8,9 +8,11 @@ import subprocess
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import yaml
+from changeset_worktree import link_changeset_worktree
 from pydantic import ValidationError
 
 from engineering_control.activities.core import ControlActivities
@@ -435,7 +437,11 @@ def test_legacy_app_tree_moves_only_with_console_files(tmp_path: Path) -> None:
     with pytest.raises(InventoryError, match="not a directory"):
         git_legacy_app_tree(run, sha, "deploy/kind/apisix/apisix.yaml")
     handler = ScanActivityHandler(
-        Settings(worktree_root=tmp_path / "worktrees", evidence_root=tmp_path / "e")
+        Settings(
+            worktree_root=tmp_path / "worktrees",
+            worktree_metadata_root=tmp_path / "worktree-git",
+            evidence_root=tmp_path / "e",
+        )
     )
     assert handler.manager.snapshot_tree(repo, expected_sha=sha, relative="apps/web-console") == (
         tree
@@ -483,14 +489,16 @@ def _git(repo: Path, *arguments: str) -> str:
 
 def _snapshot(tmp_path: Path) -> tuple[ScanActivityHandler, dict[str, Any], str]:
     root = tmp_path / "worktrees"
-    source = root / "falcone" / "snapshot"
+    source = root / "falcone" / str(uuid4())
     shutil.copytree(FIXTURE, source)
     _git(source, "init", "-q")
     _git(source, "add", "-A")
     _git(source, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "s")
     sha = _git(source, "rev-parse", "HEAD").strip()
+    link_changeset_worktree(source, tmp_path / "worktree-git")
     settings = Settings(
         worktree_root=root,
+        worktree_metadata_root=tmp_path / "worktree-git",
         evidence_root=tmp_path / "evidence",
         project_config_root=PROJECTS,
     )

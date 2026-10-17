@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from engineering_control.adapters.command import SafeCommandRunner
+from engineering_control.worktrees.hardened_git import SUBMODULES, GitLocation
 
 
 class MusematicPromotion(BaseModel):
@@ -46,20 +48,34 @@ class MusematicGitOpsAdapter:
     _max_yaml_bytes = 4 * 1024 * 1024
     _max_repository_yaml_bytes = 64 * 1024 * 1024
 
-    def __init__(self, runner: SafeCommandRunner) -> None:
+    def __init__(
+        self,
+        runner: SafeCommandRunner,
+        git_location: Callable[[Path], GitLocation] | None = None,
+    ) -> None:
         self.runner = runner
+        # NEW-221: the release activity passes this for ChangeSet worktrees (maker-
+        # writable): Git then never discovers the repository, its configuration or hooks.
+        self.git_location = git_location
+
+    def _git(self, repository: Path, *arguments: str) -> str:
+        if self.git_location is None:
+            return self.runner.run("git", list(arguments), cwd=repository).stdout
+        location = self.git_location(repository)
+        return self.runner.run(
+            "git",
+            location.arguments(arguments),
+            cwd=location.work_tree or repository,
+            environment=location.environment(),
+        ).stdout
 
     def preflight(self, plan: MusematicPromotion) -> dict[str, Any]:
         if not plan.deployment_repository.is_dir():
             raise ValueError("deployment repository worktree does not exist")
-        status = self.runner.run(
-            "git", ["status", "--porcelain=v1"], cwd=plan.deployment_repository
-        ).stdout
+        status = self._git(plan.deployment_repository, "status", "--porcelain=v1", SUBMODULES)
         if status:
             raise ValueError("Musematic deployment worktree must be clean at promotion preflight")
-        revision = self.runner.run(
-            "git", ["rev-parse", "HEAD"], cwd=plan.deployment_repository
-        ).stdout.strip()
+        revision = self._git(plan.deployment_repository, "rev-parse", "HEAD").strip()
         if revision != plan.deployment_repository_sha or revision != plan.target_revision:
             raise ValueError("deployment Git SHA does not match the approved Argo target revision")
         repository_root = plan.deployment_repository.resolve()

@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from changeset_worktree import link_changeset_worktree
 
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.codex import client as codex_module
@@ -350,7 +351,7 @@ trust_level = "trusted"
 
 
 def _base_repo(tmp_path: Path, files: dict[str, str], links: dict[str, str]) -> tuple[Path, str]:
-    repo = tmp_path / "worktrees" / "repo"
+    repo = tmp_path / "worktrees" / "llmwiki" / str(uuid4())
     repo.mkdir(parents=True)
     _git(repo, "init", "-q")
     for name, content in {"app.py": "x = 1\n", **files}.items():
@@ -363,6 +364,7 @@ def _base_repo(tmp_path: Path, files: dict[str, str], links: dict[str, str]) -> 
     base = subprocess.run(  # noqa: S603 - fixed Git executable in the test harness
         [GIT, "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout.strip()
+    link_changeset_worktree(repo, tmp_path / "metadata")
     return repo, base
 
 

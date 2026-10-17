@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 import yaml
+from changeset_worktree import link_changeset_worktree
 from pydantic import ValidationError
 
 from engineering_control.activities.scan import ScanActivityHandler
@@ -67,6 +68,7 @@ def _source_repo(worktree_root: Path) -> Path:
         "-m",
         "base",
     )
+    link_changeset_worktree(repo, worktree_root.parent / "worktree-git")
     return repo
 
 
@@ -96,6 +98,7 @@ class FakeToolchainRunner:
 def _handler(tmp_path: Path, runner: FakeToolchainRunner, **overrides: Any) -> ScanActivityHandler:
     settings = Settings(
         worktree_root=tmp_path / "worktrees",
+        worktree_metadata_root=tmp_path / "worktree-git",
         evidence_root=tmp_path / "evidence",
         project_config_root=overrides.pop("project_config_root", PROJECTS),
         toolchain_cache_root=tmp_path / "cache" / "toolchain",
@@ -359,6 +362,7 @@ def _validation(tmp_path: Path, project: str) -> tuple[ScanActivityHandler, Reco
     handler = ScanActivityHandler(
         Settings(
             worktree_root=worktrees,
+            worktree_metadata_root=tmp_path / "worktree-git",
             evidence_root=tmp_path / "evidence",
             project_config_root=PROJECTS,
         ),
@@ -465,6 +469,7 @@ def _dependency_setup(
     toolchain = FakeToolchainRunner()
     settings = Settings(
         worktree_root=tmp_path / "worktrees",
+        worktree_metadata_root=tmp_path / "worktree-git",
         evidence_root=tmp_path / "evidence",
         project_config_root=PROJECTS,
         toolchain_cache_root=tmp_path / "cache" / "toolchain",

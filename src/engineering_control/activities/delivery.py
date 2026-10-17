@@ -61,6 +61,12 @@ from engineering_control.projects import (
     alternation,
 )
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.hardened_git import (
+    SUBMODULES,
+    GitLocation,
+    HardenedGitError,
+    changeset_location,
+)
 
 _T = TypeVar("_T")
 # NEW-147: GitHub updates a PR's head asynchronously after a push (falcone #972: #1068 still
@@ -700,63 +706,27 @@ class DeliveryActivityHandler:
                 expected = self.settings.worktree_root.resolve() / slug / str(plan.change_set_id)
                 if worktree != expected or not worktree.is_dir():
                     raise ValueError("final synchronization escaped its ChangeSet worktree")
-                status = self.runner.run(
-                    "git",
-                    ["-c", f"safe.directory={worktree}", "status", "--porcelain=v1"],
-                    cwd=worktree,
-                ).stdout
+                # NEW-221: the worktree and its Git metadata are maker-writable; Git runs
+                # only against the exactly sealed metadata, never discovering anything.
+                location = self._changeset_git(worktree)
+                status = self._git(location, "status", "--porcelain=v1", SUBMODULES)
                 if status:
                     raise ValueError("final synchronization requires a clean worktree")
-                environment = {
-                    "HOME": str(self.broker.authenticated_home),
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "safe.directory",
-                    "GIT_CONFIG_VALUE_0": str(worktree),
-                }
-                self.runner.run(
-                    "git",
-                    [
-                        "-c",
-                        f"safe.directory={worktree}",
-                        "fetch",
-                        "--no-tags",
-                        f"https://github.com/{binding.repository}.git",
-                        result.merge_sha,
-                    ],
-                    cwd=worktree,
+                self._git(
+                    location,
+                    "fetch",
+                    "--no-tags",
+                    f"https://github.com/{binding.repository}.git",
+                    result.merge_sha,
                     timeout_seconds=900,
-                    environment=environment,
+                    authenticated=True,
                 )
-                fetched = self.runner.run(
-                    "git",
-                    [
-                        "-c",
-                        f"safe.directory={worktree}",
-                        "show",
-                        "-s",
-                        "--format=%T",
-                        result.merge_sha,
-                    ],
-                    cwd=worktree,
-                ).stdout.strip()
+                fetched = self._git(location, "show", "-s", "--format=%T", result.merge_sha).strip()
                 if fetched != result.merge_tree_sha:
                     raise ValueError("final merge tree changed during synchronization")
-                self.runner.run(
-                    "git",
-                    ["-c", f"safe.directory={worktree}", "reset", "--hard", result.merge_sha],
-                    cwd=worktree,
-                )
-                final_head = self.runner.run(
-                    "git",
-                    ["-c", f"safe.directory={worktree}", "rev-parse", "HEAD"],
-                    cwd=worktree,
-                ).stdout.strip()
-                final_status = self.runner.run(
-                    "git",
-                    ["-c", f"safe.directory={worktree}", "status", "--porcelain=v1"],
-                    cwd=worktree,
-                ).stdout
+                self._git(location, "reset", "--hard", result.merge_sha)
+                final_head = self._git(location, "rev-parse", "HEAD").strip()
+                final_status = self._git(location, "status", "--porcelain=v1", SUBMODULES)
                 if final_head != result.merge_sha or final_status:
                     raise ValueError("final synchronization did not produce a clean exact head")
                 synchronized.append(
@@ -772,7 +742,7 @@ class DeliveryActivityHandler:
                 "status": "FINAL_WORKTREES_SYNCHRONIZED",
                 "final_worktree_sync": synchronized,
             }
-        except (CommandFailure, OSError, ValueError, ValidationError) as error:
+        except (CommandFailure, HardenedGitError, OSError, ValueError, ValidationError) as error:
             return {
                 **payload,
                 "status": "BLOCKED",
@@ -1203,47 +1173,68 @@ class DeliveryActivityHandler:
             environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(mirror / "objects")
         return environment
 
+    def _changeset_git(self, worktree: Path) -> GitLocation:
+        """NEW-221: the hardened location of a ChangeSet worktree this identity only reads.
+
+        Its metadata repository is maker-writable; delivery cannot seal it (the scan
+        identity owns it), so it is used only when it is exactly sealed."""
+        try:
+            return changeset_location(
+                worktree,
+                worktree_root=self.settings.worktree_root,
+                metadata_root=self.settings.worktree_metadata_root,
+                mirror_root=self.settings.mirror_root,
+                seal=False,
+            )
+        except (HardenedGitError, OSError) as error:
+            raise ValueError(f"ChangeSet worktree is not safe for Git: {error}") from error
+
+    def _git(
+        self,
+        location: GitLocation,
+        *arguments: str,
+        timeout_seconds: int = 900,
+        authenticated: bool = False,
+    ) -> str:
+        """Run Git at a hardened location. ``authenticated`` (HTTPS to GitHub only) uses
+        the broker's home and its own global configuration, which holds the credential
+        helper; nothing else ever reads a global or system configuration."""
+        assert location.work_tree is not None
+        home = self.broker.authenticated_home if authenticated else None
+        return self.runner.run(
+            "git",
+            location.arguments(arguments, https=authenticated),
+            cwd=location.work_tree,
+            timeout_seconds=timeout_seconds,
+            environment=location.environment(
+                home=home,
+                global_config=(home / ".gitconfig") if home is not None else None,
+            ),
+        ).stdout
+
     def _push_from_local_worktree(
         self,
         plan: RepositoryPublication,
         publication_context: PublicationContext | None = None,
     ) -> None:
         worktree = self._bounded_worktree(plan)
-        git_arguments = ["-c", f"safe.directory={worktree}"]
-        branch = self.runner.run(
-            "git", [*git_arguments, "branch", "--show-current"], cwd=worktree
-        ).stdout.strip()
-        head = self.runner.run(
-            "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
-        ).stdout.strip()
-        status = self.runner.run(
-            "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
-        ).stdout
+        location = self._changeset_git(worktree)
+        branch = self._git(location, "branch", "--show-current").strip()
+        head = self._git(location, "rev-parse", "HEAD").strip()
+        status = self._git(location, "status", "--porcelain=v1", SUBMODULES)
         if branch != plan.branch or head != plan.head_sha or status:
             raise ValueError("publication worktree identity, head, or cleanliness changed")
-        environment = {
-            "HOME": str(self.broker.authenticated_home),
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "safe.directory",
-            "GIT_CONFIG_VALUE_0": str(worktree),
-        }
         self._publication_effect(
             plan,
             publication_context,
             "git_push",
-            lambda: self.runner.run(
-                "git",
-                [
-                    *git_arguments,
-                    "push",
-                    "--porcelain",
-                    f"https://github.com/{plan.repository}.git",
-                    f"{plan.head_sha}:refs/heads/{plan.branch}",
-                ],
-                cwd=worktree,
-                timeout_seconds=900,
-                environment=environment,
+            lambda: self._git(
+                location,
+                "push",
+                "--porcelain",
+                f"https://github.com/{plan.repository}.git",
+                f"{plan.head_sha}:refs/heads/{plan.branch}",
+                authenticated=True,
             ),
         )
 

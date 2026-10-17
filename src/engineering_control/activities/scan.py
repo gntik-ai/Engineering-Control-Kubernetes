@@ -97,6 +97,12 @@ from engineering_control.projects import (
 )
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.agent_config import is_agent_config_path
+from engineering_control.worktrees.hardened_git import (
+    SUBMODULES,
+    GitLocation,
+    HardenedGitError,
+    changeset_location,
+)
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -445,16 +451,21 @@ class ScanActivityHandler(UiPlanScanSteps):
         plan = PromotionPlan.model_validate(payload.get("promotion_plan"))
         try:
             worktree = self._promotion_worktree(plan)
-            git_arguments = ["-c", f"safe.directory={worktree}"]
-            branch = self.promotion_runner.run(
-                "git", [*git_arguments, "branch", "--show-current"], cwd=worktree
-            ).stdout.strip()
-            head = self.promotion_runner.run(
-                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
-            ).stdout.strip()
-            status = self.promotion_runner.run(
-                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
-            ).stdout
+            # NEW-221: the ChangeSet worktree is maker-writable; never let Git discover it.
+            location = self._changeset_git(worktree)
+
+            def git(*arguments: str) -> str:
+                return self.promotion_runner.run(
+                    "git",
+                    location.arguments(arguments),
+                    cwd=worktree,
+                    environment=location.environment(),
+                ).stdout
+
+            diff_options = ("--no-ext-diff", "--no-textconv", SUBMODULES)
+            branch = git("branch", "--show-current").strip()
+            head = git("rev-parse", "HEAD").strip()
+            status = git("status", "--porcelain=v1", SUBMODULES)
             if branch != plan.branch or head != plan.expected_head_sha or status:
                 raise ValueError("promotion worktree identity, head, or cleanliness changed")
             deployment_file = self._promotion_file(worktree, plan.deployment_file)
@@ -472,43 +483,26 @@ class ScanActivityHandler(UiPlanScanSteps):
                     value = value[key]
                 if value != plan.image_digests[component]:
                     raise ValueError("promoted digest does not match the candidate manifest")
-            changed = self.promotion_runner.run(
-                "git", [*git_arguments, "diff", "--name-only"], cwd=worktree
-            ).stdout.splitlines()
+            changed = git("diff", *diff_options, "--name-only").splitlines()
             if changed != [plan.deployment_file]:
                 raise ValueError("promotion changed files outside the allowlisted values file")
-            self.promotion_runner.run("git", [*git_arguments, "diff", "--check"], cwd=worktree)
+            git("diff", *diff_options, "--check")
             lint_sha, rendered_sha, manifest_count, chart_version = self._validate_promoted_chart(
                 plan, worktree
             )
-            diff = self.promotion_runner.run(
-                "git",
-                [*git_arguments, "diff", "--unified=0", "--", plan.deployment_file],
-                cwd=worktree,
-            ).stdout
-            self.promotion_runner.run(
-                "git", [*git_arguments, "add", "--", plan.deployment_file], cwd=worktree
+            diff = git("diff", *diff_options, "--unified=0", "--", plan.deployment_file)
+            git("add", "--", plan.deployment_file)
+            git(
+                "-c",
+                "user.name=Engineering Control",
+                "-c",
+                "user.email=engineering-control@local.invalid",
+                "commit",
+                "-m",
+                f"promote immutable candidate for {plan.change_set_id}",
             )
-            self.promotion_runner.run(
-                "git",
-                [
-                    *git_arguments,
-                    "-c",
-                    "user.name=Engineering Control",
-                    "-c",
-                    "user.email=engineering-control@local.invalid",
-                    "commit",
-                    "-m",
-                    f"promote immutable candidate for {plan.change_set_id}",
-                ],
-                cwd=worktree,
-            )
-            promoted_head = self.promotion_runner.run(
-                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
-            ).stdout.strip()
-            final_status = self.promotion_runner.run(
-                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
-            ).stdout
+            promoted_head = git("rev-parse", "HEAD").strip()
+            final_status = git("status", "--porcelain=v1", SUBMODULES)
             if not re.fullmatch(r"[a-f0-9]{40}", promoted_head) or final_status:
                 raise ValueError("promotion commit is not an exact clean Git head")
             evidence = {
@@ -677,9 +671,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                 protected.append({**record, "protection": "NOT_A_DIRECTORY"})
                 continue
             try:
-                branch = self.manager._run(["git", "branch", "--show-current"], path)
-                head = self.manager._run(["git", "rev-parse", "HEAD"], path)
-                dirty = self.manager.is_dirty(path)
+                branch, head, dirty = self.manager.worktree_identity(path)
             except WorktreeError:
                 protected.append({**record, "protection": "GIT_IDENTITY_UNPROVEN"})
                 continue
@@ -1868,7 +1860,34 @@ class ScanActivityHandler(UiPlanScanSteps):
             raise ValueError("toolchain worktree escaped its bounded root")
         return worktree
 
+    def _changeset_git(self, worktree: Path) -> GitLocation:
+        """NEW-221: the hardened Git location of a bounded, maker-writable worktree; this
+        (scan) identity owns its metadata repository and seals it first."""
+        try:
+            return changeset_location(
+                worktree,
+                worktree_root=self.settings.worktree_root,
+                metadata_root=self.settings.worktree_metadata_root,
+                mirror_root=self.settings.mirror_root,
+                seal=True,
+            )
+        except (HardenedGitError, OSError) as error:
+            raise WorktreeError(str(error)) from error
+
     def _git(self, worktree: Path, arguments: list[str], *, timeout_seconds: int = 300) -> str:
+        root = self.settings.worktree_root.resolve()
+        if worktree.resolve().is_relative_to(root):
+            # NEW-221: a ChangeSet worktree (or snapshot) is maker-writable: Git must not
+            # discover its repository, configuration or hooks from it.
+            location = self._changeset_git(worktree)
+            return self.git_runner.run(
+                "git",
+                location.arguments(arguments),
+                cwd=worktree.resolve(),
+                timeout_seconds=timeout_seconds,
+                environment=location.environment(),
+            ).stdout
+        # A baseline checkout cloned here from the canonical mirror (never maker-written).
         return self.git_runner.run(
             "git",
             ["-c", f"safe.directory={worktree}", *arguments],
@@ -1883,7 +1902,7 @@ class ScanActivityHandler(UiPlanScanSteps):
 
     def _git_status(self, worktree: Path, *, ignored: bool) -> dict[str, str]:
         """Map each porcelain path to its XY code ('??' untracked, '!!' ignored)."""
-        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal", SUBMODULES]
         if ignored:
             arguments.append("--ignored=traditional")
         tokens = self._git(worktree, arguments).split("\0")
@@ -2233,7 +2252,17 @@ class ScanActivityHandler(UiPlanScanSteps):
         numstat = sorted(
             tuple(line.split("\t"))
             for line in self._git(
-                source, ["diff", "--numstat", "--no-renames", "HEAD^", "HEAD"]
+                source,
+                [
+                    "diff",
+                    "--numstat",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    SUBMODULES,
+                    "HEAD^",
+                    "HEAD",
+                ],
             ).splitlines()
             if line
         )
