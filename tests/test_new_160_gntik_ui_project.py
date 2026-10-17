@@ -652,10 +652,12 @@ class _MergeGh(FakeGh):
             # The merge result's diff against the base: the PR's changes in these fixtures
             # (or, after a raced merge, what the actual merge changed).
             base = getattr(self, "base_sha", MERGE_SHA)
-            judged = f"repos/{REPOSITORY}/compare/{base}...{TEST_MERGE_SHA}?per_page=1"
+            judged = {
+                f"repos/{REPOSITORY}/compare/{base}...{merge}?per_page=1"
+                for merge in (TEST_MERGE_SHA, MERGE_SHA)
+            }
             raced = getattr(self, "raced_changes", None)
-            lines = self.changed if args[1] == judged else raced
-            assert lines is not None, args[1]
+            lines = self.changed if args[1] in judged or raced is None else raced
             return "\n".join([str(len(lines)), *lines])
         if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
             path = args[3].split("/contents/", 1)[1]

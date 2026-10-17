@@ -26,7 +26,7 @@ from test_new_160_gntik_ui_project import (
     _plan,
     _pull_request,
 )
-from test_staging_gitops import _config_root, _settings
+from test_staging_gitops import MAIN_SHA, _config_root, _settings
 
 from engineering_control.activities.gitops import GitOpsGitHubHandler
 from engineering_control.adapters.command import CommandFailure
@@ -357,15 +357,21 @@ async def test_a_merge_result_github_has_not_computed_is_judged_later(
     assert fake.mutations == []
 
 
-async def test_a_retried_merge_of_a_merged_pull_request_is_not_judged_again(
+async def test_a_retried_merge_of_a_merged_pull_request_judges_the_actual_merge(
     tmp_path: Path,
 ) -> None:
-    handler, fake = _github(tmp_path, GREEN, ["packages/ui/src/button.tsx"])
-    fake.preview.update(merged=True, mergeable=None)
-    fake.pull_requests[(REPOSITORY, 41)].update(state="MERGED", mergeCommit={"oid": MERGE_SHA})
-    merged = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
-    assert merged["status"] == "MERGED"
-    assert not any(call[:2] == ["pr", "merge"] for call in fake.calls)
+    # A merged PR is not merged again; its actual merge commit is judged instead.
+    for changed, status in ((CHANGED, "MERGED"), (["packages/ui/src/button.tsx"], "BLOCKED")):
+        handler, fake = _github(tmp_path / status, GREEN, changed)
+        fake.base_sha = MAIN_SHA  # the base the actual merge (MERGE_SHA) was made on
+        fake.preview.update(merged=True, mergeable=None)
+        pull = fake.pull_requests[(REPOSITORY, 41)]
+        pull.update(state="MERGED", mergeCommit={"oid": MERGE_SHA})
+        result = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+        assert result["status"] == status
+        if status == "BLOCKED":
+            assert result["blocker"] == "CHANGESET_MISSING_AFTER_MERGE"
+        assert not any(call[:2] == ["pr", "merge"] for call in fake.calls)
 
 
 async def test_a_manifest_with_a_repeated_key_keeps_its_package_counted(tmp_path: Path) -> None:
@@ -402,8 +408,10 @@ async def test_a_base_that_moves_during_the_merge_call_is_judged_on_the_actual_m
     assert stopped["status"] == "BLOCKED"
     assert stopped["blocker"] == "CHANGESET_MISSING_AFTER_MERGE"
     assert stopped["merge_sha"] == _git(repo, "rev-parse", "main").stdout.strip()
-    # A retry finds the PR merged and goes on: the operator added the changeset on main.
-    assert (await _merge(handler, fake))["status"] == "MERGED"
+    # Every attempt on the merged PR judges the actual merge again (an automatic retry
+    # after a lost result included), so it keeps stopping until the operator acts.
+    again = await _merge(handler, fake)
+    assert again == stopped
     # A race that leaves the PR's change private is no reason to stop.
     repo = _repository(tmp_path / "harmless", base, edit)
     handler, fake = _handler(tmp_path / "harmless", repo)
@@ -450,3 +458,26 @@ async def test_a_malformed_merge_diff_is_refused(tmp_path: Path, listing: str) -
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
     assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    "front_matter",
+    [
+        "metadata:\n  '@gntik-ai/ui': patch",  # nested under another key
+        "'@gntik-ai/ui': |\n  patch\n  and more",  # block text, not a bump
+        "'@gntik-ai/ui': none",  # releases nothing
+        "- '@gntik-ai/ui': patch",  # a list, not a mapping
+        "'@gntik-ai/ui': patch\nnotes: patch\n'@gntik-ai/ui ': major",  # a bad package name
+    ],
+)
+async def test_a_changeset_must_release_a_package_at_its_top_level(
+    tmp_path: Path, front_matter: str
+) -> None:
+    edit = {
+        "packages/ui/src/button.tsx": "export const Button = 2\n",
+        ".changeset/brave-ducks.md": f"---\n{front_matter}\n---\nFix.\n",
+    }
+    repo = _repository(tmp_path, BASE, edit)
+    handler, fake = _handler(tmp_path, repo)
+    refused = await _merge(handler, fake)
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}

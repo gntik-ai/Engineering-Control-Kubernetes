@@ -120,7 +120,7 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "CHANGESET_MISSING_AFTER_MERGE": (
         "the base branch moved while Hermes merged, and the actual merge changes a "
         "published package without a .changeset/*.md; add the changeset on main, then "
-        "backlog-retry (the merged PR is not judged again)"
+        "backlog-skip the issue and close it (every retry judges the merge again)"
     ),
     "MERGE_DELIVERY_PROTECTED_PATH_CHANGED": (
         "the PR touches a protected path (CI configuration); Hermes never merges it"

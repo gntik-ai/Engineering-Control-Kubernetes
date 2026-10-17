@@ -105,9 +105,8 @@ _PRESENT_AFTER_MERGE = frozenset({"added", "modified", "changed", "renamed", "co
 _PRESENT_BEFORE_MERGE = frozenset({"removed", "modified", "changed"})
 # NEW-219: a changeset file: YAML front matter whose lines release packages.
 _CHANGESET_FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
-_CHANGESET_RELEASE = re.compile(
-    r"""(?:"[@A-Za-z0-9._/-]+"|'[@A-Za-z0-9._/-]+'|[@A-Za-z0-9._/-]+)\s*:\s*(?:major|minor|patch)"""
-)
+_CHANGESET_PACKAGE = re.compile(r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*")
+_CHANGESET_BUMPS = frozenset({"major", "minor", "patch", "none"})
 
 
 def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -3005,7 +3004,7 @@ class GitOpsGitHubHandler:
             change_binding=binding,
             allow_unstable=allow_unstable,
         )
-        if gate_base_sha is not None and isinstance(flow, MergeDeliveryPolicy):
+        if isinstance(flow, MergeDeliveryPolicy) and flow.changeset.enabled:
             raced = self._changeset_after_merge(
                 repository, flow.changeset, str(result["merge_sha"]), gate_base_sha
             )
@@ -3165,18 +3164,31 @@ class GitOpsGitHubHandler:
 
     def _is_changeset(self, repository: str, path: str, ref: str) -> bool:
         """NEW-219: ``path`` at ``ref`` reads as a changeset that releases at least one
-        package (front matter of ``'<package>': major|minor|patch`` lines). A dangling
-        symlink, whose contents read returns no such file, or an empty changeset never
-        counts."""
+        package: YAML front matter that is a flat mapping of package names to ``major``,
+        ``minor``, ``patch`` (or ``none``), with one release at least. A dangling symlink
+        (whose contents read returns no such file), an empty changeset, nested mappings
+        and block text never count."""
         try:
             text = self.broker.repository_file_text(repository, path, ref)
         except (CommandFailure, GhCliPolicyError):
             return False
         match = _CHANGESET_FRONT_MATTER.match(text)
-        return match is not None and any(
-            _CHANGESET_RELEASE.fullmatch(line.strip())
-            for line in match.group(1).splitlines()
-            if line.strip()
+        if match is None:
+            return False
+        try:
+            releases = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            return False
+        return (
+            isinstance(releases, dict)
+            and all(
+                isinstance(name, str)
+                and _CHANGESET_PACKAGE.fullmatch(name) is not None
+                and isinstance(bump, str)
+                and bump in _CHANGESET_BUMPS
+                for name, bump in releases.items()
+            )
+            and any(bump != "none" for bump in releases.values())
         )
 
     def _changeset_after_merge(
@@ -3184,15 +3196,16 @@ class GitOpsGitHubHandler:
         repository: str,
         changeset: ChangesetGatePolicy,
         merge_sha: str,
-        gate_base_sha: str,
+        gate_base_sha: str | None,
     ) -> dict[str, Any] | None:
         """NEW-219: GitHub's merge binds only the head, so the base can still move between
-        the verdict and the merge. A merge commit whose first parent is not the judged base
-        is judged again on what it actually merged; when that needs a changeset it lacks,
-        the delivery stops with CHANGESET_MISSING_AFTER_MERGE for the operator. A retry
-        sees the PR merged and goes on, so the operator decides."""
+        the verdict and the merge. The merge commit is judged on what it actually merged
+        (its first parent to itself) unless that parent is the base this attempt judged,
+        whose test merge it then equals. Every attempt on a merged PR (an automatic retry
+        after a lost result included) judges it, so a merge that needs a changeset it lacks
+        keeps stopping with CHANGESET_MISSING_AFTER_MERGE until the operator acts."""
         parents = self.broker.commit_parents(repository, merge_sha)
-        if parents[:1] == [gate_base_sha]:
+        if gate_base_sha is not None and parents[:1] == [gate_base_sha]:
             return None
         if not parents:
             return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING_AFTER_MERGE"}
