@@ -11,6 +11,7 @@ issue's repository, so the import and the amend escalation check share one sourc
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -154,6 +155,17 @@ def test_root_names_cover_exactly_the_old_roots() -> None:
         r"clusterrole",
     )
     assert backlog._r3_keywords(frozenset()) is backlog._R3_KEYWORDS
+
+
+def test_without_exemptions_the_module_matcher_is_read_at_call_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backlog._r3_keywords(frozenset())  # warm any cache
+    replacement = re.compile("zzz-only")
+    monkeypatch.setattr(backlog, "_R3_KEYWORDS", replacement)
+    assert backlog._r3_keywords(frozenset()) is replacement
+    assert backlog._risk(backlog.BacklogIssueType.PRODUCT_BUG, "low", "destructive") == "R1"
+    assert backlog._risk(backlog.BacklogIssueType.PRODUCT_BUG, "low", "zzz-only") == "R3"
 
 
 def test_exempting_every_root_leaves_the_other_r3_triggers() -> None:

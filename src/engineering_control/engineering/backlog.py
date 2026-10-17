@@ -998,10 +998,13 @@ def repository_r3_keyword_exemptions(repository: str) -> frozenset[str]:
     return PROJECT_R3_KEYWORD_EXEMPTIONS.get(project, frozenset()) if project else frozenset()
 
 
-@lru_cache(maxsize=16)
 def _r3_keywords(exempt: frozenset[str]) -> re.Pattern[str] | None:
-    if not exempt:
-        return _R3_KEYWORDS
+    # No exemption reads the module matcher at call time (never cached), exactly as before.
+    return _R3_KEYWORDS if not exempt else _exempt_r3_keywords(exempt)
+
+
+@lru_cache(maxsize=16)
+def _exempt_r3_keywords(exempt: frozenset[str]) -> re.Pattern[str] | None:
     roots = [root for name, root in R3_KEYWORD_ROOTS.items() if name not in exempt]
     if not roots:
         return None
