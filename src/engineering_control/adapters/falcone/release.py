@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engineering_control.adapters.command import CommandResult, SafeCommandRunner
+from engineering_control.worktrees.hardened_git import GitLocation
 
 
 class FalconeReleasePlan(BaseModel):
@@ -68,14 +70,30 @@ class FalconeRecoveryPlan(BaseModel):
 
 
 class FalconeHelmAdapter:
-    def __init__(self, runner: SafeCommandRunner) -> None:
+    def __init__(
+        self,
+        runner: SafeCommandRunner,
+        git_location: Callable[[Path], GitLocation] | None = None,
+    ) -> None:
         self.runner = runner
+        # NEW-221: the release activity passes this; the chart directory lies inside a
+        # maker-writable ChangeSet worktree, so Git must not discover from it.
+        self.git_location = git_location
 
     def preflight(self, plan: FalconeReleasePlan) -> dict[str, Any]:
         self._validate_files(plan)
-        revision = self.runner.run(
-            "git", ["rev-parse", "HEAD"], cwd=plan.chart_directory
-        ).stdout.strip()
+        if self.git_location is None:
+            revision = self.runner.run(
+                "git", ["rev-parse", "HEAD"], cwd=plan.chart_directory
+            ).stdout.strip()
+        else:
+            location = self.git_location(plan.chart_directory)
+            revision = self.runner.run(
+                "git",
+                location.arguments(["rev-parse", "HEAD"]),
+                cwd=location.work_tree or plan.chart_directory,
+                environment=location.environment(),
+            ).stdout.strip()
         if revision != plan.chart_repository_sha:
             raise ValueError(
                 f"chart repository SHA mismatch: expected {plan.chart_repository_sha}, "

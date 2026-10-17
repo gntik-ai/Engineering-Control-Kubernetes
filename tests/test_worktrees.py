@@ -489,7 +489,9 @@ def test_retry_archives_and_resets_a_stopped_attempts_worktree(tmp_path: Path) -
     work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
     assert git(["rev-parse", head_ref], second.path) == ahead
     assert "maker edit" in git(["show", f"{work_ref}:README.md"], second.path)
-    assert "print('x')" in git(["show", f"{work_ref}^3:new_benchmark.py"], second.path)
+    # NEW-221: one archive commit (parent: the attempt's head) holds tracked and untracked.
+    assert "print('x')" in git(["show", f"{work_ref}:new_benchmark.py"], second.path)
+    assert git(["rev-parse", f"{work_ref}^"], second.path) == ahead
 
 
 def _resume_fixture(tmp_path: Path) -> tuple[GitWorktreeManager, dict[str, object], Path, str]:
@@ -553,7 +555,7 @@ def test_dirty_resume_archives_leftovers_then_resets_to_the_attempts_head(
     ).splitlines()
     work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
     assert "half-finished edit" in git(["show", f"{work_ref}:feature.py"], path)
-    assert "untracked" in git(["show", f"{work_ref}^3:scratch.txt"], path)
+    assert "untracked" in git(["show", f"{work_ref}:scratch.txt"], path)
 
 
 def _advance_main(tmp_path: Path) -> str:

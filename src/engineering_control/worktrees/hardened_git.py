@@ -25,18 +25,25 @@ So every privileged invocation built here:
   automatic gc and every transport but HTTPS when asked for, and never looks inside a
   nested repository (``SUBMODULES``), in a minimal environment.
 
-What the maker still writes is data Git parses: objects, refs, the index and the worktree
-files, whose attributes can only name drivers that the sealed configuration never defines.
+What the maker still writes is data Git parses: refs, the index and the worktree files,
+whose attributes can only name drivers that the sealed configuration never defines, and
+objects. Git does not check an object's content against its name when it reads one, and a
+local object shadows the canonical mirror's (alternate) copy, so every local loose object
+and pack is verified first (``verify_local_objects``): a maker cannot make validation read
+a base tree, or any other object, that differs from what its name commits to.
 """
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import secrets
 import shutil
 import stat
+import subprocess
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +69,11 @@ _INERT_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
 # would show validation a maker-chosen repository's refs.
 _COMMONDIR = b"../..\n"
 _MAX_RECORD_BYTES = 8192
+_LOOSE_DIRECTORY = re.compile(r"[0-9a-f]{2}")
+_LOOSE_NAME = re.compile(r"[0-9a-f]{38}")
+# Verified files, by path: (inode, size, mtime, ctime). Git never rewrites an object file in
+# place, and a rewrite always changes ctime, which no unprivileged identity can set back.
+_VERIFIED: dict[str, tuple[int, int, int, int]] = {}
 
 # Command-line configuration outranks repository configuration and is passed on to every
 # Git child process (GIT_CONFIG_PARAMETERS), so these hold even inside a nested repository.
@@ -71,6 +83,7 @@ HARDENED_CONFIGURATION: tuple[str, ...] = (
     "core.untrackedCache=false",
     "core.commitGraph=false",
     "core.multiPackIndex=false",
+    "pack.useBitmaps=false",
     "core.pager=cat",
     # Command lines also pass --ignore-submodules=dirty to status and diff: .gitmodules'
     # `ignore = none` outranks this setting. "dirty" never runs Git inside a nested
@@ -292,6 +305,9 @@ def seal_metadata(metadata: Path, *, origin: Path) -> None:
     configuration = sealed_configuration(origin)
     if not _sealed_record(metadata / "config", configuration, owner):
         _write_record(metadata / "config", configuration, 0o640)
+    for entry in os.scandir(metadata / "objects"):
+        if entry.is_symlink():
+            _remove(Path(entry.path))  # objects/<xx> or pack/ elsewhere: never followed
     object_info = metadata / "objects" / "info"
     current = _lstat(object_info)
     if current is not None and (not stat.S_ISDIR(current.st_mode) or current.st_uid != owner):
@@ -377,6 +393,84 @@ def verify_metadata(metadata: Path, *, origin: Path) -> None:
         raise HardenedGitError(f"ChangeSet Git metadata is not sealed: {error}") from error
 
 
+def _file_key(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _verify_loose_object(path: Path, name: str) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise HardenedGitError(f"object {name} is not a regular file")
+        key = _file_key(info)
+        if _VERIFIED.get(str(path)) == key:
+            return
+        digest = hashlib.sha1(usedforsecurity=False)
+        inflater = zlib.decompressobj()
+        try:
+            while chunk := handle.read(1 << 20):
+                digest.update(inflater.decompress(chunk))
+            digest.update(inflater.flush())
+        except zlib.error as error:
+            raise HardenedGitError(f"object {name} is corrupt") from error
+        if not inflater.eof or digest.hexdigest() != name:
+            raise HardenedGitError(f"object {name} does not match its name")
+    _VERIFIED[str(path)] = key
+
+
+def _verify_pack(metadata: Path, index: Path) -> None:
+    pack = index.with_suffix(".pack")
+    index_info, pack_info = _lstat(index), _lstat(pack)
+    if (
+        index_info is None
+        or pack_info is None
+        or not stat.S_ISREG(index_info.st_mode)
+        or not stat.S_ISREG(pack_info.st_mode)
+    ):
+        raise HardenedGitError(f"pack {index.stem} is not a regular index and pack pair")
+    index_key, pack_key = _file_key(index_info), _file_key(pack_info)
+    if _VERIFIED.get(str(index)) == index_key and _VERIFIED.get(str(pack)) == pack_key:
+        return
+    location = metadata_location(metadata)
+    # index-pack --verify (through verify-pack) re-hashes every object in the pack.
+    result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+        ["git", *location.arguments(["verify-pack", str(index)])],  # noqa: S607
+        cwd=metadata,
+        check=False,
+        capture_output=True,
+        timeout=900,
+        env=location.environment(),
+    )
+    if result.returncode:
+        raise HardenedGitError(f"pack {index.stem} does not verify")
+    _VERIFIED[str(index)] = index_key
+    _VERIFIED[str(pack)] = pack_key
+
+
+def verify_local_objects(metadata: Path) -> None:
+    """Check every object the maker could have written against its name.
+
+    Only the ChangeSet's own object directory: the canonical mirror (the alternate) is
+    never maker-writable. Its loose objects are re-hashed, its packs verified with
+    ``git verify-pack``; results are cached until the file changes."""
+    objects = metadata / "objects"
+    _real_directory(objects)
+    for entry in os.scandir(objects):
+        if entry.is_symlink():
+            raise HardenedGitError(f"objects/{entry.name} is a symlink")
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if _LOOSE_DIRECTORY.fullmatch(entry.name):
+            for item in os.scandir(entry.path):
+                if _LOOSE_NAME.fullmatch(item.name):
+                    _verify_loose_object(Path(item.path), entry.name + item.name)
+        elif entry.name == "pack":
+            for item in os.scandir(entry.path):
+                if item.name.endswith(".idx"):
+                    _verify_pack(metadata, Path(item.path))
+
+
 def metadata_location(metadata: Path) -> GitLocation:
     """The metadata repository itself, for commands that need no worktree."""
     return GitLocation(git_dir=metadata, common_dir=metadata)
@@ -413,6 +507,18 @@ def worktree_location(worktree: Path, metadata: Path) -> GitLocation:
     return GitLocation(
         git_dir=matches[0], common_dir=metadata, work_tree=Path(os.path.realpath(worktree))
     )
+
+
+def enclosing_worktree(path: Path, worktree_root: Path) -> Path:
+    """The bounded worktree ``worktree_root/<repository>/<id>`` that contains ``path``."""
+    root = worktree_root.resolve()
+    try:
+        parts = path.resolve().relative_to(root).parts
+    except ValueError as error:
+        raise HardenedGitError("path is outside the worktree root") from error
+    if len(parts) < 2:
+        raise HardenedGitError("path is not inside a ChangeSet worktree")
+    return root / parts[0] / parts[1]
 
 
 def changeset_location(
@@ -453,4 +559,5 @@ def changeset_location(
         seal_metadata(configured, origin=origin)
     else:
         verify_metadata(configured, origin=origin)
+    verify_local_objects(configured)
     return worktree_location(resolved, configured)

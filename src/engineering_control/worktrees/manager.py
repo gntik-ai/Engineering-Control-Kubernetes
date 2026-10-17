@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from engineering_control.worktrees.hardened_git import (
     changeset_location,
     metadata_location,
     seal_metadata,
+    verify_local_objects,
 )
 
 
@@ -158,6 +160,7 @@ class GitWorktreeManager:
     def _sealed(self, repository: str, metadata: Path) -> Path:
         try:
             seal_metadata(metadata, origin=self.mirror_path(repository))
+            verify_local_objects(metadata)
         except (HardenedGitError, OSError) as error:
             raise WorktreeError(f"ChangeSet Git metadata could not be sealed: {error}") from error
         return metadata
@@ -181,27 +184,53 @@ class GitWorktreeManager:
 
     @staticmethod
     def _git_process(
-        location: GitLocation, args: list[str], *, timeout: int = 300
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        index_file: Path | None = None,
+        stdin: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
+        environment = location.environment()
+        if index_file is not None:
+            environment["GIT_INDEX_FILE"] = str(index_file)
         return subprocess.run(  # noqa: S603 - argument vector only; shell is never used
             ["git", *location.arguments(args)],  # noqa: S607
             cwd=location.work_tree or location.git_dir,
             check=False,
             capture_output=True,
             timeout=timeout,
-            env=location.environment(),
+            env=environment,
+            input=stdin,
         )
 
-    def _git_bytes(self, location: GitLocation, args: list[str], *, timeout: int = 300) -> bytes:
+    def _git_bytes(
+        self,
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        index_file: Path | None = None,
+        stdin: bytes | None = None,
+    ) -> bytes:
         """Raw stdout (NUL-delimited records, unquoted non-ASCII paths)."""
-        result = self._git_process(location, args, timeout=timeout)
+        result = self._git_process(
+            location, args, timeout=timeout, index_file=index_file, stdin=stdin
+        )
         if result.returncode:
             error = str(SecretRedactor().redact_text(os.fsdecode(result.stderr)).value)
             raise WorktreeError(f"Git command failed ({result.returncode}): {error[-4000:]}")
         return result.stdout
 
-    def _git(self, location: GitLocation, args: list[str], *, timeout: int = 300) -> str:
-        result = self._git_process(location, args, timeout=timeout)
+    def _git(
+        self,
+        location: GitLocation,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        index_file: Path | None = None,
+    ) -> str:
+        result = self._git_process(location, args, timeout=timeout, index_file=index_file)
         stdout = result.stdout.decode("utf-8", "surrogateescape")
         if result.returncode:
             output = stdout + result.stderr.decode("utf-8", "replace")
@@ -892,22 +921,44 @@ class GitWorktreeManager:
         if head != base_sha:
             self._git(location, ["update-ref", f"{prefix}-head", head])
         if self._dirty(location):
-            self._git(
-                location,
-                [
-                    "-c",
-                    "user.name=engineering-control",
-                    "-c",
-                    "user.email=engineering-control@localhost",
-                    "stash",
-                    "push",
-                    "--include-untracked",
-                    "--message",
-                    f"archived stopped delivery attempt {stamp}",
-                ],
-            )
-            stash = self._git(location, ["rev-parse", "refs/stash"])
-            self._git(location, ["update-ref", f"{prefix}-worktree", stash])
+            # NEW-221: plumbing into a private index, never `git stash` or `git add`: their
+            # internal diffs take no --ignore-submodules, so a tracked gitlink with
+            # `.gitmodules` `ignore = none` would make them run Git (and its filters)
+            # inside the maker's nested repository. update-index only hashes the paths it
+            # is given and records a gitlink's commit as data. The archive commit (parent:
+            # HEAD) holds every tracked and untracked, not ignored, file.
+            with tempfile.TemporaryDirectory(prefix="archive-index-") as scratch:
+                index = Path(scratch) / "index"
+                self._git(location, ["read-tree", "HEAD"], index_file=index)
+                paths = self._git_bytes(location, ["ls-files", "-z"], index_file=index)
+                paths += self._git_bytes(
+                    location,
+                    ["ls-files", "-z", "--others", "--exclude-standard"],
+                    index_file=index,
+                )
+                self._git_bytes(
+                    location,
+                    ["update-index", "--add", "--remove", "-z", "--stdin"],
+                    index_file=index,
+                    stdin=paths,
+                )
+                tree = self._git(location, ["write-tree"], index_file=index)
+                archived = self._git(
+                    location,
+                    [
+                        "-c",
+                        "user.name=engineering-control",
+                        "-c",
+                        "user.email=engineering-control@localhost",
+                        "commit-tree",
+                        tree,
+                        "-p",
+                        head,
+                        "-m",
+                        f"archived stopped delivery attempt {stamp}",
+                    ],
+                )
+            self._git(location, ["update-ref", f"{prefix}-worktree", archived])
         self._git(location, ["reset", "--hard", destination])
         self._git(location, ["clean", "-ffdx"])
         if self._dirty(location) or self._git(location, ["rev-parse", "HEAD"]) != destination:

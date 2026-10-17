@@ -2354,12 +2354,14 @@ class ScanActivityHandler(UiPlanScanSteps):
     def _is_ancestor(self, worktree: Path, sha: str) -> bool:
         if not re.fullmatch(r"[a-f0-9]{40}", sha):
             return False
+        # NEW-221: the deployment worktree is maker-writable; never discover from it.
+        location = self._changeset_git(worktree)
         result = self.git_runner.run(
             "git",
-            ["-c", f"safe.directory={worktree}", "merge-base", "--is-ancestor", sha, "HEAD"],
-            cwd=worktree,
+            location.arguments(["merge-base", "--is-ancestor", sha, "HEAD"]),
+            cwd=worktree.resolve(),
             timeout_seconds=300,
-            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+            environment=location.environment(),
             check=False,
         )
         return result.return_code == 0

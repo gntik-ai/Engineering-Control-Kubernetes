@@ -24,7 +24,11 @@ from engineering_control.worktrees.hardened_git import (
     sealed_configuration,
     verify_metadata,
 )
-from engineering_control.worktrees.manager import GitWorktreeManager, WorktreeAllocation
+from engineering_control.worktrees.manager import (
+    GitWorktreeManager,
+    WorktreeAllocation,
+    WorktreeError,
+)
 
 
 def _git(cwd: Path, *arguments: str, env: dict[str, str] | None = None) -> str:
@@ -344,3 +348,135 @@ def test_an_admin_directory_must_record_exactly_its_worktree(tmp_path: Path) -> 
     (admin / "gitdir").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(HardenedGitError, match="no single admin directory"):
         changeset_location(allocation.path, **roots)  # type: ignore[arg-type]
+
+
+def _write_loose_object(metadata: Path, name: str, kind: bytes, payload: bytes) -> None:
+    """Store ``payload`` under an arbitrary object name, as a maker could."""
+    import zlib
+
+    directory = metadata / "objects" / name[:2]
+    directory.mkdir(exist_ok=True)
+    (directory / name[2:]).write_bytes(
+        zlib.compress(kind + b" " + str(len(payload)).encode() + b"\0" + payload)
+    )
+
+
+def test_a_local_object_cannot_shadow_the_base_tree_validation_diffs(tmp_path: Path) -> None:
+    """Git reads a local object without checking its content against its name, and the
+    local copy shadows the canonical mirror's: a forged base tree would hide the change."""
+    manager, allocation, metadata, base, _marker = _setup(tmp_path)
+    (allocation.path / ".codex").mkdir()
+    (allocation.path / ".codex" / "config.toml").write_text('model = "x"\n', encoding="utf-8")
+    _git(allocation.path, "add", "-A")
+    _git(allocation.path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m")
+    honest, _ = manager.change_evidence(allocation.path, base_sha=base)
+    assert honest["agent_config_paths"] == [".codex/config.toml"]
+    base_tree = _git(allocation.path, "rev-parse", f"{base}^{{tree}}").strip()
+    head_tree = subprocess.run(  # noqa: S603 - fixed Git executable in the test harness
+        [GIT, "cat-file", "tree", "HEAD^{tree}"],
+        cwd=allocation.path,
+        check=True,
+        capture_output=True,
+    ).stdout
+    _write_loose_object(metadata, base_tree, b"tree", head_tree)
+
+    with pytest.raises(WorktreeError, match="does not match its name"):
+        manager.change_evidence(allocation.path, base_sha=base)
+    with pytest.raises(WorktreeError, match="does not match its name"):
+        manager.is_dirty(allocation.path)
+
+
+def test_local_packs_are_verified_before_use(tmp_path: Path) -> None:
+    manager, allocation, metadata, base, _marker = _setup(tmp_path)
+    _maker_change(allocation.path)
+    _git(allocation.path, "add", "-A")
+    _git(allocation.path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m")
+    # The maker packs its own objects: a valid local pack is accepted.
+    _git(allocation.path, "repack", "-d", "-l", "-q")
+    packs = sorted((metadata / "objects" / "pack").glob("*.pack"))
+    assert packs
+    evidence, _ = manager.change_evidence(allocation.path, base_sha=base)
+    assert evidence["changed_paths"] == ["README.md", "new.txt"]
+    # A pack whose objects no longer match their names is refused.
+    pack = packs[0]
+    content = bytearray(pack.read_bytes())
+    content[len(content) // 2] ^= 0xFF
+    pack.chmod(0o644)
+    pack.write_bytes(bytes(content))
+    with pytest.raises(WorktreeError, match="does not verify"):
+        manager.change_evidence(allocation.path, base_sha=base)
+
+
+def test_archiving_a_dirty_worktree_never_enters_a_nested_repository(tmp_path: Path) -> None:
+    manager, allocation, _metadata, base, marker = _setup(tmp_path)
+    program = _program(tmp_path, marker)
+    nested = allocation.path / "vendor" / "nested"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q")
+    (nested / "data").write_text("x\n", encoding="utf-8")
+    (nested / ".gitattributes").write_text("* filter=planted\n", encoding="utf-8")
+    _git(nested, "-c", "filter.planted.clean=cat", "add", "-A")
+    _git(nested, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "n")
+    (allocation.path / ".gitmodules").write_text(
+        '[submodule "nested"]\n\tpath = vendor/nested\n\turl = ./vendor/nested\n\tignore = none\n',
+        encoding="utf-8",
+    )
+    _git(allocation.path, "add", ".gitmodules", "vendor/nested")
+    _git(allocation.path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "g")
+    head = _git(allocation.path, "rev-parse", "HEAD").strip()
+    # Planted after the maker's own (unhardened) commit, which would itself run it.
+    _config(nested / ".git" / "config", ("filter.planted.clean", str(program)))
+    (nested / "data").write_text("dirty inside\n", encoding="utf-8")
+    (allocation.path / "README.md").write_text("dirty tracked file\n", encoding="utf-8")
+
+    resumed = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="221",
+        change_set_id=allocation.change_set_id,
+        base_ref="refs/heads/main",
+        expected_base_sha=base,
+        resume_prior_commits=True,
+    )
+
+    assert not marker.exists()
+    assert resumed.resumed_from_sha == head
+    archived = _git(allocation.path, "for-each-ref", "--format=%(refname)", "refs/archive/")
+    assert any(name.endswith("-worktree") for name in archived.split())
+
+
+def test_deployment_pin_ancestry_ignores_a_redirected_git_file(tmp_path: Path) -> None:
+    from engineering_control.activities.scan import ScanActivityHandler
+    from engineering_control.config import Settings
+
+    manager, allocation, _metadata, base, _marker = _setup(tmp_path)
+    decoy = tmp_path / "decoy"
+    _git(tmp_path, "clone", "-q", str(manager.mirror_path("falcone")), str(decoy))
+    (decoy / "decoy.txt").write_text("decoy\n", encoding="utf-8")
+    _git(decoy, "add", "-A")
+    _git(decoy, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "d")
+    decoy_pin = _git(decoy, "rev-parse", "HEAD").strip()
+    _git(
+        decoy,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "e",
+    )
+    handler = ScanActivityHandler(
+        Settings(
+            worktree_root=manager.worktree_root,
+            worktree_metadata_root=manager.metadata_root,
+            mirror_root=manager.mirror_root,
+            evidence_root=tmp_path / "evidence",
+        )
+    )
+    (allocation.path / ".git").write_text(f"gitdir: {decoy / '.git'}\n", encoding="utf-8")
+
+    assert handler._is_ancestor(allocation.path, base) is True  # noqa: SLF001
+    assert handler._is_ancestor(allocation.path, decoy_pin) is False  # noqa: SLF001
