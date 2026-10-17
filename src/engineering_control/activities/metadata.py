@@ -118,6 +118,7 @@ from engineering_control.operations.change_set_publication import (
 )
 from engineering_control.operations.issue_amend import (
     ISSUE_BODY_REVISION_KEY,
+    effective_issue_revision,
     record_consumed_issue_revision,
 )
 from engineering_control.operations.issue_delivery_approval import (
@@ -2150,8 +2151,10 @@ class MetadataActivityHandler:
                     run.status = "RUNNING"
                 if run.started_at is None:
                     run.started_at = datetime.now(UTC)
+            issue_binding = self._candidate_issue_binding(session, finding)
             return {
                 **payload,
+                **issue_binding,
                 "status": "CANDIDATE_LOADED",
                 "finding_id": str(finding.id),
                 "campaign_id": str(finding.campaign_id),
@@ -2173,6 +2176,39 @@ class MetadataActivityHandler:
                 "flow": finding.impact_json.get("flow", "repository-static"),
                 "discoverer_provider": discoverer,
             }
+
+    @staticmethod
+    def _candidate_issue_binding(session: Session, finding: Finding) -> dict[str, Any]:
+        """NEW-217: the GitHub issue a revalidated backlog finding came from, and the body
+        hash it was approved with (the import, or a later operator amendment).
+
+        The verification workflow re-reads that issue's bounded full body only under this
+        hash, so the verifier sees the whole approved text instead of the import's first
+        4000 characters. Empty for any other finding, or when the binding is incomplete:
+        the workflow then keeps the imported copy, as before.
+        """
+        if finding.persona != "existing-github-issue":
+            return {}
+        record = session.scalar(
+            select(BacklogIssueRecord)
+            .where(BacklogIssueRecord.finding_id == finding.id)
+            .order_by(BacklogIssueRecord.created_at.desc())
+            .limit(1)
+        )
+        if record is None or not record.repository or not record.issue_number:
+            return {}
+        try:
+            body_sha256, _ = effective_issue_revision(record)
+        except ValueError:
+            # A malformed amendment never widens what the verifier reads.
+            return {}
+        if not re.fullmatch(r"[a-f0-9]{64}", str(body_sha256 or "")):
+            return {}
+        return {
+            "issue_repository": record.repository,
+            "issue_number": int(record.issue_number),
+            "issue_body_sha256": body_sha256,
+        }
 
     def _prepare_verifier(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding = self._object(payload.get("finding"), "finding")

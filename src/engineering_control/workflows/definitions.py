@@ -1193,6 +1193,23 @@ class FindingVerificationWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: FindingVerificationInput) -> dict[str, Any]:
         candidate = await self._step("finding.load_candidate", asdict(request))
+        # NEW-217: a revalidated backlog issue carries its GitHub binding and approved body
+        # hash. Candidates loaded before NEW-217 have neither, so their histories never
+        # reach the marker and replay unchanged.
+        if candidate.get("issue_body_sha256") and workflow.patched(
+            "verification-refresh-issue-body-v1"
+        ):
+            candidate = await self._refresh_candidate_body(candidate)
+            if candidate.get("status") == "BLOCKED":
+                blocked = await self._step(
+                    "finding.record_terminal",
+                    {
+                        "finding": candidate,
+                        "status": "BLOCKED",
+                        "blocker": "ISSUE_BODY_CHANGED_SINCE_IMPORT",
+                    },
+                )
+                return {"status": "BLOCKED", "context": blocked}
         fresh = await self._step("finding.fresh_snapshot", candidate)
         attempts: list[dict[str, Any]] = []
         for ordinal in (1, 2):
@@ -1246,6 +1263,37 @@ class FindingVerificationWorkflow(ControlledWorkflow):
                 "duplicate": duplicate,
             },
         )
+
+    async def _refresh_candidate_body(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """NEW-217: revalidate against the issue's bounded full body, not the import's
+        first 4000 characters.
+
+        The body is read only under the hash it was imported or amended with, the same
+        refresh delivery uses (NEW-44/NEW-112): any other text stops this revalidation,
+        and the operator re-imports or amends. A read failure keeps the imported copy.
+        """
+        refreshed = await self._step(
+            "delivery.refresh_issue_body",
+            {
+                "issue_repository": candidate.get("issue_repository"),
+                "issue_number": candidate.get("issue_number"),
+                "approved_issue_body_sha256": candidate["issue_body_sha256"],
+            },
+        )
+        if refreshed.get("status") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL":
+            return {
+                **candidate,
+                "status": "BLOCKED",
+                "blocker_detail": refreshed.get("blocker_detail"),
+                "approved_body_sha256": refreshed.get("approved_body_sha256"),
+                "current_body_sha256": refreshed.get("current_body_sha256"),
+            }
+        body = refreshed.get("body_excerpt")
+        if refreshed.get("status") != "ISSUE_BODY_REFRESHED" or not isinstance(body, str):
+            return candidate
+        if not body:
+            return candidate
+        return {**candidate, "actual_behavior": body}
 
 
 @workflow.defn(name="IssueDeliveryWorkflow")
