@@ -67,9 +67,30 @@ _ISSUE_URL = re.compile(
 _REFERENCE = re.compile(
     rf"(?:(?:gntik-ai/)?(?P<repo>{REPOSITORY_SLUG_ALTERNATION}))?#(?P<number>[1-9][0-9]*)"
 )
-_DEPENDENCY = re.compile(
-    r"(?i)(?:blocked\s+by|depends\s+on|dependency|requires)\s*[:#-]?\s*([^\n]{0,240})"
+# NEW-216: a dependency is only an issue reference inside the dependency clause itself.
+# Strong keywords take every reference in their clause; weak ones ("requires",
+# "dependency"/"dependencies") only a reference list that starts right after the keyword,
+# so prose such as "requires the operator" or "a dependency on lodash" never matches.
+# A clause ends at the line end, ";", a sentence end, or a word that starts another
+# relation ("feeds #945", "independent of #944"). The keyword never consumes the "#" of
+# its first reference (the old `[:#-]?` dropped "Blocked by #937" entirely).
+_DEPENDENCY_KEYWORD = re.compile(
+    r"(?<![a-z0-9])(?P<keyword>blocked\s+by|depends\s+on|depend\s+on|dependent\s+on"
+    r"|requires|dependency|dependencies)(?![a-z0-9])"
 )
+_WEAK_DEPENDENCY_KEYWORDS = frozenset({"requires", "dependency", "dependencies"})
+_DEPENDENCY_NEGATION = re.compile(r"(?<![a-z0-9])(?:not|no|never|without)\s+(?:\S+\s+)?$|n't\s+$")
+_DEPENDENCY_CLAUSE_END = re.compile(
+    r";|\.(?:\s|$)|(?<![a-z0-9])(?:feeds?|builds?\s+on|blocks|unblocks|unlike|independent"
+    r"|not|except|without|unrelated|instead|supersedes|replaces|but)(?![a-z0-9])"
+)
+_DEPENDENCY_LIST_START = re.compile(
+    rf"^\s*[:\-]?\s*(?:(?:gntik-ai/)?(?:{REPOSITORY_SLUG_ALTERNATION}))?#[1-9]"
+)
+_DEPENDENCY_HEADING = re.compile(
+    r"^[\s#>*_]*(?:blocked\s+by|depends\s+on|dependencies|dependency)[\s*_:]*$"
+)
+_DEPENDENCY_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 
 def is_reauthenticated_backlog_operator(actor: str) -> bool:
@@ -146,6 +167,11 @@ class GitHubIssueSnapshot(BacklogModel):
     assignees: tuple[str, ...] = Field(max_length=50)
     comments: tuple[str, ...] = Field(max_length=10)
     updated_at: datetime
+    # NEW-216: the OpenSpec change id this issue declares and the change ids its
+    # "Depends on:" line names, read from the FULL body at import (gntik-ui puts them
+    # past the 6000-char excerpt). Resolved to issues of the same import before planning.
+    openspec_change_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,99}$")
+    openspec_depends_on: tuple[str, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")
     def bound_identity(self) -> GitHubIssueSnapshot:
@@ -1043,11 +1069,48 @@ def _filter_eligibility(
     return False, "FILTER_EXCLUDED"
 
 
+def _dependency_clause(rest: str) -> str:
+    end = _DEPENDENCY_CLAUSE_END.search(rest)
+    return rest[: end.start()] if end else rest
+
+
+def _dependency_clauses(text: str) -> list[str]:
+    """NEW-216: the text spans whose issue references are dependencies."""
+    clauses: list[str] = []
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if _DEPENDENCY_HEADING.match(line):
+            # A bare "Depends on" / "## Dependencies" line: the list directly under it
+            # (bullets, or one line that starts with a reference), one blank line allowed.
+            following = lines[index + 1 :]
+            if following and not following[0].strip():
+                following = following[1:]
+            for position, item in enumerate(following):
+                bullet = _DEPENDENCY_LIST_ITEM.match(item)
+                if bullet:
+                    clauses.append(_dependency_clause(item[bullet.end() :]))
+                    continue
+                if position == 0 and _DEPENDENCY_LIST_START.match(item):
+                    clauses.append(_dependency_clause(item))
+                break
+            continue
+        for match in _DEPENDENCY_KEYWORD.finditer(line):
+            if _DEPENDENCY_NEGATION.search(line[max(0, match.start() - 24) : match.start()]):
+                continue
+            rest = line[match.end() :]
+            if match.group("keyword") in _WEAK_DEPENDENCY_KEYWORDS and not (
+                _DEPENDENCY_LIST_START.match(rest)
+            ):
+                continue
+            clauses.append(_dependency_clause(rest.lstrip(" \t:-")))
+    return clauses
+
+
 def _dependencies(issue: GitHubIssueSnapshot, text: str) -> tuple[str, ...]:
     values: set[str] = set()
     default_slug = issue.repository.rsplit("/", 1)[-1]
-    for block in _DEPENDENCY.findall(text):
-        for match in _REFERENCE.finditer(block):
+    for clause in _dependency_clauses(text):
+        for match in _REFERENCE.finditer(clause):
             slug = match.group("repo") or default_slug
             reference = f"gntik-ai/{slug}#{match.group('number')}"
             if reference != f"{issue.repository}#{issue.number}" and _REPOSITORY.fullmatch(
@@ -1055,6 +1118,57 @@ def _dependencies(issue: GitHubIssueSnapshot, text: str) -> tuple[str, ...]:
             ):
                 values.add(reference)
     return tuple(sorted(values))
+
+
+_OPENSPEC_CHANGE_ID = re.compile(
+    r"(?im)^[ \t]*[-*]?[ \t]*change[ \t]+id[ \t]*:[ \t]*`?([a-z0-9][a-z0-9-]{0,99})`?"
+    r"|^[ \t]*#{2,4}[ \t]*openspec[ \t]+change[ \t]*\n(?:[ \t]*\n){0,2}"
+    r"[ \t]*`([a-z0-9][a-z0-9-]{0,99})`"
+)
+_OPENSPEC_DEPENDS_ON = re.compile(
+    r"(?im)^[ \t]*[-*]?[ \t]*depends[ \t]+on[ \t]*:[ \t]*([^\n]{0,600})"
+)
+_OPENSPEC_NAME = re.compile(r"`([a-z0-9][a-z0-9-]{0,99})`")
+
+
+def openspec_change_fields(body: str) -> tuple[str | None, tuple[str, ...]]:
+    """NEW-216: the declared OpenSpec change id and its change-id dependencies."""
+    lowered = body.lower()
+    found = _OPENSPEC_CHANGE_ID.search(lowered)
+    change_id = (found.group(1) or found.group(2)) if found else None
+    names: list[str] = []
+    for line in _OPENSPEC_DEPENDS_ON.findall(lowered):
+        for name in _OPENSPEC_NAME.findall(line):
+            if name != change_id and name not in names:
+                names.append(name)
+    return change_id, tuple(names[:20])
+
+
+def resolve_openspec_dependencies(
+    records: list[BacklogIssueRecord], issues: list[GitHubIssueSnapshot]
+) -> list[BacklogIssueRecord]:
+    """NEW-216: add the issues of this import that a record's change-id dependencies name.
+
+    `records[i]` is the classification of `issues[i]`. A name no open issue declares (for
+    example an already delivered change) is satisfied and ignored.
+    """
+    by_change_id: dict[str, str] = {}
+    for issue in issues:
+        if issue.openspec_change_id:
+            by_change_id.setdefault(issue.openspec_change_id, f"{issue.repository}#{issue.number}")
+    resolved: list[BacklogIssueRecord] = []
+    for record, issue in zip(records, issues, strict=True):
+        own = f"{issue.repository}#{issue.number}"
+        extra = {
+            by_change_id[name]
+            for name in issue.openspec_depends_on
+            if name in by_change_id and by_change_id[name] != own
+        }
+        if extra - set(record.dependencies):
+            merged = tuple(sorted(set(record.dependencies) | extra))
+            record = record.model_copy(update={"dependencies": merged, "blocking_issues": merged})
+        resolved.append(record)
+    return resolved
 
 
 def _linked_pull_requests(
