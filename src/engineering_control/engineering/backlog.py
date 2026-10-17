@@ -8,7 +8,8 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from functools import lru_cache
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Final, Literal
 
 from pydantic import (
     BaseModel,
@@ -21,7 +22,9 @@ from pydantic import (
 )
 
 from engineering_control.projects import (
+    ORGANIZATION,
     PROJECT_REPOSITORIES,
+    REPOSITORY_PROJECTS,
     REPOSITORY_SLUG_ALTERNATION,
     ProjectName,
     default_branch,
@@ -563,7 +566,7 @@ def _classified_risk(
         else _change_request_issue_type(repository, labels, text, change_kind)
     )
     severity = _severity(labels, text)
-    risk = _risk(issue_type, severity, text)
+    risk = _risk(issue_type, severity, text, repository_r3_keyword_exemptions(repository))
     if change_kind is not None:
         risk = _declared_risk_floor(risk, text)
     if OPERATOR_R1_LABEL in labels:
@@ -578,7 +581,8 @@ def _classified_risk(
 def calculated_issue_risk(
     repository: str, labels: tuple[str, ...] | list[str], title: str, body: str
 ) -> RiskLevel:
-    """NEW-115: the import's deterministic risk class for an issue text (same rules)."""
+    """NEW-115: the import's deterministic risk class for an issue text (same rules,
+    including NEW-222's per-project R3 keyword exemptions)."""
     normalized = tuple(sorted({label.strip().lower() for label in labels if label.strip()}))
     return _classified_risk(repository, normalized, f"{title}\n{body}".lower())[2]
 
@@ -952,26 +956,71 @@ def _severity(
 # matches at a word START and may continue with any word characters, so every inflection
 # (productionisation, destructively, clusterrolebindings, data migrations) stays R3, while
 # a root inside another word ("reproduction") has no word boundary and is not matched.
-_R3_KEYWORD_ROOTS = (
-    r"data\s+migrat",
-    r"destructiv",
-    r"credential\s+rotat",
-    r"secret\s+lifecycle",
-    r"production",
-    r"clusterrole",
-)
+# NEW-222: every root has a stable name, so a project can exempt roots that are ordinary
+# vocabulary there (PROJECT_R3_KEYWORD_EXEMPTIONS); an exemption never lowers a declared risk.
+R3_KEYWORD_ROOTS: dict[str, str] = {
+    "data-migration": r"data\s+migrat",
+    "destructive": r"destructiv",
+    "credential-rotation": r"credential\s+rotat",
+    "secret-lifecycle": r"secret\s+lifecycle",
+    "production": r"production",
+    "clusterrole": r"clusterrole",
+}
+_R3_KEYWORD_ROOTS = tuple(R3_KEYWORD_ROOTS.values())
 # A root starts where no letter or digit precedes it: underscores and other Markdown
 # delimiters (``_production_``, ``**destructive**``) still count as word starts.
 _R3_KEYWORDS = re.compile(r"(?<![a-z0-9])(?:" + "|".join(_R3_KEYWORD_ROOTS) + r")", re.IGNORECASE)
 
 
+# NEW-222 (operator decision 2026-10-17): in the gntik-ui UI kit "destructive" is a design
+# term (the destructive button and tone variant) and "production" means a production build
+# (72 and 11 open issues used them; every batch:3 R3 was R3 only for "destructive" and
+# declared Risk: R1), so neither keyword raises a gntik-ui issue to R3. A declared Risk:
+# line, the security label, a security defect, severity, the operator R1 label and the other
+# roots still apply; every other project keeps every root. Kept in code, keyed by the
+# owning project of the issue's repository, so the import and the amend check can never
+# disagree and no project-contract schema change has to be deployed.
+PROJECT_R3_KEYWORD_EXEMPTIONS: Final[MappingProxyType[str, frozenset[str]]] = MappingProxyType(
+    {"gntik-ui": frozenset({"destructive", "production"})}
+)
+for _project, _names in PROJECT_R3_KEYWORD_EXEMPTIONS.items():
+    if _project not in BACKLOG_PROJECT_PAIRS or not _names <= R3_KEYWORD_ROOTS.keys():
+        raise RuntimeError(f"invalid NEW-222 R3 keyword exemption for {_project}")
+
+
+def repository_r3_keyword_exemptions(repository: str) -> frozenset[str]:
+    """NEW-222: the R3 roots exempt for the project that owns this repository (none if the
+    repository is not a known backlog repository)."""
+    owner, _, slug = repository.partition("/")
+    if owner != ORGANIZATION:
+        return frozenset()
+    project = REPOSITORY_PROJECTS.get(slug)
+    return PROJECT_R3_KEYWORD_EXEMPTIONS.get(project, frozenset()) if project else frozenset()
+
+
+@lru_cache(maxsize=16)
+def _r3_keywords(exempt: frozenset[str]) -> re.Pattern[str] | None:
+    if not exempt:
+        return _R3_KEYWORDS
+    roots = [root for name, root in R3_KEYWORD_ROOTS.items() if name not in exempt]
+    if not roots:
+        return None
+    return re.compile(r"(?<![a-z0-9])(?:" + "|".join(roots) + r")", re.IGNORECASE)
+
+
 def _risk(
-    issue_type: BacklogIssueType, severity: str, text: str
+    issue_type: BacklogIssueType,
+    severity: str,
+    text: str,
+    keyword_exemptions: frozenset[str] = frozenset(),
 ) -> Literal["R0", "R1", "R2", "R3"]:
     # NEW-179 (operator decision 2026-10-10): a security defect needs the operator's R3
     # approval before work starts. The release-impact floor cannot stand in for this: it
     # rates most falcone diffs R3, and falcone's flow merges R3 without a stop.
-    if _R3_KEYWORDS.search(text) is not None or issue_type is BacklogIssueType.SECURITY_DEFECT:
+    keywords = _r3_keywords(keyword_exemptions)
+    if (
+        keywords is not None and keywords.search(text) is not None
+    ) or issue_type is BacklogIssueType.SECURITY_DEFECT:
         return "R3"
     if severity in {"critical", "high"}:
         return "R2"
