@@ -4460,12 +4460,14 @@ class MetadataActivityHandler:
             # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose source PR
             # may already be merged at exactly the validated head (falcone #1001); only that
             # already-bound source PR may be merged, the deployment PR must be open.
+            # NEW-214a review 2: a merge-forward retry whose source PR merged meanwhile, its
+            # ancestry verified on GitHub, needs no deployment PR (self-contained repos).
             source_merged = (
                 source.get("pr_state") == "MERGED"
                 and source.get("head_sha") == str(change_set.source_head_sha or "")
                 and bool(change_set.source_pr_url)
                 and source.get("pr_url") == change_set.source_pr_url
-                and deployment is not None
+                and (deployment is not None or source.get("merge_forward_verified") is True)
             )
             for record, expected_sha in expected_results:
                 allowed_state = "MERGED" if record is source and source_merged else "OPEN"

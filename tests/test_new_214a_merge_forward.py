@@ -30,7 +30,7 @@ from test_delivery_activity import (
     _with_intent,
     publication_payload,
 )
-from test_delivery_metadata import _lease_fixture
+from test_delivery_metadata import _lease_fixture, _self_contained_evidence, checker_result
 from test_staging_gitops import SAFE, FakeGh, _config_root, _plan, _pull_request, _settings
 from test_workflow_replay import (
     _GITOPS_PLAN,
@@ -48,10 +48,11 @@ from engineering_control.activities.delivery import (
     RepositoryPublication,
 )
 from engineering_control.activities.gitops import GitOpsGitHubHandler
+from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
 from engineering_control.config import Settings
-from engineering_control.db.models import ChangeSet
+from engineering_control.db.models import Base, ChangeSet, Run
 from engineering_control.operations.issue_delivery_approval import CI_REPAIR_REGRESSIONS
 from engineering_control.workflows.definitions import (
     ExistingGitHubBacklogLoopWorkflow,
@@ -354,6 +355,13 @@ def test_the_trusted_clone_ancestry_check_uses_real_git(tmp_path: Path) -> None:
     environment = {"HOME": str(tmp_path), "GIT_TERMINAL_PROMPT": "0"}
 
     handler._require_merge_forward_ancestry(repository, environment, shas["merged"], requirement)
+    # As in publication: an empty scratch clone that sees the objects only through alternates.
+    scratch = tmp_path / "scratch.git"
+    git(["init", "-q", "--bare", str(scratch)], tmp_path)
+    borrowed = {**environment, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repository / ".git/objects")}
+    handler._require_merge_forward_ancestry(scratch, borrowed, shas["merged"], requirement)
+    with pytest.raises(MergeForwardNotMerged):
+        handler._require_merge_forward_ancestry(scratch, environment, shas["merged"], requirement)
     for head, required in (
         (shas["published"], requirement),  # the base tip was never merged in
         (shas["merged"], {**requirement, "from_sha": "1" * 40}),  # unknown object
@@ -477,6 +485,116 @@ def test_an_unverified_merge_forward_never_moves_the_base(
         )
 
     assert change_set.source_base_sha == "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("pr_state", "verified", "accepted"),
+    [
+        ("OPEN", True, True),  # the push path
+        ("MERGED", True, True),  # review 2: a retry after the PR merged, self-contained
+        ("MERGED", False, False),  # a merged PR without verified ancestry stays refused
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_self_contained_merge_forward_persists_its_new_base(
+    tmp_path: Path, pr_state: str, verified: bool, accepted: bool
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'merge-forward.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id, run_id = uuid4(), uuid4()
+    tip, published, head = "e" * 40, "d" * 40, "b" * 40
+    pr_url = "https://github.com/gntik-ai/gntik-ui/pull/42"
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="gntik-ui",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="gntik-ui",
+                source_branch=f"agent/gntik-ui/26/{change_set_id}",
+                source_base_sha="a" * 40,
+                source_head_sha=published,
+                source_pr_url=pr_url,
+                deployment_repository="gntik-ui",
+                deployment_branch=None,
+                deployment_base_sha="a" * 40,
+                deployment_head_sha=None,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-merge-forward",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="gntik-ui",
+            )
+        )
+    branch = f"agent/gntik-ui/26/{change_set_id}"
+    evidence = _self_contained_evidence(head, deployment_floor="R1")
+    for side in ("source", "deployment"):
+        evidence[side] = {**evidence[side], "base_sha": tip}  # type: ignore[dict-item]
+    result_record: dict[str, Any] = {
+        "repository_slug": "gntik-ui",
+        "head_sha": head,
+        "pr_state": pr_state,
+        "pr_url": pr_url,
+    }
+    if verified:
+        result_record["merge_forward_verified"] = True
+    request = {
+        "change_set_id": str(change_set_id),
+        "run_id": str(run_id),
+        "status": "SOURCE_PRS_CREATED",
+        "source_base_sha": tip,
+        "deployment_base_sha": tip,
+        "merge_forward": {
+            "target": "source",
+            "repository": "gntik-ui",
+            "base_sha": tip,
+            "from_sha": published,
+        },
+        "publication_plan": {
+            "change_set_id": str(change_set_id),
+            "publications": [{"repository_slug": "gntik-ui", "branch": branch, "head_sha": head}],
+        },
+        "publication_results": [result_record],
+        "change_evidence": evidence,
+        "agent_result": checker_result(),
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+
+    if not accepted:
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("delivery.persist_publication", request)
+        with handler.sessions() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            assert change_set is not None and change_set.source_base_sha == "a" * 40
+        return
+    result = await handler.handle("delivery.persist_publication", request)
+
+    assert result["status"] == "SOURCE_PR"
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        assert (change_set.source_base_sha, change_set.deployment_base_sha) == (tip, tip)
+        assert change_set.source_head_sha == head
+        history = change_set.recovery_json["merge_forwards"]
+    assert [(item["from_sha"], item["base_sha"], item["head_sha"]) for item in history] == [
+        (published, tip, head)
+    ]
 
 
 # -- the loop -----------------------------------------------------------------------------
