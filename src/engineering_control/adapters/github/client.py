@@ -1100,9 +1100,10 @@ class GhCliBroker:
                     if isinstance(item.get("end_line"), int)
                     else None,
                     "level": str(item.get("annotation_level") or "")[:20],
-                    # Raw (not yet truncated) so the caller redacts whole values first.
-                    "title": str(item.get("title") or "")[:MAX_ANNOTATION_FIELD_CHARS],
-                    "message": str(item.get("message") or "")[:MAX_ANNOTATION_FIELD_CHARS],
+                    # Whole, never cut: the caller redacts whole values first, and a cut
+                    # could drop a secret's closing delimiter (e.g. a PEM footer).
+                    "title": _whole_annotation_field(item.get("title")),
+                    "message": _whole_annotation_field(item.get("message")),
                 }
             )
             if len(annotations) >= MAX_CHECK_RUN_ANNOTATIONS:
@@ -1500,6 +1501,16 @@ CHECK_RUN_LISTING_BYTES = 500_000
 CHECK_RUN_ANNOTATION_BYTES = 200_000
 MAX_CHECK_RUN_ANNOTATIONS = 20
 MAX_ANNOTATION_FIELD_CHARS = 8_000
+
+
+def _whole_annotation_field(value: Any) -> str:
+    """NEW-218: an annotation field whole, or a marker when it is too long to keep."""
+    text = str(value or "")
+    if len(text) > MAX_ANNOTATION_FIELD_CHARS:
+        return f"[annotation text omitted: {len(text)} characters]"
+    return text
+
+
 _ANNOTATED_FAILURE_CONCLUSIONS = frozenset({"failure", "timed_out", "action_required"})
 _LOG_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[0-9:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

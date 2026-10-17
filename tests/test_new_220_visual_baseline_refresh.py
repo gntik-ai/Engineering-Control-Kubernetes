@@ -15,35 +15,43 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = runpy.run_path(str(ROOT / "scripts/gntik-ui-visual-baseline-refresh.py"))
 RefreshError = SCRIPT["RefreshError"]
 refresh = SCRIPT["refresh"]
+recovery = SCRIPT["recovery"]
 
 MAIN = "1" * 40
 TREE = "2" * 40
 MARKER = "3" * 40
 BOT = "4" * 40
+OTHER = "5" * 40
 NOW = datetime(2026, 10, 17, 18, 0, tzinfo=UTC)
+BRANCH = "visual-baseline-refresh-20261017180000"
+SHOT = "apps/docs/e2e/__screenshots__/install--dark.png"
 
 
 class FakeGh:
-    def __init__(
-        self,
-        *,
-        bot_files: list[str] | None = None,
-        bot_author: str = "github-actions[bot]",
-        bot_parents: list[str] | None = None,
-        visual: str = "success",
-        record_without_commit: bool = False,
-    ) -> None:
+    """A gntik-ui stand-in: the visual-update job pushes once, then completes."""
+
+    def __init__(self, **overrides: Any) -> None:
         self.calls: list[list[str]] = []
-        self.bot_files = (
-            bot_files
-            if bot_files is not None
-            else ["apps/docs/e2e/__screenshots__/install--dark.png"]
-        )
-        self.bot_author = bot_author
-        self.bot_parents = bot_parents if bot_parents is not None else [MARKER]
-        self.visual = visual
-        self.record_without_commit = record_without_commit
         self.polls = 0
+        self.record_conclusion = overrides.get("record_conclusion", "success")
+        self.records = overrides.get("records", True)  # does the job push a commit?
+        self.bot_parents = overrides.get("bot_parents", [MARKER])
+        self.pusher = overrides.get("pusher", "github-actions[bot]")
+        self.files = overrides.get("files", [{"filename": SHOT, "status": "modified"}])
+        self.visual = overrides.get("visual", "success")
+        self.stale_visual = overrides.get("stale_visual", False)
+        self.head_after = overrides.get("head_after")  # head once CI ran, if it moves
+        self.extra_commit = overrides.get("extra_commit", False)
+        self.fail_reopen = overrides.get("fail_reopen", False)
+        self.reopened = False
+
+    def _commits(self) -> list[str]:
+        commits = [MARKER]
+        if self.records and self.polls >= 2:
+            commits.append(BOT)
+        if self.extra_commit and self.polls >= 2:
+            commits.append(OTHER)
+        return commits
 
     def __call__(self, args: list[str]) -> str:
         self.calls.append(args)
@@ -52,31 +60,56 @@ class FakeGh:
             return json.dumps({"sha": MAIN, "tree": TREE})
         if "git/commits" in joined:
             assert f"parents[]={MAIN}" in args and f"tree={TREE}" in args
-            message = next(a for a in args if a.startswith("message="))
-            assert message.startswith("message=[visual-update]")
+            assert next(a for a in args if a.startswith("message=")).startswith(
+                "message=[visual-update]"
+            )
             return json.dumps({"sha": MARKER})
         if "git/refs" in joined:
             return ""
         if args[:2] == ["pr", "create"]:
             return "https://github.com/gntik-ai/gntik-ui/pull/700\n"
-        if "pulls/700/commits" in joined:
+        if args[:2] == ["pr", "view"]:
             self.polls += 1
-            commits = [{"sha": MARKER, "author": "operator", "parents": [MAIN]}]
-            if self.polls >= 2 and not self.record_without_commit:
-                commits.append({"sha": BOT, "author": self.bot_author, "parents": self.bot_parents})
-            return json.dumps(commits)
+            commits = self._commits()
+            head = commits[-1]
+            if self.reopened and self.head_after is not None:
+                head = self.head_after
+            return json.dumps({"head": head, "state": "OPEN", "commits": commits})
         if f"commits/{MARKER}/check-runs" in joined:
-            done = self.record_without_commit and self.polls >= 2
+            done = self.polls >= 3
             return json.dumps(
-                [{"name": "visual-update", "status": "completed" if done else "in_progress"}]
+                [
+                    {
+                        "id": 50,
+                        "name": "visual-update",
+                        "status": "completed" if done else "in_progress",
+                        "conclusion": self.record_conclusion if done else None,
+                    }
+                ]
             )
         if args[:2] == ["api", f"repos/gntik-ai/gntik-ui/commits/{BOT}"]:
-            return json.dumps(self.bot_files)
+            return json.dumps(self.bot_parents)
+        if "--paginate" in args and f"commits/{BOT}" in joined:
+            return "".join(json.dumps(entry) + "\n" for entry in self.files)
+        if "/activity?" in joined:
+            return json.dumps([{"before": MARKER, "after": BOT, "actor": self.pusher}])
         if f"commits/{BOT}/check-runs" in joined:
-            return json.dumps(
-                [{"name": "visual", "status": "completed", "conclusion": self.visual}]
-            )
-        if args[:2] in (["pr", "close"], ["pr", "reopen"]):
+            runs = []
+            if self.stale_visual:
+                runs.append(
+                    {"id": 60, "name": "visual", "status": "completed", "conclusion": "success"}
+                )
+            if self.reopened:
+                runs.append(
+                    {"id": 61, "name": "visual", "status": "completed", "conclusion": self.visual}
+                )
+            return json.dumps(runs)
+        if args[:2] == ["pr", "close"]:
+            return ""
+        if args[:2] == ["pr", "reopen"]:
+            if self.fail_reopen:
+                raise RefreshError("gh pr reopen failed: boom")
+            self.reopened = True
             return ""
         raise AssertionError(f"unexpected gh call {args}")
 
@@ -85,46 +118,98 @@ def _run(fake: FakeGh) -> dict[str, Any]:
     return refresh(fake, timeout_minutes=5, now=NOW, sleep=lambda _seconds: None)
 
 
-def test_a_verified_refresh_reopens_the_pr_and_reports_the_merge_command() -> None:
+def test_a_verified_refresh_reports_a_merge_command_pinned_to_the_baseline_commit() -> None:
     fake = FakeGh()
-    result = _run(fake)
-    assert result == {
+    assert _run(fake) == {
         "status": "VERIFIED",
         "pull_request": 700,
-        "branch": "visual-baseline-refresh-20261017180000",
+        "branch": BRANCH,
         "baseline_commit": BOT,
         "visual": "success",
-        "merge_command": "gh pr merge 700 --merge -R gntik-ai/gntik-ui",
+        "merge_command": (
+            f"gh pr merge 700 --merge --match-head-commit {BOT} -R gntik-ai/gntik-ui"
+        ),
     }
-    lifecycle = [call[:2] for call in fake.calls if call[0] == "pr"]
+    lifecycle = [call[:2] for call in fake.calls if call[0] == "pr" and call[1] != "view"]
     assert lifecycle == [["pr", "create"], ["pr", "close"], ["pr", "reopen"]]
     assert not any(call[:2] == ["pr", "merge"] for call in fake.calls)
 
 
 @pytest.mark.parametrize(
-    ("fake", "reason"),
+    ("overrides", "reason"),
     [
-        (FakeGh(bot_files=["apps/docs/e2e/__screenshots__/a.png", "package.json"]), "outside"),
-        (FakeGh(bot_files=[]), "outside"),
-        (FakeGh(bot_author="someone"), "not github-actions"),
-        (FakeGh(bot_parents=[MAIN]), "directly on the marker"),
+        (
+            {
+                "files": [
+                    {"filename": SHOT, "status": "modified"},
+                    {"filename": "package.json", "status": "modified"},
+                ]
+            },
+            "outside the baselines",
+        ),
+        (
+            {"files": [{"filename": SHOT, "status": "renamed", "previous_filename": "README.md"}]},
+            "outside the baselines",
+        ),
+        ({"files": [{"filename": "README.md", "status": "removed"}]}, "outside the baselines"),
+        ({"files": []}, "changes no files"),
+        ({"files": [{"filename": SHOT, "status": "modified"}] * 3000}, "may be incomplete"),
+        ({"pusher": "someone"}, "by github-actions"),
+        ({"bot_parents": [MAIN]}, "directly on the marker"),
+        ({"extra_commit": True}, "unexpected commits"),
+        ({"record_conclusion": "failure"}, "concluded 'failure'"),
     ],
 )
-def test_an_unexpected_bot_commit_stops_before_ci_reruns(fake: FakeGh, reason: str) -> None:
-    with pytest.raises(RefreshError, match=reason):
+def test_an_unverified_recording_stops_before_ci_reruns(
+    overrides: dict[str, Any], reason: str
+) -> None:
+    fake = FakeGh(**overrides)
+    with pytest.raises(RefreshError, match=reason) as stopped:
         _run(fake)
     assert not any(call[:2] == ["pr", "reopen"] for call in fake.calls)
+    assert stopped.value.state["pull_request"] == 700
 
 
-def test_a_red_visual_check_is_not_reported_as_mergeable() -> None:
-    result = _run(FakeGh(visual="failure"))
+def test_renames_and_deletions_inside_the_baselines_are_accepted() -> None:
+    files = [
+        {"filename": SHOT, "status": "renamed", "previous_filename": SHOT.replace("dark", "old")},
+        {"filename": SHOT.replace("dark", "gone"), "status": "removed"},
+    ]
+    assert _run(FakeGh(files=files))["status"] == "VERIFIED"
+
+
+def test_a_visual_result_from_before_the_reopen_never_counts() -> None:
+    result = _run(FakeGh(stale_visual=True, visual="failure"))
     assert result["status"] == "VISUAL_NOT_GREEN" and "merge_command" not in result
 
 
-def test_nothing_to_record_closes_the_pr_and_deletes_its_branch() -> None:
-    fake = FakeGh(record_without_commit=True)
+def test_a_head_that_moves_after_verification_is_never_reported_safe() -> None:
+    with pytest.raises(RefreshError, match="changed after verification"):
+        _run(FakeGh(head_after=OTHER))
+
+
+def test_nothing_to_record_needs_a_successful_job_before_cleaning_up() -> None:
+    fake = FakeGh(records=False)
     assert _run(fake) == {"status": "NO_BASELINE_CHANGED", "pull_request": 700}
     assert ["pr", "close", "700", "--repo", "gntik-ai/gntik-ui", "--delete-branch"] in fake.calls
+    failed = FakeGh(records=False, record_conclusion="failure")
+    with pytest.raises(RefreshError, match="concluded"):
+        _run(failed)
+    assert not any("--delete-branch" in call for call in failed.calls)
+
+
+def test_a_stop_reports_what_it_left_behind_and_how_to_undo_it() -> None:
+    with pytest.raises(RefreshError) as stopped:
+        _run(FakeGh(fail_reopen=True))
+    state = stopped.value.state
+    assert state["stage"] == "pull-request-closed" and state["branch"] == BRANCH
+    assert recovery(state) == [
+        "gh pr reopen 700 --repo gntik-ai/gntik-ui",
+        "gh pr close 700 --repo gntik-ai/gntik-ui --delete-branch",
+    ]
+    assert recovery({"stage": "branch-created", "branch": BRANCH}) == [
+        f"gh api -X DELETE repos/gntik-ai/gntik-ui/git/refs/heads/{BRANCH}"
+    ]
 
 
 def test_the_gntik_ui_maker_rule_points_baseline_refreshes_at_the_operator_script() -> None:

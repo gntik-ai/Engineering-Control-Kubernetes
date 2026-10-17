@@ -87,6 +87,35 @@ async def test_annotations_come_first_and_the_log_keeps_the_rest(tmp_path: Path)
     assert len(excerpt) <= 4000
 
 
+@pytest.mark.asyncio
+async def test_an_oversized_secret_never_reaches_the_excerpt_in_fragments(
+    tmp_path: Path,
+) -> None:
+    # NEW-218 review: cutting a long field before redaction dropped a private key's
+    # closing delimiter, so its body survived. Oversized fields are now omitted whole.
+    key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + "\n".join("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 2 for _ in range(150))
+        + "\n-----END PRIVATE KEY-----"
+    )
+    assert len(key) > 9_000
+    checks = [{**_check("quality", "FAILURE"), "detailsUrl": JOB_URL.format(11)}]
+    handler, fake = _baseline_handler(tmp_path, [".github/workflows/ci.yml"], checks)
+    fake.job_logs = {11: "not ok 1 - quality\n"}
+    _serve_annotations(
+        fake,
+        [{"id": 11, "name": "quality", "conclusion": "failure", "annotations": 1}],
+        {11: [dict(CODEQL, message=key)]},
+    )
+
+    blocked = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    excerpt = blocked["failure_excerpts"]["quality"]
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" not in excerpt
+    assert "BEGIN PRIVATE KEY" not in excerpt
+    assert "[annotation text omitted:" in excerpt
+
+
 def test_line_anchored_credentials_are_redacted_before_formatting() -> None:
     # NEW-218 review: redacting the joined, prefixed line missed patterns anchored to a
     # whole value (e.g. password=...), so each raw field is redacted first.
