@@ -93,6 +93,10 @@ def dependencies(body: str, number: int = 999) -> tuple[str, ...]:
         ("Dependency: #5", ("gntik-ai/falcone#5",)),
         # Cross-repository references and a list under a heading.
         ("Login is blocked by falcone-charts#7.", ("gntik-ai/falcone-charts#7",)),
+        # An unknown repository prefix is never read as this repository's issue.
+        ("Requires: foo#12", ()),
+        ("Depends on foo#12 and #13.", ("gntik-ai/falcone#13",)),
+        ("## Depends on\n- unknown-repo#5", ()),
         (
             "## Dependencies\n\n- #937 (connections) and #940. Both are closed.\n"
             "- gntik-ai/falcone-charts#62 (hook).\nSomething else #99.",
