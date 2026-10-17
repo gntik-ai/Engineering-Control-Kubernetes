@@ -15,9 +15,10 @@ and refuses to merge it. For a project with ``merge_forward`` enabled:
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from temporalio import activity, workflow
@@ -41,9 +42,14 @@ from test_workflow_replay import (
 )
 from test_worktrees import _advance_main, _resume_fixture, git
 
+from engineering_control.activities.delivery import (
+    DeliveryActivityHandler,
+    MergeForwardNotMerged,
+    RepositoryPublication,
+)
 from engineering_control.activities.gitops import GitOpsGitHubHandler
 from engineering_control.activities.scan import ScanActivityHandler
-from engineering_control.adapters.command import CommandFailure, CommandResult
+from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
 from engineering_control.config import Settings
 from engineering_control.db.models import ChangeSet
 from engineering_control.operations.issue_delivery_approval import CI_REPAIR_REGRESSIONS
@@ -219,6 +225,22 @@ async def test_a_behind_pr_is_unchanged_without_merge_forward(tmp_path: Path) ->
     assert merge == {"status": "MERGE_PENDING", "target": "source", "merge_state": "BEHIND"}
 
 
+@pytest.mark.asyncio
+async def test_a_conflicting_pr_goes_to_the_maker_when_enabled(tmp_path: Path) -> None:
+    # Review 1: a conflicting PR (DIRTY) needs the base merged in too; the maker resolves it.
+    handler, fake = _merge_forward_github(tmp_path, enabled=True)
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request(
+        mergeStateStatus="DIRTY", statusCheckRollup=[]
+    )
+
+    source = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    fake.pull_requests[("gntik-ai/musematic", 77)]["isDraft"] = False
+    merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+
+    assert source == {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}
+    assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}
+
+
 def test_merge_forward_blockers_authorize_a_repair_round() -> None:
     assert {"SOURCE_PR_BEHIND_BASE", "DEPLOYMENT_PR_BEHIND_BASE"} <= CI_REPAIR_REGRESSIONS
 
@@ -292,6 +314,110 @@ async def test_a_head_missing_either_ancestor_is_never_pushed(tmp_path: Path, mi
     assert result["status"] == "BLOCKED"
     assert result["blocker"] == "SOURCE_PR_MERGE_FORWARD_NOT_MERGED"
     assert "falcone" not in runner.pushes
+
+
+def _real_git_history(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    repository = tmp_path / "trusted-clone"
+    repository.mkdir()
+    git(["init", "-q", "-b", "main"], repository)
+    git(["config", "user.name", "T"], repository)
+    git(["config", "user.email", "t@invalid"], repository)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    git(["add", "base.txt"], repository)
+    git(["commit", "-q", "-m", "base"], repository)
+    git(["switch", "-q", "-c", "change"], repository)
+    (repository / "change.txt").write_text("change\n", encoding="utf-8")
+    git(["add", "change.txt"], repository)
+    git(["commit", "-q", "-m", "change"], repository)
+    published = git(["rev-parse", "HEAD"], repository)
+    git(["switch", "-q", "main"], repository)
+    (repository / "main.txt").write_text("main moved\n", encoding="utf-8")
+    git(["add", "main.txt"], repository)
+    git(["commit", "-q", "-m", "main moved"], repository)
+    tip = git(["rev-parse", "HEAD"], repository)
+    git(["switch", "-q", "change"], repository)
+    git(["merge", "-q", "--no-edit", "main"], repository)
+    merged = git(["rev-parse", "HEAD"], repository)
+    return repository, {"published": published, "tip": tip, "merged": merged}
+
+
+def test_the_trusted_clone_ancestry_check_uses_real_git(tmp_path: Path) -> None:
+    # Review 1: real ancestry, including a missing object (fails closed).
+    repository, shas = _real_git_history(tmp_path)
+    executable = shutil.which("git")
+    assert executable is not None
+    handler = DeliveryActivityHandler(
+        Settings(run_root=tmp_path / "runs"),
+        runner=SafeCommandRunner({"git": Path(executable), "gh": Path(executable)}),
+    )
+    requirement = {"target": "source", "base_sha": shas["tip"], "from_sha": shas["published"]}
+    environment = {"HOME": str(tmp_path), "GIT_TERMINAL_PROMPT": "0"}
+
+    handler._require_merge_forward_ancestry(repository, environment, shas["merged"], requirement)
+    for head, required in (
+        (shas["published"], requirement),  # the base tip was never merged in
+        (shas["merged"], {**requirement, "from_sha": "1" * 40}),  # unknown object
+    ):
+        with pytest.raises(MergeForwardNotMerged):
+            handler._require_merge_forward_ancestry(repository, environment, head, required)
+
+
+@pytest.mark.parametrize("contained", [True, False])
+def test_a_retry_after_the_pr_merged_verifies_on_github(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contained: bool
+) -> None:
+    # Review 1: the push succeeded, its receipt was lost and the PR merged meanwhile.
+    change_set_id = uuid4()
+    head = "c" * 40
+    plan = RepositoryPublication(
+        repository="gntik-ai/falcone",
+        repository_slug="falcone",
+        working_directory=tmp_path,
+        branch=f"agent/falcone/42/{change_set_id}",
+        head_sha=head,
+        title="t",
+        body="b",
+    )
+    handler = DeliveryActivityHandler(Settings(run_root=tmp_path / "runs"))
+    merged_pr = {"headRefOid": head, "baseRefName": "main", "state": "MERGED"}
+    monkeypatch.setattr(handler.broker, "list_pull_requests", lambda *a, **k: [merged_pr])
+    monkeypatch.setattr(handler, "_own_pull_request", lambda item, plan: True)
+    monkeypatch.setattr(
+        handler,
+        "_bind_pull_request",
+        lambda plan, context: {
+            "repository_slug": "falcone",
+            "head_sha": head,
+            "pr_state": "MERGED",
+        },
+    )
+    checked: list[tuple[str, str]] = []
+
+    def commit_contains(repository: str, *, ancestor: str, descendant: str) -> bool:
+        checked.append((ancestor, descendant))
+        return contained
+
+    monkeypatch.setattr(handler.broker, "commit_contains", commit_contains)
+    payload = {
+        "merge_forward": {
+            "target": "source",
+            "repository": "falcone",
+            "base_sha": "1" * 40,
+            "from_sha": "2" * 40,
+        }
+    }
+
+    if contained:
+        result = handler._publish(
+            plan, UUID(str(change_set_id)), publication_context=(None, payload, {})
+        )  # type: ignore[arg-type]
+        assert result["merge_forward_verified"] is True
+        assert checked == [("1" * 40, head), ("2" * 40, head)]
+    else:
+        with pytest.raises(MergeForwardNotMerged):
+            handler._publish(
+                plan, UUID(str(change_set_id)), publication_context=(None, payload, {})
+            )  # type: ignore[arg-type]
 
 
 # -- metadata: the base moves only for a verified publication ----------------------------

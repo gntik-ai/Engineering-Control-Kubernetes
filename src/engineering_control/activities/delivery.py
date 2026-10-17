@@ -1023,10 +1023,20 @@ class DeliveryActivityHandler:
         ]
         if any(item.get("headRefOid") != plan.head_sha for item in merged):
             raise ValueError("a merged pull request's branch cannot be republished")
+        merge_forward = self._merge_forward_requirement(plan, publication_context)
         if merged:
             # already merged at exactly this head
-            return self._bind_pull_request(plan, publication_context)
-        merge_forward = self._merge_forward_requirement(plan, publication_context)
+            bound = self._bind_pull_request(plan, publication_context)
+            if merge_forward is None:
+                return bound
+            # NEW-214a review: a retry after a lost receipt, the PR merged meanwhile. The
+            # head is on GitHub, so its ancestry is verified there (no push follows).
+            for ancestor in (merge_forward["base_sha"], merge_forward["from_sha"]):
+                if not self.broker.commit_contains(
+                    plan.repository, ancestor=ancestor, descendant=plan.head_sha
+                ):
+                    raise MergeForwardNotMerged(merge_forward["target"])
+            return {**bound, "merge_forward_verified": True}
         if self.settings.publication_fetch_from_worker:
             # NEW-61: the worktree lives on the worker host; bring only its commits here.
             self._push_from_worker(plan, change_set_id, publication_context, merge_forward)
@@ -1110,18 +1120,9 @@ class DeliveryActivityHandler:
                 # NEW-61: fail closed; never publish anything but the validated commit.
                 raise ValueError("fetched ChangeSet branch does not match the validated commit")
             if merge_forward is not None:
-                # NEW-214a: verified in this fresh, controller-owned clone (base objects come
-                # from the canonical mirror), never inside the maker-writable repository.
-                for ancestor in (merge_forward["base_sha"], merge_forward["from_sha"]):
-                    try:
-                        self.runner.run(
-                            "git",
-                            ["merge-base", "--is-ancestor", ancestor, plan.head_sha],
-                            cwd=repository,
-                            environment=environment,
-                        )
-                    except CommandFailure:
-                        raise MergeForwardNotMerged(merge_forward["target"]) from None
+                self._require_merge_forward_ancestry(
+                    repository, environment, plan.head_sha, merge_forward
+                )
             self._publication_effect(
                 plan,
                 publication_context,
@@ -1141,6 +1142,30 @@ class DeliveryActivityHandler:
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def _require_merge_forward_ancestry(
+        self,
+        repository: Path,
+        environment: dict[str, str],
+        head: str,
+        merge_forward: dict[str, str],
+    ) -> None:
+        """NEW-214a: the head must contain both the base tip and the published head.
+
+        Run only in the controller's fresh scratch clone, whose objects come from the
+        fetched pack and the canonical mirror, never inside a maker-writable repository. A
+        missing object is an error, so it fails closed as not merged.
+        """
+        for ancestor in (merge_forward["base_sha"], merge_forward["from_sha"]):
+            try:
+                self.runner.run(
+                    "git",
+                    ["merge-base", "--is-ancestor", ancestor, head],
+                    cwd=repository,
+                    environment=environment,
+                )
+            except CommandFailure:
+                raise MergeForwardNotMerged(merge_forward["target"]) from None
 
     def _worker_metadata_path(self, repository_slug: str, change_set_id: UUID) -> Path:
         """NEW-61: mirror GitWorktreeManager.metadata_path on the worker host."""
