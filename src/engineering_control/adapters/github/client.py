@@ -1100,8 +1100,9 @@ class GhCliBroker:
                     if isinstance(item.get("end_line"), int)
                     else None,
                     "level": str(item.get("annotation_level") or "")[:20],
-                    "title": str(item.get("title") or "")[:200],
-                    "message": str(item.get("message") or "")[:400],
+                    # Raw (not yet truncated) so the caller redacts whole values first.
+                    "title": str(item.get("title") or "")[:MAX_ANNOTATION_FIELD_CHARS],
+                    "message": str(item.get("message") or "")[:MAX_ANNOTATION_FIELD_CHARS],
                 }
             )
             if len(annotations) >= MAX_CHECK_RUN_ANNOTATIONS:
@@ -1498,6 +1499,7 @@ JOB_LOG_TAIL_BYTES = 2_000_000
 CHECK_RUN_LISTING_BYTES = 500_000
 CHECK_RUN_ANNOTATION_BYTES = 200_000
 MAX_CHECK_RUN_ANNOTATIONS = 20
+MAX_ANNOTATION_FIELD_CHARS = 8_000
 _ANNOTATED_FAILURE_CONCLUSIONS = frozenset({"failure", "timed_out", "action_required"})
 _LOG_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[0-9:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

@@ -1206,7 +1206,7 @@ class FindingVerificationWorkflow(ControlledWorkflow):
                     {
                         "finding": candidate,
                         "status": "BLOCKED",
-                        "blocker": "ISSUE_BODY_CHANGED_SINCE_IMPORT",
+                        "blocker": ISSUE_BODY_CHANGED_SINCE_IMPORT,
                     },
                 )
                 return {"status": "BLOCKED", "context": blocked}
@@ -3451,6 +3451,17 @@ _SLOT_FREEING_MARKERS = ("ALREADY_FIXED", "ISSUE_CLOSED", "NOT_REPRODUCIBLE")
 _LOOP_REFILL_LIMIT = 100
 # Child statuses that mean the child itself failed, not that the issue is blocked.
 _REVALIDATION_FAILURE_STATUSES = frozenset({"CHILD_FAILED", "FAILED"})
+# NEW-217: a revalidation that stopped because its issue changed after import.
+ISSUE_BODY_CHANGED_SINCE_IMPORT = "ISSUE_BODY_CHANGED_SINCE_IMPORT"
+
+
+def _revalidation_body_changed(verification: dict[str, Any]) -> bool:
+    context = verification.get("context")
+    return (
+        verification.get("status") == "BLOCKED"
+        and isinstance(context, dict)
+        and context.get("blocker") == ISSUE_BODY_CHANGED_SINCE_IMPORT
+    )
 
 
 def _frees_slot(result: dict[str, Any]) -> bool:
@@ -3951,6 +3962,13 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     blocker = stale_reload or (
                         f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
                     )
+                    if stale_reload is None and _revalidation_body_changed(verification):
+                        # NEW-217: the issue text changed after import, so it was not
+                        # revalidated. Like delivery's approval-bound refresh, this waits for
+                        # the operator (amend, or re-import) and never advances silently.
+                        # No earlier verification returned this blocker, so older histories
+                        # never reach this branch.
+                        blocker = ISSUE_BODY_CHANGED_SINCE_IMPORT
                     if (
                         stale_reload is None
                         and verification.get("status", "FAILED") in _REVALIDATION_FAILURE_STATUSES
@@ -5419,6 +5437,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 "EXTERNAL_DRIFT",
                 "REVISION_DRIFT",
                 "APPROVAL",
+                # NEW-217: only the operator can amend or re-import a changed issue.
+                ISSUE_BODY_CHANGED_SINCE_IMPORT,
             )
         )
 

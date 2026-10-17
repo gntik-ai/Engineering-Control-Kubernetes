@@ -85,6 +85,10 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "ISSUE_BODY_CHANGED_SINCE_APPROVAL": (
         "the GitHub issue text changed after approval; amend the approval to the new text"
     ),
+    "ISSUE_BODY_CHANGED_SINCE_IMPORT": (
+        "the GitHub issue text changed after import, so it was not revalidated; amend the "
+        "approval to the new text (or re-import)"
+    ),
     "MAKER_TEST_FAILURE": (
         "a maker test command FAILed and it is not a pre-existing failure on the base commit"
     ),
@@ -262,7 +266,7 @@ def loop_commands(
     number = str(parsed[1]) if parsed else "<issue-number>"
     target = f"{workflow_id} {repository} {number}"
     code = blocker.split(":", 1)[1] if blocker.startswith("DELIVERY_FAILED:") else blocker
-    if code == "ISSUE_BODY_CHANGED_SINCE_APPROVAL":
+    if code in {"ISSUE_BODY_CHANGED_SINCE_APPROVAL", "ISSUE_BODY_CHANGED_SINCE_IMPORT"}:
         amend = f"/loop amend {project or '<project>'} {repository} {number}"
         return [*commands, amend, f"{amend} <sha-prefix from the preview> retry"]
     if code in _CAMPAIGN_APPROVAL_BLOCKERS:

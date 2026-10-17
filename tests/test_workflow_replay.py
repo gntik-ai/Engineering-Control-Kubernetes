@@ -3708,6 +3708,63 @@ async def test_new_114_a_failed_revalidation_pauses_even_when_continuing() -> No
     ).replay_workflow(history)
 
 
+@workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
+class _BodyChangedVerificationStub:
+    """FindingVerificationWorkflow stopping because the issue changed after import."""
+
+    @workflow.run
+    async def run(self, request: Any) -> dict[str, Any]:
+        return {
+            "status": "BLOCKED",
+            "context": {"status": "BLOCKED", "blocker": "ISSUE_BODY_CHANGED_SINCE_IMPORT"},
+        }
+
+
+async def test_new_217_a_changed_issue_body_pauses_even_when_continuing() -> None:
+    """NEW-217 review: a revalidation stopped by an issue edited after import waits for
+    the operator (amend or re-import) instead of advancing as CURRENT_REVALIDATION_BLOCKED."""
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        script: dict[str, dict[str, Any]] = {
+            "backlog.load_execution": {"status": "SELECTED", "items": [_item(7)]},
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "BLOCKED",
+                "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+            },
+            "backlog.materialize_candidate": {"status": "READY", "finding_id": "finding-7"},
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "backlog.record_revalidation": {"status": "REVALIDATION_RECORDED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    history, result, _, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            continue_after_blocked_issue=True,
+        ),
+        execute_control_step,
+        [("skip", "gntik-ai/musematic#7|OPERATOR")],
+        [ExistingGitHubBacklogLoopWorkflow, _BodyChangedVerificationStub],
+    )
+
+    assert [state["blocker"] for state in _loop_states(history, "PAUSED")] == [
+        "ISSUE_BODY_CHANGED_SINCE_IMPORT"
+    ]
+    assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, _BodyChangedVerificationStub]
+    ).replay_workflow(history)
+
+
 def _free_slot_activity(
     gates: dict[int, dict[str, Any]], selectable: list[int]
 ) -> tuple[Any, list[dict[str, Any]]]:

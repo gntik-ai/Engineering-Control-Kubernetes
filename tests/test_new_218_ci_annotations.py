@@ -87,6 +87,19 @@ async def test_annotations_come_first_and_the_log_keeps_the_rest(tmp_path: Path)
     assert len(excerpt) <= 4000
 
 
+def test_line_anchored_credentials_are_redacted_before_formatting() -> None:
+    # NEW-218 review: redacting the joined, prefixed line missed patterns anchored to a
+    # whole value (e.g. password=...), so each raw field is redacted first.
+    block = _annotation_block(
+        [
+            dict(CODEQL, message="password=DemoPlaintext123"),
+            dict(CODEQL, title="password=DemoPlaintext123", message="see title"),
+        ]
+    )
+    assert "DemoPlaintext123" not in block
+    assert block.startswith("Check-run annotations (2):")
+
+
 def test_annotation_text_is_bounded_and_redacted() -> None:
     token = "ghp_" + "A" * 36
     block = _annotation_block([dict(CODEQL, message=f"token {token} leaked " + "x" * 2000)] * 40)

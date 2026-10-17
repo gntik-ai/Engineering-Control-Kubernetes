@@ -3834,24 +3834,31 @@ _EXCERPT_CHARS = 4000
 
 def _annotation_block(annotations: list[dict[str, Any]]) -> str:
     """NEW-218: check-run annotations as bounded, redacted text for the CI-repair maker."""
+    redactor = SecretRedactor()
+
+    def clean(value: Any, limit: int) -> str:
+        # Each raw field is redacted whole (line-anchored credential patterns included)
+        # before it is joined, re-spaced or cut, so no secret survives as a fragment.
+        redacted = str(redactor.redact_text(str(value or "")).value)
+        return " ".join(redacted.split())[:limit]
+
     lines: list[str] = []
     for item in annotations:
         if not isinstance(item, dict):
             continue
-        path = str(item.get("path") or "")
+        where = clean(item.get("path"), 300)
         start, end = item.get("start_line"), item.get("end_line")
-        where = path
         if isinstance(start, int):
             where += f":{start}" + (f"-{end}" if isinstance(end, int) and end != start else "")
-        level = str(item.get("level") or "")
-        title = str(item.get("title") or "")
-        message = " ".join(str(item.get("message") or "").split())
+        level = clean(item.get("level"), 20)
+        title = clean(item.get("title"), 200)
+        message = clean(item.get("message"), 400)
         text = f"- {where} [{level}] " + (f"{title}: " if title else "") + message
         lines.append(text[:500])
     if not lines:
         return ""
     block = f"Check-run annotations ({len(lines)}):\n" + "\n".join(lines)
-    return str(SecretRedactor().redact_text(block).value)[:_EXCERPT_CHARS]
+    return block[:_EXCERPT_CHARS]
 
 
 def _with_annotations(block: str, log: str) -> str:
