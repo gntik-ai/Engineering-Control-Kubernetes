@@ -33,6 +33,9 @@ class WorktreeAllocation:
     # NEW-52: the previous attempt's committed HEAD (a descendant of base_sha) this
     # allocation kept instead of resetting to the base; None for a fresh/reset worktree.
     resumed_from_sha: str | None = None
+    # NEW-214a: the canonical mirror's current base tip when a resumed allocation's base
+    # moved (read from the trusted mirror, never the worktree); None otherwise.
+    base_tip_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +314,7 @@ class GitWorktreeManager:
                         expected_base_sha,
                         change_set_id,
                         resumed_from_sha=actual_head,
+                        base_tip_sha=actual if base_moved else None,
                     )
                 if base_moved:
                     raise mismatch
@@ -368,6 +372,7 @@ class GitWorktreeManager:
                 expected_base_sha if resumed_from is not None else actual,
                 change_set_id,
                 resumed_from_sha=resumed_from,
+                base_tip_sha=actual if resumed_from is not None and base_moved else None,
             )
 
     def allocate_audit_snapshot(

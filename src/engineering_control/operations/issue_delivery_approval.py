@@ -518,7 +518,13 @@ MAX_CI_REPAIR_ROUNDS = 20
 _CI_REPAIR_START_STATES = frozenset({"SOURCE_PR", "SOURCE_MERGED"})
 # Durable record the parent loop writes when it decides to start one CI-repair round.
 CI_REPAIR_AUTHORIZATION_STEP = "backlog.ci_repair_authorization"
-CI_REPAIR_REGRESSIONS = frozenset({"SOURCE_PR_CI_REGRESSION", "DEPLOYMENT_PR_CI_REGRESSION"})
+# NEW-214a: a PR behind its base under merge-forward (gitops._behind_base); its repair round
+# merges the current base into the ChangeSet branch before the maker and checker run.
+MERGE_FORWARD_REGRESSIONS = frozenset({"SOURCE_PR_BEHIND_BASE", "DEPLOYMENT_PR_BEHIND_BASE"})
+CI_REPAIR_REGRESSIONS = (
+    frozenset({"SOURCE_PR_CI_REGRESSION", "DEPLOYMENT_PR_CI_REGRESSION"})
+    | MERGE_FORWARD_REGRESSIONS
+)
 _CI_REPAIR_MARKER = "-ci-repair-"
 _CI_REPAIR_SUFFIX = re.compile(
     r"-issue-(?P<ordinal>[1-9][0-9]{0,5})-ci-repair-(?P<round>[1-9][0-9]{0,2})"

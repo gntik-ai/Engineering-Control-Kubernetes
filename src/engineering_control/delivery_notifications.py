@@ -143,6 +143,21 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
         "the deployment PR conflicts with its base branch, so its CI cannot run; close its "
         "PRs, cancel the loop, then re-import and restart the issue"
     ),
+    # NEW-214a: merge-forward (strict up-to-date protection, project merge_forward on).
+    "SOURCE_PR_BEHIND_BASE": (
+        "the source PR is behind its base; a repair round has the maker merge the base in"
+    ),
+    "DEPLOYMENT_PR_BEHIND_BASE": (
+        "the deployment PR is behind its base; a repair round has the maker merge the base in"
+    ),
+    "CI_REPAIR_SOURCE_PR_MERGE_FORWARD_NOT_MERGED": (
+        "the merge-forward round's source head does not contain both the base tip and the "
+        "published head, so it was not published; backlog-retry repeats the round"
+    ),
+    "CI_REPAIR_DEPLOYMENT_PR_MERGE_FORWARD_NOT_MERGED": (
+        "the merge-forward round's deployment head does not contain both the base tip and "
+        "the published head, so it was not published; backlog-retry repeats the round"
+    ),
     "PROTECTED_MERGE_FAILED": "the protected merge failed",
     "R3_MERGE_REQUIRES_APPROVAL": "an R3 change needs explicit operator approval to merge",
     "CHANGE_SET_STATE_NOT_DELIVERABLE": "the ChangeSet is not in a deliverable state",

@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -155,6 +155,9 @@ class WorktreeAllocationRequest(BaseModel):
     # NEW-117: approved import heads; a base other than them must fast-forward from them.
     source_approved_base_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
     deployment_approved_base_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    # NEW-214a: the one side whose PR is behind its base (from the recorded blocker). The
+    # maker merges its moved base in; this worker only reports the mirror's base tip.
+    merge_forward: Literal["source", "deployment"] | None = None
 
 
 class RuntimeObservationPlan(BaseModel):
@@ -1676,7 +1679,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                 access=access,
                 resume_prior_commits=self.settings.delivery_resume_prior_commits,
             )
-        return {
+        result: dict[str, Any] = {
             **payload,
             "status": "WORKTREES_ALLOCATED",
             "source_worktree": str(source.path),
@@ -1686,6 +1689,44 @@ class ScanActivityHandler(UiPlanScanSteps):
             # NEW-52 (additive): the previous attempt's HEAD a worktree kept, else None.
             "source_resumed_from_sha": source.resumed_from_sha,
             "deployment_resumed_from_sha": deployment.resumed_from_sha,
+        }
+        if request.merge_forward is not None:
+            result.update(self._merge_forward_allocation(request, payload, source, deployment))
+        return result
+
+    @staticmethod
+    def _merge_forward_allocation(
+        request: WorktreeAllocationRequest,
+        payload: dict[str, Any],
+        source: WorktreeAllocation,
+        deployment: WorktreeAllocation,
+    ) -> dict[str, Any]:
+        """NEW-214a: complete the merge-forward requirement with the mirror's base tip.
+
+        Nothing is merged here. The maker merges the tip in, every later step measures the
+        change against it, and publication verifies the result from a trusted clone.
+        """
+        side = source if request.merge_forward == "source" else deployment
+        requirement = payload.get("merge_forward")
+        if (
+            side.base_tip_sha is None
+            or side.resumed_from_sha is None
+            or not isinstance(requirement, dict)
+            or requirement.get("target") != request.merge_forward
+        ):
+            # The base did not move (or nothing was published): no merge to ask for.
+            return {"merge_forward": None}
+        bases = {f"{request.merge_forward}_base_sha": side.base_tip_sha}
+        if deployment is source:
+            bases = {"source_base_sha": side.base_tip_sha, "deployment_base_sha": side.base_tip_sha}
+        return {
+            **bases,
+            "merge_forward": {
+                "target": request.merge_forward,
+                "repository": side.repository,
+                "base_sha": side.base_tip_sha,
+                "from_sha": str(requirement.get("from_sha")),
+            },
         }
 
     def _delivery_prechecks(self, payload: dict[str, Any]) -> dict[str, Any]:

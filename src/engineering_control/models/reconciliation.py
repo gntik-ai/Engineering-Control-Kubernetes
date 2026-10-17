@@ -156,6 +156,10 @@ class StagingFlowPolicy(ReconciliationModel):
 
     enabled: bool = False
     kind: Literal["argocd-image-updater"] = "argocd-image-updater"
+    # NEW-214a: with strict up-to-date branch protection, a PR GitHub reports BEHIND is
+    # merged forward onto its current base by a repair round (never rebased) before
+    # its CI can gate the merge. Off by default: concurrency-1 behaviour is unchanged.
+    merge_forward: bool = False
     argo_application: str = Field(pattern=_KUBERNETES_NAME)
     argo_namespace: str = Field(default="argocd", pattern=_KUBERNETES_NAME)
     namespaces: tuple[str, ...] = Field(min_length=1, max_length=10)
@@ -390,6 +394,10 @@ class MergeDeliveryPolicy(ReconciliationModel):
 
     enabled: bool = False
     kind: Literal["protected-merge"] = "protected-merge"
+    # NEW-214a: with strict up-to-date branch protection, a PR GitHub reports BEHIND is
+    # merged forward onto its current base by a repair round (never rebased) before
+    # its CI can gate the merge. Off by default: concurrency-1 behaviour is unchanged.
+    merge_forward: bool = False
     source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
     allow_r3_merge: bool = False
     ci_baseline: CiBaselinePolicy = Field(default_factory=CiBaselinePolicy)

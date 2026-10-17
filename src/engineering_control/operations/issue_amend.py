@@ -91,6 +91,9 @@ _CI_REPAIR_PAUSES = frozenset(
         "SOURCE_PR_CI_REGRESSION",
         "DEPLOYMENT_PR_CI_REGRESSION",
         "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+        # NEW-214a: merge-forward repairs.
+        "SOURCE_PR_BEHIND_BASE",
+        "DEPLOYMENT_PR_BEHIND_BASE",
     }
 )
 _CI_REPAIR_PAUSE_PREFIX = "CI_REPAIR_"

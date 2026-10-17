@@ -76,6 +76,14 @@ _PR_BIND_LIST_LIMIT = 1000
 _PUBLISH_HEARTBEAT_SECONDS = 30.0
 
 
+class MergeForwardNotMerged(ValueError):  # noqa: N818 - a refusal, mapped to a blocker
+    """NEW-214a: a merge-forward round's head lacks the base tip or the published head."""
+
+    def __init__(self, target: str) -> None:
+        super().__init__(f"{target} merge-forward head does not contain the base tip")
+        self.target = target
+
+
 class PullRequestHeadNotConverged(ValueError):
     """NEW-147: the publication's PR did not show the pushed commit within the bound."""
 
@@ -276,6 +284,13 @@ class DeliveryActivityHandler:
                 **payload,
                 "status": "BLOCKED",
                 "blocker": "BLOCKED_BY_GH_AUTH",
+            }
+        except MergeForwardNotMerged as refused:
+            # NEW-214a: nothing of this repository was pushed.
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": f"{refused.target.upper()}_PR_MERGE_FORWARD_NOT_MERGED",
             }
         except (CommandFailure, OSError, ValueError) as error:
             return {
@@ -1008,21 +1023,56 @@ class DeliveryActivityHandler:
         ]
         if any(item.get("headRefOid") != plan.head_sha for item in merged):
             raise ValueError("a merged pull request's branch cannot be republished")
+        merge_forward = self._merge_forward_requirement(plan, publication_context)
         if merged:
             # already merged at exactly this head
-            return self._bind_pull_request(plan, publication_context)
+            bound = self._bind_pull_request(plan, publication_context)
+            if merge_forward is None:
+                return bound
+            # NEW-214a review: a retry after a lost receipt, the PR merged meanwhile. The
+            # head is on GitHub, so its ancestry is verified there (no push follows).
+            for ancestor in (merge_forward["base_sha"], merge_forward["from_sha"]):
+                if not self.broker.commit_contains(
+                    plan.repository, ancestor=ancestor, descendant=plan.head_sha
+                ):
+                    raise MergeForwardNotMerged(merge_forward["target"])
+            return {**bound, "merge_forward_verified": True}
         if self.settings.publication_fetch_from_worker:
             # NEW-61: the worktree lives on the worker host; bring only its commits here.
-            self._push_from_worker(plan, change_set_id, publication_context)
+            self._push_from_worker(plan, change_set_id, publication_context, merge_forward)
         else:
+            if merge_forward is not None:
+                # NEW-214a: only the worker fetch gives a trusted clone to verify it in.
+                raise MergeForwardNotMerged(merge_forward["target"])
             self._push_from_local_worktree(plan, publication_context)
-        return self._bind_pull_request(plan, publication_context)
+        bound = self._bind_pull_request(plan, publication_context)
+        if merge_forward is not None:
+            # NEW-214a: persist_publication moves the ChangeSet base only on this flag.
+            return {**bound, "merge_forward_verified": True}
+        return bound
+
+    @staticmethod
+    def _merge_forward_requirement(
+        plan: RepositoryPublication, publication_context: PublicationContext | None
+    ) -> dict[str, str] | None:
+        """NEW-214a: the merge-forward this repository's head must prove, if any."""
+        payload = publication_context[1] if publication_context is not None else {}
+        value = payload.get("merge_forward")
+        if not isinstance(value, dict) or value.get("repository") != plan.repository_slug:
+            return None
+        shas = [value.get("base_sha"), value.get("from_sha")]
+        if value.get("target") not in {"source", "deployment"} or not all(
+            isinstance(sha, str) and re.fullmatch(r"[a-f0-9]{40}", sha) for sha in shas
+        ):
+            raise MergeForwardNotMerged(str(value.get("target") or "source"))
+        return {key: str(value[key]) for key in ("target", "base_sha", "from_sha")}
 
     def _push_from_worker(
         self,
         plan: RepositoryPublication,
         change_set_id: UUID,
         publication_context: PublicationContext | None = None,
+        merge_forward: dict[str, str] | None = None,
     ) -> None:
         """NEW-61: fetch the exact validated branch from the worker, then push it.
 
@@ -1069,6 +1119,10 @@ class DeliveryActivityHandler:
             if fetched != plan.head_sha:
                 # NEW-61: fail closed; never publish anything but the validated commit.
                 raise ValueError("fetched ChangeSet branch does not match the validated commit")
+            if merge_forward is not None:
+                self._require_merge_forward_ancestry(
+                    repository, environment, plan.head_sha, merge_forward
+                )
             self._publication_effect(
                 plan,
                 publication_context,
@@ -1088,6 +1142,30 @@ class DeliveryActivityHandler:
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def _require_merge_forward_ancestry(
+        self,
+        repository: Path,
+        environment: dict[str, str],
+        head: str,
+        merge_forward: dict[str, str],
+    ) -> None:
+        """NEW-214a: the head must contain both the base tip and the published head.
+
+        Run only in the controller's fresh scratch clone, whose objects come from the
+        fetched pack and the canonical mirror, never inside a maker-writable repository. A
+        missing object is an error, so it fails closed as not merged.
+        """
+        for ancestor in (merge_forward["base_sha"], merge_forward["from_sha"]):
+            try:
+                self.runner.run(
+                    "git",
+                    ["merge-base", "--is-ancestor", ancestor, head],
+                    cwd=repository,
+                    environment=environment,
+                )
+            except CommandFailure:
+                raise MergeForwardNotMerged(merge_forward["target"]) from None
 
     def _worker_metadata_path(self, repository_slug: str, change_set_id: UUID) -> Path:
         """NEW-61: mirror GitWorktreeManager.metadata_path on the worker host."""

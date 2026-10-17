@@ -3457,6 +3457,10 @@ def _loop_outcomes(results: list[dict[str, Any]]) -> list[str]:
     return outcomes[-20:]
 
 
+# NEW-214a: staging blockers a merge-forward repair round answers (gitops._behind_base).
+_MERGE_FORWARD_BLOCKERS = frozenset({"SOURCE_PR_BEHIND_BASE", "DEPLOYMENT_PR_BEHIND_BASE"})
+
+
 class _LoopIssueSkipped(Exception):  # noqa: N818 - control flow, not an error
     """NEW-162: the operator skipped the issue a failed loop step paused on."""
 
@@ -4382,6 +4386,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         # NEW-195: an operator retry of a CI regression rechecks first; this grants the
         # one repair that retry used to start directly, even at the automatic limit.
         operator_repair_grant = False
+        # NEW-214a: the pending repair merges a moved base forward (refresh mirrors first).
+        merge_forward_pending = False
         while True:
             staged: dict[str, Any] | None = None
             if restore_pending and change_set_id:
@@ -4407,7 +4413,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 if authorization_blocker is not None:
                     staged = {"status": "BLOCKED", "blocker": authorization_blocker}
-                else:
+                elif merge_forward_pending:
+                    # NEW-214a review: the worker's canonical mirror must hold the base the
+                    # PR fell behind; the scan worker never fetches from GitHub itself.
+                    try:
+                        await self._step("github.refresh_mirrors", {"project": request.project})
+                    except ActivityError:
+                        staged = {"status": "BLOCKED", "blocker": "CANONICAL_MIRROR_REFRESH_FAILED"}
+                if staged is None and authorization_blocker is None:
                     repaired = await self._ci_repair_delivery(
                         request=request,
                         item=item,
@@ -4420,9 +4433,22 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     if repaired.get("status") == "SOURCE_PR":
                         repair_pending = False
+                        merge_forward_pending = False
                         gitops_round += 1
                     else:
                         reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
+                        repaired_context = repaired.get("context")
+                        context_blocker = (
+                            repaired_context.get("blocker")
+                            if isinstance(repaired_context, dict)
+                            else None
+                        )
+                        if context_blocker in {
+                            "SOURCE_PR_MERGE_FORWARD_NOT_MERGED",
+                            "DEPLOYMENT_PR_MERGE_FORWARD_NOT_MERGED",
+                        }:
+                            # NEW-214a: name the refusal (only this new path reports it).
+                            reason = str(context_blocker)
                         staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
             if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
@@ -4475,6 +4501,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         blocker == "DEPLOYMENT_PR_CI_REGRESSION"
                         and self._deployment_ci_repair_patched(ordinal)
                     )
+                    or self._merge_forward_repair(blocker, ordinal)
                 )
                 and gate is not None
                 and (
@@ -4486,6 +4513,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             ):
                 operator_repair_grant = False
                 repair_pending = True
+                merge_forward_pending = blocker in _MERGE_FORWARD_BLOCKERS
                 continue
             # A grant covers only the recheck its retry started; any pause ends it.
             operator_repair_grant = False
@@ -4547,9 +4575,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         blocker == "DEPLOYMENT_PR_CI_REGRESSION"
                         and self._deployment_ci_repair_patched(ordinal)
                     )
+                    or self._merge_forward_repair(blocker, ordinal)
                 ):
                     # NEW-64: the operator's retry repeats the CI repair, not only GitOps.
                     repair_pending = True
+                    merge_forward_pending = blocker in _MERGE_FORWARD_BLOCKERS
                 else:
                     gitops_round += 1
                     if (
@@ -4604,6 +4634,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     def _deployment_ci_repair_patched(self, ordinal: int) -> bool:
         # NEW-103: deployment-PR CI regressions go through the same bounded CI repair.
         return workflow.patched(f"existing-backlog-deployment-ci-repair-v1-{ordinal}")
+
+    def _merge_forward_repair(self, blocker: str, ordinal: int) -> bool:
+        """NEW-214a: a PR behind its base is repaired by merging the base forward.
+
+        gitops only reports these blockers for a project with merge_forward enabled, which no
+        earlier history did, so the marker is asked only for them and old histories replay
+        unchanged.
+        """
+        return blocker in _MERGE_FORWARD_BLOCKERS and workflow.patched(
+            f"existing-backlog-merge-forward-repair-v1-{ordinal}"
+        )
 
     def _late_reset_restores_patched(self, ordinal: int) -> bool:
         return workflow.patched(f"existing-backlog-late-reset-restores-v1-{ordinal}")
