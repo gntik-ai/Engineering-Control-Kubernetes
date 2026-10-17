@@ -113,6 +113,17 @@ def dependencies(body: str, number: int = 999) -> tuple[str, ...]:
             ("gntik-ai/falcone#30", "gntik-ai/falcone#31"),
         ),
         ("## Dependencies\n- Optional integration with #30 (can ship independently).", ()),
+        # Review round 2: excluding asides and contrastive clauses.
+        ("Depends on #30 (not #31).", ("gntik-ai/falcone#30",)),
+        (
+            "Depends on #30 (merged in #29's release).",
+            ("gntik-ai/falcone#29", "gntik-ai/falcone#30"),
+        ),
+        (
+            "This does not depend on #29 but it definitely depends on #30.",
+            ("gntik-ai/falcone#30",),
+        ),
+        ("It is not blocked by #41; it depends on #42.", ("gntik-ai/falcone#42",)),
         (
             "## Depends on\n- **#41** (merged)\n- Related reading: #42\n- #43",
             ("gntik-ai/falcone#41", "gntik-ai/falcone#43"),

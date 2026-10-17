@@ -92,6 +92,16 @@ _DEPENDENCY_CLAUSE_END = re.compile(
     r"(?![a-z0-9_`-])"
 )
 _DEPENDENCY_ASIDE = re.compile(r"`[^`\n]*`|\([^()\n]*\)")
+_DEPENDENCY_PAREN_ASIDE = re.compile(r"\([^()\n]*\)")
+# An aside that excludes what it names ("(not #31)", "(independent of #44)").
+_DEPENDENCY_EXCLUSION = re.compile(
+    r"(?<![a-z0-9_`-])(?:not(?!\s+only)|no|never|without|except|unlike|independent|unrelated"
+    r"|instead)(?![a-z0-9_`-])|n't(?![a-z0-9])"
+)
+# Negation scope restarts at a clause end or a contrast ("… not … #29 but … depends on #30").
+_DEPENDENCY_CONTRAST = re.compile(
+    r";|\.(?:\s|$)|(?<![a-z0-9_`-])(?:but(?!\s+also)|however|whereas)(?![a-z0-9_`-])"
+)
 _DEPENDENCY_LIST_START = re.compile(
     rf"^\s*[:\-]?\s*(?:(?:gntik-ai/)?(?:{REPOSITORY_SLUG_ALTERNATION}))?#[1-9]"
 )
@@ -1084,13 +1094,22 @@ def _blank_asides(text: str) -> str:
 
 def _dependency_clause(rest: str) -> str:
     end = _DEPENDENCY_CLAUSE_END.search(_blank_asides(rest))
-    return rest[: end.start()] if end else rest
+    clause = rest[: end.start()] if end else rest
+    # References inside an excluding aside ("#30 (not #31)") are not dependencies.
+    return _DEPENDENCY_PAREN_ASIDE.sub(
+        lambda match: (
+            " " * len(match.group(0))
+            if _DEPENDENCY_EXCLUSION.search(match.group(0))
+            else match.group(0)
+        ),
+        clause,
+    )
 
 
 def _negated(before: str) -> bool:
     """Whether the keyword's own clause, up to the keyword, is negated."""
     blanked = _blank_asides(before)
-    starts = [match.end() for match in re.finditer(r";|\.(?:\s|$)", blanked)]
+    starts = [match.end() for match in _DEPENDENCY_CONTRAST.finditer(blanked)]
     return _DEPENDENCY_NEGATION.search(blanked[starts[-1] if starts else 0 :]) is not None
 
 
