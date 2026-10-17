@@ -76,7 +76,8 @@ class SolveBacklogCommand(OperationModel):
     continue_after_blocked_issue: bool = True
     include_enhancements: bool = False
     correction_limit: int = Field(default=2, ge=0, le=5)
-    concurrency: Literal[1] = 1
+    # NEW-214b: 2 pipelines one issue's maker/checker with the previous one's delivery.
+    concurrency: Literal[1, 2] = 1
     deployment_concurrency: Literal[1] = 1
     production: Literal[False] = False
 

@@ -410,7 +410,9 @@ class BacklogApprovalBinding(BacklogModel):
     dependency_plan_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     maximum_risk: Literal["R0", "R1", "R2", "R3"]
     maximum_items: int = Field(ge=1, le=50)
-    maximum_concurrency: Literal[1] = 1
+    # NEW-214b: 2 lets one issue's maker/checker run while the previous one is in CI,
+    # merge and staging (merges and deploys stay serialized).
+    maximum_concurrency: Literal[1, 2] = 1
     delivery_mode: Literal["source-pr", "full-delivery"]
     implementation_correction_limit: int = Field(default=5, ge=1, le=5)
     deployment_correction_limit: int = Field(default=3, ge=1, le=3)
@@ -445,6 +447,10 @@ class BacklogApprovalBinding(BacklogModel):
             raise ValueError("source-pr approval cannot permit merge or issue closure")
         if self.issue_approval is not None and self.maximum_items != 1:
             raise ValueError("issue operation approval must remain bound to one item")
+        if self.maximum_concurrency != 1 and (
+            self.issue_approval is not None or self.delivery_mode != "full-delivery"
+        ):
+            raise ValueError("concurrency 2 needs a full-delivery campaign approval")
         return self
 
     def sha256(self) -> str:
@@ -735,6 +741,7 @@ def approval_binding(
     include_enhancements: bool,
     now: datetime | None = None,
     issue_label: str | None = None,
+    maximum_concurrency: Literal[1, 2] = 1,
 ) -> BacklogApprovalBinding:
     if not _SHA.fullmatch(source_head) or not _SHA.fullmatch(deployment_head):
         raise ValueError("backlog approval requires immutable repository heads")
@@ -783,6 +790,7 @@ def approval_binding(
         ),
         expires_at=(now or datetime.now(UTC)) + timedelta(hours=24),
         issue_label=valid_issue_label(issue_label),
+        maximum_concurrency=maximum_concurrency,
     )
 
 

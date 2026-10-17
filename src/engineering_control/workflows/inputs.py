@@ -190,6 +190,8 @@ class ExistingGitHubBacklogLoopInput:
     runtime_proof: str = "runtime"
     issue_operation_id: str | None = None
     issue_approval_binding: str | None = None
+    # NEW-214b: the approved concurrency; earlier histories carry none and replay as 1.
+    maximum_concurrency: int = 1
 
 
 @dataclass

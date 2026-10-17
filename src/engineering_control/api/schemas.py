@@ -188,6 +188,8 @@ class BacklogApprovalCandidateRequest(APIModel):
     delivery_mode: Literal["source-pr", "full-delivery"]
     maximum_risk: RiskClass
     maximum_items: int = Field(default=1, ge=1, le=50)
+    # NEW-214b: the approved loop concurrency (1, or 2 to pipeline issues).
+    maximum_concurrency: Literal[1, 2] = 1
 
 
 class BacklogApprovalRequest(APIModel):
@@ -216,9 +218,17 @@ class ExistingBacklogLoopStart(APIModel):
     runtime_proof: Literal["runtime", "source-revalidation"] = "runtime"
     issue_operation_id: UUID | None = None
     issue_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    maximum_concurrency: Literal[1, 2] = 1
 
     @model_validator(mode="after")
     def exact_issue_binding(self) -> ExistingBacklogLoopStart:
+        if self.maximum_concurrency != 1 and (
+            self.target_repository is not None
+            or self.global_campaign_id is not None
+            or self.delivery_mode != "full-delivery"
+        ):
+            # NEW-214b: pipelining is for campaign full-delivery loops only.
+            raise ValueError("concurrency 2 needs a full-delivery campaign loop")
         if (self.target_repository is None) != (self.target_issue_number is None):
             raise ValueError("target repository and issue number must be supplied together")
         if self.target_repository is not None and self.maximum_items != 1:

@@ -1031,6 +1031,7 @@ class SQLMetadataRepository:
             delivery_mode=request.delivery_mode,
             include_enhancements=campaign.import_filter == "enhancements",
             issue_label=issue_label_from_query(campaign.issue_query),
+            maximum_concurrency=request.maximum_concurrency,
         )
         if issue_request is not None:
             binding = BacklogApprovalBinding.model_validate(
@@ -1047,7 +1048,7 @@ class SQLMetadataRepository:
         campaign.approval_json = {"binding": binding.model_dump(mode="json")}
         campaign.maximum_risk = request.maximum_risk.value
         campaign.maximum_items = request.maximum_items
-        campaign.maximum_concurrency = 1
+        campaign.maximum_concurrency = binding.maximum_concurrency
         campaign.delivery_mode = request.delivery_mode
         campaign.include_enhancements = binding.include_enhancements
         campaign.status = "AWAITING_APPROVAL"

@@ -300,6 +300,7 @@ class ControlActivities:
         # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
         "gitops.pr_checks",
         "gitops.pr_heads",
+        "gitops.branch_protection",
         "gitops.deployment_pr_checks",
         "gitops.merge",
         "gitops.release_tag",

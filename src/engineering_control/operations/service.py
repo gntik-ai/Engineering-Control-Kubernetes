@@ -498,6 +498,7 @@ class TypedCommandBus:
                     delivery_mode=command.delivery_mode,
                     maximum_risk=command.maximum_risk,
                     maximum_items=command.maximum_items,
+                    maximum_concurrency=command.concurrency,
                 ),
             )
             approval = await self.metadata.approve_backlog_campaign(
@@ -516,6 +517,7 @@ class TypedCommandBus:
                     maximum_items=command.maximum_items,
                     continue_after_blocked_issue=command.continue_after_blocked_issue,
                     correction_limit=command.correction_limit,
+                    maximum_concurrency=command.concurrency,
                 )
             )
         if isinstance(command, AuditPlanCommand):

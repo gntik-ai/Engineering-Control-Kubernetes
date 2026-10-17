@@ -306,6 +306,7 @@ def parser() -> argparse.ArgumentParser:
     backlog_candidate.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
     backlog_candidate.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_candidate.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
+    backlog_candidate.add_argument("--concurrency", type=int, default=1, choices=(1, 2))
     backlog_approve = commands.add_parser("backlog-approve")
     backlog_approve.add_argument("project", choices=PROJECTS)
     backlog_approve.add_argument("campaign_id")
@@ -325,6 +326,8 @@ def parser() -> argparse.ArgumentParser:
     backlog_start.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_start.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
     backlog_start.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
+    # NEW-214b: 2 runs the next issue's maker/checker during the previous one's CI and staging.
+    backlog_start.add_argument("--concurrency", type=int, default=1, choices=(1, 2))
     backlog_status = commands.add_parser("backlog-status")
     backlog_status.add_argument("workflow_id")
     global_backlog = commands.add_parser("global-backlog-start")
@@ -846,6 +849,7 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "delivery_mode": arguments.delivery_mode,
                 "maximum_risk": arguments.maximum_risk,
                 "maximum_items": arguments.max_items,
+                "maximum_concurrency": arguments.concurrency,
             },
         )
     if command == "backlog-approve":
@@ -878,6 +882,7 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "maximum_risk": arguments.maximum_risk,
                 "delivery_mode": arguments.delivery_mode,
                 "maximum_items": arguments.max_items,
+                "concurrency": arguments.concurrency,
             },
         )
     if command == "backlog-status":
