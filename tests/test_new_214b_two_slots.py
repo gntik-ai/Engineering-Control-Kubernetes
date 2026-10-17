@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_staging_gitops import SAFE, FakeGh, _config_root, _settings
@@ -70,17 +71,22 @@ class _SlowStaging:
 _WORKFLOWS = [ExistingGitHubBacklogLoopWorkflow, _SlowDelivery, _SlowStaging]
 
 
+def _item(number: int, dependencies: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "repository": "gntik-ai/musematic",
+        "issue_number": number,
+        "dependencies": dependencies or [],
+    }
+
+
 def _script(
-    *, dependencies: list[str] | None = None, ready: bool = True, merge_forward: bool = True
+    *,
+    dependencies: list[str] | None = None,
+    ready: bool = True,
+    merge_forward: bool = True,
+    issues: tuple[int, ...] = (1026, 1027),
 ) -> dict[str, dict[str, Any]]:
-    items = [
-        {"repository": "gntik-ai/musematic", "issue_number": 1026, "dependencies": []},
-        {
-            "repository": "gntik-ai/musematic",
-            "issue_number": 1027,
-            "dependencies": dependencies or [],
-        },
-    ]
+    items = [_item(issues[0]), *(_item(number, dependencies) for number in issues[1:])]
     return {
         "backlog.load_execution": {"status": "READY", "items": items},
         "backlog.register_run": {"status": "REGISTERED"},
@@ -104,14 +110,29 @@ def _script(
     }
 
 
-def _executor(script: dict[str, dict[str, Any]]) -> Any:
+Hook = Any  # async (step, payload) -> dict | None; None falls through to the script
+
+
+def _executor(
+    script: dict[str, dict[str, Any]],
+    *,
+    hook: Hook = None,
+    refill: list[dict[str, Any]] | None = None,
+) -> Any:
+    refills = list(refill or [])
+
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
         step = request["step"]
+        if hook is not None:
+            answer = await hook(step, request["payload"])
+            if answer is not None:
+                return answer
         if step == "github.refresh_mirrors":
             return {"status": "PASS"}
         if step == "backlog.load_execution" and request["payload"].get("exclude_issue_refs"):
-            return {"status": "READY", "items": []}  # a refill finds nothing new
+            # A refill selects the scripted replacement once, then nothing new.
+            return {"status": "READY", "items": [refills.pop(0)] if refills else []}
         if step not in script:
             raise AssertionError(f"unscripted step {step!r}")
         return _registered_child(step, request, script[step])
@@ -124,8 +145,13 @@ async def _run(
     *,
     concurrency: int,
     signals: list[tuple[str, str]] | None = None,
+    hook: Hook = None,
+    refill: list[dict[str, Any]] | None = None,
+    driver: Any = None,
+    maximum_items: int = 2,
+    continue_after_blocked: bool = False,
 ) -> tuple[Any, Any]:
-    activity_fn = _executor(script)
+    activity_fn = _executor(script, hook=hook, refill=refill)
     async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
         async with (
             Worker(
@@ -148,14 +174,16 @@ async def _run(
                     backlog_campaign_id="camp-1",
                     maximum_risk="R2",
                     delivery_mode="full-delivery",
-                    maximum_items=2,
-                    continue_after_blocked_issue=False,
+                    maximum_items=maximum_items,
+                    continue_after_blocked_issue=continue_after_blocked,
                     maximum_concurrency=concurrency,
                 ),
                 id=f"two-slots-{uuid.uuid4()}",
                 task_queue=CONTROL_TASK_QUEUE,
                 execution_timeout=timedelta(minutes=3),
             )
+            if driver is not None:
+                await driver(handle)
             for name, argument in signals or []:
                 for _ in range(300):
                     state = await handle.query("status")
@@ -215,8 +243,10 @@ async def test_concurrency_1_keeps_the_sequential_order() -> None:
     assert _position(events, "completed", "1-staging-gitops") < _position(
         events, "started", "2-attempt-1"
     )
-    names = [request["step"] for request in _scheduled_steps(history)]
-    assert "gitops.branch_protection" not in names
+    scheduled = _scheduled_steps(history)
+    assert "gitops.branch_protection" not in [request["step"] for request in scheduled]
+    # Activity payloads stay byte-identical to before: no concurrency key at all.
+    assert not [request for request in scheduled if "maximum_concurrency" in request["payload"]]
     await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
 
 
@@ -290,13 +320,14 @@ def _event_position(history: Any, kind: str, suffix: str) -> int:
     raise AssertionError(f"no {kind} event for {suffix}")
 
 
-def _pause_event_position(history: Any) -> int:
+def _pause_event_position(history: Any, status: str = "PAUSED") -> int:
+    marker = f'"loop_status":"{status}"'.encode()
     for index, event in enumerate(history.events):
         if event.HasField("activity_task_scheduled_event_attributes"):
             payload = event.activity_task_scheduled_event_attributes.input.payloads[0].data
-            if b'"loop_status": "PAUSED"' in payload or b'"loop_status":"PAUSED"' in payload:
+            if marker in payload.replace(b" ", b""):
                 return index
-    raise AssertionError("no PAUSED loop state")
+    raise AssertionError(f"no {status} loop state")
 
 
 @workflow.defn(name="StagingGitOpsDeliveryWorkflow", sandboxed=False)
@@ -363,6 +394,140 @@ async def test_one_maker_checker_child_runs_at_a_time() -> None:
     await Replayer(workflows=workflows).replay_workflow(history)
 
 
+class _Gate:
+    """Holds one issue's revalidation until the test released it."""
+
+    def __init__(self, issue_number: int, answer: dict[str, Any] | None = None) -> None:
+        self.issue_number = issue_number
+        self.answer = answer
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if step != "backlog.revalidate_gate":
+            return None
+        if payload["item"]["issue_number"] != self.issue_number:
+            return None
+        self.reached.set()
+        await self.release.wait()
+        return self.answer
+
+    def driver(self, signal: str) -> Any:
+        async def drive(handle: Any) -> None:
+            await asyncio.wait_for(self.reached.wait(), 60)
+            await handle.signal(signal)
+            await asyncio.sleep(0.5)
+            self.release.set()
+
+        return drive
+
+
+async def test_stop_after_current_at_a_rejected_issue_waits_for_the_back_slot() -> None:
+    # Review: a FRONT boundary other than the hand-off recorded STOPPED with BACK running.
+    _SlowStaging.first_outcome = None
+    gate = _Gate(1027, {"status": "BLOCKED", "blocker": "CURRENT_REVALIDATION_REJECTED"})
+    history, result = await _run(
+        _script(issues=(1026, 1027, 1028)),
+        concurrency=2,
+        hook=gate,
+        driver=gate.driver("stop_after_current"),
+        maximum_items=3,
+        continue_after_blocked=True,  # the rejected issue moves on without a pause
+    )
+
+    assert result["status"] == "STOPPED"
+    events = _child_events(history)
+    assert ("completed", "1-staging-gitops") in events
+    assert _pause_event_position(history, "STOPPED") > _event_position(
+        history, "completed", "1-staging-gitops"
+    )
+    assert not [suffix for _kind, suffix in events if suffix.startswith("3-")]
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_cancel_records_cancelled_only_after_the_back_slot_ended() -> None:
+    _SlowStaging.first_outcome = None
+    # The loop observes a cancel at the next issue's checkpoint (as sequentially), here
+    # while issue 1's BACK slot still runs.
+    gate = _Gate(1026, None)
+    history, result = await _run(_script(), concurrency=2, hook=gate, driver=gate.driver("cancel"))
+
+    assert result["status"] == "CANCELLED"
+    events = _child_events(history)
+    assert _pause_event_position(history, "CANCELLED") > _event_position(
+        history, "completed", "1-staging-gitops"
+    )
+    assert ("started", "2-attempt-1") not in events
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_skipped_back_bookkeeping_step_ends_only_its_own_issue() -> None:
+    # Review: NEW-162's skip close ended the whole loop with issue 2 published but never
+    # merged; in a BACK slot it ends only issue 1.
+    _SlowStaging.first_outcome = None
+    failures = {"1-staging-gitops": 1}
+
+    async def hook(step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        child = str(payload.get("child_workflow_id") or "")
+        if step == "backlog.register_child_run" and failures.get(child.rsplit("-issue-")[-1]):
+            failures[child.rsplit("-issue-")[-1]] -= 1
+            raise ApplicationError("register_child_run binding changed", non_retryable=True)
+        return None
+
+    history, result = await _run(
+        _script(), concurrency=2, hook=hook, signals=[("skip", f"{_FIRST}|OPERATOR")]
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result.get("completion") != "COMPLETE_NOTHING_DELIVERED"
+    events = _child_events(history)
+    assert ("completed", "2-staging-gitops") in events
+    assert ("started", "1-staging-gitops") not in events
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_dependency_skipped_in_flight_keeps_its_dependent_from_starting() -> None:
+    # Review: the design admits an issue only once its dependencies were delivered.
+    _SlowStaging.first_outcome = {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}
+    try:
+        history, result = await _run(
+            _script(dependencies=[_FIRST]),
+            concurrency=2,
+            signals=[("skip", f"{_FIRST}|OPERATOR")],
+        )
+    finally:
+        _SlowStaging.first_outcome = None
+
+    assert result["status"] == "COMPLETE"
+    events = _child_events(history)
+    assert not [suffix for _kind, suffix in events if suffix.startswith("2-")]
+    waiting = [item for item in result["results"] if item.get("issue_number") == 1027]
+    assert waiting[-1]["status"] == "NOT_STARTED"
+    assert waiting[-1]["blocker"] == "DEPENDENCY_NOT_DELIVERED"
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_slot_the_last_back_slot_frees_is_still_worked_on() -> None:
+    # Review: the last issue's BACK skip refilled a slot after the loop had run out.
+    _SlowStaging.first_outcome = {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}
+    try:
+        history, result = await _run(
+            _script(issues=(1026,)),
+            concurrency=2,
+            refill=[_item(1027)],
+            signals=[("skip", f"{_FIRST}|OPERATOR")],
+            maximum_items=1,
+        )
+    finally:
+        _SlowStaging.first_outcome = None
+
+    assert result["status"] == "COMPLETE"
+    assert result.get("completion") != "COMPLETE_NOTHING_DELIVERED"
+    events = _child_events(history)
+    assert ("completed", "2-staging-gitops") in events
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
 # -- approval and start bounds -----------------------------------------------------------
 
 
@@ -425,8 +590,8 @@ class _ProtectionGh(FakeGh):
     def run(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
         args = list(arguments)
         if args[:1] == ["api"] and args[1].endswith("/protection/required_status_checks"):
-            repository = args[1].split("/branches/")[0].removeprefix("repos/")
-            value = self.strict.get(repository)
+            repository, rest = args[1].removeprefix("repos/").split("/branches/")
+            value = self.strict.get(f"{repository}@{rest.split('/')[0]}")
             if value is None:
                 raise CommandFailure("Branch not protected")  # GitHub's 404
             self.calls.append(args)
@@ -434,26 +599,48 @@ class _ProtectionGh(FakeGh):
         return super().run(executable, arguments, **kwargs)
 
 
+_SOURCE = "gntik-ai/musematic@main"
+_DEPLOY = "gntik-ai/musematic-deploy@main"
+
+
 @pytest.mark.parametrize(
-    ("merge_forward", "strict", "ready"),
+    ("merge_forward", "deploy_branch", "strict", "ready"),
     [
-        (True, {"gntik-ai/musematic": "true", "gntik-ai/musematic-deploy": "true"}, True),
-        (True, {"gntik-ai/musematic": "true", "gntik-ai/musematic-deploy": "false"}, False),
-        (True, {"gntik-ai/musematic": "true", "gntik-ai/musematic-deploy": None}, False),
-        (False, {"gntik-ai/musematic": "true", "gntik-ai/musematic-deploy": "true"}, False),
+        (True, "main", {_SOURCE: "true", _DEPLOY: "true"}, True),
+        (True, "main", {_SOURCE: "true", _DEPLOY: "false"}, False),
+        (True, "main", {_SOURCE: "true", _DEPLOY: None}, False),
+        (False, "main", {_SOURCE: "true", _DEPLOY: "true"}, False),
+        # Each repository's own merge target: a protected main says nothing of master.
+        (
+            True,
+            "master",
+            {_SOURCE: "true", "gntik-ai/musematic-deploy@master": None},
+            False,
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_branch_protection_reports_strict_protection_and_merge_forward(
-    tmp_path: Any, merge_forward: bool, strict: dict[str, str | None], ready: bool
+    tmp_path: Any,
+    merge_forward: bool,
+    deploy_branch: str,
+    strict: dict[str, str | None],
+    ready: bool,
 ) -> None:
     projects = _config_root(tmp_path, safe_repositories=SAFE)
+    path = projects / "musematic.yaml"
+    text = path.read_text(encoding="utf-8")
     if merge_forward:
-        path = projects / "musematic.yaml"
         marker = "  staging_flow:\n    enabled: true\n"
-        text = path.read_text(encoding="utf-8")
         assert marker in text
-        path.write_text(text.replace(marker, marker + "    merge_forward: true\n"), "utf-8")
+        text = text.replace(marker, marker + "    merge_forward: true\n")
+    if deploy_branch != "main":
+        marker = (
+            "    mirror: /srv/engineering/mirrors/musematic-deploy.git\n    default_branch: main\n"
+        )
+        assert marker in text
+        text = text.replace(marker, marker.replace("main", deploy_branch))
+    path.write_text(text, encoding="utf-8")
     fake = _ProtectionGh(strict)
     handler = GitOpsGitHubHandler(
         _settings(tmp_path, project_config_root=projects, github_writes_enabled=True),
@@ -464,6 +651,6 @@ async def test_branch_protection_reports_strict_protection_and_merge_forward(
 
     assert result["status"] == "OK"
     assert result["merge_forward"] is merge_forward
-    assert result["strict"] == {repo: value == "true" for repo, value in strict.items()}
+    assert result["strict"] == {target: value == "true" for target, value in strict.items()}
     assert result["ready"] is ready
     assert fake.mutations == []

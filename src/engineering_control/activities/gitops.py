@@ -75,7 +75,6 @@ from engineering_control.projects import (
     REPOSITORY_SLUG_ALTERNATION,
     ProjectName,
 )
-from engineering_control.projects import default_branch as project_default_branch
 from engineering_control.security.redaction import SecretRedactor
 
 GITOPS_CONTROLLER_STEPS = frozenset(
@@ -2521,19 +2520,20 @@ class GitOpsGitHubHandler:
         if gate is None:
             merge = manifest.merge_delivery()
             gate = merge if merge is not None and merge.enabled else None
-        branch = project_default_branch(project)
-        repositories = sorted(
+        # NEW-214b review: each repository's own merge target, as the delivery plan uses.
+        targets = sorted(
             {
-                str(manifest.repositories.source.full_name),
-                str(manifest.repositories.deployment.full_name),
+                (str(side.full_name), str(side.default_branch))
+                for side in (manifest.repositories.source, manifest.repositories.deployment)
             }
         )
         strict: dict[str, bool] = {}
-        for repository in repositories:
+        for repository, branch in targets:
             try:
-                strict[repository] = self.broker.branch_protection_strict(repository, branch)
+                protected = self.broker.branch_protection_strict(repository, branch)
             except CommandFailure:
-                strict[repository] = False
+                protected = False
+            strict[f"{repository}@{branch}"] = protected
         return {
             "status": "OK",
             "merge_forward": bool(gate is not None and gate.merge_forward),

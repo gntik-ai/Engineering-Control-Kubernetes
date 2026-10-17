@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import timedelta
@@ -87,6 +88,28 @@ ACTIVITY_RETRY = RetryPolicy(
 
 # NEW-214b: the issue a pipelined BACK slot works on. Its loop-state notices name that
 # issue, not the FRONT slot's. Set only inside a BACK task's own context.
+_BACK_DRAIN_POINT: Any = object()
+
+
+def _live_loop_items(
+    raw_items: list[Any], back_in_flight: Callable[[], bool]
+) -> Iterator[tuple[int, Any]]:
+    """enumerate(raw_items, start=1) over a growing list (refills append to it).
+
+    NEW-214b: once the issues ran out with a BACK slot in flight, yields a drain point
+    instead of stopping, so a slot that BACK outcome refills is still worked on.
+    """
+    ordinal = 0
+    while True:
+        if ordinal < len(raw_items):
+            ordinal += 1
+            yield ordinal, raw_items[ordinal - 1]
+        elif back_in_flight():
+            yield ordinal, _BACK_DRAIN_POINT
+        else:
+            return
+
+
 _SLOT_ISSUE: ContextVar[str | None] = ContextVar("hermes_slot_issue", default=None)
 
 
@@ -126,6 +149,7 @@ class ControlledWorkflow:
         self._front_busy = False
         self._implementation_holder: str | None = None
         self._back_task: asyncio.Task[tuple[str, str]] | None = None
+        self._back_cancelled = False
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -193,6 +217,27 @@ class ControlledWorkflow:
         self._ignored_signals = [*self._ignored_signals, entry][-20:]
         workflow.logger.warning("backlog loop ignored a signal for another issue: %s", entry)
 
+    async def _slot_pause_gate(self) -> None:
+        """NEW-214b: only one pipelined slot ever awaits the operator.
+
+        A BACK slot pauses only once the FRONT slot is idle. A FRONT slot first lets the
+        BACK slot finish, idle meanwhile. The existing retry/skip signals then always
+        address the one paused issue. Without pipelining this does nothing.
+        """
+        if not getattr(self, "_pipelined", False):
+            return
+        if _SLOT_ISSUE.get() is not None:
+            await workflow.wait_condition(lambda: not self._front_busy)
+            return
+        task = self._back_task
+        if task is None or task.done():
+            return
+        self._front_busy = False
+        try:
+            await workflow.wait_condition(task.done)
+        finally:
+            self._front_busy = True
+
     async def _checkpoint(self, phase: str) -> bool:
         self._phase = phase
         if self._paused:
@@ -207,6 +252,16 @@ class ControlledWorkflow:
         timeout_minutes: int = 30,
         retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
+        if (
+            step == "backlog.record_loop_state"
+            and self._pipelined
+            and payload.get("loop_status") != "RUNNING"
+        ):
+            # NEW-214b: no slot leaves RUNNING while the other could still be working, so
+            # a campaign is never PAUSED, STOPPED or ended with a BACK slot in flight.
+            await self._slot_pause_gate()
+            if self._back_cancelled and _SLOT_ISSUE.get() is None:
+                return {"status": "RECORDED", "reason": "BACK_SLOT_RECORDED_CANCELLED"}
         loop_issue = _SLOT_ISSUE.get() or self._loop_issue
         if (
             step == "backlog.record_loop_state"
@@ -3323,6 +3378,9 @@ def _backlog_execution_payload(request: ExistingGitHubBacklogLoopInput) -> dict[
     for key in ("issue_operation_id", "issue_approval_binding"):
         if value[key] is None:
             value.pop(key)
+    if value.get("maximum_concurrency") == 1:
+        # NEW-214b review: concurrency-1 activity payloads stay byte-identical.
+        value.pop("maximum_concurrency")
     return value
 
 
@@ -3553,12 +3611,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 global_child_blocker_return=global_child_blocker_return,
                 register_run=register_run,
             )
-            await self._finish_back_slot()
+            back_failure = await self._finish_back_slot()
+            if back_failure is not None:
+                raise back_failure
             return outcome
         except _LoopIssueSkipped as skipped:
             # NEW-162: a skip always closes its own loop (it used to re-raise the step's
             # error, failing the loop and the whole campaign).
-            await self._finish_back_slot()
+            back_failure = await self._finish_back_slot()
+            if back_failure is not None:
+                await self._record_loop_failed(request, register_run)
+                raise back_failure from None
             return await self._complete_after_skip(request, skipped.skipped, register_run)
         except Exception:
             # Without this, an uncaught exception (e.g. a non-retryable
@@ -3577,16 +3640,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             # row gracefully (skips updating it) and unconditionally resets
             # campaign.status regardless, so this is safe even though
             # register_run hasn't necessarily succeeded.
-            if register_run:
-                await self._step(
-                    "backlog.record_loop_state",
-                    {
-                        **_backlog_execution_payload(request),
-                        "workflow_id": workflow.info().workflow_id,
-                        "loop_status": "FAILED",
-                    },
-                )
+            await self._record_loop_failed(request, register_run)
             raise
+
+    async def _record_loop_failed(
+        self, request: ExistingGitHubBacklogLoopInput, register_run: bool
+    ) -> None:
+        if register_run:
+            await self._step(
+                "backlog.record_loop_state",
+                {
+                    **_backlog_execution_payload(request),
+                    "workflow_id": workflow.info().workflow_id,
+                    "loop_status": "FAILED",
+                },
+            )
 
     async def _run_backlog_loop(
         self,
@@ -3620,6 +3688,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             and workflow.patched("existing-backlog-pipelined-v1")
         )
         back: dict[str, Any] | None = None
+        # NEW-214b: issues this loop delivered; a pipelined issue needs its dependencies
+        # among the earlier issues delivered (SKIPPED does not count), as the design says.
+        delivered_refs: set[str] = set()
         if pipelined:
             refused = await self._pipeline_prerequisites(request, register_run=register_run)
             if refused is not None:
@@ -3646,24 +3717,52 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if staged == "DONE":
                 delivered += 1
                 self._loop_delivered = delivered
+                delivered_refs.add(current["ref"])
             elif staged == "SKIPPED" and self._free_slots_patched(current["ordinal"]):
                 await self._refill_free_slot(request, raw_items, register_run=register_run)
             return None
 
         # raw_items may grow while iterating: an issue that frees its slot (REJECTED,
         # duplicate, skipped...) is replaced by the next eligible one (_refill_free_slot).
-        for ordinal, item in enumerate(raw_items, start=1):
+        def back_in_flight() -> bool:
+            return back is not None
+
+        for ordinal, item in _live_loop_items(raw_items, back_in_flight):
+            if item is _BACK_DRAIN_POINT:
+                # NEW-214b: the selected issues ran out with a BACK slot in flight; its
+                # outcome may refill a slot, whose issue this loop then still works on.
+                terminal = await drain_back()
+                if terminal is not None:
+                    return terminal
+                continue
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
             # NEW-127: workflow state only (no command); read by _step for loop-state notices.
             self._loop_issue = f"{item.get('repository')}#{item.get('issue_number')}"
-            if back is not None and back["ref"] in {
-                str(value) for value in item.get("dependencies") or []
-            }:
-                # NEW-214b: an issue never starts while one it depends on is in flight.
-                terminal = await drain_back()
-                if terminal is not None:
-                    return terminal
+            if pipelined:
+                dependencies = {str(value) for value in item.get("dependencies") or []}
+                if back is not None and back["ref"] in dependencies:
+                    # NEW-214b: an issue never starts while one it depends on is in flight.
+                    terminal = await drain_back()
+                    if terminal is not None:
+                        return terminal
+                earlier = {
+                    f"{other.get('repository')}#{other.get('issue_number')}"
+                    for other in raw_items[: ordinal - 1]
+                    if isinstance(other, dict)
+                }
+                undelivered = sorted((dependencies & earlier) - delivered_refs)
+                if undelivered:
+                    results.append(
+                        {
+                            "repository": item.get("repository"),
+                            "issue_number": item.get("issue_number"),
+                            "status": "NOT_STARTED",
+                            "blocker": "DEPENDENCY_NOT_DELIVERED",
+                            "dependencies": undelivered,
+                        }
+                    )
+                    continue
             continue_to_next_issue = False
             gate_skipped = False
             revalidation_round = 0
@@ -4278,6 +4377,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             delivered += 1
             self._loop_delivered = delivered
+            delivered_refs.add(str(self._loop_issue))
             boundary = await self._after_issue_boundary(
                 request,
                 results,
@@ -4935,35 +5035,34 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     async def _back_slot(self, issue_ref: str, **arguments: Any) -> tuple[str, str]:
         """NEW-214b: one issue's CI, merge and staging, as a task beside the FRONT slot."""
         _SLOT_ISSUE.set(issue_ref)  # this task's own context only
-        return await self._staging_gitops_delivery(**arguments)
-
-    async def _slot_pause_gate(self) -> None:
-        """NEW-214b: only one pipelined slot ever awaits the operator.
-
-        A BACK slot pauses only once the FRONT slot is idle. A FRONT slot first lets the
-        BACK slot finish, idle meanwhile. The existing retry/skip signals then always
-        address the one paused issue. Without pipelining this does nothing.
-        """
-        if not getattr(self, "_pipelined", False):
-            return
-        if _SLOT_ISSUE.get() is not None:
-            await workflow.wait_condition(lambda: not self._front_busy)
-            return
-        task = self._back_task
-        if task is None or task.done():
-            return
-        self._front_busy = False
         try:
-            await workflow.wait_condition(task.done)
-        finally:
-            self._front_busy = True
+            staged = await self._staging_gitops_delivery(**arguments)
+        except _LoopIssueSkipped as skipped:
+            # A skipped bookkeeping step ends only this slot's issue (NEW-162 closes a
+            # sequential loop, which has no other issue in flight).
+            arguments["results"].append(skipped.skipped)
+            return "SKIPPED", ""
+        if staged[0] == "CANCELLED":
+            self._back_cancelled = True  # it recorded the loop CANCELLED itself
+        return staged
 
-    async def _finish_back_slot(self) -> None:
-        """NEW-214b: a loop never ends while its BACK slot still runs."""
-        task = getattr(self, "_back_task", None)
-        if task is not None and not task.done():
+    async def _finish_back_slot(self) -> BaseException | None:
+        """NEW-214b: a loop never ends while its BACK slot still runs.
+
+        A BACK outcome the loop did not apply yet still counts as delivered (for
+        NEW-162's skip close). Returns the BACK slot's failure, which fails the loop.
+        """
+        task = self._back_task
+        if task is None:
+            return None
+        if not task.done():
             self._front_busy = False
-            await asyncio.wait([task])
+            await workflow.wait_condition(task.done)
+        self._back_task = None
+        failure = task.exception()
+        if failure is None and task.result()[0] == "DONE":
+            self._loop_delivered += 1
+        return failure
 
     async def _loop_step(
         self,

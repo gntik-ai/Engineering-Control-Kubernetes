@@ -277,6 +277,7 @@ def test_legacy_workflow_activity_payload_does_not_gain_null_fields() -> None:
     expected = asdict(request)
     del expected["issue_operation_id"]
     del expected["issue_approval_binding"]
+    del expected["maximum_concurrency"]  # NEW-214b: concurrency 1 is never sent
     assert _backlog_execution_payload(request) == expected
 
 
