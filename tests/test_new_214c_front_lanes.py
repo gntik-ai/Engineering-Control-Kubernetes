@@ -44,25 +44,37 @@ _FIRST = "gntik-ai/musematic#1026"
 
 @workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
 class _Delivery:
-    """Publishes after two seconds; issue 1026's first attempt can be scripted."""
+    """Publishes after two seconds (scripted per child id suffix); issue 1026's first
+    attempt can be scripted."""
 
     first_outcome: dict[str, Any] | None = None
+    seconds: dict[str, float] = {}
 
     @workflow.run
     async def run(self, request: dict[str, Any]) -> dict[str, Any]:
-        first = "-issue-1-attempt-1" in workflow.info().workflow_id
-        if first and _Delivery.first_outcome is not None:
+        child = workflow.info().workflow_id
+        if "-issue-1-attempt-1" in child and _Delivery.first_outcome is not None:
             await workflow.sleep(timedelta(milliseconds=500))
             return _Delivery.first_outcome
-        await workflow.sleep(timedelta(seconds=2))
+        seconds = next(
+            (value for suffix, value in _Delivery.seconds.items() if child.endswith(suffix)), 2
+        )
+        await workflow.sleep(timedelta(seconds=seconds))
         return {"status": "SOURCE_PR", "context": {"change_set_id": _GITOPS_PLAN["change_set_id"]}}
 
 
 @workflow.defn(name="StagingGitOpsDeliveryWorkflow", sandboxed=False)
 class _Staging:
+    """Verifies after three seconds; issue 1026's first CI run can regress."""
+
+    regress_first = False
+
     @workflow.run
     async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
         await workflow.sleep(timedelta(seconds=3))
+        child = workflow.info().workflow_id
+        if _Staging.regress_first and child.endswith("-issue-1-staging-gitops"):
+            return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_REGRESSION"}
         return {"status": "STAGING_VERIFIED"}
 
 
@@ -86,6 +98,7 @@ def _script(
             "risk_class": "R1",
         },
         "backlog.register_child_run": {"status": "REGISTERED"},
+        "backlog.record_ci_repair": {"status": "RECORDED"},
         "backlog.record_loop_state": {"status": "RECORDED"},
         "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
         "backlog.restore_published_change_set": {"status": "RESTORED"},
@@ -112,16 +125,29 @@ async def _run(
     signals: list[tuple[str, str | None]] | None = None,
     hook: Any = None,
     driver: Any = None,
+    refill: list[dict[str, Any]] | None = None,
+    continue_after_blocked: bool = False,
 ) -> tuple[Any, Any]:
+    pool = list(refill or [])
+
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
         step = request["step"]
         if hook is not None:
-            await hook(step, request["payload"])
+            answer = await hook(step, request["payload"])
+            if isinstance(answer, dict):
+                return answer
         if step == "github.refresh_mirrors":
             return {"status": "PASS"}
         if step == "backlog.load_execution" and request["payload"].get("exclude_issue_refs"):
-            return {"status": "READY", "items": []}
+            # A refill selects the first pooled issue the loop does not hold yet.
+            held = set(request["payload"]["exclude_issue_refs"])
+            fresh = [
+                value
+                for value in pool
+                if f"{value['repository']}#{value['issue_number']}" not in held
+            ]
+            return {"status": "READY", "items": fresh[:1]}
         if step not in script:
             raise AssertionError(f"unscripted step {step!r}")
         return _registered_child(step, request, script[step])
@@ -149,7 +175,7 @@ async def _run(
                     maximum_risk="R2",
                     delivery_mode="full-delivery",
                     maximum_items=3,
-                    continue_after_blocked_issue=False,
+                    continue_after_blocked_issue=continue_after_blocked,
                     maximum_concurrency=concurrency,
                 ),
                 id=f"front-lanes-{uuid.uuid4()}",
@@ -362,6 +388,97 @@ async def test_an_issue_waits_for_a_dependency_in_another_slot() -> None:
     await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
 
 
+async def test_hand_over_follows_checker_pass_order_not_later_lookups() -> None:
+    # Review: issue 1 passed its checker first but its next lookup finished later.
+    _Delivery.first_outcome = None
+    _Delivery.seconds = {"-issue-1-attempt-1": 1, "-issue-2-attempt-1": 2}
+    lookups = 0
+
+    async def hook(step: str, payload: dict[str, Any]) -> None:
+        nonlocal lookups
+        if step == "gitops.flow_for_project":
+            lookups += 1
+            if lookups == 1:
+                await asyncio.sleep(3)  # issue 1's lookup outlasts issue 2's checker
+
+    try:
+        history, result = await _run(_script(), hook=hook)
+    finally:
+        _Delivery.seconds = {}
+
+    assert result["status"] == "COMPLETE"
+    events = _events(history)
+    assert _at(events, "completed", "1-attempt-1") < _at(events, "completed", "2-attempt-1")
+    assert _at(events, "completed", "2-attempt-1") < _at(events, "started", "1-staging-gitops")
+    assert _at(events, "started", "1-staging-gitops") < _at(events, "started", "2-staging-gitops")
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_repair_runs_in_a_lane_while_back_takes_the_next_pr() -> None:
+    # Review: a repair inside BACK kept every other published PR waiting.
+    _Delivery.first_outcome = None
+    _Staging.regress_first = True
+    try:
+        history, result = await _run(_script())
+    finally:
+        _Staging.regress_first = False
+
+    assert result["status"] == "COMPLETE"
+    events = _events(history)
+    repair = "1-ci-repair-1-attempt-1"
+    assert ("started", repair) in [(kind, name) for kind, name, _index in events]
+    # BACK merged and deployed issue 2 while a lane repaired issue 1...
+    assert _at(events, "started", "2-staging-gitops") < _at(events, "completed", repair)
+    # ...and issue 1 rejoined BACK after its repair.
+    assert _at(events, "completed", repair) < _at(events, "started", "1-staging-gitops-retry-1")
+    staged = [item for item in result["results"] if item.get("stage") == "staging-gitops"]
+    assert [item["status"] for item in staged].count("STAGING_VERIFIED") == 3
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_two_lanes_refilling_at_once_never_select_the_same_issue() -> None:
+    # Review: both lanes passed the refill wait together and appended one issue twice.
+    async def hook(step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if step == "backlog.revalidate_gate" and payload["item"]["issue_number"] in (1026, 1027):
+            return {"status": "BLOCKED", "blocker": "CURRENT_REVALIDATION_REJECTED"}
+        return None
+
+    history, result = await _run(
+        _script(),
+        hook=hook,
+        refill=[_item(1029), _item(1030)],
+        continue_after_blocked=True,
+    )
+
+    assert result["status"] == "COMPLETE"
+    loaded = [
+        request["payload"]["item"]["issue_number"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.revalidate_gate"
+    ]
+    assert sorted(loaded) == [1026, 1027, 1028, 1029, 1030]
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_skip_without_running_records_running_before_other_lanes_resume() -> None:
+    # Review: the turn was given up while the campaign still read PAUSED.
+    async def hook(step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if step == "backlog.revalidate_gate" and payload["item"]["issue_number"] == 1026:
+            return {"status": "BLOCKED", "blocker": "REVALIDATION_NEEDS_OPERATOR"}
+        return None
+
+    history, result = await _run(_script(), hook=hook, signals=[("skip", f"{_FIRST}|OPERATOR")])
+
+    assert result["status"] == "COMPLETE"
+    paused = _state_at(history, "PAUSED")
+    assert len(paused) == 1
+    resumed = [index for index in _state_at(history, "RUNNING") if index > paused[0]]
+    assert resumed
+    started = [index for kind, _name, index in _events(history) if kind == "started"]
+    assert not [index for index in started if paused[0] < index < resumed[0]]
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
 # -- shared component leases --------------------------------------------------------------
 
 
@@ -431,6 +548,12 @@ def test_a_shared_component_stays_exclusive_to_everyone_else(session: Session) -
     with session.begin(), pytest.raises(ComponentLeaseConflict, match="excludes this run"):
         # A run outside the group cannot join it by naming its prefix.
         _acquire(manager, session, outsider, _GROUP)
+    with session.begin():
+        # The freed base key is a slot again for the group (review: it was never reused).
+        third = _run_row(session, f"{_GROUP}3-attempt-1")
+        fourth = _run_row(session, f"{_GROUP}4-attempt-1")
+        assert _acquire(manager, session, third, _GROUP) == "gntik-ui:web"
+        assert _acquire(manager, session, fourth, _GROUP) == "gntik-ui:web:shared-3"
 
 
 def test_shared_leases_are_bounded(session: Session) -> None:

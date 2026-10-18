@@ -117,7 +117,7 @@ class ComponentLeaseManager:
             if not self._in_group(session, owner_run_id, share_prefix):
                 raise ComponentLeaseConflict("the shared component group excludes this run")
             held = {holder.component_key for holder in holders}
-            slots = [
+            slots = [component_key] + [
                 f"{component_key}:shared-{number}"
                 for number in range(2, self.max_implementation_per_project + 1)
             ]
