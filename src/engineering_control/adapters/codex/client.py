@@ -21,6 +21,10 @@ from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.provider_error_kinds import provider_error_kind
 from engineering_control.security.redaction import SecretRedactor
 
+# NEW-221b: the parts of a linked worktree's commondir a maker writes (objects, branch
+# refs, reflogs); its top level, config, objects/info and worktrees/ are sealed (NEW-221).
+_MAKER_WRITABLE_COMMON_DIRECTORIES = ("objects", "refs", "logs")
+
 
 class CodexCLIAdapter:
     provider = Provider.CODEX
@@ -48,8 +52,15 @@ class CodexCLIAdapter:
         """NEW-37: a linked worktree keeps its index, HEAD and objects outside the
         worktree (the per-worktree gitdir and the shared commondir). The workspace-write
         sandbox only allows writes under the working directory, so the maker could edit
-        and test but never `git commit` ("index.lock" read-only). Return those two git
-        directories -- the maker's ACL already grants them -- as extra writable roots."""
+        and test but never `git commit` ("index.lock" read-only). Return those git
+        directories -- the maker's ACL already grants them -- as extra writable roots.
+
+        NEW-221b: of the shared commondir, only the parts the maker still writes:
+        objects/, refs/ and logs/. Codex's bubblewrap sandbox creates synthetic mount
+        targets (.git, .codex, .agents, .aws) at the top of every writable root, and
+        NEW-221 seals the commondir's top level against the maker, so passing the
+        commondir itself failed every maker run before its first command ("bwrap: Can't
+        mkdir <commondir>/.git: Permission denied")."""
         marker = worktree / ".git"
         if not marker.is_file():
             return []
@@ -65,8 +76,10 @@ class CodexCLIAdapter:
         if commondir_file.is_file():
             common = Path(commondir_file.read_text(encoding="utf-8").strip())
             common = (common if common.is_absolute() else gitdir / common).resolve()
-            if common not in roots:
-                roots.append(common)
+            for name in _MAKER_WRITABLE_COMMON_DIRECTORIES:
+                directory = common / name
+                if directory.is_dir() and not directory.is_symlink() and directory not in roots:
+                    roots.append(directory)
         worktree_root = worktree.resolve()
         return [str(root) for root in roots if not root.is_relative_to(worktree_root)]
 

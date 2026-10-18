@@ -204,7 +204,10 @@ async def test_codex_maker_can_write_its_linked_worktree_git_metadata(
     added = [command[i + 1] for i, part in enumerate(command) if part == "--add-dir"]
     git_dir = (repository / ".git").resolve()
     if writable:
-        assert str(git_dir / "worktrees" / "change") in added
-        assert str(git_dir) in added
+        # NEW-221b: never the commondir itself (sealed top level), only what a commit writes.
+        assert added == [
+            str(git_dir / "worktrees" / "change"),
+            *(str(git_dir / name) for name in ("objects", "refs", "logs")),
+        ]
     else:
         assert added == []
