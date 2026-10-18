@@ -43,6 +43,7 @@ class FakeGh:
         self.head_after = overrides.get("head_after")  # head once CI ran, if it moves
         self.extra_commit = overrides.get("extra_commit", False)
         self.fail_reopen = overrides.get("fail_reopen", False)
+        self.no_rerun = overrides.get("no_rerun", False)
         self.reopened = False
 
     def _commits(self) -> list[str]:
@@ -96,14 +97,29 @@ class FakeGh:
         if f"commits/{BOT}/check-runs" in joined:
             runs = []
             if self.stale_visual:
+                # Started before the reopen (even if created after any earlier snapshot).
                 runs.append(
-                    {"id": 60, "name": "visual", "status": "completed", "conclusion": "success"}
+                    {
+                        "id": 60,
+                        "name": "visual",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-10-17T18:04:59Z",
+                    }
                 )
-            if self.reopened:
+            if self.reopened and not self.no_rerun:
                 runs.append(
-                    {"id": 61, "name": "visual", "status": "completed", "conclusion": self.visual}
+                    {
+                        "id": 61,
+                        "name": "visual",
+                        "status": "completed",
+                        "conclusion": self.visual,
+                        "started_at": "2026-10-17T18:05:30Z",
+                    }
                 )
             return json.dumps(runs)
+        if "/issues/700/events" in joined:
+            return json.dumps(["2026-10-17T18:05:00Z"] if self.reopened else [])
         if args[:2] == ["pr", "close"]:
             return ""
         if args[:2] == ["pr", "reopen"]:
@@ -115,7 +131,14 @@ class FakeGh:
 
 
 def _run(fake: FakeGh) -> dict[str, Any]:
-    return refresh(fake, timeout_minutes=5, now=NOW, sleep=lambda _seconds: None)
+    ticks = iter(range(0, 10_000_000, 60))  # each poll advances a minute
+    return refresh(
+        fake,
+        timeout_minutes=5,
+        now=NOW,
+        sleep=lambda _seconds: None,
+        clock=lambda: float(next(ticks)),
+    )
 
 
 def test_a_verified_refresh_reports_a_merge_command_pinned_to_the_baseline_commit() -> None:
@@ -181,6 +204,9 @@ def test_renames_and_deletions_inside_the_baselines_are_accepted() -> None:
 def test_a_visual_result_from_before_the_reopen_never_counts() -> None:
     result = _run(FakeGh(stale_visual=True, visual="failure"))
     assert result["status"] == "VISUAL_NOT_GREEN" and "merge_command" not in result
+    # A success that started before GitHub's reopen time, with no new run: never VERIFIED.
+    with pytest.raises(RefreshError, match="started after the reopen"):
+        _run(FakeGh(stale_visual=True, no_rerun=True))
 
 
 def test_a_head_that_moves_after_verification_is_never_reported_safe() -> None:
@@ -188,14 +214,22 @@ def test_a_head_that_moves_after_verification_is_never_reported_safe() -> None:
         _run(FakeGh(head_after=OTHER))
 
 
-def test_nothing_to_record_needs_a_successful_job_before_cleaning_up() -> None:
+def test_nothing_to_record_closes_the_pr_and_leaves_a_guarded_branch_delete() -> None:
     fake = FakeGh(records=False)
-    assert _run(fake) == {"status": "NO_BASELINE_CHANGED", "pull_request": 700}
-    assert ["pr", "close", "700", "--repo", "gntik-ai/gntik-ui", "--delete-branch"] in fake.calls
+    result = _run(fake)
+    assert result["status"] == "NO_BASELINE_CHANGED" and result["pull_request"] == 700
+    assert ["pr", "close", "700", "--repo", "gntik-ai/gntik-ui"] in fake.calls
+    # GitHub cannot delete a ref conditionally, so the script never deletes the branch.
+    assert not any("--delete-branch" in call or "DELETE" in call for call in fake.calls)
+    (guarded,) = result["cleanup"]
+    assert guarded.startswith(
+        f'test "$(gh api repos/gntik-ai/gntik-ui/git/ref/heads/{BRANCH} --jq .object.sha)" = '
+        f"{MARKER} && "
+    )
     failed = FakeGh(records=False, record_conclusion="failure")
     with pytest.raises(RefreshError, match="concluded"):
         _run(failed)
-    assert not any("--delete-branch" in call for call in failed.calls)
+    assert not any(call[:2] == ["pr", "close"] for call in failed.calls)
 
 
 def test_a_stop_reports_what_it_left_behind_and_how_to_undo_it() -> None:
@@ -203,10 +237,11 @@ def test_a_stop_reports_what_it_left_behind_and_how_to_undo_it() -> None:
         _run(FakeGh(fail_reopen=True))
     state = stopped.value.state
     assert state["stage"] == "pull-request-closed" and state["branch"] == BRANCH
-    assert recovery(state) == [
-        "gh pr reopen 700 --repo gntik-ai/gntik-ui",
-        "gh pr close 700 --repo gntik-ai/gntik-ui --delete-branch",
-    ]
+    assert recovery(state) == ["gh pr reopen 700 --repo gntik-ai/gntik-ui"]
+    open_state = {**state, "stage": "pull-request-open"}
+    close, delete = recovery(open_state)
+    assert close == "gh pr close 700 --repo gntik-ai/gntik-ui"
+    assert f"= {MARKER} && gh api -X DELETE" in delete
     assert recovery({"stage": "branch-created", "branch": BRANCH}) == [
         f"gh api -X DELETE repos/gntik-ai/gntik-ui/git/refs/heads/{BRANCH}"
     ]

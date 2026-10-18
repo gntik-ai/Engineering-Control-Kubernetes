@@ -15,11 +15,13 @@ This script runs that path and fails closed at every step:
    top of the marker; every changed path, both sides of a rename included and across all
    pages, is under ``apps/docs/e2e/__screenshots__/``;
 4. close and reopen the PR, so CI runs on the recorded baselines, then wait for a visual run
-   that did not exist before the reopen;
+   that GitHub started after it recorded the reopen;
 5. a re-check that the PR is still open with exactly those two commits at that head, and a
    merge command pinned to it (``--match-head-commit``).
 
-It never merges. Any stop prints what it created and how to undo it. Run it as the operator,
+It never merges, and it never deletes a branch itself (GitHub has no conditional ref
+deletion); it prints a guarded delete command instead. Any stop prints what it created and
+how to undo it. Run it as the operator,
 with the operator's own ``gh`` login:
     scripts/gntik-ui-visual-baseline-refresh.py [--timeout-minutes 40]
 """
@@ -135,7 +137,7 @@ class Refresh:
                 "api",
                 f"repos/{REPOSITORY}/commits/{sha}/check-runs?per_page=100",
                 "--jq",
-                "[.check_runs[] | {id, name, status, conclusion}]",
+                "[.check_runs[] | {id, name, status, conclusion, started_at}]",
             ]
         )
         return sorted(
@@ -282,27 +284,54 @@ class Refresh:
                     f"the recorded commit changes a path outside the baselines: {entry}"
                 )
 
+    def reopened_at(self, number: int) -> str:
+        """GitHub's own time of this PR's latest reopen (ISO 8601, UTC)."""
+        events = self.json(
+            [
+                "api",
+                "--paginate",
+                f"repos/{REPOSITORY}/issues/{number}/events",
+                "--jq",
+                '[.[] | select(.event == "reopened") | .created_at]',
+            ]
+        )
+        times = [value for value in events if isinstance(value, str)]
+        if not times:
+            raise self.fail(f"GitHub records no reopen of PR #{number}")
+        return max(times)
+
     def visual_after_reopen(self, number: int, recorded: str) -> str:
-        before = {run["id"] for run in self.check_runs(recorded, VISUAL_CHECK)}
         self.call(["pr", "close", str(number), "--repo", REPOSITORY])
         self.state.update(stage="pull-request-closed")
         self.call(["pr", "reopen", str(number), "--repo", REPOSITORY])
         self.state.update(stage="pull-request-open")
+        # Only a run GitHub started after it recorded the reopen counts: never one that
+        # existed before, or was started by anything else in between.
+        reopened = self.reopened_at(number)
         while True:
             fresh = [
-                run for run in self.check_runs(recorded, VISUAL_CHECK) if run["id"] not in before
+                run
+                for run in self.check_runs(recorded, VISUAL_CHECK)
+                if isinstance(run.get("started_at"), str) and run["started_at"] >= reopened
             ]
             if fresh and fresh[-1].get("status") == "completed":
                 return str(fresh[-1].get("conclusion") or "unknown")
-            self.wait(f"a new {VISUAL_CHECK} run on {recorded[:12]}")
+            self.wait(f"a {VISUAL_CHECK} run on {recorded[:12]} started after the reopen")
 
     def run(self) -> dict[str, Any]:
         number, branch, marker = self.create()
         recorded = self.recorded_commit(number, marker)
         if recorded is None:
-            self.call(["pr", "close", str(number), "--repo", REPOSITORY, "--delete-branch"])
+            # The PR is closed, but the branch is never deleted automatically: GitHub has no
+            # conditional ref deletion, so a push in between could be lost. The operator
+            # deletes it with the guarded command below.
+            self.call(["pr", "close", str(number), "--repo", REPOSITORY])
             self.state.update(stage="closed-nothing-recorded")
-            return {"status": "NO_BASELINE_CHANGED", "pull_request": number}
+            return {
+                "status": "NO_BASELINE_CHANGED",
+                "pull_request": number,
+                "cleanup": recovery(self.state),
+            }
         self.state.update(recorded_commit=recorded)
         self.verify(branch, marker, recorded)
         conclusion = self.visual_after_reopen(number, recorded)
@@ -327,19 +356,32 @@ class Refresh:
         return result
 
 
+def _guarded_branch_delete(branch: str, marker: str | None) -> str:
+    """Delete the refresh branch only while it still points at the marker commit."""
+    if marker is None:
+        return f"gh api -X DELETE repos/{REPOSITORY}/git/refs/heads/{branch}"
+    return (
+        f'test "$(gh api repos/{REPOSITORY}/git/ref/heads/{branch} --jq .object.sha)" = '
+        f"{marker} && gh api -X DELETE repos/{REPOSITORY}/git/refs/heads/{branch}"
+    )
+
+
 def recovery(state: dict[str, Any]) -> list[str]:
-    """Commands that undo or finish what a stopped refresh left behind."""
+    """Commands that undo or finish what a stopped refresh left behind.
+
+    Closing the PR and deleting its branch are separate steps: gh does nothing for an
+    already-closed PR, so a combined close --delete-branch could leave the branch.
+    """
     number, branch, stage = state.get("pull_request"), state.get("branch"), state.get("stage")
-    if number is not None and stage == "pull-request-closed":
-        return [
-            f"gh pr reopen {number} --repo {REPOSITORY}",
-            f"gh pr close {number} --repo {REPOSITORY} --delete-branch",
-        ]
+    marker = state.get("marker_commit")
+    commands: list[str] = []
     if number is not None and stage == "pull-request-open":
-        return [f"gh pr close {number} --repo {REPOSITORY} --delete-branch"]
-    if branch is not None and number is None:
-        return [f"gh api -X DELETE repos/{REPOSITORY}/git/refs/heads/{branch}"]
-    return []
+        commands.append(f"gh pr close {number} --repo {REPOSITORY}")
+    if number is not None and stage == "pull-request-closed":
+        commands.append(f"gh pr reopen {number} --repo {REPOSITORY}")
+    if branch is not None and stage != "pull-request-closed":
+        commands.append(_guarded_branch_delete(branch, marker))
+    return commands
 
 
 def refresh(
