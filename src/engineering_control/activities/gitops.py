@@ -3194,10 +3194,10 @@ class GitOpsGitHubHandler:
             return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}, None
         if not gate.changeset.enabled:
             return None, None
-        return self._changeset_gate(plan, gate.changeset)
+        return self._changeset_gate(plan, gate, touched)
 
     def _changeset_gate(
-        self, plan: StagingGitOpsPlan, changeset: ChangesetGatePolicy
+        self, plan: StagingGitOpsPlan, gate: MergeDeliveryPolicy, touched: list[str]
     ) -> tuple[dict[str, Any] | None, str | None]:
         """NEW-219: judge the changeset rule on the merge result, never on the PR head
         against an old base.
@@ -3211,7 +3211,14 @@ class GitOpsGitHubHandler:
         that publishes the path requires a changeset, so a package that becomes private or
         public in the PR, or is deleted, still counts. An unreadable manifest keeps every
         path of its package counted. A merge GitHub cannot compute yet, or one that
-        conflicts, defers to the merge-state handling, never to CHANGESET_MISSING."""
+        conflicts, defers to the merge-state handling, never to CHANGESET_MISSING.
+
+        NEW-225: GitHub does not rebuild the test merge when only the base moves (gntik-ui
+        #168 kept one of the old main for over an hour), so a test merge of the bound head
+        into an older base stays stale. With merge-forward the PR is behind its base;
+        otherwise the stale merge is judged when that provably gives the merge into the
+        current base's verdict (``_stale_merge_equivalent``)."""
+        changeset = gate.changeset
         repository = plan.source_repository
         target = {"status": "MERGE_PENDING", "target": "source"}
         preview = self.broker.pull_request_merge_preview(repository, plan.source_pr_number)
@@ -3225,10 +3232,125 @@ class GitOpsGitHubHandler:
         if preview["mergeable"] is not True or merge_sha is None:
             return {**target, "merge_state": "MERGE_RESULT_PENDING"}, None
         base_sha = self.broker.branch_commit(repository, plan.source_base_branch)["sha"]
-        if self.broker.commit_parents(repository, merge_sha) != [base_sha, plan.source_head_sha]:
-            return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
-        refused = self._changeset_verdict(repository, changeset, base_sha, merge_sha)
+        parents = self.broker.commit_parents(repository, merge_sha)
+        judged_base = base_sha
+        if parents != [base_sha, plan.source_head_sha]:
+            if len(parents) != 2 or parents[1] != plan.source_head_sha:
+                return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
+            if gate.merge_forward:
+                # NEW-225: the base moved; the merge-forward repair round merges it in.
+                return {"status": "BLOCKED", "blocker": "SOURCE_PR_BEHIND_BASE"}, None
+            if not self._stale_merge_equivalent(
+                plan, changeset, touched, parents[0], base_sha, merge_sha
+            ):
+                return {**target, "merge_state": "MERGE_RESULT_STALE"}, None
+            judged_base = parents[0]
+        refused = self._changeset_verdict(repository, changeset, judged_base, merge_sha)
+        # The verdict holds for the current base, so BASE_MOVED and the post-merge check
+        # still compare with it.
         return (refused, None) if refused is not None else (None, base_sha)
+
+    def _stale_merge_equivalent(
+        self,
+        plan: StagingGitOpsPlan,
+        changeset: ChangesetGatePolicy,
+        touched: list[str],
+        old_base: str,
+        base_sha: str,
+        merge_sha: str,
+    ) -> bool:
+        """NEW-225: True when the stale test merge ``merge_sha`` (the bound head merged into
+        ``old_base``) provably changes the same paths, to the same contents and with the
+        same publish decisions, as the head merged into ``base_sha`` would.
+
+        ``base_sha`` descends from ``old_base`` through no commit the head has, so both
+        merges share their one merge base. The base-side delta D (``old_base`` to ``base_sha``)
+        is complete, has no rename or copy and none of the PR's paths, so each PR path
+        merges the same way into either base and each path of D keeps the base's content.
+        Git's rename detection must pair the same files in both merges: every PR path the
+        merge base had is still a file in the current base (so no base-side rename moves
+        an edit), and no directory either side adds a file to was removed on the other side
+        (no directory rename moves it). The stale merge changes only PR paths, D leaves the
+        workspace configuration alone, every manifest and changeset read is a regular file
+        (the contents API follows symlinks), and where D changes the package.json of a
+        package the PR touches, every PR path there publishes the same under both
+        manifests. Anything not provable keeps waiting for GitHub's own test merge."""
+        repository, head = plan.source_repository, plan.source_head_sha
+        try:
+            if not self.broker.commit_contains(repository, ancestor=old_base, descendant=base_sha):
+                return False
+            ahead, merge_base = self.broker.compare_summary(repository, old_base, head)
+            # As many commits ahead of the merge base as of either base: it is the only
+            # merge base (no criss-cross, so ort's merge base is the tree read below).
+            if any(
+                self.broker.compare_summary(repository, ref, head) != (ahead, merge_base)
+                for ref in (base_sha, merge_base)
+            ):
+                return False
+            delta = self.broker.compare_file_changes(repository, old_base, base_sha)
+            stale = self.broker.compare_file_changes(repository, old_base, merge_sha)
+        except GhCliPolicyError:
+            return False  # a listing at GitHub's compare cap may be truncated
+        pr_paths = set(touched)
+        moved = {path for change in delta for path in (change["path"], change["previous_path"])}
+        moved.discard("")
+        landed = {path for change in stale for path in (change["path"], change["previous_path"])}
+        landed.discard("")
+        workspace = {f"{changeset.directory}config.json", "package.json", "pnpm-workspace.yaml"}
+        if (
+            any(change["status"] in {"renamed", "copied"} for change in delta)
+            or moved & (pr_paths | workspace)
+            or not landed <= pr_paths
+        ):
+            return False
+        packages = {
+            directory
+            for path in pr_paths
+            if (directory := changeset.package_directory(path))
+            and f"{directory}package.json" in moved
+        }
+        judged = {d for path in landed if (d := changeset.package_directory(path))}
+        try:
+            trees = {
+                sha: self.broker.tree_modes(repository, sha)
+                for sha in {old_base, base_sha, merge_sha, head, merge_base}
+            }
+        except (CommandFailure, GhCliPolicyError):
+            return False
+        reads = {
+            old_base: {f"{d}package.json" for d in judged | packages},
+            base_sha: {f"{d}package.json" for d in packages},
+            merge_sha: {f"{d}package.json" for d in judged}
+            | set(changeset.changeset_candidates(stale)),
+        }
+        if (
+            any(
+                _tree_entry(trees[ref], path) not in (None, "100644", "100755")
+                for ref, paths in reads.items()
+                for path in paths
+            )
+            or any(
+                _tree_entry(trees[merge_base], path) not in (None, "040000")
+                and _tree_entry(trees[base_sha], path) not in _TREE_FILES
+                for path in pr_paths
+            )
+            or not all(
+                _directories_kept(trees[base_sha], trees[merge_base], path) for path in pr_paths
+            )
+            or not all(_directories_kept(trees[head], trees[merge_base], path) for path in moved)
+        ):
+            return False
+        paths = sorted(path for path in pr_paths if changeset.package_directory(path) in packages)
+        if not paths:
+            return True
+        before = self._manifests_at(repository, changeset, paths, old_base)
+        after = self._manifests_at(repository, changeset, paths, base_sha)
+        if before is None or after is None or None in (*before.values(), *after.values()):
+            return False  # an unreadable manifest proves nothing
+        return all(
+            changeset.touches_packages([path], before) == changeset.touches_packages([path], after)
+            for path in paths
+        )
 
     def _changeset_verdict(
         self, repository: str, changeset: ChangesetGatePolicy, base_sha: str, merge_sha: str
@@ -3968,6 +4090,38 @@ def _behind_base(
     }:
         return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_BEHIND_BASE"}
     return None
+
+
+# NEW-225: tree entries that are files (regular, executable, symlink, submodule).
+_TREE_FILES = frozenset({"100644", "100755", "120000", "160000"})
+
+
+def _tree_entry(tree: Mapping[str, str], path: str) -> str | None:
+    """NEW-225: ``path``'s Git mode in a recursive tree listing, None when absent, and ""
+    when a parent is not a directory (a symlink the contents API may follow)."""
+    parts = path.split("/")
+    for index in range(1, len(parts)):
+        mode = tree.get("/".join(parts[:index]))
+        if mode is None:
+            return None
+        if mode != "040000":
+            return ""
+    return tree.get(path)
+
+
+def _directories_kept(side: Mapping[str, str], merge_base: Mapping[str, str], path: str) -> bool:
+    """NEW-225: no directory holding ``path`` was removed on ``side`` since the merge base.
+
+    Git's directory-rename detection moves a file one side adds only out of a directory the
+    other side removed, so each directory is still one on ``side`` or none at the merge
+    base."""
+    parts = path.split("/")
+    for index in range(1, len(parts)):
+        directory = "/".join(parts[:index])
+        mode = side.get(directory)
+        if mode != "040000":
+            return mode is None and _tree_entry(merge_base, directory) is None
+    return True
 
 
 def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:
