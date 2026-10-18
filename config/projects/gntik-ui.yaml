@@ -154,6 +154,10 @@ maker_rules:
     - >-
       Do not commit visual baseline screenshots (apps/docs/e2e/__screenshots__) or put
       [visual-update] in a commit message; the visual job is recorded on the CI runner.
+      If the issue asks only to refresh a stale visual baseline, change nothing and report
+      BLOCKED with the reason OPERATOR_VISUAL_BASELINE_REFRESH: the operator runs
+      engineering-control's scripts/gntik-ui-visual-baseline-refresh.py, which re-records
+      the baseline on the CI runner and verifies the bot commit (NEW-220).
     - >-
       Every new component, block, template, layout or package export, and every new
       user-visible prop, variant or state, must be shown on the docs site

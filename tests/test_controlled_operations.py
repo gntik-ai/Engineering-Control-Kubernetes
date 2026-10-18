@@ -2433,6 +2433,8 @@ def test_operator_pause_classification_is_fail_closed_for_high_impact_blockers()
     assert required("MIGRATION_AMBIGUITY")
     assert required("SECRET_LIFECYCLE_UNRESOLVED")
     assert required("EXTERNAL_REVISION_DRIFT")
+    assert required("ISSUE_BODY_CHANGED_SINCE_IMPORT")  # NEW-217
+    assert not required("CURRENT_REVALIDATION_BLOCKED")
     assert not required("INDEPENDENT_TEST_FAILURE")
 
 

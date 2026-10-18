@@ -391,6 +391,123 @@ async def test_finding_verification_workflow_blocks_gracefully_when_controls_cra
     await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
 
 
+_NEW_217_CANDIDATE = {
+    "status": "CANDIDATE_LOADED",
+    "finding_id": "finding-1",
+    "persona": "existing-github-issue",
+    "actual_behavior": "Imported issue body (first 4000 characters)",
+    "issue_repository": "gntik-ai/falcone",
+    "issue_number": 944,
+    "issue_body_sha256": "a" * 64,
+}
+
+
+async def test_new_217_revalidation_reads_the_bounded_full_body_and_replays() -> None:
+    """NEW-217: a revalidated backlog issue is verified against its bounded full body,
+    read only under its imported (or amended) body hash, not the import's 4000 chars."""
+    script = {
+        "finding.load_candidate": dict(_NEW_217_CANDIDATE),
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": _REFRESHED_BODY,
+            "body_sha256": "0" * 64,
+        },
+        "finding.fresh_snapshot": {"snapshot_evidence_sha256": "f" * 64},
+        "finding.prepare_verifier": {"status": "RATE_LIMITED"},
+        "finding.record_terminal": {"status": "RATE_LIMITED"},
+    }
+    run_arg = FindingVerificationInput(finding_id="finding-1", project="falcone")
+    history, result = await _run_to_history(
+        FindingVerificationWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+    assert result["status"] == "RATE_LIMITED"
+    requests = _scheduled_steps(history)
+    refresh = next(r for r in requests if r["step"] == "delivery.refresh_issue_body")
+    assert refresh["payload"] == {
+        "issue_repository": "gntik-ai/falcone",
+        "issue_number": 944,
+        "approved_issue_body_sha256": "a" * 64,
+    }
+    prepared = next(r for r in requests if r["step"] == "finding.prepare_verifier")
+    assert prepared["payload"]["finding"]["actual_behavior"] == _REFRESHED_BODY
+    snapshot = next(r for r in requests if r["step"] == "finding.fresh_snapshot")
+    assert snapshot["payload"]["actual_behavior"] == _REFRESHED_BODY
+    await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
+
+
+async def test_new_217_revalidation_stops_when_the_body_changed_since_import() -> None:
+    """NEW-217: an issue edited after import is never revalidated from unapproved text;
+    the revalidation blocks with ISSUE_BODY_CHANGED_SINCE_IMPORT before any snapshot."""
+    script = {
+        "finding.load_candidate": dict(_NEW_217_CANDIDATE),
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker_detail": "re-import or amend",
+            "approved_body_sha256": "a" * 64,
+            "current_body_sha256": "b" * 64,
+        },
+        "finding.record_terminal": {"status": "BLOCKED"},
+    }
+    run_arg = FindingVerificationInput(finding_id="finding-1", project="falcone")
+    history, result = await _run_to_history(
+        FindingVerificationWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+    assert result == {"status": "BLOCKED", "context": {"status": "BLOCKED"}}
+    requests = _scheduled_steps(history)
+    terminal = next(r for r in requests if r["step"] == "finding.record_terminal")
+    assert terminal["payload"]["blocker"] == "ISSUE_BODY_CHANGED_SINCE_IMPORT"
+    assert (
+        terminal["payload"]["finding"]["actual_behavior"] == _NEW_217_CANDIDATE["actual_behavior"]
+    )
+    assert "finding.fresh_snapshot" not in _scheduled_step_names(history)
+    await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
+
+
+async def test_new_217_revalidation_keeps_the_imported_copy_when_the_read_fails() -> None:
+    """NEW-217: a failed GitHub read keeps today's behaviour (the imported excerpt)."""
+    script = {
+        "finding.load_candidate": dict(_NEW_217_CANDIDATE),
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_UNAVAILABLE",
+            "reason": "CommandFailure",
+        },
+        "finding.fresh_snapshot": {"snapshot_evidence_sha256": "f" * 64},
+        "finding.prepare_verifier": {"status": "RATE_LIMITED"},
+        "finding.record_terminal": {"status": "RATE_LIMITED"},
+    }
+    run_arg = FindingVerificationInput(finding_id="finding-1", project="falcone")
+    history, _ = await _run_to_history(
+        FindingVerificationWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+    prepared = next(r for r in _scheduled_steps(history) if r["step"] == "finding.prepare_verifier")
+    assert (
+        prepared["payload"]["finding"]["actual_behavior"] == _NEW_217_CANDIDATE["actual_behavior"]
+    )
+    await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
+
+
+async def test_new_217_candidates_without_an_issue_binding_never_refresh() -> None:
+    """NEW-217: Hermes-discovered findings (and candidates loaded before NEW-217) have no
+    issue binding, so no refresh step or patch marker is recorded."""
+    script = {
+        "finding.load_candidate": {"status": "CANDIDATE_LOADED", "finding_id": "finding-1"},
+        "finding.fresh_snapshot": {"snapshot_evidence_sha256": "f" * 64},
+        "finding.prepare_verifier": {"status": "RATE_LIMITED"},
+        "finding.record_terminal": {"status": "RATE_LIMITED"},
+    }
+    run_arg = FindingVerificationInput(finding_id="finding-1", project="falcone")
+    history, _ = await _run_to_history(
+        FindingVerificationWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+    assert "delivery.refresh_issue_body" not in _scheduled_step_names(history)
+    markers = [
+        event for event in history.events if event.HasField("marker_recorded_event_attributes")
+    ]
+    assert markers == []
+    await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
+
+
 async def test_existing_backlog_loop_continues_when_a_delivery_child_crashes() -> None:
     """Regression test for a real production incident (2026-09-23, NEW-24): the
     first delivery ever started (musematic #1025, campaign 11e90233) failed in
@@ -3588,6 +3705,63 @@ async def test_new_114_a_failed_revalidation_pauses_even_when_continuing() -> No
     assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
     await Replayer(
         workflows=[ExistingGitHubBacklogLoopWorkflow, _VerdictVerificationStub]
+    ).replay_workflow(history)
+
+
+@workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
+class _BodyChangedVerificationStub:
+    """FindingVerificationWorkflow stopping because the issue changed after import."""
+
+    @workflow.run
+    async def run(self, request: Any) -> dict[str, Any]:
+        return {
+            "status": "BLOCKED",
+            "context": {"status": "BLOCKED", "blocker": "ISSUE_BODY_CHANGED_SINCE_IMPORT"},
+        }
+
+
+async def test_new_217_a_changed_issue_body_pauses_even_when_continuing() -> None:
+    """NEW-217 review: a revalidation stopped by an issue edited after import waits for
+    the operator (amend or re-import) instead of advancing as CURRENT_REVALIDATION_BLOCKED."""
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        script: dict[str, dict[str, Any]] = {
+            "backlog.load_execution": {"status": "SELECTED", "items": [_item(7)]},
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "BLOCKED",
+                "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+            },
+            "backlog.materialize_candidate": {"status": "READY", "finding_id": "finding-7"},
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "backlog.record_revalidation": {"status": "REVALIDATION_RECORDED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    history, result, _, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            continue_after_blocked_issue=True,
+        ),
+        execute_control_step,
+        [("skip", "gntik-ai/musematic#7|OPERATOR")],
+        [ExistingGitHubBacklogLoopWorkflow, _BodyChangedVerificationStub],
+    )
+
+    assert [state["blocker"] for state in _loop_states(history, "PAUSED")] == [
+        "ISSUE_BODY_CHANGED_SINCE_IMPORT"
+    ]
+    assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, _BodyChangedVerificationStub]
     ).replay_workflow(history)
 
 
