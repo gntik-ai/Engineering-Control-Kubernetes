@@ -622,6 +622,7 @@ def test_a_direct_issue_or_global_start_cannot_ask_for_concurrency_2() -> None:
 # -- the prerequisite read ----------------------------------------------------------------
 
 
+_ACTIVE = {"enforcement": "active", "bypass": "never"}
 # What a merge target enforces, by kind (repo@branch -> kind); absent means nothing.
 _PROTECTION: dict[str, dict[str, Any]] = {
     "classic": {"classic": {"strict": True, "admins": True}},
@@ -633,6 +634,13 @@ _PROTECTION: dict[str, dict[str, Any]] = {
     "ruleset-bypassed": {"rules": True, "ruleset": {"enforcement": "active", "bypass": "always"}},
     "ruleset-evaluate": {"rules": True, "ruleset": {"enforcement": "evaluate", "bypass": "never"}},
     "ruleset-loose": {"rules": False, "ruleset": {"enforcement": "active", "bypass": "never"}},
+    # Malformed or empty check lists never count (review: they failed open).
+    "ruleset-no-checks": {"rules": True, "checks": [], "ruleset": _ACTIVE},
+    "ruleset-text-checks": {"rules": True, "checks": "ci", "ruleset": _ACTIVE},
+    "ruleset-null-check": {"rules": True, "checks": [None], "ruleset": _ACTIVE},
+    "ruleset-unnamed-check": {"rules": True, "checks": [{}], "ruleset": _ACTIVE},
+    # The qualifying rule is on the second page of applicable rules.
+    "ruleset-page-2": {"rules": True, "page": 2, "ruleset": _ACTIVE},
 }
 
 
@@ -659,6 +667,7 @@ class _ProtectionGh(FakeGh):
             return CommandResult(0, json.dumps(classic), "")
         if "/rules/branches/" in path:
             kind = self._kind(path.replace("/rules/branches/", "/branches/"))
+            page = int(path.rsplit("page=", 1)[1])
             if "rules" not in kind:
                 return CommandResult(0, "[]", "")
             rule = {
@@ -667,11 +676,18 @@ class _ProtectionGh(FakeGh):
                 "ruleset_id": 7,
                 "parameters": {
                     "strict_required_status_checks_policy": kind["rules"],
-                    "required_status_checks": [{"context": "ci", "integration_id": 15368}],
+                    "required_status_checks": kind.get(
+                        "checks", [{"context": "ci", "integration_id": 15368}]
+                    ),
                 },
             }
             self.rules_ruleset = kind["ruleset"]
-            return CommandResult(0, json.dumps([{"type": "deletion", "ruleset_id": 7}, rule]), "")
+            filler = [{"type": "deletion", "ruleset_id": 8}]
+            if kind.get("page", 1) == 2:
+                rules = filler * 100 if page == 1 else [rule]
+            else:
+                rules = [*filler, rule] if page == 1 else []
+            return CommandResult(0, json.dumps(rules), "")
         if path.endswith("/rulesets/7"):
             return CommandResult(0, json.dumps(self.rules_ruleset), "")
         return super().run(executable, arguments, **kwargs)
@@ -679,7 +695,7 @@ class _ProtectionGh(FakeGh):
 
 _SOURCE = "gntik-ai/musematic@main"
 _DEPLOY = "gntik-ai/musematic-deploy@main"
-_STRICT_KINDS = {"classic", "ruleset"}
+_STRICT_KINDS = {"classic", "ruleset", "ruleset-page-2"}
 
 
 @pytest.mark.parametrize(
@@ -703,6 +719,11 @@ _STRICT_KINDS = {"classic", "ruleset"}
         (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-evaluate"}, False),
         (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-loose"}, False),
         (True, "main", {_SOURCE: "ruleset", _DEPLOY: "classic-admins-exempt"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-no-checks"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-text-checks"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-null-check"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-unnamed-check"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-page-2"}, True),
     ],
 )
 @pytest.mark.asyncio

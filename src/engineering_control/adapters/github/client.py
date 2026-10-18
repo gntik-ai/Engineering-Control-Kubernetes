@@ -1145,19 +1145,34 @@ class GhCliBroker:
             and classic.get("admins") is True
         ):
             return True
-        rules = self._json(
-            self._run(["api", f"repos/{repository}/rules/branches/{branch}?per_page=100"]).stdout,
-            "branch rules",
-        )
+        rules: list[dict[str, Any]] = []
+        for page in range(1, 6):  # bounded: at most 500 applicable rules
+            batch = self._list(
+                self._json(
+                    self._run(
+                        [
+                            "api",
+                            f"repos/{repository}/rules/branches/{branch}?per_page=100&page={page}",
+                        ]
+                    ).stdout,
+                    "branch rules",
+                ),
+                "branch rules",
+            )
+            rules.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise GhCliPolicyError("branch rules exceeded the bounded page count")
         rulesets = sorted(
             {
                 rule["ruleset_id"]
-                for rule in self._list(rules, "branch rules")
+                for rule in rules
                 if rule.get("type") == "required_status_checks"
                 and type(rule.get("ruleset_id")) is int
                 and isinstance(rule.get("parameters"), dict)
                 and rule["parameters"].get("strict_required_status_checks_policy") is True
-                and rule["parameters"].get("required_status_checks")
+                and self._named_checks(rule["parameters"].get("required_status_checks"))
             }
         )
         for ruleset_id in rulesets:
@@ -1179,6 +1194,20 @@ class GhCliBroker:
             ):
                 return True
         return False
+
+    @staticmethod
+    def _named_checks(value: Any) -> bool:
+        """A non-empty list of required checks, each naming its context (fail closed)."""
+        return (
+            isinstance(value, list)
+            and 0 < len(value) <= 100
+            and all(
+                isinstance(check, dict)
+                and isinstance(check.get("context"), str)
+                and check["context"].strip() != ""
+                for check in value
+            )
+        )
 
     def commit_contains(self, repository: str, *, ancestor: str, descendant: str) -> bool:
         """NEW-68: True when ``descendant`` is ``ancestor`` or contains it in its history."""
