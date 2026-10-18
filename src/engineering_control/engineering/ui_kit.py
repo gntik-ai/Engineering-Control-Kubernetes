@@ -332,8 +332,14 @@ class KitSession:
 
     async def _send(self, message: dict[str, Any]) -> None:
         assert self._writer is not None
-        self._writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
-        await asyncio.wait_for(self._writer.drain(), timeout=self._remaining())
+        # NEW-224: a server that exits before or while we write closes the pipe; depending
+        # on timing that surfaces as a reset or broken pipe instead of EOF on read. Both
+        # mean the same thing for a caller: the kit server closed the session.
+        try:
+            self._writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+            await asyncio.wait_for(self._writer.drain(), timeout=self._remaining())
+        except (BrokenPipeError, ConnectionResetError) as error:
+            raise KitProtocolError("kit server closed the session") from error
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._next_id += 1
