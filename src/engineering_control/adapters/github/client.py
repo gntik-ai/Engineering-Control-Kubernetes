@@ -1005,6 +1005,49 @@ class GhCliBroker:
             changes.append({"path": parts[0], "status": parts[1], "previous_path": parts[2]})
         return changes
 
+    def compare_summary(self, repository: str, base_sha: str, head_sha: str) -> tuple[int, str]:
+        """NEW-225: how many commits ``head_sha`` has that ``base_sha`` lacks (GitHub
+        compare's ``ahead_by``) and the merge base GitHub compares from."""
+        repository = self._batch(repository)
+        if not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(head_sha):
+            raise GhCliPolicyError("compare SHA is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/compare/{base_sha}...{head_sha}?per_page=1",
+                "--jq",
+                '"\\(.ahead_by) \\(.merge_base_commit.sha)"',
+            ]
+        ).stdout.split()
+        if len(raw) != 2 or not raw[0].isdigit() or not _SHA.fullmatch(raw[1]):
+            raise GhCliPolicyError("compare summary is malformed")
+        return int(raw[0]), raw[1]
+
+    def tree_modes(self, repository: str, sha: str) -> dict[str, str]:
+        """NEW-225: path -> Git mode of every entry of one commit's tree (040000 a
+        directory, 120000 a symlink). The contents API follows symlinks, so only this read
+        tells a regular file from a link. A truncated listing is refused."""
+        repository = self._batch(repository)
+        if not _SHA.fullmatch(sha):
+            raise GhCliPolicyError("tree SHA is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/git/trees/{sha}?recursive=1",
+                "--jq",
+                'if .truncated == false and (.tree | type) == "array" '
+                'then (.tree[] | [.mode, .path] | @tsv) else "INVALID" end',
+            ],
+            max_output_bytes=self.maximum_json_bytes,
+        ).stdout
+        modes: dict[str, str] = {}
+        for entry in raw.splitlines():
+            mode, _, path = entry.partition("\t")
+            if not re.fullmatch(r"[0-7]{6}", mode) or not path:
+                raise GhCliPolicyError("tree listing is malformed")
+            modes[path] = mode
+        return modes
+
     def job_log_excerpt(self, repository: str, job_id: int, *, timeout_seconds: int = 15) -> str:
         """NEW-100: the failing lines of one Actions job log, bounded (untrusted text).
 
