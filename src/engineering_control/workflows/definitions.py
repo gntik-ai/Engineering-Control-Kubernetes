@@ -391,6 +391,9 @@ class ControlledWorkflow:
         timeout_minutes: int = 30,
         retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
+        if self._loop_ending and _in_front_lane():
+            # NEW-214 Stage 2: another slot recorded the loop's end; this lane stops.
+            raise _LaneStopped()
         if (
             step == "backlog.record_loop_state"
             and self._pipelined
@@ -429,6 +432,9 @@ class ControlledWorkflow:
                 self._held_paused = payload.get("loop_status") == "PAUSED"
                 if payload.get("loop_status") == "RUNNING":
                     self._release_operator(holder)
+            if payload.get("loop_status") in {"CANCELLED", "FAILED", "STOPPED", "COMPLETE"}:
+                # The end is durable: no lane starts anything from now on.
+                self._loop_ending = True
         if (
             step == "backlog.record_loop_state"
             and self._pipelined
@@ -507,6 +513,9 @@ class ControlledWorkflow:
         self._child_run_ids[workflow_id] = run_id
 
     def _child_run_options(self, workflow_id: str) -> dict[str, Any]:
+        if self._loop_ending and _in_front_lane():
+            # NEW-214 Stage 2: another slot recorded the loop's end; start no child.
+            raise _LaneStopped()
         run_id = self._child_run_ids.get(workflow_id)
         if run_id is None:
             return {}
@@ -3876,7 +3885,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             current, back = back, None
             if _in_front_lane():
                 # NEW-214 Stage 2: idle meanwhile; resumes once no slot awaits the operator.
-                await self._lane_wait(current["task"].done)
+                try:
+                    await self._lane_wait(current["task"].done)
+                except _LaneStopped:
+                    back = current  # the coordinator applies its outcome (e.g. CANCELLED)
+                    raise
                 staged, staged_blocker = current["task"].result()
                 self._back_task = None
             else:

@@ -68,6 +68,7 @@ class _Staging:
     """Verifies after three seconds; issue 1026's first CI run can regress."""
 
     regress_first = False
+    block_first = False
 
     @workflow.run
     async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
@@ -75,6 +76,8 @@ class _Staging:
         child = workflow.info().workflow_id
         if _Staging.regress_first and child.endswith("-issue-1-staging-gitops"):
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_REGRESSION"}
+        if _Staging.block_first and child.endswith("-issue-1-staging-gitops"):
+            return {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}
         return {"status": "STAGING_VERIFIED"}
 
 
@@ -362,6 +365,27 @@ async def test_cancel_is_recorded_once_no_lane_or_back_still_works() -> None:
     started = [name for kind, name, _index in events if kind == "started"]
     assert len(finished) == len(started)  # every child ended before the record
     assert cancelled[0] > max(finished)
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
+async def test_no_lane_starts_work_once_back_recorded_the_loop_cancelled() -> None:
+    # Review: a lane waiting for quota started its delivery after BACK's durable CANCELLED.
+    _Delivery.first_outcome = None
+    _Delivery.seconds = {"-issue-2-attempt-1": 6}
+    _Staging.block_first = True
+    try:
+        history, result = await _run(_script(quota_ok=False), signals=[("cancel", None)])
+    finally:
+        _Delivery.seconds = {}
+        _Staging.block_first = False
+
+    assert result["status"] == "CANCELLED"
+    cancelled = _state_at(history, "CANCELLED")
+    assert cancelled
+    started_after = [
+        name for kind, name, index in _events(history) if kind == "started" and index > cancelled[0]
+    ]
+    assert started_after == []
     await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
 
 
