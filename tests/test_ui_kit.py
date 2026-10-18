@@ -411,6 +411,25 @@ async def test_a_closed_or_broken_server_is_a_protocol_error(tmp_path: Path) -> 
         GntikUiKitClient(["docker", "run"], environment={})
 
 
+@pytest.mark.parametrize("failure", [ConnectionResetError, BrokenPipeError])
+async def test_a_pipe_lost_while_writing_is_the_same_closed_error(failure: type[OSError]) -> None:
+    """NEW-224: a server that exits before the client writes resets or breaks the pipe;
+    that is the same "closed" protocol error as EOF, never a raw OSError."""
+
+    class _LostWriter:
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise failure("Connection lost")
+
+    client = GntikUiKitClient(["/bin/true"], environment={"PATH": "/usr/bin:/bin"})
+    client._writer = _LostWriter()  # type: ignore[assignment]
+    client._remaining = lambda: 5.0  # type: ignore[method-assign]
+    with pytest.raises(KitProtocolError, match="closed"):
+        await client._send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+
 # -- the scan step and the CLI -----------------------------------------------------------
 
 
