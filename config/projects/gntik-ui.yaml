@@ -154,6 +154,13 @@ maker_rules:
     - >-
       Do not commit visual baseline screenshots (apps/docs/e2e/__screenshots__) or put
       [visual-update] in a commit message; the visual job is recorded on the CI runner.
+    - >-
+      Every new component, block, template, layout or package export, and every new
+      user-visible prop, variant or state, must be shown on the docs site
+      (ui.gntik.ai) in the same PR: add its *.doc.ts and an examples/*.tsx live preview,
+      or extend an existing example to demonstrate the new behaviour.
+      apps/docs/test/docs-coverage.test.mjs (once present) must pass; never add to its known-gap
+      lists. The checker rejects a change that ships behaviour no docs example shows.
 dependencies: {}
 classification:
   product: true
