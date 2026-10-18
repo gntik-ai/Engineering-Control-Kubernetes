@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -23,6 +23,8 @@ class ComponentLeaseManager:
 
     _component_pattern = re.compile(rf"^({PROJECT_ALTERNATION}):[a-z0-9][a-z0-9:-]*$")
     _modes = frozenset({"implementation", "deployment", "migration-secret"})
+    # NEW-214 Stage 2: the workflow-id prefix of one backlog loop's delivery children.
+    _share_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}-issue-$")
 
     def __init__(self, *, max_implementation_per_project: int = 2) -> None:
         if max_implementation_per_project < 1:
@@ -37,8 +39,23 @@ class ComponentLeaseManager:
         owner_run_id: UUID,
         mode: str,
         ttl: timedelta,
+        share_prefix: str | None = None,
     ) -> ComponentLease:
+        """Acquire a writer lease; one writer per component key.
+
+        NEW-214 Stage 2: with ``share_prefix`` (a loop's delivery-child workflow-id
+        prefix), an implementation lease may join a component that only that loop's
+        children hold. Each extra writer gets its own slot key ``<key>:shared-<n>``, so
+        every writer still holds a distinct, uniquely indexed row. Writers from anywhere
+        else stay exclusive: they conflict with any holder of the key or of its slots.
+        """
         project = self._validate(component_key, mode, ttl)
+        if ":shared-" in component_key:
+            raise ValueError("a shared component slot is assigned, never requested")
+        if share_prefix is not None and (
+            mode != "implementation" or not self._share_pattern.fullmatch(share_prefix)
+        ):
+            raise ValueError("only implementation leases are shared, within one bounded group")
         environment = component_key.rsplit(":", 1)[-1] if mode == "deployment" else ""
         scope = (
             "migration-secret:global"
@@ -65,27 +82,49 @@ class ComponentLeaseManager:
         )
         if unresolved is not None:
             raise ComponentLeaseConflict("unresolved publication effect requires reconciliation")
+        same_component = or_(
+            ComponentLease.component_key == component_key,
+            ComponentLease.component_key.startswith(f"{component_key}:shared-", autoescape=True),
+        )
         session.execute(
             update(ComponentLease)
             .where(
                 # Do not expire unrelated owners while holding only this scope's
                 # advisory lock. Publication admission serializes with this key.
-                ComponentLease.component_key == component_key,
+                same_component,
                 ComponentLease.released_at.is_(None),
                 ComponentLease.expires_at <= now,
             )
             .values(released_at=now)
         )
-        existing = session.scalar(
-            select(ComponentLease).where(
-                ComponentLease.component_key == component_key,
-                ComponentLease.released_at.is_(None),
-            )
-        )
-        if existing is not None:
+        holders = session.scalars(
+            select(ComponentLease)
+            .where(same_component, ComponentLease.released_at.is_(None))
+            .order_by(ComponentLease.component_key)
+        ).all()
+        for existing in holders:
             if existing.owner_run_id == owner_run_id and existing.mode == mode:
                 return existing
-            raise ComponentLeaseConflict(f"component already has an active writer: {component_key}")
+        if holders:
+            if share_prefix is None or not all(
+                self._in_group(session, holder.owner_run_id, share_prefix)
+                and holder.mode == "implementation"
+                for holder in holders
+            ):
+                raise ComponentLeaseConflict(
+                    f"component already has an active writer: {component_key}"
+                )
+            if not self._in_group(session, owner_run_id, share_prefix):
+                raise ComponentLeaseConflict("the shared component group excludes this run")
+            held = {holder.component_key for holder in holders}
+            slots = [component_key] + [
+                f"{component_key}:shared-{number}"
+                for number in range(2, self.max_implementation_per_project + 1)
+            ]
+            free = next((slot for slot in slots if slot not in held), None)
+            if free is None:
+                raise ComponentLeaseConflict(f"shared component slots exhausted: {component_key}")
+            component_key = free
         if mode == "implementation":
             active = session.scalar(
                 select(func.count())
@@ -156,6 +195,11 @@ class ComponentLeaseManager:
             .values(released_at=datetime.now(UTC))
         )
         return bool(cast(CursorResult[Any], result).rowcount)
+
+    @staticmethod
+    def _in_group(session: Session, run_id: UUID, share_prefix: str) -> bool:
+        run = session.get(Run, run_id)
+        return run is not None and run.workflow_id.startswith(share_prefix)
 
     def _serialize_scope(self, session: Session, scope: str) -> None:
         if session.bind is not None and session.bind.dialect.name == "postgresql":

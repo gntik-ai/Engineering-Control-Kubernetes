@@ -213,6 +213,9 @@ class Settings(BaseSettings):
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
+    # NEW-214 Stage 2 (operator 2026-10-18): implementation leases one project may hold at
+    # once. One is always left for the BACK slot of a pipelined loop.
+    implementation_leases_per_project: int = Field(default=3, ge=1, le=4)
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)

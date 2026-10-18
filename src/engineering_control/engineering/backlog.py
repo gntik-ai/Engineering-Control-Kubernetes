@@ -411,8 +411,9 @@ class BacklogApprovalBinding(BacklogModel):
     maximum_risk: Literal["R0", "R1", "R2", "R3"]
     maximum_items: int = Field(ge=1, le=50)
     # NEW-214b: 2 lets one issue's maker/checker run while the previous one is in CI,
-    # merge and staging (merges and deploys stay serialized).
-    maximum_concurrency: Literal[1, 2] = 1
+    # merge and staging (merges and deploys stay serialized). NEW-214 Stage 2: 3 runs up
+    # to two FRONT slots beside the BACK slot.
+    maximum_concurrency: Literal[1, 2, 3] = 1
     delivery_mode: Literal["source-pr", "full-delivery"]
     implementation_correction_limit: int = Field(default=5, ge=1, le=5)
     deployment_correction_limit: int = Field(default=3, ge=1, le=3)
@@ -450,7 +451,7 @@ class BacklogApprovalBinding(BacklogModel):
         if self.maximum_concurrency != 1 and (
             self.issue_approval is not None or self.delivery_mode != "full-delivery"
         ):
-            raise ValueError("concurrency 2 needs a full-delivery campaign approval")
+            raise ValueError("concurrency above 1 needs a full-delivery campaign approval")
         return self
 
     def sha256(self) -> str:
@@ -741,7 +742,7 @@ def approval_binding(
     include_enhancements: bool,
     now: datetime | None = None,
     issue_label: str | None = None,
-    maximum_concurrency: Literal[1, 2] = 1,
+    maximum_concurrency: Literal[1, 2, 3] = 1,
 ) -> BacklogApprovalBinding:
     if not _SHA.fullmatch(source_head) or not _SHA.fullmatch(deployment_head):
         raise ValueError("backlog approval requires immutable repository heads")

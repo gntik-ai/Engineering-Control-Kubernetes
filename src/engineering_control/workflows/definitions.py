@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid5
 
 from temporalio import workflow
@@ -110,6 +110,18 @@ def _live_loop_items(
             return
 
 
+# NEW-214 Stage 2: which slot a task is ("back", "front-<n>"); None is the loop itself.
+_SLOT_ID: ContextVar[str | None] = ContextVar("hermes_slot_id", default=None)
+
+
+def _in_front_lane() -> bool:
+    return (_SLOT_ID.get() or "").startswith("front-")
+
+
+class _LaneStopped(Exception):  # noqa: N818 - control flow, not an error
+    """NEW-214 Stage 2: the loop ends (another slot recorded its end); stop this lane."""
+
+
 _SLOT_ISSUE: ContextVar[str | None] = ContextVar("hermes_slot_issue", default=None)
 
 
@@ -150,6 +162,25 @@ class ControlledWorkflow:
         self._implementation_holder: str | None = None
         self._back_task: asyncio.Task[tuple[str, str]] | None = None
         self._back_cancelled = False
+        # NEW-214 Stage 2: FRONT lanes of a concurrency-3 loop (workflow state only).
+        self._front_lanes = 1
+        self._front_capacity_payload: dict[str, Any] = {}
+        self._lanes_busy: set[str] = set()
+        self._front_refs: set[str] = set()
+        self._handoff_queue: list[tuple[str, str]] = []
+        self._back_outcomes: dict[str, str] = {}
+        self._back_ref = ""
+        self._back_resume: dict[int, dict[str, Any]] = {}
+        self._repair_queue: list[dict[str, Any]] = []
+        self._handoff_tickets: dict[str, tuple[Any, int]] = {}
+        self._lane_ordinals: dict[str, int] = {}
+        self._held_paused = False
+        self._loop_request: ExistingGitHubBacklogLoopInput | None = None
+        self._makers_running: set[str] = set()
+        self._operator_waiters: set[str] = set()
+        self._operator_holder: str | None = None
+        self._loop_ending = False
+        self._refilling = False
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -226,7 +257,10 @@ class ControlledWorkflow:
         """
         if not getattr(self, "_pipelined", False):
             return
-        if _SLOT_ISSUE.get() is not None:
+        if self._front_lanes >= 2:
+            await self._operator_turn()
+            return
+        if _SLOT_ID.get() == "back":
             await workflow.wait_condition(lambda: not self._front_busy)
             return
         task = self._back_task
@@ -237,6 +271,111 @@ class ControlledWorkflow:
             await workflow.wait_condition(task.done)
         finally:
             self._front_busy = True
+
+    async def _operator_turn(self) -> None:
+        """NEW-214 Stage 2: the operator turn among the BACK slot and the FRONT lanes.
+
+        A slot leaves RUNNING (pause or end) only once every FRONT lane is idle and,
+        for a FRONT lane or the loop itself, the BACK slot ended. Waiting slots keep the
+        lanes from starting new work, and one slot at a time holds the turn, so the
+        retry/skip signals always address the one paused issue.
+        """
+        me = _SLOT_ID.get() or "loop"
+        self._operator_waiters.add(me)
+        self._lanes_busy.discard(me)
+        try:
+            while True:
+                await workflow.wait_condition(
+                    lambda: (
+                        self._operator_holder in (None, me)
+                        and not (self._lanes_busy - {me})
+                        and (me == "back" or self._back_task is None or self._back_task.done())
+                    )
+                )
+                if self._operator_holder in (None, me):
+                    self._operator_holder = me
+                    return
+        finally:
+            self._operator_waiters.discard(me)
+            if me.startswith("front-"):
+                self._lanes_busy.add(me)
+
+    def _release_operator(self, slot: str | None) -> None:
+        if self._operator_holder == (slot or "loop"):
+            self._operator_holder = None
+            self._held_paused = False
+
+    async def _end_operator_turn(self, slot: str) -> None:
+        """NEW-214 Stage 2: a slot's issue ended; it gives its operator turn up.
+
+        A turn that last recorded PAUSED (a skip records no RUNNING) records RUNNING
+        first, so no other slot works while the campaign reads PAUSED.
+        """
+        if self._front_lanes < 2 or self._operator_holder != slot:
+            return
+        if self._held_paused and not self._loop_ending and self._loop_request is not None:
+            state = {**_backlog_execution_payload(self._loop_request), "loop_status": "RUNNING"}
+            if self._loop_register_run:
+                state["workflow_id"] = workflow.info().workflow_id
+            await self._step("backlog.record_loop_state", state)
+        self._release_operator(slot)
+
+    def _operator_quiet(self, lane: str) -> bool:
+        return not (self._operator_waiters - {lane}) and self._operator_holder in (None, lane)
+
+    async def _lane_wait(self, ready: Callable[[], bool]) -> None:
+        """NEW-214 Stage 2: a FRONT lane waits idle for ``ready``.
+
+        It resumes only while no other slot awaits or holds the operator turn, and stops
+        (``_LaneStopped``) once the loop ends.
+        """
+        lane = _SLOT_ID.get() or "loop"
+        self._lanes_busy.discard(lane)
+        try:
+            await workflow.wait_condition(
+                lambda: self._loop_ending or (ready() and self._operator_quiet(lane))
+            )
+        finally:
+            self._lanes_busy.add(lane)
+        if self._loop_ending:
+            raise _LaneStopped()
+
+    def _waits_for_dependency(self, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        dependencies = {str(value) for value in item.get("dependencies") or []}
+        return bool(dependencies & self._in_flight_refs())
+
+    def _in_flight_refs(self) -> set[str]:
+        """Issues another slot still works on: FRONT lanes, hand-over and repair queues,
+        BACK (also while a lane drains it)."""
+        refs = set(self._front_refs) | {ref for _lane, ref in self._handoff_queue}
+        refs |= {str(entry["ref"]) for entry in self._repair_queue}
+        if self._back_task is not None and not self._back_task.done():
+            refs.add(self._back_ref)
+        return refs
+
+    async def _handoff_turn(self, ref: str) -> None:
+        """NEW-214 Stage 2: lanes hand over to BACK in the order their checkers passed.
+
+        The ticket (checker-pass time, plan order) is taken when the delivery returns its
+        PR (_issue_delivery), so lookups between that and the hand-over never reorder.
+        """
+        lane = _SLOT_ID.get() or "loop"
+        self._handoff_tickets.setdefault(lane, (workflow.now(), self._lane_ordinals.get(lane, 0)))
+        self._handoff_queue.append((lane, ref))
+        try:
+            await self._lane_wait(
+                lambda: min(self._handoff_tickets.values()) == self._handoff_tickets[lane]
+            )
+        except BaseException:
+            self._handoff_done()
+            raise
+
+    def _handoff_done(self) -> None:
+        lane = _SLOT_ID.get() or "loop"
+        self._handoff_queue = [entry for entry in self._handoff_queue if entry[0] != lane]
+        self._handoff_tickets.pop(lane, None)
 
     async def _checkpoint(self, phase: str) -> bool:
         self._phase = phase
@@ -252,6 +391,9 @@ class ControlledWorkflow:
         timeout_minutes: int = 30,
         retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
+        if self._loop_ending and _in_front_lane():
+            # NEW-214 Stage 2: another slot recorded the loop's end; this lane stops.
+            raise _LaneStopped()
         if (
             step == "backlog.record_loop_state"
             and self._pipelined
@@ -260,7 +402,7 @@ class ControlledWorkflow:
             # NEW-214b: no slot leaves RUNNING while the other could still be working, so
             # a campaign is never PAUSED, STOPPED or ended with a BACK slot in flight.
             await self._slot_pause_gate()
-            if self._back_cancelled and _SLOT_ISSUE.get() is None:
+            if self._back_cancelled and _SLOT_ID.get() != "back":
                 return {"status": "RECORDED", "reason": "BACK_SLOT_RECORDED_CANCELLED"}
         loop_issue = _SLOT_ISSUE.get() or self._loop_issue
         if (
@@ -281,11 +423,23 @@ class ControlledWorkflow:
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
+        if step == "backlog.record_loop_state" and self._front_lanes >= 2:
+            # NEW-214 Stage 2: the turn holder's state is now durable. RUNNING ends its
+            # operator wait (only now may other slots work again); PAUSED is remembered,
+            # so a turn given up without RUNNING records it first (_end_operator_turn).
+            holder = _SLOT_ID.get() or "loop"
+            if self._operator_holder == holder:
+                self._held_paused = payload.get("loop_status") == "PAUSED"
+                if payload.get("loop_status") == "RUNNING":
+                    self._release_operator(holder)
+            if payload.get("loop_status") in {"CANCELLED", "FAILED", "STOPPED", "COMPLETE"}:
+                # The end is durable: no lane starts anything from now on.
+                self._loop_ending = True
         if (
             step == "backlog.record_loop_state"
             and self._pipelined
             and payload.get("loop_status") == "CANCELLED"
-            and _SLOT_ISSUE.get() is not None
+            and _SLOT_ID.get() == "back"
         ):
             # NEW-214b: the BACK slot recorded the loop CANCELLED (also on a path that
             # then raises, e.g. a cancelled failed bookkeeping step).
@@ -359,6 +513,9 @@ class ControlledWorkflow:
         self._child_run_ids[workflow_id] = run_id
 
     def _child_run_options(self, workflow_id: str) -> dict[str, Any]:
+        if self._loop_ending and _in_front_lane():
+            # NEW-214 Stage 2: another slot recorded the loop's end; start no child.
+            raise _LaneStopped()
         run_id = self._child_run_ids.get(workflow_id)
         if run_id is None:
             return {}
@@ -3688,7 +3845,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         # maker/checker) beside one BACK slot (CI, merge, staging). The marker is asked only
         # for concurrency 2, which no earlier history recorded.
         pipelined = (
-            request.maximum_concurrency == 2
+            request.maximum_concurrency in (2, 3)
             and request.global_campaign_id is None
             and request.target_repository is None
             and request.delivery_mode == "full-delivery"
@@ -3700,12 +3857,25 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         # NEW-214b: issues this loop delivered; a pipelined issue needs its dependencies
         # among the earlier issues delivered (SKIPPED does not count), as the design says.
         delivered_refs: set[str] = set()
+        # NEW-214 Stage 2: FRONT lanes; 1 is the NEW-214b pipeline (concurrency 2).
+        lanes = 1
         if pipelined:
             refused = await self._pipeline_prerequisites(request, register_run=register_run)
             if refused is not None:
                 return {**refused, "results": results}
             self._pipelined = True
             self._front_busy = True
+            if request.maximum_concurrency == 3 and workflow.patched(
+                "existing-backlog-front-lanes-v1"
+            ):
+                # Asked only for concurrency 3, which no earlier history recorded.
+                self._front_capacity_payload = {
+                    "project": request.project,
+                    "maximum_concurrency": request.maximum_concurrency,
+                }
+                capacity = await self._step("delivery.front_capacity", self._front_capacity_payload)
+                lanes = 2 if capacity.get("front_slots") == 2 else 1
+                self._front_lanes = lanes
 
         async def drain_back() -> dict[str, Any] | None:
             """NEW-214b: let the BACK slot finish, then apply its outcome to the loop."""
@@ -3713,12 +3883,32 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if back is None:
                 return None
             current, back = back, None
-            self._front_busy = False
-            try:
-                staged, staged_blocker = await current["task"]
-            finally:
-                self._front_busy = True
+            if _in_front_lane():
+                # NEW-214 Stage 2: idle meanwhile; resumes once no slot awaits the operator.
+                try:
+                    await self._lane_wait(current["task"].done)
+                except _LaneStopped:
+                    back = current  # the coordinator applies its outcome (e.g. CANCELLED)
+                    raise
+                staged, staged_blocker = current["task"].result()
                 self._back_task = None
+            else:
+                self._front_busy = False
+                try:
+                    staged, staged_blocker = await current["task"]
+                finally:
+                    self._front_busy = True
+                    self._back_task = None
+            if staged == "REPAIR":
+                # NEW-214 Stage 2: BACK gave the repair up and queued it (_back_slot) for a
+                # FRONT lane; the PR then rejoins the hand-over queue.
+                return None
+            return await apply_back_outcome(current, staged, staged_blocker)
+
+        async def apply_back_outcome(
+            current: dict[str, Any], staged: str, staged_blocker: str
+        ) -> dict[str, Any] | None:
+            nonlocal delivered
             if staged == "CANCELLED":
                 return {"status": "CANCELLED", "results": results}
             if staged == "BLOCKED":
@@ -3731,26 +3921,65 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._refill_free_slot(request, raw_items, register_run=register_run)
             return None
 
+        async def hand_over(
+            ref: str,
+            ordinal: int,
+            arguments: dict[str, Any],
+            resume: dict[str, Any] | None = None,
+        ) -> dict[str, Any] | None:
+            """NEW-214b: start this issue's BACK once the previous one ended. NEW-214 Stage
+            2: FRONT lanes hand over in the order their checkers passed (FIFO), and their
+            BACK gives repairs up to a lane."""
+            nonlocal back
+            if lanes >= 2:
+                await self._handoff_turn(ref)
+            try:
+                terminal = await drain_back()
+                if terminal is not None:
+                    return terminal
+                launch = (
+                    {**arguments, "repair_mode": "yield", "resume": resume}
+                    if lanes >= 2
+                    else arguments
+                )
+                task = asyncio.create_task(self._back_slot(ref, **launch))
+                self._back_task = task
+                self._back_ref = ref
+                back = {"task": task, "ordinal": ordinal, "ref": ref, "arguments": arguments}
+            finally:
+                if lanes >= 2:
+                    self._handoff_done()
+            return None
+
         # raw_items may grow while iterating: an issue that frees its slot (REJECTED,
         # duplicate, skipped...) is replaced by the next eligible one (_refill_free_slot).
         def back_in_flight() -> bool:
             return back is not None
 
-        for ordinal, item in _live_loop_items(raw_items, back_in_flight):
+        async def front_item(ordinal: int, item: Any) -> dict[str, Any] | None:
+            """One issue's FRONT (the loop body). NEW-214 Stage 2: FRONT lanes run it too."""
+            nonlocal back, delivered
             if item is _BACK_DRAIN_POINT:
                 # NEW-214b: the selected issues ran out with a BACK slot in flight; its
                 # outcome may refill a slot, whose issue this loop then still works on.
                 terminal = await drain_back()
                 if terminal is not None:
                     return terminal
-                continue
+                return None
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
             # NEW-127: workflow state only (no command); read by _step for loop-state notices.
             self._loop_issue = f"{item.get('repository')}#{item.get('issue_number')}"
             if pipelined:
                 dependencies = {str(value) for value in item.get("dependencies") or []}
-                if back is not None and back["ref"] in dependencies:
+                delivered_now = delivered_refs
+                if lanes >= 2:
+                    # NEW-214 Stage 2: wait (idle) until no dependency is in another slot.
+                    await self._lane_wait(lambda: not dependencies & self._in_flight_refs())
+                    delivered_now = delivered_refs | {
+                        ref for ref, staged in self._back_outcomes.items() if staged == "DONE"
+                    }
+                elif back is not None and back["ref"] in dependencies:
                     # NEW-214b: an issue never starts while one it depends on is in flight.
                     terminal = await drain_back()
                     if terminal is not None:
@@ -3760,7 +3989,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     for other in raw_items[: ordinal - 1]
                     if isinstance(other, dict)
                 }
-                undelivered = sorted((dependencies & earlier) - delivered_refs)
+                undelivered = sorted((dependencies & earlier) - delivered_now)
                 if undelivered:
                     results.append(
                         {
@@ -3771,7 +4000,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             "dependencies": undelivered,
                         }
                     )
-                    continue
+                    return None
             continue_to_next_issue = False
             gate_skipped = False
             revalidation_round = 0
@@ -4057,7 +4286,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 if boundary is not None:
                     return boundary
-                continue
+                return None
             delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
             # NEW-33: a blocked delivery used to record PAUSED and then end the workflow,
             # leaving a PAUSED campaign no signal could reach (resume/retry/skip target
@@ -4220,7 +4449,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 if boundary is not None:
                     return boundary
-                continue
+                return None
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
                     delivered += 1
@@ -4233,7 +4462,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     if boundary is not None:
                         return boundary
-                    continue
+                    return None
                 return {"status": "AWAITING_STAGING_DELIVERY", "results": results}
             if not workflow.patched("existing-backlog-full-delivery-orchestration-v1"):
                 return {
@@ -4248,29 +4477,31 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if flow_state.get("enabled") is True and pipelined:
                     # NEW-214b: BACK stays serialized (merges and deploys one at a time);
                     # this issue's BACK starts once the previous one ended, and the FRONT
-                    # moves on to the next issue meanwhile.
-                    terminal = await drain_back()
+                    # moves on to the next issue meanwhile. NEW-214 Stage 2: FRONT lanes
+                    # hand over in the order their checkers passed (FIFO).
+                    item_ref = _issue_ref(item)
+                    terminal = await hand_over(
+                        item_ref,
+                        ordinal,
+                        {
+                            "request": request,
+                            "item": item,
+                            "finding_id": str(gate["finding_id"]),
+                            "ordinal": ordinal,
+                            "delivery": delivery,
+                            "results": results,
+                            "register_child_runs": register_child_runs,
+                            "register_run": register_run,
+                            "global_child_blocker_return": global_child_blocker_return,
+                            "gate": gate,
+                        },
+                    )
                     if terminal is not None:
                         return terminal
-                    task = asyncio.create_task(
-                        self._back_slot(
-                            str(self._loop_issue),
-                            request=request,
-                            item=item,
-                            finding_id=str(gate["finding_id"]),
-                            ordinal=ordinal,
-                            delivery=delivery,
-                            results=results,
-                            register_child_runs=register_child_runs,
-                            register_run=register_run,
-                            global_child_blocker_return=global_child_blocker_return,
-                            gate=gate,
-                        )
-                    )
-                    self._back_task = task
-                    back = {"task": task, "ordinal": ordinal, "ref": str(self._loop_issue)}
-                    if self._stop_after_current or self._pause_after_current:
-                        # Stop and pause-after-current carry the started BACK through first.
+                    if lanes < 2 and (self._stop_after_current or self._pause_after_current):
+                        # Stop and pause-after-current carry the started BACK through first
+                        # (with lanes, the coordinator does once every lane is between
+                        # issues).
                         terminal = await drain_back()
                         if terminal is not None:
                             return terminal
@@ -4282,7 +4513,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     if boundary is not None:
                         return boundary
-                    continue
+                    return None
                 if flow_state.get("enabled") is True:
                     # Post-merge staging GitOps flow replaces the pre-merge candidate
                     # pipeline entirely; _execute_full_delivery is never reached.
@@ -4317,7 +4548,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     if boundary is not None:
                         return boundary
-                    continue
+                    return None
             full_delivery = await self._execute_full_delivery(
                 request=request,
                 finding_id=str(gate["finding_id"]),
@@ -4386,7 +4617,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             delivered += 1
             self._loop_delivered = delivered
-            delivered_refs.add(str(self._loop_issue))
+            delivered_refs.add(_issue_ref(item))
             boundary = await self._after_issue_boundary(
                 request,
                 results,
@@ -4395,6 +4626,135 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
             if boundary is not None:
                 return boundary
+            return None
+
+        cursor = 0  # NEW-214 Stage 2: the next issue a FRONT lane takes, in plan order
+
+        async def front_repair(entry: dict[str, Any]) -> dict[str, Any] | None:
+            """NEW-214 Stage 2: repair a PR its BACK gave up, then hand it back to BACK."""
+            ordinal, ref = int(entry["ordinal"]), str(entry["ref"])
+            staged, staged_blocker = await self._staging_gitops_delivery(
+                **entry["arguments"], repair_mode="only", resume=self._back_resume.get(ordinal)
+            )
+            if staged == "REPAIRED":
+                return await hand_over(
+                    ref, ordinal, entry["arguments"], resume=self._back_resume.get(ordinal)
+                )
+            self._back_outcomes[ref] = staged
+            return await apply_back_outcome(entry, staged, staged_blocker)
+
+        def lane_may_proceed() -> bool:
+            return (
+                bool(self._repair_queue)
+                or self._stop_after_current
+                or self._pause_after_current
+                or cursor >= len(raw_items)
+                or not self._waits_for_dependency(raw_items[cursor])
+            )
+
+        async def front_lane(lane: str) -> dict[str, Any] | None:
+            """One FRONT lane: repairs first, then issues in plan order, until none is left.
+
+            After a stop or pause after the current issue it takes only repairs, so every
+            started issue is carried through BACK before the boundary applies.
+            """
+            nonlocal cursor
+            _SLOT_ID.set(lane)
+            self._lanes_busy.add(lane)
+            try:
+                while True:
+                    # Between issues: wait while another slot awaits the operator, and
+                    # while the next issue in plan order depends on one still in a slot
+                    # (repairs, which may be what it waits for, are taken meanwhile).
+                    await self._lane_wait(lane_may_proceed)
+                    entry: dict[str, Any] | None = None
+                    if self._repair_queue:
+                        entry = self._repair_queue.pop(0)
+                        ordinal, item = int(entry["ordinal"]), entry["arguments"]["item"]
+                    elif (
+                        self._stop_after_current
+                        or self._pause_after_current
+                        or cursor >= len(raw_items)
+                    ):
+                        return None
+                    else:
+                        cursor += 1
+                        ordinal, item = cursor, raw_items[cursor - 1]
+                    ref = _issue_ref(item) if isinstance(item, dict) else ""
+                    _SLOT_ISSUE.set(ref)  # this lane's loop-state notices name its issue
+                    self._front_refs.add(ref)
+                    self._lane_ordinals[lane] = ordinal
+                    try:
+                        outcome = await (
+                            front_repair(entry) if entry is not None else front_item(ordinal, item)
+                        )
+                    except _LoopIssueSkipped as skipped:
+                        # A skipped bookkeeping step ends only this lane's issue.
+                        results.append(skipped.skipped)
+                        if self._free_slots_patched(ordinal):
+                            await self._refill_free_slot(
+                                request, raw_items, register_run=register_run
+                            )
+                        outcome = None
+                    finally:
+                        self._front_refs.discard(ref)
+                        self._handoff_tickets.pop(lane, None)
+                    await self._end_operator_turn(lane)
+                    if outcome is not None:
+                        self._loop_ending = True
+                        return outcome
+            except _LaneStopped:
+                return None
+            except BaseException:
+                self._loop_ending = True
+                raise
+            finally:
+                self._lanes_busy.discard(lane)
+                if self._operator_holder == lane and self._loop_ending:
+                    self._release_operator(lane)
+
+        async def run_front_lanes() -> dict[str, Any] | None:
+            """NEW-214 Stage 2: run the FRONT lanes; apply boundaries between issues."""
+            self._loop_request = request
+            while True:
+                outcomes = await asyncio.gather(
+                    *(asyncio.create_task(front_lane(f"front-{index}")) for index in range(lanes)),
+                    return_exceptions=True,
+                )
+                failures = [value for value in outcomes if isinstance(value, BaseException)]
+                if failures:
+                    raise failures[0]
+                for outcome in outcomes:
+                    if isinstance(outcome, dict):
+                        return outcome
+                # Every lane is between issues: carry the last BACK through. It may free and
+                # refill a slot, or give a repair up to the lanes.
+                terminal = await drain_back()
+                if terminal is not None:
+                    return terminal
+                if self._repair_queue:
+                    continue
+                has_more = cursor < len(raw_items)
+                if has_more and (self._stop_after_current or self._pause_after_current):
+                    # Stop or pause as a sequential loop does after its current issue.
+                    boundary = await self._after_issue_boundary(
+                        request, results, enabled=after_current_controls, has_more=True
+                    )
+                    if boundary is not None:
+                        return boundary
+                    continue
+                if not has_more:
+                    return None
+
+        if lanes < 2:
+            for ordinal, item in _live_loop_items(raw_items, back_in_flight):
+                outcome = await front_item(ordinal, item)
+                if outcome is not None:
+                    return outcome
+        else:
+            outcome = await run_front_lanes()
+            if outcome is not None:
+                return outcome
         terminal = await drain_back()
         if terminal is not None:
             return terminal
@@ -4582,6 +4942,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         register_run: bool,
         global_child_blocker_return: bool,
         gate: dict[str, Any] | None = None,
+        repair_mode: Literal["inline", "yield", "only"] = "inline",
+        resume: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """Run the post-merge staging GitOps child; hold for the operator when it blocks.
 
@@ -4590,6 +4952,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         NEW-64: when the CI baseline gate attributes PR CI failures to the ChangeSet
         (SOURCE_PR_CI_REGRESSION), the issue delivery re-runs on the same ChangeSet
         (resuming its commits, updating the same PR) before a fresh GitOps child.
+
+        NEW-214 Stage 2: a BACK slot beside FRONT lanes gives the repair up ("yield":
+        returns "REPAIR"), so the next published PR can take BACK. A FRONT lane then runs
+        only the repair ("only": returns "REPAIRED"), and BACK resumes from the state
+        saved in ``_back_resume``. "inline" is the sequential behaviour.
         """
         delivery_context = delivery.get("context")
         change_set_id = (
@@ -4607,6 +4974,24 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         operator_repair_grant = False
         # NEW-214a: the pending repair merges a moved base forward (refresh mirrors first).
         merge_forward_pending = False
+        if resume is not None:
+            gitops_round = int(resume["gitops_round"])
+            repair_round = int(resume["repair_round"])
+            repair_pending = bool(resume["repair_pending"])
+            restore_pending = bool(resume["restore_pending"])
+            operator_repair_grant = bool(resume["operator_repair_grant"])
+            merge_forward_pending = bool(resume["merge_forward_pending"])
+
+        def save_progress() -> None:
+            self._back_resume[ordinal] = {
+                "gitops_round": gitops_round,
+                "repair_round": repair_round,
+                "repair_pending": repair_pending,
+                "restore_pending": restore_pending,
+                "operator_repair_grant": operator_repair_grant,
+                "merge_forward_pending": merge_forward_pending,
+            }
+
         while True:
             staged: dict[str, Any] | None = None
             if restore_pending and change_set_id:
@@ -4619,6 +5004,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     restore_pending = False
                 else:
                     staged = {"status": "BLOCKED", "blocker": restore_blocker}
+            if repair_mode == "yield" and staged is None and repair_pending and gate is not None:
+                save_progress()
+                return "REPAIR", ""  # a FRONT lane repairs; BACK takes the next PR
             if staged is None and repair_pending and gate is not None:
                 repair_round += 1
                 authorization_blocker = await self._authorize_ci_repair(
@@ -4669,6 +5057,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             # NEW-214a: name the refusal (only this new path reports it).
                             reason = str(context_blocker)
                         staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+            if repair_mode == "only" and staged is None:
+                save_progress()
+                return "REPAIRED", ""  # back to BACK for the CI, merge and staging
             if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
                 if gitops_round:
@@ -4967,6 +5358,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         has_more: bool,
     ) -> dict[str, Any] | None:
         """Apply campaign controls only between issues, never during provider work."""
+        if _in_front_lane():
+            return None  # NEW-214 Stage 2: the lane coordinator applies them for all lanes
         if not enabled or not has_more:
             return None
         if self._stop_after_current:
@@ -5028,10 +5421,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         work, and the operator restarts it with concurrency 1.
         """
         readiness = await self._step("gitops.branch_protection", {"project": request.project})
-        if readiness.get("ready") is True:
+        # NEW-214 Stage 2: the project caps the approved concurrency (falcone 2, gntik-ui
+        # 3). A result recorded before the cap existed carries none.
+        cap = readiness.get("maximum_concurrency")
+        above_cap = type(cap) is int and request.maximum_concurrency > cap
+        if readiness.get("ready") is True and not above_cap:
             return None
         blocker = (
-            "CONCURRENCY_2_REQUIRES_MERGE_FORWARD"
+            "CONCURRENCY_ABOVE_PROJECT_CAP"
+            if readiness.get("ready") is True
+            else "CONCURRENCY_2_REQUIRES_MERGE_FORWARD"
             if readiness.get("merge_forward") is not True
             else "CONCURRENCY_2_REQUIRES_STRICT_PROTECTION"
         )
@@ -5044,13 +5443,35 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     async def _back_slot(self, issue_ref: str, **arguments: Any) -> tuple[str, str]:
         """NEW-214b: one issue's CI, merge and staging, as a task beside the FRONT slot."""
         _SLOT_ISSUE.set(issue_ref)  # this task's own context only
+        _SLOT_ID.set("back")
+        staged: tuple[str, str] = ("FAILED", "")
         try:
-            return await self._staging_gitops_delivery(**arguments)
+            staged = await self._staging_gitops_delivery(**arguments)
+            if staged[0] == "REPAIR":
+                # NEW-214 Stage 2: queued before this task ends, so the issue never leaves
+                # custody (a dependent keeps waiting for it).
+                self._repair_queue.append(
+                    {
+                        "ref": issue_ref,
+                        "ordinal": arguments["ordinal"],
+                        "arguments": {
+                            key: value
+                            for key, value in arguments.items()
+                            if key not in ("repair_mode", "resume")
+                        },
+                    }
+                )
+            return staged
         except _LoopIssueSkipped as skipped:
             # A skipped bookkeeping step ends only this slot's issue (NEW-162 closes a
             # sequential loop, which has no other issue in flight).
             arguments["results"].append(skipped.skipped)
-            return "SKIPPED", ""
+            staged = ("SKIPPED", "")
+            return staged
+        finally:
+            # NEW-214 Stage 2: a dependent issue reads the outcome once BACK ended.
+            self._back_outcomes[issue_ref] = staged[0]
+            await self._end_operator_turn("back")
 
     async def _finish_back_slot(self) -> BaseException | None:
         """NEW-214b: a loop never ends while its BACK slot still runs.
@@ -5194,6 +5615,32 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         delivery_workflow_id: str,
         issue_approval_id: str | None = None,
     ) -> dict[str, Any]:
+        if self._front_lanes >= 2:
+            # NEW-214 Stage 2: the loop's makers share the component lease (one writer
+            # slot each). An additional FRONT maker also needs provider quota above the
+            # 25% verification reserve; without it the lane waits for the other maker.
+            # Below the reserve the loop keeps one FRONT maker at a time, as concurrency 2
+            # does; it never stalls. The check repeats after every wait.
+            while _in_front_lane() and self._makers_running:
+                capacity = await self._step("delivery.front_capacity", self._front_capacity_payload)
+                if capacity.get("quota_ok") is True:
+                    break
+                await self._lane_wait(lambda: not self._makers_running)
+            self._makers_running.add(delivery_workflow_id)
+            try:
+                result = await self._issue_delivery_child(
+                    gate,
+                    delivery_workflow_id,
+                    issue_approval_id,
+                    lease_share_group=workflow.info().workflow_id,
+                )
+            finally:
+                self._makers_running.discard(delivery_workflow_id)
+            lane = _SLOT_ID.get() or ""
+            if lane.startswith("front-") and result.get("status") == "SOURCE_PR":
+                # The checker passed: this fixes the lane's place in the hand-over queue.
+                self._handoff_tickets[lane] = (workflow.now(), self._lane_ordinals.get(lane, 0))
+            return result
         if getattr(self, "_pipelined", False):
             # NEW-214b: one maker/checker child at a time per loop (FRONT delivery or BACK
             # CI repair), so the component's implementation lease never conflicts.
@@ -5212,6 +5659,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         gate: dict[str, Any],
         delivery_workflow_id: str,
         issue_approval_id: str | None,
+        lease_share_group: str | None = None,
     ) -> dict[str, Any]:
         # A failed delivery child (e.g. NEW-23's evidence 422) must block its one issue
         # through the normal FAILED path below, not crash the whole backlog loop.
@@ -5223,6 +5671,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     risk_class=str(gate["risk_class"]),
                     dry_run=False,
                     issue_approval_id=issue_approval_id,
+                    lease_share_group=lease_share_group,
                 ).payload(),
                 id=delivery_workflow_id,
                 task_queue=workflow.info().task_queue,
@@ -5317,6 +5766,26 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         return workflow.patched("existing-backlog-nothing-delivered-v1")
 
     async def _refill_free_slot(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        raw_items: list[Any],
+        *,
+        register_run: bool,
+    ) -> None:
+        if self._front_lanes < 2:
+            await self._refill_free_slot_once(request, raw_items, register_run=register_run)
+            return
+        # NEW-214 Stage 2: one refill at a time, so two lanes never select the same issue.
+        # Waiters wake together, so each rechecks before it takes the refill.
+        while self._refilling:
+            await workflow.wait_condition(lambda: not self._refilling)
+        self._refilling = True
+        try:
+            await self._refill_free_slot_once(request, raw_items, register_run=register_run)
+        finally:
+            self._refilling = False
+
+    async def _refill_free_slot_once(
         self,
         request: ExistingGitHubBacklogLoopInput,
         raw_items: list[Any],

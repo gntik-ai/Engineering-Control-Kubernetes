@@ -101,6 +101,7 @@ delivery_control:
       mcp-runtime: mcp.runtimeImage.digest
   staging_flow:
     enabled: true
+    maximum_concurrency: 2  # NEW-214 operator decision 2026-10-17
     kind: argocd-image-updater
     argo_application: falcone-staging
     argo_namespace: argocd
