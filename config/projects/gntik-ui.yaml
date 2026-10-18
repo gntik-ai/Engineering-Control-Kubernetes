@@ -44,6 +44,7 @@ delivery_control:
   source_ci_workflow: ci
   merge_delivery:
     enabled: true
+    maximum_concurrency: 3  # NEW-214 operator decision 2026-10-17
     kind: protected-merge
     source_ci_workflow: ci
     # NEW-193 (operator 2026-10-13): the path classifier floors any packages/*/src/auth/

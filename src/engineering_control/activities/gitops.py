@@ -2541,6 +2541,8 @@ class GitOpsGitHubHandler:
             "merge_forward": bool(gate is not None and gate.merge_forward),
             "strict": strict,
             "ready": bool(gate is not None and gate.merge_forward) and all(strict.values()),
+            # NEW-214 Stage 2: the project's highest approved-concurrency cap.
+            "maximum_concurrency": gate.maximum_concurrency if gate is not None else 1,
         }
 
     def _pr_heads(self, payload: dict[str, Any]) -> dict[str, Any]:
