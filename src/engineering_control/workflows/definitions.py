@@ -340,6 +340,12 @@ class ControlledWorkflow:
         if self._loop_ending:
             raise _LaneStopped()
 
+    def _waits_for_dependency(self, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        dependencies = {str(value) for value in item.get("dependencies") or []}
+        return bool(dependencies & self._in_flight_refs())
+
     def _in_flight_refs(self) -> set[str]:
         """Issues another slot still works on: FRONT lanes, hand-over and repair queues,
         BACK (also while a lane drains it)."""
@@ -3881,9 +3887,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     self._front_busy = True
                     self._back_task = None
             if staged == "REPAIR":
-                # NEW-214 Stage 2: BACK gave the repair up; a FRONT lane runs it, then the
-                # PR rejoins the hand-over queue.
-                self._repair_queue.append(current)
+                # NEW-214 Stage 2: BACK gave the repair up and queued it (_back_slot) for a
+                # FRONT lane; the PR then rejoins the hand-over queue.
                 return None
             return await apply_back_outcome(current, staged, staged_blocker)
 
@@ -4625,6 +4630,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             self._back_outcomes[ref] = staged
             return await apply_back_outcome(entry, staged, staged_blocker)
 
+        def lane_may_proceed() -> bool:
+            return (
+                bool(self._repair_queue)
+                or self._stop_after_current
+                or self._pause_after_current
+                or cursor >= len(raw_items)
+                or not self._waits_for_dependency(raw_items[cursor])
+            )
+
         async def front_lane(lane: str) -> dict[str, Any] | None:
             """One FRONT lane: repairs first, then issues in plan order, until none is left.
 
@@ -4636,8 +4650,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             self._lanes_busy.add(lane)
             try:
                 while True:
-                    # Between issues: wait while another slot awaits the operator.
-                    await self._lane_wait(lambda: True)
+                    # Between issues: wait while another slot awaits the operator, and
+                    # while the next issue in plan order depends on one still in a slot
+                    # (repairs, which may be what it waits for, are taken meanwhile).
+                    await self._lane_wait(lane_may_proceed)
                     entry: dict[str, Any] | None = None
                     if self._repair_queue:
                         entry = self._repair_queue.pop(0)
@@ -5418,6 +5434,20 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         staged: tuple[str, str] = ("FAILED", "")
         try:
             staged = await self._staging_gitops_delivery(**arguments)
+            if staged[0] == "REPAIR":
+                # NEW-214 Stage 2: queued before this task ends, so the issue never leaves
+                # custody (a dependent keeps waiting for it).
+                self._repair_queue.append(
+                    {
+                        "ref": issue_ref,
+                        "ordinal": arguments["ordinal"],
+                        "arguments": {
+                            key: value
+                            for key, value in arguments.items()
+                            if key not in ("repair_mode", "resume")
+                        },
+                    }
+                )
             return staged
         except _LoopIssueSkipped as skipped:
             # A skipped bookkeeping step ends only this slot's issue (NEW-162 closes a

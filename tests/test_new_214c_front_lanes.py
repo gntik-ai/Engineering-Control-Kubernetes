@@ -436,6 +436,26 @@ async def test_a_repair_runs_in_a_lane_while_back_takes_the_next_pr() -> None:
     await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
 
 
+async def test_dependents_wait_through_their_dependencys_repair() -> None:
+    # Review: a yielded repair left custody, so its dependents were never started.
+    _Delivery.first_outcome = None
+    _Staging.regress_first = True
+    try:
+        history, result = await _run(_script(dependencies=[_FIRST]))
+    finally:
+        _Staging.regress_first = False
+
+    assert result["status"] == "COMPLETE"
+    assert not [item for item in result["results"] if item.get("status") == "NOT_STARTED"]
+    events = _events(history)
+    # Issue 2 depends on issue 1 (issue 3 is independent and runs meanwhile).
+    verified = _at(events, "completed", "1-staging-gitops-retry-1")
+    assert verified < _at(events, "started", "2-attempt-1")
+    staged = [item for item in result["results"] if item.get("stage") == "staging-gitops"]
+    assert [item["status"] for item in staged].count("STAGING_VERIFIED") == 3
+    await Replayer(workflows=_WORKFLOWS).replay_workflow(history)
+
+
 async def test_two_lanes_refilling_at_once_never_select_the_same_issue() -> None:
     # Review: both lanes passed the refill wait together and appended one issue twice.
     async def hook(step: str, payload: dict[str, Any]) -> dict[str, Any] | None:
