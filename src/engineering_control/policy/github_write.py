@@ -51,6 +51,8 @@ GITOPS_READ_ONLY_GITHUB_STEPS = frozenset(
         "gitops.deployment_pr_checks",
         "gitops.workflow_run",
         "gitops.image_pin",
+        # NEW-214b: strict up-to-date protection, required for concurrency 2.
+        "gitops.branch_protection",
     }
 )
 GITOPS_WRITE_CAPABLE_GITHUB_STEPS = frozenset(

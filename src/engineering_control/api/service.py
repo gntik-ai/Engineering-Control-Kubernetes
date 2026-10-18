@@ -782,6 +782,8 @@ class TemporalControlService:
             raise ValueError("existing backlog delivery mode changed after approval")
         if request.maximum_items > int(campaign.get("maximum_items") or 0):
             raise ValueError("existing backlog item bound exceeds its approval")
+        if request.maximum_concurrency > int(campaign.get("maximum_concurrency") or 1):
+            raise ValueError("existing backlog concurrency exceeds its approval")
         if direct:
             await self.repository.validate_issue_operation_approval(request)
         workflow_id = (

@@ -1113,6 +1113,21 @@ class GhCliBroker:
             raise GhCliPolicyError("commit date is invalid")
         return value
 
+    def branch_protection_strict(self, repository: str, branch: str) -> bool:
+        """NEW-214b: True when the branch requires status checks to be up to date."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", branch) or ".." in branch:
+            raise GhCliPolicyError("branch name is invalid")
+        strict = self._run(
+            [
+                "api",
+                f"repos/{repository}/branches/{branch}/protection/required_status_checks",
+                "--jq",
+                ".strict",
+            ]
+        ).stdout.strip()
+        return strict == "true"
+
     def commit_contains(self, repository: str, *, ancestor: str, descendant: str) -> bool:
         """NEW-68: True when ``descendant`` is ``ancestor`` or contains it in its history."""
         repository = self._batch(repository)

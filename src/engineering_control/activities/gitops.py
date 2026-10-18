@@ -2384,6 +2384,7 @@ class GitOpsGitHubHandler:
     _failure_blockers = {
         "gitops.pr_checks": "SOURCE_PR_CHECKS_UNAVAILABLE",
         "gitops.pr_heads": "PR_HEADS_UNAVAILABLE",
+        "gitops.branch_protection": "BRANCH_PROTECTION_UNAVAILABLE",
         "gitops.deployment_pr_checks": "DEPLOYMENT_PR_CHECKS_UNAVAILABLE",
         "gitops.merge": "PROTECTED_MERGE_FAILED",
         "gitops.release_tag": "RELEASE_TAG_FAILED",
@@ -2422,6 +2423,7 @@ class GitOpsGitHubHandler:
         handlers = {
             "gitops.pr_checks": self._pr_checks,
             "gitops.pr_heads": self._pr_heads,
+            "gitops.branch_protection": self._branch_protection,
             "gitops.deployment_pr_checks": self._deployment_pr_checks,
             "gitops.merge": self._merge,
             "gitops.release_tag": self._release_tag,
@@ -2504,6 +2506,40 @@ class GitOpsGitHubHandler:
         return path
 
     # -- 1. PR checks ------------------------------------------------------------------
+
+    def _branch_protection(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-214b: is every repository of the project protected strictly up to date?
+
+        Concurrency 2 lets an issue's PR be built while another merges, so a merge must be
+        refused (atomically, by GitHub) once its base moved, and merge-forward must answer
+        that. Read-only; a repository without protection counts as not strict.
+        """
+        project = str(payload.get("project", ""))
+        manifest, flow = load_project_contract(self.settings.project_config_root, project)
+        gate: DeliveryGate | None = flow if flow is not None and flow.enabled else None
+        if gate is None:
+            merge = manifest.merge_delivery()
+            gate = merge if merge is not None and merge.enabled else None
+        # NEW-214b review: each repository's own merge target, as the delivery plan uses.
+        targets = sorted(
+            {
+                (str(side.full_name), str(side.default_branch))
+                for side in (manifest.repositories.source, manifest.repositories.deployment)
+            }
+        )
+        strict: dict[str, bool] = {}
+        for repository, branch in targets:
+            try:
+                protected = self.broker.branch_protection_strict(repository, branch)
+            except CommandFailure:
+                protected = False
+            strict[f"{repository}@{branch}"] = protected
+        return {
+            "status": "OK",
+            "merge_forward": bool(gate is not None and gate.merge_forward),
+            "strict": strict,
+            "ready": bool(gate is not None and gate.merge_forward) and all(strict.values()),
+        }
 
     def _pr_heads(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-102: live head and state of each named pull request (read-only)."""
