@@ -9,6 +9,7 @@ issue waits, and only one slot ever awaits the operator. Concurrency 1 is unchan
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -621,41 +622,108 @@ def test_a_direct_issue_or_global_start_cannot_ask_for_concurrency_2() -> None:
 # -- the prerequisite read ----------------------------------------------------------------
 
 
+_ACTIVE = {"enforcement": "active", "bypass": "never"}
+# What a merge target enforces, by kind (repo@branch -> kind); absent means nothing.
+_PROTECTION: dict[str, dict[str, Any]] = {
+    "classic": {"classic": {"strict": True, "admins": True}},
+    # Not enforced for administrators: Hermes' identity could merge a behind head.
+    "classic-admins-exempt": {"classic": {"strict": True, "admins": False}},
+    "classic-loose": {"classic": {"strict": False, "admins": True}},
+    "ruleset": {"rules": True, "ruleset": {"enforcement": "active", "bypass": "never"}},
+    # Hermes may bypass it (for example an admin-role bypass actor).
+    "ruleset-bypassed": {"rules": True, "ruleset": {"enforcement": "active", "bypass": "always"}},
+    "ruleset-evaluate": {"rules": True, "ruleset": {"enforcement": "evaluate", "bypass": "never"}},
+    "ruleset-loose": {"rules": False, "ruleset": {"enforcement": "active", "bypass": "never"}},
+    # Malformed or empty check lists never count (review: they failed open).
+    "ruleset-no-checks": {"rules": True, "checks": [], "ruleset": _ACTIVE},
+    "ruleset-text-checks": {"rules": True, "checks": "ci", "ruleset": _ACTIVE},
+    "ruleset-null-check": {"rules": True, "checks": [None], "ruleset": _ACTIVE},
+    "ruleset-unnamed-check": {"rules": True, "checks": [{}], "ruleset": _ACTIVE},
+    # The qualifying rule is on the second page of applicable rules.
+    "ruleset-page-2": {"rules": True, "page": 2, "ruleset": _ACTIVE},
+}
+
+
 class _ProtectionGh(FakeGh):
-    def __init__(self, strict: dict[str, str | None]) -> None:
+    def __init__(self, kinds: dict[str, str | None]) -> None:
         super().__init__()
-        self.strict = strict
+        self.kinds = kinds
+
+    def _kind(self, path: str) -> dict[str, Any]:
+        repository, rest = path.removeprefix("repos/").split("/branches/")
+        kind = self.kinds.get(f"{repository}@{rest.split('/')[0].split('?')[0]}")
+        return _PROTECTION.get(kind or "", {})
 
     def run(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
         args = list(arguments)
-        if args[:1] == ["api"] and args[1].endswith("/protection/required_status_checks"):
-            repository, rest = args[1].removeprefix("repos/").split("/branches/")
-            value = self.strict.get(f"{repository}@{rest.split('/')[0]}")
-            if value is None:
+        if args[:1] != ["api"]:
+            return super().run(executable, arguments, **kwargs)
+        self.calls.append(args)
+        path = args[1]
+        if path.endswith("/protection"):
+            classic = self._kind(path).get("classic")
+            if classic is None:
                 raise CommandFailure("Branch not protected")  # GitHub's 404
-            self.calls.append(args)
-            return CommandResult(0, value + "\n", "")
+            return CommandResult(0, json.dumps(classic), "")
+        if "/rules/branches/" in path:
+            kind = self._kind(path.replace("/rules/branches/", "/branches/"))
+            page = int(path.rsplit("page=", 1)[1])
+            if "rules" not in kind:
+                return CommandResult(0, "[]", "")
+            rule = {
+                "type": "required_status_checks",
+                "ruleset_source_type": "Repository",
+                "ruleset_id": 7,
+                "parameters": {
+                    "strict_required_status_checks_policy": kind["rules"],
+                    "required_status_checks": kind.get(
+                        "checks", [{"context": "ci", "integration_id": 15368}]
+                    ),
+                },
+            }
+            self.rules_ruleset = kind["ruleset"]
+            filler = [{"type": "deletion", "ruleset_id": 8}]
+            if kind.get("page", 1) == 2:
+                rules = filler * 100 if page == 1 else [rule]
+            else:
+                rules = [*filler, rule] if page == 1 else []
+            return CommandResult(0, json.dumps(rules), "")
+        if path.endswith("/rulesets/7"):
+            return CommandResult(0, json.dumps(self.rules_ruleset), "")
         return super().run(executable, arguments, **kwargs)
 
 
 _SOURCE = "gntik-ai/musematic@main"
 _DEPLOY = "gntik-ai/musematic-deploy@main"
+_STRICT_KINDS = {"classic", "ruleset", "ruleset-page-2"}
 
 
 @pytest.mark.parametrize(
     ("merge_forward", "deploy_branch", "strict", "ready"),
     [
-        (True, "main", {_SOURCE: "true", _DEPLOY: "true"}, True),
-        (True, "main", {_SOURCE: "true", _DEPLOY: "false"}, False),
-        (True, "main", {_SOURCE: "true", _DEPLOY: None}, False),
-        (False, "main", {_SOURCE: "true", _DEPLOY: "true"}, False),
+        (True, "main", {_SOURCE: "classic", _DEPLOY: "classic"}, True),
+        (True, "main", {_SOURCE: "classic", _DEPLOY: "classic-loose"}, False),
+        (True, "main", {_SOURCE: "classic", _DEPLOY: None}, False),
+        (False, "main", {_SOURCE: "classic", _DEPLOY: "classic"}, False),
         # Each repository's own merge target: a protected main says nothing of master.
         (
             True,
             "master",
-            {_SOURCE: "true", "gntik-ai/musematic-deploy@master": None},
+            {_SOURCE: "classic", "gntik-ai/musematic-deploy@master": None},
             False,
         ),
+        # A ruleset counts like classic protection (NEW-214 Stage 2 review).
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset"}, True),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "classic"}, True),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-bypassed"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-evaluate"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-loose"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "classic-admins-exempt"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-no-checks"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-text-checks"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-null-check"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-unnamed-check"}, False),
+        (True, "main", {_SOURCE: "ruleset", _DEPLOY: "ruleset-page-2"}, True),
     ],
 )
 @pytest.mark.asyncio
@@ -690,6 +758,6 @@ async def test_branch_protection_reports_strict_protection_and_merge_forward(
 
     assert result["status"] == "OK"
     assert result["merge_forward"] is merge_forward
-    assert result["strict"] == {target: value == "true" for target, value in strict.items()}
+    assert result["strict"] == {target: kind in _STRICT_KINDS for target, kind in strict.items()}
     assert result["ready"] is ready
     assert fake.mutations == []
