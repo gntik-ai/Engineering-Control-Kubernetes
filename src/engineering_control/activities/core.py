@@ -83,6 +83,7 @@ class ControlActivities:
         "delivery.invoke_spec",
         "delivery.create_openspec",
         "delivery.acquire_leases",
+        "delivery.front_capacity",
         "delivery.release_leases",
         "delivery.allocate_worktrees",
         "delivery.persist_worktree_leases",

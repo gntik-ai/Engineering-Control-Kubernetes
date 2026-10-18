@@ -379,7 +379,7 @@ def test_command_models_deny_production_and_arbitrary_arguments() -> None:
         SolveBacklogCommand(
             project="falcone",
             backlog_campaign_id=CAMPAIGN_ID,
-            concurrency=3,  # type: ignore[arg-type]
+            concurrency=4,  # type: ignore[arg-type]
         )
     with pytest.raises(ValidationError):
         EnhancementRejectCommand(

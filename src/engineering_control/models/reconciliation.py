@@ -160,6 +160,9 @@ class StagingFlowPolicy(ReconciliationModel):
     # merged forward onto its current base by a repair round (never rebased) before
     # its CI can gate the merge. Off by default: concurrency-1 behaviour is unchanged.
     merge_forward: bool = False
+    # NEW-214 Stage 2: the highest backlog concurrency a loop of this project may run
+    # (operator decision 2026-10-17: falcone 2, gntik-ui 3).
+    maximum_concurrency: Literal[1, 2, 3] = 2
     argo_application: str = Field(pattern=_KUBERNETES_NAME)
     argo_namespace: str = Field(default="argocd", pattern=_KUBERNETES_NAME)
     namespaces: tuple[str, ...] = Field(min_length=1, max_length=10)
@@ -398,6 +401,9 @@ class MergeDeliveryPolicy(ReconciliationModel):
     # merged forward onto its current base by a repair round (never rebased) before
     # its CI can gate the merge. Off by default: concurrency-1 behaviour is unchanged.
     merge_forward: bool = False
+    # NEW-214 Stage 2: the highest backlog concurrency a loop of this project may run
+    # (operator decision 2026-10-17: falcone 2, gntik-ui 3).
+    maximum_concurrency: Literal[1, 2, 3] = 2
     source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
     allow_r3_merge: bool = False
     ci_baseline: CiBaselinePolicy = Field(default_factory=CiBaselinePolicy)

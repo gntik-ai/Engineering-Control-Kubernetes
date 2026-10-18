@@ -615,7 +615,7 @@ def test_a_direct_issue_or_global_start_cannot_ask_for_concurrency_2() -> None:
         {"global_campaign_id": str(uuid.uuid4())},
         {"delivery_mode": "source-pr"},
     ):
-        with pytest.raises(ValueError, match="concurrency 2"):
+        with pytest.raises(ValueError, match="concurrency above 1"):
             ExistingBacklogLoopStart.model_validate({**base, **extra})
 
 

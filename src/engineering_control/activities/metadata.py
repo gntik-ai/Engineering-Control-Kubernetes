@@ -157,6 +157,7 @@ from engineering_control.workflows.cleanup_scope import (
     PROJECT_UNATTRIBUTABLE_PROTECTION,
 )
 from engineering_control.workflows.provider_stops import provider_unavailable_stop
+from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -509,6 +510,7 @@ class MetadataActivityHandler:
             "delivery.load_confirmed_finding",
             "delivery.ensure_issue",
             "delivery.acquire_leases",
+            "delivery.front_capacity",
             "delivery.release_leases",
             "delivery.route_providers",
             "delivery.persist_worktree_leases",
@@ -668,6 +670,8 @@ class MetadataActivityHandler:
                     }
             if step == "delivery.release_leases":
                 return await asyncio.to_thread(self._release_delivery_leases, payload)
+            if step == "delivery.front_capacity":
+                return await asyncio.to_thread(self._front_capacity, payload)
             if step == "delivery.route_providers":
                 return await asyncio.to_thread(self._route_delivery, payload)
             if step == "delivery.persist_worktree_leases":
@@ -2949,20 +2953,56 @@ class MetadataActivityHandler:
         project = Project(str(payload["project"]))
         component = self._component_key(project, str(payload["affected_component"]))
         run_id = UUID(str(payload["run_id"]))
-        manager = ComponentLeaseManager()
+        manager = ComponentLeaseManager(
+            max_implementation_per_project=self.settings.implementation_leases_per_project
+        )
+        # NEW-214 Stage 2: a concurrency-3 loop's makers may share a component; the group
+        # is the loop's workflow id, which this delivery's own Run must belong to.
+        group = payload.get("lease_share_group")
+        share_prefix = f"{group}-issue-" if isinstance(group, str) else None
         with self.sessions.begin() as session:
+            if share_prefix is not None:
+                run = session.get(Run, run_id)
+                if run is None or not run.workflow_id.startswith(share_prefix):
+                    raise ValueError("lease share group does not own this delivery run")
             lease = manager.acquire(
                 session,
                 component_key=component,
                 owner_run_id=run_id,
                 mode="implementation",
                 ttl=timedelta(hours=4),
+                share_prefix=share_prefix,
             )
+            acquired = {"component_key": lease.component_key, "component_lease_id": str(lease.id)}
+        return {**payload, "status": "LEASES_ACQUIRED", **acquired}
+
+    def _front_capacity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-214 Stage 2 (read-only): the FRONT slots a concurrency-3 loop may run.
+
+        min(concurrency - 1, project leases - 1 (one stays for BACK), provider worker
+        slots), plus whether both providers have quota above the 25% verification reserve.
+        Without that quota no additional FRONT maker starts.
+        """
+        requested = payload.get("maximum_concurrency")
+        if requested not in (1, 2, 3):
+            raise ValueError("FRONT capacity needs the approved concurrency")
+        leases = self.settings.implementation_leases_per_project
+        maker_slots = min(
+            ROLE_WORKER_REGISTRY["codex"].max_concurrent_activities,
+            ROLE_WORKER_REGISTRY["claude"].max_concurrent_activities,
+        )
+        broker = self._quota_broker()
+        quota = {
+            provider.value: broker.available(provider, reserve_work=False)[0]
+            for provider in (Provider.CODEX, Provider.CLAUDE)
+        }
         return {
-            **payload,
-            "status": "LEASES_ACQUIRED",
-            "component_key": component,
-            "component_lease_id": str(lease.id),
+            "status": "OK",
+            "front_slots": max(1, min(int(requested) - 1, leases - 1, maker_slots)),
+            "lease_capacity": leases,
+            "maker_slots": maker_slots,
+            "quota": quota,
+            "quota_ok": all(quota.values()),
         }
 
     def _release_delivery_leases(self, payload: dict[str, Any]) -> dict[str, Any]:

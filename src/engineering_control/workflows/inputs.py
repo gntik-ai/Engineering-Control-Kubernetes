@@ -51,12 +51,16 @@ class IssueDeliveryInput:
     risk_class: str
     dry_run: bool = True
     issue_approval_id: str | None = None
+    # NEW-214 Stage 2: the concurrency-3 loop whose makers may share a component lease.
+    lease_share_group: str | None = None
 
     def payload(self) -> dict[str, Any]:
         """Preserve legacy command bytes when no child approval was supplied."""
         value = asdict(self)
         if self.issue_approval_id is None:
             value.pop("issue_approval_id")
+        if self.lease_share_group is None:
+            value.pop("lease_share_group")
         return value
 
 
