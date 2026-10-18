@@ -305,14 +305,15 @@ class Refresh:
         self.state.update(stage="pull-request-closed")
         self.call(["pr", "reopen", str(number), "--repo", REPOSITORY])
         self.state.update(stage="pull-request-open")
-        # Only a run GitHub started after it recorded the reopen counts: never one that
-        # existed before, or was started by anything else in between.
+        # Only a run GitHub started strictly after the second it recorded the reopen counts:
+        # never one that existed before, or started within that same second. (The visual job
+        # waits for the checks job, so a real post-reopen run starts well after the reopen.)
         reopened = self.reopened_at(number)
         while True:
             fresh = [
                 run
                 for run in self.check_runs(recorded, VISUAL_CHECK)
-                if isinstance(run.get("started_at"), str) and run["started_at"] >= reopened
+                if isinstance(run.get("started_at"), str) and run["started_at"] > reopened
             ]
             if fresh and fresh[-1].get("status") == "completed":
                 return str(fresh[-1].get("conclusion") or "unknown")

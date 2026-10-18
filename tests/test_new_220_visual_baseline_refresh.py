@@ -44,6 +44,7 @@ class FakeGh:
         self.extra_commit = overrides.get("extra_commit", False)
         self.fail_reopen = overrides.get("fail_reopen", False)
         self.no_rerun = overrides.get("no_rerun", False)
+        self.stale_started = overrides.get("stale_started", "2026-10-17T18:04:59Z")
         self.reopened = False
 
     def _commits(self) -> list[str]:
@@ -104,7 +105,7 @@ class FakeGh:
                         "name": "visual",
                         "status": "completed",
                         "conclusion": "success",
-                        "started_at": "2026-10-17T18:04:59Z",
+                        "started_at": self.stale_started,
                     }
                 )
             if self.reopened and not self.no_rerun:
@@ -207,6 +208,9 @@ def test_a_visual_result_from_before_the_reopen_never_counts() -> None:
     # A success that started before GitHub's reopen time, with no new run: never VERIFIED.
     with pytest.raises(RefreshError, match="started after the reopen"):
         _run(FakeGh(stale_visual=True, no_rerun=True))
+    # Nor one started within the same second GitHub recorded the reopen.
+    with pytest.raises(RefreshError, match="started after the reopen"):
+        _run(FakeGh(stale_visual=True, no_rerun=True, stale_started="2026-10-17T18:05:00Z"))
 
 
 def test_a_head_that_moves_after_verification_is_never_reported_safe() -> None:
