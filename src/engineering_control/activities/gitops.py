@@ -2512,7 +2512,9 @@ class GitOpsGitHubHandler:
 
         Concurrency 2 lets an issue's PR be built while another merges, so a merge must be
         refused (atomically, by GitHub) once its base moved, and merge-forward must answer
-        that. Read-only; a repository without protection counts as not strict.
+        that. Classic protection or a repository ruleset, either binding Hermes itself
+        (broker.branch_protection_strict). Read-only; a repository without protection
+        counts as not strict.
         """
         project = str(payload.get("project", ""))
         manifest, flow = load_project_contract(self.settings.project_config_root, project)

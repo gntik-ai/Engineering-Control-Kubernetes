@@ -1114,19 +1114,71 @@ class GhCliBroker:
         return value
 
     def branch_protection_strict(self, repository: str, branch: str) -> bool:
-        """NEW-214b: True when the branch requires status checks to be up to date."""
+        """NEW-214b: True when GitHub refuses, for Hermes too, a merge whose head is behind.
+
+        Classic protection counts only when "require up to date" is enforced for
+        administrators, because Hermes' identity administers the repositories. A
+        repository ruleset counts when it is active, requires status checks strictly and
+        Hermes cannot bypass it. Bypass actors only exempt others, such as an updater
+        pushing to the branch directly.
+        """
         repository = self._batch(repository)
         if not re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", branch) or ".." in branch:
             raise GhCliPolicyError("branch name is invalid")
-        strict = self._run(
-            [
-                "api",
-                f"repos/{repository}/branches/{branch}/protection/required_status_checks",
-                "--jq",
-                ".strict",
-            ]
-        ).stdout.strip()
-        return strict == "true"
+        try:
+            classic = self._json(
+                self._run(
+                    [
+                        "api",
+                        f"repos/{repository}/branches/{branch}/protection",
+                        "--jq",
+                        "{strict: .required_status_checks.strict, admins: .enforce_admins.enabled}",
+                    ]
+                ).stdout,
+                "branch protection",
+            )
+        except CommandFailure:
+            classic = None  # GitHub answers 404 for a branch without classic protection
+        if (
+            isinstance(classic, dict)
+            and classic.get("strict") is True
+            and classic.get("admins") is True
+        ):
+            return True
+        rules = self._json(
+            self._run(["api", f"repos/{repository}/rules/branches/{branch}?per_page=100"]).stdout,
+            "branch rules",
+        )
+        rulesets = sorted(
+            {
+                rule["ruleset_id"]
+                for rule in self._list(rules, "branch rules")
+                if rule.get("type") == "required_status_checks"
+                and type(rule.get("ruleset_id")) is int
+                and isinstance(rule.get("parameters"), dict)
+                and rule["parameters"].get("strict_required_status_checks_policy") is True
+                and rule["parameters"].get("required_status_checks")
+            }
+        )
+        for ruleset_id in rulesets:
+            ruleset = self._json(
+                self._run(
+                    [
+                        "api",
+                        f"repos/{repository}/rulesets/{ruleset_id}",
+                        "--jq",
+                        "{enforcement, bypass: .current_user_can_bypass}",
+                    ]
+                ).stdout,
+                "ruleset",
+            )
+            if (
+                isinstance(ruleset, dict)
+                and ruleset.get("enforcement") == "active"
+                and ruleset.get("bypass") == "never"
+            ):
+                return True
+        return False
 
     def commit_contains(self, repository: str, *, ancestor: str, descendant: str) -> bool:
         """NEW-68: True when ``descendant`` is ``ancestor`` or contains it in its history."""
