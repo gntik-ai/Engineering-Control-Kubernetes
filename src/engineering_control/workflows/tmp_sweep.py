@@ -8,8 +8,10 @@ removed that nobody wrote for the idle time and that no running step wrote:
 
 - "wrote" is the newest ctime in the entry, which no tool can set back (tar and pnpm
   restore old mtimes; ctime is the time of that restore);
-- an entry changed after the oldest running step started is kept, as is anything that
-  is, contains or lies inside a live run directory;
+- nothing is removed while a step runs: the pass starts only on an idle worker, and
+  stops before the next removal once a step has started (a walk cannot prove that a
+  running step will not write into what it has already visited);
+- anything that is, contains or lies inside a live run directory is kept;
 - node-compile-cache stays, and so do Codex's bubblewrap mount targets: a running
   sandbox may have one mounted, and unlinking it would lift that mount.
 
@@ -39,6 +41,8 @@ _PRIVATE_TMP_ROOT = re.compile(r"^/systemd-private-[0-9a-f]{32}-[^/]+/tmp$")
 # Start times (time.time()) of the steps this worker process is running.
 _RUNNING: dict[int, float] = {}
 _TOKENS = itertools.count()
+# Incremented by every step start: a sweep pass stops when it changes.
+_STARTED = [0]
 
 
 @contextmanager
@@ -46,6 +50,7 @@ def running_step() -> Iterator[None]:
     """Mark one activity as running for the sweep's "written by a running step" rule."""
     token = next(_TOKENS)
     _RUNNING[token] = time.time()
+    _STARTED[0] += 1
     try:
         yield
     finally:
@@ -145,26 +150,22 @@ def sweep(
     root: Path,
     *,
     idle_seconds: float,
-    running_since: float | None,
     protected: Collection[Path],
 ) -> SweepResult:
+    """Remove the stale entries of ``root``, only while this worker runs no step."""
     removed = failed = 0
+    started = _STARTED[0]
+    if _RUNNING:
+        return SweepResult(removed, failed)
     device = root.lstat().st_dev
     for entry in stale_entries(
-        root,
-        now=time.time(),
-        idle_seconds=idle_seconds,
-        running_since=running_since,
-        protected=protected,
+        root, now=time.time(), idle_seconds=idle_seconds, protected=protected
     ):
-        # Revalidated right before its removal: the selection pass may be minutes old,
-        # and a step may have started (or written into the entry) since.
-        started = oldest_running_step()
-        cutoff = time.time() - idle_seconds
-        if running_since is not None or started is not None:
-            cutoff = min(cutoff, *(t for t in (running_since, started) if t is not None))
+        if _RUNNING or _STARTED[0] != started:
+            break
+        # Revalidated right before its removal: the selection pass may be minutes old.
         newest = _newest_change(entry, device, MAX_WALK_ENTRIES)
-        if newest is None or newest >= cutoff:
+        if newest is None or newest >= time.time() - idle_seconds:
             continue
         if remove_tree(entry):
             removed += 1

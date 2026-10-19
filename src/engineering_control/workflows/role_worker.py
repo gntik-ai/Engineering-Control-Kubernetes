@@ -12,6 +12,7 @@ from engineering_control.adapters.run_temp import (
     clear_run_temporaries,
     live_run_temporaries,
     retry_unremoved,
+    wait_for_removals,
 )
 from engineering_control.config import Settings, get_settings
 from engineering_control.logging import configure_logging
@@ -39,9 +40,7 @@ def worker_slots(settings: Settings, spec: RoleWorkerSpec) -> int:
     return spec.max_concurrent_activities
 
 
-def sweep_temporaries(
-    settings: Settings, *, running_since: float | None, protected: frozenset[Path]
-) -> None:
+def sweep_temporaries(settings: Settings, *, protected: frozenset[Path]) -> None:
     """NEW-226: one pass of the private /tmp sweep and of the run-directory retries."""
     retry_unremoved()
     if not tmp_sweep.is_private_tmp():
@@ -49,7 +48,6 @@ def sweep_temporaries(
     result = tmp_sweep.sweep(
         Path("/tmp"),  # noqa: S108 - the unit's PrivateTmp, checked just above
         idle_seconds=settings.private_tmp_sweep_idle_minutes * 60,
-        running_since=running_since,
         protected=protected,
     )
     if result.removed or result.failed:
@@ -59,13 +57,8 @@ def sweep_temporaries(
 async def _sweep_forever(settings: Settings) -> None:
     while True:
         try:
-            # Read here, in the event loop: the sweep thread never sees them change.
-            await asyncio.to_thread(
-                sweep_temporaries,
-                settings,
-                running_since=tmp_sweep.oldest_running_step(),
-                protected=live_run_temporaries(),
-            )
+            # Read here, in the event loop: the sweep thread never sees it change.
+            await asyncio.to_thread(sweep_temporaries, settings, protected=live_run_temporaries())
         except Exception:  # noqa: BLE001 - a backstop never stops the worker
             LOGGER.exception("private /tmp sweep failed")
         await asyncio.sleep(settings.private_tmp_sweep_interval_seconds)
@@ -102,6 +95,8 @@ async def serve() -> None:
         for task in (heartbeat_task, sweep_task):
             task.cancel()
         await asyncio.gather(heartbeat_task, sweep_task, return_exceptions=True)
+        # NEW-226: within TimeoutStopSec; what is left is cleared at the next start.
+        await asyncio.to_thread(wait_for_removals, 10.0)
 
 
 def run() -> None:

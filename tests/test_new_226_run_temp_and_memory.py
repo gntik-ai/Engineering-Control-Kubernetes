@@ -73,6 +73,7 @@ def test_a_run_directory_is_private_and_removed(tmp_path: Path) -> None:
         assert run_temp.live_run_temporaries() >= {first, second}
         (first / "vitest-output").mkdir()
         (first / "vitest-output" / "log").write_text("x")
+    run_temp.wait_for_removals()
     assert not first.exists()
     assert not second.exists()
     assert first not in run_temp.live_run_temporaries()
@@ -82,6 +83,7 @@ def test_a_run_directory_is_removed_when_the_run_fails(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError), run_temp.run_temporary_directory(tmp_path) as path:
         (path / "partial").write_text("x")
         raise RuntimeError("provider failed")
+    run_temp.wait_for_removals()
     assert not path.exists()
 
 
@@ -103,6 +105,7 @@ async def test_a_run_directory_is_removed_when_the_activity_is_cancelled(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    run_temp.wait_for_removals()
     assert not created[0].exists()
 
 
@@ -155,6 +158,7 @@ def test_a_failed_removal_is_retried_by_the_sweep(
     monkeypatch.setattr(run_temp, "remove_tree", first_fails)
     with run_temp.run_temporary_directory(tmp_path) as path:
         pass
+    run_temp.wait_for_removals()
     assert path.exists()
     assert run_temp.retry_unremoved() == 1
     assert not path.exists()
@@ -194,6 +198,7 @@ async def test_codex_runs_get_their_own_tmpdir_and_memory_bound(
     assert directory.parent == tmp_path / "codex" / run_temp.RUN_TEMP_PARENT
     assert seen["environment"]["TMP"] == seen["environment"]["TEMP"] == str(directory)
     assert seen["run_memory_max_bytes"] == 4 * GIB
+    run_temp.wait_for_removals()
     assert not directory.exists()  # noqa: ASYNC240 - synchronous test assertion
 
 
@@ -213,6 +218,7 @@ async def test_claude_runs_get_their_own_tmpdir_removed_even_on_cancellation(
     adapter = ClaudeCLIAdapter(temp_root=str(tmp_path / "claude"))
     with pytest.raises(asyncio.CancelledError):
         await adapter.execute(_request(Provider.CLAUDE, worktree))
+    run_temp.wait_for_removals()
     assert seen and not seen[0].exists()
 
 
@@ -311,19 +317,26 @@ def test_an_entry_too_large_to_walk_is_kept(tmp_path: Path) -> None:
 def test_the_sweep_removes_what_it_selects(tmp_path: Path) -> None:
     _tree(tmp_path)
     # A negative idle time stands for "much later": every entry is older than the cutoff.
-    result = tmp_sweep.sweep(tmp_path, idle_seconds=-60, running_since=None, protected=())
+    result = tmp_sweep.sweep(tmp_path, idle_seconds=-60, protected=())
     assert result == tmp_sweep.SweepResult(removed=3, failed=0)
     assert sorted(entry.name for entry in tmp_path.iterdir()) == [".git", "node-compile-cache"]
 
 
-def test_the_sweep_revalidates_each_entry_before_removing_it(
+def test_the_sweep_removes_nothing_while_a_step_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _tree(tmp_path)
-    # A step that started before the entries changed began after the selection pass.
-    monkeypatch.setattr(tmp_sweep, "oldest_running_step", lambda: time.time() - 3600)
-    result = tmp_sweep.sweep(tmp_path, idle_seconds=-60, running_since=None, protected=())
-    assert result == tmp_sweep.SweepResult(removed=0, failed=0)
+    with tmp_sweep.running_step():
+        assert tmp_sweep.sweep(tmp_path, idle_seconds=-60, protected=()).removed == 0
+    # A step that starts during the pass stops it before the next removal.
+    real = tmp_sweep.remove_tree
+
+    def start_a_step(path: Path) -> bool:
+        tmp_sweep._STARTED[0] += 1  # noqa: SLF001
+        return real(path)
+
+    monkeypatch.setattr(tmp_sweep, "remove_tree", start_a_step)
+    assert tmp_sweep.sweep(tmp_path, idle_seconds=-60, protected=()).removed == 1
     assert (tmp_path / "vitest-1234" / "deep" / "out.log").exists()
 
 

@@ -25,6 +25,7 @@ import os
 import secrets
 import shutil
 import stat
+import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from pathlib import Path
@@ -39,6 +40,8 @@ _LIVE: set[Path] = set()
 # Run directories whose removal failed (a process that could not be stopped still wrote
 # in it): the periodic sweep retries them.
 _UNREMOVED: set[Path] = set()
+# Removals still running in their threads.
+_REMOVALS: set[threading.Thread] = set()
 
 
 def run_temp_environment(directory: Path) -> dict[str, str]:
@@ -77,11 +80,28 @@ def run_temporary_directory(root: Path) -> Iterator[Path]:
     try:
         yield path
     finally:
-        # Synchronous, so a cancelled activity still removes it before it returns.
-        _LIVE.discard(path)
+        # Started even when the activity is cancelled; a thread, so a large tree never
+        # holds the worker's event loop (the other run's output, heartbeats). The path
+        # stays live until it is gone; a worker stopped meanwhile clears it at start.
+        removal = threading.Thread(target=_remove_run_directory, args=(path,), daemon=True)
+        _REMOVALS.add(removal)
+        removal.start()
+
+
+def _remove_run_directory(path: Path) -> None:
+    try:
         if not remove_tree(path):
             _UNREMOVED.add(path)
             LOGGER.warning("run temporary directory not removed; the sweep retries it")
+    finally:
+        _LIVE.discard(path)
+        _REMOVALS.discard(threading.current_thread())
+
+
+def wait_for_removals(timeout: float = 30.0) -> None:
+    """Join the removals started so far (worker shutdown, tests)."""
+    for removal in list(_REMOVALS.copy()):
+        removal.join(timeout)
 
 
 def optional_run_temporary_directory(root: str | None) -> AbstractContextManager[Path | None]:
