@@ -1040,8 +1040,12 @@ def test_the_deployment_maker_gets_the_ui_makers_result_without_its_evidence(
         maker_output(api_calls=[{**maker_output()["api_calls"][0], "payload_shape": shape}] * 100),
         payload["ui_page"],
     )
+    # The Codex adapter's agent summary is the raw JSON output (review round 3).
+    raw = json.dumps(
+        maker_output(api_calls=[{**maker_output()["api_calls"][0], "payload_shape": shape}] * 100)
+    )
     prepared = handler._prepare_maker(
-        {**payload, "agent_result": {"structured_result": big}}, deployment=True
+        {**payload, "agent_result": {"summary": raw, "structured_result": big}}, deployment=True
     )
     prompt = prepared["deployment_maker_request"]["prompt"]
     assert shape not in prompt and len(prompt) < 200_000

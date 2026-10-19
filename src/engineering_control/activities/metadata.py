@@ -3856,11 +3856,13 @@ class MetadataActivityHandler:
         shown = prior
         if isinstance(prior, dict) and isinstance(prior.get("structured_result"), dict):
             # NEW-227: a UI page source maker's typed evidence is the checker's input (bounded
-            # there), not the deployment maker's; it could exceed the prompt bound.
+            # there), not the deployment maker's; it could exceed the prompt bound. Its
+            # agent summary is the provider's raw output (the same evidence), so only the
+            # identity and the delivery maker fields are shown.
             structured = prior["structured_result"]
             if "ui_page" in structured:
                 shown = {
-                    **prior,
+                    **{key: prior.get(key) for key in ("provider", "role", "status")},
                     "structured_result": {
                         key: value for key, value in structured.items() if key != "ui_page"
                     },
