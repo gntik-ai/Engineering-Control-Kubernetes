@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -67,6 +67,25 @@ def verified_backlog_approval(
     ):
         return None
     return binding
+
+
+def lapsing_backlog_approval(
+    campaign: db.GitHubBacklogCampaign | None,
+) -> BacklogApprovalBinding | None:
+    """NEW-229: the campaign's recorded approval binding if its durable evidence verifies
+    apart from the expiry itself (whatever the campaign status), expired or not; else None.
+
+    Read-only and never an authority: it only tells an expired approval from a changed or
+    missing one, and how long a current one still lasts."""
+    if campaign is None or not isinstance(campaign.approval_json, dict):
+        return None
+    raw_binding = campaign.approval_json.get("binding")
+    binding_value = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
+    try:
+        expires_at = _as_utc(datetime.fromisoformat(str(binding_value.get("expires_at"))))
+    except (TypeError, ValueError):
+        return None
+    return verified_backlog_approval(campaign, now=expires_at - timedelta(microseconds=1))
 
 
 # NEW-163: a row in one of these states with policy_role owner (or none, pre-upgrade)
