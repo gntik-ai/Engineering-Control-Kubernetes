@@ -68,12 +68,13 @@ KIT_SELECTION_MAX = 100
 COMMITS_SHOWN = 20
 COMMITS_MAX = 200
 CHANGED_FILES_SHOWN = 60
-# Bytes (UTF-8) of each input part Hermes adds to one maker or checker prompt. With the
-# fences and headers, the whole section stays under INPUT_BUDGET (AGENTS.md: 24 KiB per
-# model input); the checker trades page-entry room for the maker's UI evidence.
+# Bytes (UTF-8) of the section Hermes adds to one maker or checker prompt, fences and
+# headers included (AGENTS.md: 24 KiB per model input). The approved page entry and its
+# epics and gaps are authoritative: never cut, a larger one BLOCKs (SPEC_LIMIT, fenced).
+# The kit excerpt, the maker's evidence (checker) and the legacy drift share the rest; the
+# drift is cut last, with the git command that shows the remainder.
 INPUT_BUDGET = 24_576
-SPEC_BUDGET = {"maker": 11_776, "checker": 7_680}
-REFERENCES_BUDGET = 1_536
+SPEC_LIMIT = {"maker": 16_384, "checker": 12_288}
 KIT_BUDGET = 3_584
 DRIFT_BUDGET = 5_120
 EVIDENCE_BUDGET = 4_096
@@ -332,6 +333,19 @@ def legacy_drift(
     }
 
 
+def kit_failures(document: Mapping[str, Any]) -> list[str]:
+    """The required calls (get_rules and every spec item) that failed or are missing."""
+    calls = [call for call in document.get("calls") or [] if isinstance(call, dict)]
+    failed = [
+        f"{call.get('tool')} {(call.get('arguments') or {}).get('id') or ''}".strip()
+        for call in calls
+        if call.get("tool") in ("get_rules", *_KIT_ITEM_TOOLS) and call.get("is_error")
+    ]
+    if not any(call.get("tool") == "get_rules" for call in calls):
+        failed.append("get_rules (not called)")
+    return failed
+
+
 def kit_excerpt(document: Mapping[str, Any]) -> dict[str, Any]:
     """A bounded excerpt of a page's kit snapshot: the rules, then each spec item."""
     calls = [call for call in document.get("calls") or [] if isinstance(call, dict)]
@@ -422,6 +436,19 @@ def checker_instructions(ui_page: Mapping[str, Any]) -> str:
     )
 
 
+def _fenced(fence: Callable[[str, str], str], label: str, text: str, limit: int, note: str) -> str:
+    """``fence(label, text)`` with ``text`` cut until the block holds at most ``limit``
+    content bytes: the fence neutralises delimiter-like markers, which can expand it."""
+    overhead = len(fence(label, "").encode("utf-8"))
+    cut = limit
+    while True:
+        block = fence(label, bounded_text(text, cut, note))
+        excess = len(block.encode("utf-8")) - overhead - limit
+        if excess <= 0 or cut == 0:
+            return block
+        cut = max(0, cut - excess)
+
+
 def input_section(
     view: Mapping[str, Any],
     ui_page: Mapping[str, Any],
@@ -431,42 +458,38 @@ def input_section(
     fence: Callable[[str, str], str],
     maker_result: Mapping[str, Any] | None = None,
 ) -> str:
-    """The page spec, its references, the kit excerpt and the legacy drift (and, for the
-    checker, the maker's UI evidence), each re-bounded here: at most INPUT_BUDGET bytes."""
-    spec = bounded_text(
-        _compact(view["page"]),
-        SPEC_BUDGET[role],
-        "page entry truncated; the issue content renders the complete entry",
+    """The page spec and its references (complete), the kit excerpt, the maker's UI
+    evidence (checker) and the legacy drift: at most INPUT_BUDGET bytes as rendered."""
+    references = "\n".join(
+        [
+            *(f"epic {_compact(epic)}" for epic in view.get("epics") or []),
+            *(f"gap {_compact(gap)}" for gap in view.get("gaps") or []),
+        ]
     )
-    references = bounded_text(
-        "\n".join(
-            [
-                *(f"epic {_compact(epic)}" for epic in view.get("epics") or []),
-                *(f"gap {_compact(gap)}" for gap in view.get("gaps") or []),
-            ]
+    spec = fence(
+        "ui page spec",
+        f"{_compact(view['page'])}\nReferenced epics and gaps:\n{references or 'none'}",
+    )
+    size = len(spec.encode("utf-8"))
+    if size > SPEC_LIMIT[role]:
+        raise UiPageRejected(
+            "UI_PAGE_SPEC_TOO_LARGE", f"page entry with references is {size} bytes fenced"
         )
-        or "none",
-        REFERENCES_BUDGET,
-        "references truncated",
-    )
     kit = inputs.get("kit") or {}
     drift = inputs.get("drift") or {}
     parts = [
         f"Approved page entry {ui_page['page_id']} of blueprint {ui_page['blueprint_id']} "
         f"(blueprint sha256 {ui_page['blueprint_sha256']}; the page entry, canonical JSON, "
-        f"sha256 {ui_page['page_sha256']}) and its referenced epics and gaps:",
-        fence("ui page spec", f"{spec}\nReferenced epics and gaps:\n{references}"),
+        f"sha256 {ui_page['page_sha256']}) and its referenced epics and gaps, complete:",
+        spec,
         f"gntik-ui kit snapshot {str(kit.get('snapshot_sha256'))[:64]} for the pinned "
         f"version {str(kit.get('gntik_ui_version'))[:40]} (Hermes-collected):",
-        fence(
+        _fenced(
+            fence,
             "gntik-ui kit snapshot",
-            bounded_text(str(kit.get("text") or ""), KIT_BUDGET, "kit excerpt truncated"),
-        ),
-        f"Legacy changes since the blueprint ({str(drift.get('from_sha'))[:40]}.."
-        f"{str(drift.get('to_sha'))[:40]}; full diff sha256 {str(drift.get('diff_sha256'))[:64]}):",
-        fence(
-            "legacy changes since the blueprint",
-            bounded_text(str(drift.get("text") or ""), DRIFT_BUDGET, "legacy diff truncated"),
+            str(kit.get("text") or ""),
+            KIT_BUDGET,
+            "kit excerpt truncated",
         ),
     ]
     if maker_result is not None:
@@ -477,12 +500,36 @@ def input_section(
         }
         parts += [
             "The UI page maker's result (decision, tests and its migrate-ui-page evidence):",
-            fence(
+            _fenced(
+                fence,
                 "ui page maker result",
-                bounded_text(_compact(evidence), EVIDENCE_BUDGET, "maker result truncated"),
+                _compact(evidence),
+                EVIDENCE_BUDGET,
+                "maker result truncated",
             ),
         ]
-    return "\n".join(parts) + "\n"
+    from_sha, to_sha = str(drift.get("from_sha"))[:40], str(drift.get("to_sha"))[:40]
+    parts.append(
+        f"Legacy changes since the blueprint ({from_sha}..{to_sha}; full diff sha256 "
+        f"{str(drift.get('diff_sha256'))[:64]}, `git diff {from_sha} {to_sha} -- <file>` in "
+        "the source worktree shows any part cut below):"
+    )
+    label = "legacy changes since the blueprint"
+    used = len(("\n".join(parts) + "\n\n").encode("utf-8"))
+    room = INPUT_BUDGET - used - len(fence(label, "").encode("utf-8"))
+    parts.append(
+        _fenced(
+            fence,
+            label,
+            str(drift.get("text") or ""),
+            max(0, min(DRIFT_BUDGET, room)),
+            "legacy diff truncated",
+        )
+    )
+    section = "\n".join(parts) + "\n"
+    if len(section.encode("utf-8")) > INPUT_BUDGET:
+        raise UiPageRejected("UI_PAGE_INPUTS_TOO_LARGE", f"{len(section.encode())} bytes")
+    return section
 
 
 # --------------------------------------------------------------------------------------

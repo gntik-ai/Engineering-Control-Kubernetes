@@ -89,6 +89,7 @@ from engineering_control.engineering.ui_kit import (
 from engineering_control.engineering.ui_page_delivery import (
     UiPageRejected,
     kit_excerpt,
+    kit_failures,
     legacy_drift,
 )
 from engineering_control.evidence.transfer import EvidencePublisher
@@ -1444,6 +1445,11 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "gntik-ui kit snapshot exceeded its deadline", type="UiKitTimeout"
             ) from error
         stored = await asyncio.to_thread(self._store_kit_snapshot, payload, document)
+        failed = kit_failures(document)
+        if failed:
+            # A tool error is data, not an exception: the rules or a spec item the models
+            # need is missing from the pinned kit (stored above as evidence).
+            return blocked("UI_KIT_SNAPSHOT_FAILED", "failed kit calls: " + ", ".join(failed))
         return {
             **payload,
             "ui_page_inputs": {

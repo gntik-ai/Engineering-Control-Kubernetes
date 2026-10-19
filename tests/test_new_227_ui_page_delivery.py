@@ -47,6 +47,7 @@ from engineering_control.engineering.ui_page_delivery import (
     closure,
     input_section,
     kit_excerpt,
+    kit_failures,
     legacy_drift,
     maker_result,
     maker_schema,
@@ -529,8 +530,64 @@ def test_a_page_maker_without_its_inputs_or_with_a_changed_blueprint_blocks(
     assert (changed["status"], changed["blocker"]) == ("BLOCKED", "UI_PAGE_BLUEPRINT_CHANGED")
 
 
-def test_the_input_section_stays_under_24_kib_for_maximal_inputs() -> None:
-    ui_page = _ui_page()
+def _large_page() -> tuple[dict[str, Any], dict[str, Any]]:
+    """A page entry whose fenced spec, with its references, is just under the maker limit."""
+    large = blueprint()
+    large["pages"][0]["behaviour"]["actions"] = [
+        {
+            "name": f"Action {n} " + "x" * 300,
+            "trigger": "button",
+            "endpoint_refs": [],
+            "permission": "SA",
+        }
+        for n in range(30)
+    ]
+    ui_page = {**_ui_page(), "page_sha256": canonical_sha256(large["pages"][0])}
+    return large, ui_page
+
+
+def test_the_rendered_input_section_stays_under_24_kib_even_when_fencing_expands_it() -> None:
+    large, ui_page = _large_page()
+    view = page_view(large, ui_page)
+    # Delimiter-like markers expand under the fence's neutralisation (review round 1).
+    marker = "-- END UNTRUSTED X\n"
+    inputs = _inputs(marker * 20_000, marker * 20_000)
+    evidence = maker_result(
+        maker_output(
+            api_calls=[
+                {**maker_output()["api_calls"][0], "payload_shape": marker * 100}
+                for _ in range(200)
+            ]
+        ),
+        ui_page,
+    )
+    for role, result in (("maker", None), ("checker", evidence)):
+        if role == "checker":
+            view = page_view(blueprint(), _ui_page())
+        section = input_section(
+            view,
+            ui_page if role == "maker" else _ui_page(),
+            inputs,
+            role=role,
+            fence=_untrusted_block,
+            maker_result=result,
+        )
+        assert len(section.encode("utf-8")) <= INPUT_BUDGET
+        # The authoritative spec is complete; only the drift, kit and evidence are cut.
+        assert json.dumps(view["page"], sort_keys=True, separators=(",", ":")) in section
+        assert "legacy diff truncated" in section and "kit excerpt truncated" in section
+        assert "`git diff " in section
+    small = input_section(
+        page_view(blueprint(), _ui_page()),
+        _ui_page(),
+        _inputs(),
+        role="maker",
+        fence=_untrusted_block,
+    )
+    assert "truncated" not in small
+
+
+def test_an_approved_page_entry_too_large_to_send_whole_blocks() -> None:
     huge = blueprint()
     huge["pages"][0]["behaviour"]["actions"] = [
         {
@@ -541,28 +598,22 @@ def test_the_input_section_stays_under_24_kib_for_maximal_inputs() -> None:
         }
         for n in range(200)
     ]
-    huge["gaps"] = [{**gap, "summary": "s" * 2000} for gap in huge["gaps"] for _ in range(20)]
-    view = page_view(huge, {**ui_page, "page_sha256": canonical_sha256(huge["pages"][0])})
-    inputs = _inputs("d" * 200_000, "k" * 200_000)
-    evidence = maker_result(
-        maker_output(
-            api_calls=[
-                {**maker_output()["api_calls"][0], "payload_shape": "p" * 2000} for _ in range(200)
-            ]
-        ),
-        ui_page,
-    )
-    for role, result in (("maker", None), ("checker", evidence)):
-        section = input_section(
-            view, ui_page, inputs, role=role, fence=_untrusted_block, maker_result=result
+    ui_page = {**_ui_page(), "page_sha256": canonical_sha256(huge["pages"][0])}
+    with pytest.raises(UiPageRejected, match="UI_PAGE_SPEC_TOO_LARGE"):
+        input_section(
+            page_view(huge, ui_page), ui_page, _inputs(), role="maker", fence=_untrusted_block
         )
-        assert len(section.encode("utf-8")) <= INPUT_BUDGET
-        assert "page entry truncated" in section
-        assert "legacy diff truncated" in section and "kit excerpt truncated" in section
-    small = input_section(
-        page_view(blueprint(), ui_page), ui_page, _inputs(), role="maker", fence=_untrusted_block
-    )
-    assert "truncated" not in small
+    # The checker's limit is lower (it also carries the maker's evidence).
+    large, large_page = _large_page()
+    with pytest.raises(UiPageRejected, match="UI_PAGE_SPEC_TOO_LARGE"):
+        input_section(
+            page_view(large, large_page),
+            large_page,
+            _inputs(),
+            role="checker",
+            fence=_untrusted_block,
+            maker_result={},
+        )
 
 
 # -- contracts --------------------------------------------------------------------------------
@@ -927,3 +978,54 @@ def test_embedded_ui_page_schemas_equal_the_agent_pack_files(skill: str) -> None
     assert json.loads(skill_schema.read_text()) == load_schema(schema)
     assert json.loads((LOCAL_PACK / "schemas" / schema).read_text()) == load_schema(schema)
     assert role in (LOCAL_PACK / "skills" / "catalog.yaml").read_text()
+
+
+def test_a_failed_required_kit_call_is_reported() -> None:
+    calls = [
+        {"tool": "get_rules", "arguments": {}, "is_error": False},
+        {"tool": "get_tokens", "arguments": {}, "is_error": True},
+        {"tool": "get_component", "arguments": {"id": "button"}, "is_error": True},
+    ]
+    assert kit_failures({"calls": calls}) == ["get_component button"]
+    assert kit_failures({"calls": calls[1:2]}) == ["get_rules (not called)"]
+
+
+async def test_the_scan_step_blocks_when_a_spec_kit_item_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git, (source, _change, base) = _git_repository(tmp_path / "repo")
+    worktree = tmp_path / "worktrees" / "falcone" / str(uuid4())
+    worktree.mkdir(parents=True)
+    handler = ScanActivityHandler(
+        Settings(
+            worktree_root=tmp_path / "worktrees",
+            evidence_root=tmp_path / "evidence",
+            project_config_root=PROJECTS,
+        ),
+        kit_client_factory=lambda policy: _stub(tmp_path)[0],
+    )
+    monkeypatch.setattr(handler, "_git", lambda path, arguments, **_: git(arguments))
+    real = handler._kit_document
+
+    async def missing_item(policy: Any, plan: Any) -> dict[str, Any]:
+        document = await real(policy, plan)
+        for call in document["calls"]:
+            if call["tool"] == "get_template":
+                call["is_error"] = True
+        return document
+
+    monkeypatch.setattr(handler, "_kit_document", missing_item)
+    ui_page = {**_ui_page(), "source_sha": source, "closure": ["apps/web-console/src/pages/T.tsx"]}
+    result = await handler.handle(
+        "delivery.prepare_ui_page",
+        {
+            "project": "falcone",
+            "change_set_id": str(uuid4()),
+            "source_worktree": str(worktree),
+            "source_base_sha": base,
+            "ui_page": ui_page,
+        },
+    )
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "UI_KIT_SNAPSHOT_FAILED")
+    assert "get_template list-page" in result["blocker_detail"]
+    assert "ui_page_inputs" not in result
