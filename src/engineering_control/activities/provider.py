@@ -40,6 +40,10 @@ from engineering_control.observability.agent import (
     local_worker_host,
     normalize_agent_role,
 )
+from engineering_control.observability.cgroup_memory import (
+    memory_pressure_event,
+    memory_snapshot,
+)
 from engineering_control.security.redaction import (
     SecretRedactor,
     bounded_detail,
@@ -158,13 +162,22 @@ class ProviderActivityHandler:
         self.redactor = SecretRedactor()
 
     def _default_adapter(self) -> ProviderAdapter:
+        # NEW-226: every run's TMPDIR under temporary_root/<provider>, and its memory bound.
+        temp_root = str(self.settings.temporary_root / self.provider.value)
+        memory_mib = self.settings.agent_run_memory_max_mib
+        memory = memory_mib << 20 if memory_mib is not None else None
         if self.provider is Provider.CODEX:
             return CodexCLIAdapter(
                 executable=str(self.settings.codex_executable),
-                temp_root=str(self.settings.temporary_root / self.provider.value),
+                temp_root=temp_root,
                 default_model=self.settings.codex_model,
+                run_memory_max_bytes=memory,
             )
-        return ClaudeCLIAdapter(executable=str(self.settings.claude_executable))
+        return ClaudeCLIAdapter(
+            executable=str(self.settings.claude_executable),
+            temp_root=temp_root,
+            run_memory_max_bytes=memory,
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step == "quota.refresh":
@@ -321,6 +334,8 @@ class ProviderActivityHandler:
                 except Exception:  # noqa: BLE001 - observability cannot change provider work
                     recorder.transcript_incomplete = True
 
+        # NEW-226: compared with the worker's memory state if the step fails.
+        memory_before = memory_snapshot()
         keepalive = asyncio.create_task(heartbeat_keepalive())
         try:
             result = await self._execute(request, heartbeat_event, sandbox_toolchain)
@@ -339,6 +354,11 @@ class ProviderActivityHandler:
                 await asyncio.sleep(delay)
                 result = await self._execute(request, heartbeat_event, sandbox_toolchain)
         except BaseException as error:
+            # NEW-226: an activity timeout arrives here as a cancellation.
+            pressure = memory_pressure_event(memory_before, memory_snapshot())
+            if pressure is not None:
+                with suppress(Exception):
+                    await recorder.event(pressure)
             try:
                 await recorder.finish(
                     ExecutionFinishInput(
@@ -358,6 +378,11 @@ class ProviderActivityHandler:
             keepalive.cancel()
             with suppress(asyncio.CancelledError):
                 await keepalive
+        if result.status in {RunStatus.FAILED, RunStatus.TIMED_OUT}:
+            # NEW-226: a slow maker reads "memory-throttled", not only a timeout.
+            pressure = memory_pressure_event(memory_before, memory_snapshot())
+            if pressure is not None:
+                await heartbeat_event(pressure)
         try:
             await recorder.finish(
                 ExecutionFinishInput(

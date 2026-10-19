@@ -157,7 +157,6 @@ from engineering_control.workflows.cleanup_scope import (
     PROJECT_UNATTRIBUTABLE_PROTECTION,
 )
 from engineering_control.workflows.provider_stops import provider_unavailable_stop
-from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -2987,10 +2986,8 @@ class MetadataActivityHandler:
         if requested not in (1, 2, 3):
             raise ValueError("FRONT capacity needs the approved concurrency")
         leases = self.settings.implementation_leases_per_project
-        maker_slots = min(
-            ROLE_WORKER_REGISTRY["codex"].max_concurrent_activities,
-            ROLE_WORKER_REGISTRY["claude"].max_concurrent_activities,
-        )
+        # NEW-226: the provider workers' slots are set per deployment (default 2 each).
+        maker_slots = min(self.settings.codex_worker_slots, self.settings.claude_worker_slots)
         broker = self._quota_broker()
         quota = {
             provider.value: broker.available(provider, reserve_work=False)[0]

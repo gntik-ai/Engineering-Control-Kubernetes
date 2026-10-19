@@ -622,18 +622,19 @@ def test_worker_memory_budget_fits_the_worker_host() -> None:
     systemd = REPOSITORY_ROOT / "systemd"
     workers = (systemd / "engineering-workers.slice").read_text(encoding="utf-8")
     agents = (systemd / "engineering-workers-agents.slice").read_text(encoding="utf-8")
+    # NEW-226: two codex makers at once; the agents slice holds codex 8G or claude 7G.
     assert _unit_setting(workers, "MemoryMax") == ["13G"]
-    assert _unit_setting(agents, "MemoryMax") == ["9G"]
+    assert _unit_setting(agents, "MemoryMax") == ["10.5G"]
     for unit in ("engineering-worker@.service", "engineering-release-worker.service"):
         text = (systemd / unit).read_text(encoding="utf-8")
         assert _unit_setting(text, "Slice") == ["engineering-workers.slice"], unit
-    for agent in ("codex", "claude"):
+    for agent, high, maximum in (("codex", "7G", "8G"), ("claude", "6G", "7G")):
         dropin = (systemd / f"engineering-worker@{agent}.service.d" / "50-memory.conf").read_text(
             encoding="utf-8"
         )
         assert _unit_setting(dropin, "Slice") == ["engineering-workers-agents.slice"]
-        assert _unit_setting(dropin, "MemoryMax") == ["7G"]
-        assert _unit_setting(dropin, "MemoryHigh") == ["6G"]
+        assert _unit_setting(dropin, "MemoryMax") == [maximum]
+        assert _unit_setting(dropin, "MemoryHigh") == [high]
     bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
     assert "engineering-workers.slice engineering-workers-agents.slice" in bootstrap
     assert "50-memory.conf" in bootstrap

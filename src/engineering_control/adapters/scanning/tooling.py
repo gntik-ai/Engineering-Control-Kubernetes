@@ -11,8 +11,10 @@ from engineering_control.security.redaction import REDACTED, SecretRedactor
 
 
 class DeterministicScanner:
-    def __init__(self, runner: SafeCommandRunner) -> None:
+    def __init__(self, runner: SafeCommandRunner, trivy_cache_root: Path | None = None) -> None:
         self.runner = runner
+        # NEW-226: Trivy's DB cache on disk; unset, trivy's own default (as before).
+        self.trivy_cache_root = trivy_cache_root
         self.redactor = SecretRedactor()
 
     def secret_scan(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
@@ -50,10 +52,18 @@ class DeterministicScanner:
         if existing.is_file():
             return self._sanitize_trivy(existing)
         report = self._report_path(evidence_directory, "trivy.json")
+        cache: list[str] = []
+        if self.trivy_cache_root is not None:
+            # The runner's environment has no HOME, so trivy's default cache was
+            # os.TempDir()/trivy: the worker's tmpfs. Scan results stay in memory (an fs
+            # result cache would only grow); the DB persists across worker restarts.
+            self.trivy_cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cache = ["--cache-dir", str(self.trivy_cache_root), "--cache-backend", "memory"]
         result = self.runner.run(
             "trivy",
             [
                 "filesystem",
+                *cache,
                 "--format",
                 "json",
                 "--output",

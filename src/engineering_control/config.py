@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     deployment_target_root: Path = Path("/etc/engineering-control/targets")
     runtime_target_root: Path = Path("/etc/engineering-control/runtime")
     temporary_root: Path = Path("/srv/engineering/tmp")
+    # NEW-226: provider runs get their own TMPDIR under temporary_root/<provider>; this
+    # sweep is the backstop for the role worker's private /tmp (PrivateTmp, a tmpfs held
+    # in RAM). On start and every interval it removes entries nobody wrote for the idle
+    # time and none a running step wrote; node-compile-cache stays.
+    private_tmp_sweep_idle_minutes: int = Field(default=90, ge=15, le=1440)
+    private_tmp_sweep_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    # NEW-226: one provider run's cgroup memory.max (MiB). Unset: the worker's MemoryHigh
+    # less 1 GiB (codex 6G, claude 5G), so a runaway command is OOM-killed in its own run.
+    agent_run_memory_max_mib: int | None = Field(default=None, ge=512, le=65536)
     codex_executable: Path = Path("/usr/local/bin/codex")
     # NEW-36: pin the Codex model instead of inheriting the CLI default, which changed
     # under us (codex-cli 0.149.0 defaulted to gpt-5.4, refused for the ChatGPT account).
@@ -183,6 +192,11 @@ class Settings(BaseSettings):
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")
     trivy_executable: Path = Path("/usr/local/bin/trivy")
+    # NEW-226: the scan worker's own Trivy cache (vulnerability DB; scan results stay in
+    # memory). Without HOME, trivy fell back to os.TempDir()/trivy: 1.6 GB in the unit's
+    # PrivateTmp tmpfs, i.e. RAM. Under the scan unit's ReadWritePaths
+    # (/srv/engineering/cache/%i); never the makers' read-only toolchain/trivy.
+    trivy_cache_root: Path = Path("/srv/engineering/cache/scan/trivy")
     semgrep_executable: Path = Path("/usr/local/bin/semgrep")
     syft_executable: Path = Path("/usr/local/bin/syft")
     kubeconform_executable: Path = Path("/usr/local/bin/kubeconform")
@@ -216,6 +230,17 @@ class Settings(BaseSettings):
     # NEW-214 Stage 2 (operator 2026-10-18): implementation leases one project may hold at
     # once. One is always left for the BACK slot of a pipelined loop.
     implementation_leases_per_project: int = Field(default=3, ge=1, le=4)
+    # NEW-226: the activities (makers, checkers, specs) each provider worker runs at once,
+    # per deployment: the NEW-214 Stage 2 FRONT capacity is bounded by the smaller one.
+    # The agent workers' memory drop-ins are sized for 2, so it may only be lowered (1
+    # while the worker host is short of RAM). Set it where both read it: the worker's env
+    # (the worker runs that many) and control.env (FRONT capacity).
+    codex_worker_slots: int = Field(
+        default=ROLE_WORKER_REGISTRY["codex"].max_concurrent_activities, ge=1, le=2
+    )
+    claude_worker_slots: int = Field(
+        default=ROLE_WORKER_REGISTRY["claude"].max_concurrent_activities, ge=1, le=2
+    )
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)

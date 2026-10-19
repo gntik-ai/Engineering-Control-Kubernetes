@@ -14,6 +14,10 @@ from engineering_control.adapters.process import (
     classify_failure,
     run_jsonl_process,
 )
+from engineering_control.adapters.run_temp import (
+    optional_run_temporary_directory,
+    run_temp_environment,
+)
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.provider_error_kinds import provider_error_kind
@@ -23,8 +27,16 @@ from engineering_control.security.redaction import SecretRedactor
 class ClaudeCLIAdapter:
     provider = Provider.CLAUDE
 
-    def __init__(self, executable: str = "claude") -> None:
+    def __init__(
+        self,
+        executable: str = "claude",
+        temp_root: str | None = None,
+        run_memory_max_bytes: int | None = None,
+    ) -> None:
         self.executable = executable
+        # NEW-226: each run's TMPDIR is created (and removed) under this root.
+        self.temp_root = temp_root
+        self.run_memory_max_bytes = run_memory_max_bytes
 
     async def authenticated(self) -> bool:
         result = await run_auth_probe(
@@ -101,15 +113,18 @@ class ClaudeCLIAdapter:
         if request.effort:
             command.extend(("--effort", request.effort))
 
-        process_result = await run_jsonl_process(
-            command,
-            prompt=request.prompt,
-            cwd=request.working_directory,
-            timeout_seconds=request.timeout_seconds,
-            provider=self.provider.value,
-            on_event=on_event,
-            toolchain=toolchain,
-        )
+        with optional_run_temporary_directory(self.temp_root) as run_temp:
+            process_result = await run_jsonl_process(
+                command,
+                prompt=request.prompt,
+                cwd=request.working_directory,
+                timeout_seconds=request.timeout_seconds,
+                provider=self.provider.value,
+                on_event=on_event,
+                environment=run_temp_environment(run_temp) if run_temp is not None else None,
+                toolchain=toolchain,
+                run_memory_max_bytes=self.run_memory_max_bytes,
+            )
         structured_result, summary, session_id = self._final(process_result.events)
         usage = self._usage(process_result.events)
         recovered: dict[str, Any] | None = None

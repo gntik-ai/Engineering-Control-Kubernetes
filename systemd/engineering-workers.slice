@@ -2,6 +2,8 @@
 # host (engineering-worker@{browser,scan,delivery,codex,claude}, the release worker).
 # 13G of the 15G host, so the OS and the backup receiver always keep ~2G. Per-unit caps
 # (3G browser/scan/delivery, 1G release, 7G agents) stay limits inside it.
+# NEW-226 (2026-10-19): unchanged at 13G (the host has 15.2G, no swap); the agents'
+# nested slice grows from 9G to 10.5G inside it, codex to 8G.
 [Unit]
 Description=Engineering Control workers (aggregate memory budget)
 
