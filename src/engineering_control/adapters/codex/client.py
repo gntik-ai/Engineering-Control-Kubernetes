@@ -16,6 +16,10 @@ from engineering_control.adapters.process import (
     classify_failure,
     run_jsonl_process,
 )
+from engineering_control.adapters.run_temp import (
+    optional_run_temporary_directory,
+    run_temp_environment,
+)
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.provider_error_kinds import provider_error_kind
@@ -34,10 +38,12 @@ class CodexCLIAdapter:
         executable: str = "codex",
         temp_root: str | None = None,
         default_model: str | None = None,
+        run_memory_max_bytes: int | None = None,
     ) -> None:
         self.executable = executable
         self.temp_root = temp_root
         self.default_model = default_model
+        self.run_memory_max_bytes = run_memory_max_bytes
 
     async def authenticated(self) -> bool:
         result = await run_auth_probe(
@@ -147,7 +153,11 @@ class CodexCLIAdapter:
             raise ValueError("Codex adapter received a non-Codex request")
         started_at = datetime.now(UTC)
         temp_parent = self._run_temp_parent(request.run_id) if self.temp_root else None
-        with tempfile.TemporaryDirectory(prefix="attempt-", dir=temp_parent) as raw:
+        with (
+            tempfile.TemporaryDirectory(prefix="attempt-", dir=temp_parent) as raw,
+            # NEW-226: the run's TMPDIR, beside (not inside) the attempt directory: short.
+            optional_run_temporary_directory(self.temp_root) as run_temp,
+        ):
             temp = Path(raw)
             os.chmod(temp, 0o700)
             schema_path = temp / "output-schema.json"
@@ -197,7 +207,9 @@ class CodexCLIAdapter:
                 timeout_seconds=request.timeout_seconds,
                 provider=self.provider.value,
                 on_event=on_event,
+                environment=run_temp_environment(run_temp) if run_temp is not None else None,
                 toolchain=toolchain,
+                run_memory_max_bytes=self.run_memory_max_bytes,
             )
             structured_result: dict[str, Any] = {}
             summary = ""

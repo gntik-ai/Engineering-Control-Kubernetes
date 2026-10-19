@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import tempfile
@@ -189,6 +190,14 @@ DELEGATED_SUBGROUP = "supervisor"
 # Run cgroups this worker process owns: the stale sweep never touches one that was just
 # created and is not populated yet.
 _LIVE_RUN_CGROUPS: set[str] = set()
+# NEW-226: a run cgroup's memory.max. A runaway command is OOM-killed inside its own run
+# (the agent sees a failed command) before the worker reaches MemoryHigh, where the
+# kernel throttles every process in it: on 2026-10-19 one maker's 4.45 GB `node --test`
+# held the codex worker at 97% memory pressure and the other loop's auth probe timed out.
+# Unless configured, a run may use the worker's MemoryHigh (else MemoryMax) less this
+# reserve for the supervisor (heartbeats, probes) and the other run's working set.
+_RUN_MEMORY_RESERVE_BYTES = 1 << 30
+_LOGGER = logging.getLogger(__name__)
 
 
 def _own_cgroup() -> Path | None:
@@ -228,6 +237,9 @@ class _RunCgroup:
         _LIVE_RUN_CGROUPS.add(path.name)
         return cls(path)
 
+    def limit_memory(self, configured: int | None) -> None:
+        _limit_run_memory(self.path.parent, self.path, configured)
+
     def wrap(self, command: Sequence[str]) -> list[str]:
         return ["/bin/sh", "-c", _ENTER_CGROUP, str(self.path / "cgroup.procs"), *command]
 
@@ -248,6 +260,42 @@ class _RunCgroup:
         with suppress(OSError):
             self.path.rmdir()  # left in place if a process is stuck; a later sweep retries
         _LIVE_RUN_CGROUPS.discard(self.path.name)
+
+
+def _cgroup_limit(path: Path) -> int | None:
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None
+    return int(value) if value.isdigit() else None
+
+
+def run_memory_limit(worker: Path, configured: int | None) -> int | None:
+    """NEW-226: the memory.max of a run cgroup under ``worker`` (None: no limit)."""
+    if configured is not None:
+        return configured
+    budget = _cgroup_limit(worker / "memory.high") or _cgroup_limit(worker / "memory.max")
+    if budget is None:
+        return None
+    return max(budget - _RUN_MEMORY_RESERVE_BYTES, budget // 2)
+
+
+def _limit_run_memory(worker: Path, run: Path, configured: int | None) -> None:
+    """Enable the delegated memory controller for run cgroups and cap this one.
+
+    The unit delegates the controller (Delegate=yes) but leaves its subtree_control
+    empty; the worker cgroup itself holds no process (the worker is in "supervisor"),
+    so it may enable it. A limit that cannot be set leaves the run as it was before."""
+    limit = run_memory_limit(worker, configured)
+    if limit is None:
+        return
+    try:
+        control = worker / "cgroup.subtree_control"
+        if "memory" not in control.read_text().split():
+            control.write_text("+memory")
+        (run / "memory.max").write_text(str(limit))
+    except OSError as error:
+        _LOGGER.warning("run cgroup memory limit not applied: %s", error.strerror or error)
 
 
 def _remove_stale_run_cgroups(parent: Path) -> None:
@@ -485,6 +533,7 @@ async def run_jsonl_process(
     environment: Mapping[str, str] | None = None,
     max_stderr_bytes: int = 256_000,
     toolchain: SandboxToolchain | None = None,
+    run_memory_max_bytes: int | None = None,
 ) -> ProcessResult:
     if not command or any(not isinstance(part, str) or "\x00" in part for part in command):
         raise ValueError("command must be a non-empty string sequence without NUL bytes")
@@ -494,6 +543,8 @@ async def run_jsonl_process(
     prompt_bytes = safe_prompt.encode("utf-8")  # fails here, before anything is started
     cgroup = _RunCgroup.create()
     try:
+        if cgroup is not None:
+            cgroup.limit_memory(run_memory_max_bytes)
         process = await asyncio.create_subprocess_exec(
             *(cgroup.wrap(command) if cgroup is not None else command),
             cwd=cwd,
