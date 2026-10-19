@@ -79,10 +79,17 @@ from engineering_control.engineering.ui_inventory import (
 from engineering_control.engineering.ui_kit import (
     UI_MCP_UNAVAILABLE,
     GntikUiKitClient,
+    KitProtocolError,
     KitSession,
+    KitToolRefused,
     KitUnavailable,
     collect_kit_snapshot,
     snapshot_plan,
+)
+from engineering_control.engineering.ui_page_delivery import (
+    UiPageRejected,
+    kit_excerpt,
+    legacy_drift,
 )
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
@@ -247,6 +254,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             "observability.cleanup_workspace",
             "ui.inventory",
             "ui.kit_snapshot",
+            "delivery.prepare_ui_page",
             *UI_PLAN_SCAN_STEPS,
         }
     )
@@ -388,6 +396,10 @@ class ScanActivityHandler(UiPlanScanSteps):
             if step == "ui.kit_snapshot":
                 return await self._with_heartbeat(
                     self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"
+                )
+            if step == "delivery.prepare_ui_page":
+                return await self._with_heartbeat(
+                    self._prepare_ui_page(payload), phase="ui_page_inputs"
                 )
         except PermissionError as error:
             raise ApplicationError(
@@ -1348,14 +1360,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             selection[kind] = value
         plan = snapshot_plan(**selection)
         try:
-            async with self.kit_client_factory(policy) as client:
-                document = await collect_kit_snapshot(
-                    client,
-                    image=policy.mcp.image,
-                    digest=policy.mcp.digest,
-                    gntik_ui_version=policy.gntik_ui.version,
-                    plan=plan,
-                )
+            document = await self._kit_document(policy, plan)
         except KitUnavailable as error:
             return {
                 **payload,
@@ -1370,6 +1375,82 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "gntik-ui kit snapshot exceeded its deadline", type="UiKitTimeout"
             ) from error
         return await asyncio.to_thread(self._store_kit_snapshot, payload, document)
+
+    async def _kit_document(
+        self, policy: UiMigrationPolicy, plan: list[tuple[str, dict[str, Any]]]
+    ) -> dict[str, Any]:
+        async with self.kit_client_factory(policy) as client:
+            return await collect_kit_snapshot(
+                client,
+                image=policy.mcp.image,
+                digest=policy.mcp.digest,
+                gntik_ui_version=policy.gntik_ui.version,
+                plan=plan,
+            )
+
+    async def _prepare_ui_page(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-227: the bounded inputs of a blueprint page's maker and checker.
+
+        The legacy drift: the page's closure between the blueprint's source commit and this
+        delivery's source base (deterministic git in the hardened ChangeSet location, never
+        the maker's index or configuration). The kit: a snapshot of the page's template,
+        blocks and components from the pinned gntik-ui MCP image, stored as evidence like
+        ui.kit_snapshot. The payload carries only the bounded excerpts; a missing commit or
+        kit service BLOCKs the delivery instead of a maker running without them."""
+        ui_page = payload.get("ui_page")
+        if not isinstance(ui_page, dict):
+            raise ValueError("delivery.prepare_ui_page requires the ui_page context")
+        project = Project(str(payload["project"]))
+
+        def blocked(blocker: str, detail: str) -> dict[str, Any]:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": blocker,
+                "blocker_detail": str(SecretRedactor().redact_text(detail).value)[:300],
+            }
+
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        base_sha = self._sha(payload.get("source_base_sha"), "source_base_sha")
+        try:
+            drift = await asyncio.to_thread(
+                legacy_drift,
+                lambda arguments: self._git(worktree, arguments),
+                source_sha=str(ui_page.get("source_sha")),
+                base_sha=base_sha,
+                files=[str(path) for path in ui_page.get("closure") or []],
+            )
+        except UiPageRejected as rejected:
+            return blocked(rejected.code, rejected.detail)
+        except (CommandFailure, WorktreeError) as error:
+            return blocked("UI_PAGE_LEGACY_DRIFT_UNAVAILABLE", str(error))
+        policy = (await asyncio.to_thread(self.catalog.project, project.value)).ui_migration
+        if policy is None:
+            raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        selection = ui_page.get("kit_selection") or {}
+        plan = snapshot_plan(
+            templates=list(selection.get("templates") or []),
+            blocks=list(selection.get("blocks") or []),
+            components=list(selection.get("components") or []),
+        )
+        try:
+            document = await self._kit_document(policy, plan)
+        except KitUnavailable as error:
+            return blocked(UI_MCP_UNAVAILABLE, str(error))
+        except (KitProtocolError, KitToolRefused) as error:
+            return blocked("UI_KIT_SNAPSHOT_FAILED", str(error))
+        except TimeoutError as error:
+            raise ApplicationError(
+                "gntik-ui kit snapshot exceeded its deadline", type="UiKitTimeout"
+            ) from error
+        stored = await asyncio.to_thread(self._store_kit_snapshot, payload, document)
+        return {
+            **payload,
+            "ui_page_inputs": {
+                "drift": drift,
+                "kit": {**kit_excerpt(document), "evidence": stored["evidence"]},
+            },
+        }
 
     def _store_kit_snapshot(
         self, payload: dict[str, Any], document: dict[str, Any]

@@ -44,6 +44,11 @@ UI_PLAN_SKILLS: dict[str, tuple[str, str]] = {
     "plan-ui-migration": ("ui-migration-architect", "ui-migration-blueprint.schema.json"),
     "triage-ui-gap": ("ui-gap-triager", "ui-gap-draft.schema.json"),
 }
+# NEW-227: the skills that deliver one published page change request (maker and checker).
+UI_PAGE_SKILLS: dict[str, tuple[str, str]] = {
+    "migrate-ui-page": ("ui-page-implementer", "ui-page-implementation.schema.json"),
+    "review-ui-page": ("ui-page-reviewer", "ui-page-review.schema.json"),
+}
 # NEW-131: the skill's released part schemas, part name -> schema (catalog
 # `part_output_schemas`).
 UI_PLAN_PART_SCHEMAS: dict[str, dict[str, str]] = {
@@ -176,7 +181,7 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
         if isinstance(record, dict)
     }
     for skill in skills or tuple(UI_PLAN_SKILLS):
-        role, schema_name = UI_PLAN_SKILLS[skill]
+        role, schema_name = {**UI_PLAN_SKILLS, **UI_PAGE_SKILLS}[skill]
         for relative in (
             f"skills/{skill}/SKILL.md",
             f"skills/{skill}/references/contract.md",

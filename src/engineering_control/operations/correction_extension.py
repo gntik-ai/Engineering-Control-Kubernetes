@@ -29,6 +29,7 @@ from engineering_control.db.models import (
     Step,
 )
 from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS, canonical_sha256
+from engineering_control.engineering.ui_page_delivery import CHECKER_ROLES
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.operations.issue_delivery_approval import (
     CORRECTION_EXTENSION_KEY,
@@ -41,7 +42,6 @@ from engineering_control.operations.issue_start import backlog_issue_signal_bloc
 
 EXTENSION_EVENT_TYPE = "correction_extension_granted"
 VALIDATION_BLOCKER = "CHANGESET_VALIDATION_FINDINGS"
-CHECKER_ROLE = "code-reviewer"
 # Durable record of the issue a backlog loop Run is paused on (NEW-133).
 LOOP_PAUSE_TARGET_STEP = "backlog.loop_pause_target"
 _ISSUE_REF = re.compile(r"gntik-ai/[a-z][a-z-]{0,60}#[1-9][0-9]{0,9}")
@@ -310,9 +310,10 @@ def grant_correction_extension(
             "CORRECTION_EXTENSION_FINDINGS_MISSING",
             "the latest attempt has no recorded validation findings",
         )
+    # NEW-227: the code-reviewer, or a UI page delivery's ui-page-reviewer.
     checker = session.scalar(
         select(AgentInvocation)
-        .where(AgentInvocation.run_id == latest_run.id, AgentInvocation.role == CHECKER_ROLE)
+        .where(AgentInvocation.run_id == latest_run.id, AgentInvocation.role.in_(CHECKER_ROLES))
         .order_by(AgentInvocation.started_at.desc(), AgentInvocation.id.desc())
         .limit(1)
     )

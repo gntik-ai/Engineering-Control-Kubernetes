@@ -28,9 +28,10 @@ AgentRole = Literal["maker", "checker", "auditor", "reviewer", "verifier"]
 
 def normalize_agent_role(value: str) -> AgentRole:
     role = value.strip().lower().replace("_", "-")
-    if role in {"maker", "implementer", "product-spec-architect"}:
+    # NEW-227: the UI page delivery roles are a maker and a checker too.
+    if role in {"maker", "implementer", "ui-page-implementer", "product-spec-architect"}:
         return "maker"
-    if role in {"checker", "code-reviewer"}:
+    if role in {"checker", "code-reviewer", "ui-page-reviewer"}:
         return "checker"
     if role in {"auditor", "domain-auditor"}:
         return "auditor"

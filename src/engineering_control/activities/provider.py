@@ -30,6 +30,12 @@ from engineering_control.engineering.toolchain import (
     payload_node_toolchain,
 )
 from engineering_control.engineering.ui_blueprint import agent_pack_parts_only
+from engineering_control.engineering.ui_page_delivery import (
+    UI_PAGE_CHECKER_ROLE,
+    UI_PAGE_MAKER_ROLE,
+    checker_result,
+    maker_result,
+)
 from engineering_control.handoff.store import HandoffStore
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import Provider, RunStatus
@@ -377,6 +383,7 @@ class ProviderActivityHandler:
             recorder.transcript_incomplete = True
         if result.status is RunStatus.SUCCESS:
             self._validate_result_schema(request, result)
+            result = self._ui_page_contract(step, request, result, payload)
 
         response = {
             **runtime_payload,
@@ -603,6 +610,21 @@ class ProviderActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+
+    @staticmethod
+    def _ui_page_contract(
+        step: str, request: AgentRequest, result: AgentResult, payload: dict[str, Any]
+    ) -> AgentResult:
+        """NEW-227: the UI page skills' outputs, valid against their released schemas, become
+        the delivery maker result and checker verdict every later step consumes."""
+        ui_page = payload.get("ui_page")
+        if step == "delivery.invoke_maker" and request.role == UI_PAGE_MAKER_ROLE:
+            mapped = maker_result(result.structured_result, ui_page)
+        elif step == "delivery.invoke_checker" and request.role == UI_PAGE_CHECKER_ROLE:
+            mapped = checker_result(result.structured_result, ui_page)
+        else:
+            return result
+        return result.model_copy(update={"structured_result": mapped})
 
     _SCHEMA_FINDINGS = 20
     _SCHEMA_FINDING_MESSAGE = 300

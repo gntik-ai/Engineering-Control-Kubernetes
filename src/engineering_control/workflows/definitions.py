@@ -701,6 +701,7 @@ class ControlledWorkflow:
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
+            "delivery.prepare_ui_page",
             "delivery.resolve_dependencies",
             "delivery.converge_deployment_pin",
             "delivery.validate_changeset",
@@ -1560,6 +1561,26 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                     # per attempt. Idempotent no-op if nothing was ever acquired.
                     await self._release_delivery_leases_best_effort(context)
                     return {"status": context["status"], "context": context}
+                if (
+                    step == "delivery.deterministic_prechecks"
+                    and context.get("ui_page")
+                    and self._ui_page_inputs_patched()
+                ):
+                    # NEW-227: a blueprint page's maker and checker get its legacy changes
+                    # since the blueprint and a kit snapshot of the pinned gntik-ui (scan
+                    # worker). Only for such a delivery: every other one never reaches the
+                    # marker, so its history is unchanged.
+                    if not await self._checkpoint("DELIVERY_PREPARE_UI_PAGE"):
+                        await self._release_delivery_leases_best_effort(context)
+                        return {"status": "CANCELLED", "context": context}
+                    context = await self._step(
+                        "delivery.prepare_ui_page",
+                        {**context, "delivery_request": delivery_request},
+                        timeout_minutes=30,
+                    )
+                    if context.get("status") == "BLOCKED":
+                        await self._release_delivery_leases_best_effort(context)
+                        return {"status": "BLOCKED", "context": context}
                 if step == "delivery.invoke_deployment_maker" and self._pin_convergence_patched():
                     # NEW-118: the source maker runs first, so a deployment commit left the
                     # source CI pin of the deployment repository one commit behind
@@ -1694,6 +1715,10 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
 
     def _prepare_toolchain_patched(self) -> bool:
         return workflow.patched("delivery-prepare-toolchain-v1")
+
+    def _ui_page_inputs_patched(self) -> bool:
+        # Checked once, after the prechecks of a UI page delivery (NEW-227).
+        return workflow.patched("delivery-ui-page-inputs-v1")
 
     def _pin_convergence_patched(self) -> bool:
         # Checked once, right after the deployment maker; histories recorded before
