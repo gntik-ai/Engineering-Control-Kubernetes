@@ -32,7 +32,9 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.issue_approval import campaign_loop_prefix
+from engineering_control.operations.issue_delivery_approval import campaign_loop_scope
 from engineering_control.operations.issue_reapproval import (
+    campaign_loop_identity,
     plan_issue_reapproval,
     record_issue_reapproval,
 )
@@ -278,7 +280,10 @@ class TypedCommandBus:
         preconditions are checked, then re-checked inside the one transaction that prepares,
         approves and audits, under the campaign approval and row locks; any change of the
         campaign's approval in between refuses. A rerun after the approval reports
-        ALREADY_APPROVED, re-enqueues a missing policy activation and awaits it."""
+        ALREADY_APPROVED, re-enqueues a missing policy activation and awaits it.
+
+        NEW-229: a campaign-wide loop (no issue operation) gets its campaign approval
+        re-issued with exactly its own scope, audited on the campaign for the loop."""
         current_run_id = await self.control.current_open_run_id(loop_workflow_id)
         awaited_issue = (
             await self.control.awaited_operator_issue(loop_workflow_id, current_run_id)
@@ -295,21 +300,35 @@ class TypedCommandBus:
             "awaited_issue": awaited_issue,
         }
         loop_prefix, separator, _ = loop_workflow_id.partition("-operation-")
+        campaign_loop = campaign_loop_identity(loop_workflow_id, project)
         if separator and loop_prefix.startswith(f"backlog-loop-{project}-"):
             await self._close_ended_campaign_loops(loop_prefix, exclude=loop_workflow_id)
+        elif campaign_loop is not None:
+            await self._close_ended_campaign_loops(
+                campaign_loop_prefix(project, campaign_loop[0]), exclude=loop_workflow_id
+            )
         plan = await self.operations.plan_issue_reapproval(actor=actor, **arguments)
         request: ExistingBacklogLoopStart = plan["request"]
         campaign_id = request.backlog_campaign_id
         operation_id = request.issue_operation_id
-        if operation_id is None:
+        loop_scope = (
+            campaign_loop_scope(request.model_dump(mode="json")) if operation_id is None else None
+        )
+        if operation_id is None and (campaign_loop is None or loop_scope is None):
             raise ValueError("issue re-approval requires the loop's issue operation")
-        issue_ref = f"{request.target_repository}#{request.target_issue_number}"
+        issue_ref = (
+            f"{request.target_repository}#{request.target_issue_number}"
+            if operation_id is not None
+            else f"gntik-ai/{repository}#{issue_number}"
+        )
         result: dict[str, Any] = {
             "loop_workflow_id": loop_workflow_id,
             "issue": issue_ref,
-            "issue_operation_id": str(request.issue_operation_id),
+            "issue_operation_id": str(operation_id) if operation_id is not None else None,
             "production": False,
         }
+        if operation_id is None:
+            result["backlog_campaign_id"] = str(campaign_id)
         if plan["status"] == "ALREADY_APPROVED":
             approval: dict[str, Any] = {
                 "status": plan["campaign"],
@@ -332,6 +351,7 @@ class TypedCommandBus:
                     approval_status=str(approved["status"]),
                     actor=actor,
                     issue_approval_binding=request.issue_approval_binding,
+                    loop_scope=loop_scope,
                 )
 
             approval = await self.metadata.reissue_issue_approval(
@@ -341,11 +361,8 @@ class TypedCommandBus:
             result["approval_binding"] = str(approval["approval_binding"])
             result["audit_event_id"] = approval["audit_event_id"]
         await self._await_policy_activation(campaign_id, approval)
-        short = str(request.target_repository).removeprefix("gntik-ai/")
-        result["next"] = (
-            f"engineering-ctl backlog-retry {loop_workflow_id} {short} "
-            f"{request.target_issue_number}"
-        )
+        short, _, number = issue_ref.removeprefix("gntik-ai/").partition("#")
+        result["next"] = f"engineering-ctl backlog-retry {loop_workflow_id} {short} {number}"
         return result
 
     async def _await_policy_activation(self, campaign_id: UUID, approval: dict[str, Any]) -> None:

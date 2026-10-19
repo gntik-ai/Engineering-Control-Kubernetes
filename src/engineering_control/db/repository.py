@@ -1279,7 +1279,10 @@ class SQLMetadataRepository:
 
         The campaign approval lock and the campaign row lock are held from validation to
         commit, so no approval, ownership or loop-start change can slip between the checks
-        and the mutation; ``validate`` re-runs every precondition inside it."""
+        and the mutation; ``validate`` re-runs every precondition inside it.
+
+        NEW-229: for a campaign-wide loop (no issue operation) the campaign approval is
+        re-issued with exactly the loop's own scope (mode, risk, items, concurrency)."""
         if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("existing-backlog approval requires a reauthenticated operator")
         with self.sessions.begin() as session:
@@ -1291,6 +1294,7 @@ class SQLMetadataRepository:
                 .with_for_update()
             )
             validate(session)
+            issue_loop = request.issue_operation_id is not None
             prepared = self._prepare_backlog_approval_in(
                 session,
                 request.backlog_campaign_id,
@@ -1298,9 +1302,10 @@ class SQLMetadataRepository:
                     project=request.project,
                     delivery_mode=request.delivery_mode,
                     maximum_risk=request.maximum_risk,
-                    maximum_items=1,
+                    maximum_items=1 if issue_loop else request.maximum_items,
+                    maximum_concurrency=1 if issue_loop else request.maximum_concurrency,
                 ),
-                issue_request=request,
+                issue_request=request if issue_loop else None,
             )
             result, activation = self._approve_backlog_campaign_in(
                 session,

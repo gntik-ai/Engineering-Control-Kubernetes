@@ -878,7 +878,10 @@ def create_app(
 
         Same trust model as /v1/r3-issues/approve: the bearer-authenticated channel asserts
         the actor, which must be a canonical operator. The loop's request is rebuilt from
-        durable records; the operator then resumes the loop with backlog-retry."""
+        durable records; the operator then resumes the loop with backlog-retry.
+
+        NEW-229: for a campaign-wide loop paused on the issue, its campaign approval is
+        re-issued with the loop's exact scope instead."""
         actor = approval_actor(subject)
         try:
             return await bus.reapprove_issue(

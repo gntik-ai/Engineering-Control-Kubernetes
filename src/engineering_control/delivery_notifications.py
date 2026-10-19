@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import BacklogIssueRecord, Issue, NotificationOutbox
+from engineering_control.operations.issue_reapproval import loop_reapproval_phrase
 from engineering_control.projects import PROJECT_SET
 from engineering_control.security.redaction import SecretRedactor
 
@@ -78,6 +79,16 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
         "the backlog campaign approval is missing or no longer current"
     ),
     "APPROVAL_EXPIRED": "the approval expired",
+    # NEW-229: refused before (or, expired, during) a child; nothing was lost.
+    "CAMPAIGN_APPROVAL_EXPIRING": (
+        "the campaign approval expires before a delivery child could finish, so none was "
+        "started; re-issue it with issue-reapprove (same scope, the ChangeSet is kept), then "
+        "retry"
+    ),
+    "CAMPAIGN_APPROVAL_EXPIRED": (
+        "the campaign approval expired; re-issue it with issue-reapprove (same scope, the "
+        "ChangeSet is kept), then retry"
+    ),
     "APPROVAL_BINDING_CHANGED": "the approved binding changed after approval",
     "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED": (
         "the per-issue delivery approval is missing or changed"
@@ -269,7 +280,14 @@ def loop_commands(
     if code in {"ISSUE_BODY_CHANGED_SINCE_APPROVAL", "ISSUE_BODY_CHANGED_SINCE_IMPORT"}:
         amend = f"/loop amend {project or '<project>'} {repository} {number}"
         return [*commands, amend, f"{amend} <sha-prefix from the preview> retry"]
-    if code in _CAMPAIGN_APPROVAL_BLOCKERS:
+    if code in {"CAMPAIGN_APPROVAL_EXPIRING", "CAMPAIGN_APPROVAL_EXPIRED"}:
+        # NEW-229: the re-issue keeps the loop's scope and its ChangeSet custody.
+        phrase = loop_reapproval_phrase(workflow_id, project or "")
+        commands.append(
+            f"{CTL} issue-reapprove {workflow_id} {project or '<project>'} {repository} "
+            f"{number} {phrase or '<confirmation phrase>'}"
+        )
+    elif code in _CAMPAIGN_APPROVAL_BLOCKERS:
         campaign = campaign_id or "<backlog campaign id>"
         commands.extend(
             [
@@ -424,6 +442,17 @@ def orchestration_sequence(payload: dict[str, Any]) -> tuple[str, str] | None:
     return workflow_id, f"{run_id[:64]}:{activity_id[:64]}"
 
 
+def _expiry(value: Any) -> str | None:
+    """A well-formed ISO timestamp, normalized to UTC, else None (never echoed raw)."""
+    try:
+        parsed = datetime.fromisoformat(str(value)) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    if parsed is None or parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC).isoformat(timespec="seconds")
+
+
 def loop_state_label(status: str, previous: str | None) -> str | None:
     """The notified transition, or None when the state did not change."""
     if status == "RUNNING":
@@ -467,6 +496,7 @@ def enqueue_loop_state(
         if parse_issue(issue) is None:
             issue = ""
     blocker = bounded_code(payload.get("blocker")) if status == "PAUSED" else None
+    expires_at = _expiry(payload.get("approval_expires_at")) if status == "PAUSED" else None
     control_state = bounded_code(payload.get("control_state"))
     campaign_id = str(payload.get("backlog_campaign_id") or "")
     campaign_id = campaign_id if re.fullmatch(r"[0-9a-f-]{36}", campaign_id) else ""
@@ -481,6 +511,9 @@ def enqueue_loop_state(
         explanation = "paused after the current issue at the operator's request"
     elif status == "PAUSED":
         explanation = explain_blocker(blocker)
+        if expires_at is not None:
+            # NEW-229: when the campaign approval the issue waits on expires (expired).
+            explanation += f" (campaign approval expiry {expires_at})"
     elif label == "RESUMED":
         explanation = "the loop resumed after a pause"
     elif status == "COMPLETE":
@@ -520,6 +553,7 @@ def enqueue_loop_state(
             "issue": issue or None,
             "workflow_id": workflow_id,
             "blocker": blocker,
+            **({"approval_expires_at": expires_at} if expires_at is not None else {}),
             "control_state": control_state,
             "backlog_campaign_id": campaign_id or None,
             "commands": commands,

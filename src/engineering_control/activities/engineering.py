@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import and_, create_engine, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
+from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.gitops import (
     StagingFlowBlocked,
@@ -52,6 +53,7 @@ from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
     _global_campaign_authorizes,
     _valid_r3_candidate,
+    lapsing_backlog_approval,
     lock_backlog_policy,
     require_alternative_issue_authority,
     unexpired_policy_owners,
@@ -75,12 +77,15 @@ from engineering_control.operations.issue_approval import (
     require_issue_request_approval,
 )
 from engineering_control.operations.issue_delivery_approval import (
+    APPROVAL_LIFETIME_BLOCKERS,
     CI_REPAIR_AUTHORIZATION_STEP,
     CI_REPAIR_REGRESSIONS,
     MAX_CI_REPAIR_ROUNDS,
+    CampaignApprovalLapse,
     ci_repair_authorization_id,
     correction_attempt_budget,
     register_child_issue_approval,
+    require_child_authority_lifetime,
 )
 from engineering_control.projects import GLOBAL_PROJECT_SET, PROJECT_ALTERNATION, PROJECT_SET
 
@@ -2097,6 +2102,18 @@ class EngineeringActivityHandler:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
+            lapsing = (
+                lapsing_backlog_approval(campaign)
+                if status == "PAUSED" and payload.get("blocker") in APPROVAL_LIFETIME_BLOCKERS
+                else None
+            )
+            if lapsing is not None:
+                # NEW-229: the pause record and its notification name the expiry, read from
+                # the campaign's own recorded approval (never from the workflow).
+                payload = {
+                    **payload,
+                    "approval_expires_at": _as_utc(lapsing.expires_at).isoformat(),
+                }
             # NEW-127: the state before this record decides whether it is a transition.
             previous_status: str | None = campaign.status
             if isinstance(run_workflow_id, str) and run_workflow_id:
@@ -2600,6 +2617,20 @@ class EngineeringActivityHandler:
         return self._envelope(step, payload, "RESTORED")
 
     def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._register_backlog_child(payload)
+        except CampaignApprovalLapse as error:
+            # NEW-229: non-retryable and typed, so the loop pauses AWAITING_OPERATOR on
+            # this reason (ExistingGitHubBacklogLoopWorkflow._loop_step) before the child
+            # exists; the registration transaction rolled back.
+            raise ApplicationError(
+                str(error),
+                {"approval_expires_at": error.expires_at.isoformat()},
+                type=error.blocker,
+                non_retryable=True,
+            ) from error
+
+    def _register_backlog_child(self, payload: dict[str, Any]) -> dict[str, Any]:
         child_kind = str(payload.get("child_kind", ""))
         child_workflow_id = str(payload.get("child_workflow_id", ""))
         allowed = {
@@ -2668,6 +2699,20 @@ class EngineeringActivityHandler:
                         **({"issue_approval_id": str(approval.id)} if approval else {}),
                     },
                     "REGISTERED",
+                )
+            if child_kind == "finding-verification" and payload.get("backlog_campaign_id"):
+                # NEW-229: a revalidation is not started on an approval about to lapse
+                # either (its delivery could not follow); delivery children check this
+                # while registering their approval.
+                require_child_authority_lifetime(
+                    session,
+                    ExistingBacklogLoopStart.model_validate(
+                        {
+                            key: payload[key]
+                            for key in ExistingBacklogLoopStart.model_fields
+                            if key in payload
+                        }
+                    ),
                 )
             run = new_bound_run(
                 campaign_id=(finding.campaign_id if child_kind == "finding-verification" else None),

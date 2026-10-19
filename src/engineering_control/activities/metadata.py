@@ -122,6 +122,7 @@ from engineering_control.operations.issue_amend import (
     record_consumed_issue_revision,
 )
 from engineering_control.operations.issue_delivery_approval import (
+    CampaignApprovalLapse,
     bind_change_set_issue_approval,
     expired_unreferenced_reissue_event_ids,
     validate_change_set_issue_approval,
@@ -407,6 +408,14 @@ _TASKS_MD_ADVISORY = (
 )
 
 
+def _issue_approval_blocker(error: ValueError) -> str:
+    """NEW-229: an approval that only expired is named as such (the remedy is a re-issue
+    of the same approval, issue-reapprove); every other refusal stays the generic one."""
+    if isinstance(error, CampaignApprovalLapse):
+        return error.blocker
+    return "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+
+
 def _issue_content(payload: dict[str, Any]) -> str | None:
     """The confirmed issue as the spec agent sees it (refreshed body, NEW-44)."""
     if not all(key in payload for key in ("expected_behavior", "actual_behavior")):
@@ -610,11 +619,11 @@ class MetadataActivityHandler:
             ):
                 try:
                     payload = await asyncio.to_thread(self._issue_approval_preparation, payload)
-                except ValueError:
+                except ValueError as error:
                     return {
                         **payload,
                         "status": "BLOCKED",
-                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                        "blocker": _issue_approval_blocker(error),
                     }
             if step == "audit.prepare_agent_cell":
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
@@ -2750,14 +2759,14 @@ class MetadataActivityHandler:
                         finding=finding,
                         run=run,
                     )
-                except ValueError:
+                except ValueError as error:
                     run.status = "BLOCKED"
                     run.finished_at = datetime.now(UTC)
-                    run.error_code = "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+                    run.error_code = _issue_approval_blocker(error)
                     return {
                         **payload,
                         "status": "BLOCKED",
-                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                        "blocker": run.error_code,
                     }
             project = Project(finding.project)
             source_repository, deployment_repository = PROJECT_REPOSITORY_SLUGS[project.value]
@@ -4345,11 +4354,11 @@ class MetadataActivityHandler:
     def _prepare_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             payload = self._issue_approval_preparation(payload)
-        except ValueError:
+        except ValueError as error:
             return {
                 **payload,
                 "status": "BLOCKED",
-                "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                "blocker": _issue_approval_blocker(error),
             }
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -20,9 +20,10 @@ from engineering_control.db.models import (
     Run,
     Step,
 )
-from engineering_control.engineering.backlog import canonical_sha256
+from engineering_control.engineering.backlog import BacklogApprovalBinding, canonical_sha256
 from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
+    lapsing_backlog_approval,
     require_alternative_issue_authority,
 )
 from engineering_control.operations.issue_amend import change_set_unstarted
@@ -33,6 +34,74 @@ from engineering_control.operations.issue_approval import (
 from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 
 STEP_NAME = "delivery.issue_approval"
+
+# NEW-229: a delivery child runs under the campaign approval for its whole life, and the
+# approval check repeats at every preparation gate, so a child started shortly before the
+# 24 h approval expires is refused mid-way and its unpushed maker work is lost (gntik-ui
+# #175). No child starts with less than its bounded worst case left: the spec architect
+# (1 h), source and deployment makers (2 h each) and the independent checker (1.5 h)
+# timeouts of MetadataActivityHandler sum to 6.5 h; 1.5 h more covers leases, toolchain,
+# validation, publication and queueing. A revalidation (one 1 h verifier) fits within it.
+CHILD_AUTHORITY_MINIMUM_LIFETIME = timedelta(hours=8)
+CAMPAIGN_APPROVAL_EXPIRING = "CAMPAIGN_APPROVAL_EXPIRING"
+CAMPAIGN_APPROVAL_EXPIRED = "CAMPAIGN_APPROVAL_EXPIRED"
+APPROVAL_LIFETIME_BLOCKERS = frozenset({CAMPAIGN_APPROVAL_EXPIRING, CAMPAIGN_APPROVAL_EXPIRED})
+
+
+class CampaignApprovalLapse(ValueError):
+    """NEW-229: the child's campaign approval expired (or will before a child can finish).
+
+    A ValueError like every other approval refusal, so no existing check is weakened; it
+    only names the reason (and the expiry) for the operator's pause."""
+
+    def __init__(self, blocker: str, expires_at: datetime) -> None:
+        super().__init__(f"{blocker}: the campaign approval expires at {expires_at.isoformat()}")
+        self.blocker = blocker
+        self.expires_at = expires_at
+
+
+def _lapsed(
+    campaign: GitHubBacklogCampaign | None, request: ExistingBacklogLoopStart, now: datetime
+) -> BacklogApprovalBinding | None:
+    """The campaign's own approval for this request if it is unchanged but expired."""
+    binding = lapsing_backlog_approval(campaign)
+    if (
+        binding is None
+        or campaign is None
+        or campaign.delivery_mode != request.delivery_mode
+        or campaign.maximum_risk != request.maximum_risk.value
+        or _utc(binding.expires_at) > now
+    ):
+        return None
+    reference = binding.issue_approval
+    if request.issue_operation_id is None:
+        return binding if reference is None else None
+    if (
+        reference is None
+        or reference.operation_id != str(request.issue_operation_id)
+        or reference.binding_sha256 != request.issue_approval_binding
+    ):
+        return None
+    return binding
+
+
+def require_child_authority_lifetime(
+    session: Session, request: ExistingBacklogLoopStart, *, now: datetime | None = None
+) -> None:
+    """NEW-229: refuse to start a loop's child under a campaign approval that expires within
+    CHILD_AUTHORITY_MINIMUM_LIFETIME (or already expired). A missing or changed approval is
+    left to the authority check itself; this only ever refuses."""
+    now = now or datetime.now(UTC)
+    binding = lapsing_backlog_approval(
+        session.get(GitHubBacklogCampaign, request.backlog_campaign_id)
+    )
+    if binding is None:
+        return
+    expires_at = _utc(binding.expires_at)
+    if expires_at <= now:
+        raise CampaignApprovalLapse(CAMPAIGN_APPROVAL_EXPIRED, expires_at)
+    if expires_at - now < CHILD_AUTHORITY_MINIMUM_LIFETIME:
+        raise CampaignApprovalLapse(CAMPAIGN_APPROVAL_EXPIRING, expires_at)
 
 
 def _current_snapshot(
@@ -63,14 +132,18 @@ def _current_snapshot(
         )
     ):
         raise ValueError("delivery issue and authoritative finding do not match")
+    now = datetime.now(UTC)
     if request.issue_operation_id is not None:
         require_issue_request_approval(session, request)
         approval = _current_backlog_approval(
             campaign,
             delivery_mode=request.delivery_mode,
             maximum_risk=request.maximum_risk.value,
-            now=datetime.now(UTC),
+            now=now,
         )
+        lapsed = _lapsed(campaign, request, now) if approval is None else None
+        if lapsed is not None:
+            raise CampaignApprovalLapse(CAMPAIGN_APPROVAL_EXPIRED, _utc(lapsed.expires_at))
         if (
             approval is None
             or approval.issue_approval is None
@@ -88,8 +161,12 @@ def _current_snapshot(
             campaign,
             delivery_mode=request.delivery_mode,
             maximum_risk=request.maximum_risk.value,
-            now=datetime.now(UTC),
+            now=now,
         )
+        lapsed = _lapsed(campaign, request, now) if approval is None else None
+        if lapsed is not None:
+            # NEW-229: expired, not changed; the remedy is a re-issue, not a new approval.
+            raise CampaignApprovalLapse(CAMPAIGN_APPROVAL_EXPIRED, _utc(lapsed.expires_at))
         if approval is None or campaign.status == "APPROVED_INVENTORY":
             raise ValueError("delivery child requires its current campaign approval")
         require_backlog_issue_approval(session, approval)
@@ -158,6 +235,9 @@ def register_child_issue_approval(
         ):
             raise ValueError("delivery child approval changed during idempotent retry")
         return existing
+    # NEW-229: a new child never starts on an approval that cannot outlive it (the
+    # idempotent retry above returns the child this registration already recorded).
+    require_child_authority_lifetime(session, request)
     record = Step(
         id=identifier,
         run_id=run.id,
@@ -224,22 +304,33 @@ def validate_child_issue_approval(
         # paused its campaign, which voids the current-approval check; the next delivery
         # child re-proves the full current approval when it binds after the resume.
         return record
-    issue, campaign, snapshot = _current_snapshot(session, request, finding)
+    try:
+        issue, campaign, snapshot = _current_snapshot(session, request, finding)
+    except CampaignApprovalLapse as error:
+        # NEW-229: "expired" only when the record is bound to that very approval;
+        # an approval that changed as well stays the generic refusal.
+        lapsed = session.get(GitHubBacklogCampaign, request.backlog_campaign_id)
+        if lapsed is None or not _holds_campaign_approval(value, lapsed, custody_bindings):
+            raise ValueError("delivery issue revision or campaign approval changed") from error
+        raise
     if (
         value["issue_repository"] != issue.repository
         or value["issue_number"] != issue.issue_number
         or value["issue_snapshot_sha256"] != snapshot
-        or not (
-            value["campaign_approval_binding"] == campaign.approval_binding
-            or (
-                custody_bindings is not None
-                and campaign.approval_binding == custody_bindings[-1]
-                and value["campaign_approval_binding"] in custody_bindings
-            )
-        )
+        or not _holds_campaign_approval(value, campaign, custody_bindings)
     ):
         raise ValueError("delivery issue revision or campaign approval changed")
     return record
+
+
+def _holds_campaign_approval(
+    value: dict[str, Any], campaign: GitHubBacklogCampaign, custody_bindings: list[str] | None
+) -> bool:
+    return value["campaign_approval_binding"] == campaign.approval_binding or (
+        custody_bindings is not None
+        and campaign.approval_binding == custody_bindings[-1]
+        and value["campaign_approval_binding"] in custody_bindings
+    )
 
 
 def approval_reference(record: Step) -> dict[str, str]:
@@ -335,28 +426,72 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+def campaign_loop_scope(request: dict[str, Any]) -> dict[str, Any] | None:
+    """NEW-229: the approval scope of a campaign-wide loop's request (``backlog-start``: no
+    issue operation, global parent, R3 approval or target issue), else None. A re-issue
+    of the loop's campaign approval records it and must keep exactly it."""
+    if any(
+        request.get(key) is not None
+        for key in (
+            "issue_operation_id",
+            "issue_approval_binding",
+            "global_campaign_id",
+            "r3_approval_binding",
+            "target_repository",
+            "target_issue_number",
+        )
+    ):
+        return None
+    return {
+        key: request.get(key)
+        for key in (
+            "project",
+            "backlog_campaign_id",
+            "delivery_mode",
+            "maximum_risk",
+            "maximum_items",
+            "maximum_concurrency",
+        )
+    }
+
+
 def _reissue_event(
     session: Session,
     event: DashboardEvent | None,
     origin_value: dict[str, Any],
     to_binding: str,
 ) -> DashboardEvent:
-    """The audit event of a NEW-143 re-issue of the origin's own approval to ``to_binding``."""
+    """The audit event of a NEW-143 re-issue of the origin's own approval to ``to_binding``.
+
+    NEW-229: for a campaign-wide loop, the re-issue of its campaign approval with the
+    loop's exact scope (written by issue-reapprove for that loop)."""
     request = origin_value.get("request")
     recorded = event.metadata_json if event is not None else None
     if (
         event is None
         or not isinstance(request, dict)
-        or not request.get("issue_operation_id")
-        or not request.get("issue_approval_binding")
         or event.event_type != REISSUE_EVENT_TYPE
-        or event.entity_type != "operation_request"
-        or event.entity_id != str(request["issue_operation_id"])
         or event.workflow_id != origin_value.get("parent_workflow_id")
         or not isinstance(recorded, dict)
         or recorded.get("approval_binding") != to_binding
-        or recorded.get("issue_approval_binding", request["issue_approval_binding"])
-        != request["issue_approval_binding"]
+    ):
+        raise ValueError("ChangeSet already belongs to another issue approval")
+    if request.get("issue_operation_id"):
+        if (
+            not request.get("issue_approval_binding")
+            or event.entity_type != "operation_request"
+            or event.entity_id != str(request["issue_operation_id"])
+            or recorded.get("issue_approval_binding", request["issue_approval_binding"])
+            != request["issue_approval_binding"]
+        ):
+            raise ValueError("ChangeSet already belongs to another issue approval")
+        return event
+    scope = campaign_loop_scope(request)
+    if (
+        scope is None
+        or event.entity_type != "backlog_campaign"
+        or event.entity_id != str(request.get("backlog_campaign_id"))
+        or recorded.get("loop_scope") != scope
     ):
         raise ValueError("ChangeSet already belongs to another issue approval")
     return event
@@ -458,16 +593,28 @@ def _prove_reissue(
     snapshot. The re-issued campaign approval must be the one an issue_approval_reissued
     audit event, written in NEW-143's approval transaction, names for that operation and
     loop, and that event must strictly follow the custody's latest move (``after``: event
-    id and time), so an older re-issue can never be replayed over a newer one."""
+    id and time), so an older re-issue can never be replayed over a newer one.
+
+    NEW-229: a campaign-wide loop has no issue operation; its re-issue event names the
+    campaign and the loop's exact approval scope (campaign_loop_scope) instead, under the
+    same ordering rules."""
     origin_value, value = origin.result_json, record.result_json
     request = origin_value.get("request")
     if (
         _custody_scope(origin_value) != _custody_scope(value)
         or not isinstance(request, dict)
-        or not request.get("issue_operation_id")
-        or not request.get("issue_approval_binding")
+        or not (
+            (request.get("issue_operation_id") and request.get("issue_approval_binding"))
+            or campaign_loop_scope(request) is not None
+        )
     ):
         raise ValueError("ChangeSet already belongs to another issue approval")
+    # NEW-229: a campaign-wide loop's re-issue is audited on its campaign, under the loop.
+    entity = (
+        ("operation_request", str(request["issue_operation_id"]))
+        if request.get("issue_operation_id")
+        else ("backlog_campaign", str(request.get("backlog_campaign_id")))
+    )
     to_binding = str(value["campaign_approval_binding"])
     loop = str(origin_value["parent_workflow_id"])
     floor = after or (0, _utc(origin.created_at))
@@ -477,8 +624,8 @@ def _prove_reissue(
             select(DashboardEvent)
             .where(
                 DashboardEvent.event_type == REISSUE_EVENT_TYPE,
-                DashboardEvent.entity_type == "operation_request",
-                DashboardEvent.entity_id == str(request["issue_operation_id"]),
+                DashboardEvent.entity_type == entity[0],
+                DashboardEvent.entity_id == entity[1],
                 DashboardEvent.workflow_id == loop,
                 DashboardEvent.metadata_json["approval_binding"].as_string() == to_binding,
             )
@@ -494,8 +641,8 @@ def _prove_reissue(
         "version": 1,
         "from": from_binding,
         "to": to_binding,
-        "issue_operation_id": request["issue_operation_id"],
-        "issue_approval_binding": request["issue_approval_binding"],
+        "issue_operation_id": request.get("issue_operation_id"),
+        "issue_approval_binding": request.get("issue_approval_binding"),
         "loop_workflow_id": loop,
         "approval_id": str(record.id),
         "audit_event_id": int(event.id),

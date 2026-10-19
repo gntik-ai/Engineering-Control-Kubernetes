@@ -3610,6 +3610,9 @@ _LOOP_REFILL_LIMIT = 100
 _REVALIDATION_FAILURE_STATUSES = frozenset({"CHILD_FAILED", "FAILED"})
 # NEW-217: a revalidation that stopped because its issue changed after import.
 ISSUE_BODY_CHANGED_SINCE_IMPORT = "ISSUE_BODY_CHANGED_SINCE_IMPORT"
+# NEW-229: issue_delivery_approval.APPROVAL_LIFETIME_BLOCKERS (not importable in the
+# workflow sandbox); a child registration refused for one of them pauses on it.
+_APPROVAL_LIFETIME_BLOCKERS = frozenset({"CAMPAIGN_APPROVAL_EXPIRING", "CAMPAIGN_APPROVAL_EXPIRED"})
 
 
 def _revalidation_body_changed(verification: dict[str, Any]) -> bool:
@@ -5576,6 +5579,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if not workflow.patched("existing-backlog-resilient-loop-steps-v1"):
                     raise
                 blocker = "LOOP_STEP_FAILED_" + step.upper().replace(".", "_")
+                cause = error.cause
+                if (
+                    isinstance(cause, ApplicationError)
+                    and cause.type in _APPROVAL_LIFETIME_BLOCKERS
+                ):
+                    # NEW-229: the child was refused before it started because its campaign
+                    # approval expires too soon (or expired): pause on that reason. Replay
+                    # safe without a patch marker: only the payload differs, and histories
+                    # recorded before NEW-229 never carry these failure types.
+                    blocker = str(cause.type)
                 paused = {
                     **_backlog_execution_payload(request),
                     "loop_status": "PAUSED",
