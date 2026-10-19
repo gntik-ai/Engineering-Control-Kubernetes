@@ -3853,9 +3853,21 @@ class MetadataActivityHandler:
                     "blocker": rejected.code,
                     "blocker_detail": rejected.detail,
                 }
+        shown = prior
+        if isinstance(prior, dict) and isinstance(prior.get("structured_result"), dict):
+            # NEW-227: a UI page source maker's typed evidence is the checker's input (bounded
+            # there), not the deployment maker's; it could exceed the prompt bound.
+            structured = prior["structured_result"]
+            if "ui_page" in structured:
+                shown = {
+                    **prior,
+                    "structured_result": {
+                        key: value for key, value in structured.items() if key != "ui_page"
+                    },
+                }
         derived_content = (
             f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
-            f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
+            f"Prior source maker result: {json.dumps(shown, sort_keys=True, default=str)}\n"
         )
         correction = self._prior_checker_findings(change_set_id, workflow_id)
         # NEW-52: the allocation kept the previous attempt's commits (they descend from

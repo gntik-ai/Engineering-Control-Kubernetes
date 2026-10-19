@@ -1029,3 +1029,38 @@ async def test_the_scan_step_blocks_when_a_spec_kit_item_failed(
     assert (result["status"], result["blocker"]) == ("BLOCKED", "UI_KIT_SNAPSHOT_FAILED")
     assert "get_template list-page" in result["blocker_detail"]
     assert "ui_page_inputs" not in result
+
+
+def test_the_deployment_maker_gets_the_ui_makers_result_without_its_evidence(
+    tmp_path: Path,
+) -> None:
+    handler, payload = _delivery_payload(tmp_path)
+    shape = "p" * 2000
+    big = maker_result(
+        maker_output(api_calls=[{**maker_output()["api_calls"][0], "payload_shape": shape}] * 100),
+        payload["ui_page"],
+    )
+    prepared = handler._prepare_maker(
+        {**payload, "agent_result": {"structured_result": big}}, deployment=True
+    )
+    prompt = prepared["deployment_maker_request"]["prompt"]
+    assert shape not in prompt and len(prompt) < 200_000
+    # The checker still receives the complete source maker result.
+    assert prepared["source_maker_result"]["structured_result"] == big
+
+
+def test_a_kit_item_hermes_cannot_request_blocks_instead_of_being_dropped() -> None:
+    long_id = blueprint()
+    long_id["pages"][0]["target"]["template"] = "t" * 81
+    item = next(item for item in fanout_items(blueprint()) if item.key == f"page:{PAGE_ID}")
+    context = item_context(item, blueprint_id=str(uuid4()), blueprint_sha256=DIGEST)
+    loaded = {
+        "status": "APPROVED",
+        "blueprint": long_id,
+        "blueprint_sha256": DIGEST,
+        "source_sha": SOURCE_SHA,
+    }
+    with pytest.raises(UiPageRejected, match="UI_PAGE_KIT_SELECTION_INVALID"):
+        page_context(
+            str(item_change_request_id(DIGEST, item.key)), ui_context_json(context), loaded
+        )

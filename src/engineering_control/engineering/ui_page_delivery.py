@@ -175,8 +175,13 @@ def page_context(
     template = target.get("template")
 
     def kit_ids(values: Any) -> list[str]:
-        items = [item for item in values or [] if isinstance(item, str) and _KIT_ID.fullmatch(item)]
-        return sorted(set(items))[:KIT_SELECTION_MAX]
+        # Every spec item is a required kit call: one Hermes cannot request blocks.
+        items = sorted(set(values or []))
+        if len(items) > KIT_SELECTION_MAX or not all(
+            isinstance(item, str) and _KIT_ID.fullmatch(item) for item in items
+        ):
+            raise UiPageRejected("UI_PAGE_KIT_SELECTION_INVALID", "unsupported kit item ids")
+        return items
 
     return {
         "change_request_id": str(change_request_id),
