@@ -306,11 +306,11 @@ class TypedCommandBus:
         elif campaign_loop is not None:
             prefix = campaign_loop_prefix(project, campaign_loop[0])
             await self._close_ended_campaign_loops(prefix, exclude=loop_workflow_id)
-            # NEW-229: a child still recorded active must be proven closed in Temporal (an
+            # NEW-229: the campaign's children must be proven closed in Temporal (an
             # unknown state refuses); the plan, and its re-run in the approving
             # transaction, refuse any other.
             closed: list[str] = []
-            for child in await self.operations.campaign_active_children(prefix):
+            for child in await self.operations.campaign_children(loop_workflow_id):
                 try:
                     if await self.control.workflow_id_closed(child):
                         closed.append(child)

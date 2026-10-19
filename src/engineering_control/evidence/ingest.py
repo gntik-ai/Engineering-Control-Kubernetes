@@ -31,6 +31,7 @@ from engineering_control.observability.agent import (
     LogBatchInput,
     ObservabilityModel,
 )
+from engineering_control.operations.issue_delivery_approval import CampaignApprovalLapse
 from engineering_control.operations.publication_authority import (
     PublicationAuthorityRepository,
     PublicationEffectUnresolved,
@@ -109,6 +110,9 @@ def create_evidence_ingest_app(
             raise HTTPException(
                 status_code=409, detail={"code": "PUBLICATION_EFFECT_UNRESOLVED"}
             ) from error
+        except CampaignApprovalLapse as error:
+            # NEW-229: denied like any refusal, but named (its remedy is a re-issue).
+            raise HTTPException(status_code=409, detail={"code": error.blocker}) from error
         except (ValueError, KeyError, TypeError) as error:
             raise HTTPException(
                 status_code=409, detail="publication authority denied or unresolved"

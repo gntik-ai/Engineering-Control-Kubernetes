@@ -6625,7 +6625,13 @@ class MetadataActivityHandler:
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
         deployment = self._object(evidence.get("deployment"), "deployment change evidence")
-        if source.get("head_sha") == payload.get("source_base_sha"):
+        if payload.get("status") == "BLOCKED" and payload.get("blocker") == (
+            CAMPAIGN_APPROVAL_EXPIRED
+        ):
+            # NEW-229: publication was refused because the campaign approval expired; the
+            # handoff still preserves the committed heads, and keeps the reason.
+            blocker = CAMPAIGN_APPROVAL_EXPIRED
+        elif source.get("head_sha") == payload.get("source_base_sha"):
             blocker = "SOURCE_CHANGES_NOT_COMMITTED"
         elif int(deployment.get("changed_file_count", 0)) > 0 and deployment.get(
             "head_sha"
@@ -10142,8 +10148,12 @@ def _record_correction_state(
     provider_stop: dict[str, str] | None = None
     # NEW-229: an attempt whose campaign approval expired mid-way (gntik-ui #175) is, like
     # a provider outage, no verdict on the change; once the approval is re-issued a bounded
-    # retry attempt binds and continues the ChangeSet's worktree.
-    if stop not in _CORRECTION_STOPS and stop != ("BLOCKED", CAMPAIGN_APPROVAL_EXPIRED):
+    # retry attempt binds and continues the ChangeSet's worktree (never after a
+    # publication effect of unknown outcome, which NEW-145 reconciles first).
+    expired = stop == ("BLOCKED", CAMPAIGN_APPROVAL_EXPIRED) and (
+        payload.get("publication_effect_unknown") is not True
+    )
+    if stop not in _CORRECTION_STOPS and not expired:
         # NEW-137: a provider call of the attempt (spec, maker or checker) failed for an
         # allowlisted transient reason (falcone #1012: checker 529 Overloaded).
         provider_stop = provider_unavailable_stop(payload)

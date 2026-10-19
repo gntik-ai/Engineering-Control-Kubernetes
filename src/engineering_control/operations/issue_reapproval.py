@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from engineering_control.api.schemas import ExistingBacklogLoopStart
@@ -431,7 +431,7 @@ def _plan_campaign_reapproval(
     # A paused parent does not prove its children stopped (NEW-168 review): every child
     # recorded active must be proven closed in Temporal by the caller.
     unproven = [
-        name for name in campaign_active_children(session, prefix) if name not in closed_children
+        name for name in campaign_children(session, loop_workflow_id) if name not in closed_children
     ]
     if unproven:
         raise _refuse("CHILD_ACTIVE", f"the campaign's child {unproven[0]} may still be running")
@@ -486,24 +486,36 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-# More recorded-active children than this cannot be proven closed and refuse.
-MAX_ACTIVE_CHILDREN = 50
+# More children than this cannot be proven closed and refuse (as NEW-168's bound).
+MAX_PROVEN_CHILDREN = 256
 
 
-def campaign_active_children(session: Session, prefix: str) -> list[str]:
-    """NEW-229: the campaign's child workflow IDs whose Run is still recorded active; the
-    caller proves each closed in Temporal before a campaign loop's re-issue."""
+def campaign_children(session: Session, loop_workflow_id: str) -> list[str]:
+    """NEW-229: the child workflow IDs a campaign loop's re-issue must see proven closed
+    in Temporal: every child of the loop, whatever its recorded status (a child reset in
+    Temporal may run again; NEW-168 review), and every child of another loop of the
+    campaign still recorded active (those loops are closed, which ends their children)."""
+    match = _CAMPAIGN_LOOP.fullmatch(loop_workflow_id)
+    if match is None:
+        raise _refuse("LOOP_INVALID", "the workflow is not a campaign loop")
+    prefix = campaign_loop_prefix(match["project"], match["campaign"])
     names = session.scalars(
         select(Run.workflow_id)
         .where(
-            Run.workflow_id.startswith(f"{prefix}-", autoescape=True),
             Run.run_type != "existing-backlog-loop",
-            Run.status.in_(_ACTIVE_CHILD_STATES),
+            or_(
+                Run.workflow_id.startswith(f"{loop_workflow_id}-", autoescape=True),
+                and_(
+                    Run.workflow_id.startswith(f"{prefix}-", autoescape=True),
+                    Run.status.in_(_ACTIVE_CHILD_STATES),
+                ),
+            ),
         )
+        .distinct()
         .order_by(Run.workflow_id)
-        .limit(MAX_ACTIVE_CHILDREN + 1)
+        .limit(MAX_PROVEN_CHILDREN + 1)
     ).all()
-    if len(names) > MAX_ACTIVE_CHILDREN:
+    if len(names) > MAX_PROVEN_CHILDREN:
         raise _refuse("CHILD_ACTIVE", "too many campaign children to verify as closed")
     return [str(name) for name in names]
 

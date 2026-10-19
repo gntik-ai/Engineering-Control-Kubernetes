@@ -30,10 +30,19 @@ T = TypeVar("T")
 
 
 class PublicationAuthorityError(ValueError):
-    def __init__(self, message: str, *, unknown: bool = False, not_attempted: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        unknown: bool = False,
+        not_attempted: bool = False,
+        blocker: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.unknown = unknown
         self.not_attempted = not_attempted
+        # NEW-229: a named denial (CAMPAIGN_APPROVAL_EXPIRED) the delivery reports as such.
+        self.blocker = blocker
 
 
 class PublicationAuthorityClient:
@@ -88,9 +97,13 @@ class PublicationAuthorityClient:
             if response.status_code != 200:
                 unresolved = data.get("detail") == {"code": "PUBLICATION_EFFECT_UNRESOLVED"}
                 ambiguous = response.status_code not in {401, 403, 409, 413, 422}
+                expired = response.status_code == 409 and data.get("detail") == {
+                    "code": "CAMPAIGN_APPROVAL_EXPIRED"
+                }
                 raise PublicationAuthorityError(
                     "publication authority denied or is unavailable",
                     unknown=unresolved or ambiguous,
+                    blocker="CAMPAIGN_APPROVAL_EXPIRED" if expired else None,
                 )
             return data
         except (httpx.HTTPError, json.JSONDecodeError, OSError) as error:

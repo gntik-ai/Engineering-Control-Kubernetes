@@ -8,10 +8,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 from temporalio.exceptions import ApplicationError
 from test_controlled_operations import CAMPAIGN_ID, _repository, _seed_ready_issue
@@ -22,6 +23,10 @@ from test_new_144_reissue_custody import _Delivery, _recovery, _register_ci_repa
 
 from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.activities.metadata import MetadataActivityHandler
+from engineering_control.adapters.publication_authority import (
+    PublicationAuthorityClient,
+    PublicationAuthorityError,
+)
 from engineering_control.api.schemas import (
     BacklogApprovalCandidateRequest,
     ExistingBacklogLoopStart,
@@ -45,6 +50,7 @@ from engineering_control.db.models import (
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.delivery_notifications import CTL, loop_commands
 from engineering_control.engineering.backlog import BacklogApprovalBinding
+from engineering_control.evidence.ingest import create_evidence_ingest_app
 from engineering_control.models.enums import RiskClass
 from engineering_control.operations import issue_delivery_approval
 from engineering_control.operations.correction_extension import loop_pause_target_id
@@ -75,6 +81,8 @@ class _CampaignLive(_Live):
     def __init__(self, operations: Any, metadata: Any, engineering: Any, request: Any) -> None:
         with patch("test_new_143_issue_reapproval.issue_workflow_id", return_value=LOOP):
             super().__init__(operations, metadata, engineering, request)
+        # Every child of the loop is proven closed in Temporal unless a test says otherwise.
+        self.control.workflow_id_closed = AsyncMock(return_value=True)
 
     async def reapprove(self, **overrides: Any) -> dict[str, Any]:
         arguments: dict[str, Any] = {
@@ -482,6 +490,9 @@ def _event_or_none(live: _Live) -> DashboardEvent | None:
 
 
 def _running_child(live: _Live) -> None:
+    live.control.workflow_id_closed = AsyncMock(
+        side_effect=lambda workflow_id: "ci-repair-3" not in workflow_id
+    )
     with live.operations.sessions.begin() as session:
         session.add(
             Run(
@@ -491,6 +502,13 @@ def _running_child(live: _Live) -> None:
                 project="falcone",
             )
         )
+
+
+def _open_in_temporal(live: _Live) -> None:
+    # Recorded COMPLETE, yet reset and running again in Temporal (NEW-168 review).
+    live.control.workflow_id_closed = AsyncMock(
+        side_effect=lambda workflow_id: not workflow_id.endswith("-issue-1-attempt-1")
+    )
 
 
 def _leased_child(live: _Live) -> None:
@@ -530,6 +548,7 @@ def _ran_another_request(live: _Live) -> None:
     ("change", "code"),
     [
         (_running_child, "CHILD_ACTIVE"),
+        (_open_in_temporal, "CHILD_ACTIVE"),
         (_leased_child, "CHILD_ACTIVE"),
         (_ran_another_request, "LOOP_REQUEST_MISMATCH"),
     ],
@@ -730,3 +749,89 @@ def test_a_blocked_child_names_an_expired_approval_to_its_loop() -> None:
         blocker="CI_REPAIR_CAMPAIGN_APPROVAL_EXPIRED",
     )
     assert any(" issue-reapprove " in command for command in commands)
+
+
+async def test_a_publication_refused_for_expiry_keeps_its_reason_and_is_retryable(
+    tmp_path: Path,
+) -> None:
+    # Codex review 2: the handoff after a refused publication renamed the blocker, and the
+    # publication authority's refusal was flattened; an unknown effect never moves on.
+    live, delivery = await _campaign_loop(tmp_path)
+    handler = delivery.handler
+    assert handler is not None
+    with live.operations.sessions.begin() as session:
+        change_set = session.get(ChangeSet, delivery.change_set_id)
+        change_set.state = "IMPLEMENTING"
+        change_set.source_pr_url = None
+        run = session.scalar(select(Run).where(Run.workflow_id == f"{LOOP}-issue-1-attempt-1"))
+        run.status = "RUNNING"
+        run_id = run.id
+    evidence = {"head_sha": "c" * 40, "changed_file_count": 1}
+    handoff = handler._persist_delivery_handoff(
+        {
+            "status": "BLOCKED",
+            "blocker": "CAMPAIGN_APPROVAL_EXPIRED",
+            "change_set_id": str(delivery.change_set_id),
+            "run_id": str(run_id),
+            "source_branch": "hermes/fixture",
+            "deployment_branch": "hermes/fixture",
+            "source_base_sha": "a" * 40,
+            "deployment_base_sha": "b" * 40,
+            "maker_provider": "codex",
+            "checker_provider": "claude",
+            "change_evidence": {"source": evidence, "deployment": evidence},
+        }
+    )
+    assert handoff["blocker"] == "CAMPAIGN_APPROVAL_EXPIRED"
+    stop = {
+        "run_id": str(run_id),
+        "change_set_id": str(delivery.change_set_id),
+        "status": "BLOCKED",
+        "blocker": "CAMPAIGN_APPROVAL_EXPIRED",
+    }
+    handler._release_delivery_leases({**stop, "publication_effect_unknown": True})
+    with live.operations.sessions() as session:
+        assert session.get(ChangeSet, delivery.change_set_id).state == "IMPLEMENTING"
+    handler._release_delivery_leases(stop)
+    with live.operations.sessions() as session:
+        assert session.get(ChangeSet, delivery.change_set_id).state == "REQUEST_CHANGES"
+    handler.engine.dispose()
+    live.dispose()
+
+
+def test_the_publication_authority_names_an_expired_approval(tmp_path: Path) -> None:
+    token_path = tmp_path / "ingest.token"
+    token_path.write_text("fixture-only-" + "t" * 40)
+    token_path.chmod(0o600)
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url=f"sqlite+pysqlite:///{tmp_path / 'ingest.db'}",
+        worker_kind="delivery",
+        evidence_ingest_url="http://127.0.0.1:8750/v1/evidence",
+        evidence_ingest_token_file=token_path,
+    )
+    authority = Mock()
+    authority.claim.side_effect = CampaignApprovalLapse(
+        "CAMPAIGN_APPROVAL_EXPIRED", datetime.now(UTC)
+    )
+    app = create_evidence_ingest_app(
+        settings=settings,
+        repository=Mock(),
+        observability_repository=Mock(),
+        publication_authority=authority,
+        tokens={"delivery-runner": token_path.read_text()},
+    )
+    with (
+        # The claim body itself is validated by the NEW-145 tests; here only the refusal.
+        patch("engineering_control.evidence.ingest.PublicationEffectClaim"),
+        TestClient(app, base_url="http://127.0.0.1:8750") as http,
+    ):
+        client = PublicationAuthorityClient(settings, Mock(), client=http)
+        with pytest.raises(PublicationAuthorityError) as refused:
+            client._request(
+                "/v1/publications/claim",
+                {"intent_id": str(uuid4())},
+            )
+    assert refused.value.blocker == "CAMPAIGN_APPROVAL_EXPIRED"
+    assert refused.value.unknown is False
+    assert authority.claim.called

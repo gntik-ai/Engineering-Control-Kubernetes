@@ -281,7 +281,7 @@ class DeliveryActivityHandler:
             return {
                 **payload,
                 "status": "BLOCKED",
-                "blocker": "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED",
+                "blocker": error.blocker or "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED",
                 "publication_effect_unknown": error.unknown,
                 # Refers to the current effect, not earlier completed effects
                 # within a paired publication. Unknown may still describe lost

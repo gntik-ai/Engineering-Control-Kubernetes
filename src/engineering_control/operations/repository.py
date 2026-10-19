@@ -74,7 +74,7 @@ from engineering_control.operations.issue_approval import (
     open_campaign_loops,
 )
 from engineering_control.operations.issue_reapproval import (
-    campaign_active_children,
+    campaign_children,
     plan_issue_reapproval,
 )
 from engineering_control.operations.issue_start import (
@@ -740,13 +740,13 @@ class OperationsRepository:
         with self.sessions() as session:
             return plan_issue_reapproval(session, **arguments)
 
-    async def campaign_active_children(self, prefix: str) -> list[str]:
-        return await asyncio.to_thread(self._campaign_active_children, prefix)
+    async def campaign_children(self, loop_workflow_id: str) -> list[str]:
+        return await asyncio.to_thread(self._campaign_children, loop_workflow_id)
 
-    def _campaign_active_children(self, prefix: str) -> list[str]:
+    def _campaign_children(self, loop_workflow_id: str) -> list[str]:
         """NEW-229: read-only; the caller proves each closed before a campaign re-issue."""
         with self.sessions() as session:
-            return campaign_active_children(session, prefix)
+            return campaign_children(session, loop_workflow_id)
 
     async def plan_publication_reconcile(
         self, effect_id: UUID, phrase: str, actor: str
