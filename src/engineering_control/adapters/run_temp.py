@@ -26,6 +26,7 @@ import secrets
 import shutil
 import stat
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from pathlib import Path
@@ -99,9 +100,10 @@ def _remove_run_directory(path: Path) -> None:
 
 
 def wait_for_removals(timeout: float = 30.0) -> None:
-    """Join the removals started so far (worker shutdown, tests)."""
+    """Join the removals started so far, within one shared deadline."""
+    deadline = time.monotonic() + timeout
     for removal in list(_REMOVALS.copy()):
-        removal.join(timeout)
+        removal.join(max(0.0, deadline - time.monotonic()))
 
 
 def optional_run_temporary_directory(root: str | None) -> AbstractContextManager[Path | None]:

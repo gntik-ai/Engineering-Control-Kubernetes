@@ -338,6 +338,20 @@ def test_the_sweep_removes_nothing_while_a_step_runs(
     monkeypatch.setattr(tmp_sweep, "remove_tree", start_a_step)
     assert tmp_sweep.sweep(tmp_path, idle_seconds=-60, protected=()).removed == 1
     assert (tmp_path / "vitest-1234" / "deep" / "out.log").exists()
+    # A step that starts during an entry's revalidation walk stops it too.
+    monkeypatch.setattr(tmp_sweep, "remove_tree", real)
+    walk = tmp_sweep._newest_change  # noqa: SLF001
+
+    def start_during_walk(*args: Any) -> float | None:
+        tmp_sweep._STARTED[0] += 1  # noqa: SLF001
+        return walk(*args)
+
+    selected = tmp_sweep.stale_entries(tmp_path, now=time.time() + 60, idle_seconds=-60)
+    assert selected
+    monkeypatch.setattr(tmp_sweep, "stale_entries", lambda *_, **__: selected)
+    monkeypatch.setattr(tmp_sweep, "_newest_change", start_during_walk)
+    assert tmp_sweep.sweep(tmp_path, idle_seconds=-60, protected=()).removed == 0
+    assert all(entry.exists() for entry in selected)
 
 
 def test_running_steps_are_tracked_until_they_end() -> None:

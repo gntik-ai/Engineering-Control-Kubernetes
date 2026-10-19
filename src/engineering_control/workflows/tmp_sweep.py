@@ -167,6 +167,8 @@ def sweep(
         newest = _newest_change(entry, device, MAX_WALK_ENTRIES)
         if newest is None or newest >= time.time() - idle_seconds:
             continue
+        if _RUNNING or _STARTED[0] != started:  # a step started during that walk
+            break
         if remove_tree(entry):
             removed += 1
         else:
