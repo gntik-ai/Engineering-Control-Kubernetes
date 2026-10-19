@@ -11,8 +11,11 @@ Bash tool's output files under it.
 
 Runs of one worker share a uid, so file modes alone cannot keep them apart: the run
 directories sit in a parent the runner may enter but not list (0300), under names nobody
-can guess, and inside the Codex sandbox that parent is read-only, so it cannot be opened
-up either.
+can guess. Inside the Codex sandbox that parent is read-only (it cannot be opened up)
+and /proc shows only the run's own processes, so one Codex run cannot find another's.
+A Claude run has no such sandbox: like every unsandboxed process of the uid, it could
+chmod the parent or read a sibling's environment in /proc, exactly as it can already
+read the other runs' worktrees. Separating those needs a uid or sandbox per run.
 """
 
 from __future__ import annotations
@@ -143,13 +146,32 @@ def remove_tree(path: Path) -> bool:
 
 
 def _restore_owner_access(path: Path) -> None:
-    if path.is_symlink():
+    """Give the owner rwx on every directory of the tree, through descriptors only.
+
+    Each directory is opened with O_NOFOLLOW (O_PATH works without any permission) and
+    changed through its /proc/self/fd link, so a directory swapped for a symlink
+    meanwhile fails to open instead of redirecting the chmod outside the tree."""
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        pending = [os.open(path, flags)]
+    except OSError:
         return
-    with suppress(OSError):
-        os.chmod(path, 0o700)
-    for directory, subdirectories, _ in os.walk(path):  # never follows symlinks
-        for name in subdirectories:
-            entry = os.path.join(directory, name)
-            if not os.path.islink(entry):
+    while pending:
+        handle = pending.pop()
+        try:
+            with suppress(OSError):
+                os.chmod(f"/proc/self/fd/{handle}", 0o700)
+            try:
+                listing = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=handle)
+            except OSError:
+                continue
+            try:
+                with os.scandir(listing) as entries:
+                    names = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+            finally:
+                os.close(listing)
+            for name in names:
                 with suppress(OSError):
-                    os.chmod(entry, 0o700)
+                    pending.append(os.open(name, flags, dir_fd=handle))
+        finally:
+            os.close(handle)

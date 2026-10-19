@@ -149,6 +149,7 @@ def sweep(
     protected: Collection[Path],
 ) -> SweepResult:
     removed = failed = 0
+    device = root.lstat().st_dev
     for entry in stale_entries(
         root,
         now=time.time(),
@@ -156,6 +157,15 @@ def sweep(
         running_since=running_since,
         protected=protected,
     ):
+        # Revalidated right before its removal: the selection pass may be minutes old,
+        # and a step may have started (or written into the entry) since.
+        started = oldest_running_step()
+        cutoff = time.time() - idle_seconds
+        if running_since is not None or started is not None:
+            cutoff = min(cutoff, *(t for t in (running_since, started) if t is not None))
+        newest = _newest_change(entry, device, MAX_WALK_ENTRIES)
+        if newest is None or newest >= cutoff:
+            continue
         if remove_tree(entry):
             removed += 1
         else:

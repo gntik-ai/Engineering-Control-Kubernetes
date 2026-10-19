@@ -120,9 +120,13 @@ def test_read_only_and_unreadable_directories_are_still_removed(tmp_path: Path) 
     os.chmod(path / "go-mod" / "pkg", 0o500)
     os.chmod(path / "go-mod", 0o500)
     os.chmod(path / "sealed", 0o000)
+    os.chmod(outside, 0o500)
     assert run_temp.remove_tree(path)
     assert not path.exists()
-    assert (outside / "keep").exists()  # a symlink is removed, never followed
+    # A symlink is removed, never followed: neither its target nor the target's mode.
+    assert (outside / "keep").exists()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o500
+    os.chmod(outside, 0o700)
 
 
 def test_the_worker_start_clears_left_run_directories(tmp_path: Path) -> None:
@@ -310,6 +314,17 @@ def test_the_sweep_removes_what_it_selects(tmp_path: Path) -> None:
     result = tmp_sweep.sweep(tmp_path, idle_seconds=-60, running_since=None, protected=())
     assert result == tmp_sweep.SweepResult(removed=3, failed=0)
     assert sorted(entry.name for entry in tmp_path.iterdir()) == [".git", "node-compile-cache"]
+
+
+def test_the_sweep_revalidates_each_entry_before_removing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tree(tmp_path)
+    # A step that started before the entries changed began after the selection pass.
+    monkeypatch.setattr(tmp_sweep, "oldest_running_step", lambda: time.time() - 3600)
+    result = tmp_sweep.sweep(tmp_path, idle_seconds=-60, running_since=None, protected=())
+    assert result == tmp_sweep.SweepResult(removed=0, failed=0)
+    assert (tmp_path / "vitest-1234" / "deep" / "out.log").exists()
 
 
 def test_running_steps_are_tracked_until_they_end() -> None:
