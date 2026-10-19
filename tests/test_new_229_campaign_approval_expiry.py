@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,6 +27,7 @@ from engineering_control.api.schemas import (
     ExistingBacklogLoopStart,
 )
 from engineering_control.config import Settings
+from engineering_control.db import runtime_binding
 from engineering_control.db.models import (
     BacklogIssueRecord,
     ChangeSet,
@@ -54,6 +55,7 @@ from engineering_control.operations.issue_delivery_approval import (
     CampaignApprovalLapse,
     _custody_chain,
     _prove_reissue,
+    approval_lifetime_blocker,
     validate_change_set_issue_approval,
 )
 from engineering_control.operations.issue_reapproval import (
@@ -99,7 +101,7 @@ def _clock(monkeypatch: pytest.MonkeyPatch, ahead: timedelta) -> None:
     monkeypatch.setattr(issue_delivery_approval, "datetime", _Later)
 
 
-def _seed_finding(live: _Live, tmp_path: Path) -> None:
+def _seed_finding(live: _Live, tmp_path: Path, *, register_loop: bool = False) -> None:
     handler = MetadataActivityHandler(
         Settings(  # type: ignore[call-arg]
             _env_file=None,
@@ -161,23 +163,35 @@ def _seed_finding(live: _Live, tmp_path: Path) -> None:
             operation = session.get(OperationRequest, live.operation_id)
             operation.status = "STARTED"
             operation.workflow_id = live.loop
-        session.add(
-            Run(
-                workflow_id=live.loop,
-                run_type="existing-backlog-loop",
-                status="RUNNING",
-                project="falcone",
-                temporal_first_execution_run_id=RUN,
+        if not register_loop:
+            session.add(
+                Run(
+                    workflow_id=live.loop,
+                    run_type="existing-backlog-loop",
+                    status="RUNNING",
+                    project="falcone",
+                    temporal_first_execution_run_id=RUN,
+                )
             )
+    if register_loop:
+        # The loop registers its own Run (and, NEW-229, the request it starts with).
+        token = runtime_binding._current_identity.set(
+            runtime_binding._Identity(live.loop, RUN, RUN)
         )
+        try:
+            registered = live.engineering._register_backlog_run(
+                {**live.request.model_dump(mode="json"), "workflow_id": live.loop}
+            )
+        finally:
+            runtime_binding._current_identity.reset(token)
+        assert registered["status"] == "REGISTERED"
     live.finding_id = str(finding.id)
     live.set_campaign(status="APPROVED")  # the reconciler activated the policy
     live.loop_state("RUNNING")
 
 
-async def _campaign_loop(tmp_path: Path) -> tuple[_CampaignLive, _Delivery]:
-    """backlog-approve (R1, source-pr, 5 items), backlog-start, and its first delivery
-    child published its ChangeSet (SOURCE_PR) and finished."""
+async def _campaign_start(tmp_path: Path) -> _CampaignLive:
+    """backlog-approve (R1, source-pr, 5 items) and backlog-start's loop registered."""
     operations = _repository(tmp_path)
     _seed_ready_issue(operations)
     policy_root = tmp_path / "fixture-policy-requests"
@@ -197,7 +211,14 @@ async def _campaign_loop(tmp_path: Path) -> tuple[_CampaignLive, _Delivery]:
     )
     request = ExistingBacklogLoopStart(project="falcone", backlog_campaign_id=CAMPAIGN_ID, **scope)
     live = _CampaignLive(operations, metadata, engineering, request)
-    _seed_finding(live, tmp_path)
+    _seed_finding(live, tmp_path, register_loop=True)
+    return live
+
+
+async def _campaign_loop(tmp_path: Path) -> tuple[_CampaignLive, _Delivery]:
+    """_campaign_start, and its first delivery child published its ChangeSet (SOURCE_PR)
+    and finished."""
+    live = await _campaign_start(tmp_path)
     delivery = _Delivery(tmp_path)
     delivery(live, live.register(1))
     _finish_children(live)
@@ -601,3 +622,111 @@ def test_both_loop_kinds_get_their_own_reissue_command() -> None:
         assert f"{CTL} backlog-retry {loop} falcone 42" in commands
         assert not any("backlog-approve " in command for command in commands)
     assert loop_reapproval_phrase(LOOP, "musematic") is None
+
+
+async def test_a_loop_paused_before_its_first_child_is_reissued_from_its_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex review: the first registration rolls back, so no delivery child records the
+    # request; the loop's own start record (backlog.register_run) supplies the scope.
+    live = await _campaign_start(tmp_path)
+    _clock(monkeypatch, timedelta(hours=17))
+    _refused(lambda: live.register(1), "CAMPAIGN_APPROVAL_EXPIRING")
+    monkeypatch.undo()
+    live.loop_state("PAUSED", blocker="CAMPAIGN_APPROVAL_EXPIRING")
+    assert (await live.reapprove())["status"] == "REAPPROVED"
+    assert _event(live).metadata_json["loop_scope"]["maximum_items"] == 5
+    live.loop_state("RUNNING")
+    assert live.register(1)["status"] == "REGISTERED"
+    # A loop registered before NEW-229, with nothing recorded, gets the plain remedy.
+    with live.operations.sessions.begin() as session:
+        for step in session.scalars(
+            select(Step).where(Step.name.in_(["backlog.loop_request", "delivery.issue_approval"]))
+        ):
+            session.delete(step)
+    live.loop_state("PAUSED", blocker="CAMPAIGN_APPROVAL_EXPIRING")
+    with pytest.raises(IssueReapprovalBlocked, match="NO_CUSTODY.*backlog-approve"):
+        await live.reapprove()
+    live.dispose()
+
+
+async def test_a_recorded_active_child_proven_closed_in_temporal_does_not_refuse(
+    tmp_path: Path,
+) -> None:
+    live, delivery = await _campaign_loop(tmp_path)
+    live.loop_state("PAUSED", blocker="CAMPAIGN_APPROVAL_EXPIRING")
+    _running_child(live)
+    live.control.workflow_id_closed = AsyncMock(side_effect=RuntimeError("unavailable"))
+    with pytest.raises(ValueError, match="CHILD_ACTIVE: cannot verify"):
+        await live.reapprove()
+    live.control.workflow_id_closed = AsyncMock(return_value=True)
+    assert (await live.reapprove())["status"] == "REAPPROVED"
+    delivery.handler.engine.dispose()  # type: ignore[union-attr]
+    live.dispose()
+
+
+async def test_an_attempt_stopped_by_expiry_is_ended_and_its_retry_binds(
+    tmp_path: Path,
+) -> None:
+    # Codex review: the stopped attempt's Run stayed RUNNING and its ChangeSet in
+    # IMPLEMENTING, so neither the re-issue nor the retry child could proceed.
+    live, delivery = await _campaign_loop(tmp_path)
+    handler = delivery.handler
+    assert handler is not None
+    with live.operations.sessions.begin() as session:
+        change_set = session.get(ChangeSet, delivery.change_set_id)
+        change_set.state = "IMPLEMENTING"
+        change_set.source_pr_url = None
+        run = session.scalar(select(Run).where(Run.workflow_id == f"{LOOP}-issue-1-attempt-1"))
+        run.status = "RUNNING"
+        run.finished_at = None
+        run_id = run.id
+    handler._release_delivery_leases(
+        {
+            "run_id": str(run_id),
+            "change_set_id": str(delivery.change_set_id),
+            "status": "BLOCKED",
+            "blocker": "CAMPAIGN_APPROVAL_EXPIRED",
+        }
+    )
+    with live.operations.sessions() as session:
+        run = session.get(Run, run_id)
+        assert (run.status, run.error_code) == ("BLOCKED", "CAMPAIGN_APPROVAL_EXPIRED")
+        change_set = session.get(ChangeSet, delivery.change_set_id)
+        assert change_set.state == "REQUEST_CHANGES"
+    live.loop_state("PAUSED", blocker="CAMPAIGN_APPROVAL_EXPIRED")
+    assert (await live.reapprove())["status"] == "REAPPROVED"
+    live.loop_state("RUNNING")
+    child = f"{LOOP}-issue-1-retry-1-attempt-1"
+    registered = live.engineering._register_backlog_child_run(
+        {
+            **live.request.model_dump(mode="json"),
+            "child_kind": "issue-delivery",
+            "child_workflow_id": child,
+            "finding_id": live.finding_id,
+            "orchestration": {"workflow_id": LOOP},
+        }
+    )
+    loaded = delivery.load(live, registered, child)
+    assert loaded["status"] == "CONFIRMED_LOADED"
+    assert len(_recovery(live, delivery)[REISSUE_CUSTODY_KEY]) == 1
+    handler.engine.dispose()
+    live.dispose()
+
+
+def test_a_blocked_child_names_an_expired_approval_to_its_loop() -> None:
+    blocked = {"status": "BLOCKED", "context": {"blocker": "CAMPAIGN_APPROVAL_EXPIRED"}}
+    assert definitions._approval_lifetime_blocker(blocked) == "CAMPAIGN_APPROVAL_EXPIRED"
+    other = {"status": "BLOCKED", "context": {"blocker": "MAKER_TEST_FAILURE"}}
+    assert definitions._approval_lifetime_blocker(other) is None
+    assert approval_lifetime_blocker("CI_REPAIR_CAMPAIGN_APPROVAL_EXPIRED") == (
+        "CAMPAIGN_APPROVAL_EXPIRED"
+    )
+    commands = loop_commands(
+        workflow_id=LOOP,
+        project="falcone",
+        issue="gntik-ai/falcone#42",
+        state="PAUSED",
+        blocker="CI_REPAIR_CAMPAIGN_APPROVAL_EXPIRED",
+    )
+    assert any(" issue-reapprove " in command for command in commands)

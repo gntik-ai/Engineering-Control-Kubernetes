@@ -3615,6 +3615,17 @@ ISSUE_BODY_CHANGED_SINCE_IMPORT = "ISSUE_BODY_CHANGED_SINCE_IMPORT"
 _APPROVAL_LIFETIME_BLOCKERS = frozenset({"CAMPAIGN_APPROVAL_EXPIRING", "CAMPAIGN_APPROVAL_EXPIRED"})
 
 
+def _approval_lifetime_blocker(delivery: dict[str, Any]) -> str | None:
+    """NEW-229: a BLOCKED delivery child whose approval expired while it ran (its context
+    names CAMPAIGN_APPROVAL_EXPIRED), so the loop pauses on that reason. Deterministic on
+    replay: children recorded before NEW-229 never report it."""
+    context = delivery.get("context")
+    blocker = context.get("blocker") if isinstance(context, dict) else None
+    if delivery.get("status") == "BLOCKED" and blocker in _APPROVAL_LIFETIME_BLOCKERS:
+        return str(blocker)
+    return None
+
+
 def _revalidation_body_changed(verification: dict[str, Any]) -> bool:
     context = verification.get("context")
     return (
@@ -4428,6 +4439,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 pause_blocker: str | None = None
                 if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
                     blocker = str(delivery.get("blocker") or delivery.get("status"))
+                    blocker = _approval_lifetime_blocker(delivery) or blocker
                     # NEW-114: a FAILED child (e.g. a non-retryable PolicyViolation) is not
                     # a verdict on the issue: pause with its code instead of moving on.
                     delivery_failed = delivery.get(
@@ -5125,6 +5137,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         }:
                             # NEW-214a: name the refusal (only this new path reports it).
                             reason = str(context_blocker)
+                        # NEW-229: an approval that expired in the repair child is named
+                        # (CI_REPAIR_CAMPAIGN_APPROVAL_EXPIRED); the CI_REPAIR_ prefix keeps
+                        # the retry's recheck and published-state restore.
+                        reason = _approval_lifetime_blocker(repaired) or reason
                         staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
             if repair_mode == "only" and staged is None:
                 save_progress()

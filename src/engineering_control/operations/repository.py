@@ -73,7 +73,10 @@ from engineering_control.operations.issue_approval import (
     current_issue_approval_binding,
     open_campaign_loops,
 )
-from engineering_control.operations.issue_reapproval import plan_issue_reapproval
+from engineering_control.operations.issue_reapproval import (
+    campaign_active_children,
+    plan_issue_reapproval,
+)
 from engineering_control.operations.issue_start import (
     ISSUE_START_UNCONFIRMED,
     backlog_issue_signal_blocker,
@@ -736,6 +739,14 @@ class OperationsRepository:
             raise ValueError("issue re-approval requires an allowlisted operator channel")
         with self.sessions() as session:
             return plan_issue_reapproval(session, **arguments)
+
+    async def campaign_active_children(self, prefix: str) -> list[str]:
+        return await asyncio.to_thread(self._campaign_active_children, prefix)
+
+    def _campaign_active_children(self, prefix: str) -> list[str]:
+        """NEW-229: read-only; the caller proves each closed before a campaign re-issue."""
+        with self.sessions() as session:
+            return campaign_active_children(session, prefix)
 
     async def plan_publication_reconcile(
         self, effect_id: UUID, phrase: str, actor: str

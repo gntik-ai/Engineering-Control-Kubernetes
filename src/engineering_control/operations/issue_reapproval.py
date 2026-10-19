@@ -23,6 +23,7 @@ campaign so the NEW-144 custody chain can follow it.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -33,6 +34,7 @@ from sqlalchemy.orm import Session
 from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.db.models import (
     BacklogIssueRecord,
+    ChangeSet,
     ComponentLease,
     DashboardEvent,
     GitHubBacklogCampaign,
@@ -58,9 +60,11 @@ from engineering_control.operations.issue_approval import (
 )
 from engineering_control.operations.issue_delivery_approval import (
     CHILD_AUTHORITY_MINIMUM_LIFETIME,
+    LOOP_REQUEST_STEP,
     REISSUE_EVENT_TYPE,
     STEP_NAME,
     campaign_loop_scope,
+    loop_request_id,
 )
 from engineering_control.operations.issue_start import issue_start_request, issue_workflow_id
 from engineering_control.operations.models import SolveIssueCommand, parse_command
@@ -178,6 +182,7 @@ def plan_issue_reapproval(
     current_run_id: str | None,
     awaited_issue: str | None,
     validated: dict[str, Any] | None = None,
+    closed_children: Collection[str] = (),
 ) -> dict[str, Any]:
     """Every precondition, re-read from durable records; returns the loop's request.
 
@@ -200,6 +205,7 @@ def plan_issue_reapproval(
             current_run_id=current_run_id,
             awaited_issue=awaited_issue,
             validated=validated,
+            closed_children=closed_children,
         )
     if match is None or match["project"] != project:
         raise _refuse("LOOP_INVALID", "the workflow is not an issue-start loop of that project")
@@ -328,14 +334,17 @@ def _plan_campaign_reapproval(
     current_run_id: str | None,
     awaited_issue: str | None,
     validated: dict[str, Any] | None,
+    closed_children: Collection[str],
 ) -> dict[str, Any]:
     """NEW-229: plan_issue_reapproval for a campaign-wide loop paused on this issue.
 
-    The request is the one every delivery child the loop registered recorded (at least
-    one: without custody to continue, a plain backlog-approve is the remedy). It must be
-    a campaign-wide request of this campaign; the re-issue keeps exactly its scope.
-    Refused while another loop of the campaign is open or any child of the campaign may
-    still run (an active Run, or an unreleased, unexpired component or worktree lease)."""
+    The request is the one the loop registered with (LOOP_REQUEST_STEP) and every
+    delivery child it registered recorded; all must agree, and it must be a campaign-wide
+    request of this campaign; the re-issue keeps exactly its scope. Refused while another
+    loop of the campaign is open or any child of the campaign may still run: a Run still
+    recorded active that the caller did not prove closed in Temporal
+    (``closed_children``), or an unreleased, unexpired component lease or unpublished
+    worktree lease of a child."""
     identity = campaign_loop_identity(loop_workflow_id, project)
     if identity is None:
         raise _refuse("LOOP_INVALID", "the workflow is not a campaign loop of that project")
@@ -346,24 +355,42 @@ def _plan_campaign_reapproval(
     target = f"{full_repository}#{issue_number}"
     if full_repository not in BACKLOG_PROJECT_PAIRS[project]:
         raise _refuse("OPERATION_MISMATCH", f"{full_repository} is not a {project} repository")
-    recorded = session.scalars(
-        select(Step)
-        .where(
-            Step.name == STEP_NAME,
-            Step.result_json["parent_workflow_id"].as_string() == loop_workflow_id,
-        )
-        .order_by(Step.created_at)
+    # The loop's own records of the request it runs: the one it registered with and the
+    # one every delivery child approval it registered carries; all must be the same.
+    requests = [
+        record.result_json.get("request")
+        for record in session.scalars(
+            select(Step)
+            .where(
+                Step.name == STEP_NAME,
+                Step.result_json["parent_workflow_id"].as_string() == loop_workflow_id,
+            )
+            .order_by(Step.created_at)
+        ).all()
+    ]
+    loops = session.scalars(
+        select(Run.id)
+        .where(Run.workflow_id == loop_workflow_id, Run.run_type == "existing-backlog-loop")
+        .limit(2)
     ).all()
-    if not recorded:
+    started = session.get(Step, loop_request_id(loops[0])) if len(loops) == 1 else None
+    if (
+        started is not None
+        and started.name == LOOP_REQUEST_STEP
+        and started.run_id == loops[0]
+        and isinstance(started.result_json, dict)
+        and started.result_json.get("loop_workflow_id") == loop_workflow_id
+    ):
+        requests.insert(0, started.result_json.get("request"))
+    if not requests:
         raise _refuse(
             "NO_CUSTODY",
-            "no delivery child of the loop holds a ChangeSet; renew the campaign approval "
-            "with backlog-approval-candidate and backlog-approve, then retry",
+            "the loop recorded no request (it started before NEW-229 and no delivery child "
+            "holds a ChangeSet); renew the campaign approval with backlog-approval-candidate "
+            "and backlog-approve, then retry",
         )
-    expected = recorded[0].result_json.get("request")
-    if not isinstance(expected, dict) or any(
-        record.result_json.get("request") != expected for record in recorded
-    ):
+    expected = requests[0]
+    if not isinstance(expected, dict) or any(item != expected for item in requests):
         raise _refuse("LOOP_REQUEST_MISMATCH", "the loop ran a different request")
     try:
         request = ExistingBacklogLoopStart.model_validate(expected)
@@ -401,6 +428,13 @@ def _plan_campaign_reapproval(
     ).all()
     if others:
         raise _refuse("CAMPAIGN_IN_USE", f"another loop of the campaign is open ({others[0]})")
+    # A paused parent does not prove its children stopped (NEW-168 review): every child
+    # recorded active must be proven closed in Temporal by the caller.
+    unproven = [
+        name for name in campaign_active_children(session, prefix) if name not in closed_children
+    ]
+    if unproven:
+        raise _refuse("CHILD_ACTIVE", f"the campaign's child {unproven[0]} may still be running")
     children = (
         select(Run.id)
         .where(
@@ -409,26 +443,31 @@ def _plan_campaign_reapproval(
         )
         .scalar_subquery()
     )
-    active = session.scalar(
-        select(Run.workflow_id)
-        .where(Run.id.in_(children), Run.status.in_(_ACTIVE_CHILD_STATES))
+    now = datetime.now(UTC)
+    component = session.scalar(
+        select(ComponentLease.id)
+        .where(
+            ComponentLease.owner_run_id.in_(children),
+            ComponentLease.released_at.is_(None),
+            ComponentLease.expires_at > now,
+        )
         .limit(1)
     )
-    if active is not None:
-        raise _refuse("CHILD_ACTIVE", f"the campaign's child {active} may still be running")
-    now = datetime.now(UTC)
-    for lease in (ComponentLease, WorktreeLease):
-        held = session.scalar(
-            select(lease.id)
-            .where(
-                lease.owner_run_id.in_(children),
-                lease.released_at.is_(None),
-                lease.expires_at > now,
-            )
-            .limit(1)
+    # A published ChangeSet keeps its worktree lease for the release path (NEW-32); only
+    # an unpublished one's lease means a child may still be writing.
+    worktree = session.scalar(
+        select(WorktreeLease.id)
+        .join(ChangeSet, ChangeSet.id == WorktreeLease.change_set_id)
+        .where(
+            WorktreeLease.owner_run_id.in_(children),
+            WorktreeLease.released_at.is_(None),
+            WorktreeLease.expires_at > now,
+            ChangeSet.source_pr_url.is_(None),
         )
-        if held is not None:
-            raise _refuse("CHILD_ACTIVE", "a child of the campaign still holds a lease")
+        .limit(1)
+    )
+    if component is not None or worktree is not None:
+        raise _refuse("CHILD_ACTIVE", "a child of the campaign still holds a lease")
     current = lapsing_backlog_approval(campaign)
     if (
         current is not None
@@ -445,6 +484,28 @@ def _plan_campaign_reapproval(
 
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+# More recorded-active children than this cannot be proven closed and refuse.
+MAX_ACTIVE_CHILDREN = 50
+
+
+def campaign_active_children(session: Session, prefix: str) -> list[str]:
+    """NEW-229: the campaign's child workflow IDs whose Run is still recorded active; the
+    caller proves each closed in Temporal before a campaign loop's re-issue."""
+    names = session.scalars(
+        select(Run.workflow_id)
+        .where(
+            Run.workflow_id.startswith(f"{prefix}-", autoescape=True),
+            Run.run_type != "existing-backlog-loop",
+            Run.status.in_(_ACTIVE_CHILD_STATES),
+        )
+        .order_by(Run.workflow_id)
+        .limit(MAX_ACTIVE_CHILDREN + 1)
+    ).all()
+    if len(names) > MAX_ACTIVE_CHILDREN:
+        raise _refuse("CHILD_ACTIVE", "too many campaign children to verify as closed")
+    return [str(name) for name in names]
 
 
 def _campaign_reissue_event(

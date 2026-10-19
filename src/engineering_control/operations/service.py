@@ -304,9 +304,21 @@ class TypedCommandBus:
         if separator and loop_prefix.startswith(f"backlog-loop-{project}-"):
             await self._close_ended_campaign_loops(loop_prefix, exclude=loop_workflow_id)
         elif campaign_loop is not None:
-            await self._close_ended_campaign_loops(
-                campaign_loop_prefix(project, campaign_loop[0]), exclude=loop_workflow_id
-            )
+            prefix = campaign_loop_prefix(project, campaign_loop[0])
+            await self._close_ended_campaign_loops(prefix, exclude=loop_workflow_id)
+            # NEW-229: a child still recorded active must be proven closed in Temporal (an
+            # unknown state refuses); the plan, and its re-run in the approving
+            # transaction, refuse any other.
+            closed: list[str] = []
+            for child in await self.operations.campaign_active_children(prefix):
+                try:
+                    if await self.control.workflow_id_closed(child):
+                        closed.append(child)
+                except Exception:  # noqa: BLE001 - an unknown child state refuses
+                    raise ValueError(
+                        f"ISSUE_REAPPROVE_CHILD_ACTIVE: cannot verify {child} is closed"
+                    ) from None
+            arguments["closed_children"] = closed
         plan = await self.operations.plan_issue_reapproval(actor=actor, **arguments)
         request: ExistingBacklogLoopStart = plan["request"]
         campaign_id = request.backlog_campaign_id

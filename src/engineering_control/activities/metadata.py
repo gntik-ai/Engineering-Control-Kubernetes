@@ -122,6 +122,7 @@ from engineering_control.operations.issue_amend import (
     record_consumed_issue_revision,
 )
 from engineering_control.operations.issue_delivery_approval import (
+    CAMPAIGN_APPROVAL_EXPIRED,
     CampaignApprovalLapse,
     bind_change_set_issue_approval,
     expired_unreferenced_reissue_event_ids,
@@ -3029,13 +3030,16 @@ class MetadataActivityHandler:
             run = session.get(Run, UUID(str(raw_run_id)))
             if (
                 run is not None
-                and payload.get("blocker") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                and payload.get("blocker")
+                in {"ISSUE_BODY_CHANGED_SINCE_APPROVAL", CAMPAIGN_APPROVAL_EXPIRED}
                 and run.status == "RUNNING"
             ):
                 # NEW-115: this run stopped at the issue-body refresh, before any work;
                 # record it so /loop amend can tell it from a delivery still running.
+                # NEW-229: likewise a run stopped because its campaign approval expired,
+                # so issue-reapprove sees it ended.
                 run.status = "BLOCKED"
-                run.error_code = "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                run.error_code = str(payload["blocker"])
                 run.finished_at = datetime.now(UTC)
             if run is not None:
                 self._notify_delivery_blocked(session, run, payload)
@@ -10123,7 +10127,8 @@ def _record_correction_state(
 
     NEW-137: also when a provider call stopped it for an allowlisted transient reason
     (blocker PROVIDER_UNAVAILABLE, with the provider and its error code), so a bounded
-    retry binds after a provider outage without a database fix.
+    retry binds after a provider outage without a database fix. NEW-229: also when its
+    campaign approval expired (BLOCKED CAMPAIGN_APPROVAL_EXPIRED).
 
     The bounded correction child (and an operator retry) may bind only to a ChangeSet in
     REQUEST_CHANGES, but the validation verdict was never persisted, so every automatic
@@ -10135,7 +10140,10 @@ def _record_correction_state(
     """
     stop = (str(payload.get("status") or ""), str(payload.get("blocker") or ""))
     provider_stop: dict[str, str] | None = None
-    if stop not in _CORRECTION_STOPS:
+    # NEW-229: an attempt whose campaign approval expired mid-way (gntik-ui #175) is, like
+    # a provider outage, no verdict on the change; once the approval is re-issued a bounded
+    # retry attempt binds and continues the ChangeSet's worktree.
+    if stop not in _CORRECTION_STOPS and stop != ("BLOCKED", CAMPAIGN_APPROVAL_EXPIRED):
         # NEW-137: a provider call of the attempt (spec, maker or checker) failed for an
         # allowlisted transient reason (falcone #1012: checker 529 Overloaded).
         provider_stop = provider_unavailable_stop(payload)

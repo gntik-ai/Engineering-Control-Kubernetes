@@ -48,6 +48,12 @@ CAMPAIGN_APPROVAL_EXPIRED = "CAMPAIGN_APPROVAL_EXPIRED"
 APPROVAL_LIFETIME_BLOCKERS = frozenset({CAMPAIGN_APPROVAL_EXPIRING, CAMPAIGN_APPROVAL_EXPIRED})
 
 
+def approval_lifetime_blocker(blocker: object) -> str | None:
+    """The NEW-229 code a loop pause names (a CI-repair round's carries ``CI_REPAIR_``)."""
+    code = str(blocker or "").removeprefix("CI_REPAIR_")
+    return code if code in APPROVAL_LIFETIME_BLOCKERS else None
+
+
 class CampaignApprovalLapse(ValueError):
     """NEW-229: the child's campaign approval expired (or will before a child can finish).
 
@@ -343,6 +349,16 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
         for key, item in value.items()
         if key not in {"child_workflow_id", "binding_sha256"}
     }
+
+
+# NEW-229: the request a campaign-wide loop registered its Run with (backlog.register_run),
+# so its campaign approval can be re-issued with exactly that scope even before any
+# delivery child holds custody (a pause at the first registration or revalidation).
+LOOP_REQUEST_STEP = "backlog.loop_request"
+
+
+def loop_request_id(loop_run_id: UUID) -> UUID:
+    return uuid5(NAMESPACE_URL, f"backlog-loop-request:{loop_run_id}")
 
 
 # NEW-144: ChangeSet.recovery_json record of each move of its custody to a NEW-143

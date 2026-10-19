@@ -89,6 +89,10 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
         "the campaign approval expired; re-issue it with issue-reapprove (same scope, the "
         "ChangeSet is kept), then retry"
     ),
+    "CI_REPAIR_CAMPAIGN_APPROVAL_EXPIRED": (
+        "the campaign approval expired during the CI repair; re-issue it with "
+        "issue-reapprove (same scope, the published ChangeSet is kept), then retry"
+    ),
     "APPROVAL_BINDING_CHANGED": "the approved binding changed after approval",
     "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED": (
         "the per-issue delivery approval is missing or changed"
@@ -280,7 +284,10 @@ def loop_commands(
     if code in {"ISSUE_BODY_CHANGED_SINCE_APPROVAL", "ISSUE_BODY_CHANGED_SINCE_IMPORT"}:
         amend = f"/loop amend {project or '<project>'} {repository} {number}"
         return [*commands, amend, f"{amend} <sha-prefix from the preview> retry"]
-    if code in {"CAMPAIGN_APPROVAL_EXPIRING", "CAMPAIGN_APPROVAL_EXPIRED"}:
+    if code.removeprefix("CI_REPAIR_") in {
+        "CAMPAIGN_APPROVAL_EXPIRING",
+        "CAMPAIGN_APPROVAL_EXPIRED",
+    }:
         # NEW-229: the re-issue keeps the loop's scope and its ChangeSet custody.
         phrase = loop_reapproval_phrase(workflow_id, project or "")
         commands.append(
