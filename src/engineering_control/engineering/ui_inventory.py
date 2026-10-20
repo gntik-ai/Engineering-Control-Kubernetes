@@ -1455,6 +1455,72 @@ def git_legacy_app_tree(run: Callable[[list[str]], str], source_sha: str, legacy
     return tree
 
 
+def git_page_closure(
+    run: Callable[[list[str]], str],
+    commit: str,
+    legacy_app: str,
+    page_file: str,
+    *,
+    max_files: int,
+) -> list[str]:
+    """NEW-227: a page's transitive import closure at `commit`, as `ModuleGraph.closure`
+    computes it for the inventory (tests and the shell, context and primitive modules are
+    not followed), read from the Git object store, never from a worktree a maker can write.
+
+    Only regular blobs count (a symlink is never followed); a closure above `max_files`, or
+    a page that is not a source file of the legacy app at `commit`, raises InventoryError.
+    Returns repository-relative paths, sorted."""
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise InventoryError("closure commit must be a full 40-character commit")
+    src = f"{legacy_app}/src"
+    if not page_file.startswith(f"{src}/"):
+        raise InventoryError(f"page file is outside {src}: {page_file}")
+    listing = run(
+        ["--literal-pathspecs", "ls-tree", "-r", "-z", "-l", "--full-tree", commit, "--", src]
+    )
+    sizes: dict[str, int] = {}
+    for entry in listing.split("\0"):
+        meta, _, path = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) != 4 or fields[1] != "blob" or fields[0] not in {"100644", "100755"}:
+            continue
+        relative = path.removeprefix(f"{src}/")
+        if (
+            relative == path
+            or Path(relative).suffix not in SOURCE_SUFFIXES
+            or relative.endswith(".d.ts")
+            or "/node_modules/" in f"/{relative}"
+        ):
+            continue
+        sizes[relative] = int(fields[3])
+    if len(sizes) > MAX_SOURCE_FILES:
+        raise InventoryError("legacy app has too many source files to inventory")
+    start = page_file.removeprefix(f"{src}/")
+    if start not in sizes:
+        raise InventoryError(f"page file is not a source file at {commit}: {page_file}")
+    # Resolution only tests membership, so the graph holds every listed file unread.
+    graph = ModuleGraph(Path(src), dict.fromkeys(sizes, scan_js("")), {}, {})
+    seen = {start}
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if sizes[current] > MAX_SOURCE_BYTES:
+            raise InventoryError(f"source file exceeds the size bound: {current}")
+        source = scan_js(
+            run(["--literal-pathspecs", "cat-file", "blob", f"{commit}:{src}/{current}"])
+        )
+        for target in sorted(graph._imports(current, source)):
+            if target in seen or _is_test(target):
+                continue
+            if any(target.startswith(prefix) for prefix in CLOSURE_STOP_PREFIXES):
+                continue
+            seen.add(target)
+            stack.append(target)
+            if len(seen) > max_files:
+                raise InventoryError(f"page closure exceeds {max_files} files at {commit}")
+    return sorted(f"{src}/{relative}" for relative in seen)
+
+
 def render_markdown(document: dict[str, Any]) -> str:
     summary = document["summary"]
     classes = summary["endpoint_classes"]

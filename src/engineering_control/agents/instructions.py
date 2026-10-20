@@ -55,20 +55,34 @@ class AgentInstructionPack:
         # its output schema is Hermes-pinned (plan_schema), not the skill's draft schema.
         "ui_consolidate.plan": "triage-ui-gap",
     }
+    # NEW-227: a blueprint page's delivery maker and checker use the UI page skills; the
+    # role in the request (set by delivery.prepare_maker/prepare_checker from Hermes's own
+    # page provenance) selects them. Both send exactly the released skill output schema.
+    _role_skills = {
+        ("delivery.invoke_maker", "ui-page-implementer"): "migrate-ui-page",
+        ("delivery.invoke_checker", "ui-page-reviewer"): "review-ui-page",
+    }
     # NEW-123: these steps must send exactly the released skill's output schema.
     _pinned_schema_steps = frozenset({"ui_plan.draft", "ui_plan.review", "ui_fanout.gap_draft"})
     # NEW-123 (design section 11): the UI roles list gntik-ui MCP tools, but models get no
     # MCP -- Hermes supplies the kit data. Those grants are accepted in the role definition
-    # and never granted; the UI roles are otherwise strictly read-only.
+    # and never granted; the UI planning roles are otherwise strictly read-only.
     _read_only_roles = frozenset({"ui-migration-architect", "ui-gap-triager"})
+    _kit_mcp_roles = _read_only_roles | {"ui-page-implementer", "ui-page-reviewer"}
     _read_only_tools = frozenset({"Read", "Glob", "Grep"})
     _unused_mcp_grant = re.compile(r"^mcp__gntik_ui__[a-z][a-z_]{0,63}$")
+    # NEW-227: the delivery makers; every other role is read-only.
+    _writable_roles = frozenset({"implementer", "ui-page-implementer"})
 
     def __init__(self, root: Path) -> None:
         self.root = root
 
     def enrich(self, request: AgentRequest, step: str) -> tuple[AgentRequest, InstructionBundle]:
-        skill = "audit-security" if request.role == "security-auditor" else self._skill(step)
+        skill = (
+            "audit-security"
+            if request.role == "security-auditor"
+            else self._role_skills.get((step, request.role)) or self._skill(step)
+        )
         provider_asset = (
             f"generated/claude/agents/{request.role}.md"
             if request.provider.value == "claude"
@@ -102,6 +116,8 @@ class AgentInstructionPack:
             raise ValueError("agent-pack output schema is invalid") from error
         if step == "reconcile.invoke_release_reviewer" and request.output_schema != schema:
             raise ValueError("release review request drifted from its canonical output schema")
+        if (step, request.role) in self._role_skills and request.output_schema != schema:
+            raise ValueError("ui page request drifted from the released skill output schema")
         if step in self._pinned_schema_steps and request.output_schema != schema:
             # NEW-131: a batched plan part sends one of the skill's released part schemas.
             part = self._part_schema(catalog, skill, request.output_schema)
@@ -214,15 +230,16 @@ class AgentInstructionPack:
         if not isinstance(raw_tools, list) or not raw_tools:
             raise ValueError("agent role has no bounded tool set")
         tools = {str(tool) for tool in raw_tools}
-        if request.role in self._read_only_roles:
+        if request.role in self._kit_mcp_roles:
             tools = {tool for tool in tools if not self._unused_mcp_grant.fullmatch(tool)}
+        if request.role in self._read_only_roles:
             if not tools or not tools.issubset(self._read_only_tools) or request.writable:
                 raise ValueError("UI migration roles are read-only and receive no MCP tools")
         if not tools.issubset(self._allowed_tools):
             raise ValueError("agent role requests a non-allowlisted tool")
         write_tools = {"Edit", "Write"}
         if request.writable:
-            if request.role != "implementer" or not write_tools.issubset(tools):
+            if request.role not in self._writable_roles or not write_tools.issubset(tools):
                 raise ValueError("only the implementer may receive write tools")
         effective_tools = set(request.allowed_tools) if request.allowed_tools else tools
         if not effective_tools.issubset(tools):

@@ -1498,6 +1498,76 @@ async def test_issue_delivery_prepares_the_toolchain_after_prechecks_and_replays
         if event.HasField("marker_recorded_event_attributes")
     ]
     assert any(b"delivery-prepare-toolchain-v1" in marker for marker in markers)
+    # NEW-227: a delivery without a UI page context never reaches its inputs step.
+    assert "delivery.prepare_ui_page" not in steps
+    assert not any(b"delivery-ui-page-inputs-v1" in marker for marker in markers)
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+_UI_PAGE_CONTEXT = {"page_id": "tenants", "closure": ["apps/web-console/src/pages/T.tsx"]}
+
+
+async def test_new_227_a_page_delivery_prepares_its_ui_inputs_after_the_prechecks() -> None:
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.deterministic_prechecks": {
+            "status": "PRECHECKS_PASS",
+            "run_id": "run-1",
+            "ui_page": _UI_PAGE_CONTEXT,
+        },
+        "delivery.prepare_ui_page": {
+            "status": "PRECHECKS_PASS",
+            "run_id": "run-1",
+            "ui_page": _UI_PAGE_CONTEXT,
+            "ui_page_inputs": {"drift": {"text": "none"}, "kit": {"text": "rules"}},
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    steps = _scheduled_step_names(history)
+    prechecks = steps.index("delivery.deterministic_prechecks")
+    assert steps[prechecks + 1 : prechecks + 4] == [
+        "delivery.prepare_ui_page",
+        "delivery.prepare_toolchain",
+        "delivery.prepare_spec",
+    ]
+    (inputs,) = _payloads(history, "delivery.prepare_ui_page")
+    assert inputs["ui_page"] == _UI_PAGE_CONTEXT
+    assert "delivery_request" in inputs
+    assert any(b"delivery-ui-page-inputs-v1" in marker for marker in _markers(history))
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_new_227_a_blocked_ui_page_input_stops_the_delivery_and_releases_its_leases() -> None:
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.deterministic_prechecks": {
+            "status": "PRECHECKS_PASS",
+            "run_id": "run-1",
+            "ui_page": _UI_PAGE_CONTEXT,
+        },
+        "delivery.prepare_ui_page": {
+            "status": "BLOCKED",
+            "blocker": "UI_MCP_UNAVAILABLE",
+            "run_id": "run-1",
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    assert result["context"]["blocker"] == "UI_MCP_UNAVAILABLE"
+    steps = _scheduled_step_names(history)
+    assert steps[-2:] == ["delivery.prepare_ui_page", "delivery.release_leases"]
+    assert "delivery.prepare_spec" not in steps
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 

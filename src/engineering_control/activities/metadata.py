@@ -35,6 +35,7 @@ from engineering_control.db.models import (
     Artifact,
     BacklogIssueRecord,
     Campaign,
+    ChangeRequest,
     ChangeSet,
     ComponentLease,
     CoverageCell,
@@ -57,6 +58,7 @@ from engineering_control.db.models import (
     WorktreeLease,
 )
 from engineering_control.db.runtime_binding import new_bound_run
+from engineering_control.db.ui_blueprints import UiBlueprintNotFoundError, UiBlueprintRepository
 from engineering_control.delivery_notifications import (
     attempt_label,
     checker_verdict,
@@ -81,6 +83,21 @@ from engineering_control.engineering.toolchain import (
     load_maker_rules,
     toolchain_test_command_lines,
 )
+from engineering_control.engineering.ui_blueprint import agent_pack_problems
+from engineering_control.engineering.ui_page_delivery import (
+    CHECKER_ROLES,
+    MAKER_ROLES,
+    UI_PAGE_CHECKER_ROLE,
+    UI_PAGE_MAKER_ROLE,
+    UiPageRejected,
+    checker_instructions,
+    input_section,
+    maker_instructions,
+    page_context,
+    page_view,
+)
+from engineering_control.engineering.ui_page_delivery import checker_schema as ui_checker_schema
+from engineering_control.engineering.ui_page_delivery import maker_schema as ui_maker_schema
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
 from engineering_control.models.core import AgentRequest, AgentResult, resolve_agent_effort
 from engineering_control.models.core import ChangeSet as ChangeSetModel
@@ -3129,6 +3146,17 @@ class MetadataActivityHandler:
                 "status": "RATE_LIMITED" if maker.status == "RATE_LIMITED" else "BLOCKED",
                 "routing_reason": f"maker={maker.reason};spec={spec.reason}",
             }
+        try:
+            # NEW-227: an issue published from a blueprint page is delivered with the UI
+            # page skills; recognised from Hermes's own records before any worktree exists.
+            ui_page = self._ui_page_context(payload)
+        except UiPageRejected as rejected:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": rejected.code,
+                "blocker_detail": rejected.detail,
+            }
         issue = str(payload.get("issue_number") or f"finding-{str(payload['fingerprint'])[:12]}")
         allocation = {
             "change_set_id": payload["change_set_id"],
@@ -3162,7 +3190,82 @@ class MetadataActivityHandler:
             "allocation_request": allocation,
             # NEW-214a: completed by the allocation with the base tip, else None.
             "merge_forward": merge_forward,
+            **({"ui_page": ui_page} if ui_page is not None else {}),
         }
+
+    def _ui_page_context(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """NEW-227: the approved blueprint page the delivered issue was published from.
+
+        Hermes-held provenance only: the PUBLISHED change request the operator recorded for
+        this issue, whose stored UI context is a page of an APPROVED blueprint (labels such
+        as ui-migration or wave:u1 are never consulted). None for every other issue."""
+        number = payload.get("issue_number")
+        repository = payload.get("issue_repository")
+        if not isinstance(number, int) or not isinstance(repository, str):
+            return None
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(ChangeRequest).where(
+                    ChangeRequest.project == str(payload.get("project")),
+                    ChangeRequest.target_repository == repository,
+                    ChangeRequest.issue_number == number,
+                    ChangeRequest.status == "PUBLISHED",
+                )
+            ).all()
+        pages = [
+            row
+            for row in rows
+            if isinstance(row.ui_context_json, dict)
+            and row.ui_context_json.get("item_kind") == "page"
+        ]
+        if not pages:
+            return None
+        if len(rows) != 1:
+            raise UiPageRejected("UI_PAGE_PROVENANCE_AMBIGUOUS", f"{len(rows)} requests")
+        row = pages[0]
+        context = cast(dict[str, Any], row.ui_context_json)
+        problems = agent_pack_problems(
+            self.settings.agent_pack_root, ("migrate-ui-page", "review-ui-page")
+        )
+        if problems:
+            raise UiPageRejected("AGENT_PACK_SKILL_MISSING", "; ".join(problems))
+        try:
+            blueprint_id = UUID(str(context.get("blueprint_id")))
+            loaded = UiBlueprintRepository(engine=self.engine).load_approved_sync(blueprint_id)
+        except (ValueError, UiBlueprintNotFoundError) as error:
+            raise UiPageRejected("UI_PAGE_BLUEPRINT_NOT_APPROVED", str(error)) from error
+        return page_context(str(row.id), context, loaded)
+
+    def _ui_page_section(self, payload: dict[str, Any], *, role: str) -> tuple[str, str]:
+        """NEW-227: the UI page instructions and the bounded input section of one prompt."""
+        ui_page = self._object(payload.get("ui_page"), "ui_page")
+        inputs = payload.get("ui_page_inputs")
+        if not isinstance(inputs, dict):
+            raise UiPageRejected("UI_PAGE_INPUTS_MISSING", "no legacy drift or kit snapshot")
+        try:
+            loaded = UiBlueprintRepository(engine=self.engine).load_approved_sync(
+                UUID(str(ui_page.get("blueprint_id")))
+            )
+        except (ValueError, UiBlueprintNotFoundError) as error:
+            raise UiPageRejected("UI_PAGE_BLUEPRINT_NOT_APPROVED", str(error)) from error
+        if loaded.get("status") != "APPROVED" or loaded.get("blueprint_sha256") != ui_page.get(
+            "blueprint_sha256"
+        ):
+            raise UiPageRejected("UI_PAGE_BLUEPRINT_CHANGED", "blueprint changed since routing")
+        view = page_view(loaded.get("blueprint") or {}, ui_page)
+        if role == "maker":
+            return maker_instructions(ui_page, inputs), input_section(
+                view, ui_page, inputs, role=role, fence=_untrusted_block
+            )
+        source = self._object(payload.get("source_maker_result"), "source_maker_result")
+        return checker_instructions(ui_page), input_section(
+            view,
+            ui_page,
+            inputs,
+            role=role,
+            fence=_untrusted_block,
+            maker_result=self._object(source.get("structured_result"), "source maker result"),
+        )
 
     def _persist_worktree_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
         change_set_id = UUID(str(payload["change_set_id"]))
@@ -3648,7 +3751,8 @@ class MetadataActivityHandler:
                 .where(
                     Run.change_set_id == change_set_id,
                     Run.workflow_id != workflow_id,
-                    AgentInvocation.role == "code-reviewer",
+                    # NEW-227: a UI page's checker findings are mapped to the same strings.
+                    AgentInvocation.role.in_(CHECKER_ROLES),
                 )
                 .order_by(AgentInvocation.started_at.desc())
                 .limit(1)
@@ -3700,7 +3804,7 @@ class MetadataActivityHandler:
                 .where(
                     Run.change_set_id == change_set_id,
                     Run.workflow_id != workflow_id,
-                    AgentInvocation.role == "implementer",
+                    AgentInvocation.role.in_(MAKER_ROLES),
                 )
             ).all()
         for invocation_id, structured, started_at, run_workflow in rows:
@@ -3745,9 +3849,37 @@ class MetadataActivityHandler:
                     "status": "BLOCKED",
                     "blocker": "SOURCE_MAKER_DID_NOT_COMPLETE",
                 }
+        # NEW-227: a blueprint page's source maker is the ui-page-implementer (migrate-ui-page);
+        # the deployment maker stays the implementer.
+        ui_page = None if deployment else payload.get("ui_page")
+        ui_instructions = ui_inputs = ""
+        if ui_page is not None:
+            try:
+                ui_instructions, ui_inputs = self._ui_page_section(payload, role="maker")
+            except UiPageRejected as rejected:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": rejected.code,
+                    "blocker_detail": rejected.detail,
+                }
+        shown = prior
+        if isinstance(prior, dict) and isinstance(prior.get("structured_result"), dict):
+            # NEW-227: a UI page source maker's typed evidence is the checker's input (bounded
+            # there), not the deployment maker's; it could exceed the prompt bound. Its
+            # agent summary is the provider's raw output (the same evidence), so only the
+            # identity and the delivery maker fields are shown.
+            structured = prior["structured_result"]
+            if "ui_page" in structured:
+                shown = {
+                    **{key: prior.get(key) for key in ("provider", "role", "status")},
+                    "structured_result": {
+                        key: value for key, value in structured.items() if key != "ui_page"
+                    },
+                }
         derived_content = (
             f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
-            f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
+            f"Prior source maker result: {json.dumps(shown, sort_keys=True, default=str)}\n"
         )
         correction = self._prior_checker_findings(change_set_id, workflow_id)
         # NEW-52: the allocation kept the previous attempt's commits (they descend from
@@ -4003,6 +4135,7 @@ class MetadataActivityHandler:
             "delivery share a budget of three such commands. A real failure that cannot be "
             "reported in these shapes is still reported as FAIL, as you ran it: it blocks "
             "the delivery even when main fails the same way.\n"
+            + ui_instructions
             + ci_repair_instruction
             + resume_instruction
             + (
@@ -4089,6 +4222,7 @@ class MetadataActivityHandler:
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"
             f"{_untrusted_block('issue-derived content', derived_content)}\n"
+            + ui_inputs
             + _issue_context(payload)
         )
         request = AgentRequest(
@@ -4099,12 +4233,13 @@ class MetadataActivityHandler:
                 + (f":deps-{dependency_round}" if dependency_round else ""),
             ),
             project=Project(str(payload["project"])),
-            role="implementer",
+            role=UI_PAGE_MAKER_ROLE if ui_page is not None else "implementer",
             provider=provider,
             model_class=ModelClass.WORKER,
             prompt=prompt,
             working_directory=str(payload[worktree_key]),
-            output_schema=self._maker_output_schema(),
+            # NEW-227: exactly the released skill schema (the instruction pack checks it).
+            output_schema=ui_maker_schema() if ui_page is not None else self._maker_output_schema(),
             timeout_seconds=7200,
             effort=resolve_agent_effort(ModelClass.WORKER, writable=True),
             writable=True,
@@ -4288,6 +4423,19 @@ class MetadataActivityHandler:
                     "status": "BLOCKED",
                     "blocker": f"{label.upper()}_MAKER_DID_NOT_COMPLETE",
                 }
+        # NEW-227: a blueprint page's checker is the ui-page-reviewer (review-ui-page).
+        ui_page = payload.get("ui_page")
+        ui_instructions = ui_inputs = ""
+        if ui_page is not None:
+            try:
+                ui_instructions, ui_inputs = self._ui_page_section(payload, role="checker")
+            except UiPageRejected as rejected:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": rejected.code,
+                    "blocker_detail": rejected.detail,
+                }
         derived_content = (
             f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
             f"Latest maker result: {json.dumps(source_result, sort_keys=True, default=str)}\n"
@@ -4306,6 +4454,7 @@ class MetadataActivityHandler:
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
             "and risk gates. Request changes on any uncertainty.\n"
+            + ui_instructions
             # NEW-57 (operator 2026-09-25): #993 was repeatedly rejected only because the
             # gate-record wording or checkbox state in the OpenSpec tasks.md did not match
             # the checker's own gate runs. The checker verifies gates itself; the record
@@ -4320,17 +4469,20 @@ class MetadataActivityHandler:
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"
             f"{_untrusted_block('issue-derived content', derived_content)}\n"
+            + ui_inputs
             + _issue_context(payload)
         )
         request = AgentRequest(
             run_id=uuid5(NAMESPACE_URL, f"delivery-checker:{workflow_id}:{change_set_id}"),
             project=Project(str(payload["project"])),
-            role="code-reviewer",
+            role=UI_PAGE_CHECKER_ROLE if ui_page is not None else "code-reviewer",
             provider=provider,
             model_class=ModelClass.JUDGE,
             prompt=prompt,
             working_directory=str(payload["source_worktree"]),
-            output_schema=self._checker_output_schema(),
+            output_schema=(
+                ui_checker_schema() if ui_page is not None else self._checker_output_schema()
+            ),
             timeout_seconds=5400,
             effort=resolve_agent_effort(ModelClass.JUDGE),
             # NEW-53: optional pin; only meaningful for the Claude CLI.
