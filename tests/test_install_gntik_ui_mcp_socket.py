@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "install-gntik-ui-mcp-socket.sh"
 MANIFEST = ROOT / "config" / "projects" / "falcone.yaml"
 IMAGE = "ghcr.io/gntik-ai/gntik-ui-mcp"
-DIGEST = "sha256:145c5a39a76342814030a6b4c67db2b1c4c31939e2a1247b4cc9bc3b1027afa1"
+DIGEST = "sha256:a5446d3555e1169c11fe1b054c8cbb0d415ba006627cb6d7c2851f712c377d77"
 BASH = shutil.which("bash") or "/bin/bash"
 
 

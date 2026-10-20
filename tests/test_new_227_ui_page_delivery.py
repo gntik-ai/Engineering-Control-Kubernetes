@@ -1019,7 +1019,7 @@ async def test_the_scan_step_hands_over_the_drift_and_the_kit_excerpt(
     assert (drift["from_sha"], drift["to_sha"], drift["changed_files"]) == (source, base, 1)
     assert all(arguments[0] == "--literal-pathspecs" for arguments in seen)
     kit = result["ui_page_inputs"]["kit"]
-    assert kit["gntik_ui_version"] == "0.7.0"
+    assert kit["gntik_ui_version"] == "0.9.0"
     assert "get_template list-page" in kit["text"] and "get_rules" in kit["text"]
     assert len(json.dumps(result["ui_page_inputs"]).encode()) < 16_384  # no 600 KiB tokens
     stored = tmp_path / "evidence/scan/ui-kit" / kit["snapshot_sha256"][:32]

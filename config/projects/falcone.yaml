@@ -183,6 +183,9 @@ delivery_control:
 # Operator rule 2026-10-13: the falcone kit comes only from public npm (registry.npmjs.org),
 # never GitHub Packages. Bump to 0.7.0 (released 10-17 from main ef0e0dc, Version Packages
 # gntik-ui#89); the digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-ef0e0dc.
+# Operator decision 2026-10-20 (UI migration start): bump to 0.9.0 before wave u1 (released
+# 10-20 from main 36afdb3, Version Packages gntik-ui#652); the digest is the multi-arch index
+# of ghcr.io/gntik-ai/gntik-ui-mcp:sha-36afdb3.
 ui_migration:
   legacy_app: apps/web-console
   target_app: apps/web-console-next
@@ -190,10 +193,10 @@ ui_migration:
   gntik_ui:
     registry: registry.npmjs.org
     scope: "@gntik-ai"
-    version: 0.7.0
+    version: 0.9.0
   mcp:
     image: ghcr.io/gntik-ai/gntik-ui-mcp
-    digest: sha256:145c5a39a76342814030a6b4c67db2b1c4c31939e2a1247b4cc9bc3b1027afa1
+    digest: sha256:a5446d3555e1169c11fe1b054c8cbb0d415ba006627cb6d7c2851f712c377d77
     socket: /run/gntik-ui-mcp/mcp.sock
   route_tables:
     control_plane_routes: apps/control-plane/routes.mjs
