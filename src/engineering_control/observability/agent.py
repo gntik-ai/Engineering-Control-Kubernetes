@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.config import Settings
 from engineering_control.db.models import AgentExecution, AgentLogChunk, DashboardEvent
+from engineering_control.observability.cgroup_memory import EVENT_TYPE as MEMORY_PRESSURE_EVENT
 from engineering_control.projects import ProjectName
 from engineering_control.security.redaction import SecretRedactor
 
@@ -199,6 +200,9 @@ class TranscriptNormalizer:
             return []
         if event_type == "provider.stderr":
             return self._line("stderr", event.get("text"), now)
+        if event_type == MEMORY_PRESSURE_EVENT:
+            # NEW-226: Hermes' own reading of the worker's memory state on a failed step.
+            return self._line("system", event.get("summary"), now)
         if provider == "codex":
             return self._codex(event_type, event, now)
         return self._claude(event_type, event, now)

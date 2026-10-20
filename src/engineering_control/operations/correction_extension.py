@@ -148,6 +148,10 @@ def record_loop_pause_target(
         "recorded_at": (now or datetime.now(UTC)).isoformat(),
         "fence": loop_state_fence(payload),
     }
+    expires_at = payload.get("approval_expires_at")
+    if status == "PAUSED" and isinstance(expires_at, str) and len(expires_at) <= 64:
+        # NEW-229: when the campaign approval the paused issue waits on expires (expired).
+        value["approval_expires_at"] = expires_at
     identifier = loop_pause_target_id(run.id)
     record = session.get(Step, identifier)
     # The order in which this loop's workflow runs first wrote a state (bounded).

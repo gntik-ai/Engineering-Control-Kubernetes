@@ -139,6 +139,8 @@ from engineering_control.operations.issue_amend import (
     record_consumed_issue_revision,
 )
 from engineering_control.operations.issue_delivery_approval import (
+    CAMPAIGN_APPROVAL_EXPIRED,
+    CampaignApprovalLapse,
     bind_change_set_issue_approval,
     expired_unreferenced_reissue_event_ids,
     validate_change_set_issue_approval,
@@ -174,7 +176,6 @@ from engineering_control.workflows.cleanup_scope import (
     PROJECT_UNATTRIBUTABLE_PROTECTION,
 )
 from engineering_control.workflows.provider_stops import provider_unavailable_stop
-from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -425,6 +426,14 @@ _TASKS_MD_ADVISORY = (
 )
 
 
+def _issue_approval_blocker(error: ValueError) -> str:
+    """NEW-229: an approval that only expired is named as such (the remedy is a re-issue
+    of the same approval, issue-reapprove); every other refusal stays the generic one."""
+    if isinstance(error, CampaignApprovalLapse):
+        return error.blocker
+    return "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+
+
 def _issue_content(payload: dict[str, Any]) -> str | None:
     """The confirmed issue as the spec agent sees it (refreshed body, NEW-44)."""
     if not all(key in payload for key in ("expected_behavior", "actual_behavior")):
@@ -628,11 +637,11 @@ class MetadataActivityHandler:
             ):
                 try:
                     payload = await asyncio.to_thread(self._issue_approval_preparation, payload)
-                except ValueError:
+                except ValueError as error:
                     return {
                         **payload,
                         "status": "BLOCKED",
-                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                        "blocker": _issue_approval_blocker(error),
                     }
             if step == "audit.prepare_agent_cell":
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
@@ -2768,14 +2777,14 @@ class MetadataActivityHandler:
                         finding=finding,
                         run=run,
                     )
-                except ValueError:
+                except ValueError as error:
                     run.status = "BLOCKED"
                     run.finished_at = datetime.now(UTC)
-                    run.error_code = "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+                    run.error_code = _issue_approval_blocker(error)
                     return {
                         **payload,
                         "status": "BLOCKED",
-                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                        "blocker": run.error_code,
                     }
             project = Project(finding.project)
             source_repository, deployment_repository = PROJECT_REPOSITORY_SLUGS[project.value]
@@ -3004,10 +3013,8 @@ class MetadataActivityHandler:
         if requested not in (1, 2, 3):
             raise ValueError("FRONT capacity needs the approved concurrency")
         leases = self.settings.implementation_leases_per_project
-        maker_slots = min(
-            ROLE_WORKER_REGISTRY["codex"].max_concurrent_activities,
-            ROLE_WORKER_REGISTRY["claude"].max_concurrent_activities,
-        )
+        # NEW-226: the provider workers' slots are set per deployment (default 2 each).
+        maker_slots = min(self.settings.codex_worker_slots, self.settings.claude_worker_slots)
         broker = self._quota_broker()
         quota = {
             provider.value: broker.available(provider, reserve_work=False)[0]
@@ -3040,13 +3047,16 @@ class MetadataActivityHandler:
             run = session.get(Run, UUID(str(raw_run_id)))
             if (
                 run is not None
-                and payload.get("blocker") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                and payload.get("blocker")
+                in {"ISSUE_BODY_CHANGED_SINCE_APPROVAL", CAMPAIGN_APPROVAL_EXPIRED}
                 and run.status == "RUNNING"
             ):
                 # NEW-115: this run stopped at the issue-body refresh, before any work;
                 # record it so /loop amend can tell it from a delivery still running.
+                # NEW-229: likewise a run stopped because its campaign approval expired,
+                # so issue-reapprove sees it ended.
                 run.status = "BLOCKED"
-                run.error_code = "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                run.error_code = str(payload["blocker"])
                 run.finished_at = datetime.now(UTC)
             if run is not None:
                 self._notify_delivery_blocked(session, run, payload)
@@ -4500,11 +4510,11 @@ class MetadataActivityHandler:
     def _prepare_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             payload = self._issue_approval_preparation(payload)
-        except ValueError:
+        except ValueError as error:
             return {
                 **payload,
                 "status": "BLOCKED",
-                "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                "blocker": _issue_approval_blocker(error),
             }
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
@@ -6767,7 +6777,13 @@ class MetadataActivityHandler:
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
         deployment = self._object(evidence.get("deployment"), "deployment change evidence")
-        if source.get("head_sha") == payload.get("source_base_sha"):
+        if payload.get("status") == "BLOCKED" and payload.get("blocker") == (
+            CAMPAIGN_APPROVAL_EXPIRED
+        ):
+            # NEW-229: publication was refused because the campaign approval expired; the
+            # handoff still preserves the committed heads, and keeps the reason.
+            blocker = CAMPAIGN_APPROVAL_EXPIRED
+        elif source.get("head_sha") == payload.get("source_base_sha"):
             blocker = "SOURCE_CHANGES_NOT_COMMITTED"
         elif int(deployment.get("changed_file_count", 0)) > 0 and deployment.get(
             "head_sha"
@@ -10269,7 +10285,8 @@ def _record_correction_state(
 
     NEW-137: also when a provider call stopped it for an allowlisted transient reason
     (blocker PROVIDER_UNAVAILABLE, with the provider and its error code), so a bounded
-    retry binds after a provider outage without a database fix.
+    retry binds after a provider outage without a database fix. NEW-229: also when its
+    campaign approval expired (BLOCKED CAMPAIGN_APPROVAL_EXPIRED).
 
     The bounded correction child (and an operator retry) may bind only to a ChangeSet in
     REQUEST_CHANGES, but the validation verdict was never persisted, so every automatic
@@ -10281,7 +10298,14 @@ def _record_correction_state(
     """
     stop = (str(payload.get("status") or ""), str(payload.get("blocker") or ""))
     provider_stop: dict[str, str] | None = None
-    if stop not in _CORRECTION_STOPS:
+    # NEW-229: an attempt whose campaign approval expired mid-way (gntik-ui #175) is, like
+    # a provider outage, no verdict on the change; once the approval is re-issued a bounded
+    # retry attempt binds and continues the ChangeSet's worktree (never after a
+    # publication effect of unknown outcome, which NEW-145 reconciles first).
+    expired = stop == ("BLOCKED", CAMPAIGN_APPROVAL_EXPIRED) and (
+        payload.get("publication_effect_unknown") is not True
+    )
+    if stop not in _CORRECTION_STOPS and not expired:
         # NEW-137: a provider call of the attempt (spec, maker or checker) failed for an
         # allowlisted transient reason (falcone #1012: checker 529 Overloaded).
         provider_stop = provider_unavailable_stop(payload)

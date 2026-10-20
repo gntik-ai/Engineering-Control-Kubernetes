@@ -301,7 +301,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                     "syft": settings.syft_executable,
                     "kubeconform": settings.kubeconform_executable,
                 }
-            )
+            ),
+            trivy_cache_root=settings.trivy_cache_root,
         )
         self.publisher = publisher or EvidencePublisher(settings, settings.evidence_root)
         self.observer_runner = observer_runner or SafeCommandRunner(

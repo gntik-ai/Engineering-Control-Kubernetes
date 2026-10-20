@@ -1126,6 +1126,47 @@ async def test_a_failed_loop_bookkeeping_step_pauses_and_retries_instead_of_fail
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 
+@pytest.mark.parametrize("blocker", ["CAMPAIGN_APPROVAL_EXPIRING", "CAMPAIGN_APPROVAL_EXPIRED"])
+async def test_a_child_refused_for_its_approval_lifetime_pauses_on_that_reason(
+    blocker: str,
+) -> None:
+    # NEW-229: the registration refused the child before it started; the loop pauses
+    # AWAITING_OPERATOR on the explicit reason and the operator's retry registers it.
+    script = _full_delivery_loop_script()
+    failures = {"backlog.register_child_run": 1}
+
+    @activity.defn(name="execute_control_step")
+    async def lapsing(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        if failures.get(step):
+            failures[step] -= 1
+            raise ApplicationError(
+                f"{blocker}: the campaign approval expires at 2026-10-19T14:58:00+00:00",
+                {"approval_expires_at": "2026-10-19T14:58:00+00:00"},
+                type=blocker,
+                non_retryable=True,
+            )
+        if step == "gitops.notify_merged" and step not in script:
+            return {"status": "NOTIFIED"}
+        if step == "github.refresh_mirrors" and step not in script:
+            return {"status": "PASS"}
+        return _registered_child(step, request, script[step])
+
+    history, result, _children = await _run_loop(
+        script, [("retry", "gntik-ai/musematic#1026")], activity_fn=lapsing
+    )
+
+    assert result["status"] == "COMPLETE"
+    paused = [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert [state["blocker"] for state in paused] == [blocker]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
 @workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
 class _FailingVerificationStub:
     """Stands in for FindingVerificationWorkflow failing (e.g. a stale mirror)."""

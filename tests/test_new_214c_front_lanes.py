@@ -623,9 +623,13 @@ def test_shared_leases_are_bounded(session: Session) -> None:
             )
 
 
-def _handler(engine: Any, leases: int = 3) -> Any:
+def _handler(engine: Any, leases: int = 3, codex_slots: int = 2) -> Any:
     return SimpleNamespace(
-        settings=SimpleNamespace(implementation_leases_per_project=leases),
+        settings=SimpleNamespace(
+            implementation_leases_per_project=leases,
+            codex_worker_slots=codex_slots,
+            claude_worker_slots=2,
+        ),
         sessions=sessionmaker(engine, expire_on_commit=False),
         _component_key=MetadataActivityHandler._component_key,
         _quota_broker=QuotaBroker,
@@ -659,6 +663,9 @@ def test_front_capacity_leaves_one_lease_for_back() -> None:
     assert capacity(_handler(None, leases=2), {"maximum_concurrency": 3})["front_slots"] == 1
     assert capacity(_handler(None, leases=3), {"maximum_concurrency": 2})["front_slots"] == 1
     assert capacity(_handler(None), {"maximum_concurrency": 3})["quota_ok"] is True
+    # NEW-226: a deployment that runs one codex activity at a time gets one FRONT slot.
+    one = capacity(_handler(None, codex_slots=1), {"maximum_concurrency": 3})
+    assert (one["front_slots"], one["maker_slots"]) == (1, 1)
 
 
 # -- approval and start bounds -----------------------------------------------------------

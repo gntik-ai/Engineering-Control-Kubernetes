@@ -412,7 +412,7 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
         "StagingFlowPolicy": ["f:@REPOSITORY_SLUG_ALTERNATION@", "f:@REPOSITORY_SLUG_ALTERNATION@"],
     },
     "src/engineering_control/operations/issue_reapproval.py": {
-        "<module>": ["f:@PROJECT_ALTERNATION@"],
+        "<module>": ["f:@PROJECT_ALTERNATION@", "f:@PROJECT_ALTERNATION@"],
     },
     "src/engineering_control/operations/issue_start.py": {
         "<module>": ["f:@PROJECT_ALTERNATION@"],
@@ -846,6 +846,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "models.reconciliation:StagingFlowPolicy.chart_source_repository": ["re:REPOSITORY_SLUGS"],
     "models.reconciliation:StagingFlowPolicy.deploy_repository": ["re:REPOSITORY_SLUGS"],
     "observability.agent:GatewayEventInput.project": ["enum:PROJECTS"],
+    "operations.issue_reapproval:_CAMPAIGN_LOOP": ["re:PROJECTS"],
     "operations.issue_reapproval:_ISSUE_LOOP": ["re:PROJECTS"],
     "operations.issue_start:_BACKLOG_LOOP_WORKFLOW": ["re:PROJECTS"],
     "operations.models:LLMWikiBootstrapPlanCommand.project": ["enum:(llmwiki)"],

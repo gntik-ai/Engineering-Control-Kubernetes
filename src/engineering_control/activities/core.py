@@ -13,6 +13,7 @@ from engineering_control.config import Settings
 from engineering_control.db.run_enrollment import enroll_activity_run
 from engineering_control.db.runtime_binding import verified_activity_run_binding
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.workflows.tmp_sweep import running_step
 
 from .browser import BrowserActivityHandler
 from .change_requests import ChangeRequestActivityHandler, ChangeRequestGitHubHandler
@@ -607,6 +608,11 @@ class ControlActivities:
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
+        # NEW-226: the private /tmp sweep keeps whatever a running step wrote.
+        with running_step():
+            return await self._execute_control_step(request)
+
+    async def _execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
         step = request.get("step")
         payload = request.get("payload")
         if step not in self._allowed_steps or not isinstance(payload, dict):
