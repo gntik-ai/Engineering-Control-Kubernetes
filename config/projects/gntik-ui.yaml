@@ -140,6 +140,9 @@ maker_rules:
       fixes, minor for new components or props, and never major unless the issue asks
       for a breaking change. Hermes refuses to merge a package change without it. Changes only to
       tests, fixtures or snapshots need none; never mix the private mcp package with public ones.
+      Format every file you add or change with `pnpm exec prettier --write <files>`, the
+      changeset included: CI's Format step (`pnpm format:check`) fails on an unformatted
+      .changeset/*.md (#117 and #118 each needed a CI repair for it).
     - >-
       When components, blocks or their documented items change, regenerate the kit
       registry with `pnpm registry` and commit the updated registry.json and
