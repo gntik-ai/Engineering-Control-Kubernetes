@@ -73,6 +73,7 @@ from engineering_control.engineering.ui_inventory import (
     InventoryError,
     build_inventory,
     check_git_scan_roots,
+    git_page_closure,
     inventory_content_key,
     render_markdown,
 )
@@ -87,6 +88,7 @@ from engineering_control.engineering.ui_kit import (
     snapshot_plan,
 )
 from engineering_control.engineering.ui_page_delivery import (
+    CLOSURE_MAX_FILES,
     UiPageRejected,
     kit_excerpt,
     kit_failures,
@@ -1412,23 +1414,44 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "blocker_detail": str(SecretRedactor().redact_text(detail).value)[:300],
             }
 
-        worktree = self._bounded_worktree(payload["source_worktree"])
-        base_sha = self._sha(payload.get("source_base_sha"), "source_base_sha")
-        try:
-            drift = await asyncio.to_thread(
-                legacy_drift,
-                lambda arguments: self._git(worktree, arguments),
-                source_sha=str(ui_page.get("source_sha")),
-                base_sha=base_sha,
-                files=[str(path) for path in ui_page.get("closure") or []],
-            )
-        except UiPageRejected as rejected:
-            return blocked(rejected.code, rejected.detail)
-        except (CommandFailure, WorktreeError) as error:
-            return blocked("UI_PAGE_LEGACY_DRIFT_UNAVAILABLE", str(error))
         policy = (await asyncio.to_thread(self.catalog.project, project.value)).ui_migration
         if policy is None:
             raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        base_sha = self._sha(payload.get("source_base_sha"), "source_base_sha")
+        source_sha = str(ui_page.get("source_sha"))
+
+        def git(arguments: list[str]) -> str:
+            return self._git(worktree, arguments)
+
+        def drift_files() -> list[str]:
+            # The blueprint's direct files and tests, plus the page's transitive import
+            # closure at the blueprint's commit and at this base: a change in a shared
+            # helper deeper down shows in the drift, and so does one the page now imports.
+            files = [str(path) for path in ui_page.get("closure") or []]
+            for commit in (source_sha, base_sha):
+                files.extend(
+                    git_page_closure(
+                        git,
+                        commit,
+                        policy.legacy_app,
+                        str(ui_page.get("page_file")),
+                        max_files=CLOSURE_MAX_FILES,
+                    )
+                )
+            return list(dict.fromkeys(files))
+
+        try:
+            files = await asyncio.to_thread(drift_files)
+            drift = await asyncio.to_thread(
+                legacy_drift, git, source_sha=source_sha, base_sha=base_sha, files=files
+            )
+        except UiPageRejected as rejected:
+            return blocked(rejected.code, rejected.detail)
+        except InventoryError as error:
+            return blocked("UI_PAGE_CLOSURE_INVALID", str(error))
+        except (CommandFailure, WorktreeError) as error:
+            return blocked("UI_PAGE_LEGACY_DRIFT_UNAVAILABLE", str(error))
         selection = ui_page.get("kit_selection") or {}
         plan = snapshot_plan(
             templates=list(selection.get("templates") or []),

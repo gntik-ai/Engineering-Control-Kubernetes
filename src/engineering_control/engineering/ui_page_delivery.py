@@ -192,6 +192,9 @@ def page_context(
         "page_sha256": canonical_sha256(page),
         "source_sha": source_sha,
         "closure": closure(page),
+        # The page's own file (the inventory's first legacy file): where the scan step's
+        # transitive closure starts.
+        "page_file": str(page["legacy_files"][0]),
         "kit_selection": {
             "templates": kit_ids([template] if template else []),
             "blocks": kit_ids(target.get("blocks")),

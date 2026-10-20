@@ -36,6 +36,7 @@ from engineering_control.engineering.ui_blueprint import (
     item_change_request_id,
     item_context,
 )
+from engineering_control.engineering.ui_inventory import InventoryError, git_page_closure
 from engineering_control.engineering.ui_page_delivery import (
     CHECKS,
     DRIFT_BUDGET,
@@ -279,6 +280,7 @@ def test_a_published_blueprint_page_issue_is_recognised_from_hermes_records(
         "page_sha256": canonical_sha256(page),
         "source_sha": SOURCE_SHA,
         "closure": ["apps/web-console/src/pages/tenants.tsx", "TenantsPage.test.tsx"],
+        "page_file": "apps/web-console/src/pages/tenants.tsx",
         "kit_selection": {
             "templates": ["list-page"],
             "blocks": ["data-table"],
@@ -878,6 +880,102 @@ def test_a_large_legacy_drift_is_cut_with_the_command_for_the_rest(tmp_path: Pat
     assert drift["diff_bytes"] > DRIFT_BUDGET
 
 
+def _closure_repository(path: Path) -> tuple[Any, str, str]:
+    """A console whose page reaches lib/http.ts only through a service module (review 4):
+    the second commit changes nothing but that deep helper."""
+    git, _commits = _git_repository(path)
+    src = path / "apps/web-console/src"
+    for relative in ("services", "lib", "components/ui"):
+        (src / relative).mkdir(parents=True, exist_ok=True)
+    (src / "pages/PlansPage.tsx").write_text(
+        "import { list } from '../services/plans';\n"
+        "import { Button } from '@/components/ui/Button';\n"
+        "export const Plans = () => list;\n"
+    )
+    (src / "pages/PlansPage.test.tsx").write_text("import { Plans } from './PlansPage';\n")
+    (src / "services/plans.ts").write_text(
+        "import { http } from '../lib/http';\nexport const list = http;\n"
+    )
+    (src / "lib/http.ts").write_text("export const http = 'v1';\n")
+    (src / "components/ui/Button.tsx").write_text(
+        "import { http } from '../../lib/other';\nexport const Button = http;\n"
+    )
+    (src / "lib/other.ts").write_text("export const http = 'other';\n")
+    (src / "lib/link.ts").symlink_to("http.ts")
+    git(["add", "-A"])
+    git(["commit", "--quiet", "-m", "plans page"])
+    source = git(["rev-parse", "HEAD"]).strip()
+    (src / "lib/http.ts").write_text("export const http = 'v2';\n")
+    git(["commit", "--quiet", "-am", "fix(console): deep helper only"])
+    return git, source, git(["rev-parse", "HEAD"]).strip()
+
+
+def test_the_page_closure_is_the_inventorys_transitive_closure_from_git(tmp_path: Path) -> None:
+    git, source, _base = _closure_repository(tmp_path / "repo")
+    page = "apps/web-console/src/pages/PlansPage.tsx"
+
+    closure_files = git_page_closure(git, source, "apps/web-console", page, max_files=300)
+
+    # Tests and the shell/primitive modules are not followed (components/ui/ never pulls
+    # in lib/other.ts); the service's own import is.
+    assert closure_files == [
+        "apps/web-console/src/lib/http.ts",
+        page,
+        "apps/web-console/src/services/plans.ts",
+    ]
+    with pytest.raises(InventoryError, match="exceeds 2 files"):
+        git_page_closure(git, source, "apps/web-console", page, max_files=2)
+    with pytest.raises(InventoryError, match="not a source file"):
+        git_page_closure(
+            git, source, "apps/web-console", "apps/web-console/src/lib/link.ts", max_files=300
+        )
+    with pytest.raises(InventoryError, match="outside"):
+        git_page_closure(git, source, "apps/web-console", "README.md", max_files=300)
+    with pytest.raises(InventoryError, match="full 40-character"):
+        git_page_closure(git, "main", "apps/web-console", page, max_files=300)
+
+
+async def test_the_scan_drift_shows_a_change_in_a_deep_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git, source, base = _closure_repository(tmp_path / "repo")
+    worktree = tmp_path / "worktrees" / "falcone" / str(uuid4())
+    worktree.mkdir(parents=True)
+    handler = ScanActivityHandler(
+        Settings(
+            worktree_root=tmp_path / "worktrees",
+            evidence_root=tmp_path / "evidence",
+            project_config_root=PROJECTS,
+        ),
+        kit_client_factory=lambda policy: _stub(tmp_path)[0],
+    )
+    monkeypatch.setattr(handler, "_git", lambda path, arguments, **_: git(arguments))
+    page = "apps/web-console/src/pages/PlansPage.tsx"
+    # The blueprint lists only the page's direct files: lib/http.ts is two imports away.
+    ui_page = {**_ui_page(), "source_sha": source, "closure": [page], "page_file": page}
+    payload = {
+        "project": "falcone",
+        "change_set_id": str(uuid4()),
+        "source_worktree": str(worktree),
+        "source_base_sha": base,
+        "ui_page": ui_page,
+    }
+
+    result = await handler.handle("delivery.prepare_ui_page", payload)
+
+    drift = result["ui_page_inputs"]["drift"]
+    assert (drift["files"], drift["changed_files"]) == (3, 1)
+    assert "- apps/web-console/src/lib/http.ts (+1 -1)" in drift["text"]
+    assert "fix(console): deep helper only" in drift["text"]
+
+    missing = await handler.handle(
+        "delivery.prepare_ui_page",
+        {**payload, "ui_page": {**ui_page, "page_file": "apps/web-console/src/pages/Gone.tsx"}},
+    )
+    assert (missing["status"], missing["blocker"]) == ("BLOCKED", "UI_PAGE_CLOSURE_INVALID")
+    assert "ui_page_inputs" not in missing
+
+
 async def test_the_scan_step_hands_over_the_drift_and_the_kit_excerpt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,6 +1003,7 @@ async def test_the_scan_step_hands_over_the_drift_and_the_kit_excerpt(
     monkeypatch.setattr(handler, "_git", hardened_git)
     ui_page = {**_ui_page(), "source_sha": source}
     ui_page["closure"] = ["apps/web-console/src/pages/TenantsPage.tsx"]
+    ui_page["page_file"] = "apps/web-console/src/pages/TenantsPage.tsx"
     payload = {
         "project": "falcone",
         "change_set_id": str(uuid4()),
@@ -1015,7 +1114,12 @@ async def test_the_scan_step_blocks_when_a_spec_kit_item_failed(
         return document
 
     monkeypatch.setattr(handler, "_kit_document", missing_item)
-    ui_page = {**_ui_page(), "source_sha": source, "closure": ["apps/web-console/src/pages/T.tsx"]}
+    ui_page = {
+        **_ui_page(),
+        "source_sha": source,
+        "closure": ["apps/web-console/src/pages/T.tsx"],
+        "page_file": "apps/web-console/src/pages/TenantsPage.tsx",
+    }
     result = await handler.handle(
         "delivery.prepare_ui_page",
         {
