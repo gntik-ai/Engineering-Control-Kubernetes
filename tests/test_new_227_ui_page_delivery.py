@@ -42,6 +42,7 @@ from engineering_control.engineering.ui_page_delivery import (
     DRIFT_BUDGET,
     HARD_RULES,
     INPUT_BUDGET,
+    SPEC_LIMIT,
     UiPageRejected,
     checker_result,
     checker_schema,
@@ -533,7 +534,7 @@ def test_a_page_maker_without_its_inputs_or_with_a_changed_blueprint_blocks(
 
 
 def _large_page() -> tuple[dict[str, Any], dict[str, Any]]:
-    """A page entry whose fenced spec, with its references, is just under the maker limit."""
+    """A page entry whose fenced spec, with its references, is just under the spec limit."""
     large = blueprint()
     large["pages"][0]["behaviour"]["actions"] = [
         {
@@ -542,13 +543,13 @@ def _large_page() -> tuple[dict[str, Any], dict[str, Any]]:
             "endpoint_refs": [],
             "permission": "SA",
         }
-        for n in range(30)
+        for n in range(46)
     ]
     ui_page = {**_ui_page(), "page_sha256": canonical_sha256(large["pages"][0])}
     return large, ui_page
 
 
-def test_the_rendered_input_section_stays_under_24_kib_even_when_fencing_expands_it() -> None:
+def test_the_rendered_input_section_stays_within_its_budget_even_when_fencing_expands_it() -> None:
     large, ui_page = _large_page()
     view = page_view(large, ui_page)
     # Delimiter-like markers expand under the fence's neutralisation (review round 1).
@@ -605,17 +606,30 @@ def test_an_approved_page_entry_too_large_to_send_whole_blocks() -> None:
         input_section(
             page_view(huge, ui_page), ui_page, _inputs(), role="maker", fence=_untrusted_block
         )
-    # The checker's limit is lower (it also carries the maker's evidence).
-    large, large_page = _large_page()
     with pytest.raises(UiPageRejected, match="UI_PAGE_SPEC_TOO_LARGE"):
         input_section(
-            page_view(large, large_page),
-            large_page,
+            page_view(huge, ui_page),
+            ui_page,
             _inputs(),
             role="checker",
             fence=_untrusted_block,
             maker_result={},
         )
+
+
+def test_a_spec_the_maker_can_build_is_never_too_large_for_the_checker() -> None:
+    # falcone #1215 (2026-10-21): a 15158-byte spec passed the maker's limit, then BLOCKed
+    # the checker's lower one after the page was built. Both roles now share one limit.
+    assert SPEC_LIMIT["maker"] == SPEC_LIMIT["checker"]
+    large, large_page = _large_page()
+    view = page_view(large, large_page)
+    spec = json.dumps(view["page"], sort_keys=True, separators=(",", ":"))
+    for role, result in (("maker", None), ("checker", {})):
+        section = input_section(
+            view, large_page, _inputs(), role=role, fence=_untrusted_block, maker_result=result
+        )
+        assert spec in section
+        assert len(section.encode("utf-8")) <= INPUT_BUDGET
 
 
 # -- contracts --------------------------------------------------------------------------------
