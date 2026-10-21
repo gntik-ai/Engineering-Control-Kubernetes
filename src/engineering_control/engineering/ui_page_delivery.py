@@ -69,12 +69,15 @@ COMMITS_SHOWN = 20
 COMMITS_MAX = 200
 CHANGED_FILES_SHOWN = 60
 # Bytes (UTF-8) of the section Hermes adds to one maker or checker prompt, fences and
-# headers included (AGENTS.md: 24 KiB per model input). The approved page entry and its
-# epics and gaps are authoritative: never cut, a larger one BLOCKs (SPEC_LIMIT, fenced).
-# The kit excerpt, the maker's evidence (checker) and the legacy drift share the rest; the
-# drift is cut last, with the git command that shows the remainder.
-INPUT_BUDGET = 24_576
-SPEC_LIMIT = {"maker": 16_384, "checker": 12_288}
+# headers included. The approved page entry and its epics and gaps are authoritative:
+# never cut, a larger one BLOCKs (SPEC_LIMIT, fenced). The kit excerpt, the maker's
+# evidence (checker) and the legacy drift share the rest; the drift is cut last, with the
+# git command that shows the remainder. Operator decision 2026-10-21: UI page inputs may
+# exceed AGENTS.md's usual 24 KiB (32 KiB), and maker and checker share one spec limit,
+# so a spec the maker can build is never too large to review (falcone #1215 was 15158
+# bytes fenced, #1223 17934: both blocked under the old 16/12 KiB limits).
+INPUT_BUDGET = 32_768
+SPEC_LIMIT = {"maker": 20_480, "checker": 20_480}
 KIT_BUDGET = 3_584
 DRIFT_BUDGET = 5_120
 EVIDENCE_BUDGET = 4_096
