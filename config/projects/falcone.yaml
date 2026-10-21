@@ -186,6 +186,10 @@ delivery_control:
 # Operator decision 2026-10-20 (UI migration start): bump to 0.9.0 before wave u1 (released
 # 10-20 from main 36afdb3, Version Packages gntik-ui#652); the digest is the multi-arch index
 # of ghcr.io/gntik-ai/gntik-ui-mcp:sha-36afdb3.
+# Bump to 0.10.0 (released 2026-10-21 from main 8a43a41, Version Packages gntik-ui#679):
+# blocks and templates read built-in labels from the en/es catalogs (gntik-ui #685), which
+# the first u1 page delivery (falcone #1215) needed. The digest is the multi-arch index of
+# ghcr.io/gntik-ai/gntik-ui-mcp:sha-8a43a41.
 ui_migration:
   legacy_app: apps/web-console
   target_app: apps/web-console-next
@@ -193,10 +197,10 @@ ui_migration:
   gntik_ui:
     registry: registry.npmjs.org
     scope: "@gntik-ai"
-    version: 0.9.0
+    version: 0.10.0
   mcp:
     image: ghcr.io/gntik-ai/gntik-ui-mcp
-    digest: sha256:a5446d3555e1169c11fe1b054c8cbb0d415ba006627cb6d7c2851f712c377d77
+    digest: sha256:cc188548db99d0c0fc1228ba5c427524e7e7bc951eced286ee017a1a57b9d728
     socket: /run/gntik-ui-mcp/mcp.sock
   route_tables:
     control_plane_routes: apps/control-plane/routes.mjs
