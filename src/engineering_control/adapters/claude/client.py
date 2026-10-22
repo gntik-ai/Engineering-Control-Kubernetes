@@ -7,6 +7,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
+from engineering_control.adapters.agent_sandbox import AgentSandbox, claude_loopback_settings
 from engineering_control.adapters.auth_probe import AuthProbeError, run_auth_probe
 from engineering_control.adapters.process import (
     EventCallback,
@@ -32,11 +33,15 @@ class ClaudeCLIAdapter:
         executable: str = "claude",
         temp_root: str | None = None,
         run_memory_max_bytes: int | None = None,
+        loopback_shell: str | None = None,
     ) -> None:
         self.executable = executable
         # NEW-226: each run's TMPDIR is created (and removed) under this root.
         self.temp_root = temp_root
         self.run_memory_max_bytes = run_memory_max_bytes
+        # NEW-228: scripts/agent-loopback-shell, the CLAUDE_CODE_SHELL_PREFIX of
+        # loopback-enabled runs (checked by the provider handler before every use).
+        self.loopback_shell = loopback_shell
 
     async def authenticated(self) -> bool:
         result = await run_auth_probe(
@@ -65,6 +70,7 @@ class ClaudeCLIAdapter:
         on_event: EventCallback | None = None,
         *,
         toolchain: SandboxToolchain | None = None,
+        sandbox: AgentSandbox | None = None,
     ) -> AgentResult:
         if request.provider is not self.provider:
             raise ValueError("Claude adapter received a non-Claude request")
@@ -112,8 +118,33 @@ class ClaudeCLIAdapter:
             command.extend(("--model", request.model))
         if request.effort:
             command.extend(("--effort", request.effort))
+        shell: str | None = None
+        if sandbox is not None and sandbox.loopback_network:
+            shell = sandbox.loopback_shell or self.loopback_shell
+            if not shell:
+                raise ValueError("loopback network requested without a loopback shell")
 
         with optional_run_temporary_directory(self.temp_root) as run_temp:
+            environment: dict[str, str] | None = None
+            if run_temp is not None:
+                environment = run_temp_environment(run_temp)
+            if sandbox is not None and shell is not None:
+                # NEW-228: every Bash command runs through the loopback-only shell prefix,
+                # which mounts the run's working directory and TMPDIR (and the roots the
+                # provider worker named); set in --settings too, which beats any user or
+                # project settings `env` entry.
+                writable = [request.working_directory, *sandbox.writable_roots]
+                if run_temp is not None:
+                    writable.append(str(run_temp))
+                settings = claude_loopback_settings(
+                    shell, writable=writable, readable=sandbox.readable_roots
+                )
+                if run_temp is not None:
+                    # The CLI's own temp files (a command's cwd, background output) are
+                    # written by the command, inside the view.
+                    settings["env"]["CLAUDE_CODE_TMPDIR"] = str(run_temp)
+                command.extend(("--settings", json.dumps(settings, separators=(",", ":"))))
+                environment = {**(environment or {}), **settings["env"]}
             process_result = await run_jsonl_process(
                 command,
                 prompt=request.prompt,
@@ -121,7 +152,7 @@ class ClaudeCLIAdapter:
                 timeout_seconds=request.timeout_seconds,
                 provider=self.provider.value,
                 on_event=on_event,
-                environment=run_temp_environment(run_temp) if run_temp is not None else None,
+                environment=environment,
                 toolchain=toolchain,
                 run_memory_max_bytes=self.run_memory_max_bytes,
             )
