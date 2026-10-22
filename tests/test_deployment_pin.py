@@ -406,8 +406,11 @@ def test_standing_maker_rules_reach_the_matching_maker_and_the_checker() -> None
     source = _rules_prompt((False,))
     checker = _rules_prompt((False, True), checker=True)
     assert "--reuse-values" in deployment and "deployment repository" in deployment
-    assert source == ""  # falcone has no source rules
+    # falcone's source rules are the UI page sandbox limits (u1, 2026-10-22).
+    assert "SHELL_TEST_FIXTURES=true" in source and "source repository" in source
+    assert "--reuse-values" not in source
     assert "--reuse-values" in checker and "a violation is a blocking finding" in checker
+    assert "SHELL_TEST_FIXTURES=true" in checker
 
 
 def test_maker_rules_are_bounded_operator_config() -> None:
