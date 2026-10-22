@@ -239,6 +239,11 @@ maker_rules:
       viewport runs as SKIPPED ("Chromium unavailable; PR CI runs them") instead of
       blocking; they gate the pull request in CI. Visual review is not covered by CI: the
       parity screenshots still need the checker's assessment and operator approval.
+    - >-
+      Language (operator decision 2026-10-22): write new identifiers, code comments, test
+      names and descriptions, commit messages and docs in English. User-facing copy in
+      apps/web-console-next goes into both the en and es catalogs. Do not translate or
+      rewrite existing Spanish text unless the issue asks for it.
   deployment:
     - >-
       Chart changes must survive `helm upgrade --reuse-values` from an existing release:
@@ -246,6 +251,10 @@ maker_rules:
       `hasKey`) in templates and in templates/validate.yaml, so a release installed
       before this change still renders. Run the reuse-values upgrade test
       (bbx-temporal-bootstrap-048 in tests/blackbox/temporal-bootstrap) before finishing.
+    - >-
+      Language (operator decision 2026-10-22): write new identifiers, code comments, test
+      names and descriptions, commit messages and docs in English. Do not translate or
+      rewrite existing Spanish text unless the issue asks for it.
     - >-
       Hermes moves the falcone FALCONE_CHARTS_REF pins to your final commit only after
       you finish, so a check comparing those pins with the charts checkout (e.g.

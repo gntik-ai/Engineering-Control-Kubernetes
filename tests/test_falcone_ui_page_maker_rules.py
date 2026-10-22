@@ -25,3 +25,13 @@ def test_falcone_deployment_makers_keep_their_own_rules() -> None:
     rules = " ".join(load_maker_rules(PROJECTS, "falcone", deployment=True))
     assert "--reuse-values" in rules
     assert "SHELL_TEST_FIXTURES" not in rules
+
+
+def test_falcone_makers_write_new_code_and_tests_in_english() -> None:
+    # Operator decision 2026-10-22: English is Falcone's default language.
+    for deployment in (False, True):
+        rules = " ".join(load_maker_rules(PROJECTS, "falcone", deployment=deployment))
+        assert "test names and descriptions, commit messages and docs in English" in rules
+        assert "Do not translate or rewrite existing Spanish text" in rules
+    source = " ".join(load_maker_rules(PROJECTS, "falcone", deployment=False))
+    assert "both the en and es catalogs" in source
