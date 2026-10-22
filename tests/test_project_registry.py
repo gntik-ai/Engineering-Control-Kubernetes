@@ -812,6 +812,14 @@ RUNTIME_SITES: dict[str, list[str]] = {
     ],
     "engineering.change_requests:UI_KIT_REPOSITORIES": ["keys:(falcone)", "(gntik-ai/gntik-ui)"],
     "engineering.change_requests:_REPOSITORY_PATTERN": ["re:REPOSITORY_SLUGS"],
+    # NEW-234: the backlog decomposition's project and its three task repositories.
+    "engineering.decomposition:DECOMPOSITION_PROJECTS": ["{falcone-serverless}"],
+    "engineering.decomposition:TASK_TARGETS": [
+        "keys:(gntik-ai/falcone-serverless, gntik-ai/falcone, gntik-ai/falcone-charts)"
+    ],
+    "engineering.decomposition:TEST_COMMANDS": [
+        "keys:(gntik-ai/falcone-serverless, gntik-ai/falcone, gntik-ai/falcone-charts)"
+    ],
     "engineering.github:FindingPublication.affected_repositories": ["re:REPOSITORY_SLUGS"],
     "engineering.github:FindingPublication.project": ["enum:PROJECTS"],
     "engineering.models:BuildWorkflow.repository": ["re:REPOSITORY_SLUGS"],

@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "project",
+    "inputs",
+    "frame",
+    "blockers"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "COMPLETE",
+        "BLOCKED"
+      ]
+    },
+    "project": {
+      "const": "falcone-serverless"
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_sha",
+        "design_sha256",
+        "backlog_sha256",
+        "issues_sha256",
+        "part_id"
+      ],
+      "properties": {
+        "source_sha": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 40,
+              "maxLength": 40,
+              "pattern": "^[a-f0-9]{40}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "design_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "backlog_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issues_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "part_id": {
+          "type": "string",
+          "minLength": 22,
+          "maxLength": 22,
+          "pattern": "^frame-[a-f0-9]{16}$"
+        }
+      }
+    },
+    "frame": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/frame"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    }
+  },
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contracts",
+        "global_decisions"
+      ],
+      "properties": {
+        "contracts": {
+          "type": "array",
+          "maxItems": 60,
+          "items": {
+            "$ref": "#/$defs/contract"
+          },
+          "minItems": 1
+        },
+        "global_decisions": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "owner_repository",
+        "kind",
+        "path",
+        "summary",
+        "consumers",
+        "sources"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 48,
+          "pattern": "^ctr-[a-z0-9][a-z0-9-]{0,43}$"
+        },
+        "owner_repository": {
+          "enum": [
+            "gntik-ai/falcone-serverless",
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "wit",
+            "http-api",
+            "event",
+            "helm-values",
+            "metric",
+            "config"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^([A-Za-z0-9_][A-Za-z0-9._-]{0,7}|[A-Za-z0-9_][A-Za-z0-9._-]{9,99}|[0123456789BDEFGHIJKLMNOPQRSTUVWXYZ_bdefghijklmnopqrstuvwxyz][A-Za-z0-9._-]{8}|[aA]([\\.0123456789ABCDEFHIJKLMNOPQRSTUVWXYZ_abcdefhijklmnopqrstuvwxyz-][A-Za-z0-9._-]{7}|[gG][\\.0123456789ABCDFGHIJKLMNOPQRSTUVWXYZ_abcdfghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{6}|[gG][eE][\\.0123456789ABCDEFGHIJKLMOPQRSTUVWXYZ_abcdefghijklmopqrstuvwxyz-][A-Za-z0-9._-]{5}|[gG][eE][nN][\\.0123456789ABCDEFGHIJKLMNOPQRSUVWXYZ_abcdefghijklmnopqrsuvwxyz-][A-Za-z0-9._-]{4}|[gG][eE][nN][tT][\\.0123456789ABCDEFGHIJKLMNOPQRTUVWXYZ_abcdefghijklmnopqrtuvwxyz-][A-Za-z0-9._-]{3}|[gG][eE][nN][tT][sS][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{2}|[gG][eE][nN][tT][sS]\\.[\\.0123456789ABCDEFGHIJKLNOPQRSTUVWXYZ_abcdefghijklnopqrstuvwxyz-][A-Za-z0-9._-]{1}|[gG][eE][nN][tT][sS]\\.[mM][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-])|[cC]([\\.0123456789ABCDEFGHIJKMNOPQRSTUVWXYZ_abcdefghijkmnopqrstuvwxyz-][A-Za-z0-9._-]{7}|[lL][\\.0123456789BCDEFGHIJKLMNOPQRSTUVWXYZ_bcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{6}|[lL][aA][\\.0123456789ABCDEFGHIJKLMNOPQRSTVWXYZ_abcdefghijklmnopqrstvwxyz-][A-Za-z0-9._-]{5}|[lL][aA][uU][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{4}|[lL][aA][uU][dD][\\.0123456789ABCDFGHIJKLMNOPQRSTUVWXYZ_abcdfghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{3}|[lL][aA][uU][dD][eE][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{2}|[lL][aA][uU][dD][eE]\\.[\\.0123456789ABCDEFGHIJKLNOPQRSTUVWXYZ_abcdefghijklnopqrstuvwxyz-][A-Za-z0-9._-]{1}|[lL][aA][uU][dD][eE]\\.[mM][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-])|\\.(cargo|gitignore|helmignore|dockerignore|gitattributes|editorconfig|golangci\\.ya?ml))(/([A-Za-z0-9_][A-Za-z0-9._-]{0,7}|[A-Za-z0-9_][A-Za-z0-9._-]{9,99}|[0123456789BDEFGHIJKLMNOPQRSTUVWXYZ_bdefghijklmnopqrstuvwxyz][A-Za-z0-9._-]{8}|[aA]([\\.0123456789ABCDEFHIJKLMNOPQRSTUVWXYZ_abcdefhijklmnopqrstuvwxyz-][A-Za-z0-9._-]{7}|[gG][\\.0123456789ABCDFGHIJKLMNOPQRSTUVWXYZ_abcdfghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{6}|[gG][eE][\\.0123456789ABCDEFGHIJKLMOPQRSTUVWXYZ_abcdefghijklmopqrstuvwxyz-][A-Za-z0-9._-]{5}|[gG][eE][nN][\\.0123456789ABCDEFGHIJKLMNOPQRSUVWXYZ_abcdefghijklmnopqrsuvwxyz-][A-Za-z0-9._-]{4}|[gG][eE][nN][tT][\\.0123456789ABCDEFGHIJKLMNOPQRTUVWXYZ_abcdefghijklmnopqrtuvwxyz-][A-Za-z0-9._-]{3}|[gG][eE][nN][tT][sS][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{2}|[gG][eE][nN][tT][sS]\\.[\\.0123456789ABCDEFGHIJKLNOPQRSTUVWXYZ_abcdefghijklnopqrstuvwxyz-][A-Za-z0-9._-]{1}|[gG][eE][nN][tT][sS]\\.[mM][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-])|[cC]([\\.0123456789ABCDEFGHIJKMNOPQRSTUVWXYZ_abcdefghijkmnopqrstuvwxyz-][A-Za-z0-9._-]{7}|[lL][\\.0123456789BCDEFGHIJKLMNOPQRSTUVWXYZ_bcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{6}|[lL][aA][\\.0123456789ABCDEFGHIJKLMNOPQRSTVWXYZ_abcdefghijklmnopqrstvwxyz-][A-Za-z0-9._-]{5}|[lL][aA][uU][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{4}|[lL][aA][uU][dD][\\.0123456789ABCDFGHIJKLMNOPQRSTUVWXYZ_abcdfghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{3}|[lL][aA][uU][dD][eE][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-][A-Za-z0-9._-]{2}|[lL][aA][uU][dD][eE]\\.[\\.0123456789ABCDEFGHIJKLNOPQRSTUVWXYZ_abcdefghijklnopqrstuvwxyz-][A-Za-z0-9._-]{1}|[lL][aA][uU][dD][eE]\\.[mM][\\.0123456789ABCEFGHIJKLMNOPQRSTUVWXYZ_abcefghijklmnopqrstuvwxyz-])|\\.(cargo|gitignore|helmignore|dockerignore|gitattributes|editorconfig|golangci\\.ya?ml)))*/?$"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        },
+        "consumers": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "enum": [
+              "gntik-ai/falcone-serverless",
+              "gntik-ai/falcone",
+              "gntik-ai/falcone-charts"
+            ]
+          },
+          "minItems": 1
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "minItems": 1
+        }
+      }
+    }
+  }
+}

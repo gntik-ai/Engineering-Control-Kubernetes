@@ -36,6 +36,7 @@ from engineering_control.activities.provider import ProviderActivityHandler
 from engineering_control.agents.instructions import AgentInstructionPack
 from engineering_control.config import Settings
 from engineering_control.db.models import ChangeRequest
+from engineering_control.engineering import decomposition
 from engineering_control.engineering.change_requests import (
     change_proposal_schema,
     change_review_schema,
@@ -71,6 +72,13 @@ def hermes_output_schemas() -> dict[str, dict[str, Any]]:
         "change-proposal": change_proposal_schema(),
         "review-change": change_review_schema(),
         **{f"ui-plan-part-{kind}": part_schema(kind) for kind in PART_SCHEMAS},
+        # NEW-234: the decomposition plan, its drafted parts and the part review.
+        "decomposition-plan": decomposition.plan_schema(),
+        "decomposition-review": decomposition.review_schema(),
+        **{
+            f"decomposition-part-{kind}": decomposition.part_schema(kind)
+            for kind in decomposition.DECOMPOSITION_PART_SCHEMAS[decomposition.DECOMPOSE_SKILL]
+        },
         **{
             f"file-{path.name}": json.loads(path.read_text(encoding="utf-8"))
             for path in sorted(SCHEMA_DIRECTORY.glob("*.json"))

@@ -54,6 +54,10 @@ class AgentInstructionPack:
         # NEW-154: the gap consolidation plan runs under the gap triager's role and skill;
         # its output schema is Hermes-pinned (plan_schema), not the skill's draft schema.
         "ui_consolidate.plan": "triage-ui-gap",
+        # NEW-234: the backlog decomposition -- Claude drafts each part (the frame or one
+        # epic batch, with the skill's released part schemas); Codex reviews each part.
+        "decomposition.draft": "decompose-backlog",
+        "decomposition.review": "review-decomposition",
     }
     # NEW-227: a blueprint page's delivery maker and checker use the UI page skills; the
     # role in the request (set by delivery.prepare_maker/prepare_checker from Hermes's own
@@ -62,13 +66,24 @@ class AgentInstructionPack:
         ("delivery.invoke_maker", "ui-page-implementer"): "migrate-ui-page",
         ("delivery.invoke_checker", "ui-page-reviewer"): "review-ui-page",
     }
-    # NEW-123: these steps must send exactly the released skill's output schema.
-    _pinned_schema_steps = frozenset({"ui_plan.draft", "ui_plan.review", "ui_fanout.gap_draft"})
+    # NEW-123: these steps must send exactly the released skill's output schema (or, for a
+    # drafted part, one of its released part schemas). NEW-234: so must the decomposition.
+    _pinned_schema_steps = frozenset(
+        {
+            "ui_plan.draft",
+            "ui_plan.review",
+            "ui_fanout.gap_draft",
+            "decomposition.draft",
+            "decomposition.review",
+        }
+    )
     # NEW-123 (design section 11): the UI roles list gntik-ui MCP tools, but models get no
     # MCP -- Hermes supplies the kit data. Those grants are accepted in the role definition
     # and never granted; the UI planning roles are otherwise strictly read-only.
-    _read_only_roles = frozenset({"ui-migration-architect", "ui-gap-triager"})
-    _kit_mcp_roles = _read_only_roles | {"ui-page-implementer", "ui-page-reviewer"}
+    _ui_plan_roles = frozenset({"ui-migration-architect", "ui-gap-triager"})
+    _kit_mcp_roles = _ui_plan_roles | {"ui-page-implementer", "ui-page-reviewer"}
+    # NEW-234: the decomposition roles read the staged inputs only (no MCP, no writes).
+    _read_only_roles = _ui_plan_roles | {"backlog-decomposer", "decomposition-reviewer"}
     _read_only_tools = frozenset({"Read", "Glob", "Grep"})
     _unused_mcp_grant = re.compile(r"^mcp__gntik_ui__[a-z][a-z_]{0,63}$")
     # NEW-227: the delivery makers; every other role is read-only.
@@ -122,7 +137,8 @@ class AgentInstructionPack:
             # NEW-131: a batched plan part sends one of the skill's released part schemas.
             part = self._part_schema(catalog, skill, request.output_schema)
             if part is None:
-                raise ValueError("ui plan request drifted from the released skill output schema")
+                flow = "decomposition" if step.startswith("decomposition.") else "ui plan"
+                raise ValueError(f"{flow} request drifted from the released skill output schema")
             name, payload, schema = part
             try:
                 Draft202012Validator.check_schema(schema)
@@ -234,7 +250,7 @@ class AgentInstructionPack:
             tools = {tool for tool in tools if not self._unused_mcp_grant.fullmatch(tool)}
         if request.role in self._read_only_roles:
             if not tools or not tools.issubset(self._read_only_tools) or request.writable:
-                raise ValueError("UI migration roles are read-only and receive no MCP tools")
+                raise ValueError("planning roles are read-only and receive no MCP tools")
         if not tools.issubset(self._allowed_tools):
             raise ValueError("agent role requests a non-allowlisted tool")
         write_tools = {"Edit", "Write"}
