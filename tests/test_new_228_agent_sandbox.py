@@ -18,6 +18,7 @@ import shutil
 import socket
 import stat
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -107,10 +108,13 @@ def test_payload_sandbox_is_absent_by_default_and_strict_when_present() -> None:
 
 
 def test_only_gntik_ui_opts_in() -> None:
-    assert load_agent_sandbox(PROJECTS, "gntik-ui") == {
-        "loopback_network": True,
-        "checker_scratch_copy": True,
-    }
+    # Both off on 2026-10-22: loopback until the worker-unit smoke PASSes on the worker
+    # (gntik-ui #247), the checker copy after two SIGABRT checker aborts. The block stays,
+    # so re-enabling is a one-line config change.
+    assert load_agent_sandbox(PROJECTS, "gntik-ui") is None
+    text = (PROJECTS / "gntik-ui.yaml").read_text(encoding="utf-8")
+    assert "  loopback_network: false" in text and "worker-unit" in text
+    assert "  checker_scratch_copy: false" in text and "SIGABRT" in text
     for project in ("falcone", "musematic", "llmwiki"):
         assert load_agent_sandbox(PROJECTS, project) is None
 
@@ -995,3 +999,989 @@ def test_loopback_shell_refuses_misuse_and_broad_roots(tmp_path: Path) -> None:
     assert refused.returncode == 126
     # A missing root (no mirrors on this host, say) is skipped.
     assert _in_shell("true", tmp_path, f"{tmp_path}:{tmp_path / 'missing'}").returncode == 0
+
+
+# -- the worker unit's /proc protections (gntik-ui #247, 2026-10-22) -------------------
+
+SYSTEMD = REPOSITORY / "systemd"
+SMOKE = REPOSITORY / "scripts" / "agent-loopback-smoke.py"
+# systemd's ProtectKernelTunables= /proc table (src/core/namespace.c, v259).
+TUNABLES_READ_ONLY = (
+    "acpi",
+    "apm",
+    "asound",
+    "bus",
+    "fs",
+    "irq",
+    "latency_stats",
+    "mtrr",
+    "scsi",
+    "sys",
+    "sysrq-trigger",
+    "timer_stats",
+)
+TUNABLES_INACCESSIBLE = ("kallsyms", "kcore")
+
+
+def _smoke_module() -> Any:
+    loader = importlib.machinery.SourceFileLoader("agent_loopback_smoke", str(SMOKE))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("agent_loopback_smoke", loader)  # type: ignore[arg-type]
+    )
+    loader.exec_module(module)
+    return module
+
+
+def _service_assignments(*paths: Path) -> list[tuple[str, str]]:
+    """[Service] key=value lines in file order (an independent reading of the units)."""
+    found: list[tuple[str, str]] = []
+    for path in paths:
+        section = ""
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("["):
+                section = line.strip()
+            elif section == "[Service]" and "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                found.append((key, value))
+    return found
+
+
+def _effective(assignments: list[tuple[str, str]], key: str) -> str | None:
+    values = [value for name, value in assignments if name == key]
+    return values[-1] if values else None
+
+
+def _worker_assignments(instance: str) -> list[tuple[str, str]]:
+    drop_ins = sorted((SYSTEMD / f"engineering-worker@{instance}.service.d").glob("*.conf"))
+    return _service_assignments(SYSTEMD / "engineering-worker@.service", *drop_ins)
+
+
+def test_loopback_shell_reapplies_protect_kernel_tunables_over_its_own_proc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _shell_constant("PROC_READ_ONLY") == TUNABLES_READ_ONLY
+    assert _shell_constant("PROC_MASKED") == TUNABLES_INACCESSIBLE
+    shell = _shell_module()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HERMES_LOOPBACK_WRITABLE", "")
+    monkeypatch.setenv("HERMES_LOOPBACK_READABLE", "")
+    argv = shell.arguments(str(home), 9, "true")
+    assert "--unshare-pid" in argv  # never the worker's /proc (the CLI's environ)
+    start = argv.index("--proc")
+    assert argv[start : start + 2] == ["--proc", "/proc"]
+    expected: list[str] = []
+    for name in TUNABLES_READ_ONLY:
+        if os.path.lexists(f"/proc/{name}"):
+            expected += ["--ro-bind", f"/proc/{name}", f"/proc/{name}"]
+    for name in TUNABLES_INACCESSIBLE:
+        if os.path.lexists(f"/proc/{name}"):
+            expected += ["--ro-bind", "/dev/null", f"/proc/{name}"]
+    assert "/proc/sys" in expected
+    assert argv[start + 2 : start + 2 + len(expected)] == expected
+    assert argv.count("--proc") == 1 and argv.count("/proc") == 1
+
+
+def test_loopback_shell_names_the_unit_setting_when_proc_is_overmounted(
+    tmp_path: Path,
+) -> None:
+    shell = _shell_module()
+    mountinfo = tmp_path / "mountinfo"
+    lines = [
+        "50 42 0:24 / /proc rw,nosuid,nodev,noexec,relatime shared:11 - proc proc rw",
+        "27 50 0:32 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw",
+        "55 27 0:43 / /proc/sys/fs/binfmt_misc rw,relatime shared:87 - binfmt_misc b rw",
+    ]
+    mountinfo.write_text("\n".join(lines) + "\n")
+    assert shell.proc_overmounts(str(mountinfo)) == []  # an ordinary host or the fixed unit
+    lines += [
+        "60 50 0:24 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "61 50 0:24 /sysrq-trigger /proc/sysrq-trigger ro,nosuid - proc proc rw",
+    ]
+    mountinfo.write_text("\n".join(lines) + "\n")
+    assert shell.proc_overmounts(str(mountinfo)) == ["/proc/sys", "/proc/sysrq-trigger"]
+    source = LOOPBACK_SHELL.read_text()
+    assert "ProtectKernelTunables=false" in source and "70-loopback-proc.conf" in source
+
+
+def test_only_the_claude_worker_drops_protect_kernel_tunables_and_sys_stays_read_only() -> None:
+    template = _service_assignments(SYSTEMD / "engineering-worker@.service")
+    assert _effective(template, "ProtectKernelTunables") == "true"
+    claude, codex = _worker_assignments("claude"), _worker_assignments("codex")
+    assert _effective(codex, "ProtectKernelTunables") == "true"
+    assert _effective(claude, "ProtectKernelTunables") == "false"
+    assert ("ReadOnlyPaths", "/sys") in claude  # what ProtectKernelTunables did for /sys
+    # Nothing else of the claude worker mounts over /proc (each would be locked too).
+    path_keys = {
+        "ReadOnlyPaths",
+        "ReadWritePaths",
+        "InaccessiblePaths",
+        "BindPaths",
+        "BindReadOnlyPaths",
+        "TemporaryFileSystem",
+        "ExecPaths",
+        "NoExecPaths",
+    }
+    for key, value in claude:
+        if key in path_keys:
+            for item in value.split():
+                assert not item.lstrip("-+").startswith("/proc"), (key, item)
+    assert _effective(claude, "ProtectKernelLogs") in (None, "false", "no")
+    assert _effective(claude, "ProcSubset") in (None, "all")
+    # The rest of the template's sandbox is unchanged for claude.
+    for key in (
+        "NoNewPrivileges",
+        "PrivateTmp",
+        "ProtectHome",
+        "ProtectSystem",
+        "ProtectKernelModules",
+        "RestrictSUIDSGID",
+        "LockPersonality",
+        "User",
+    ):
+        assert _effective(claude, key) == _effective(template, key), key
+    drop_in = "systemd/engineering-worker@claude.service.d/70-loopback-proc.conf"
+    bootstrap = (REPOSITORY / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert f'"${{RELEASE_ROOT}}/source/{drop_in}"' in bootstrap
+    assert not (SYSTEMD / "engineering-worker@codex.service.d/70-loopback-proc.conf").exists()
+
+
+def test_smoke_worker_unit_runs_with_exactly_the_worker_units_settings(tmp_path: Path) -> None:
+    smoke = _smoke_module()
+    for instance in ("claude", "codex"):
+        expected = [
+            f"{key}={value.replace('%i', instance)}"
+            for key, value in _worker_assignments(instance)
+            if key not in smoke.LIFECYCLE_KEYS
+        ]
+        assert smoke.worker_unit_properties(instance) == expected
+    claude = smoke.worker_unit_properties("claude")
+    # Every template key reaches the unit unless it is the worker process's lifecycle.
+    template_keys = {key for key, _ in _worker_assignments("claude")}
+    passed = {item.split("=", 1)[0] for item in claude}
+    assert template_keys - passed == {
+        "Type",
+        "NotifyAccess",
+        "WatchdogSec",
+        "TimeoutStartSec",
+        "WatchdogSignal",
+        "ExecStart",
+        "Restart",
+        "RestartSec",
+        "TimeoutStopSec",
+    }
+    for required in (
+        "User=claude-runner",
+        "ProtectKernelTunables=true",
+        "ProtectKernelTunables=false",
+        "ProtectControlGroups=private",
+        "ReadOnlyPaths=/sys",
+        "CPUQuota=250%",
+    ):
+        assert required in claude, required
+    assert claude.index("ProtectKernelTunables=false") > claude.index("ProtectKernelTunables=true")
+    assert not [item for item in claude if "%i" in item or "%I" in item]
+    command = smoke.worker_unit_command("claude", ["shell", "--work-root", "/w"])
+    assert command[:6] == [
+        "systemd-run",
+        "--quiet",
+        "--pipe",
+        "--wait",
+        "--collect",
+        "--service-type=exec",
+    ]
+    assert [item[len("--property=") :] for item in command if item.startswith("--property=")][
+        1:
+    ] == claude
+    separator = command.index("--")
+    assert command[separator + 2 :] == [str(SMOKE.resolve()), "shell", "--work-root", "/w"]
+    with pytest.raises(SystemExit):
+        smoke.worker_unit_command("claude", ["--work-root", "/w"])
+    # A drop-in of the template's own directory counts; an instance one replaces it.
+    root = tmp_path / "units"
+    (root / "engineering-worker@.service.d").mkdir(parents=True)
+    (root / "engineering-worker@claude.service.d").mkdir()
+    (root / "engineering-worker@.service").write_text(
+        "[Unit]\nDescription=x %i\n[Service]\nType=notify\nUser=%i-runner\nUMask=0027\n"
+    )
+    (root / "engineering-worker@.service.d" / "10-a.conf").write_text("[Service]\nUMask=0077\n")
+    (root / "engineering-worker@.service.d" / "20-b.conf").write_text("[Service]\nUMask=0007\n")
+    (root / "engineering-worker@claude.service.d" / "20-b.conf").write_text(
+        "[Service]\nProtectKernelTunables=false\n"
+    )
+    assert smoke.worker_unit_properties("claude", root) == [
+        "User=claude-runner",
+        "UMask=0027",
+        "UMask=0077",
+        "ProtectKernelTunables=false",
+    ]
+    (root / "engineering-worker@claude.service.d" / "30-c.conf").write_text(
+        "[Service]\nEnvironment=HOME=%h\n"
+    )
+    with pytest.raises(SystemExit, match="specifier %h"):
+        smoke.worker_unit_properties("claude", root)
+
+
+def _unit_proc_mounts(assignments: list[tuple[str, str]]) -> list[str]:
+    """bwrap arguments reproducing what systemd mounts over /proc for these settings."""
+    mounts: list[str] = []
+    if _effective(assignments, "ProtectKernelTunables") in ("true", "yes"):
+        for name in TUNABLES_READ_ONLY:
+            if os.path.lexists(f"/proc/{name}"):
+                mounts += ["--ro-bind", f"/proc/{name}", f"/proc/{name}"]
+        for name in TUNABLES_INACCESSIBLE:
+            if os.path.lexists(f"/proc/{name}"):
+                mounts += ["--ro-bind", "/dev/null", f"/proc/{name}"]
+    return mounts
+
+
+def _in_unit_namespace(
+    proc_mounts: list[str], command: list[str], cwd: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run ``command`` in a mount namespace whose /proc carries ``proc_mounts``, made in a
+    user namespace the command then joins (nsenter): bubblewrap's own user namespace below
+    it locks those mounts exactly as it locks a systemd unit's."""
+    outer = subprocess.Popen(  # noqa: S603 - fixed bubblewrap, test-owned arguments
+        [
+            "/usr/bin/bwrap",
+            "--unshare-user",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--dev-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            *proc_mounts,
+            "--",
+            "sleep",
+            "120",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        children = Path(f"/proc/{outer.pid}/task/{outer.pid}/children")
+        for _ in range(100):
+            pids = children.read_text().split() if children.exists() else []
+            if pids or outer.poll() is not None:
+                break
+            subprocess.run(["sleep", "0.05"], check=False)  # noqa: S607 - fixed command
+        if not pids:
+            pytest.skip(f"no namespace to join: {outer.stderr.read() if outer.stderr else ''}")
+        return subprocess.run(  # noqa: S603 - fixed nsenter, test-owned command
+            [
+                shutil.which("nsenter") or "/usr/bin/nsenter",
+                "-t",
+                pids[0],
+                "-U",
+                "-m",
+                "-p",
+                "--preserve-credentials",
+                f"--wd={cwd}",
+                "--",
+                *command,
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    finally:
+        outer.kill()
+        outer.wait()
+
+
+def _unit_namespace_usable(tmp_path: Path) -> bool:
+    if not _bwrap_usable() or not shutil.which("nsenter"):
+        return False
+    probe = _in_unit_namespace(
+        [],
+        ["/usr/bin/bwrap", "--unshare-pid", "--dev-bind", "/", "/", "true"],
+        tmp_path,
+        dict(os.environ),
+    )
+    return probe.returncode == 0
+
+
+_UNIT_PROBE = r"""
+import json, os
+mounts = {}
+with open("/proc/self/mountinfo") as handle:
+    for line in handle:
+        fields = line.split()
+        mounts[fields[4]] = fields[5].split(",")
+def denied(path):
+    try:
+        open(path, "rb").close()
+        return "readable"
+    except OSError as error:
+        return error.strerror
+print(json.dumps({
+    "pid1": open("/proc/1/comm").read().strip(),
+    "pids": sorted(int(name) for name in os.listdir("/proc") if name.isdigit()),
+    "sys_ro": "ro" in mounts.get("/proc/sys", []),
+    "sysrq_ro": "ro" in mounts.get("/proc/sysrq-trigger", []),
+    "kcore": denied("/proc/kcore"),
+    "net_conf": sorted(os.listdir("/proc/sys/net/ipv6/conf")),
+}))
+"""
+
+
+def test_loopback_shell_under_the_worker_units_proc_mounts(tmp_path: Path) -> None:
+    """gntik-ui #247: every Bash command of the checker failed under the worker unit while
+    the operator's smoke (run with sudo -u, outside the unit) passed."""
+    if not _unit_namespace_usable(tmp_path):
+        pytest.skip("bubblewrap or nsenter cannot nest user namespaces on this host")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "probe.py").write_text(_UNIT_PROBE)
+    environment = {
+        **{key: value for key, value in os.environ.items() if key not in {"TMPDIR", "TMP"}},
+        "HERMES_LOOPBACK_WRITABLE": str(work),
+        "HERMES_LOOPBACK_READABLE": "",
+    }
+    shell = [str(LOOPBACK_SHELL), "python3 probe.py"]
+    # The template's ProtectKernelTunables=true (codex keeps it): the kernel refuses
+    # bubblewrap's procfs (the command never runs), and the shell names the setting.
+    template = _unit_proc_mounts(_worker_assignments("codex"))
+    assert template
+    raw = _in_unit_namespace(
+        template,
+        ["/usr/bin/bwrap", "--unshare-pid", "--dev-bind", "/", "/", "--proc", "/proc", "true"],
+        work,
+        environment,
+    )
+    assert raw.returncode != 0
+    assert "Can't mount proc" in raw.stderr and "Operation not permitted" in raw.stderr
+    refused = _in_unit_namespace(template, shell, work, environment)
+    assert refused.returncode != 0
+    assert "Can't mount proc" in refused.stderr
+    assert "ProtectKernelTunables=false" in refused.stderr  # the cause, named
+    # The claude worker (template plus its drop-ins): no mounts over /proc, so the shell
+    # runs, with a procfs of its own PID namespace that it re-protects.
+    claude = _unit_proc_mounts(_worker_assignments("claude"))
+    assert claude == []
+    completed = _in_unit_namespace(claude, shell, work, environment)
+    assert completed.returncode == 0, completed.stderr
+    results = json.loads(completed.stdout)
+    assert results["pid1"] == "bwrap"
+    assert len(results["pids"]) <= 4, results["pids"]  # bwrap, bash, python: no CLI pid
+    assert results["sys_ro"] and results["sysrq_ro"]
+    assert results["kcore"] == "Permission denied"
+    assert results["net_conf"] == ["all", "default", "lo"]  # its own netns's sysctls
+
+
+def _variant(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and "type" in value:
+        return value
+    kind = {bool: "b", int: "u", list: "as"}.get(type(value), "s")
+    return {"type": kind, "data": value}
+
+
+class _FakeSystemd:
+    """busctl, systemctl and systemd-run as the smoke's worker-unit mode calls them."""
+
+    def __init__(
+        self, worker: dict[str, Any], probe: dict[str, Any], smoke: str, smoke_status: int = 0
+    ) -> None:
+        self.worker, self.probe, self.smoke, self.smoke_status = worker, probe, smoke, smoke_status
+        self.calls: list[list[str]] = []
+        self.facts: str | None = None
+        self.units_loaded: int | None = 1_000  # the manager's UnitsLoadTimestampMonotonic
+
+    def __call__(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        bus = ["busctl", "--json=short", "call", "org.freedesktop.systemd1"]
+        if command[:4] == bus and command[6] == "GetUnit":
+            unit = command[-1]
+            if unit.startswith("engineering-worker@") and not self.worker:
+                return subprocess.CompletedProcess(command, 1, "", "Unit not loaded")
+            reply = {"type": "o", "data": [f"/org/freedesktop/systemd1/unit/{unit}"]}
+            return subprocess.CompletedProcess(command, 0, json.dumps(reply), "")
+        if command[:4] == bus and command[6] == "Get":
+            assert command[-2:] == [
+                "org.freedesktop.systemd1.Manager",
+                "UnitsLoadTimestampMonotonic",
+            ]
+            if self.units_loaded is None:
+                return subprocess.CompletedProcess(command, 1, "", "Unknown property")
+            reply_get = {"type": "v", "data": [{"type": "t", "data": self.units_loaded}]}
+            return subprocess.CompletedProcess(command, 0, json.dumps(reply_get), "")
+        if command[:4] == bus and command[6] == "GetAll":
+            source = self.worker if "engineering-worker@" in command[4] else self.probe
+            # Everything on the Service interface; the Unit interface holds none here.
+            values = (
+                {name: _variant(value) for name, value in source.items()}
+                if command[-1].endswith(".Service")
+                else {}
+            )
+            reply_all: dict[str, Any] = {"type": "a{sv}", "data": [values]}
+            return subprocess.CompletedProcess(command, 0, json.dumps(reply_all), "")
+        if command[0] == "systemd-run" and command[-3:-1] == ["/bin/sh", "-c"]:
+            unit = next(item for item in command if item.startswith("--unit="))[7:] + ".service"
+            facts = (
+                self.facts
+                if self.facts is not None
+                else (
+                    f"{_status_text(Pid='77', NSpid='77', VmRSS='999 kB')}"
+                    "--- hermes-loopback-mountinfo ---\n"
+                    + _mountinfo("probe", unit=unit)
+                    + "--- hermes-loopback-namespaces ---\n"
+                    + "".join(f"{name} {link}\n" for name, link in _ns_links("probe").items())
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, facts, "")
+        if command[0] == "systemd-run" and "--pipe" in command:
+            return subprocess.CompletedProcess(command, self.smoke_status, self.smoke + "\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+_STATUS = {
+    "Name": "engineering-rol",
+    "Umask": "0027",
+    "Pid": "4242",
+    "TracerPid": "0",
+    "Uid": "990\t990\t990\t990",
+    "Gid": "990\t990\t990\t990",
+    "Groups": "",
+    "CapInh": "0000000000000000",
+    "CapPrm": "0000000000000000",
+    "CapEff": "0000000000000000",
+    "CapBnd": "000001fffffeffff",
+    "CapAmb": "0000000000000000",
+    "NoNewPrivs": "1",
+    "Seccomp": "2",
+    "Seccomp_filters": "3",
+    "NSpid": "4242",
+    "Speculation_Store_Bypass": "thread force mitigated",
+    "SpeculationIndirectBranch": "conditional force disabled",
+    "VmRSS": "123456 kB",
+}
+# Namespace links: the host's (PID 1), and what differs for the worker or a probe process
+# (a mount and a cgroup namespace of its own: ProtectSystem=, ProtectControlGroups=private).
+_HOST_NS = {
+    name: f"{name}:[40265318{index}]"
+    for index, name in enumerate(("cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"))
+}
+
+
+def _ns_links(tag: str, **changes: str) -> dict[str, str]:
+    base = 900 if tag == "worker" else 800
+    return {
+        **_HOST_NS,
+        "mnt": f"mnt:[{base}]",
+        "cgroup": f"cgroup:[{base + 1}]",
+        **changes,
+    }
+
+
+# A sandboxed worker's mount table (systemd: ProtectSystem=strict, ProtectHome, PrivateTmp,
+# ReadOnlyPaths=/sys, its ReadWritePaths); ids and sources differ between processes.
+_MOUNTS = (
+    "/ / ro,relatime - ext4 /dev/sda1 rw",
+    "/ /home ro,nosuid,nodev,noexec - tmpfs tmpfs ro",
+    "/ /root ro,nosuid,nodev,noexec - tmpfs tmpfs ro",
+    "/systemd-private-{boot}-{unit}-{tag}/tmp /tmp rw,nosuid,nodev - ext4 /dev/sda1 rw",
+    "/systemd-private-{boot}-{unit}-{tag}/tmp /var/tmp rw,nosuid,nodev - ext4 /dev/sda1 rw",
+    "/ /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+    "/ /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw",
+    "/ /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw",
+    "/ /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw",
+    "/ /dev rw,nosuid - devtmpfs udev rw",
+    "/srv/engineering/tmp/claude /srv/engineering/tmp/claude rw,relatime - ext4 /dev/sda1 rw",
+)
+
+
+def _status_text(**changes: str) -> str:
+    return "".join(f"{name}:\t{value}\n" for name, value in {**_STATUS, **changes}.items())
+
+
+def _mountinfo(tag: str, *extra: str, unit: str = "engineering-worker@claude.service") -> str:
+    """The same mounts as another process sees them: other IDs, peer groups, PrivateTmp
+    directory names and tmpfs sizes (all per instance)."""
+    offset = 100 if tag == "worker" else 700
+    lines = [
+        f"{offset + index} {offset - 1} 0:{offset + index} "
+        + line.format(boot="0123456789abcdef0123456789abcdef", unit=unit, tag=f"{tag}AbC")
+        .replace(" - ", f" shared:{offset + index} - ", 1)
+        .replace("tmpfs tmpfs ro", f"tmpfs tmpfs ro,size={offset}k")
+        for index, line in enumerate(_MOUNTS)
+    ]
+    return "\n".join([*lines, *extra]) + "\n"
+
+
+def _proc_root(
+    tmp_path: Path,
+    *extra: str,
+    namespaces: Mapping[str, str] | None = None,
+    status: Mapping[str, str] | None = None,
+) -> Path:
+    root = tmp_path / "proc"
+    (root / "4242" / "ns").mkdir(parents=True)
+    (root / "1" / "ns").mkdir(parents=True)
+    (root / "4242" / "mountinfo").write_text(_mountinfo("worker", *extra))
+    (root / "4242" / "status").write_text(_status_text(**(status or {})))
+    for name, link in _HOST_NS.items():
+        (root / "1" / "ns" / name).symlink_to(link)
+    for name, link in _ns_links("worker", **(namespaces or {})).items():
+        (root / "4242" / "ns" / name).symlink_to(link)
+    return root
+
+
+def _account(name: str) -> Any:
+    if name != "claude-runner":
+        raise KeyError(name)
+    return type("Account", (), {"pw_uid": 990, "pw_gid": 990})()
+
+
+# Sandbox and resource settings the bus exposes (review 2: all must be compared).
+_SANDBOX_SHOWN = (
+    "RestrictNamespaces",
+    "SystemCallFilter",
+    "SystemCallArchitectures",
+    "SystemCallErrorNumber",
+    "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "PrivateUsers",
+    "PrivateNetwork",
+    "PrivateDevices",
+    "PrivateIPC",
+    "PrivatePIDs",
+    "PrivateTmp",
+    "PrivateMounts",
+    "ProtectProc",
+    "ProcSubset",
+    "ProtectClock",
+    "ProtectHostname",
+    "ProtectKernelLogs",
+    "ProtectKernelTunables",
+    "ProtectKernelModules",
+    "ProtectControlGroups",
+    "ProtectSystem",
+    "ProtectHome",
+    "RestrictAddressFamilies",
+    "MemoryDenyWriteExecute",
+    "RestrictRealtime",
+    "RestrictSUIDSGID",
+    "NoNewPrivileges",
+    "InaccessiblePaths",
+    "ReadOnlyPaths",
+    "ReadWritePaths",
+    "ExecPaths",
+    "NoExecPaths",
+    "TemporaryFileSystem",
+    "BindPaths",
+    "BindReadOnlyPaths",
+    "AppArmorProfile",
+    "SELinuxContext",
+    "SmackProcessLabel",
+    "Personality",
+    "LockPersonality",
+    "IPAddressDeny",
+    "IPAddressAllow",
+    "SocketBindDeny",
+    "SocketBindAllow",
+    "RestrictNetworkInterfaces",
+    "RestrictFileSystems",
+    "DevicePolicy",
+    "DeviceAllow",
+    "User",
+    "Group",
+    "DynamicUser",
+    "SupplementaryGroups",
+    "UMask",
+    "Environment",
+    "EnvironmentFiles",
+    "WorkingDirectory",
+    "RootDirectory",
+    "MountAPIVFS",
+    "Slice",
+    "MemoryMax",
+    "MemoryHigh",
+    "TasksMax",
+    "CPUQuotaPerSecUSec",
+    "Delegate",
+    "DelegateSubgroup",
+    "JoinsNamespaceOf",
+    "NetworkNamespacePath",
+    "IPCNamespacePath",
+    "RootImage",
+    "PrivateTmpEx",
+    "ExecSearchPath",
+    "LimitCORE",
+    "LimitNOFILE",
+    "SecureBits",
+    "KeyringMode",
+)
+
+
+WORKER_BINARY = "/opt/engineering-control/venv/bin/engineering-role-worker"
+
+
+def _commands(*entries: tuple[str, list[str], list[str]]) -> dict[str, Any]:
+    """An Exec*Ex bus property: (path, argv, flags, times, PID, code, status) per command."""
+    return {
+        "type": "a(sasasttttuii)",
+        "data": [[path, argv, flags, 0, 0, 0, 0, 0, 0, 0] for path, argv, flags in entries],
+    }
+
+
+def test_smoke_compares_every_sandbox_and_resource_property_shown() -> None:
+    smoke = _smoke_module()
+    assert [name for name in _SANDBOX_SHOWN if not smoke.compared(name)] == []
+    for runtime in (
+        "MainPID",
+        "ExecMainStartTimestamp",
+        "ActiveEnterTimestampMonotonic",
+        "MemoryCurrent",
+        "IPIngressBytes",
+        "InvocationID",
+        "Description",
+        "After",
+        "Type",
+        "WatchdogUSec",
+        "TimeoutStartUSec",
+        "RestartUSec",
+        "Transient",
+        "FragmentPath",
+        "KillMode",
+    ):
+        assert not smoke.compared(runtime), runtime
+
+
+def test_smoke_worker_unit_accepts_only_the_loaded_unit_and_a_restarted_worker(
+    tmp_path: Path,
+) -> None:
+    smoke = _smoke_module()
+    properties = smoke.worker_unit_properties("claude")
+    common: dict[str, Any] = {name: f"value-of-{name}" for name in _SANDBOX_SHOWN}
+    common["ProtectKernelTunables"] = "no"
+    common["RestrictNamespaces"] = ""  # neither the release nor the template sets it
+    common["JoinsNamespaceOf"] = []
+    worker = {
+        **common,
+        "Id": "engineering-worker@claude.service",
+        "Description": "Engineering Control bounded claude worker",
+        "Type": "notify",
+        "WatchdogUSec": 600000000,
+        "After": ["network-online.target"],
+        "Transient": False,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "NeedDaemonReload": False,
+        "MainPID": 4242,
+        "ExecMainStartTimestamp": 1_792_000_000_000_000,
+        "ExecMainStartTimestampMonotonic": 5_000,
+        "MemoryCurrent": 1234,
+        "FragmentPath": "/etc/systemd/system/engineering-worker@.service",
+        "DropInPaths": ["/etc/systemd/system/engineering-worker@claude.service.d/70-x.conf"],
+        "ExecStart": {"type": "a(sasbttttuii)", "data": []},
+        "ExecStartEx": _commands((WORKER_BINARY, [WORKER_BINARY], [])),
+        "ExecStopEx": _commands(),
+    }
+    probe = {
+        **common,
+        "Id": "engineering-loopback-probe.service",
+        "Description": "[systemd-run] /bin/true",
+        "Type": "oneshot",
+        "RemainAfterExit": True,
+        "Transient": True,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "MainPID": 0,
+        "ExecStartEx": _commands(("/bin/true", ["/bin/true"], [])),
+    }
+    passed = json.dumps({"mode": "shell", "status": "PASS", "problems": []})
+    arguments = ["shell", "--work-root", "/w"]
+
+    def check(
+        loaded: dict[str, Any],
+        proc: Path,
+        sandbox: str = passed,
+        status: int = 0,
+        facts: str | None = None,
+    ) -> dict[str, Any]:
+        fake = _FakeSystemd(loaded, probe, sandbox, status)
+        fake.facts = facts
+        result: dict[str, Any] = smoke.worker_unit_check(
+            "claude", arguments, expectation_only=False, run=fake, proc_root=proc, lookup=_account
+        )
+        facts_probe = [call for call in fake.calls if call[-3:-1] == ["/bin/sh", "-c"]]
+        assert len(facts_probe) == 1
+        assert [item for item in facts_probe[0] if item.startswith("--property=")] == [
+            f"--property={item}" for item in properties
+        ]
+        made = [call for call in fake.calls if call[0] == "systemd-run" and "--pipe" not in call]
+        assert len(made) == 1 and made[0][-2:] == ["--", "/bin/true"]
+        assert [item for item in made[0] if item.startswith("--property=")][1:] == [
+            f"--property={item}" for item in properties
+        ]
+        assert ["systemctl", "stop", made[0][2].split("=", 1)[1]] in fake.calls
+        return result
+
+    def problems(result: dict[str, Any]) -> str:
+        return " | ".join(result["checks"]["unit_loaded_matches"]["problems"])
+
+    clean = _proc_root(tmp_path)
+    good = check(worker, clean)
+    assert good["status"] == "PASS", good
+    assert set(good["checks"]) == {
+        "unit_loaded_matches",
+        "worker_proc_unlocked",
+        "worker_process_matches",
+        "worker_started_after_last_reload",
+        "sandbox",
+    }
+    assert good["checks"]["worker_process_matches"]["ok"], good["checks"]
+    assert good["checks"]["worker_started_after_last_reload"] == {
+        "ok": True,
+        "problems": [],
+        "started_monotonic_usec": 5_000,
+        "units_loaded_monotonic_usec": 1_000,
+    }
+    # Review 8: a stale invocation's umask, tracer, PID or network namespace.
+    for field, setting in (("Umask", "0000"), ("TracerPid", "1"), ("NSpid", "4242\t1")):
+        drifted = check(worker, _proc_root(tmp_path / str(uuid4()), status={field: setting}))
+        assert drifted["status"] == "FAIL", field
+        key = "NSpid_depth" if field == "NSpid" else field
+        assert f"status:{key}" in drifted["checks"]["worker_process_matches"]["differences"]
+    for namespace, link in (("net", "net:[5]"), ("ipc", "ipc:[5]"), ("mnt", _HOST_NS["mnt"])):
+        joined_ns = check(worker, _proc_root(tmp_path / str(uuid4()), namespaces={namespace: link}))
+        assert joined_ns["status"] == "FAIL", namespace
+        assert (
+            f"namespaces:{namespace}"
+            in joined_ns["checks"]["worker_process_matches"]["differences"]
+        )
+    assert good["checks"]["worker_process_matches"]["status"]["Umask"] == "0027"
+    # Review 7: started, then the unit changed and reloaded without a restart.
+    for started in (999, 1_000, 0):
+        stale_start = check({**worker, "ExecMainStartTimestampMonotonic": started}, clean)
+        assert stale_start["status"] == "FAIL", started
+        assert not stale_start["checks"]["worker_started_after_last_reload"]["ok"]
+    # Review 7: /tmp still shared with the peer a removed JoinsNamespaceOf= named.
+    peer = _proc_root(tmp_path / "peer")
+    (peer / "4242" / "mountinfo").write_text(_mountinfo("worker", unit="peer.service"))
+    shared = check(worker, peer)
+    assert shared["status"] == "FAIL"
+    assert any(
+        "another unit's PrivateTmp: /tmp: /systemd-private-" in item and "peer.service" in item
+        for item in shared["checks"]["worker_process_matches"]["problems"]
+    )
+    # Review 5: started privileged (ExecStart=+...), the unprefixed command restored and
+    # reloaded without a restart: the unit is clean, the running process is not.
+    for changes in (
+        {
+            "Uid": "0\t0\t0\t0",
+            "Gid": "0\t0\t0\t0",
+            "CapEff": "000001ffffffffff",
+            "CapPrm": "000001ffffffffff",
+        },
+        {"CapAmb": "0000000000200000"},
+        {"NoNewPrivs": "0"},
+        {"Seccomp": "0", "Seccomp_filters": "0"},
+        {"CapBnd": "000001ffffffffff"},
+    ):
+        forged = check(worker, _proc_root(tmp_path / str(uuid4()), status=changes))
+        assert forged["status"] == "FAIL", changes
+        assert forged["checks"]["unit_loaded_matches"]["ok"]
+        process = forged["checks"]["worker_process_matches"]
+        assert not process["ok"]
+        assert {f"status:{name}" for name in changes} <= set(process["differences"]), process
+    root_worker = check(worker, _proc_root(tmp_path / "root", status={"Uid": "0\t0\t0\t0"}))
+    assert (
+        "Uid 0 0 0 0 (expected 990 x4)"
+        in root_worker["checks"]["worker_process_matches"]["problems"]
+    )
+    # The worker's mounts differ from a process started with the release's settings.
+    shared_tmp = _proc_root(tmp_path / "shared-tmp")
+    (shared_tmp / "4242" / "mountinfo").write_text(
+        _mountinfo("worker").replace(" /tmp rw", " /tmp-elsewhere rw")
+    )
+    tmp = check(worker, shared_tmp)
+    assert tmp["status"] == "FAIL"
+    assert "mounts:/tmp" in tmp["checks"]["worker_process_matches"]["differences"]
+    assert any("PrivateTmp" in item for item in tmp["checks"]["worker_process_matches"]["problems"])
+    writable = _proc_root(tmp_path / "writable")
+    (writable / "4242" / "mountinfo").write_text(
+        _mountinfo("worker").replace(" / ro,relatime", " / rw,relatime")
+    )
+    usr = check(worker, writable)
+    assert "/usr is not read-only" in usr["checks"]["worker_process_matches"]["problems"]
+    assert check(worker, clean, facts="garbage")["status"] == "FAIL"
+    # Review 6: the whole mount table, not only the sampled paths.
+    kept = _proc_root(
+        tmp_path / "kept-rw",
+        "900 103 8:1 /etc/engineering-control /etc/engineering-control rw,relatime"
+        " shared:9 - ext4 /dev/sda1 rw",
+    )
+    extra_mount = check(worker, kept)
+    assert extra_mount["status"] == "FAIL"
+    table = extra_mount["checks"]["worker_process_matches"]["differences"]["mounts:table"]
+    assert table == {
+        "worker": ["/etc/engineering-control /etc/engineering-control relatime,rw [shared] ext4"],
+        "release": [],
+    }
+    unbound = _proc_root(tmp_path / "unbound")
+    (unbound / "4242" / "mountinfo").write_text(
+        "\n".join(line for line in _mountinfo("worker").splitlines() if " /sys ro," not in line)
+        + "\n"
+    )
+    missing_bind = check(worker, unbound)
+    assert missing_bind["status"] == "FAIL"
+    assert missing_bind["checks"]["worker_process_matches"]["differences"]["mounts:table"][
+        "release"
+    ] == ["/ /sys nodev,noexec,nosuid,relatime,ro [shared] sysfs"]
+    options = _proc_root(tmp_path / "options")
+    (options / "4242" / "mountinfo").write_text(
+        _mountinfo("worker").replace(" /var/tmp rw,nosuid,nodev", " /var/tmp rw,nodev")
+    )
+    assert check(worker, options)["status"] == "FAIL"
+    propagation = _proc_root(tmp_path / "propagation")
+    (propagation / "4242" / "mountinfo").write_text(
+        _mountinfo("worker").replace(" shared:103 ", " master:5 ")
+    )
+    assert check(worker, propagation)["status"] == "FAIL"
+    assert good["checks"]["unit_loaded_matches"]["ok"]
+    assert good["checks"]["unit_loaded_matches"]["compared"] == len(_SANDBOX_SHOWN)
+    assert good["checks"]["unit_loaded_matches"]["commands"] == {
+        "ExecStartEx": [{"path": WORKER_BINARY, "argv": [WORKER_BINARY], "flags": []}]
+    }
+    assert good["checks"]["worker_proc_unlocked"] == {
+        "ok": True,
+        "main_pid": "4242",
+        "overmounts": [],
+        "problems": [],
+    }
+    # A drop-in missing or overridden on the host: the loaded unit differs.
+    stale = check({**worker, "ProtectKernelTunables": "yes"}, clean)
+    assert stale["status"] == "FAIL"
+    assert stale["checks"]["unit_loaded_matches"]["mismatches"] == {
+        "ProtectKernelTunables": {"loaded": "yes", "release": "no"}
+    }
+    # A setting only the host has (review 2: RestrictNamespaces=~net blocks bwrap's netns).
+    extra = check({**worker, "RestrictNamespaces": "~net"}, clean)
+    assert extra["status"] == "FAIL"
+    assert extra["checks"]["unit_loaded_matches"]["mismatches"] == {
+        "RestrictNamespaces": {"loaded": "~net", "release": ""}
+    }
+    unknown = check({**worker, "SomeFutureSandboxing": True}, clean)
+    assert unknown["checks"]["unit_loaded_matches"]["mismatches"] == {
+        "SomeFutureSandboxing": {"loaded": True, "release": None}
+    }
+    # The same value with another bus type differs too (typed comparison).
+    typed = check({**worker, "ProtectKernelTunables": {"type": "as", "data": "no"}}, clean)
+    assert typed["status"] == "FAIL"
+    # A unit joining another unit's namespaces (its /tmp, say, with PrivateTmp=; review 3).
+    joined = check({**worker, "JoinsNamespaceOf": ["other.service"]}, clean)
+    assert joined["checks"]["unit_loaded_matches"]["mismatches"] == {
+        "JoinsNamespaceOf": {"loaded": ["other.service"], "release": []}
+    }
+    # Commands, read as typed bus data (review 3, 4): "+", "!" or "!!" lifts the sandbox
+    # or the user switch; each command list must be exactly the release's.
+    for flags in (["privileged"], ["no-setuid"], ["ambient"], ["ignore-failure", "privileged"]):
+        for name, value in (
+            ("ExecStartPreEx", _commands(("/bin/sh", ["/bin/sh", "-c", "x"], flags))),
+            ("ExecStartEx", _commands((WORKER_BINARY, [WORKER_BINARY], flags))),
+            (
+                "ExecStopPostEx",
+                _commands(("/bin/true", ["/bin/true"], []), ("/bin/sh", ["/bin/sh"], flags)),
+            ),
+        ):
+            lifted = check({**worker, name: value}, clean)
+            assert lifted["status"] == "FAIL", (name, flags)
+            assert f"{name} " in problems(lifted) and flags[-1] in problems(lifted)
+    # Review 4: an argument that reads like systemctl's own "flags=" text changes nothing.
+    forged = _commands(
+        (WORKER_BINARY, [WORKER_BINARY, " ; flags= ; "], ["privileged"]),
+    )
+    injected = check({**worker, "ExecStartEx": forged}, clean)
+    assert injected["status"] == "FAIL"
+    assert "ExecStartEx " + WORKER_BINARY + ": privileged" in problems(injected)
+    assert "ExecStartEx differs from the release" in problems(injected)
+    # Extra arguments, another executable, or a command the release does not define.
+    for value in (
+        {"ExecStartEx": _commands((WORKER_BINARY, [WORKER_BINARY, "--debug"], []))},
+        {"ExecStartEx": _commands(("/usr/bin/python3", ["/usr/bin/python3"], []))},
+        {"ExecStartEx": _commands()},
+        {"ExecStartPreEx": _commands(("/bin/true", ["/bin/true"], ["ignore-failure"]))},
+        {"ExecFutureHookEx": _commands(("/bin/true", ["/bin/true"], []))},
+    ):
+        differs = check({**worker, **value}, clean)
+        assert differs["status"] == "FAIL", value
+        assert "differs from the release" in problems(differs)
+    assert smoke.release_commands("claude") == {"ExecStartEx": [[WORKER_BINARY, [WORKER_BINARY]]]}
+    root = tmp_path / "units"
+    (root / "engineering-worker@claude.service.d").mkdir(parents=True)
+    (root / "engineering-worker@.service").write_text(
+        "[Service]\nExecStartPre=/bin/a %i\nExecStart=/bin/b\nExecStart=\nExecStart=/bin/c 'x y'\n"
+    )
+    assert smoke.release_commands("claude", root) == {
+        "ExecStartPreEx": [["/bin/a", ["/bin/a", "claude"]]],
+        "ExecStartEx": [["/bin/c", ["/bin/c", "x y"]]],
+    }
+    (root / "engineering-worker@claude.service.d" / "x.conf").write_text(
+        "[Service]\nExecStartPost=+/bin/d\n"
+    )
+    with pytest.raises(SystemExit, match="prefix"):
+        smoke.release_commands("claude", root)
+    # Installed but systemd not reloaded.
+    reload = check({**worker, "NeedDaemonReload": True}, clean)
+    assert reload["status"] == "FAIL"
+    assert "NeedDaemonReload=True (expected False)" in problems(reload)
+    # The worker unit not loaded at all.
+    missing = _FakeSystemd({}, probe, passed)
+    absent = smoke.worker_unit_check(
+        "claude", arguments, expectation_only=False, run=missing, proc_root=clean, lookup=_account
+    )
+    assert absent["status"] == "FAIL"
+    assert not absent["checks"]["unit_loaded_matches"]["ok"]
+    # Reloaded but the worker not restarted: its /proc still carries the old mounts.
+    locked = _proc_root(
+        tmp_path / "locked",
+        "60 50 0:24 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+    )
+    old = check(worker, locked)
+    assert old["status"] == "FAIL"
+    assert old["checks"]["worker_proc_unlocked"]["overmounts"] == ["/proc/sys"]
+    assert old["checks"]["unit_loaded_matches"]["ok"]
+    assert old["checks"]["sandbox"]["status"] == "PASS"
+    stopped = check({**worker, "MainPID": 0, "ActiveState": "inactive"}, clean)
+    assert stopped["status"] == "FAIL"
+    assert not stopped["checks"]["worker_proc_unlocked"]["ok"]
+    # The sandbox verdict needs both a PASS line and systemd-run exiting 0 (review 2).
+    for sandbox, status in ((json.dumps({"status": "FAIL"}), 0), ("garbage", 0), (passed, 1)):
+        failed = check(worker, clean, sandbox, status)
+        assert failed["status"] == "FAIL", (sandbox, status)
+        assert failed["checks"]["sandbox"]["status"] == "FAIL"
+    assert check(worker, clean, passed, 1)["checks"]["sandbox"]["exit_status"] == 1
+    # Before the install: the sandbox checks only, labelled, never PASS.
+    fake = _FakeSystemd({}, {}, passed)
+    expectation = smoke.worker_unit_check("claude", arguments, expectation_only=True, run=fake)
+    assert expectation["status"] == "EXPECTATION_PASS"
+    assert set(expectation["checks"]) == {"sandbox"}
+    assert "not production acceptance" in expectation["note"]
+    assert [call[0] for call in fake.calls] == ["systemd-run"]
+    fake = _FakeSystemd({}, {}, passed, 1)
+    refused = smoke.worker_unit_check("claude", arguments, expectation_only=True, run=fake)
+    assert refused["status"] == "FAIL"
+
+
+def test_smoke_worker_start_fails_closed_without_the_manager_timestamp() -> None:
+    # Review 8: no file-time fallback (a deleted drop-in leaves no newer file).
+    smoke = _smoke_module()
+    worker = {"ExecMainStartTimestampMonotonic": 5_000}
+    for loaded in (None, 0):
+        fake = _FakeSystemd({}, {}, "")
+        fake.units_loaded = loaded
+        result = smoke.worker_started_after_last_reload(fake, worker)
+        assert not result["ok"], loaded
+        assert result["problems"] == [
+            "systemd's last unit load time is unavailable (UnitsLoadTimestamp)"
+        ]
+    fake = _FakeSystemd({}, {}, "")
+    assert smoke.worker_started_after_last_reload(fake, worker)["ok"]
+    assert not smoke.worker_started_after_last_reload(fake, {})["ok"]

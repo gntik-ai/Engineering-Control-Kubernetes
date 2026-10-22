@@ -92,9 +92,19 @@ delivery_control:
 # visual browser suites, which makers and the checker could not run ("listen EPERM
 # ::1:4173"); the Claude checker could not build in the codex-runner-owned worktree.
 # Reduced scope: Claude makers/checkers only; Codex runs keep today's sandbox (no sockets).
+# Off (2026-10-22, gntik-ui #247): under the worker unit every loopback command failed
+# ("bwrap: Can't mount proc"; ProtectKernelTunables, see 70-loopback-proc.conf). Deploy
+# step 5b reinstalls this copy, which re-enabled the broken loopback at ~20:55. Only a
+# follow-up config change re-enables it, after `agent-loopback-smoke.py worker-unit`
+# PASSes on the worker for shell and claude.
+# checker_scratch_copy off too: two Claude checkers on gntik-ui aborted with SIGABRT
+# (exit -6, PROVIDER_EXIT_NONZERO) at 20:40 and 22:23 on 2026-10-22 after NEW-228 was
+# deployed, suspected Node heap aborts from the full-worktree scratch copy (node_modules
+# included). Re-enabled only after the copy excludes build output and a worker-unit smoke
+# PASSes.
 sandbox:
-  loopback_network: true      # Claude maker/checker commands may use 127.0.0.1 and ::1 only
-  checker_scratch_copy: true  # the Claude checker builds in a private copy of the worktree
+  loopback_network: false      # when true: Claude maker/checker commands use 127.0.0.1 and ::1 only
+  checker_scratch_copy: false  # when true: the Claude checker builds in a private copy of the worktree
 toolchain:
   # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree before
   # the maker runs; makers and the checker have no network (Claude ones: loopback only,

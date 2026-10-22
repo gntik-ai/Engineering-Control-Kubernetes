@@ -13,7 +13,9 @@ built here that holds no host socket file (review 2, finding 1): read-only syste
 credentials), the run's own directories (the provider worker names them, this ChangeSet's
 Git metadata included, in HERMES_LOOPBACK_WRITABLE / HERMES_LOOPBACK_READABLE, pinned in
 --settings; every bind source is resolved and checked), a minimal /dev, a /proc of its
-own PID namespace (no /proc/<host pid>/root) and fresh tmpfs mounts for /run, /tmp (the
+own PID namespace (no /proc/<host pid>/{environ,root,cwd,fd}: the Claude CLI's environment
+holds its credentials) with systemd's ProtectKernelTunables= /proc table re-applied (the
+worker unit cannot apply it: see PROC_READ_ONLY) and fresh tmpfs mounts for /run, /tmp (the
 run's TMPDIR when it has one), /var/tmp, /dev/shm and the home (only the shell snapshots
 Claude sources, the git configuration and the Playwright browsers come back, read-only).
 No /sys, /srv, /var or /home otherwise.
@@ -72,6 +74,20 @@ HOME_ENTRIES = ((".gitconfig", "file"), (".config/git", "dir"), (".cache/ms-play
 # Fresh, size-capped tmpfs mounts (MiB).
 SCRATCH = (("/tmp", 2048), ("/var/tmp", 1024), ("/run", 16), ("/dev/shm", 1024))
 HOME_TMPFS_MIB = 1024
+# systemd's ProtectKernelTunables= /proc table (src/core/namespace.c), re-applied inside
+# over the sandbox's own procfs. The claude worker unit sets ProtectKernelTunables=false
+# (systemd/engineering-worker@claude.service.d/70-loopback-proc.conf): its mounts over
+# /proc are locked in bubblewrap's user namespace, and the kernel then refuses any new
+# procfs (mount_too_revealing: "Can't mount proc on /newroot/proc: Operation not
+# permitted", gntik-ui #247, 2026-10-22). Bound from the worker's /proc (same kernel);
+# /proc/sys shows the sysctls of the reader's own namespaces.
+PROC_READ_ONLY = (
+    "acpi", "apm", "asound", "bus", "fs", "irq", "latency_stats", "mtrr", "scsi", "sys",
+    "sysrq-trigger", "timer_stats",
+)
+PROC_MASKED = ("kallsyms", "kcore")  # /dev/null on a nodev mount: every open fails
+# Mounts the kernel accepts below the worker's /proc (permanently empty directories).
+PROC_SUBMOUNTS_ALLOWED = ("/proc/sys/fs/binfmt_misc", "/proc/fs/nfsd")
 # Never bound from the environment or the home: kernel and runtime trees (their sockets),
 # /etc (credentials), the roots holding everyone's temp files, and the home (or an
 # ancestor of it) as a whole.
@@ -174,6 +190,14 @@ def arguments(home: str, seccomp_fd: int, command: str) -> list[str]:
                 fail(f"{entry} is not a plain file or directory")
             argv += ["--ro-bind", entry, entry]
     argv += ["--dev", "/dev", "--proc", "/proc"]
+    for name in PROC_READ_ONLY:
+        entry = os.path.join("/proc", name)
+        if os.path.lexists(entry):
+            argv += ["--ro-bind", entry, entry]
+    for name in PROC_MASKED:
+        entry = os.path.join("/proc", name)
+        if os.path.lexists(entry):
+            argv += ["--ro-bind", "/dev/null", entry]
     readable = roots("HERMES_LOOPBACK_READABLE", home)
     writable = roots("HERMES_LOOPBACK_WRITABLE", home)
     # The run's TMPDIR (NEW-226, on disk, removed with the run) is /tmp inside too: Chrome's
@@ -209,11 +233,32 @@ def arguments(home: str, seccomp_fd: int, command: str) -> list[str]:
     return argv
 
 
+def proc_overmounts(mountinfo: str = "/proc/self/mountinfo") -> list[str]:
+    """Mounts below this process's /proc: locked in bubblewrap's user namespace, they make
+    the kernel refuse the sandbox's own procfs."""
+    with open(mountinfo, encoding="utf-8") as handle:
+        points = [line.split()[4] for line in handle if len(line.split()) > 4]
+    return [
+        point
+        for point in points
+        if point.startswith("/proc/") and point not in PROC_SUBMOUNTS_ALLOWED
+    ]
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail("expected exactly one command string")
     if os.uname().machine != "x86_64":
         fail("only x86_64 is supported")
+    covered = proc_overmounts()
+    if covered:  # bubblewrap decides; this names the likely cause of its refusal
+        print(
+            f"agent-loopback-shell: mounts over /proc ({', '.join(sorted(set(covered))[:4])})"
+            " make the kernel refuse bubblewrap's own /proc; the worker unit needs"
+            " ProtectKernelTunables=false (engineering-worker@claude.service.d/"
+            "70-loopback-proc.conf)",
+            file=sys.stderr,
+        )
     home = pwd.getpwuid(os.getuid()).pw_dir
     if not home.startswith("/") or not os.path.isdir(home) or within(home, "/run"):
         fail(f"no usable home directory for uid {os.getuid()}")

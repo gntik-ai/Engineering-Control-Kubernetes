@@ -562,6 +562,11 @@ for agent in codex claude; do
     "${RELEASE_ROOT}/source/systemd/engineering-worker@${agent}.service.d/60-cgroup-delegation.conf" \
     "/etc/systemd/system/engineering-worker@${agent}.service.d/60-cgroup-delegation.conf"
 done
+# NEW-228: no mounts over the claude worker's /proc (the loopback shell mounts a procfs of
+# its own and re-protects it); codex keeps ProtectKernelTunables=true.
+install -o root -g root -m 0644 \
+  "${RELEASE_ROOT}/source/systemd/engineering-worker@claude.service.d/70-loopback-proc.conf" \
+  "/etc/systemd/system/engineering-worker@claude.service.d/70-loopback-proc.conf"
 systemd-analyze verify /etc/systemd/system/engineering-workers.slice \
   /etc/systemd/system/engineering-workers-agents.slice \
   /etc/systemd/system/engineering-worker@.service \
