@@ -28,8 +28,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # NEW-154: 0021 (MERGED and gap consolidations) follows 0020 (UI blueprints).
-    assert (head, parent) == ("0021", "0020")
+    # NEW-234: 0022 (backlog decompositions) follows 0021 (MERGED and gap consolidations),
+    # which follows 0020 (UI blueprints).
+    assert (head, parent) == ("0022", "0021")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -52,10 +53,16 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         column["name"] for column in inspect(engine).get_columns("runs")
     }
 
-    assert "ui_gap_consolidations" in inspect(engine).get_table_names()
+    assert "backlog_decompositions" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "backlog_decompositions" not in inspect(engine).get_table_names()
+    assert "decomposition_lineage" not in {
+        column["name"] for column in inspect(engine).get_columns("change_requests")
+    }
+    assert "ui_gap_consolidations" in inspect(engine).get_table_names()
+    command.downgrade(config, "0020")
     assert "ui_gap_consolidations" not in inspect(engine).get_table_names()
     assert "merged_into_id" not in {
         column["name"] for column in inspect(engine).get_columns("change_requests")

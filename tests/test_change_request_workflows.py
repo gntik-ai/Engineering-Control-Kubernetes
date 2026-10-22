@@ -361,8 +361,15 @@ def test_migration_0019_creates_exactly_the_model_table(
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns("change_requests")}
     model_columns = set(Base.metadata.tables["change_requests"].columns.keys())
-    # NEW-123: 0020 adds the fanned-out UI item context; NEW-154: 0021 the merge columns.
-    assert columns == model_columns - {"ui_context_json", "merged_into_id", "consolidation_json"}
+    # NEW-123: 0020 adds the fanned-out UI item context; NEW-154: 0021 the merge columns;
+    # NEW-234: 0022 the decomposition context and lineage.
+    assert columns == model_columns - {
+        "ui_context_json",
+        "merged_into_id",
+        "consolidation_json",
+        "decomposition_context_json",
+        "decomposition_lineage",
+    }
     command.upgrade(config, "head")
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns("change_requests")}

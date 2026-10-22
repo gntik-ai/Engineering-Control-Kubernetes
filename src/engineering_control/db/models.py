@@ -473,6 +473,13 @@ class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
     # NEW-154: the consolidation record of a merged member, a canonical request, or a
     # request whose blocked_by was re-pointed (or, once published, still names a member).
     consolidation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # NEW-234: the backlog-decomposition task a fanned-out technical request came from
+    # (rendered into the bound issue body), and its cross-plan dedupe identity
+    # project:story:task. Both NULL for every other request.
+    decomposition_context_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    decomposition_lineage: Mapped[str | None] = mapped_column(
+        String(160), nullable=True, index=True
+    )
     __table_args__ = (
         CheckConstraint("revision >= 1", name="revision_positive"),
         CheckConstraint(
@@ -532,6 +539,60 @@ class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
     )
     # When the active marker was claimed: a marker whose workflow Temporal does not know
     # yet is a start in progress for a grace period, not an ended fan-out.
+    fanout_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('DRAFTING', 'BLOCKED', 'FAILED', 'CANDIDATE', 'APPROVED', 'SUPERSEDED')",
+            name="status_known",
+        ),
+    )
+
+
+BACKLOG_DECOMPOSITION_STATUSES = (
+    "DRAFTING",
+    "BLOCKED",
+    "FAILED",
+    "CANDIDATE",
+    "APPROVED",
+    "SUPERSEDED",
+)
+
+
+class BacklogDecomposition(UUIDPrimaryKey, Timestamps, Base):
+    """NEW-234: one backlog decomposition run, its bound sources, candidate plan, approval
+    and fan-out. Modelled on UiBlueprint, without the kit and inventory columns."""
+
+    __tablename__ = "backlog_decompositions"
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(240))
+    requested_by: Mapped[str] = mapped_column(String(128))
+    requested_source_sha: Mapped[str | None] = mapped_column(String(40))
+    source_sha: Mapped[str | None] = mapped_column(String(40))
+    # The bound sources: the design document, docs/backlog.json and the issue snapshot.
+    design_sha256: Mapped[str | None] = mapped_column(String(64))
+    backlog_sha256: Mapped[str | None] = mapped_column(String(64))
+    issues_sha256: Mapped[str | None] = mapped_column(String(64))
+    # Per-part (frame, epic batches) drafts and reviews, and the provider-call budget used.
+    parts_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider_calls: Mapped[int] = mapped_column(Integer, default=0)
+    review_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    plan_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    markdown_sha256: Mapped[str | None] = mapped_column(String(64))
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    approval_binding_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    blockers_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    decided_by: Mapped[str | None] = mapped_column(String(128))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    fanout_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # At most one active fan-out: set by compare-and-set, cleared when that fan-out ends.
+    fanout_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    active_fanout_workflow_id: Mapped[str | None] = mapped_column(
+        String(240), unique=True, index=True
+    )
     fanout_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint(
