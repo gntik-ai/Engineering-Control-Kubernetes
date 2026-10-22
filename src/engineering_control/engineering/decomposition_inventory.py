@@ -117,6 +117,54 @@ def body_sha256(body: str) -> str:
     return _sha256(_normalized(body).encode("utf-8"))
 
 
+# The issue publisher resolves backlog ids to issue numbers: it rewrites "- Parent: EP-API"
+# to "- Parent: EP-API (#1)", "- Depends on: MIG-01, SEC-01" to "- Depends on: MIG-01 (#48),
+# SEC-01 (#33)" and an epic's "- API-01 — ..." row to "- [ ] #15 — API-01 — ...". A GitHub body
+# matches its backlog.json body when every line equals the backlog line or exactly that
+# rewrite of it, computed from the backlog line and the bound issue numbers. Comparing
+# line by line against the trusted text needs no Markdown parsing; anything else is drift.
+_ID = r"(?:EP-[A-Z]{2,4}|[A-Z]{2,4}-[0-9]{2})"
+_ID_TOKEN = re.compile(rf"\b{_ID}\b")
+_REF_LINE = re.compile(r"^- (?:Parent|Depends on): ")
+_CHILD_LINE = re.compile(rf"^- ({_ID}) — (.*)$")
+
+
+def _published_line(line: str, numbers: Mapping[str, int], children: frozenset[str]) -> str:
+    if _REF_LINE.match(line):
+        head, _, ids = line.partition(": ")
+        return (
+            head
+            + ": "
+            + _ID_TOKEN.sub(
+                lambda match: (
+                    f"{match.group(0)} (#{numbers[match.group(0)]})"
+                    if match.group(0) in numbers
+                    else match.group(0)
+                ),
+                ids,
+            )
+        )
+    child = _CHILD_LINE.match(line)
+    if child and child.group(1) in children and child.group(1) in numbers:
+        key = child.group(1)
+        return f"- [ ] #{numbers[key]} — {key} — {child.group(2)}"
+    return line
+
+
+def _matches_published(
+    github: str,
+    backlog: str,
+    numbers: Mapping[str, int],
+    children: frozenset[str] = frozenset(),
+) -> bool:
+    actual = _normalized(github).split("\n")
+    expected = _normalized(backlog).split("\n")
+    return len(actual) == len(expected) and all(
+        got in (want, _published_line(want, numbers, children))
+        for got, want in zip(actual, expected, strict=True)
+    )
+
+
 def _slug(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "section"
 
@@ -561,8 +609,20 @@ def _join_issues(
         bound[item["id"]] = issue
         if issue.title.strip() != item["title"].strip():
             drift.append(f"issue {issue.number} ({item['id']}) title differs from backlog.json")
-        if body_sha256(issue.body) != body_sha256(item["body"]):
-            drift.append(f"issue {issue.number} ({item['id']}) body differs from backlog.json")
+    issue_numbers = {key: issue.number for key, issue in bound.items()}
+    children = {
+        epic["id"]: frozenset(story["id"] for story in stories if story["epic"] == epic["id"])
+        for epic in epics
+    }
+    for item in items:
+        bound_issue = bound.get(item["id"])
+        own = children.get(item["id"], frozenset())
+        if bound_issue is not None and not _matches_published(
+            bound_issue.body, item["body"], issue_numbers, own
+        ):
+            drift.append(
+                f"issue {bound_issue.number} ({item['id']}) body differs from backlog.json"
+            )
     for epic in epics:
         epic_issue = bound.get(epic["id"])
         if epic_issue is not None and epic_issue.parent is not None:
