@@ -78,8 +78,9 @@ _DEPENDS = re.compile(r"^\s*[-*]?\s*Depends on:\s*(.*?)\s*$", re.IGNORECASE)
 _NO_DEPENDENCY = frozenset({"", "none", "-", "n/a"})
 _ADR_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.md$")
 _STAGED_NAME = re.compile(
-    r"^part-(?:frame|ep[0-9]{2})-[a-f0-9]{16}-(?:input|brief|draft-[123]|review-[123])\.json$"
-    r"|^reference-[a-z0-9][a-z0-9.-]{0,90}\.md$"
+    r"^part-(?:frame|ep[0-9]{2})-[a-f0-9]{16}-(?:input|brief|draft-[123]|review-[123])"
+    r"(?:_[0-9]{2}-of-[0-9]{2})?\.json$"
+    r"|^reference-[a-z0-9][a-z0-9.-]{0,90}(?:_[0-9]{2}-of-[0-9]{2})?\.md$"
 )
 
 
@@ -874,6 +875,194 @@ def input_text(document: Mapping[str, Any]) -> str:
     return text
 
 
+# --------------------------------------------------------------------------------------
+# Bounded staging: a document over 64 KiB is staged as numbered pieces, never truncated
+# --------------------------------------------------------------------------------------
+
+PIECE_KIND: Final = "hermes-staged-piece-v1"
+MAX_PIECES = 99
+PIECES_RULE = (
+    "A staged document over 64 KiB is split into numbered pieces, NAME_01-of-NN.json (or "
+    ".md), every one of which you must Read. A JSON piece is {kind: hermes-staged-piece-v1, "
+    "document, piece, pieces, entries}; the document is every entry of every piece applied "
+    "in order: path is the key and list-index path from the document root; value sets "
+    "that field; items_from i means value holds the list's items from index i on; "
+    "fragment k means value is the k-th consecutive fragment of that one string. A "
+    "Markdown piece is the next consecutive part of the text."
+)
+
+
+def _dump(value: Any) -> str:
+    return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def _size(value: Any) -> int:
+    return len(_dump(value).encode("utf-8"))
+
+
+def piece_name(name: str, piece: int, pieces: int) -> str:
+    stem, extension = name.rsplit(".", 1)
+    # "_" never occurs in a staged base name (part ids and reference slugs), so a piece
+    # name can never equal another document's name.
+    return f"{stem}_{piece:02d}-of-{pieces:02d}.{extension}"
+
+
+class _Pieces:
+    """Splits one document into entries and packs them into pieces, every piece measured
+    as the exact text staged (the envelope and its indentation included)."""
+
+    def __init__(self, name: str, limit: int) -> None:
+        self.name = name
+        self.limit = limit
+
+    def envelope(self, entries: list[dict[str, Any]], number: int, count: int) -> dict[str, Any]:
+        return {
+            "kind": PIECE_KIND,
+            "document": self.name,
+            "piece": number,
+            "pieces": count,
+            "entries": entries,
+        }
+
+    def fits(self, entries: list[dict[str, Any]]) -> bool:
+        return _size(self.envelope(entries, MAX_PIECES, MAX_PIECES)) <= self.limit
+
+    def fragments(self, path: list[Any], text: str) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        start = 0
+        while start < len(text):
+            low, high = start, len(text)
+            while low < high:  # the longest fitting prefix
+                middle = (low + high + 1) // 2
+                entry = {"path": path, "fragment": len(entries) + 1, "value": text[start:middle]}
+                if self.fits([entry]):
+                    low = middle
+                else:
+                    high = middle - 1
+            if low == start:
+                raise DecompositionSourceError(
+                    INPUT_TOO_LARGE, [f"{self.name}: a value at {path} cannot be split"]
+                )
+            entries.append({"path": path, "fragment": len(entries) + 1, "value": text[start:low]})
+            start = low
+        return entries or [{"path": path, "value": ""}]
+
+    def entries(self, path: list[Any], value: Any) -> list[dict[str, Any]]:
+        """Depth-first, deterministic entries of `value`, each fitting one piece."""
+        if self.fits([{"path": path, "value": value}]):
+            return [{"path": path, "value": value}]
+        if isinstance(value, dict):
+            found: list[dict[str, Any]] = [{"path": path, "value": {}}]
+            for key in sorted(value):
+                found += self.entries([*path, key], value[key])
+            return found
+        if isinstance(value, list):
+            found = [{"path": path, "value": []}]
+            index = 0
+            while index < len(value):
+                end = index
+                while end < len(value) and self.fits(
+                    [{"path": path, "items_from": index, "value": value[index : end + 1]}]
+                ):
+                    end += 1
+                if end > index:
+                    found.append({"path": path, "items_from": index, "value": value[index:end]})
+                    index = end
+                else:  # one item alone is too large: its own entries, at its index
+                    found += self.entries([*path, index], value[index])
+                    index += 1
+            return found
+        if isinstance(value, str):
+            return self.fragments(path, value)
+        raise DecompositionSourceError(
+            INPUT_TOO_LARGE, [f"{self.name}: a value at {path} cannot be split"]
+        )
+
+    def files(self, document: Mapping[str, Any]) -> dict[str, str]:
+        groups: list[list[dict[str, Any]]] = [[]]
+        for entry in self.entries([], dict(document)):
+            if groups[-1] and not self.fits([*groups[-1], entry]):
+                groups.append([])
+            groups[-1].append(entry)
+        if len(groups) > MAX_PIECES:
+            raise DecompositionSourceError(
+                INPUT_TOO_LARGE, [f"{self.name} needs {len(groups)} pieces, over {MAX_PIECES}"]
+            )
+        return {
+            piece_name(self.name, number, len(groups)): _dump(
+                self.envelope(entries, number, len(groups))
+            )
+            for number, entries in enumerate(groups, start=1)
+        }
+
+
+def bounded_json_files(
+    name: str, document: Mapping[str, Any], limit: int | None = None
+) -> dict[str, str]:
+    """The staged files of one JSON document: the document itself when it fits within
+    `limit` bytes, else its numbered pieces (each within `limit`; see PIECES_RULE).
+    Deterministic and lossless (reassemble_pieces); never truncated."""
+    limit = MAX_INPUT_BYTES if limit is None else limit
+    text = _dump(document)
+    if len(text.encode("utf-8")) <= limit:
+        return {name: text}
+    return _Pieces(name, limit).files(document)
+
+
+def reassemble_pieces(pieces: Sequence[Mapping[str, Any]]) -> Any:
+    """The document that bounded_json_files split into `pieces` (in piece order)."""
+    root: dict[str, Any] = {}
+    for piece in pieces:
+        if piece.get("kind") != PIECE_KIND:
+            raise ValueError("not a staged piece")
+        for entry in piece["entries"]:
+            parent: Any = root
+            key: Any = "document"
+            for step in entry["path"]:
+                container = parent[key]
+                if isinstance(container, list) and step == len(container):
+                    container.append(None)
+                parent, key = container, step
+            value = json.loads(json.dumps(entry["value"]))
+            if "items_from" in entry:
+                parent[key].extend(value)
+            elif "fragment" in entry:
+                current = parent[key] if isinstance(parent, list) else parent.get(key)
+                parent[key] = (current if entry["fragment"] > 1 else "") + value
+            else:
+                parent[key] = value
+    return root.get("document")
+
+
+def bounded_text_files(name: str, text: str, limit: int | None = None) -> dict[str, str]:
+    """A Markdown reference within `limit` bytes per file: whole, else consecutive pieces
+    split at line ends (a longer line at character boundaries)."""
+    limit = MAX_INPUT_BYTES if limit is None else limit
+    if len(text.encode("utf-8")) <= limit:
+        return {name: text}
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line.encode("utf-8")) > limit:
+            cut = limit
+            while len(line[:cut].encode("utf-8")) > limit:
+                cut -= 1
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:cut])
+            line = line[cut:]
+        if len((current + line).encode("utf-8")) > limit:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    if len(chunks) > MAX_PIECES:
+        raise DecompositionSourceError(INPUT_TOO_LARGE, [f"{name} needs over {MAX_PIECES} pieces"])
+    return {piece_name(name, n, len(chunks)): chunk for n, chunk in enumerate(chunks, start=1)}
+
+
 def part_input_name(part: str) -> str:
     if PART_ID.fullmatch(part) is None:
         raise ValueError("decomposition part id is invalid")
@@ -902,7 +1091,25 @@ def reference_files(inventory: Mapping[str, Any]) -> dict[str, str]:
     collisions = _reference_collisions([item["path"] for item in inventory["references"]])
     if collisions:
         raise DecompositionSourceError(SOURCE_INVALID, collisions)
-    return {reference_name(item["path"]): item["text"] + "\n" for item in inventory["references"]}
+    files: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    clashes: list[str] = []
+    for item in inventory["references"]:
+        # The complete expanded names first: no staged file may ever replace another.
+        for name, text in bounded_text_files(
+            reference_name(item["path"]), item["text"] + "\n"
+        ).items():
+            if name in sources:
+                clashes.append(
+                    f"reference documents {sources[name]} and {item['path']} would both be "
+                    f"staged as {name}"
+                )
+                continue
+            sources[name] = str(item["path"])
+            files[name] = text
+    if clashes:
+        raise DecompositionSourceError(SOURCE_INVALID, clashes)
+    return files
 
 
 def stage_files(base: Path, directory: Path, files: Mapping[str, str]) -> dict[str, Any]:
