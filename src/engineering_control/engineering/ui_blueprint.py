@@ -157,6 +157,7 @@ def agent_pack_problems(
     *,
     registry: Mapping[str, tuple[str, str]] | None = None,
     part_schemas: Mapping[str, Mapping[str, str]] | None = None,
+    min_version: tuple[int, ...] | None = None,
 ) -> list[str]:
     """What the released agent pack lacks for flow A (empty when it is usable).
 
@@ -166,7 +167,10 @@ def agent_pack_problems(
 
     NEW-234: `registry` (skill id -> (role, output schema)) and `part_schemas` (skill id ->
     part name -> schema) default to the UI skills; without `skills` every skill of an
-    explicit registry is checked (the UI default checks UI_PLAN_SKILLS only)."""
+    explicit registry is checked (the UI default checks UI_PLAN_SKILLS only). NEW-234 PR4:
+    `min_version` (the oldest usable profile) defaults to AGENT_PACK_MIN_VERSION."""
+    if min_version is None:
+        min_version = AGENT_PACK_MIN_VERSION
     if registry is None:
         registry = {**UI_PLAN_SKILLS, **UI_PAGE_SKILLS}
         default_skills = tuple(UI_PLAN_SKILLS)
@@ -183,8 +187,8 @@ def agent_pack_problems(
     version = _version(parsed.get("version")) if isinstance(parsed, dict) else None
     if version is None:
         problems.append("profiles/engineering.yaml has no readable version")
-    elif version < AGENT_PACK_MIN_VERSION:
-        wanted = ".".join(str(part) for part in AGENT_PACK_MIN_VERSION)
+    elif version < min_version:
+        wanted = ".".join(str(part) for part in min_version)
         found = ".".join(str(part) for part in version)
         problems.append(f"profile version {found} is older than {wanted}")
     catalog_bytes = _pack_bytes(root, "skills/catalog.yaml")

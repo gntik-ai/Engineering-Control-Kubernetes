@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 import yaml
+from new_234_decomposition_fixtures import build_decomposition_pack
 
 from engineering_control.agents.instructions import AgentInstructionPack
+from engineering_control.engineering.decomposition import part_schema, plan_schema, review_schema
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
 
@@ -141,3 +143,116 @@ def test_reverse_canary_steps_have_canonical_instruction_skills() -> None:
     assert AgentInstructionPack._step_skills["observability.invoke_codex_checker"] == (
         "review-change"
     )
+
+
+# NEW-234 PR4: the backlog decomposition steps, skills and read-only roles ------------------
+
+
+def test_decomposition_steps_map_to_their_skills_and_pin_the_schema() -> None:
+    skills = AgentInstructionPack._step_skills
+    assert skills["decomposition.draft"] == "decompose-backlog"
+    assert skills["decomposition.review"] == "review-decomposition"
+    assert {"decomposition.draft", "decomposition.review"} <= (
+        AgentInstructionPack._pinned_schema_steps
+    )
+    assert {"backlog-decomposer", "decomposition-reviewer"} <= (
+        AgentInstructionPack._read_only_roles
+    )
+    # The decomposition roles never get the UI kit's unused MCP grants accepted.
+    assert not {"backlog-decomposer", "decomposition-reviewer"} & (
+        AgentInstructionPack._kit_mcp_roles
+    )
+
+
+def _decomposition_pack(root: Path, *, tools: tuple[str, ...] = ("Read", "Glob", "Grep")) -> Path:
+    source = build_decomposition_pack(root / "releases" / ("c" * 40) / "source")
+    for role in ("backlog-decomposer", "decomposition-reviewer"):
+        (source / f"roles/{role}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "id": role,
+                    "purpose": "Plan.",
+                    "tools": list(tools),
+                    "deployment_permissions": False,
+                    "merge_permissions": False,
+                    "release_credentials": False,
+                    "recursion_depth": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+    (source / "domain-packs/falcone-serverless/domains.yaml").write_text(
+        yaml.safe_dump({"project": "falcone-serverless", "domains": ["runtime"]}),
+        encoding="utf-8",
+    )
+    return source
+
+
+def _decomposition_request(
+    root: Path, role: str, provider: Provider, schema: dict[str, object]
+) -> AgentRequest:
+    return AgentRequest(
+        project=Project.FALCONE_SERVERLESS,
+        role=role,
+        provider=provider,
+        model_class=ModelClass.WORKER,
+        prompt="Draft the part.",
+        working_directory=str(root / "worktree"),
+        output_schema=schema,
+    )
+
+
+def test_decomposition_parts_and_reviews_send_the_released_schemas(tmp_path: Path) -> None:
+    pack = AgentInstructionPack(_decomposition_pack(tmp_path))
+    for kind in ("frame", "epic"):
+        enriched, bundle = pack.enrich(
+            _decomposition_request(
+                tmp_path, "backlog-decomposer", Provider.CLAUDE, part_schema(kind)
+            ),
+            "decomposition.draft",
+        )
+        assert set(bundle.allowed_tools) == {"Read", "Glob", "Grep"}
+        assert any(
+            name.endswith(f"backlog-decomposition-{kind}.schema.json") for name in bundle.sources
+        )
+        assert "Skill: `decompose-backlog`" in enriched.prompt
+    _, review = pack.enrich(
+        _decomposition_request(tmp_path, "decomposition-reviewer", Provider.CODEX, review_schema()),
+        "decomposition.review",
+    )
+    assert "skills/review-decomposition/references/output.schema.json" in review.sources
+    with pytest.raises(ValueError, match="decomposition request drifted"):
+        pack.enrich(
+            _decomposition_request(
+                tmp_path, "backlog-decomposer", Provider.CLAUDE, {"type": "object"}
+            ),
+            "decomposition.draft",
+        )
+    with pytest.raises(ValueError, match="decomposition request drifted"):
+        # A review never sends the drafter's schemas.
+        pack.enrich(
+            _decomposition_request(
+                tmp_path, "decomposition-reviewer", Provider.CODEX, plan_schema()
+            ),
+            "decomposition.review",
+        )
+
+
+def test_decomposition_roles_are_read_only(tmp_path: Path) -> None:
+    writable = AgentInstructionPack(
+        _decomposition_pack(tmp_path, tools=("Read", "Glob", "Grep", "Write"))
+    )
+    with pytest.raises(ValueError, match="read-only"):
+        writable.enrich(
+            _decomposition_request(
+                tmp_path, "backlog-decomposer", Provider.CLAUDE, part_schema("frame")
+            ),
+            "decomposition.draft",
+        )
+    pack = AgentInstructionPack(_decomposition_pack(tmp_path / "ok"))
+    request = _decomposition_request(
+        tmp_path, "backlog-decomposer", Provider.CLAUDE, part_schema("frame")
+    ).model_copy(update={"writable": True})
+    with pytest.raises(ValueError, match="read-only"):
+        pack.enrich(request, "decomposition.draft")
