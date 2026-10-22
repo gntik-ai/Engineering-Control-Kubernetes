@@ -37,3 +37,5 @@ class WorkflowName(StrEnum):
     UI_GAP_CONSOLIDATION_PLAN = "UiGapConsolidationPlanWorkflow"
     # NEW-234 PR5: the backlog decomposition plan, through CANDIDATE and approval.
     BACKLOG_DECOMPOSITION_PLAN = "BacklogDecompositionPlanWorkflow"
+    # NEW-234 PR6: the approved decomposition's change-request fan-out.
+    BACKLOG_DECOMPOSITION_FANOUT = "BacklogDecompositionFanOutWorkflow"

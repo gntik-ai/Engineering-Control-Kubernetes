@@ -462,6 +462,35 @@ def parser() -> argparse.ArgumentParser:
     decomposition_approve.add_argument("decomposition_id")
     decomposition_approve.add_argument("approval_binding")
     decomposition_approve.add_argument("typed_confirmation")
+    # NEW-234 PR6: approval starts (a replay resumes) the change-request fan-out.
+    decomposition_approve.add_argument(
+        "--max-items", type=_bounded_integer(1, 400), metavar="1-400"
+    )
+    decomposition_approve.add_argument(
+        "--replace",
+        action="store_true",
+        help="fan out a task although an unpublished request of its lineage exists",
+    )
+    decomposition_retry = commands.add_parser("backlog-decomposition-fanout-retry")
+    decomposition_retry.add_argument("decomposition_id")
+    decomposition_retry.add_argument("approval_binding")
+    decomposition_retry.add_argument("typed_confirmation")
+    decomposition_retry.add_argument("--max-items", type=_bounded_integer(1, 400), metavar="1-400")
+    decomposition_retry.add_argument("--replace", action="store_true")
+    commands.add_parser("backlog-decomposition-ready").add_argument("decomposition_id")
+    decomposition_ready = commands.add_parser("backlog-decomposition-approve-ready")
+    decomposition_ready.add_argument("decomposition_id")
+    decomposition_ready.add_argument("ready_binding")
+    amendments = commands.add_parser("backlog-decomposition-story-amendments")
+    amendments.add_argument("decomposition_id")
+    amendments.add_argument(
+        "--output-dir", type=Path, help="existing directory for the amended body files"
+    )
+    amendments.add_argument(
+        "--verify-current",
+        action="store_true",
+        help="read each story issue first (read-only, your gh) and refuse a drifted one",
+    )
     ui_inventory = commands.add_parser("ui-inventory")
     ui_inventory.add_argument("--checkout", type=Path, required=True)
     ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
@@ -984,14 +1013,38 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         return client.request(
             "GET", f"/v1/backlog-decompositions/{arguments.decomposition_id}/markdown"
         )
-    if command == "backlog-decomposition-approve":
+    if command in {"backlog-decomposition-approve", "backlog-decomposition-fanout-retry"}:
+        decision: dict[str, Any] = {
+            "approval_binding": arguments.approval_binding,
+            "typed_confirmation": arguments.typed_confirmation,
+            "replace": bool(arguments.replace),
+        }
+        if arguments.max_items is not None:
+            decision["max_items"] = arguments.max_items
+        route = "approve" if command == "backlog-decomposition-approve" else "fanout-retry"
+        return client.request(
+            "POST", f"/v1/backlog-decompositions/{arguments.decomposition_id}/{route}", decision
+        )
+    if command == "backlog-decomposition-ready":
+        return client.request(
+            "GET", f"/v1/backlog-decompositions/{arguments.decomposition_id}/ready"
+        )
+    if command == "backlog-decomposition-approve-ready":
         return client.request(
             "POST",
-            f"/v1/backlog-decompositions/{arguments.decomposition_id}/approve",
-            {
-                "approval_binding": arguments.approval_binding,
-                "typed_confirmation": arguments.typed_confirmation,
-            },
+            f"/v1/backlog-decompositions/{arguments.decomposition_id}/approve-ready",
+            {"ready_binding": arguments.ready_binding},
+        )
+    if command == "backlog-decomposition-story-amendments":
+        from engineering_control.engineering.decomposition_amendments import (
+            story_amendment_edits,
+        )
+
+        return story_amendment_edits(
+            client,
+            arguments.decomposition_id,
+            output_dir=arguments.output_dir,
+            verify_current=arguments.verify_current,
         )
     if command == "ui-plan":
         plan: dict[str, Any] = {"project": arguments.project}
@@ -1122,6 +1175,13 @@ def main() -> None:
     except (OSError, ValueError, httpx.HTTPError) as error:
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
+    if arguments.command == "backlog-decomposition-story-amendments" and isinstance(result, dict):
+        from engineering_control.engineering.decomposition_amendments import (
+            render_story_amendment_edits,
+        )
+
+        print(render_story_amendment_edits(result))
+        return
     if arguments.command in {"ui-blueprint-show", "backlog-decomposition-show"} and isinstance(
         result, dict
     ):

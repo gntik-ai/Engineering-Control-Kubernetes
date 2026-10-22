@@ -911,6 +911,18 @@ Index(
     OperationRequest.target_id,
     OperationRequest.status,
 )
+# NEW-234 PR6 review (migration 0023): at most one active change request per backlog
+# decomposition lineage, so two decompositions can never both file the same task.
+ACTIVE_DECOMPOSITION_STATUSES = ("DRAFTING", "CANDIDATE", "APPROVED", "PUBLISHED")
+Index(
+    "uq_change_requests_active_decomposition_lineage",
+    ChangeRequest.decomposition_lineage,
+    unique=True,
+    postgresql_where=ChangeRequest.decomposition_lineage.is_not(None)
+    & ChangeRequest.status.in_(ACTIVE_DECOMPOSITION_STATUSES),
+    sqlite_where=ChangeRequest.decomposition_lineage.is_not(None)
+    & ChangeRequest.status.in_(ACTIVE_DECOMPOSITION_STATUSES),
+)
 Index(
     "uq_operation_requests_active_target",
     OperationRequest.action,

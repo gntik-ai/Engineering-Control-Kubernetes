@@ -39,6 +39,9 @@ from engineering_control.api.schemas import (
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.decomposition import decomposition_workflow_id
+from engineering_control.engineering.decomposition_fanout import (
+    FANOUT_WORKFLOW_PREFIX as DECOMPOSITION_FANOUT_PREFIX,
+)
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.engineering.ui_blueprint import (
     ui_plan_workflow_id,
@@ -54,6 +57,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
+    BacklogDecompositionFanOutInput,
     BacklogDecompositionPlanInput,
     ChangeRequestInput,
     DeliveryReconciliationInput,
@@ -157,6 +161,9 @@ class ControlService(Protocol):
     async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]: ...
     async def start_backlog_decomposition(
         self, decomposition_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted: ...
+    async def start_decomposition_fanout(
+        self, decomposition_id: UUID, max_items: int, replace: bool, workflow_id: str
     ) -> OperationAccepted: ...
 
 
@@ -988,6 +995,21 @@ class TemporalControlService:
                 source_sha=source_sha,
             ),
             decomposition_workflow_id(project, str(decomposition_id)),
+        )
+
+    async def start_decomposition_fanout(
+        self, decomposition_id: UUID, max_items: int, replace: bool, workflow_id: str
+    ) -> OperationAccepted:
+        """NEW-234 PR6: start the fan-out execution the caller claimed (the decomposition's
+        single active-fan-out marker); every task is idempotent under its deterministic id."""
+        if not workflow_id.startswith(f"{DECOMPOSITION_FANOUT_PREFIX}{decomposition_id}-"):
+            raise ValueError("decomposition fan-out workflow id does not belong to the plan")
+        return await self._start_once(
+            WorkflowName.BACKLOG_DECOMPOSITION_FANOUT.value,
+            BacklogDecompositionFanOutInput(
+                decomposition_id=str(decomposition_id), max_items=max_items, replace=replace
+            ),
+            workflow_id,
         )
 
     async def start_ui_fanout(

@@ -818,6 +818,8 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "engineering.change_requests:AffectedRepository.repository": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:CHANGE_REQUEST_REPOSITORY_ALTERNATION": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:ChangeRequestIntake.project": ["enum:PROJECTS"],
+    # NEW-234 PR6: a published predecessor's issue (gntik-ai/<repo>#N).
+    "engineering.change_requests:DecompositionChangeContext.depends_on": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:ChangeRequestIntake.target_repository": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:CROSS_REPOSITORY_TARGETS": [
         "keys:(falcone-serverless)",
@@ -992,6 +994,9 @@ PATTERN_SITES: dict[str, list[tuple[tuple[str, ...], str]] | str] = {
     "engineering.change_requests:AffectedRepository.repository": [(_CHANGE_SLUGS, "gntik-ai/{}")],
     "engineering.change_requests:ChangeRequestIntake.target_repository": [
         (_CHANGE_SLUGS, "gntik-ai/{}")
+    ],
+    "engineering.change_requests:DecompositionChangeContext.depends_on": [
+        (_CHANGE_SLUGS, "gntik-ai/{}#12")
     ],
     "engineering.github:FindingPublication.affected_repositories": [
         (REPOSITORY_SLUGS, "gntik-ai/{}")

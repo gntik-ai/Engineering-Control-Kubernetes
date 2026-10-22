@@ -385,6 +385,18 @@ def api(tmp_path: Path) -> tuple[TestClient, Mock, PlanHarness]:
             workflow_id=f"backlog-decomposition-{project}-{identity}", run_id="run"
         )
     )
+    # NEW-234 PR6: an approval starts (a replay joins) the fan-out.
+    fake.start_decomposition_fanout = AsyncMock(
+        side_effect=lambda identity, max_items, replace, workflow_id: OperationAccepted(
+            workflow_id=workflow_id, run_id="fanout-run"
+        )
+    )
+    fake.ui_fanout_state = AsyncMock(
+        side_effect=lambda workflow_id: (
+            "RUNNING",
+            OperationAccepted(workflow_id=workflow_id, run_id="fanout-run"),
+        )
+    )
     app = create_app(
         settings=harness.settings,
         service=fake,
@@ -480,14 +492,21 @@ def test_the_api_approves_only_the_bound_candidate_and_records_the_decision(api:
             False,
             "cli:engineering-ctl",
         )
-        # The decision only: no fan-out was started (PR 6).
-        assert "fanout" not in body
+        # NEW-234 PR6: the approval starts the fan-out (default cap 250), a replay joins it.
+        assert body["fanout"] == {
+            "workflow_id": f"backlog-decomposition-fanout-{created['id']}-1",
+            "run_id": "fanout-run",
+            "max_items": 250,
+            "replace": False,
+            "joined": False,
+        }
         again = client.post(
             f"{route}/approve",
             json={"approval_binding": binding, "typed_confirmation": APPROVAL_PHRASE},
             headers=CLI,
         )
         assert again.json()["replayed"] is True
+        assert again.json()["fanout"]["joined"] is True
 
 
 def test_the_api_refuses_approval_after_the_agent_pack_changed(api: Any) -> None:
@@ -605,7 +624,8 @@ def test_cli_decomposition_commands_use_only_the_decomposition_routes() -> None:
         ("backlog-decomposition-approve", identifier, "b" * 64, APPROVAL_PHRASE): (
             "POST",
             f"{route}/{identifier}/approve",
-            {"approval_binding": "b" * 64, "typed_confirmation": APPROVAL_PHRASE},
+            # NEW-234 PR6: the fan-out's --replace (default off) travels with the approval.
+            {"approval_binding": "b" * 64, "typed_confirmation": APPROVAL_PHRASE, "replace": False},
         ),
     }
     for argv, (method, path, payload) in cases.items():

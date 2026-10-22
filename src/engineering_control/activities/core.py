@@ -19,6 +19,7 @@ from .backlog_decomposition import DecompositionActivityHandler
 from .browser import BrowserActivityHandler
 from .change_requests import ChangeRequestActivityHandler, ChangeRequestGitHubHandler
 from .connections import ConnectionsActivityHandler
+from .decomposition_fanout import DecompositionFanoutActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
 from .github import GitHubActivityHandler
@@ -266,6 +267,11 @@ class ControlActivities:
         "decomposition.persist",
         "decomposition.record_terminal",
         "decomposition.finalize_run",
+        # NEW-234 PR6: the approved decomposition's change-request fan-out.
+        "decomposition_fanout.plan",
+        "decomposition_fanout.prepare_item",
+        "decomposition_fanout.prepare_review",
+        "decomposition_fanout.finalize",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -639,6 +645,11 @@ class ControlActivities:
         self.decomposition_handler = (
             DecompositionActivityHandler(settings) if self.worker_kind == "controller" else None
         )
+        self.decomposition_fanout_handler = (
+            DecompositionFanoutActivityHandler(settings)
+            if self.worker_kind == "controller"
+            else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -699,6 +710,11 @@ class ControlActivities:
             and step in self.decomposition_handler.supported_steps
         ):
             return await self.decomposition_handler.handle(step, safe_payload)
+        if (
+            self.decomposition_fanout_handler is not None
+            and step in self.decomposition_fanout_handler.supported_steps
+        ):
+            return await self.decomposition_fanout_handler.handle(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:

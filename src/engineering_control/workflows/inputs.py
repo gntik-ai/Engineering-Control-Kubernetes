@@ -285,6 +285,22 @@ class BacklogDecompositionPlanInput:
 
 
 @dataclass
+class BacklogDecompositionFanOutInput:
+    """NEW-234 PR6: one resumable fan-out run of an approved backlog decomposition
+    (continue-as-new state). ``worktrees`` maps each target repository already
+    snapshotted in this run to its read-only worktree."""
+
+    decomposition_id: str
+    max_items: int = 250
+    replace: bool = False
+    processed: int = 0
+    drafted: int = 0
+    failed: int = 0
+    skipped: int = 0
+    worktrees: dict[str, str] | None = None
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

@@ -37,7 +37,9 @@ from engineering_control.api.schemas import (
     CorrectionExtensionRequest,
     DecompositionAccepted,
     DecompositionApproval,
+    DecompositionApproveReady,
     DecompositionCreate,
+    DecompositionFanoutRetry,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
@@ -74,6 +76,7 @@ from engineering_control.api.service import ControlService, TemporalControlServi
 from engineering_control.config import Settings, get_settings
 from engineering_control.db.backlog_decompositions import (
     BacklogDecompositionRepository,
+    DecompositionFanoutActiveError,
     DecompositionNotFoundError,
 )
 from engineering_control.db.change_requests import (
@@ -1961,23 +1964,30 @@ def create_app(
             "usage": (view or {}).get("usage") or {},
         }
 
-    @app.post("/v1/backlog-decompositions/{decomposition_id}/approve")
-    async def decomposition_approve(
-        decomposition_id: UUID,
-        body: DecompositionApproval,
-        subject: str = auth_dependency,
-        repository: BacklogDecompositionRepository = decompositions_dependency,
-    ) -> dict[str, Any]:
-        actor = approval_actor(subject)
-        # The released agent pack now: a plan drafted under another pack is refused.
+    async def decomposition_pack() -> tuple[str, list[str]]:
+        """The released agent pack now: a plan drafted under another pack is refused."""
         current_pack = await asyncio.to_thread(
             decomposition_pack_revision, resolved.agent_pack_root
         )
         pack_problems = await asyncio.to_thread(
             decomposition_pack_problems, resolved.agent_pack_root
         )
+        return current_pack, pack_problems
+
+    @app.post("/v1/backlog-decompositions/{decomposition_id}/approve")
+    async def decomposition_approve(
+        decomposition_id: UUID,
+        body: DecompositionApproval,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        """Approve the plan (PR5) and start or join its fan-out (NEW-234 PR6). A replay
+        re-runs the plan and pack checks and resumes the fan-out."""
+        actor = approval_actor(subject)
+        current_pack, pack_problems = await decomposition_pack()
         try:
-            return await repository.approve(
+            approved = await repository.approve(
                 decomposition_id,
                 body.approval_binding,
                 body.typed_confirmation,
@@ -1989,6 +1999,181 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        limit = resolved.backlog_decomposition_fanout_max_items
+        max_items = min(body.max_items or limit, limit)
+        try:
+            accepted, joined = await decomposition_fanout_start_or_join(
+                decomposition_id, max_items, body.replace, service, repository
+            )
+        except Exception as error:  # noqa: BLE001 - the approval stands; a replay resumes
+            raise HTTPException(
+                status_code=503,
+                detail="backlog decomposition approved, but its fan-out could not be started; "
+                "repeat the approval to resume",
+            ) from error
+        # Hermes drafts the change requests only; the operator approves and publishes them.
+        return {
+            **approved,
+            "fanout": {
+                "workflow_id": accepted.workflow_id,
+                "run_id": accepted.run_id,
+                "max_items": max_items,
+                "replace": body.replace,
+                "joined": joined,
+            },
+        }
+
+    @app.post("/v1/backlog-decompositions/{decomposition_id}/fanout-retry")
+    async def decomposition_fanout_retry(
+        decomposition_id: UUID,
+        body: DecompositionFanoutRetry,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        """NEW-146 for flow D: reset the FAILED fan-out tasks, then start (or join) a
+        fan-out. Refused while a fan-out runs; a marker whose workflow ended is released
+        first, exactly as an approval replay would."""
+        actor = approval_actor(subject)
+        limit = resolved.backlog_decomposition_fanout_max_items
+        max_items = min(body.max_items or limit, limit)
+        current_pack, pack_problems = await decomposition_pack()
+        try:
+            await repository.check_retry(
+                decomposition_id,
+                body.approval_binding,
+                body.typed_confirmation,
+                actor,
+                current_pack,
+                pack_problems,
+            )
+            marker = await repository.active_fanout(decomposition_id)
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if marker is not None:
+            active = marker["workflow_id"]
+            claimed_at = marker["claimed_at"]
+            state, _running = await service.ui_fanout_state(active)
+            if state == "RUNNING" or (
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"a decomposition fan-out is running ({active}); retry after it "
+                    "has finished",
+                )
+            await repository.release_fanout(decomposition_id, active)
+        try:
+            retried = await repository.retry_fanout(
+                decomposition_id,
+                body.approval_binding,
+                body.typed_confirmation,
+                actor,
+                limit=max_items,
+            )
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (DecompositionFanoutActiveError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            accepted, joined = await decomposition_fanout_start_or_join(
+                decomposition_id, max_items, body.replace, service, repository
+            )
+        except Exception as error:  # noqa: BLE001 - the reset stands; a repeat resumes
+            raise HTTPException(
+                status_code=503,
+                detail="failed decomposition tasks were reset, but the fan-out could not be "
+                "started; repeat the retry (or the approval) to resume",
+            ) from error
+        return {
+            **retried,
+            "fanout": {
+                "workflow_id": accepted.workflow_id,
+                "run_id": accepted.run_id,
+                "max_items": max_items,
+                "replace": body.replace,
+                "joined": joined,
+            },
+        }
+
+    @app.get("/v1/backlog-decompositions/{decomposition_id}/ready")
+    async def decomposition_ready(
+        decomposition_id: UUID,
+        _subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        """The requests whose predecessors are all published, and the ready binding."""
+        try:
+            return await repository.ready(decomposition_id)
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/backlog-decompositions/{decomposition_id}/approve-ready")
+    async def decomposition_approve_ready(
+        decomposition_id: UUID,
+        body: DecompositionApproveReady,
+        subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        """One typed confirmation (the ready binding) approves every ready request."""
+        actor = approval_actor(subject)
+        try:
+            return await repository.approve_ready(decomposition_id, body.ready_binding, actor)
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/v1/backlog-decompositions/{decomposition_id}/story-amendments")
+    async def decomposition_story_amendments(
+        decomposition_id: UUID,
+        _subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        """The approved plan's story amendments as operator-published edits (Hermes never
+        edits an issue): each amended body, its diff and the bound body hash."""
+        try:
+            return await repository.story_amendments(decomposition_id)
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def decomposition_fanout_start_or_join(
+        decomposition_id: UUID,
+        max_items: int,
+        replace: bool,
+        service: ControlService,
+        repository: BacklogDecompositionRepository,
+    ) -> tuple[OperationAccepted, bool]:
+        """One fan-out per decomposition: join the active one, or win the claim and start
+        (the UI fan-out's rules: a start in progress is joined during a grace period, an
+        ended or crashed one is released once and the claim retried)."""
+        for _ in range(2):
+            claim = await repository.claim_fanout(decomposition_id)
+            if claim["action"] == "START":
+                started = await service.start_decomposition_fanout(
+                    decomposition_id, max_items, replace, str(claim["workflow_id"])
+                )
+                return started, False
+            state, running = await service.ui_fanout_state(str(claim["workflow_id"]))
+            if state == "RUNNING" and running is not None:
+                return running, True
+            claimed_at = claim.get("claimed_at")
+            if (
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+            ):
+                return OperationAccepted(workflow_id=str(claim["workflow_id"]), run_id=""), True
+            await repository.release_fanout(decomposition_id, str(claim["workflow_id"]))
+        raise RuntimeError("decomposition fan-out claim did not settle")
 
     @app.get("/v1/change-requests", response_model=RecordList)
     async def change_request_list(
