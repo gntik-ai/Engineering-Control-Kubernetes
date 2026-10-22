@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.resources import files
@@ -150,12 +151,29 @@ def agent_pack_parts_only(root: Path) -> bool:
     return version is not None and version >= AGENT_PACK_PARTS_VERSION
 
 
-def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> list[str]:
+def agent_pack_problems(
+    root: Path,
+    skills: tuple[str, ...] | None = None,
+    *,
+    registry: Mapping[str, tuple[str, str]] | None = None,
+    part_schemas: Mapping[str, Mapping[str, str]] | None = None,
+) -> list[str]:
     """What the released agent pack lacks for flow A (empty when it is usable).
 
     The workers load roles, skills and schemas from the released pack (not the local
     repository), so a pack older than profile 1.4.0 or without the UI skills BLOCKs the
-    flow before any model step instead of failing inside one."""
+    flow before any model step instead of failing inside one.
+
+    NEW-234: `registry` (skill id -> (role, output schema)) and `part_schemas` (skill id ->
+    part name -> schema) default to the UI skills; without `skills` every skill of an
+    explicit registry is checked (the UI default checks UI_PLAN_SKILLS only)."""
+    if registry is None:
+        registry = {**UI_PLAN_SKILLS, **UI_PAGE_SKILLS}
+        default_skills = tuple(UI_PLAN_SKILLS)
+    else:
+        default_skills = tuple(registry)
+    if part_schemas is None:
+        part_schemas = UI_PLAN_PART_SCHEMAS
     problems: list[str] = []
     profile = _pack_bytes(root, "profiles/engineering.yaml")
     try:
@@ -180,8 +198,8 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
         for record in (records if isinstance(records, list) else [])
         if isinstance(record, dict)
     }
-    for skill in skills or tuple(UI_PLAN_SKILLS):
-        role, schema_name = {**UI_PLAN_SKILLS, **UI_PAGE_SKILLS}[skill]
+    for skill in skills or default_skills:
+        role, schema_name = registry[skill]
         for relative in (
             f"skills/{skill}/SKILL.md",
             f"skills/{skill}/references/contract.md",
@@ -203,7 +221,7 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
             same = False
         if not same:
             problems.append(f"skills/{skill} output schema differs from Hermes's {schema_name}")
-        parts = UI_PLAN_PART_SCHEMAS.get(skill, {})
+        parts = dict(part_schemas.get(skill, {}))
         listed = next(
             (
                 record.get("part_output_schemas")
@@ -228,12 +246,24 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
     return problems
 
 
-def plan_provenance(root: Path, project: str, skill: str = "plan-ui-migration") -> str:
+def plan_provenance(
+    root: Path,
+    project: str,
+    skill: str = "plan-ui-migration",
+    *,
+    registry: Mapping[str, tuple[str, str]] | None = None,
+    part_schemas: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
     """NEW-131: what a drafted part depends on besides its data -- the released instruction
     sources of the skill and its role (as the instruction bundle reads them), the profile
     version, the skill's catalog record, and Hermes's full and part schemas. Bound into every
-    part id, so a skill, role, profile or schema change forces a redraft."""
-    role, schema_name = UI_PLAN_SKILLS[skill]
+    part id, so a skill, role, profile or schema change forces a redraft.
+
+    NEW-234: `registry` and `part_schemas` default to UI_PLAN_SKILLS and
+    UI_PLAN_PART_SCHEMAS (see agent_pack_problems)."""
+    role, schema_name = (UI_PLAN_SKILLS if registry is None else registry)[skill]
+    if part_schemas is None:
+        part_schemas = UI_PLAN_PART_SCHEMAS
     sources = (
         "profiles/engineering.yaml",
         f"skills/{skill}/SKILL.md",
@@ -262,7 +292,7 @@ def plan_provenance(root: Path, project: str, skill: str = "plan-ui-migration") 
     for relative in sources:
         payload = _pack_bytes(root, relative)
         digests[relative] = hashlib.sha256(payload).hexdigest() if payload is not None else None
-    schemas = [schema_name, *UI_PLAN_PART_SCHEMAS.get(skill, {}).values()]
+    schemas = [schema_name, *part_schemas.get(skill, {}).values()]
     return canonical_sha256(
         {
             "kind": "hermes-ui-plan-provenance-v1",
