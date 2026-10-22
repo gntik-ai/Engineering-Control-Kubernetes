@@ -143,6 +143,10 @@ class ProviderActivityHandler:
     # times, and only while the activity's own timeout leaves room for real work.
     _capacity_backoff_seconds: tuple[float, ...] = (120.0, 300.0, 600.0)
     _capacity_minimum_work_seconds = 600.0
+    # NEW-234 PR5 review: a backlog decomposition call is charged to the plan's provider
+    # budget once per reservation, so it runs exactly once (no capacity retry; the
+    # workflow schedules it with a single activity attempt).
+    _single_execution_steps = frozenset({"decomposition.draft", "decomposition.review"})
 
     _request_keys = {
         "audit.agent_cell": "agent_request",
@@ -166,6 +170,9 @@ class ProviderActivityHandler:
         "ui_fanout.gap_draft": "draft_request",
         # NEW-154: the gap consolidation plan (Claude, Hermes-pinned output schema).
         "ui_consolidate.plan": "draft_request",
+        # NEW-234 PR5: the backlog decomposition parts (Claude drafts, Codex reviews).
+        "decomposition.draft": "draft_request",
+        "decomposition.review": "review_request",
     }
 
     def __init__(
@@ -392,7 +399,9 @@ class ProviderActivityHandler:
                 request, heartbeat_event, sandbox_toolchain, agent_sandbox, scratch_copy
             )
             for retry, delay in enumerate(self._capacity_backoff_seconds, start=1):
-                if not self._capacity_retry_allowed(result, delay):
+                if step in self._single_execution_steps or not self._capacity_retry_allowed(
+                    result, delay
+                ):
                     break
                 # Recorded in the transcript and heartbeat like any provider event.
                 await heartbeat_event(

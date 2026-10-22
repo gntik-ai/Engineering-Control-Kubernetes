@@ -29,6 +29,9 @@ from engineering_control.engineering.backlog import (
     openspec_change_fields,
     valid_issue_label,
 )
+from engineering_control.engineering.change_requests import project_repositories
+from engineering_control.engineering.decomposition import DECOMPOSITION_PROJECTS
+from engineering_control.engineering.decomposition_inventory import ISSUE_MARKER
 from engineering_control.projects import PROJECT_REPOSITORY_SLUGS, ProjectName
 from engineering_control.projects import default_branch as project_default_branch
 from engineering_control.security.redaction import SecretRedactor
@@ -95,6 +98,8 @@ class GitHubActivityHandler:
                 "github.refresh_mirrors",
                 "backlog.github_import",
                 "delivery.refresh_issue_body",
+                # NEW-234 PR5: the decomposition's read-only epic and story issue snapshot.
+                "decomposition.read_issues",
             }
         )
         | GitOpsGitHubHandler.supported_steps
@@ -125,6 +130,8 @@ class GitHubActivityHandler:
             return await asyncio.to_thread(self._refresh_mirrors, payload)
         if step == "delivery.refresh_issue_body":
             return await asyncio.to_thread(self._refresh_issue_body, payload)
+        if step == "decomposition.read_issues":
+            return await asyncio.to_thread(self._read_decomposition_issues, payload)
         if step != "llmwiki.bootstrap.plan":
             raise ApplicationError("unsupported GitHub broker activity", non_retryable=True)
         if payload.get("project") != "llmwiki" or payload.get("environment") != "staging":
@@ -134,6 +141,78 @@ class GitHubActivityHandler:
                 non_retryable=True,
             )
         return await asyncio.to_thread(self._plan_llmwiki_bootstrap, payload)
+
+    def _read_decomposition_issues(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-234 PR5: the read-only snapshot of the project's epic and story issues (those
+        carrying a backlog marker), with their parent issue numbers; never a write."""
+        project = payload.get("project")
+        if project not in DECOMPOSITION_PROJECTS:
+            raise ApplicationError(
+                "decomposition issues are read only for a decomposition project",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        repository = project_repositories(str(project))[0]
+        try:
+            listed = self.broker.list_issue_snapshot(repository)
+        except (GhCliAuthError, GhCliPolicyError, CommandFailure, OSError, ValueError) as error:
+            return {
+                "status": "BLOCKED",
+                "blocker": "DECOMPOSITION_ISSUES_UNAVAILABLE",
+                "reason": type(error).__name__,
+            }
+        # The snapshot is built from an explicit field allowlist: nothing else the broker
+        # returned reaches Temporal history.
+        issues: list[dict[str, Any]] = []
+        for item in listed:
+            body = item.get("body")
+            if not isinstance(body, str) or not ISSUE_MARKER.search(body):
+                continue
+            number, title, state = item.get("number"), item.get("title"), item.get("state")
+            labels, parent = item.get("labels") or [], item.get("parent")
+            if (
+                type(number) is not int
+                or not isinstance(title, str)
+                or not isinstance(state, str)
+                or not isinstance(labels, list)
+                or not all(isinstance(label, str) for label in labels)
+                or (parent is not None and type(parent) is not int)
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "blocker": "DECOMPOSITION_ISSUES_UNAVAILABLE",
+                    "reason": "the issue snapshot is malformed",
+                }
+            issues.append(
+                {
+                    "number": number,
+                    "title": title,
+                    "body": body,
+                    "state": state,
+                    "labels": list(labels),
+                    "parent": parent,
+                }
+            )
+        # NEW-234 PR5 review: the snapshot enters Temporal history, so credential-like text
+        # in any returned string (title, body, labels, state) never leaves this activity;
+        # only the issue numbers are reported.
+        redactor = SecretRedactor()
+        leaking = [issue["number"] for issue in issues if redactor.redact(issue).value != issue]
+        result: dict[str, Any] = {
+            "status": "ISSUES_READ",
+            "repository": repository,
+            "issues": issues,
+            "listed": len(listed),
+        }
+        if leaking or redactor.redact(result).value != result:
+            return {
+                "status": "BLOCKED",
+                "blocker": "DECOMPOSITION_ISSUES_CREDENTIAL_TEXT",
+                "reason": "credential-like text in issues "
+                + ", ".join(str(number) for number in leaking)[:250],
+                "issues": leaking,
+            }
+        return result
 
     def _refresh_issue_body(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-44: re-read an existing backlog issue's body at delivery start.

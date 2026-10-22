@@ -28,8 +28,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.decomposition_scan import (
+    DECOMPOSITION_SCAN_STEPS,
+    DecompositionScanSteps,
+)
 from engineering_control.activities.retention import cleanup_authorization_sha256
-from engineering_control.activities.ui_plan_scan import UI_PLAN_SCAN_STEPS, UiPlanScanSteps
+from engineering_control.activities.ui_plan_scan import UI_PLAN_SCAN_STEPS
 from engineering_control.adapters.agent_sandbox import AGENT_SANDBOX_KEY
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.kubernetes import KubernetesObserver
@@ -239,7 +243,7 @@ class CleanupCandidate(BaseModel):
     )
 
 
-class ScanActivityHandler(UiPlanScanSteps):
+class ScanActivityHandler(DecompositionScanSteps):
     """Bounded mirror and worktree operations owned only by scan-runner."""
 
     supported_steps = frozenset(
@@ -270,6 +274,8 @@ class ScanActivityHandler(UiPlanScanSteps):
             "ui.kit_snapshot",
             "delivery.prepare_ui_page",
             *UI_PLAN_SCAN_STEPS,
+            # NEW-234 PR5: the backlog decomposition's inventory, staging and evidence.
+            *DECOMPOSITION_SCAN_STEPS,
         }
     )
     _repositories = {Project(name): PROJECT_REPOSITORY_SLUGS[name] for name in PROJECTS}
@@ -408,6 +414,12 @@ class ScanActivityHandler(UiPlanScanSteps):
                 return await asyncio.to_thread(self._ui_plan_stage_document, payload)
             if step == "ui_plan.stage_parts":
                 return await asyncio.to_thread(self._ui_plan_stage_parts, payload)
+            if step == "decomposition.inventory":
+                return await asyncio.to_thread(self._decomposition_inventory, payload)
+            if step == "decomposition.stage_inputs":
+                return await asyncio.to_thread(self._decomposition_stage_inputs, payload)
+            if step == "decomposition.stage_document":
+                return await asyncio.to_thread(self._decomposition_stage_document, payload)
             if step == "ui.kit_snapshot":
                 return await self._with_heartbeat(
                     self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"

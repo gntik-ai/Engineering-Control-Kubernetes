@@ -311,6 +311,7 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
         "create_app.backlog_issue_locate": ["f:@PROJECT_ALTERNATION@"],
         "create_app.backlog_list": ["f:@PROJECT_ALTERNATION@"],
         "create_app.change_request_list": ["f:@PROJECT_ALTERNATION@"],
+        "create_app.decomposition_list": ["f:@PROJECT_ALTERNATION@"],
         "create_app.r3_issue_candidate_create": ["f:@PROJECT_ALTERNATION@"],
         "create_app.r3_issue_candidate_get": ["f:@PROJECT_ALTERNATION@"],
         "create_app.ui_blueprint_list": ["f:@PROJECT_ALTERNATION@"],
@@ -320,6 +321,8 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
         "BacklogIssueAction": ["Literal:(falcone, falcone-charts, musematic, musematic-deploy)"],
         "ChangeRequestCreate": ["Literal:REPOSITORIES"],
         "ChangeRequestPublication": ["re:REPOSITORY_SLUGS"],
+        # NEW-234 PR5: the backlog decomposition is configured for falcone-serverless only.
+        "DecompositionCreate": ["Literal:(falcone-serverless)"],
         "LLMWikiBootstrapExecuteRequest": ["Literal:(llmwiki)"],
         "LLMWikiBootstrapPlanRequest": ["Literal:(llmwiki)"],
         "UiPlanCreate": ["Literal:(falcone)"],
@@ -327,7 +330,16 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
     # single-project commands; change repositories add the UI kit
     "src/engineering_control/cli.py": {
         "<module>": ["compose:(*REPOSITORY_SLUGS, 'gntik-ui')"],
-        "parser": ["(llmwiki)", "(llmwiki)", "(falcone)", "(falcone)", "(falcone)", "(falcone)"],
+        "parser": [
+            "(llmwiki)",
+            "(llmwiki)",
+            "(falcone)",
+            "(falcone)",
+            "(falcone-serverless)",
+            "(falcone-serverless)",
+            "(falcone)",
+            "(falcone)",
+        ],
     },
     # projects plus the platform scope
     "src/engineering_control/dashboard/events.py": {
@@ -779,6 +791,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "api.schemas:R3IssueApprovalRequest.confirmation_phrase": ["re:UPPER_PROJECTS"],
     "api.schemas:R3IssueApprovalRequest.project": ["enum:PROJECTS"],
     "api.schemas:UiPlanCreate.project": ["enum:(falcone)"],
+    "api.schemas:DecompositionCreate.project": ["enum:(falcone-serverless)"],
     "api.schemas:_PROJECT_PHRASE": ["re:UPPER_PROJECTS"],
     "cli:_CHANGE_REPOSITORIES": ["REPOSITORY_SLUGS"],
     "dashboard.app:PROJECTS": ["{PROJECTS}"],
@@ -930,6 +943,8 @@ CLI_SITES: dict[str, str] = {
     "issue-touch-refresh:repository": "REPOSITORY_SLUGS",
     "r3-approve:project": "PROJECTS",
     "r3-candidate:project": "PROJECTS",
+    "backlog-decompose:project": "(falcone-serverless)",
+    "backlog-decompositions:project": "(falcone-serverless)",
     "ui-blueprints:project": "(falcone)",
     "ui-inventory:project": "(falcone)",
     "ui-kit-snapshot:project": "(falcone)",

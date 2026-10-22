@@ -15,6 +15,7 @@ from engineering_control.db.runtime_binding import verified_activity_run_binding
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.workflows.tmp_sweep import running_step
 
+from .backlog_decomposition import DecompositionActivityHandler
 from .browser import BrowserActivityHandler
 from .change_requests import ChangeRequestActivityHandler, ChangeRequestGitHubHandler
 from .connections import ConnectionsActivityHandler
@@ -247,6 +248,24 @@ class ControlActivities:
         "ui_consolidate.record_plan",
         "ui_consolidate.record_failure",
         "ui_consolidate.finalize",
+        # NEW-234 PR5: the backlog decomposition plan (flow D) through CANDIDATE.
+        "decomposition.register",
+        "decomposition.read_issues",
+        "decomposition.inventory",
+        "decomposition.record_inputs",
+        "decomposition.prepare_part_input",
+        "decomposition.stage_inputs",
+        "decomposition.prepare_part",
+        "decomposition.draft",
+        "decomposition.record_part_draft",
+        "decomposition.stage_document",
+        "decomposition.prepare_part_review",
+        "decomposition.review",
+        "decomposition.record_part_review",
+        "decomposition.assemble",
+        "decomposition.persist",
+        "decomposition.record_terminal",
+        "decomposition.finalize_run",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -421,6 +440,12 @@ class ControlActivities:
             "ui_plan.review",
             "ui_fanout.gap_draft",
             "ui_consolidate.plan",
+            "decomposition.read_issues",
+            "decomposition.inventory",
+            "decomposition.stage_inputs",
+            "decomposition.stage_document",
+            "decomposition.draft",
+            "decomposition.review",
         }
         - GITOPS_GITHUB_STEPS,
         "scan": {
@@ -453,6 +478,9 @@ class ControlActivities:
             "ui_plan.stage_inputs",
             "ui_plan.stage_document",
             "ui_plan.stage_parts",
+            "decomposition.inventory",
+            "decomposition.stage_inputs",
+            "decomposition.stage_document",
         },
         "codex": {
             "audit.agent_cell",
@@ -472,6 +500,7 @@ class ControlActivities:
             "observability.invoke_codex_checker",
             "change_request.review",
             "ui_plan.review",
+            "decomposition.review",
         },
         "claude": {
             "audit.agent_cell",
@@ -491,6 +520,7 @@ class ControlActivities:
             "ui_plan.draft",
             "ui_fanout.gap_draft",
             "ui_consolidate.plan",
+            "decomposition.draft",
         },
         "browser": {
             "runtime.browser_checks",
@@ -511,6 +541,7 @@ class ControlActivities:
             "llmwiki.bootstrap.plan",
             "github.refresh_mirrors",
             "backlog.github_import",
+            "decomposition.read_issues",
             "delivery.refresh_issue_body",
             "finding.dedupe",
             "delivery.publish",
@@ -605,6 +636,9 @@ class ControlActivities:
         self.ui_plan_handler = (
             UiPlanActivityHandler(settings) if self.worker_kind == "controller" else None
         )
+        self.decomposition_handler = (
+            DecompositionActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -660,6 +694,11 @@ class ControlActivities:
             return await self.change_request_handler.handle(step, safe_payload)
         if self.ui_plan_handler is not None and step in self.ui_plan_handler.supported_steps:
             return await self.ui_plan_handler.handle(step, safe_payload)
+        if (
+            self.decomposition_handler is not None
+            and step in self.decomposition_handler.supported_steps
+        ):
+            return await self.decomposition_handler.handle(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:

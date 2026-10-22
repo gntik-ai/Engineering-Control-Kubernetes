@@ -37,6 +37,7 @@ from engineering_control.engineering.change_requests import (
     validate_proposal,
 )
 from engineering_control.engineering.ui_blueprint import (
+    _pack_bytes,
     agent_pack_problems,
     load_schema,
     plan_provenance,
@@ -1525,3 +1526,158 @@ def render_markdown(
         "request per task. Hermes never publishes them and never edits an epic or story issue.",
     ]
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------
+# NEW-234 PR5: the plan workflow's identity, scope, approval binding and assembly redrafts
+# --------------------------------------------------------------------------------------
+
+APPROVAL_PHRASE: Final = "APPROVE_DECOMPOSITION"
+BINDING_KIND: Final = "hermes-backlog-decomposition-v1"
+WORKFLOW_PREFIX: Final = "backlog-decomposition-"
+# An epic selector of `backlog-decompose --epic`: its id (EP-API) or its number (1-99).
+EPIC_SELECTOR = re.compile(r"^(?:EP-[A-Z]{2,4}|[1-9][0-9]?)$")
+MAX_EPIC_SELECTORS = 20
+
+
+def decomposition_workflow_id(project: str, decomposition_id: str) -> str:
+    return f"{WORKFLOW_PREFIX}{project}-{decomposition_id}"
+
+
+def pack_revision(root: Path) -> str:
+    """The released agent-pack revision a plan is drafted and reviewed under: the
+    provenance of both skills (their instruction sources, roles, profile, catalog records
+    and schemas). Bound into every part id and into the approval, so a pack change between
+    the plan's start and its approval refuses the approval."""
+    released: dict[str, str | None] = {}
+    for skill in DECOMPOSITION_SKILLS:
+        # NEW-234 PR5 review: the released schema bytes too, not only Hermes's own copies.
+        names = ["output.schema.json", *DECOMPOSITION_PART_SCHEMAS.get(skill, {}).values()]
+        for name in names:
+            relative = f"skills/{skill}/references/{name}"
+            data = _pack_bytes(root, relative)
+            released[relative] = hashlib.sha256(data).hexdigest() if data is not None else None
+    return canonical_sha256(
+        {
+            "kind": "hermes-backlog-decomposition-pack-v2",
+            "skills": {
+                skill: decomposition_provenance(root, skill) for skill in DECOMPOSITION_SKILLS
+            },
+            "released_schemas": released,
+        }
+    )
+
+
+def resolve_epics(
+    inventory: Mapping[str, Any], selectors: Sequence[str] | None
+) -> list[int] | None:
+    """The epic numbers `--epic` selects (None: every epic). Raises ValueError naming the
+    selectors the inventory does not know."""
+    if not selectors:
+        return None
+    numbers = {int(epic["number"]): int(epic["number"]) for epic in inventory["epics"]}
+    ids = {str(epic["id"]): int(epic["number"]) for epic in inventory["epics"]}
+    chosen: set[int] = set()
+    unknown: list[str] = []
+    for selector in selectors:
+        value = ids.get(selector) if selector.startswith("EP-") else None
+        if value is None and selector.isdigit():
+            value = numbers.get(int(selector))
+        if value is None:
+            unknown.append(selector)
+        else:
+            chosen.add(value)
+    if unknown:
+        raise ValueError(f"unknown epics: {', '.join(sorted(set(unknown)))}")
+    return sorted(chosen)
+
+
+def scoped_inventory(inventory: Mapping[str, Any], epics: Sequence[int] | None) -> dict[str, Any]:
+    """The inventory a scoped plan (`--epic`) is checked and assembled against: only the
+    selected epics and their stories. A dependency on a story outside the scope stays a
+    story dependency (it orders nothing in this plan); a task may not depend on a task of
+    an unplanned story (DEPENDENCY_UNRESOLVED). The bound hashes are the full inventory's."""
+    if epics is None:
+        return dict(inventory)
+    selected = set(epics)
+    kept = [epic for epic in inventory["epics"] if int(epic["number"]) in selected]
+    ids = {str(epic["id"]) for epic in kept}
+    return {
+        **inventory,
+        "epics": kept,
+        "stories": [story for story in inventory["stories"] if str(story["epic"]) in ids],
+    }
+
+
+def approval_binding(
+    *,
+    decomposition_id: str,
+    project: str,
+    source_sha: str,
+    design_sha256: str,
+    backlog_sha256: str,
+    issues_sha256: str,
+    plan_sha256: str,
+    pack_revision: str,
+    epics: Sequence[int] | None,
+) -> str:
+    """sha256 of the exact plan and every immutable input it was drafted from: the
+    project, the source commit, the design, backlog and issue-snapshot hashes, the plan
+    hash, the agent-pack revision and the epic scope."""
+    if project not in DECOMPOSITION_PROJECTS:
+        raise ValueError("decomposition project is not configured")
+    if not _SHA.fullmatch(source_sha):
+        raise ValueError("source SHA is invalid")
+    for value in (design_sha256, backlog_sha256, issues_sha256, plan_sha256, pack_revision):
+        if not _DIGEST.fullmatch(value):
+            raise ValueError("decomposition binding hash is invalid")
+    return canonical_sha256(
+        {
+            "kind": BINDING_KIND,
+            "decomposition_id": decomposition_id,
+            "project": project,
+            "source_sha": source_sha,
+            "design_sha256": design_sha256,
+            "backlog_sha256": backlog_sha256,
+            "issues_sha256": issues_sha256,
+            "plan_sha256": plan_sha256,
+            "pack_revision": pack_revision,
+            "epics": None if epics is None else sorted(int(item) for item in epics),
+        }
+    )
+
+
+def assembly_redrafts(
+    problems: Sequence[Mapping[str, Any]],
+    inventory: Mapping[str, Any],
+    parts: Sequence[EpicPart],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Map ASSEMBLY_INVALID problems to the epic part that owns them: a task key or a story
+    id names its story's epic batch; a duplicate title names the last batch (in drafting
+    order) with a task of that title. Returns (part id -> its problems, in `parts` order;
+    the problems no part owns)."""
+    facts = story_facts(inventory)
+    by_epic = {part.number: part.part_id for part in parts}
+    titles: dict[str, str] = {}
+    for part in parts:
+        for story in part.content["stories"]:
+            for task in story["tasks"]:
+                # A problem's subject is bounded to 100 characters (PlanProblem.as_dict).
+                titles[" ".join(str(task["title"]).split()).casefold()[:100]] = part.part_id
+    owned: dict[str, list[dict[str, Any]]] = {}
+    unowned: list[dict[str, Any]] = []
+    for problem in problems:
+        subject = str(problem.get("subject") or "")
+        match = TASK_KEY.fullmatch(subject)
+        story = match.group(1) if match else subject if STORY_KEY.fullmatch(subject) else None
+        owner: str | None = None
+        if story is not None and story in facts:
+            owner = by_epic.get(facts[story].epic_number)
+        elif problem.get("code") == "TASK_TITLE_DUPLICATE":
+            owner = titles.get(" ".join(subject.split()).casefold()[:100])
+        if owner is None:
+            unowned.append(dict(problem))
+        else:
+            owned.setdefault(owner, []).append(dict(problem))
+    order = [part.part_id for part in parts]
+    return {part: owned[part] for part in order if part in owned}, unowned

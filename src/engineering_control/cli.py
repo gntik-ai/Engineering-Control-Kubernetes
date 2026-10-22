@@ -439,6 +439,29 @@ def parser() -> argparse.ArgumentParser:
         metavar=("PLAN_SHA12", "CONSOLIDATE_GAPS"),
         help="apply the previewed plan with this sha and the typed confirmation",
     )
+    # NEW-234 PR5: the backlog decomposition plan -> CANDIDATE -> approval (decision only).
+    decompose = commands.add_parser("backlog-decompose")
+    decompose.add_argument("project", choices=("falcone-serverless",))
+    decompose.add_argument("--source-sha", help="expected project main head (full SHA)")
+    decompose.add_argument(
+        "--epic",
+        action="append",
+        dest="epics",
+        metavar="EPIC",
+        help="plan only this epic (id such as EP-API, or its number); repeatable",
+    )
+    decompositions = commands.add_parser("backlog-decompositions")
+    decompositions.add_argument("--project", choices=("falcone-serverless",))
+    decompositions.add_argument(
+        "--status",
+        choices=("DRAFTING", "BLOCKED", "FAILED", "CANDIDATE", "APPROVED", "SUPERSEDED"),
+    )
+    commands.add_parser("backlog-decomposition-status").add_argument("decomposition_id")
+    commands.add_parser("backlog-decomposition-show").add_argument("decomposition_id")
+    decomposition_approve = commands.add_parser("backlog-decomposition-approve")
+    decomposition_approve.add_argument("decomposition_id")
+    decomposition_approve.add_argument("approval_binding")
+    decomposition_approve.add_argument("typed_confirmation")
     ui_inventory = commands.add_parser("ui-inventory")
     ui_inventory.add_argument("--checkout", type=Path, required=True)
     ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
@@ -939,6 +962,37 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         if arguments.repository is not None:
             draft["target_repository"] = f"gntik-ai/{arguments.repository}"
         return client.request("POST", "/v1/change-requests", draft)
+    if command == "backlog-decompose":
+        decomposition: dict[str, Any] = {"project": arguments.project}
+        if arguments.source_sha is not None:
+            decomposition["source_sha"] = arguments.source_sha
+        if arguments.epics:
+            decomposition["epics"] = list(arguments.epics)
+        return client.request("POST", "/v1/backlog-decompositions", decomposition)
+    if command == "backlog-decompositions":
+        query = httpx.QueryParams(
+            {
+                key: value
+                for key, value in (("project", arguments.project), ("status", arguments.status))
+                if value is not None
+            }
+        )
+        return client.request("GET", f"/v1/backlog-decompositions?{query}")
+    if command == "backlog-decomposition-status":
+        return client.request("GET", f"/v1/backlog-decompositions/{arguments.decomposition_id}")
+    if command == "backlog-decomposition-show":
+        return client.request(
+            "GET", f"/v1/backlog-decompositions/{arguments.decomposition_id}/markdown"
+        )
+    if command == "backlog-decomposition-approve":
+        return client.request(
+            "POST",
+            f"/v1/backlog-decompositions/{arguments.decomposition_id}/approve",
+            {
+                "approval_binding": arguments.approval_binding,
+                "typed_confirmation": arguments.typed_confirmation,
+            },
+        )
     if command == "ui-plan":
         plan: dict[str, Any] = {"project": arguments.project}
         if arguments.source_sha is not None:
@@ -1068,7 +1122,9 @@ def main() -> None:
     except (OSError, ValueError, httpx.HTTPError) as error:
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
-    if arguments.command == "ui-blueprint-show" and isinstance(result, dict):
+    if arguments.command in {"ui-blueprint-show", "backlog-decomposition-show"} and isinstance(
+        result, dict
+    ):
         print(str(result.get("markdown", "")), end="")
         usage = result.get("usage")
         if isinstance(usage, dict) and (usage.get("total") or {}).get("calls"):

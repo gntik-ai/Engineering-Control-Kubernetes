@@ -446,6 +446,23 @@ class UiBlueprintApproval(APIModel):
     max_items: int | None = Field(default=None, ge=1, le=600)
 
 
+class DecompositionCreate(APIModel):
+    """NEW-234 PR5: start a backlog decomposition plan for one configured project."""
+
+    project: Literal["falcone-serverless"]
+    # Optional expected project main head; the snapshot refuses any other commit.
+    source_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    # Optional epic scope (ids such as EP-API or numbers); default every epic.
+    epics: list[Annotated[str, Field(pattern=r"^(?:EP-[A-Z]{2,4}|[1-9][0-9]?)$")]] | None = Field(
+        default=None, min_length=1, max_length=20
+    )
+
+
+class DecompositionApproval(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["APPROVE_DECOMPOSITION"]
+
+
 class UiFanoutRetry(APIModel):
     """NEW-146: reset an approved blueprint's FAILED fan-out items and fan out again."""
 
@@ -566,6 +583,10 @@ class ChangeRequestAccepted(OperationAccepted):
 
 class UiPlanAccepted(OperationAccepted):
     blueprint_id: UUID
+
+
+class DecompositionAccepted(OperationAccepted):
+    decomposition_id: UUID
 
 
 class RecordList(APIModel):

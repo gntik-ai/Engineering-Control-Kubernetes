@@ -178,7 +178,7 @@ def _issues_with(number: int, **changes: Any) -> list[IssueSnapshot]:
             "issue 9 carries marker OPS-01, which backlog.json lacks",
         ),
         (lambda: _issues_with(3, parent=2), "issue 3 (API-01) parent is 2, not epic issue 1"),
-        (lambda: _issues_with(5, parent=None), "issue 5 (RUN-01) parent is None"),
+        (lambda: _issues_with(5, parent=1), "issue 5 (RUN-01) parent is 1, not epic issue 2"),
         (lambda: _issues_with(1, parent=2), "epic issue 1 (EP-API) has a parent issue"),
     ],
 )
@@ -186,6 +186,22 @@ def test_github_and_backlog_disagreeing_is_source_drift(snapshot: Any, detail: s
     error = error_of(issues=snapshot())
     assert error.code == SOURCE_DRIFT
     assert any(item.startswith(detail) for item in error.details), error.details
+
+
+def test_stories_without_a_native_parent_link_bind_by_backlog_membership() -> None:
+    """NEW-234 PR5 review: the sub-issue links come later (PR 7); unlinked stories whose
+    marker, title and body match backlog.json are their epic's, linked ones too."""
+    unlinked = [
+        replace(item, parent=None) if item.number in {3, 4, 5} else item for item in issues()
+    ]
+    built = build_inventory(source_sha=SOURCE_SHA, files=files(), issues=unlinked)
+    assert [(story["id"], story["epic_issue"]) for story in built["stories"]] == [
+        ("API-01", 1),
+        ("API-02", 1),
+        ("RUN-01", 2),
+    ]
+    linked = build_inventory(source_sha=SOURCE_SHA, files=files(), issues=issues())
+    assert [story["epic_issue"] for story in linked["stories"]] == [1, 1, 2]
 
 
 def _backlog_with(change: Any) -> dict[str, bytes]:
