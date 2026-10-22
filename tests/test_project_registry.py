@@ -346,11 +346,13 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
             "keys:(gntik-ui, falcone-serverless)",
         ],
     },
-    # UI-kit repositories per project
+    # UI-kit repositories per project; NEW-234 cross-repository targets per project
     "src/engineering_control/engineering/change_requests.py": {
         "<module>": [
             "keys:(falcone)",
             "(gntik-ai/gntik-ui)",
+            "keys:(falcone-serverless)",
+            "keys:(gntik-ai/falcone, gntik-ai/falcone-charts)",
             "compose:(*REPOSITORY_SLUGS, *(repository.removeprefix('gntik-ai/') for repositories in UI_KIT_REPOSITORIES.values() for repository in repositories))",  # noqa: E501
         ],
     },
@@ -804,6 +806,10 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "engineering.change_requests:CHANGE_REQUEST_REPOSITORY_ALTERNATION": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:ChangeRequestIntake.project": ["enum:PROJECTS"],
     "engineering.change_requests:ChangeRequestIntake.target_repository": ["re:REPOSITORY_SLUGS"],
+    "engineering.change_requests:CROSS_REPOSITORY_TARGETS": [
+        "keys:(falcone-serverless)",
+        "keys:(gntik-ai/falcone, gntik-ai/falcone-charts)",
+    ],
     "engineering.change_requests:UI_KIT_REPOSITORIES": ["keys:(falcone)", "(gntik-ai/gntik-ui)"],
     "engineering.change_requests:_REPOSITORY_PATTERN": ["re:REPOSITORY_SLUGS"],
     "engineering.github:FindingPublication.affected_repositories": ["re:REPOSITORY_SLUGS"],

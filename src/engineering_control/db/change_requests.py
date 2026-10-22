@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from engineering_control.db.models import ChangeRequest, Run, UiBlueprint
+from engineering_control.db.models import BacklogDecomposition, ChangeRequest, Run, UiBlueprint
 from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
 )
@@ -23,6 +23,7 @@ from engineering_control.engineering.change_requests import (
     ChangeProposal,
     ChangeRequestIntake,
     ChangeReviewRecord,
+    DecompositionChangeContext,
     RenderedChangeRequest,
     UiChangeContext,
     approval_phrase,
@@ -45,6 +46,8 @@ _ISSUE_URL = re.compile(
 
 # NEW-146 review 1: what a fan-out item write that no longer owns its blueprint returns.
 UI_FANOUT_SUPERSEDED = "UI_FANOUT_SUPERSEDED"
+# NEW-234: the same, for a write that no longer owns its backlog decomposition.
+DECOMPOSITION_FANOUT_SUPERSEDED = "DECOMPOSITION_FANOUT_SUPERSEDED"
 # NEW-154: merge hops blocker resolution follows (a canonical request may be merged again);
 # consolidation refuses chains longer than this (engineering.ui_gap_consolidation).
 from engineering_control.engineering.ui_gap_consolidation import MAX_MERGE_HOPS  # noqa: E402
@@ -513,6 +516,7 @@ class ChangeRequestRepository:
                 review=review,
                 description_redacted=row.description_redacted,
                 ui_context=self._ui_context(row),
+                decomposition_context=self._decomposition_context(row),
             )
             error = self._render_error(rendered)
             if error is not None:
@@ -625,16 +629,25 @@ class ChangeRequestRepository:
         an earlier fan-out still running in its thread, after a retry reset the item) is
         refused. Callers that are not activities (``fanout_writer`` None), operator requests
         and operator revisions (revision 2 or later, ChangeRequestWorkflow) are not fenced.
-        The blueprint row is locked before the request row, the order the retry uses."""
+        The blueprint row is locked before the request row, the order the retry uses.
+        NEW-234: a fanned-out decomposition task is fenced the same way by its backlog
+        decomposition's active marker; a request with neither context is not fenced."""
         if fanout_writer is None or revision != 1:
             return True
-        context = session.scalar(
-            select(ChangeRequest.ui_context_json).where(ChangeRequest.id == change_request_id)
-        )
+        context, decomposition = session.execute(
+            select(ChangeRequest.ui_context_json, ChangeRequest.decomposition_context_json).where(
+                ChangeRequest.id == change_request_id
+            )
+        ).one_or_none() or (None, None)
         blueprint_id = context.get("blueprint_id") if isinstance(context, dict) else None
-        if not blueprint_id:
-            return True
-        return cls._fanout_owns(session, str(blueprint_id), fanout_writer)
+        if blueprint_id:
+            return cls._fanout_owns(session, str(blueprint_id), fanout_writer)
+        decomposition_id = (
+            decomposition.get("decomposition_id") if isinstance(decomposition, dict) else None
+        )
+        if decomposition_id:
+            return cls._decomposition_fanout_owns(session, str(decomposition_id), fanout_writer)
+        return True
 
     @staticmethod
     def _fanout_owns(session: Any, blueprint_id: str, fanout_writer: str) -> bool:
@@ -650,11 +663,31 @@ class ChangeRequestRepository:
         return bool(fanout_writer) and marker == fanout_writer
 
     @staticmethod
-    def _fanout_superseded(session: Any, change_request_id: UUID) -> dict[str, Any]:
-        status = session.scalar(
-            select(ChangeRequest.status).where(ChangeRequest.id == change_request_id)
+    def _decomposition_fanout_owns(session: Any, decomposition_id: str, fanout_writer: str) -> bool:
+        try:
+            identity = UUID(decomposition_id)
+        except ValueError:
+            return False
+        marker = session.scalar(
+            select(BacklogDecomposition.active_fanout_workflow_id)
+            .where(BacklogDecomposition.id == identity)
+            .with_for_update()
         )
-        return {"status": "SUPERSEDED", "current_status": status, "blocker": UI_FANOUT_SUPERSEDED}
+        return bool(fanout_writer) and marker == fanout_writer
+
+    @staticmethod
+    def _fanout_superseded(session: Any, change_request_id: UUID) -> dict[str, Any]:
+        status, decomposition = session.execute(
+            select(ChangeRequest.status, ChangeRequest.decomposition_context_json).where(
+                ChangeRequest.id == change_request_id
+            )
+        ).one_or_none() or (None, None)
+        blocker = (
+            DECOMPOSITION_FANOUT_SUPERSEDED
+            if isinstance(decomposition, dict) and decomposition.get("decomposition_id")
+            else UI_FANOUT_SUPERSEDED
+        )
+        return {"status": "SUPERSEDED", "current_status": status, "blocker": blocker}
 
     @staticmethod
     def _failure(row: ChangeRequest) -> dict[str, Any]:
@@ -722,6 +755,7 @@ class ChangeRequestRepository:
             review=review,
             description_redacted=row.description_redacted,
             ui_context=ChangeRequestRepository._ui_context(row),
+            decomposition_context=ChangeRequestRepository._decomposition_context(row),
         )
 
     @staticmethod
@@ -729,6 +763,12 @@ class ChangeRequestRepository:
         """NEW-123: the fanned-out blueprint item, part of the rendered (bound) body."""
         value = row.ui_context_json
         return UiChangeContext.model_validate(value) if value else None
+
+    @staticmethod
+    def _decomposition_context(row: ChangeRequest) -> DecompositionChangeContext | None:
+        """NEW-234: the fanned-out decomposition task, part of the rendered (bound) body."""
+        value = row.decomposition_context_json
+        return DecompositionChangeContext.model_validate(value) if value else None
 
     @classmethod
     def _verify_stored_content(cls, row: ChangeRequest) -> None:
@@ -819,6 +859,8 @@ class ChangeRequestRepository:
             "decision_sequence": row.decision_sequence,
             "workflow_id": change_request_workflow_id(str(row.id), row.revision),
             "ui_context": row.ui_context_json or None,
+            # NEW-234: the decomposition task a fanned-out technical request came from.
+            "decomposition_context": row.decomposition_context_json or None,
             # NEW-146: why a FAILED request failed (blocker and bounded, redacted detail).
             "failure": cls._failure(row) or None,
             # NEW-154: merge, canonical and re-pointing records of a gap consolidation.

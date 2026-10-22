@@ -23,9 +23,11 @@ from typing import Any, Protocol
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.engineering.backlog import CHANGE_REQUEST_LABEL
 from engineering_control.engineering.change_requests import (
+    CROSS_REPOSITORY_TARGETS,
     MARKER_PATTERN,
     UI_KIT_REPOSITORIES,
     ChangeReviewRecord,
+    DecompositionChangeContext,
     UiChangeContext,
     approval_binding,
     approval_record_matches,
@@ -90,7 +92,13 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
     project = str(view.get("project", ""))
     repository = str(view.get("target_repository", ""))
     # NEW-123: a UI-kit repository (gntik-ui) is published only by the operator's gh.
-    known = ALLOWED_REPOSITORIES | frozenset(UI_KIT_REPOSITORIES.get(project, ()))
+    # NEW-234: so is a project's cross-repository target (falcone-serverless -> falcone,
+    # falcone-charts); target_repository_allowed still requires it in the broker allowlist.
+    known = (
+        ALLOWED_REPOSITORIES
+        | frozenset(UI_KIT_REPOSITORIES.get(project, ()))
+        | frozenset(CROSS_REPOSITORY_TARGETS.get(project, {}))
+    )
     if repository not in known or not target_repository_allowed(project, repository):
         raise ChangePublishError("change request repository is not allowlisted")
     revision = view.get("revision")
@@ -105,6 +113,12 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
         proposal = validate_proposal(view.get("proposal"), project, repository)
         raw_context = view.get("ui_context")
         ui_context = UiChangeContext.model_validate(raw_context) if raw_context else None
+        raw_decomposition = view.get("decomposition_context")
+        decomposition_context = (
+            DecompositionChangeContext.model_validate(raw_decomposition)
+            if raw_decomposition
+            else None
+        )
         rendered = render_change_request(
             change_request_id=change_request_id,
             revision=revision,
@@ -114,6 +128,7 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
             review=ChangeReviewRecord.model_validate(view.get("review")),
             description_redacted=str(view.get("description_redacted", "")),
             ui_context=ui_context,
+            decomposition_context=decomposition_context,
         )
     except ValueError as error:
         raise ChangePublishError("change request content cannot be re-rendered") from error

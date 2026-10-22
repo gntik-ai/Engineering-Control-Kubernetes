@@ -43,6 +43,16 @@ REVIEW_CATEGORIES = ("code_claim", "testability", "scope", "risk", "other")
 # NEW-123: the UI-kit repository a project's console migration may file change requests in
 # (kit gaps). Hermes never writes these issues: the operator publishes with their own gh.
 UI_KIT_REPOSITORIES: dict[str, tuple[str, ...]] = {"falcone": ("gntik-ai/gntik-ui",)}
+# NEW-234: other projects' repositories a project's change requests may target, with the
+# role each one plays. A backlog decomposition of falcone-serverless files its technical
+# issues in falcone (source) and falcone-charts (deployment); the request keeps its own
+# project, and the operator publishes with their own gh, as for every change request.
+CROSS_REPOSITORY_TARGETS: dict[str, dict[str, Literal["source", "deployment"]]] = {
+    "falcone-serverless": {
+        "gntik-ai/falcone": "source",
+        "gntik-ai/falcone-charts": "deployment",
+    }
+}
 # NEW-157: the registry's repositories plus the UI-kit ones, de-duplicated in order.
 CHANGE_REQUEST_REPOSITORY_ALTERNATION = alternation(
     dict.fromkeys(
@@ -198,6 +208,39 @@ def ui_context_json(context: UiChangeContext) -> dict[str, Any]:
     return value
 
 
+_TASK_KEY_PATTERN = r"^[A-Z]{2,4}-[0-9]{2}\.t[0-9]{1,2}$"
+_STORY_KEY_PATTERN = r"^[A-Z]{2,4}-[0-9]{2}$"
+
+
+class DecompositionChangeContext(ChangeRequestModel):
+    """NEW-234: the backlog-decomposition task a change request was fanned out from.
+
+    Rendered into (and bound by) the issue body: the story and epic issues it belongs to,
+    in the project's source repository, and a hidden marker naming the plan and task."""
+
+    decomposition_id: str = Field(pattern=_UUID_PATTERN)
+    plan_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    task_key: str = Field(pattern=_TASK_KEY_PATTERN)
+    story_key: str = Field(pattern=_STORY_KEY_PATTERN)
+    story_issue: int = Field(ge=1, le=10_000_000)
+    epic_issue: int = Field(ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def task_of_story(self) -> DecompositionChangeContext:
+        if self.task_key.split(".", 1)[0] != self.story_key:
+            raise ValueError("decomposition task key must belong to its story")
+        return self
+
+
+def decomposition_lineage(project: str, context: DecompositionChangeContext) -> str:
+    """NEW-234: the dedupe identity of a decomposition task across plans."""
+    return f"{project}:{context.story_key}:{context.task_key}"
+
+
+def decomposition_marker(*, project: str, decomposition_id: str, task_key: str) -> str:
+    return f"<!-- hermes-decomposition plan={decomposition_id} task={project}:{task_key} -->"
+
+
 class ChangeRequestIntake(ChangeRequestModel):
     project: ProjectName
     description_redacted: str = Field(min_length=DESCRIPTION_MIN_CHARACTERS)
@@ -225,6 +268,9 @@ def project_repositories(project: str) -> tuple[str, str]:
 def target_repository_allowed(project: str, repository: str) -> bool:
     if repository in UI_KIT_REPOSITORIES.get(project, ()):
         return True
+    # NEW-234: a cross-repository target must also be a repository the broker allowlists.
+    if repository in CROSS_REPOSITORY_TARGETS.get(project, {}):
+        return project in BACKLOG_PROJECT_PAIRS and repository in ALLOWED_REPOSITORIES
     return (
         project in BACKLOG_PROJECT_PAIRS
         and repository in BACKLOG_PROJECT_PAIRS[project]
@@ -266,12 +312,16 @@ def validate_proposal(
     """Validate a drafted proposal and bind its repositories to the project allowlist.
 
     NEW-123: a change request targeting the project's UI-kit repository may also name
-    that repository (as its source)."""
+    that repository (as its source). NEW-234: one targeting a cross-repository target may
+    also name that project's cross-repository targets, each in its own role."""
     proposal = ChangeProposal.model_validate(value)
     source, deployment = project_repositories(project)
     allowed = {(source, "source"), (deployment, "deployment")}
     if target_repository is not None and target_repository in UI_KIT_REPOSITORIES.get(project, ()):
         allowed.add((target_repository, "source"))
+    cross = CROSS_REPOSITORY_TARGETS.get(project, {})
+    if target_repository is not None and target_repository in cross:
+        allowed.update(cross.items())
     for item in proposal.affected_repositories:
         if (item.repository, item.role) not in allowed:
             raise ValueError("proposal names a repository outside the project allowlist")
@@ -381,12 +431,15 @@ def render_change_request(
     review: ChangeReviewRecord,
     description_redacted: str,
     ui_context: UiChangeContext | None = None,
+    decomposition_context: DecompositionChangeContext | None = None,
 ) -> RenderedChangeRequest:
     """Render the exact issue title and body an operator approves (pure, deterministic).
 
     The approval binding covers the body without its trailing hidden marker, because the
     marker itself carries the binding; the marker is then appended verbatim.
     """
+    if ui_context is not None and decomposition_context is not None:
+        raise ValueError("a change request has a UI or a decomposition context, not both")
     fingerprint = proposal_fingerprint(proposal)
     title = issue_title(proposal)
     # kind/Risk lines stay first: backlog import reads them from a bounded body excerpt.
@@ -404,6 +457,12 @@ def render_change_request(
         # NEW-123: only a fanned-out UI migration item has this section, so every other
         # change request renders (and binds) exactly as before.
         *(_ui_context_lines(ui_context) if ui_context is not None else ()),
+        # NEW-234: only a fanned-out decomposition task has this section.
+        *(
+            _decomposition_context_lines(project, decomposition_context)
+            if decomposition_context is not None
+            else ()
+        ),
         "## Why",
         "",
         f"- {_line(proposal.why)}",
@@ -525,6 +584,27 @@ def _ui_context_lines(context: UiChangeContext) -> list[str]:
         ),
         "",
         *(line for section in context.continued for line in _continued_lines(section)),
+    ]
+
+
+def _decomposition_context_lines(project: str, context: DecompositionChangeContext) -> list[str]:
+    # The story and epic live in the project's own source repository. These lines carry no
+    # dependency keyword, so backlog import never reads them as dependencies (NEW-216).
+    source = project_repositories(project)[0]
+    return [
+        "## Backlog decomposition",
+        "",
+        f"- Story: {source}#{context.story_issue} ({context.story_key})",
+        f"- Epic: {source}#{context.epic_issue}",
+        f"- Task: `{context.task_key}`",
+        f"- Plan: `{context.decomposition_id}` (sha256 `{context.plan_sha256}`)",
+        "",
+        decomposition_marker(
+            project=project,
+            decomposition_id=context.decomposition_id,
+            task_key=context.task_key,
+        ),
+        "",
     ]
 
 
