@@ -123,6 +123,21 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "DEPLOYMENT_CHANGES_NOT_COMMITTED": "the maker left uncommitted deployment changes",
     "COMPONENT_LEASE_CONFLICT": "another run holds the component lease",
     "PROVIDER_MODEL_AT_CAPACITY": "the model provider is at capacity; retry later",
+    # NEW-232: the loop pauses on the issue instead of using up its remaining items.
+    "MANUAL_AUTH_REQUIRED_CLAUDE": (
+        "the Claude CLI login on the worker expired; log in with ssh -t worker 'sudo -u "
+        "claude-runner -H /usr/local/bin/claude auth login', then /loop retry"
+    ),
+    "MANUAL_AUTH_REQUIRED_CODEX": (
+        "the Codex CLI login on the worker expired; log in with ssh -t worker 'sudo -u "
+        "codex-runner -H /usr/local/bin/codex login', then /loop retry"
+    ),
+    "PROVIDER_CLI_MISSING_CLAUDE": (
+        "the Claude CLI is missing on the worker; reinstall it, then /loop retry"
+    ),
+    "PROVIDER_CLI_MISSING_CODEX": (
+        "the Codex CLI is missing on the worker; reinstall it, then /loop retry"
+    ),
     "DELIVERY_CHILD_WORKFLOW_FAILED": "the delivery child workflow failed",
     "DELIVERY_NOT_STARTED": "the delivery never started",
     "GITHUB_PUBLICATION_FAILED": "the PRs could not be published",

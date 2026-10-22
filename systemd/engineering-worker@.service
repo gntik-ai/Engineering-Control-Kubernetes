@@ -4,7 +4,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# NEW-232: the worker pings WATCHDOG=1 from its event loop; a stalled loop is aborted
+# (SIGABRT, so faulthandler writes every thread's stack to the journal) and restarted.
+# 10 minutes tolerates the bounded synchronous work some activities still do on the loop
+# (browser evidence uploads, 60 s each); the stalls this catches lasted over an hour.
+# Startup removes stale run directories before READY, so its deadline stays unbounded.
+Type=notify
+NotifyAccess=main
+WatchdogSec=600
+TimeoutStartSec=infinity
+WatchdogSignal=SIGABRT
+LimitCORE=0
 User=%i-runner
 Group=%i-runner
 WorkingDirectory=/var/lib/engineering-control/workers/%i
