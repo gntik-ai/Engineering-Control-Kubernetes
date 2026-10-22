@@ -272,6 +272,46 @@ def test_whitespace_check_fails_closed_on_unexpected_results(
         manager.whitespace_check_failed(worktree, base_sha=sha)
 
 
+def test_whitespace_check_treats_git_warnings_on_a_clean_exit_as_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # falcone #1223 and gntik-ui #247 (2026-10-22) failed closed on exit 0 with warnings.
+    manager, worktree, sha = _whitespace_allocation(tmp_path)
+    real_run = subprocess.run
+    seen: list[list[str]] = []
+    warning = b"warning: in the working copy of 'a', LF will be replaced by CRLF\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        if "--check" in args:
+            seen.append(list(args))
+            return subprocess.CompletedProcess(args, 0, b"", warning + warning)
+        return real_run(args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    assert manager.whitespace_check_failed(worktree, base_sha=sha) is False
+    # Rename detection stays on: an unchanged rename must not count as new content.
+    assert "--no-renames" not in seen[0]
+
+
+def test_whitespace_check_failure_names_the_output_shape_not_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, worktree, sha = _whitespace_allocation(tmp_path)
+    real_run = subprocess.run
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        if "--check" in args:
+            return subprocess.CompletedProcess(args, 0, b"", b"error: secret-looking text\n")
+        return real_run(args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    with pytest.raises(WorktreeError) as raised:
+        manager.whitespace_check_failed(worktree, base_sha=sha)
+    message = str(raised.value)
+    assert "stdout lines 0, stderr lines 1, stderr warnings only False" in message
+    assert "secret-looking" not in message
+
+
 def test_maker_and_checker_must_be_independent() -> None:
     with pytest.raises(ValueError, match="must differ"):
         WorktreeAccess("codex-runner", "codex-runner")
