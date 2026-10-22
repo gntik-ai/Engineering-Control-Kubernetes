@@ -1058,7 +1058,10 @@ class GitWorktreeManager:
         violation (gntik-ui #16: a generated snapshot kept rendered trailing spaces).
         The output is never parsed or returned: Git prints file names and offending
         lines verbatim. Exit 2 with silent stderr is Git's "problems found" result;
-        anything else (errors, unexpected output) fails closed.
+        anything else (errors, unexpected output) fails closed. Exit 0 with only
+        `warning:` lines on stderr is clean: Git warns there without failing (falcone
+        #1223 and gntik-ui #247, 2026-10-22, failed closed on such a result). The
+        failure message names only the shape of the output, never its text.
         """
         root = self.worktree_root.resolve()
         resolved = path.resolve()
@@ -1081,11 +1084,14 @@ class GitWorktreeManager:
                 "--",
             ],
         )
-        if result.returncode == 0 and not result.stdout and not result.stderr:
+        if result.returncode == 0 and not result.stdout and _only_git_warnings(result.stderr):
             return False
         if result.returncode == 2 and result.stdout and not result.stderr:
             return True
-        raise WorktreeError(f"unexpected git diff --check result ({result.returncode})")
+        raise WorktreeError(
+            f"unexpected git diff --check result ({result.returncode}; "
+            f"{_output_shape(result.stdout, result.stderr)})"
+        )
 
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, object], str]:
         root = self.worktree_root.resolve()
@@ -1392,3 +1398,17 @@ class GitWorktreeManager:
             self._metadata_git(allocation.repository, metadata),
             ["worktree", "remove", "--force", str(allocation.path)],
         )
+
+
+def _only_git_warnings(stderr: bytes) -> bool:
+    """Empty, or every non-blank line is a Git `warning:` line."""
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    return all(line.startswith(b"warning: ") for line in lines)
+
+
+def _output_shape(stdout: bytes, stderr: bytes) -> str:
+    """Line counts and the warning-only flag: diagnosable without echoing repository text."""
+    out = sum(1 for line in stdout.splitlines() if line.strip())
+    err = [line for line in stderr.splitlines() if line.strip()]
+    warning_only = bool(err) and all(line.startswith(b"warning: ") for line in err)
+    return f"stdout lines {out}, stderr lines {len(err)}, stderr warnings only {warning_only}"
