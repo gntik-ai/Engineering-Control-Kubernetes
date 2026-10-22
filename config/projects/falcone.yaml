@@ -227,6 +227,18 @@ toolchain:
       argv: [pnpm, install, --frozen-lockfile]
       timeout_seconds: 1800
 maker_rules:
+  source:
+    - >-
+      apps/web-console-next: SHELL_TEST_FIXTURES=true is a build flag for the Playwright
+      builds only (.github/workflows/ci.yml). CI never runs the full vitest suite with it,
+      and in that mode the route-set assertion fails on main too, because router.tsx adds
+      /console/__fixture/*. Do not run or block on a fixture-mode full vitest run. The gates
+      are the normal vitest suite, the separate fixture tests and the CI browser jobs.
+    - >-
+      Chromium cannot launch in the maker sandbox. Report the browser parity, axe and
+      viewport runs as SKIPPED ("Chromium unavailable; PR CI runs them") instead of
+      blocking; they gate the pull request in CI. Visual review is not covered by CI: the
+      parity screenshots still need the checker's assessment and operator approval.
   deployment:
     - >-
       Chart changes must survive `helm upgrade --reuse-values` from an existing release:
