@@ -1038,13 +1038,19 @@ async def test_the_controller_selects_and_completes_a_merge_only_delivery(
 # -- the root reconciler: gntik-ui joins without stranding an in-flight campaign -------------
 
 SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py"))
+# The allowlist before the newest project joined (gntik-ui at NEW-160, now
+# falcone-serverless): an in-flight campaign's policy and queued request stay valid.
 PREVIOUS = [
     "gntik-ai/falcone",
     "gntik-ai/falcone-charts",
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
 ]
+NEWEST = "gntik-ai/falcone-serverless"
+# The set before gntik-ui joined (NEW-160): still accepted, never rotated out.
+PRE_GNTIK_UI = PREVIOUS[:-1]
 
 
 def _request(tmp_path: Path, repositories: list[str], project: str = "falcone") -> Path:
@@ -1068,12 +1074,13 @@ def _request(tmp_path: Path, repositories: list[str], project: str = "falcone") 
 
 
 def test_the_reconciler_accepts_new_and_in_flight_requests(tmp_path: Path) -> None:
-    assert SCRIPT["SAFE_REPOSITORIES"] == (*PREVIOUS, REPOSITORY)
+    assert SCRIPT["SAFE_REPOSITORIES"] == (*PREVIOUS, NEWEST)
     read = SCRIPT["read_request"]
-    assert read(_request(tmp_path, [*PREVIOUS, REPOSITORY], "gntik-ui"), os.getuid())
+    assert read(_request(tmp_path, [*PREVIOUS, NEWEST], "falcone-serverless"), os.getuid())
     # NEW-160: a request queued by the previous release is still honoured.
     assert read(_request(tmp_path, PREVIOUS), os.getuid())["project"] == "falcone"
-    for other in ([*PREVIOUS[:-1]], [REPOSITORY], [*PREVIOUS, REPOSITORY, "gntik-ai/x"]):
+    assert read(_request(tmp_path, PRE_GNTIK_UI), os.getuid())["project"] == "falcone"
+    for other in (PREVIOUS[:-2], [NEWEST], [*PREVIOUS, NEWEST, "gntik-ai/x"]):
         with pytest.raises(ValueError, match="repository set changed"):
             read(_request(tmp_path, other), os.getuid())
 
@@ -1109,12 +1116,14 @@ def _root_policy(
 @pytest.mark.parametrize(
     ("repositories", "valid"),
     [
-        ([*PREVIOUS, REPOSITORY], True),
+        ([*PREVIOUS, NEWEST], True),
         # The policy the running campaign enabled before this release.
         (PREVIOUS, True),
+        # The policy a campaign enabled before gntik-ui joined (review 1: never rotated out).
+        (PRE_GNTIK_UI, True),
         (None, True),
-        (PREVIOUS[:-1], False),
-        ([REPOSITORY], False),
+        (PREVIOUS[:-2], False),
+        ([NEWEST], False),
     ],
 )
 def test_the_reconciler_keeps_an_in_flight_enabled_policy_valid(
@@ -1139,20 +1148,23 @@ def test_installing_an_enabled_policy_writes_the_current_allowlist(
     policy.write_text("enabled: false\nsafe_repositories: []\n", encoding="utf-8")
     SCRIPT["install_policy"](policy, tmp_path / "backups", os.getgid(), enabled=True)
     value = yaml.safe_load(policy.read_text(encoding="utf-8"))
-    assert value == {"enabled": True, "safe_repositories": [*PREVIOUS, REPOSITORY]}
+    assert value == {"enabled": True, "safe_repositories": [*PREVIOUS, NEWEST]}
 
 
 def test_the_worker_write_policy_accepts_the_in_flight_allowlist() -> None:
     from engineering_control.policy.github_write import (
+        HISTORICAL_WRITE_REPOSITORIES,
         PREVIOUS_WRITE_REPOSITORIES,
         WRITE_REPOSITORIES,
         GitHubWritePolicyDocument,
     )
 
     assert set(PREVIOUS) == PREVIOUS_WRITE_REPOSITORIES
-    assert WRITE_REPOSITORIES == {*PREVIOUS, REPOSITORY}
+    assert HISTORICAL_WRITE_REPOSITORIES == (set(PREVIOUS), set(PRE_GNTIK_UI))
+    assert SCRIPT["HISTORICAL_SAFE_REPOSITORIES"] == (tuple(PREVIOUS), tuple(PRE_GNTIK_UI))
+    assert WRITE_REPOSITORIES == {*PREVIOUS, NEWEST}
     document = GitHubWritePolicyDocument(enabled=True, safe_repositories=tuple(PREVIOUS))
-    assert REPOSITORY not in document.safe_repositories
+    assert NEWEST not in document.safe_repositories
 
 
 # -- workflows: the merge ends the delivery ---------------------------------------------------

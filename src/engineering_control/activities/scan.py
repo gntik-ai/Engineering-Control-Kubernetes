@@ -58,12 +58,19 @@ from engineering_control.engineering.safe_files import (
     write_text_at,
 )
 from engineering_control.engineering.toolchain import (
+    CARGO_HOME_CACHE,
+    TOOLCHAIN_BASELINE_SANDBOX_REQUIRED,
+    TOOLCHAIN_CARGO_CONFIG_REFUSED,
     NodeToolchain,
     ToolchainUnavailableError,
+    baseline_language_executables,
+    baseline_requires_sandbox,
+    cargo_config_violations,
     enabled_toolchain,
     load_toolchain_policy,
     match_toolchain_test_command,
     payload_node_toolchain,
+    platform_language_variables,
     prepare_executables,
     render_argv,
     resolve_node_toolchain,
@@ -125,6 +132,8 @@ from engineering_control.worktrees.manager import (
 
 _T = TypeVar("_T")
 _TOOLCHAIN_STDERR_TAIL = 2000
+# Final review: no platform dependency resolution under a pinned Rust/Go toolchain.
+DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN = "DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN"
 _TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
 _BASELINE_TEST_TIMEOUT_SECONDS = 1200
 _BASELINE_OUTPUT_TAIL = 500
@@ -2131,10 +2140,27 @@ class ScanActivityHandler(UiPlanScanSteps):
     def _node_toolchain_environment(
         self, environment: dict[str, str], toolchain: NodeToolchain, base_path: str
     ) -> dict[str, str]:
-        """Add the selected node/pnpm to an environment; the default returns it unchanged."""
+        """Add the selected node/pnpm (and Rust/Go) to an environment; the default returns
+        it unchanged."""
         if toolchain.default:
             return environment
-        return {**environment, **toolchain.variables, "PATH": toolchain.path(base_path)}
+        extra: dict[str, str] = {}
+        if toolchain.rust is not None:
+            # The shared crate cache that `cargo fetch --locked` fills with network and the
+            # offline makers and checkers then read (as go-mod for Go).
+            cargo_home = self.settings.toolchain_cache_root / CARGO_HOME_CACHE
+            cargo_home.mkdir(parents=True, exist_ok=True, mode=0o750)
+            if cargo_home.stat().st_uid == os.getuid():
+                cargo_home.chmod(0o750)
+            extra["CARGO_HOME"] = str(cargo_home)
+        return {
+            **environment,
+            **toolchain.variables,
+            **extra,
+            # Review 1: fixed compiler, no wrapper or credential program, no Go switching.
+            **platform_language_variables(toolchain),
+            "PATH": toolchain.path(base_path),
+        }
 
     def _toolchain_runner_for(self, toolchain: NodeToolchain) -> SafeCommandRunner:
         if toolchain.default or self._runners_injected[0]:
@@ -2144,9 +2170,8 @@ class ScanActivityHandler(UiPlanScanSteps):
     def _dependency_runner_for(self, toolchain: NodeToolchain) -> SafeCommandRunner:
         if toolchain.default or self._runners_injected[1]:
             return self.dependency_runner
-        return SafeCommandRunner(
-            {"go": self.settings.go_executable, "pnpm": toolchain.pnpm_executable}
-        )
+        go = self.settings.go_executable if toolchain.go_bin is None else toolchain.go_bin / "go"
+        return SafeCommandRunner({"go": go, "pnpm": toolchain.pnpm_executable})
 
     # NEW-75: the only commands the platform runs to resolve maker-edited manifests
     # (network; no install scripts), and the only files they may change.
@@ -2177,6 +2202,19 @@ class ScanActivityHandler(UiPlanScanSteps):
             return self._dependency_blocked(payload, error.blocker, str(error))
         except (OSError, ValueError) as error:
             return self._dependency_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error))
+        if self._pinned_language_selection(payload, toolchain):
+            # Final review: resolvers run maker-committed code outside the sandbox (pnpm
+            # runs .pnpmfile.cjs hooks despite --ignore-scripts), so a project with a
+            # pinned Rust/Go selection gets no platform dependency resolution at all; its
+            # makers report DEPENDENCY_CHANGE_REQUIRED instead. Projects without one are
+            # unchanged. Follow-up: the same pnpmfile-hook exposure exists for node
+            # projects' pnpm resolution (falcone, gntik-ui); sandbox or refuse it there.
+            return self._dependency_blocked(
+                payload,
+                DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN,
+                "platform dependency resolution is not available for a pinned Rust/Go "
+                "toolchain; report DEPENDENCY_CHANGE_REQUIRED with the exact dependency",
+            )
         environment = self._node_toolchain_environment(
             self._dependency_environment(), toolchain, _DEFAULT_PATH
         )
@@ -2269,6 +2307,20 @@ class ScanActivityHandler(UiPlanScanSteps):
     def _dependency_environment(self) -> dict[str, str]:
         """The toolchain installer environment plus private Go caches (never GOPROXY auth)."""
         return {**self._toolchain_environment(), "GIT_TERMINAL_PROMPT": "0"}
+
+    def _pinned_language_selection(self, payload: dict[str, Any], toolchain: NodeToolchain) -> bool:
+        """True when the delivery carries, or the project manifest selects, a pinned Rust or
+        Go toolchain. An unreadable manifest counts only through the carried selection, so
+        projects without one behave exactly as before."""
+        if toolchain.rust is not None or toolchain.go is not None:
+            return True
+        try:
+            policy = load_toolchain_policy(
+                self.settings.project_config_root, str(payload.get("project", ""))
+            )
+        except (OSError, ValueError):
+            return False
+        return policy is not None and (policy.rust is not None or policy.go is not None)
 
     @staticmethod
     def _dependency_blocked(
@@ -2631,6 +2683,17 @@ class ScanActivityHandler(UiPlanScanSteps):
                 )
             argv = render_argv(command.argv, self.settings)
             record: dict[str, Any] = {"cwd": command.cwd, "argv": argv}
+            if argv[0] == "cargo":
+                refused = cargo_config_violations(worktree, cwd)
+                if refused:
+                    commands.append({**record, "status": "REFUSED"})
+                    return self._toolchain_blocked(
+                        payload,
+                        TOOLCHAIN_CARGO_CONFIG_REFUSED,
+                        "repository cargo configuration is never used outside the sandbox: "
+                        + ", ".join(refused),
+                        commands,
+                    )
             started = time.monotonic()
             try:
                 result = toolchain_runner.run(
@@ -2770,6 +2833,21 @@ class ScanActivityHandler(UiPlanScanSteps):
             # NEW-159 review 2: the baseline runs under the delivery's carried selection,
             # never a later manifest edit, exactly as the maker and checker did.
             toolchain = payload_node_toolchain(self.settings, payload)
+            refused = [
+                shlex.join(render_argv(command.argv, self.settings))
+                for command in commands
+                if baseline_requires_sandbox(command.argv, toolchain)
+            ]
+            if refused:
+                # Review 2: under a pinned Rust/Go selection only (other projects run as
+                # before): never a checkout, prepare or run (so never cached); the maker
+                # FAIL stays MAKER_TEST_FAILURE with this visible baseline_error.
+                # Follow-ups: sandbox cargo/go baselines like the node sandbox; musematic's
+                # pre-existing go test baseline (no selection) still runs unsandboxed.
+                return None, (
+                    f"{TOOLCHAIN_BASELINE_SANDBOX_REQUIRED}: pinned Rust/Go contract commands "
+                    "are never rerun at the base outside a sandbox: " + "; ".join(refused)
+                )[:_TOOLCHAIN_STDERR_TAIL]
             repository = str(payload["source_repository"])
             results = (
                 self._baseline_test_results(
@@ -3181,6 +3259,11 @@ class ScanActivityHandler(UiPlanScanSteps):
             if not cwd.is_relative_to(resolved_root) or not cwd.is_dir():
                 raise ValueError(f"baseline prepare cwd {command.cwd!r} is not in the checkout")
             argv = render_argv(command.argv, self.settings)
+            if argv[0] == "cargo" and cargo_config_violations(resolved_root, cwd):
+                raise ValueError(
+                    f"{TOOLCHAIN_CARGO_CONFIG_REFUSED}: baseline prepare would read repository "
+                    "cargo configuration"
+                )
             result = toolchain_runner.run(
                 argv[0],
                 argv[1:],
@@ -3203,6 +3286,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         """Contract test commands may run the installers, timeout, or a checkout-local tool."""
         executables = {
             **prepare_executables(self.settings, toolchain),
+            **baseline_language_executables(toolchain),
             "timeout": self.settings.timeout_executable,
         }
         if "/" in executable:
@@ -3225,6 +3309,13 @@ class ScanActivityHandler(UiPlanScanSteps):
         if not cwd.is_relative_to(root) or not cwd.is_dir():
             raise ValueError(f"baseline test cwd {command.cwd!r} is not in the checkout")
         argv = render_argv(command.argv, self.settings)
+        if baseline_requires_sandbox(argv, toolchain):
+            # Review 2 (defence in depth; _preexisting_test_failures refuses first): builds
+            # and tests under a pinned Rust/Go run repository code, so never here,
+            # unsandboxed. Follow-up: sandbox cargo/go baselines like the node sandbox.
+            raise ValueError(
+                f"{TOOLCHAIN_BASELINE_SANDBOX_REQUIRED}: {argv[0]} is never run unsandboxed"
+            )
         runner = self.baseline_runner or SafeCommandRunner(
             self._baseline_executables(root, cwd, argv[0], toolchain)
         )

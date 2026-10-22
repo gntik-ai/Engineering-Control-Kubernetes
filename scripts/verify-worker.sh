@@ -87,7 +87,7 @@ sudo -u release-runner /usr/local/bin/argocd version --client --short | \
 sudo -u hermes /usr/local/bin/gh --version | head -n 1 | \
   grep -q '^gh version 2\.98\.0 '
 sudo -u hermes -H /usr/local/bin/gh auth status --hostname github.com >/dev/null
-for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui; do
+for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui falcone-serverless; do
   sudo -u hermes -H /usr/local/bin/gh repo view "gntik-ai/${repository}" \
     --json nameWithOwner,defaultBranchRef,viewerPermission,isPrivate >/dev/null
 done
@@ -187,6 +187,54 @@ if [[ -e ${TOOLCHAIN_ROOT} || ${ENGINEERING_VERIFY_NODE_TOOLCHAIN:-0} == 1 ]]; t
   echo "PASS node toolchain: node v${NODE24_VERSION}, pnpm ${PNPM_PINNED_VERSION}"
 else
   echo "SKIP node toolchain: ${TOOLCHAIN_ROOT} is not installed"
+fi
+# Shared offline toolchain caches (bootstrap-worker.sh): makers and the checker read and
+# traverse them but never write; scan-runner is the only writer.
+TOOLCHAIN_CACHE=/srv/engineering/cache/scan/toolchain
+for cache in go-mod cargo-home trivy; do
+  for identity in codex-runner claude-runner; do
+    sudo -u "${identity}" test -r "${TOOLCHAIN_CACHE}/${cache}" -a -x "${TOOLCHAIN_CACHE}/${cache}"
+    if sudo -u "${identity}" test -w "${TOOLCHAIN_CACHE}/${cache}"; then
+      echo "FAIL ${identity} can write ${TOOLCHAIN_CACHE}/${cache}" >&2
+      exit 1
+    fi
+  done
+  [[ $(stat -c '%U' "${TOOLCHAIN_CACHE}/${cache}") == scan-runner ]]
+  getfacl -p "${TOOLCHAIN_CACHE}/${cache}" | grep -qx 'default:user:codex-runner:r-x'
+  getfacl -p "${TOOLCHAIN_CACHE}/${cache}" | grep -qx 'default:user:claude-runner:r-x'
+done
+echo "PASS shared toolchain caches: read-only for makers and the checker"
+# ToolchainPolicy.rust / .go (bootstrap-worker.sh --project-toolchains[-only]). Verified
+# when installed, or required with ENGINEERING_VERIFY_LANGUAGE_TOOLCHAINS=1 (set it once a
+# project selects them, today falcone-serverless). Keep in sync with bootstrap-worker.sh
+# and config.py (toolchain_rust_roots / toolchain_go_roots).
+RUST_PINNED_VERSION=1.99.1
+RUST_PINNED_RUSTC="rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+GO_PINNED_LINE=1.26
+GO_PINNED_VERSION=1.26.10
+RUST_LINK="${TOOLCHAIN_ROOT}/rust-${RUST_PINNED_VERSION}"
+GO_LINK="${TOOLCHAIN_ROOT}/go-${GO_PINNED_LINE}"
+if [[ -e ${RUST_LINK} || -e ${GO_LINK} || ${ENGINEERING_VERIFY_LANGUAGE_TOOLCHAINS:-0} == 1 ]]; then
+  for link in "${RUST_LINK}" "${GO_LINK}"; do
+    [[ -L ${link} ]]
+    release=$(readlink -f -- "${link}")
+    [[ $(dirname -- "${release}") == "${TOOLCHAIN_ROOT}" && -d ${release} && ! -L ${release} ]]
+    [[ $(stat -c '%a:%U:%G' "${release}") == 755:root:root ]]
+  done
+  for tool in cargo rustc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+    [[ -x ${RUST_LINK}/bin/${tool} ]]
+  done
+  [[ -x ${GO_LINK}/bin/go && -x ${GO_LINK}/bin/gofmt ]]
+  for identity in codex-runner claude-runner scan-runner; do
+    [[ $(cd / && sudo -u "${identity}" env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      "${RUST_LINK}/bin/rustc" --version) == "${RUST_PINNED_RUSTC}" ]]
+    [[ $(cd / && sudo -u "${identity}" env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      GOTOOLCHAIN=local GOTELEMETRY=off "${GO_LINK}/bin/go" version) == \
+      "go version go${GO_PINNED_VERSION} linux/amd64" ]]
+  done
+  echo "PASS language toolchains: rust ${RUST_PINNED_VERSION}, go ${GO_PINNED_VERSION}"
+else
+  echo "SKIP language toolchains: rust ${RUST_PINNED_VERSION} and go ${GO_PINNED_LINE} are not installed"
 fi
 
 if (( blocked != 0 )); then

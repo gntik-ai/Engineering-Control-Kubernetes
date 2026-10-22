@@ -20,13 +20,19 @@ ORGANIZATION: Final = "gntik-ai"
 
 # mypy cannot build a Literal from a tuple, so the Literal is the source and the tuples
 # are derived from it.
-ProjectName = Literal["falcone", "musematic", "llmwiki", "gntik-ui"]
+ProjectName = Literal["falcone", "musematic", "llmwiki", "gntik-ui", "falcone-serverless"]
 # Projects of the global / multi-project campaign paths (all-project audit, backlog
 # campaign id maps). A project may be registered without joining them.
 GlobalProjectName = Literal["falcone", "musematic", "llmwiki"]
 # Repository slugs (name without the organization), source then deployment per project.
 RepositorySlug = Literal[
-    "falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki", "gntik-ui"
+    "falcone",
+    "falcone-charts",
+    "musematic",
+    "musematic-deploy",
+    "llmwiki",
+    "gntik-ui",
+    "falcone-serverless",
 ]
 BranchName = Literal["main", "master"]
 RepositoryFullName = Literal[
@@ -36,6 +42,7 @@ RepositoryFullName = Literal[
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
+    "gntik-ai/falcone-serverless",
 ]
 
 PROJECTS: Final[tuple[ProjectName, ...]] = get_args(ProjectName)
@@ -56,6 +63,9 @@ PROJECT_REPOSITORY_SLUGS: Final[MappingProxyType[str, tuple[str, str]]] = Mappin
         "llmwiki": ("llmwiki", "llmwiki"),
         # NEW-160: the UI kit monorepo; delivery ends at Hermes's protected merge.
         "gntik-ui": ("gntik-ui", "gntik-ui"),
+        # The Falcone serverless runtime (Rust worker, Go controller). No runtime adapter
+        # yet: delivery ends at Hermes's protected merge, as for gntik-ui.
+        "falcone-serverless": ("falcone-serverless", "falcone-serverless"),
     }
 )
 # project -> (source full name, deployment full name)
@@ -99,7 +109,13 @@ SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS: Final[tuple[str, ...]] = tuple(
 )
 # Default branch of a project's source and deployment repositories.
 DEFAULT_BRANCH: Final[MappingProxyType[str, BranchName]] = MappingProxyType(
-    {"falcone": "main", "musematic": "main", "llmwiki": "master", "gntik-ui": "main"}
+    {
+        "falcone": "main",
+        "musematic": "main",
+        "llmwiki": "master",
+        "gntik-ui": "main",
+        "falcone-serverless": "main",
+    }
 )
 
 

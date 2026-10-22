@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="page-heading"><div><p class="eyebrow">Persisted audit outcomes</p><h2>Findings</h2></div><a href="/commands">Back to commands</a></section>
-<form id="findings-filters" class="filters"><label>Project<select name="project"><option value="">All</option><option>falcone</option><option>musematic</option><option>llmwiki</option><option>gntik-ui</option></select></label><label>Limit<input name="limit" type="number" min="1" max="200" value="100"></label><button type="submit">Apply</button></form>
+<form id="findings-filters" class="filters"><label>Project<select name="project"><option value="">All</option><option>falcone</option><option>musematic</option><option>llmwiki</option><option>gntik-ui</option><option>falcone-serverless</option></select></label><label>Limit<input name="limit" type="number" min="1" max="200" value="100"></label><button type="submit">Apply</button></form>
 <p id="findings-error" class="alert error hidden" role="alert" aria-live="polite"></p><p id="findings-refreshed" class="muted"></p>
 <div class="table-shell"><table><thead><tr><th>Finding</th><th>Project</th><th>Domain</th><th>Persona</th><th>Severity</th><th>Risk</th><th>Disposition</th><th>Component</th><th>Recommended action</th><th>Updated</th></tr></thead><tbody id="findings-rows"></tbody></table></div>
 <p id="findings-empty" class="empty hidden">No persisted findings match this filter.</p>

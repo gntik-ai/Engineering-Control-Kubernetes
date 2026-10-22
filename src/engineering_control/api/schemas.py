@@ -420,6 +420,7 @@ class ChangeRequestCreate(APIModel):
             "gntik-ai/musematic-deploy",
             "gntik-ai/llmwiki",
             "gntik-ai/gntik-ui",
+            "gntik-ai/falcone-serverless",
         ]
         | None
     ) = None
@@ -484,7 +485,8 @@ class ChangeRequestPublication(APIModel):
     issue_url: str = Field(
         pattern=(
             r"^https://github\.com/gntik-ai/"
-            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
+            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui"
+            r"|falcone-serverless)"
             r"/issues/[1-9][0-9]*$"
         )
     )

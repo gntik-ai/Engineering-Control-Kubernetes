@@ -2735,7 +2735,13 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: GitHubBacklogImportInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
+        if request.project not in {
+            "falcone",
+            "musematic",
+            "llmwiki",
+            "gntik-ui",
+            "falcone-serverless",
+        }:
             raise ApplicationError(
                 "existing GitHub backlog project is not allowlisted",
                 type="PolicyViolation",
@@ -2777,14 +2783,17 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 # NEW-145: the pull requests a publication reconciliation may read (same allowlist as
 # gitops.pr_heads).
 _PUBLICATION_PR_URL = re.compile(
-    r"https://github\.com/gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
+    r"https://github\.com/gntik-ai/"
+    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless)"
     r"/pull/[1-9][0-9]{0,9}"
 )
 _PUBLICATION_REPOSITORY = re.compile(
-    r"gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
+    r"gntik-ai/"
+    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless)"
 )
 _PUBLICATION_BRANCH = re.compile(
-    r"agent/(?:falcone|musematic|llmwiki|gntik-ui)/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
+    r"agent/(?:falcone|musematic|llmwiki|gntik-ui|falcone-serverless)"
+    r"/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
 )
 _AMEND_ISSUE_REPOSITORIES = frozenset(
     {
@@ -2794,6 +2803,7 @@ _AMEND_ISSUE_REPOSITORIES = frozenset(
         "gntik-ai/musematic-deploy",
         "gntik-ai/llmwiki",
         "gntik-ai/gntik-ui",
+        "gntik-ai/falcone-serverless",
     }
 )
 
@@ -3842,7 +3852,13 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         return workflow.patched("existing-backlog-blocked-start-closes-run-v1")
 
     async def _run_loop(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
+        if request.project not in {
+            "falcone",
+            "musematic",
+            "llmwiki",
+            "gntik-ui",
+            "falcone-serverless",
+        }:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",
                 type="PolicyViolation",

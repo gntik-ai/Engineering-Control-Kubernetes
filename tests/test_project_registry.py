@@ -222,9 +222,11 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
     },
     # root-owned; may not import the package (text parity below)
     "scripts/reconcile-backlog-github-policy.py": {
-        # SAFE_REPOSITORIES, then the pre-NEW-160 set still accepted from in-flight campaigns
+        # SAFE_REPOSITORIES, then every earlier set still accepted from in-flight campaigns
+        # (before falcone-serverless, before gntik-ui)
         "<module>": [
             "REPOSITORIES",
+            "(gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/musematic, gntik-ai/musematic-deploy, gntik-ai/llmwiki, gntik-ai/gntik-ui)",  # noqa: E501
             "(gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/musematic, gntik-ai/musematic-deploy, gntik-ai/llmwiki)",  # noqa: E501
         ],
         "read_request": ["{PROJECTS}"],
@@ -234,6 +236,7 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
             "(gntik-ai/musematic, gntik-ai/musematic-deploy)",
             "(gntik-ai/llmwiki, gntik-ai/llmwiki)",
             "(gntik-ai/gntik-ui, gntik-ai/gntik-ui)",
+            "(gntik-ai/falcone-serverless, gntik-ai/falcone-serverless)",
         ],
         "verified_owner_expiry": [
             "keys:PROJECTS",
@@ -241,6 +244,7 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
             "(gntik-ai/musematic, gntik-ai/musematic-deploy)",
             "(gntik-ai/llmwiki, gntik-ai/llmwiki)",
             "(gntik-ai/gntik-ui, gntik-ai/gntik-ui)",
+            "(gntik-ai/falcone-serverless, gntik-ai/falcone-serverless)",
         ],
     },
     # root-owned; may not import the package
@@ -333,13 +337,13 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
     "src/engineering_control/dashboard/schemas.py": {
         "ActivityEventInput": ["f:@PROJECT_ALTERNATION@|platform"],
     },
-    # NEW-222: gntik-ui's R3 keyword exemptions are a single-project feature
+    # NEW-222: per-project R3 keyword exemptions (gntik-ui, falcone-serverless)
     "src/engineering_control/engineering/backlog.py": {
         "<module>": [
             "f:@REPOSITORY_SLUG_ALTERNATION@",
             "f:@REPOSITORY_SLUG_ALTERNATION@",
             "f:@REPOSITORY_SLUG_ALTERNATION@",
-            "keys:(gntik-ui)",
+            "keys:(gntik-ui, falcone-serverless)",
         ],
     },
     # UI-kit repositories per project
@@ -432,9 +436,10 @@ CATALOG_SITES: dict[str, dict[str, list[str]]] = {
     "src/engineering_control/operations/repository.py": {
         "command_target": ["(llmwiki, staging-bootstrap-plan, llmwiki)"],
     },
-    # NEW-160: the write allowlist before gntik-ui (in-flight campaign policies)
+    # NEW-160: the write allowlists before falcone-serverless and before gntik-ui
+    # (in-flight campaign policies)
     "src/engineering_control/policy/github_write.py": {
-        "<module>": ["{gntik-ai/gntik-ui}"],
+        "<module>": ["{gntik-ai/falcone-serverless}", "{gntik-ai/gntik-ui}"],
     },
     # workflow sandbox module: not converted (replay safety)
     "src/engineering_control/workflows/cleanup_scope.py": {
@@ -738,6 +743,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
         "(musematic, musematic-deploy)",
         "(llmwiki, llmwiki)",
         "(gntik-ui, gntik-ui)",
+        "(falcone-serverless, falcone-serverless)",
     ],
     "adapters.github.client:ALLOWED_REPOSITORIES": ["{REPOSITORIES}"],
     "adapters.llmwiki.staging:BootstrapAction.surface": [
@@ -775,7 +781,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "cli:_CHANGE_REPOSITORIES": ["REPOSITORY_SLUGS"],
     "dashboard.app:PROJECTS": ["{PROJECTS}"],
     "dashboard.schemas:ActivityEventInput.project": [
-        "re:(falcone, musematic, llmwiki, gntik-ui, platform)"
+        "re:(falcone, musematic, llmwiki, gntik-ui, falcone-serverless, platform)"
     ],
     "db.change_requests:_ISSUE_URL": ["re:REPOSITORY_SLUGS"],
     "delivery_notifications:_PROJECTS": ["{PROJECTS}"],
@@ -785,11 +791,12 @@ RUNTIME_SITES: dict[str, list[str]] = {
         "(gntik-ai/musematic, gntik-ai/musematic-deploy)",
         "(gntik-ai/llmwiki, gntik-ai/llmwiki)",
         "(gntik-ai/gntik-ui, gntik-ai/gntik-ui)",
+        "(gntik-ai/falcone-serverless, gntik-ai/falcone-serverless)",
     ],
     "engineering.backlog:BACKLOG_REPOSITORIES": ["{REPOSITORIES}"],
     "engineering.backlog:BacklogApprovalBinding.project": ["enum:PROJECTS"],
     "engineering.backlog:GitHubBacklogImportSnapshot.project": ["enum:PROJECTS"],
-    "engineering.backlog:PROJECT_R3_KEYWORD_EXEMPTIONS": ["keys:(gntik-ui)"],
+    "engineering.backlog:PROJECT_R3_KEYWORD_EXEMPTIONS": ["keys:(gntik-ui, falcone-serverless)"],
     "engineering.backlog:_ISSUE_URL": ["re:REPOSITORY_SLUGS"],
     "engineering.backlog:_REFERENCE": ["re:REPOSITORY_SLUGS"],
     "engineering.backlog:_REPOSITORY": ["re:REPOSITORY_SLUGS"],
@@ -855,8 +862,15 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "operations.models:WorkflowControlCommand.repository": ["enum:REPOSITORY_SLUGS"],
     "operations.publication_reconcile:_PR_URL": ["re:REPOSITORY_SLUGS"],
     "operations.registry:_PROJECT": ["PROJECTS"],
-    "policy.github_write:PREVIOUS_WRITE_REPOSITORIES": [
+    "policy.github_write:HISTORICAL_WRITE_REPOSITORIES": [
+        "{gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/gntik-ui, gntik-ai/llmwiki, gntik-ai/musematic, gntik-ai/musematic-deploy}",  # noqa: E501
+        "{gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/llmwiki, gntik-ai/musematic, gntik-ai/musematic-deploy}",  # noqa: E501
+    ],
+    "policy.github_write:PRE_GNTIK_UI_WRITE_REPOSITORIES": [
         "{gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/llmwiki, gntik-ai/musematic, gntik-ai/musematic-deploy}"  # noqa: E501
+    ],
+    "policy.github_write:PREVIOUS_WRITE_REPOSITORIES": [
+        "{gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/gntik-ui, gntik-ai/llmwiki, gntik-ai/musematic, gntik-ai/musematic-deploy}"  # noqa: E501
     ],
     "policy.github_write:WRITE_REPOSITORIES": ["{REPOSITORIES}"],
     "workflows.cleanup_scope:CLEANUP_PROJECTS": ["{PROJECTS}"],
@@ -867,7 +881,7 @@ RUNTIME_SITES: dict[str, list[str]] = {
     "workflows.definitions:_PUBLICATION_PR_URL": ["re:REPOSITORY_SLUGS"],
     "workflows.definitions:_PUBLICATION_REPOSITORY": ["re:REPOSITORY_SLUGS"],
     "worktrees.manager:GitWorktreeManager._deployment_repositories": [
-        "{falcone-charts, gntik-ui, llmwiki, musematic-deploy}"
+        "{falcone-charts, falcone-serverless, gntik-ui, llmwiki, musematic-deploy}"
     ],
     "worktrees.manager:GitWorktreeManager._repositories": ["{REPOSITORY_SLUGS}"],
 }
@@ -1010,7 +1024,7 @@ def test_registry_is_internally_consistent() -> None:
         dict.fromkeys(slug for pair in PROJECT_REPOSITORY_SLUGS.values() for slug in pair)
     )
     assert REPOSITORIES == tuple(f"{projects.ORGANIZATION}/{slug}" for slug in REPOSITORY_SLUGS)
-    assert SELF_CONTAINED == {"llmwiki", "gntik-ui"}
+    assert SELF_CONTAINED == {"llmwiki", "gntik-ui", "falcone-serverless"}
     assert projects.SPLIT_PROJECTS == ("falcone", "musematic")
     assert dict(projects.REPOSITORY_PROJECTS) == {
         "falcone": "falcone",
@@ -1019,13 +1033,16 @@ def test_registry_is_internally_consistent() -> None:
         "musematic-deploy": "musematic",
         "llmwiki": "llmwiki",
         "gntik-ui": "gntik-ui",
+        "falcone-serverless": "falcone-serverless",
     }
     assert projects.default_branch("llmwiki") == "master"
     assert projects.default_branch("gntik-ui") == "main"
+    assert projects.default_branch("falcone-serverless") == "main"
     assert "gntik-ui" not in GLOBAL_PROJECTS
+    assert "falcone-serverless" not in GLOBAL_PROJECTS
     assert projects.default_branch("unregistered") == "main"
     assert projects.REPOSITORY_SLUG_ALTERNATION == (
-        "falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui"
+        "falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless"
     )
     with pytest.raises(ValueError):
         projects.alternation(("falcone", "a|b"))
@@ -1064,8 +1081,8 @@ def _mutated(relative: str, old: str, new: str) -> list[str]:
         # A narrowed allowlist (now a single name) in a root-owned script.
         (
             "scripts/reconcile-backlog-github-policy.py",
-            'if value["project"] not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:',
-            'if value["project"] not in {"falcone"}:',
+            '        "gntik-ui",\n        "falcone-serverless",\n    }:',
+            "    }:",
         ),
         # A reordered ordered catalog.
         (
@@ -1292,11 +1309,14 @@ def test_root_owned_shell_scripts_match_the_registry_as_text() -> None:
         *(f"{projects.ORGANIZATION}-{slug}" for slug in REPOSITORY_SLUGS),
     )
     # Manifests are installed per project; NEW-160: credentials, personas and flows only for
-    # projects with a runtime (gntik-ui is skipped right after its manifest).
+    # projects with a runtime (gntik-ui and falcone-serverless are skipped right after their
+    # manifests).
     match = re.search(r"^for project in ([a-z0-9 -]+); do$", worker, re.MULTILINE)
     assert match is not None and tuple(match.group(1).split()) == PROJECTS
     loop = worker[match.end() : worker.index("\ndone\n", match.end())]
-    assert loop.index("projects.d") < loop.index("if [[ ${project} == gntik-ui ]]; then")
+    assert loop.index("projects.d") < loop.index(
+        "if [[ ${project} == gntik-ui || ${project} == falcone-serverless ]]; then"
+    )
     assert loop.index("continue") < loop.index("personas.d") < loop.index("flows.d")
 
 
@@ -1314,7 +1334,8 @@ def test_policy_activation_request_repositories_are_byte_identical() -> None:
     )
     assert json.dumps(request["safe_repositories"]) == (
         '["gntik-ai/falcone", "gntik-ai/falcone-charts", "gntik-ai/musematic", '
-        '"gntik-ai/musematic-deploy", "gntik-ai/llmwiki", "gntik-ai/gntik-ui"]'
+        '"gntik-ai/musematic-deploy", "gntik-ai/llmwiki", "gntik-ai/gntik-ui", '
+        '"gntik-ai/falcone-serverless"]'
     )
     reconcile = SCRIPTS / "reconcile-backlog-github-policy.py"
     tree = ast.parse(reconcile.read_text(encoding="utf-8"))

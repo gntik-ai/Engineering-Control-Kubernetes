@@ -128,7 +128,7 @@ def test_toolchain_contract_rejects_paths_outside_the_repository(cwd: str) -> No
     [["bash", "-c", "uv sync"], ["npm", "ci"], ["/usr/local/bin/uv", "sync"], ["curl", "x"]],
 )
 def test_toolchain_contract_rejects_executables_outside_the_allowlist(argv: list[str]) -> None:
-    with pytest.raises(ValidationError, match="must be one of go, pnpm, trivy, uv"):
+    with pytest.raises(ValidationError, match="must be one of cargo, go, pnpm, trivy, uv"):
         ToolchainPolicy.model_validate({"enabled": True, "prepare": [{"cwd": ".", "argv": argv}]})
 
 

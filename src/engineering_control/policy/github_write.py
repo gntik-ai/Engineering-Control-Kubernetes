@@ -74,10 +74,15 @@ GITHUB_ACTIVITY_STEPS = (
     | CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
 )
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
-# NEW-160: the write allowlist before gntik-ui joined. A policy enabled for a campaign
-# approved before that release still lists exactly these until its terminal disable
-# (scripts/reconcile-backlog-github-policy.py PREVIOUS_SAFE_REPOSITORIES).
-PREVIOUS_WRITE_REPOSITORIES = WRITE_REPOSITORIES - {"gntik-ai/gntik-ui"}
+# NEW-160: every write allowlist an earlier release installed. A policy enabled for a
+# campaign approved before a project joined still lists exactly that release's set until
+# its terminal disable (scripts/reconcile-backlog-github-policy.py
+# HISTORICAL_SAFE_REPOSITORIES); sets are only ever added, never rotated out.
+# Before falcone-serverless joined:
+PREVIOUS_WRITE_REPOSITORIES = WRITE_REPOSITORIES - {"gntik-ai/falcone-serverless"}
+# Before gntik-ui joined (NEW-160):
+PRE_GNTIK_UI_WRITE_REPOSITORIES = PREVIOUS_WRITE_REPOSITORIES - {"gntik-ai/gntik-ui"}
+HISTORICAL_WRITE_REPOSITORIES = (PREVIOUS_WRITE_REPOSITORIES, PRE_GNTIK_UI_WRITE_REPOSITORIES)
 
 
 class GitHubWriteDenialReason(StrEnum):

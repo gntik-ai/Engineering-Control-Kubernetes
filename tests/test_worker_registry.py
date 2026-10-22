@@ -331,7 +331,7 @@ def test_registry_verifier_is_mandatory_for_both_bootstraps() -> None:
     assert "source GitHub safe repository list must be empty" in verifier
     assert "WRITE_REPOSITORIES" in verifier
     # NEW-160: or exactly the pre-gntik-ui allowlist of a campaign enabled before the deploy.
-    assert "set(repositories) in (WRITE_REPOSITORIES, PREVIOUS_WRITE_REPOSITORIES)" in verifier
+    assert "set(repositories) in (WRITE_REPOSITORIES, *HISTORICAL_WRITE_REPOSITORIES)" in verifier
     for bootstrap in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
         content = (ROOT / "scripts" / bootstrap).read_text(encoding="utf-8")
         assert "verify-worker-registry.py" in content

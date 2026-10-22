@@ -19,7 +19,7 @@ from engineering_control.activities.github import GitHubActivityHandler  # noqa:
 from engineering_control.policy.github_write import (  # noqa: E402
     GITHUB_ACTIVITY_STEPS,
     GITHUB_WRITE_POLICY_PATH,
-    PREVIOUS_WRITE_REPOSITORIES,
+    HISTORICAL_WRITE_REPOSITORIES,
     WRITE_REPOSITORIES,
 )
 from engineering_control.workflows.definitions import ControlledWorkflow  # noqa: E402
@@ -199,7 +199,7 @@ def verify_write_policy(path: Path) -> None:
                 enabled is True
                 and isinstance(repositories, list)
                 and len(repositories) == len(set(repositories))
-                and set(repositories) in (WRITE_REPOSITORIES, PREVIOUS_WRITE_REPOSITORIES)
+                and set(repositories) in (WRITE_REPOSITORIES, *HISTORICAL_WRITE_REPOSITORIES)
             ),
             "installed GitHub policy is neither disabled nor exactly backlog-approved",
         )
