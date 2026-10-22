@@ -29,6 +29,7 @@ from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
 from engineering_control.db.ui_gap_consolidations import UiGapConsolidationRepository
 from engineering_control.delivery_notifications import CTL, enqueue_milestone, literal
+from engineering_control.engineering import plan_review
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
     MAXIMUM_ISSUE_BODY_CHARACTERS,
@@ -181,31 +182,27 @@ _CONSOLIDATED_GAP_RULE = (
 )
 
 
+# NEW-234: the plan-review helpers live in engineering/plan_review.py. These thin wrappers
+# pass this module's globals at call time, so rebinding PRIOR_FINDINGS_MAX,
+# PRIOR_FINDINGS_CHARS, _finding_text or _fenced here behaves exactly as before the move.
+
+
 def _fenced(label: str, content: str) -> str:
-    content = content.replace("--- BEGIN", "[fence removed]").replace("--- END", "[fence removed]")
-    return f"--- BEGIN {label.upper()} ---\n{content.strip()}\n--- END {label.upper()} ---"
+    return plan_review.fenced(label, content)
 
 
 def _bounded_json(value: Any, limit: int) -> str:
-    text = json.dumps(value, sort_keys=True, ensure_ascii=False)
-    return text if len(text) <= limit else text[:limit] + " [truncated]"
+    return plan_review.bounded_json(value, limit)
 
 
 # NEW-139: review convergence. Every review of a part is exhaustive, and every redraft and
 # re-review carries all earlier findings on that part (labelled by round), bounded.
-PRIOR_FINDINGS_MAX = 60
-PRIOR_FINDINGS_CHARS = 40_000
+PRIOR_FINDINGS_MAX = plan_review.PRIOR_FINDINGS_MAX
+PRIOR_FINDINGS_CHARS = plan_review.PRIOR_FINDINGS_CHARS
 
 
 def _finding_text(item: Any) -> str:
-    if isinstance(item, dict):
-        text = (
-            f"[{item.get('category') or '-'}] {item.get('subject') or '-'}: "
-            f"{item.get('detail') or ''}"
-        )
-    else:
-        text = str(item)
-    return " ".join(text.split())[:2_000]
+    return plan_review.finding_text(item)
 
 
 def cumulative_findings(
@@ -216,91 +213,32 @@ def cumulative_findings(
     *,
     bounded: bool = True,
 ) -> tuple[list[str], int]:
-    """Every REVISE finding and Hermes rejection finding on drafts 1..before-1 of a part,
-    deduplicated (a repeated finding lists every round it was raised in) and labelled by
-    round, ordered by each finding's latest occurrence. Past PRIOR_FINDINGS_MAX findings or
-    PRIOR_FINDINGS_CHARS characters the findings last raised longest ago are omitted (the
-    newest rounds, repeats included, are kept whole); returns the lines and the number
-    omitted.
-
-    NEW-142: `previous` (blueprint_id, reviews, rejections) is the earlier plan run this
-    part continues; all its findings come first, labelled "previous run <id>, round N"."""
-    raised: list[tuple[tuple[int, int], str, str]] = []
-
-    def collect(
-        run: int, prefix: str, items: list[dict[str, Any]], fails: list[dict[str, Any]], limit: int
-    ) -> None:
-        for review in items:
-            attempt = int(review.get("attempt") or 0)
-            if 1 <= attempt < limit and review.get("decision") == "REVISE":
-                label = f"{prefix}round {attempt} (review of draft {attempt})"
-                raised.extend(
-                    ((run, attempt), label, _finding_text(item))
-                    for item in review.get("findings") or []
-                )
-        for rejection in fails:
-            attempt = int(rejection.get("attempt") or 0)
-            if 1 <= attempt < limit:
-                source = f"Hermes rejection {rejection.get('code') or ''}".strip()
-                label = f"{prefix}round {attempt} ({source} of draft {attempt})"
-                raised.extend(
-                    ((run, attempt), label, _finding_text(item))
-                    for item in rejection.get("details") or []
-                )
-
-    if previous:
-        collect(
-            0,
-            f"previous run {str(previous.get('blueprint_id'))[:8]}, ",
-            list(previous.get("reviews") or []),
-            list(previous.get("rejections") or []),
-            1_000,
-        )
-    collect(1, "", reviews, rejections, before)
-    rounds: dict[str, list[str]] = {}
-    latest: dict[str, int] = {}
-    for position, (_order, label, text) in enumerate(sorted(raised, key=lambda x: x[0])):
-        if label not in rounds.setdefault(text, []):
-            rounds[text].append(label)
-        latest[text] = position
-    # NEW-139 review: order by each finding's latest occurrence, so a finding repeated in
-    # the newest round (still unresolved) is kept before older round-only findings.
-    order = sorted(rounds, key=lambda text: latest[text])
-    lines = [f"- [{'; '.join(rounds[text])}] {text}" for text in order]
-    if not bounded:
-        # NEW-142 review: the complete list, staged with a continued draft.
-        return lines, 0
-    kept: list[str] = []
-    size = 0
-    for line in reversed(lines):
-        if len(kept) >= PRIOR_FINDINGS_MAX or size + len(line) + 1 > PRIOR_FINDINGS_CHARS:
-            break
-        kept.append(line)
-        size += len(line) + 1
-    kept.reverse()
-    return kept, len(lines) - len(kept)
+    """See plan_review.cumulative_findings (bounded by this module's PRIOR_FINDINGS_*)."""
+    return plan_review.cumulative_findings(
+        reviews,
+        rejections,
+        before,
+        previous,
+        bounded=bounded,
+        max_findings=PRIOR_FINDINGS_MAX,
+        max_chars=PRIOR_FINDINGS_CHARS,
+        format_finding=_finding_text,
+    )
 
 
 def _findings_block(
     label: str, lines: list[str], omitted: int, previous_file: str | None = None
 ) -> str:
-    """NEW-142 review: when a previous run's findings are part of the list, the complete
-    list of them is in the staged continuation file (`previous_file`), field
-    prior_findings; this run's own are in its review files."""
-    where = (
-        f"this run's are in the earlier review files of this part in the input directory, "
-        f"and the complete list from the previous run is in {previous_file} (field "
-        "prior_findings)"
-        if previous_file
-        else "they are in the earlier review files of this part in the input directory"
+    """See plan_review.findings_block (this module's bounds and _fenced)."""
+    return plan_review.findings_block(
+        label,
+        lines,
+        omitted,
+        previous_file,
+        max_findings=PRIOR_FINDINGS_MAX,
+        max_chars=PRIOR_FINDINGS_CHARS,
+        fence=_fenced,
     )
-    note = (
-        f"\n({omitted} older findings are omitted past the bound of {PRIOR_FINDINGS_MAX} "
-        f"findings or {PRIOR_FINDINGS_CHARS} characters; {where}, and they still apply.)"
-        if omitted
-        else ""
-    )
-    return _fenced(label, "\n".join(lines) + note)
 
 
 def _previous_file(payload: dict[str, Any]) -> str | None:
