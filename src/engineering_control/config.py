@@ -125,6 +125,16 @@ class Settings(BaseSettings):
             "11.28.3": Path("/opt/engineering-toolchain/pnpm-11.28.3/pnpm"),
         }
     )
+    # Side-by-side pinned Rust releases (toolchain.rust: <root>/bin/{cargo,rustc,rustfmt,
+    # cargo-clippy}) and Go release lines (toolchain.go: <root>/bin/{go,gofmt}). No
+    # project selects either by default; scripts/bootstrap-worker.sh
+    # --project-toolchains[-only] installs them, pinned and checksum-verified.
+    toolchain_rust_roots: dict[str, Path] = Field(
+        default_factory=lambda: {"1.99.1": Path("/opt/engineering-toolchain/rust-1.99.1")}
+    )
+    toolchain_go_roots: dict[str, Path] = Field(
+        default_factory=lambda: {"1.26": Path("/opt/engineering-toolchain/go-1.26")}
+    )
     # NEW-75: makers are offline; delivery.resolve_dependencies (scan worker, network)
     # regenerates go.sum / pnpm-lock.yaml after the maker edited only the manifests.
     go_executable: Path = Path("/usr/local/go/bin/go")
@@ -344,6 +354,21 @@ class Settings(BaseSettings):
     ) -> dict[Literal["22", "24"], Path]:
         if any(not path.is_absolute() for path in value.values()):
             raise ValueError("toolchain node roots must be absolute paths")
+        return value
+
+    @field_validator("toolchain_rust_roots", "toolchain_go_roots")
+    @classmethod
+    def pinned_language_roots(cls, value: dict[str, Path], info: ValidationInfo) -> dict[str, Path]:
+        pattern = (
+            r"1\.(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})"
+            if info.field_name == "toolchain_rust_roots"
+            else r"1\.(?:0|[1-9][0-9]{0,3})"
+        )
+        for version, path in value.items():
+            if not re.fullmatch(pattern, version):
+                raise ValueError(f"{info.field_name} keys must be pinned versions")
+            if not path.is_absolute():
+                raise ValueError(f"{info.field_name} must be absolute paths")
         return value
 
     @field_validator("node_test_path_prefixes")

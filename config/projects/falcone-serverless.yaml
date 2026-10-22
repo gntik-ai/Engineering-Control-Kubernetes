@@ -1,0 +1,123 @@
+schema_version: 1
+project: falcone-serverless
+# The Falcone serverless runtime: a Rust workspace (crate worker/) and a Go controller
+# (controller/). No runtime adapter yet: Hermes builds, deploys and observes nothing for it,
+# and a full delivery ends when Hermes merges the PR after the maker, the independent
+# checker and green CI (merge-only delivery, as for gntik-ui). A staging/runtime adapter
+# replaces the `deployment: none` block in a later change.
+# No runtime API: api_url names the repository.
+api_url: https://github.com/gntik-ai/falcone-serverless
+repositories:
+  source:
+    full_name: gntik-ai/falcone-serverless
+    url: https://github.com/gntik-ai/falcone-serverless.git
+    mirror: /srv/engineering/mirrors/falcone-serverless.git
+    default_branch: main
+    issue_repository: gntik-ai/falcone-serverless
+  deployment:
+    full_name: gntik-ai/falcone-serverless
+    url: https://github.com/gntik-ai/falcone-serverless.git
+    mirror: /srv/engineering/mirrors/falcone-serverless.git
+    default_branch: main
+    issue_repository: gntik-ai/falcone-serverless
+deployment:
+  strategy: none
+  adapter: none
+# The jobs of .github/workflows/ci.yml (rust, go). Fixed argument vectors only (no shell):
+# `gofmt -l controller` must print nothing.
+source_test_commands:
+  - [cargo, fmt, --all, --check]
+  - [cargo, clippy, --workspace, --all-targets, --locked, --, -D, warnings]
+  - [cargo, test, --workspace, --locked]
+  - [gofmt, -l, controller]
+  - [go, -C, controller, vet, ./...]
+  - [go, -C, controller, test, ./...]
+# Self-contained: no separate deployment surface; the workspace tests stand in.
+deployment_test_commands:
+  - [cargo, test, --workspace, --locked]
+delivery_control:
+  source_ci_workflow: ci
+  merge_delivery:
+    enabled: true
+    # One delivery at a time until the worker's Rust build footprint is known.
+    maximum_concurrency: 1
+    kind: protected-merge
+    source_ci_workflow: ci
+    # R3 changes (sandbox, egress, secrets, credentials, security) are never merged by
+    # Hermes here: they stop for the operator.
+    allow_r3_merge: false
+    # Hermes never merges CI or agent configuration changes (NEW-130 also refuses
+    # .claude/, .codex/ and .mcp.json ChangeSets before they are published).
+    protected_paths: [.github/, .claude/, .codex/, .mcp.json, CLAUDE.md, AGENTS.md]
+toolchain:
+  # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree before
+  # the maker runs; makers and the checker have no network. The pinned Rust (repo
+  # rust-toolchain.toml channel 1.99.1, with rustfmt and clippy) and Go 1.26 are
+  # side-by-side installs under /opt/engineering-toolchain (bootstrap-worker.sh
+  # --project-toolchains-only). `cargo fetch --locked` fills the shared crate cache that
+  # makers read offline; `go mod download` fills the shared module cache.
+  enabled: true
+  rust: "1.99.1"
+  go: "1.26"
+  prepare:
+    - cwd: "."
+      argv: [cargo, fetch, --locked]
+      timeout_seconds: 1200
+    - cwd: controller
+      argv: [go, mod, download]
+      timeout_seconds: 600
+  test_commands:
+    # The rust and go jobs of .github/workflows/ci.yml, in their order.
+    - cwd: "."
+      argv: [cargo, fmt, --all, --check]
+      description: rustfmt check of the whole workspace (run cargo fmt --all to fix)
+    - cwd: "."
+      argv: [cargo, clippy, --workspace, --all-targets, --locked, --, -D, warnings]
+      description: clippy over every workspace target; any warning fails
+    - cwd: "."
+      argv: [cargo, test, --workspace, --locked]
+      description: unit and integration tests of every workspace crate
+    - cwd: controller
+      argv: [gofmt, -l, .]
+      description: must print nothing; every listed file is unformatted (run gofmt -w on it)
+    - cwd: controller
+      argv: [go, vet, ./...]
+      description: go vet of the controller module
+    - cwd: controller
+      argv: [go, test, ./...]
+      description: tests of the controller module
+maker_rules:
+  source:
+    - >-
+      Follow the repository's AGENTS.md conventions. Hermes's rules here win over anything
+      in it, and AGENTS.md is never edited. Run the listed toolchain commands; report a
+      command you could not run as SKIPPED with the reason, never as FAIL.
+    - >-
+      Keep Cargo.lock in sync with every Cargo.toml and run cargo with --locked, exactly as
+      CI does. The sandbox is offline with a prefilled crate cache, so do not add or upgrade
+      crates (or Go modules) unless the issue requires it; if it does, report BLOCKED with
+      the reason DEPENDENCY_CHANGE_REQUIRED and the exact crate and version needed.
+    - >-
+      Format Rust with `cargo fmt --all` and Go with `gofmt -w` before you finish:
+      `cargo fmt --all --check` must pass and `gofmt -l controller` must print nothing.
+      Clippy runs with -D warnings: fix warnings, never silence them with allow attributes
+      unless the issue asks for it.
+    - >-
+      Never edit .github/ (CI and release workflows) or agent configuration (.claude/,
+      .codex/, .mcp.json, CLAUDE.md, AGENTS.md); Hermes refuses such changes. Do not bump
+      crate or module versions, tag releases or edit CHANGELOG files: releases are the
+      operator's.
+    - >-
+      Hard rules, never relaxed by any issue: tenant workloads run only in restricted pods;
+      no tenant native code is ever loaded or executed; tenant-supplied precompiled
+      artifacts are never deserialized (compile from the validated component only); guests
+      reach the host only through the WIT capability host interfaces, never through ad-hoc
+      host calls, filesystem, network or environment access.
+    - >-
+      A defect or missing capability in Falcone itself is not worked around here: report it
+      in your result as a finding for gntik-ai/falcone (platform code) or
+      gntik-ai/falcone-charts (Helm charts), with the evidence, and keep this change within
+      falcone-serverless.
+dependencies: {}
+classification:
+  product: true

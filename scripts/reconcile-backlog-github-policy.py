@@ -42,18 +42,31 @@ SAFE_REPOSITORIES = (
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
+    "gntik-ai/falcone-serverless",
 )
-# NEW-160: the allowlist before gntik-ui joined. A policy that an approved campaign enabled
-# before this release (and an activation request it queued) still carries it; it stays
-# valid until that campaign's terminal disable, so the deploy never strands its owner.
+# NEW-160: every allowlist an earlier release installed or queued. A policy that an
+# approved campaign enabled before a project joined (and an activation request it queued)
+# still carries that release's set; it stays valid until that campaign's terminal disable,
+# so a deploy never strands its owner. Sets are only ever added here, never rotated out.
+# Before falcone-serverless joined:
 PREVIOUS_SAFE_REPOSITORIES = (
     "gntik-ai/falcone",
     "gntik-ai/falcone-charts",
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
 )
-ACCEPTED_SAFE_REPOSITORIES = frozenset({SAFE_REPOSITORIES, PREVIOUS_SAFE_REPOSITORIES})
+# Before gntik-ui joined (NEW-160):
+PRE_GNTIK_UI_SAFE_REPOSITORIES = (
+    "gntik-ai/falcone",
+    "gntik-ai/falcone-charts",
+    "gntik-ai/musematic",
+    "gntik-ai/musematic-deploy",
+    "gntik-ai/llmwiki",
+)
+HISTORICAL_SAFE_REPOSITORIES = (PREVIOUS_SAFE_REPOSITORIES, PRE_GNTIK_UI_SAFE_REPOSITORIES)
+ACCEPTED_SAFE_REPOSITORIES = frozenset({SAFE_REPOSITORIES, *HISTORICAL_SAFE_REPOSITORIES})
 PRE_APPROVAL_STATUSES = frozenset({"IMPORTED", "PLANNED", "AWAITING_APPROVAL"})
 UNAPPROVED_EVIDENCE_STATUSES = PRE_APPROVAL_STATUSES | frozenset(
     {"EXPIRED", "STOPPED", "CANCELLED", "FAILED"}
@@ -127,7 +140,13 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
         "disable-existing-backlog",
     }:
         raise ValueError("GitHub policy action is not allowlisted")
-    if value["project"] not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
+    if value["project"] not in {
+        "falcone",
+        "musematic",
+        "llmwiki",
+        "gntik-ui",
+        "falcone-serverless",
+    }:
         raise ValueError("GitHub policy project is invalid")
     requested = tuple(value["safe_repositories"])
     if value["action"] == "enable-existing-backlog":
@@ -248,6 +267,7 @@ def validate_campaign(
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
         "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
+        "falcone-serverless": ["gntik-ai/falcone-serverless", "gntik-ai/falcone-serverless"],
     }[campaign.project]
     if binding.get("paired_repositories") != expected_pair:
         raise ValueError("GitHub campaign pair changed")
@@ -285,6 +305,7 @@ def verified_owner_expiry(campaign: GitHubBacklogCampaign, now: datetime) -> dat
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
         "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
+        "falcone-serverless": ["gntik-ai/falcone-serverless", "gntik-ai/falcone-serverless"],
     }.get(campaign.project)
     if (
         not isinstance(raw_binding, dict)

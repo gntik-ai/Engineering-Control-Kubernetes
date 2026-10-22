@@ -187,12 +187,15 @@ class NoDeploymentManifest(EngineeringModel):
 
     strategy: Literal["none"]
     adapter: Literal["none"]
-    release: PackageReleasePolicy
+    # None: Hermes releases nothing and no package release flow is declared (e.g.
+    # falcone-serverless until its runtime adapter exists).
+    release: PackageReleasePolicy | None = None
     production_supported: Literal[False] = False
     production_installed: Literal[False] = False
 
 
-TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm", "go", "trivy"})
+# cargo exists only for a project that selects a pinned Rust toolchain (ToolchainPolicy.rust).
+TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm", "go", "trivy", "cargo"})
 TOOLCHAIN_PLACEHOLDERS = frozenset({"{python312}"})
 TOOLCHAIN_TOTAL_TIMEOUT = 80 * 60
 _FORBIDDEN_TOOLCHAIN_COMMANDS = frozenset(
@@ -287,6 +290,11 @@ class ToolchainTestCommand(EngineeringModel):
 DEFAULT_TOOLCHAIN_NODE: Literal["22"] = "22"
 # A pinned pnpm release: exact MAJOR.MINOR.PATCH, no range, tag or pre-release.
 _PNPM_VERSION = r"^(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})$"
+# A pinned Rust release (exact 1.MINOR.PATCH, no channel name) and a Go release line
+# (1.MINOR): both are side-by-side installs under Settings.toolchain_rust_roots /
+# toolchain_go_roots. Their absence (None) is exactly today's toolchain.
+_RUST_VERSION = r"^1\.(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})$"
+_GO_VERSION = r"^1\.(?:0|[1-9][0-9]{0,3})$"
 
 
 class ToolchainPolicy(EngineeringModel):
@@ -299,6 +307,10 @@ class ToolchainPolicy(EngineeringModel):
     # Settings.toolchain_pnpm_executable). The defaults are exactly today's toolchain.
     node: Literal["22", "24"] = DEFAULT_TOOLCHAIN_NODE
     pnpm: str | None = Field(default=None, pattern=_PNPM_VERSION)
+    # Optional pinned Rust release and Go line for prepare, baseline and the maker/checker
+    # sandbox (falcone-serverless). Quoted strings only: YAML reads `go: 1.26` as a float.
+    rust: str | None = Field(default=None, pattern=_RUST_VERSION)
+    go: str | None = Field(default=None, pattern=_GO_VERSION)
 
     @field_validator("node", mode="before")
     @classmethod
@@ -306,6 +318,13 @@ class ToolchainPolicy(EngineeringModel):
         # `node: 24` in YAML is an integer; accept it as the same major, nothing else.
         if isinstance(value, int) and not isinstance(value, bool):
             return str(value)
+        return value
+
+    @field_validator("rust", "go", mode="before")
+    @classmethod
+    def quoted_version(cls, value: object) -> object:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("toolchain rust/go versions must be quoted strings")
         return value
 
     @property
@@ -316,6 +335,9 @@ class ToolchainPolicy(EngineeringModel):
     def enabled_requires_prepare(self) -> ToolchainPolicy:
         if self.enabled and not self.prepare:
             raise ValueError("an enabled toolchain requires at least one prepare command")
+        if self.rust is None and any(command.argv[0] == "cargo" for command in self.prepare):
+            # Fail closed: there is no worker-wide cargo; only a pinned Rust provides one.
+            raise ValueError("a cargo prepare command requires a pinned toolchain.rust")
         if sum(command.timeout_seconds for command in self.prepare) > TOOLCHAIN_TOTAL_TIMEOUT:
             # IssueDeliveryWorkflow gives delivery.prepare_toolchain 90 minutes in total.
             raise ValueError("toolchain prepare timeouts exceed the step's bounded budget")

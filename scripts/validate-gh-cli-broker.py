@@ -21,6 +21,7 @@ REQUIRED_REPOSITORIES = (
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
+    "gntik-ai/falcone-serverless",
 )
 
 

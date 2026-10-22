@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import tempfile
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -31,27 +32,35 @@ TOOLCHAIN_CACHE_ROOT = Path(
     os.environ.get("ENGINEERING_TOOLCHAIN_CACHE_ROOT", "/srv/engineering/cache/scan/toolchain")
 )
 GO_ROOT_BIN = Path("/usr/local/go/bin")
+_RUN_DIRECTORY_NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 
 
 @dataclass(frozen=True)
 class SandboxToolchain:
-    """NEW-159: a project's non-default Node.js/pnpm selection for the agent sandbox.
+    """NEW-159: a project's non-default Node.js/pnpm (and Rust/Go) selection for the agent
+    sandbox.
 
-    ``path_prefix`` directories go first on PATH; ``variables`` are added verbatim. The
-    default toolchain (Node 22, worker pnpm) is represented by ``None``, never by an
-    empty instance, so the default environment stays byte-identical.
+    ``path_prefix`` directories go first on PATH; ``variables`` are added verbatim;
+    ``run_directories`` (variable, relative name) point at a directory of that name in the
+    run's own TMPDIR (writable, removed with the run), set after every other variable. The
+    default toolchain (Node 22, worker pnpm) is represented by ``None``, never by an empty
+    instance, so the default environment stays byte-identical.
     """
 
     path_prefix: tuple[str, ...]
     variables: tuple[tuple[str, str], ...] = ()
+    run_directories: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.path_prefix or any(
             not entry.startswith("/") or ":" in entry for entry in self.path_prefix
         ):
             raise ValueError("sandbox toolchain PATH entries must be absolute directories")
-        if any(key == "PATH" for key, _ in self.variables):
-            raise ValueError("sandbox toolchain variables cannot replace PATH")
+        names = [key for key, _ in (*self.variables, *self.run_directories)]
+        if "PATH" in names or "TMPDIR" in names:
+            raise ValueError("sandbox toolchain variables cannot replace PATH or TMPDIR")
+        if any(not _RUN_DIRECTORY_NAME.fullmatch(name) for _key, name in self.run_directories):
+            raise ValueError("sandbox toolchain run directories must be plain names")
 
 
 def sandbox_toolchain_environment(
@@ -144,6 +153,11 @@ def subscription_only_environment(
                 f"API-paid or third-party provider variables are forbidden: {sorted(disallowed)}"
             )
         env.update(overrides)
+    if toolchain is not None and toolchain.run_directories:
+        # The run's TMPDIR (NEW-226) when the adapter gave one, else this process's.
+        run_temp = Path(env.get("TMPDIR") or tempfile.gettempdir())
+        for key, name in toolchain.run_directories:
+            env[key] = str(run_temp / name)
     return env
 
 

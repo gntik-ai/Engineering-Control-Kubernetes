@@ -73,7 +73,7 @@ mirror_git() {
 runuser -u hermes -- env HOME="${GH_HOME}" GH_PROMPT_DISABLED=1 \
   gh auth status --hostname github.com >/dev/null
 
-repositories=(falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui)
+repositories=(falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui falcone-serverless)
 for repository in "${repositories[@]}"; do
   remote="https://github.com/gntik-ai/${repository}.git"
   target="${MIRROR_ROOT}/${repository}.git"

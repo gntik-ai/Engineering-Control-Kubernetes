@@ -36,6 +36,7 @@ CLEANUP_REPOSITORY_PROJECTS: dict[str, str] = {
     "musematic-deploy": "musematic",
     "llmwiki": "llmwiki",
     "gntik-ui": "gntik-ui",
+    "falcone-serverless": "falcone-serverless",
 }
 CLEANUP_PROJECTS = frozenset(CLEANUP_REPOSITORY_PROJECTS.values())
 # Runs such as cleanup, quota and observability canaries belong to no product project.

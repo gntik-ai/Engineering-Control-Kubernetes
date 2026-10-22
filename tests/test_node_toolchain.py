@@ -130,13 +130,14 @@ def test_policy_rejects_unpinned_pnpm_versions(pnpm: str) -> None:
 
 def test_existing_project_manifests_keep_the_default_toolchain() -> None:
     # NEW-157 registry: every shipped project stays on Node 22 and the worker pnpm, except
-    # NEW-160's gntik-ui (Node 24 and pnpm 11.28.3, NEW-159).
+    # NEW-160's gntik-ui (Node 24 and pnpm 11.28.3, NEW-159) and falcone-serverless (Node 22
+    # with a pinned Rust and Go: tests/test_language_toolchain.py).
     gntik_ui = ProjectManifest.model_validate(
         yaml.safe_load((PROJECTS / "gntik-ui.yaml").read_text())
     )
     assert gntik_ui.toolchain is not None
     assert (gntik_ui.toolchain.node, gntik_ui.toolchain.pnpm) == ("24", "11.28.3")
-    for project in sorted(PROJECT_SET - {"gntik-ui"}):
+    for project in sorted(PROJECT_SET - {"gntik-ui", "falcone-serverless"}):
         path = PROJECTS / f"{project}.yaml"
         manifest = ProjectManifest.model_validate(yaml.safe_load(path.read_text()))
         toolchain = project_node_toolchain(Settings(project_config_root=PROJECTS), project)
@@ -658,8 +659,9 @@ def test_scripts_pin_the_toolchains_the_settings_select() -> None:
 def test_bootstrap_toolchain_section_is_opt_in_and_never_replaces_node_22() -> None:
     bootstrap = BOOTSTRAP.read_text()
     assert "NODE_TOOLCHAIN_MODE=none" in bootstrap
-    # Only the two explicit modes call the installer; the default path never does.
-    assert bootstrap.count("\n  install_node_toolchains\n") == 2
+    # Only the explicit modes call the installer; the default path never does.
+    assert bootstrap.count("\n  install_node_toolchains\n") == 1
+    assert bootstrap.count("\n  install_project_toolchains\n") == 2
     assert "if [[ ${NODE_TOOLCHAIN_MODE} == only ]]; then" in bootstrap
     assert "if [[ ${NODE_TOOLCHAIN_MODE} == also ]]; then" in bootstrap
     section = bootstrap[bootstrap.index("install_pinned_toolchain() {") :]
@@ -671,7 +673,8 @@ def test_bootstrap_toolchain_section_is_opt_in_and_never_replaces_node_22() -> N
     assert 'local release_name="${name}.${sha256:0:16}"' in section
     assert 'mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"' in section
     assert "trap \"rm -rf -- '${staging}'\" EXIT" in section
-    assert section.count("rm -rf --") == 3  # staging (trap + success), unpublished release
+    # staging (trap + success), unpublished release, the Rust installer's extraction
+    assert section.count("rm -rf --") == 4
     assert "previous" not in section.replace("A previous release", "")
     # The Node 22 contract for the full bootstrap is unchanged.
     assert '[[ $("${NODE_BIN}" --version) == v22.* ]]' in bootstrap

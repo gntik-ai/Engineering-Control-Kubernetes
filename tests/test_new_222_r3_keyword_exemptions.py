@@ -71,9 +71,11 @@ def _risk(snapshot: GitHubIssueSnapshot) -> str:
     ).calculated_risk
 
 
-def test_only_gntik_ui_exempts_and_only_destructive_and_production() -> None:
+def test_only_gntik_ui_and_falcone_serverless_exempt_their_listed_roots() -> None:
     assert dict(PROJECT_R3_KEYWORD_EXEMPTIONS) == {
-        "gntik-ui": frozenset({"destructive", "production"})
+        "gntik-ui": frozenset({"destructive", "production"}),
+        # falcone-serverless: "production" only; destructive and data migration stay R3.
+        "falcone-serverless": frozenset({"production"}),
     }
     assert repository_r3_keyword_exemptions(GNTIK) == {"destructive", "production"}
     for project, pair in PROJECT_REPOSITORIES.items():

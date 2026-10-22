@@ -10,20 +10,28 @@ fi
 # NEW-159: optional side-by-side project toolchains (ToolchainPolicy.node / .pnpm) under
 # /opt/engineering-toolchain. They never replace /usr/local/bin/node (Node 22) or
 # /usr/local/bin/pnpm. Without an argument this script behaves exactly as before.
-#   --node-toolchain       full bootstrap, then also install the pinned toolchains
-#   --node-toolchain-only  install only the pinned toolchains and exit
+#   --node-toolchain           full bootstrap, then also install the pinned toolchains
+#   --node-toolchain-only      install only the pinned toolchains and exit
+# ToolchainPolicy.rust / .go (falcone-serverless) add a pinned Rust release and a Go line
+# beside them; they never replace /usr/local/go (the worker's Go) or any rustup install.
+#   --project-toolchains       full bootstrap, then Node.js/pnpm, Rust and Go
+#   --project-toolchains-only  install only Node.js/pnpm, Rust and Go and exit
 NODE_TOOLCHAIN_MODE=none
+LANGUAGE_TOOLCHAINS=0
+USAGE="Usage: sudo $0 [--node-toolchain | --node-toolchain-only | --project-toolchains | --project-toolchains-only]"
 case "${1-}" in
   "") ;;
   --node-toolchain) NODE_TOOLCHAIN_MODE=also ;;
   --node-toolchain-only) NODE_TOOLCHAIN_MODE=only ;;
+  --project-toolchains) NODE_TOOLCHAIN_MODE=also LANGUAGE_TOOLCHAINS=1 ;;
+  --project-toolchains-only) NODE_TOOLCHAIN_MODE=only LANGUAGE_TOOLCHAINS=1 ;;
   *)
-    echo "Usage: sudo $0 [--node-toolchain | --node-toolchain-only]" >&2
+    echo "${USAGE}" >&2
     exit 64
     ;;
 esac
 if (( $# > 1 )); then
-  echo "Usage: sudo $0 [--node-toolchain | --node-toolchain-only]" >&2
+  echo "${USAGE}" >&2
   exit 64
 fi
 
@@ -37,23 +45,42 @@ NODE24_URL=https://nodejs.org/dist/v${NODE24_VERSION}/node-v${NODE24_VERSION}-li
 PNPM_PINNED_VERSION=11.28.3
 PNPM_PINNED_SHA256=b0c9673be13d4b914b8045a56986418c55c446bb8d113b65ec65bf7cb7bec35f
 PNPM_PINNED_URL=https://github.com/pnpm/pnpm/releases/download/v${PNPM_PINNED_VERSION}/pnpm-linux-x64.tar.gz
+# ToolchainPolicy.rust / .go: keep in sync with config.py (toolchain_rust_roots /
+# toolchain_go_roots) and scripts/verify-worker.sh. Hashes: the .sha256 file published
+# beside the Rust standalone installer on static.rust-lang.org/dist and go.dev/dl's
+# published SHA256 (both re-verified by download 2026-10-22). The standalone installer is
+# installed with only rustc, cargo, rust-std, rustfmt and clippy (no rustup: a repo's
+# rust-toolchain.toml can never trigger a download).
+RUST_PINNED_VERSION=1.99.1
+RUST_PINNED_SHA256=231fcae47ee950621374725b5fc3b5441d2fbda2955ac45dd7dc816d8876cfe7
+RUST_PINNED_URL=https://static.rust-lang.org/dist/rust-${RUST_PINNED_VERSION}-x86_64-unknown-linux-gnu.tar.xz
+RUST_PINNED_RUSTC="rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+RUST_COMPONENTS=rustc,cargo,rust-std-x86_64-unknown-linux-gnu,rustfmt-preview,clippy-preview
+GO_PINNED_LINE=1.26
+GO_PINNED_VERSION=1.26.10
+GO_PINNED_SHA256=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5
+GO_PINNED_URL=https://go.dev/dl/go${GO_PINNED_VERSION}.linux-amd64.tar.gz
 
-# toolchain_release_ok RELEASE SHA256 CHECK_RELATIVE EXPECTED_VERSION
+# toolchain_release_ok RELEASE SHA256 CHECK_RELATIVE EXPECTED_VERSION [VERSION_ARGUMENT]
 toolchain_release_ok() {
-  local release=$1 sha256=$2 check=$3 expected=$4
+  local release=$1 sha256=$2 check=$3 expected=$4 version_argument=${5:---version}
   [[ -d ${release} && ! -L ${release} && -f ${release}/.engineering-toolchain ]] &&
     [[ $(<"${release}/.engineering-toolchain") == "${sha256}" ]] &&
     [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-      "${release}/${check}" --version 2>/dev/null) == "${expected}" ]]
+      "${release}/${check}" "${version_argument}" 2>/dev/null) == "${expected}" ]]
 }
 
 # install_pinned_toolchain LINK URL SHA256 COMPRESSION STRIP CHECK_RELATIVE EXPECTED_VERSION
+#   [VERSION_ARGUMENT] [RUST_COMPONENTS]
 # Each verified download is an immutable release directory LINK.<sha256 prefix>; LINK is
 # a symlink (the path Settings uses) switched by an atomic rename. A previous release is
 # never removed, so an interrupted run leaves the published toolchain untouched, and the
-# EXIT trap only ever removes this run's staging directory. Idempotent.
+# EXIT trap only ever removes this run's staging directory. Idempotent. With
+# RUST_COMPONENTS the verified archive is a Rust standalone installer: its install.sh
+# installs exactly those components into the release (no ldconfig, nothing outside it).
 install_pinned_toolchain() {
   local name=$1 url=$2 sha256=$3 compression=$4 strip=$5 check=$6 expected=$7
+  local version_argument=${8:---version} components=${9-}
   local link="${TOOLCHAIN_ROOT}/${name}"
   local release_name="${name}.${sha256:0:16}"
   local release="${TOOLCHAIN_ROOT}/${release_name}"
@@ -62,7 +89,8 @@ install_pinned_toolchain() {
     echo "${link} exists and is not a symlink; refusing to replace it" >&2
     exit 1
   fi
-  if ! toolchain_release_ok "${release}" "${sha256}" "${check}" "${expected}"; then
+  if ! toolchain_release_ok "${release}" "${sha256}" "${check}" "${expected}" \
+    "${version_argument}"; then
     if [[ -e ${release} || -L ${release} ]]; then
       if [[ $(readlink -- "${link}" 2>/dev/null) == "${release_name}" ]]; then
         echo "${link} points at an unverifiable release ${release}" >&2
@@ -77,14 +105,26 @@ install_pinned_toolchain() {
       --max-time 900 --output "${staging}/download" "${url}"
     printf '%s  %s\n' "${sha256}" "${staging}/download" | sha256sum --check --quiet -
     install -d -m 0755 "${staging}/root"
-    tar "-x${compression}f" "${staging}/download" -C "${staging}/root" \
-      --strip-components="${strip}" --no-same-owner --no-same-permissions
-    rm -f -- "${staging}/download"
+    if [[ -n ${components} ]]; then
+      install -d -m 0700 "${staging}/installer"
+      tar "-x${compression}f" "${staging}/download" -C "${staging}/installer" \
+        --strip-components="${strip}" --no-same-owner --no-same-permissions
+      rm -f -- "${staging}/download"
+      (cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        /bin/bash "${staging}/installer/install.sh" --prefix="${staging}/root" \
+        --components="${components}" --disable-ldconfig >/dev/null)
+      rm -rf -- "${staging}/installer"
+    else
+      tar "-x${compression}f" "${staging}/download" -C "${staging}/root" \
+        --strip-components="${strip}" --no-same-owner --no-same-permissions
+      rm -f -- "${staging}/download"
+    fi
     printf '%s\n' "${sha256}" >"${staging}/root/.engineering-toolchain"
     chown -R root:root "${staging}/root"
     chmod -R u+rwX,go+rX,go-w "${staging}/root"
     chmod 0755 "${staging}/root"
-    toolchain_release_ok "${staging}/root" "${sha256}" "${check}" "${expected}" || {
+    toolchain_release_ok "${staging}/root" "${sha256}" "${check}" "${expected}" \
+      "${version_argument}" || {
       echo "${name}: downloaded toolchain does not report ${expected}" >&2
       exit 1
     }
@@ -100,7 +140,7 @@ install_pinned_toolchain() {
   ln -sfn -- "${release_name}" "${TOOLCHAIN_ROOT}/.${name}.link.new"
   mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"
   [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-    "${link}/${check}" --version) == "${expected}" ]]
+    "${link}/${check}" "${version_argument}") == "${expected}" ]]
   echo "${name}: installed ${expected} (${release_name}; earlier releases are kept)"
 }
 
@@ -122,13 +162,75 @@ install_node_toolchains() {
     "${PNPM_PINNED_SHA256}" z 0 pnpm "${PNPM_PINNED_VERSION}"
 }
 
+install_language_toolchains() {
+  local tool
+  install_pinned_toolchain "rust-${RUST_PINNED_VERSION}" "${RUST_PINNED_URL}" \
+    "${RUST_PINNED_SHA256}" J 1 bin/rustc "${RUST_PINNED_RUSTC}" --version "${RUST_COMPONENTS}"
+  install_pinned_toolchain "go-${GO_PINNED_LINE}" "${GO_PINNED_URL}" "${GO_PINNED_SHA256}" \
+    z 1 bin/go "go version go${GO_PINNED_VERSION} linux/amd64" version
+  # Every executable resolve_node_toolchain requires (engineering/toolchain.py).
+  for tool in cargo rustc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+    [[ -x ${TOOLCHAIN_ROOT}/rust-${RUST_PINNED_VERSION}/bin/${tool} ]] || {
+      echo "rust-${RUST_PINNED_VERSION}: ${tool} is missing" >&2
+      exit 1
+    }
+  done
+  for tool in go gofmt; do
+    [[ -x ${TOOLCHAIN_ROOT}/go-${GO_PINNED_LINE}/bin/${tool} ]] || {
+      echo "go-${GO_PINNED_LINE}: ${tool} is missing" >&2
+      exit 1
+    }
+  done
+}
+
+# Shared offline toolchain caches (Settings.toolchain_cache_root): the scan worker fills
+# go-mod, cargo-home and trivy with network (delivery.prepare_toolchain); makers and the
+# checker (codex-runner, claude-runner) only read them. Traverse-only on the ancestors,
+# read on the caches and, through default ACLs, on every future entry; scan-runner stays
+# the only writer. The other toolchain cache directories (uv, pnpm, home, baselines) stay
+# private to scan-runner. Called after every chmod of the ancestors (setfacl recomputes
+# the mask). Idempotent.
+SCAN_CACHE_ROOT=/srv/engineering/cache/scan
+TOOLCHAIN_CACHE="${SCAN_CACHE_ROOT}/toolchain"
+SHARED_TOOLCHAIN_CACHES=(go-mod cargo-home trivy)
+grant_shared_toolchain_caches() {
+  local cache
+  command -v setfacl >/dev/null || {
+    echo "Required command missing: setfacl" >&2
+    exit 1
+  }
+  install -d -o scan-runner -g scan-runner -m 0700 "${SCAN_CACHE_ROOT}"
+  install -d -o scan-runner -g scan-runner -m 0750 "${TOOLCHAIN_CACHE}"
+  for cache in "${SHARED_TOOLCHAIN_CACHES[@]}"; do
+    install -d -o scan-runner -g scan-runner -m 0750 "${TOOLCHAIN_CACHE}/${cache}"
+  done
+  setfacl --modify u:codex-runner:--x,u:claude-runner:--x \
+    "${SCAN_CACHE_ROOT}" "${TOOLCHAIN_CACHE}"
+  for cache in "${SHARED_TOOLCHAIN_CACHES[@]}"; do
+    setfacl -R --modify u:codex-runner:rX,u:claude-runner:rX "${TOOLCHAIN_CACHE}/${cache}"
+    find "${TOOLCHAIN_CACHE}/${cache}" -type d -exec setfacl --modify \
+      d:u::rwx,d:u:codex-runner:rx,d:u:claude-runner:rx,d:g::---,d:m::rwx,d:o::--- {} +
+  done
+}
+
+install_project_toolchains() {
+  install_node_toolchains
+  if (( LANGUAGE_TOOLCHAINS == 1 )); then
+    install_language_toolchains
+  fi
+}
+
 if [[ ${NODE_TOOLCHAIN_MODE} == only ]]; then
   exec 9>/run/engineering-control-bootstrap.lock
   flock -n 9 || {
     echo "Another Engineering Control bootstrap is active" >&2
     exit 1
   }
-  install_node_toolchains
+  install_project_toolchains
+  if (( LANGUAGE_TOOLCHAINS == 1 )); then
+    # The worker already exists (users, /srv/engineering): share the caches now too.
+    grant_shared_toolchain_caches
+  fi
   exit 0
 fi
 
@@ -252,8 +354,9 @@ install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
 for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui \
+  falcone-serverless \
   gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy \
-  gntik-ai-llmwiki gntik-ai-gntik-ui; do
+  gntik-ai-llmwiki gntik-ai-gntik-ui gntik-ai-falcone-serverless; do
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
@@ -276,6 +379,8 @@ install -d -o hermes -g hermes -m 0700 \
   "${PLATFORM_ROOT}/tmp/github"
 install -d -o scan-runner -g scan-runner -m 0710 \
   "${PLATFORM_ROOT}/cache/scan/worktree-git"
+# Shared offline toolchain caches: read-only for makers and the checker (see below).
+grant_shared_toolchain_caches
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   chmod 0700 "${STATE_ROOT}/identities/${identity}"
   chown "${identity}:${identity}" "${STATE_ROOT}/identities/${identity}"
@@ -287,13 +392,14 @@ RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
 }
 RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
-for project in falcone musematic llmwiki gntik-ui; do
+for project in falcone musematic llmwiki gntik-ui falcone-serverless; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
     "${CONFIG_ROOT}/projects.d/${project}.yaml"
   # NEW-160: credentials, personas and flows exist only for projects with a runtime;
-  # gntik-ui (a UI kit, delivered by a protected merge) has none.
-  if [[ ${project} == gntik-ui ]]; then
+  # gntik-ui (a UI kit) and falcone-serverless (no runtime adapter yet), both delivered
+  # by a protected merge, have none.
+  if [[ ${project} == gntik-ui || ${project} == falcone-serverless ]]; then
     continue
   fi
   if [[ ${project} == falcone || ${project} == musematic ]]; then
@@ -338,7 +444,7 @@ chmod -R a+rX "${CLI_ROOT}"
 ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
 if [[ ${NODE_TOOLCHAIN_MODE} == also ]]; then
-  install_node_toolchains
+  install_project_toolchains
 fi
 
 install -d -o root -g root -m 0755 \

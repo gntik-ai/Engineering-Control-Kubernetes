@@ -144,6 +144,10 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "SOURCE_PR_CI_REGRESSION": "the source PR's CI fails checks that pass on main",
     "DEPLOYMENT_PR_CI_REGRESSION": "the deployment PR's CI fails checks that pass on main",
     "SOURCE_PR_CI_FAILED": "the source PR's CI failed",
+    "DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN": (
+        "the maker asked Hermes to resolve dependencies, which a pinned Rust/Go project "
+        "(falcone-serverless) never gets; change the dependency by hand or skip the issue"
+    ),
     # NEW-160: merge-only delivery (projects without a runtime, e.g. gntik-ui).
     "CHANGESET_MISSING": (
         "the PR changes a published package file but carries no .changeset/*.md; "

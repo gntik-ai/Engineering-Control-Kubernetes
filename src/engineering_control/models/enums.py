@@ -6,6 +6,7 @@ class Project(StrEnum):
     MUSEMATIC = "musematic"
     LLMWIKI = "llmwiki"
     GNTIK_UI = "gntik-ui"
+    FALCONE_SERVERLESS = "falcone-serverless"
 
 
 class Provider(StrEnum):
