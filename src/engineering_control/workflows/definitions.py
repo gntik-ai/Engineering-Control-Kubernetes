@@ -3695,6 +3695,25 @@ def _child_failure_code(error: BaseException) -> str:
     return "CHILD_WORKFLOW_FAILED"
 
 
+_PROVIDER_ACCESS_PREFIXES = ("MANUAL_AUTH_REQUIRED_", "PROVIDER_CLI_MISSING_")
+
+
+def _provider_access_code(blocker: Any, child: Any) -> str | None:
+    """NEW-232: a provider login/CLI code in a child's blocker or its final context.
+
+    Revalidation reports a generic CURRENT_REVALIDATION_BLOCKED, so the child's own
+    context blocker is read too."""
+    context = child.get("context") if isinstance(child, dict) else None
+    for value in (
+        blocker,
+        child.get("blocker") if isinstance(child, dict) else None,
+        context.get("blocker") if isinstance(context, dict) else None,
+    ):
+        if isinstance(value, str) and value.startswith(_PROVIDER_ACCESS_PREFIXES):
+            return value[:120]
+    return None
+
+
 _AGENT_STEP_BLOCKERS = frozenset(
     {
         "MANUAL_AUTH_REQUIRED_CODEX",
@@ -4139,6 +4158,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 blocker = str(gate.get("blocker") or gate.get("status") or "BLOCKED")
                 # NEW-114: a failed revalidation child pauses the loop (never moves on).
                 revalidation_failed = False
+                verification: dict[str, Any] = {}
                 if blocker in {
                     "CURRENT_SOURCE_REVALIDATION_REQUIRED",
                     "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED",
@@ -4247,6 +4267,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         revalidation_failed = True
                         blocker = "REVALIDATION_FAILED"
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
+                # A FAILED revalidation already pauses with its own code. The marker names
+                # the retry round too: an operator retry is a new decision point.
+                access_blocker = (
+                    None
+                    if revalidation_failed
+                    else self._provider_access_pause(
+                        blocker, verification, f"revalidation-{ordinal}-{revalidation_round}"
+                    )
+                )
+                if access_blocker is not None:
+                    blocker = access_blocker
                 if global_child_blocker_return and request.global_campaign_id is not None:
                     results.append(
                         {
@@ -4270,6 +4301,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     and request.continue_after_blocked_issue
                     and not self._requires_operator_pause(blocker)
                     and not revalidation_failed
+                    and access_blocker is None
                 ):
                     results.append(
                         {
@@ -4475,6 +4507,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         if self._provider_unavailable_pause(delivery, ordinal, delivery_round):
                             # NEW-137: the release recorded REQUEST_CHANGES; a retry binds.
                             blocker = f"DELIVERY_FAILED:{PROVIDER_UNAVAILABLE}"
+                    # A FAILED child already pauses with its own code.
+                    access_blocker = (
+                        None
+                        if delivery_failed
+                        else self._provider_access_pause(
+                            blocker, delivery, f"delivery-{ordinal}-{delivery_round}"
+                        )
+                    )
+                    if access_blocker is not None:
+                        blocker = access_blocker
                     if global_child_blocker_return and request.global_campaign_id is not None:
                         await self._step(
                             "backlog.record_loop_state",
@@ -4490,6 +4532,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         and request.continue_after_blocked_issue
                         and not self._requires_operator_pause(blocker)
                         and not delivery_failed
+                        and access_blocker is None
                     ):
                         advance_to_next_issue = True
                         break
@@ -5867,6 +5910,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         return workflow.patched(
             f"existing-backlog-provider-unavailable-pause-v1-{ordinal}-{delivery_round}"
         )
+
+    @staticmethod
+    def _provider_access_pause(blocker: str, child: dict[str, Any], point: str) -> str | None:
+        """NEW-232: the expired-login or missing-CLI code that stopped a child, or None.
+
+        Such a stop is not a verdict on the issue: every later issue would stop the same
+        way, so the loop pauses on this one (backlog-retry resumes it after the login)
+        instead of using up its remaining items. The marker is per decision point (issue,
+        and round for a delivery), like NEW-137's, so a replayed older history advances."""
+        code = _provider_access_code(blocker, child)
+        if code is None:
+            return None
+        if not workflow.patched(f"existing-backlog-provider-access-pause-v1-{point}"):
+            return None
+        return code
 
     @staticmethod
     def _child_failure_pauses_patched(ordinal: int) -> bool:

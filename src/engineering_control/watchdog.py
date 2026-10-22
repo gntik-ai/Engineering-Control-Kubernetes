@@ -37,6 +37,7 @@ from engineering_control.delivery_notifications import (
 from engineering_control.logging import configure_logging
 from engineering_control.notifier import NotificationSink
 from engineering_control.operations.projection_health import projection_connection_status
+from engineering_control.systemd_notify import notify as _systemd_notify
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
     identity_blocked_projects_from_summary,
@@ -1099,18 +1100,6 @@ def serve() -> None:
             time.sleep(max(1, settings.watchdog_probe_seconds - elapsed))
     finally:
         watchdog.close()
-
-
-def _systemd_notify(value: str) -> None:
-    address = os.getenv("NOTIFY_SOCKET")
-    if not address:
-        return
-    target = f"\0{address[1:]}" if address.startswith("@") else address
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
-            client.sendto(value.encode("utf-8"), target)
-    except OSError:
-        return
 
 
 def run() -> None:

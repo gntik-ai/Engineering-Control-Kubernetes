@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shutil
@@ -174,10 +175,12 @@ class RetentionActivityHandler:
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            # NEW-232: a tree walk can take minutes; on the event loop it would stop the
+            # worker's systemd watchdog pings (and its Temporal heartbeats).
             if step.startswith("cleanup.inspect_"):
-                return self._inspect(payload)
+                return await asyncio.to_thread(self._inspect, payload)
             if step.startswith("cleanup.execute_"):
-                return self._execute(payload)
+                return await asyncio.to_thread(self._execute, payload)
         except (OSError, ValueError, ValidationError) as error:
             raise ApplicationError(
                 "retention candidate failed bounded policy validation",

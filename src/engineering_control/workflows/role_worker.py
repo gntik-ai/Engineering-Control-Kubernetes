@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import logging
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from engineering_control.adapters.run_temp import (
 from engineering_control.config import Settings, get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.observability.heartbeat import WorkerHeartbeatPublisher
+from engineering_control.systemd_notify import notify, watchdog_interval_seconds
 from engineering_control.workflows import tmp_sweep
 from engineering_control.workflows.supervision import run_worker_until_signal
 from engineering_control.workflows.worker_registry import (
@@ -64,7 +66,27 @@ async def _sweep_forever(settings: Settings) -> None:
         await asyncio.sleep(settings.private_tmp_sweep_interval_seconds)
 
 
+async def _notify_systemd_forever(worker: Worker) -> None:
+    """NEW-232: ping the unit's watchdog from the event loop itself.
+
+    READY waits for the worker's namespace validation (is_running). A loop that stops
+    turning (a busy or blocked main thread) stops the pings, so systemd aborts and
+    restarts the worker; its Temporal activities then retry on the new one."""
+    ready = False
+    interval = watchdog_interval_seconds()
+    while True:
+        if not ready and worker.is_running:
+            notify("READY=1\nSTATUS=role worker polling")
+            ready = True
+        if ready:
+            notify("WATCHDOG=1")
+        await asyncio.sleep(interval if ready else 0.5)
+
+
 async def serve() -> None:
+    # NEW-232: the watchdog's SIGABRT (WatchdogSignal) dumps every thread's stack to the
+    # journal before the restart, so a stalled loop names the code that held it.
+    faulthandler.enable(all_threads=True)
     settings = get_settings()
     configure_logging(settings.log_level)
     spec = role_worker_spec(settings.worker_kind)
@@ -89,12 +111,13 @@ async def serve() -> None:
     heartbeat = WorkerHeartbeatPublisher(settings, f"{spec.kind}-runner")
     heartbeat_task = asyncio.create_task(heartbeat.serve())
     sweep_task = asyncio.create_task(_sweep_forever(settings))
+    notify_task = asyncio.create_task(_notify_systemd_forever(worker))
     try:
         await run_worker_until_signal(worker)
     finally:
-        for task in (heartbeat_task, sweep_task):
+        for task in (heartbeat_task, sweep_task, notify_task):
             task.cancel()
-        await asyncio.gather(heartbeat_task, sweep_task, return_exceptions=True)
+        await asyncio.gather(heartbeat_task, sweep_task, notify_task, return_exceptions=True)
         # NEW-226: within TimeoutStopSec; what is left is cleared at the next start.
         await asyncio.to_thread(wait_for_removals, 10.0)
 
