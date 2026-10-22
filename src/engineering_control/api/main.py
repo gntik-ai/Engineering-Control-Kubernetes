@@ -35,6 +35,9 @@ from engineering_control.api.schemas import (
     ChangeRequestRevision,
     ChangeSetResetRequest,
     CorrectionExtensionRequest,
+    DecompositionAccepted,
+    DecompositionApproval,
+    DecompositionCreate,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
@@ -69,6 +72,10 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService, TemporalControlService
 from engineering_control.config import Settings, get_settings
+from engineering_control.db.backlog_decompositions import (
+    BacklogDecompositionRepository,
+    DecompositionNotFoundError,
+)
 from engineering_control.db.change_requests import (
     ChangeRequestNotFoundError,
     ChangeRequestRepository,
@@ -89,6 +96,12 @@ from engineering_control.db.ui_gap_consolidations import (
 )
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.engineering.change_requests import prepare_intake
+from engineering_control.engineering.decomposition import (
+    decomposition_pack_problems,
+)
+from engineering_control.engineering.decomposition import (
+    pack_revision as decomposition_pack_revision,
+)
 from engineering_control.engineering.ui_gap_consolidation import ConsolidationRejected
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
@@ -127,6 +140,7 @@ def create_app(
     command_bus: TypedCommandBus | None = None,
     change_request_repository: ChangeRequestRepository | None = None,
     ui_blueprint_repository: UiBlueprintRepository | None = None,
+    decomposition_repository: BacklogDecompositionRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     admission_mode = resolved.api_admission_mode
@@ -196,6 +210,12 @@ def create_app(
         # NEW-154: gap consolidations live in the blueprint database (shared engine).
         app.state.ui_gap_consolidation_repository = (
             UiGapConsolidationRepository(engine=resolved_ui_blueprints.engine)
+            if resolved_ui_blueprints is not None
+            else None
+        )
+        # NEW-234 PR5: backlog decompositions live in the same database (shared engine).
+        app.state.decomposition_repository = decomposition_repository or (
+            BacklogDecompositionRepository(engine=resolved_ui_blueprints.engine)
             if resolved_ui_blueprints is not None
             else None
         )
@@ -335,10 +355,19 @@ def create_app(
             )
         return cast(UiGapConsolidationRepository, value)
 
+    def decompositions(request: Request) -> BacklogDecompositionRepository:
+        value = getattr(request.app.state, "decomposition_repository", None)
+        if value is None:
+            raise HTTPException(
+                status_code=503, detail="backlog decomposition repository unavailable"
+            )
+        return cast(BacklogDecompositionRepository, value)
+
     control_dependency = Depends(control)
     change_requests_dependency = Depends(change_requests)
     ui_blueprints_dependency = Depends(ui_blueprints)
     gap_consolidations_dependency = Depends(gap_consolidations)
+    decompositions_dependency = Depends(decompositions)
     metadata_dependency = Depends(metadata)
     operations_dependency = Depends(operations)
     commands_dependency = Depends(commands)
@@ -1856,6 +1885,110 @@ def create_app(
                 return OperationAccepted(workflow_id=str(claim["workflow_id"]), run_id=""), True
             await repository.release_fanout(blueprint_id, str(claim["workflow_id"]))
         raise RuntimeError("ui fan-out claim did not settle")
+
+    # NEW-234 PR5: the backlog decomposition plan, through CANDIDATE and approval. The
+    # approval records the operator's decision only (the fan-out is PR 6).
+    @app.post("/v1/backlog-decompositions", response_model=DecompositionAccepted, status_code=202)
+    async def decomposition_create(
+        body: DecompositionCreate,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> DecompositionAccepted:
+        actor = approval_actor(subject)
+        try:
+            created = await repository.create(body.project, actor, body.source_sha, body.epics)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        decomposition_id = UUID(str(created["id"]))
+        try:
+            accepted = await service.start_backlog_decomposition(
+                decomposition_id, body.project, actor, body.source_sha
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced as a durable FAILED row
+            await repository.record_start_failure(decomposition_id)
+            raise HTTPException(
+                status_code=503, detail="backlog decomposition workflow could not be started"
+            ) from error
+        return DecompositionAccepted(
+            workflow_id=accepted.workflow_id,
+            run_id=accepted.run_id,
+            decomposition_id=decomposition_id,
+        )
+
+    @app.get("/v1/backlog-decompositions", response_model=RecordList)
+    async def decomposition_list(
+        project: str | None = Query(default=None, pattern=rf"^({PROJECT_ALTERNATION})$"),
+        status: str | None = Query(
+            default=None,
+            pattern=r"^(DRAFTING|BLOCKED|FAILED|CANDIDATE|APPROVED|SUPERSEDED)$",
+        ),
+        limit: int = Query(default=20, ge=1, le=200),
+        _subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_decompositions(project, status, limit), next_cursor=None
+        )
+
+    @app.get("/v1/backlog-decompositions/{decomposition_id}")
+    async def decomposition_get(
+        decomposition_id: UUID,
+        _subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.get(decomposition_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="backlog decomposition not found")
+        return value
+
+    @app.get("/v1/backlog-decompositions/{decomposition_id}/markdown")
+    async def decomposition_markdown(
+        decomposition_id: UUID,
+        _subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        try:
+            markdown = await repository.markdown(decomposition_id)
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        if markdown is None:
+            raise HTTPException(status_code=409, detail="backlog decomposition has no plan yet")
+        view = await repository.get(decomposition_id)
+        return {
+            "decomposition_id": str(decomposition_id),
+            "markdown": markdown,
+            "usage": (view or {}).get("usage") or {},
+        }
+
+    @app.post("/v1/backlog-decompositions/{decomposition_id}/approve")
+    async def decomposition_approve(
+        decomposition_id: UUID,
+        body: DecompositionApproval,
+        subject: str = auth_dependency,
+        repository: BacklogDecompositionRepository = decompositions_dependency,
+    ) -> dict[str, Any]:
+        actor = approval_actor(subject)
+        # The released agent pack now: a plan drafted under another pack is refused.
+        current_pack = await asyncio.to_thread(
+            decomposition_pack_revision, resolved.agent_pack_root
+        )
+        pack_problems = await asyncio.to_thread(
+            decomposition_pack_problems, resolved.agent_pack_root
+        )
+        try:
+            return await repository.approve(
+                decomposition_id,
+                body.approval_binding,
+                body.typed_confirmation,
+                actor,
+                current_pack,
+                pack_problems,
+            )
+        except DecompositionNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/v1/change-requests", response_model=RecordList)
     async def change_request_list(

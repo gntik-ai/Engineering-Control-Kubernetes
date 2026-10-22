@@ -273,6 +273,18 @@ class UiGapConsolidationPlanInput:
 
 
 @dataclass
+class BacklogDecompositionPlanInput:
+    """NEW-234 PR5: one backlog decomposition plan run (the row is created by the API first
+    and carries the requested epic scope)."""
+
+    decomposition_id: str
+    project: str
+    requested_by: str
+    # Optional: the expected project main head (a full SHA); default is the current head.
+    source_sha: str | None = None
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

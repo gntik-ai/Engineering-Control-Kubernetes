@@ -38,6 +38,7 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
+from engineering_control.engineering.decomposition import decomposition_workflow_id
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.engineering.ui_blueprint import (
     ui_plan_workflow_id,
@@ -53,6 +54,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
+    BacklogDecompositionPlanInput,
     ChangeRequestInput,
     DeliveryReconciliationInput,
     EnhancementDiscoveryInput,
@@ -153,6 +155,9 @@ class ControlService(Protocol):
         self, consolidation_id: UUID, workflow_id: str
     ) -> OperationAccepted: ...
     async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]: ...
+    async def start_backlog_decomposition(
+        self, decomposition_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted: ...
 
 
 class TemporalControlService:
@@ -968,6 +973,21 @@ class TemporalControlService:
                 source_sha=source_sha,
             ),
             ui_plan_workflow_id(project, str(blueprint_id)),
+        )
+
+    async def start_backlog_decomposition(
+        self, decomposition_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted:
+        """NEW-234 PR5: one backlog decomposition plan workflow per decomposition row."""
+        return await self._start_once(
+            WorkflowName.BACKLOG_DECOMPOSITION_PLAN.value,
+            BacklogDecompositionPlanInput(
+                decomposition_id=str(decomposition_id),
+                project=project,
+                requested_by=requested_by,
+                source_sha=source_sha,
+            ),
+            decomposition_workflow_id(project, str(decomposition_id)),
         )
 
     async def start_ui_fanout(

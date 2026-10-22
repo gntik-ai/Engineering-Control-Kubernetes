@@ -65,6 +65,8 @@ HERMES_FILLS = (
 )
 TASK_KEY_FORMAT = f"{PROJECT}:<STORY>.t<n>"
 _MARKER = re.compile(r"<!--\s*falcone-serverless:([A-Z]{2,4}-[0-9]{2}|EP-[A-Z]{2,4})\s*-->")
+# NEW-234 PR5: the GitHub snapshot step keeps only the issues carrying a backlog marker.
+ISSUE_MARKER = _MARKER
 _EPIC_ID = re.compile(r"^EP-([A-Z]{2,4})$")
 _TITLE_PREFIX = re.compile(r"^\[falcone-serverless\]\[[A-Z0-9-]+\]\s*")
 _HEADING = re.compile(r"^(#{2,3}) +(\S.*?)\s*$")
@@ -566,8 +568,17 @@ def _join_issues(
         if epic_issue is not None and epic_issue.parent is not None:
             drift.append(f"epic issue {epic_issue.number} ({epic['id']}) has a parent issue")
     for story in stories:
+        # NEW-234 PR5 review: a story's epic is its backlog membership (the bound body and
+        # title equal backlog.json's). The native sub-issue link is optional until the
+        # operator links them (PR 7): a missing parent is accepted, a conflicting one is
+        # drift.
         child, parent = bound.get(story["id"]), bound.get(story["epic"])
-        if child is not None and parent is not None and child.parent != parent.number:
+        if (
+            child is not None
+            and parent is not None
+            and child.parent is not None
+            and child.parent != parent.number
+        ):
             drift.append(
                 f"issue {child.number} ({story['id']}) parent is {child.parent}, "
                 f"not epic issue {parent.number}"

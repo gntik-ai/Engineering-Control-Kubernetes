@@ -33,6 +33,7 @@ GITHUB_STEPS = frozenset(
         "gitops.branch_protection",
         "backlog.github_import",
         "delivery.refresh_issue_body",
+        "decomposition.read_issues",
         "finding.dedupe",
         "delivery.publish",
         "reconcile.inspect_ci",

@@ -35,3 +35,5 @@ class WorkflowName(StrEnum):
     UI_BLUEPRINT_FANOUT = "UiBlueprintFanOutWorkflow"
     # NEW-154: the plan step of an operator-driven gap consolidation.
     UI_GAP_CONSOLIDATION_PLAN = "UiGapConsolidationPlanWorkflow"
+    # NEW-234 PR5: the backlog decomposition plan, through CANDIDATE and approval.
+    BACKLOG_DECOMPOSITION_PLAN = "BacklogDecompositionPlanWorkflow"

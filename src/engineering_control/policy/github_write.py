@@ -27,6 +27,8 @@ READ_ONLY_GITHUB_STEPS = frozenset(
         "reconcile.inspect_ci",
         "final.inspect_artifact",
         "final.sync_worktrees",
+        # NEW-234 PR5: the decomposition's issue snapshot (GraphQL query, never a mutation).
+        "decomposition.read_issues",
     }
 )
 WRITE_CAPABLE_GITHUB_STEPS = frozenset(

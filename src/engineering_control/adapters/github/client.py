@@ -169,6 +169,67 @@ class GhCliBroker:
         )
         return self._list(value, "open issue backlog", maximum=1000)
 
+    _ISSUE_SNAPSHOT_QUERY = (
+        "query($owner: String!, $name: String!, $cursor: String) { repository(owner: $owner, "
+        "name: $name) { issues(first: 100, after: $cursor, orderBy: {field: CREATED_AT, "
+        "direction: ASC}) { nodes { number title body state labels(first: 50) { nodes { name "
+        "} } parent { number } } pageInfo { hasNextPage endCursor } } } }"
+    )
+    _CURSOR = re.compile(r"^[A-Za-z0-9+/=:_-]{1,200}$")
+
+    def list_issue_snapshot(
+        self, repository: str, *, maximum_pages: int = 10
+    ) -> list[dict[str, Any]]:
+        """NEW-234 PR5: every issue of one repository (open and closed, oldest first) with
+        its title, body, state, labels and parent issue number (read-only GraphQL)."""
+        repository = self._batch(repository)
+        owner, name = repository.split("/", 1)
+        issues: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _page in range(maximum_pages):
+            arguments = [
+                "api",
+                "graphql",
+                "-f",
+                f"query={self._ISSUE_SNAPSHOT_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+            ]
+            if cursor is not None:
+                arguments += ["-f", f"cursor={cursor}"]
+            value = self._json(self._run(arguments).stdout, "issue snapshot")
+            try:
+                connection = value["data"]["repository"]["issues"]
+                nodes = self._list(connection["nodes"], "issue snapshot")
+                page = connection["pageInfo"]
+            except (KeyError, TypeError) as error:
+                raise GhCliPolicyError("issue snapshot response is malformed") from error
+            for node in nodes:
+                labels = (node.get("labels") or {}).get("nodes") or []
+                parent = node.get("parent")
+                issues.append(
+                    {
+                        "number": node.get("number"),
+                        "title": node.get("title"),
+                        "body": node.get("body"),
+                        "state": node.get("state"),
+                        "labels": [
+                            str(label.get("name"))
+                            for label in labels
+                            if isinstance(label, dict) and label.get("name")
+                        ],
+                        "parent": parent.get("number") if isinstance(parent, dict) else None,
+                    }
+                )
+            if not page.get("hasNextPage"):
+                return issues
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str) or not self._CURSOR.fullmatch(cursor):
+                raise GhCliPolicyError("issue snapshot cursor is malformed")
+        raise GhCliPolicyError("issue snapshot exceeded its page bound")
+
     def list_repository_pull_requests(self, repository: str) -> list[dict[str, Any]]:
         """Return open PRs used for existing-work adoption without a history-wide query."""
         repository = self._batch(repository)

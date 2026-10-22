@@ -41,6 +41,8 @@ MILESTONE_EVENTS = frozenset(
         # NEW-123: UI migration flow A milestones.
         "UI_BLUEPRINT_READY",
         "UI_FANOUT_DONE",
+        # NEW-234 PR5: a backlog decomposition plan awaits the operator's approval.
+        "DECOMPOSITION_READY",
     }
 )
 
@@ -639,6 +641,7 @@ def enqueue_milestone(
         "STAGING_BLOCKED": "staging delivery BLOCKED",
         "UI_BLUEPRINT_READY": "UI blueprint ready for approval",
         "UI_FANOUT_DONE": "UI fan-out done",
+        "DECOMPOSITION_READY": "backlog decomposition ready for approval",
     }
     message = (
         f"Hermes {titles[event]}"

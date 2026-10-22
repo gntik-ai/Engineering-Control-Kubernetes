@@ -513,6 +513,9 @@ class MetadataActivityHandler:
         "ui_plan.review": "review_request",
         "ui_fanout.gap_draft": "draft_request",
         "ui_consolidate.plan": "draft_request",
+        # NEW-234 PR5: the backlog decomposition parts (Claude drafts, Codex reviews).
+        "decomposition.draft": "draft_request",
+        "decomposition.review": "review_request",
     }
 
     supported_steps = frozenset(
@@ -1471,6 +1474,8 @@ class MetadataActivityHandler:
             return "ui-blueprint-fanout"
         if provider_step.startswith("ui_consolidate."):
             return "ui-gap-consolidation"
+        if provider_step.startswith("decomposition."):
+            return "backlog-decomposition-plan"
         raise ValueError("provider telemetry step has no bounded run type")
 
     @staticmethod
