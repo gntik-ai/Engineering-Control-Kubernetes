@@ -18,6 +18,7 @@ from new_234_decomposition_fixtures import (
     ADR,
     DESIGN,
     FRAME_SHA,
+    ISSUE_NUMBERS,
     SOURCE_SHA,
     api_epic,
     backlog,
@@ -532,3 +533,77 @@ def test_reference_documents_never_share_a_staged_name() -> None:
     )
     with pytest.raises(DecompositionSourceError):
         reference_files(document)
+
+
+def _published(issue: IssueSnapshot, refs: dict[str, int]) -> IssueSnapshot:
+    """The issue publisher's rewrite: backlog ids resolved to issue numbers."""
+    lines = []
+    for line in issue.body.splitlines():
+        if line.startswith(("- Parent: ", "- Depends on: ")):
+            head, _, ids = line.partition(": ")
+            line = (
+                head
+                + ": "
+                + ", ".join(
+                    f"{key} (#{refs[key]})" if key in refs else key for key in ids.split(", ")
+                )
+            )
+        elif line.startswith("- ") and " — " in line and line[2:].split(" — ")[0] in refs:
+            key = line[2:].split(" — ")[0]
+            line = f"- [ ] #{refs[key]} — {line[2:]}"
+        lines.append(line)
+    return replace(issue, body="\n".join(lines))
+
+
+def test_issue_numbers_the_publisher_resolved_are_not_drift() -> None:
+    """falcone-serverless 2026-10-22: every issue failed DECOMPOSITION_SOURCE_DRIFT because
+    the publisher wrote "- Parent: EP-API (#1)", "- Depends on: MIG-01 (#48)" and, in an
+    epic, "- [ ] #15 — API-01 — ..." where backlog.json has the bare ids."""
+    refs = dict(ISSUE_NUMBERS)
+    published = [_published(issue, refs) for issue in issues()]
+    assert any(p.body != i.body for p, i in zip(published, issues(), strict=True))
+    assert build(issues=published)["backlog_sha256"] == build()["backlog_sha256"]
+
+
+def test_an_issue_number_that_names_another_issue_is_drift() -> None:
+    wrong = {**ISSUE_NUMBERS, "EP-API": 2}
+    published = [_published(issue, wrong) for issue in issues()]
+    error = error_of(issues=published)
+    assert error.code == SOURCE_DRIFT
+    assert any("API-01) body differs" in item for item in error.details), error.details
+
+
+def test_only_the_publisher_rewrite_of_each_backlog_line_is_accepted() -> None:
+    from engineering_control.engineering.decomposition_inventory import _matches_published
+
+    numbers = {"EP-API": 1, "API-01": 15, "MIG-01": 48, "SEC-01": 33}
+    stories = frozenset({"API-01"})
+    epic = "## Stories\n\n- API-01 — Preserve the Functions API"
+    story = "## Planning\n\n- Parent: EP-API\n- Depends on: MIG-01, SEC-01"
+    assert _matches_published(epic, epic, numbers, stories)
+    assert _matches_published(
+        "## Stories\n\n- [ ] #15 — API-01 — Preserve the Functions API", epic, numbers, stories
+    )
+    assert _matches_published(
+        "## Planning\n\n- Parent: EP-API (#1)\n- Depends on: MIG-01 (#48), SEC-01 (#33)",
+        story,
+        numbers,
+    )
+    drift = [
+        # Codex reviews: a ref or row anywhere the backlog line is not a Parent, Depends on
+        # or own-story row, a ticked row, a wrong number, a partial rewrite, an added line.
+        (
+            "## Acceptance criteria\n\n- [ ] Keeps API-01 (#15) behaviour",
+            "## Acceptance criteria\n\n- [ ] Keeps API-01 behaviour",
+            stories,
+        ),
+        ("## Stories\n\n- [x] #15 — API-01 — Preserve the Functions API", epic, stories),
+        ("## Stories\n\n- [ ] #16 — API-01 — Preserve the Functions API", epic, stories),
+        ("## Stories\n\n- [ ] #15 — API-01 — Preserve the Functions API", epic, frozenset()),
+        ("## Stories\n\n- [ ] #15 — API-01 — Something else", epic, stories),
+        ("## Planning\n\n- Parent: EP-API (#2)\n- Depends on: MIG-01, SEC-01", story, stories),
+        ("## Planning\n\n- Parent: EP-API\n- Depends on: MIG-01 (#48), SEC-01", story, stories),
+        (epic + "\n- API-02 — Added", epic, stories),
+    ]
+    for github, backlog_body, own in drift:
+        assert not _matches_published(github, backlog_body, numbers, own), github
