@@ -54,6 +54,17 @@ def load_maker_rules(project_config_root: Path, project: str, *, deployment: boo
     return list(rules.deployment if deployment else rules.source)
 
 
+def load_agent_sandbox(project_config_root: Path, project: str) -> dict[str, bool] | None:
+    """NEW-228: the project's enabled agent sandbox opt-ins, as they travel in the payload.
+
+    None (no block, or nothing enabled) keeps today's sandbox and adds nothing."""
+    policy = load_project_manifest(project_config_root, project).sandbox
+    if policy is None:
+        return None
+    enabled = {key: True for key, value in policy.model_dump().items() if value is True}
+    return enabled or None
+
+
 def load_project_manifest(project_config_root: Path, project: str) -> ProjectManifest:
     """Read one bounded project manifest (no symlinks, size-bounded, identity-checked)."""
     if project not in _PROJECTS:

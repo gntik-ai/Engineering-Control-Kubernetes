@@ -504,6 +504,19 @@ class MakerRules(EngineeringModel):
     )
 
 
+class AgentSandboxPolicy(EngineeringModel):
+    """NEW-228: per-project agent sandbox opt-ins (default off: today's sandbox).
+
+    ``loopback_network``: maker and checker commands may bind and connect on 127.0.0.1
+    and ::1 (vite preview, Playwright and Chromium, a local registry mirror) and reach no
+    other address. ``checker_scratch_copy``: the Claude checker works in a private,
+    writable copy of the maker's worktree (it cannot write build output into the
+    maker-owned worktree itself, and still cannot)."""
+
+    loopback_network: bool = False
+    checker_scratch_copy: bool = False
+
+
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
     project: ProjectName
@@ -524,6 +537,8 @@ class ProjectManifest(EngineeringModel):
     # NEW-120: the side-by-side console migration (legacy -> gntik-ui) contract.
     ui_migration: UiMigrationPolicy | None = None
     maker_rules: MakerRules | None = None
+    # NEW-228: see AgentSandboxPolicy.
+    sandbox: AgentSandboxPolicy | None = None
 
     @model_validator(mode="after")
     def deployment_pin_requires_a_pair(self) -> ProjectManifest:

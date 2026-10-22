@@ -4,10 +4,11 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -15,11 +16,20 @@ from pydantic import ValidationError as PydanticValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.adapters.agent_sandbox import (
+    AgentSandbox,
+    ScratchCopyError,
+    copy_worktree,
+    payload_agent_sandbox,
+    remove_tree,
+    verified_loopback_shell,
+)
 from engineering_control.adapters.auth_probe import AuthProbeError
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.adapters.process import (
     PROVIDER_CAPACITY_ERROR,
+    TOOLCHAIN_CACHE_ROOT,
     SandboxToolchain,
     subscription_only_environment,
 )
@@ -55,6 +65,7 @@ from engineering_control.security.redaction import (
     bounded_detail,
     redact_detail_text,
 )
+from engineering_control.worktrees.hardened_git import HardenedGitError, worktree_location
 
 _PYDANTIC_MESSAGE_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
 
@@ -113,6 +124,14 @@ class InstructionPack(Protocol):
     def enrich(
         self, request: AgentRequest, step: str
     ) -> tuple[AgentRequest, InstructionBundle]: ...
+
+
+# NEW-228: the delivery agents a project's agent sandbox opt-ins apply to (the spec,
+# reviewers and every other flow keep today's sandbox), Claude runs only: Codex keeps
+# today's sandbox (no sockets) whatever the payload says.
+_AGENT_SANDBOX_STEPS = frozenset(
+    {"delivery.invoke_maker", "delivery.invoke_deployment_maker", "delivery.invoke_checker"}
+)
 
 
 class ProviderActivityHandler:
@@ -183,6 +202,7 @@ class ProviderActivityHandler:
             executable=str(self.settings.claude_executable),
             temp_root=temp_root,
             run_memory_max_bytes=memory,
+            loopback_shell=str(self.settings.agent_loopback_shell),
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +264,30 @@ class ProviderActivityHandler:
                 "TOOLCHAIN_CONTRACT_INVALID",
                 detail=error_detail(error, self.redactor),
             )
+        try:
+            agent_sandbox = (
+                payload_agent_sandbox(payload)
+                if step in _AGENT_SANDBOX_STEPS and self.provider is Provider.CLAUDE
+                else None
+            )
+        except ValueError as error:
+            return self._blocked(
+                runtime_payload,
+                "AGENT_SANDBOX_CONTRACT_INVALID",
+                detail=error_detail(error, self.redactor),
+            )
+        agent_sandbox, sandbox_problem = self._agent_sandbox_problem(agent_sandbox, request)
+        if sandbox_problem is not None:
+            # Fail closed: never a run with more network than the opt-in describes.
+            return self._blocked(
+                runtime_payload, "AGENT_SANDBOX_LOOPBACK_UNAVAILABLE", detail=sandbox_problem
+            )
+        scratch_copy = (
+            agent_sandbox is not None
+            and agent_sandbox.checker_scratch_copy
+            and step == "delivery.invoke_checker"
+            and not request.writable
+        )
         try:
             authenticated = await self.adapter.authenticated()
         except FileNotFoundError:
@@ -344,7 +388,9 @@ class ProviderActivityHandler:
         memory_before = memory_snapshot()
         keepalive = asyncio.create_task(heartbeat_keepalive())
         try:
-            result = await self._execute(request, heartbeat_event, sandbox_toolchain)
+            result = await self._execute(
+                request, heartbeat_event, sandbox_toolchain, agent_sandbox, scratch_copy
+            )
             for retry, delay in enumerate(self._capacity_backoff_seconds, start=1):
                 if not self._capacity_retry_allowed(result, delay):
                     break
@@ -358,7 +404,9 @@ class ProviderActivityHandler:
                     }
                 )
                 await asyncio.sleep(delay)
-                result = await self._execute(request, heartbeat_event, sandbox_toolchain)
+                result = await self._execute(
+                    request, heartbeat_event, sandbox_toolchain, agent_sandbox, scratch_copy
+                )
         except BaseException as error:
             # NEW-226: an activity timeout arrives here as a cancellation.
             pressure = memory_pressure_event(memory_before, memory_snapshot())
@@ -433,11 +481,143 @@ class ProviderActivityHandler:
         request: AgentRequest,
         on_event: Callable[[dict[str, Any]], Awaitable[None]],
         toolchain: SandboxToolchain | None,
+        sandbox: AgentSandbox | None = None,
+        scratch_copy: bool = False,
     ) -> AgentResult:
-        if toolchain is None:
-            # The default toolchain calls the adapter exactly as before NEW-159.
-            return await self.adapter.execute(request, on_event)
-        return await self.adapter.execute(request, on_event, toolchain=toolchain)
+        options: dict[str, Any] = {}
+        if toolchain is not None:
+            options["toolchain"] = toolchain
+        if sandbox is not None:
+            options["sandbox"] = sandbox
+        if not scratch_copy:
+            # The default toolchain and sandbox call the adapter exactly as before.
+            return await self.adapter.execute(request, on_event, **options)
+        copy_root = (
+            self.settings.temporary_root
+            / self.provider.value
+            / f"checker-copy-{request.run_id}-{uuid4().hex[:8]}"
+        )
+        try:
+            copy = await self._scratch_worktree(request, copy_root, on_event)
+            if copy is not None:
+                if sandbox is not None and sandbox.loopback_network:
+                    # The copy links the maker's pnpm store: its commands read the original.
+                    options["sandbox"] = replace(
+                        sandbox,
+                        readable_roots=(*sandbox.readable_roots, request.working_directory),
+                    )
+                note = self._scratch_copy_note(request, copy)
+                request = request.model_copy(
+                    update={"working_directory": str(copy), "prompt": f"{request.prompt}\n\n{note}"}
+                )
+            return await self.adapter.execute(request, on_event, **options)
+        finally:
+            with suppress(OSError):  # a leftover copy only costs disk, never the result
+                await asyncio.to_thread(remove_tree, copy_root)
+
+    def _agent_sandbox_problem(
+        self, sandbox: AgentSandbox | None, request: AgentRequest
+    ) -> tuple[AgentSandbox | None, str | None]:
+        """NEW-228: the sandbox to run with, or why a loopback opt-in cannot be honoured."""
+        if sandbox is None or not sandbox.loopback_network:
+            return sandbox, None
+        shell, problem = verified_loopback_shell(self.settings.agent_loopback_shell)
+        if shell is None:
+            return sandbox, problem
+        readable, writable = self._git_metadata_mounts(
+            Path(request.working_directory), writable=request.writable
+        )
+        return (
+            replace(
+                sandbox,
+                loopback_shell=str(shell),
+                # The offline toolchain caches (Go modules, Trivy) are shared and read-only.
+                readable_roots=(*readable, str(TOOLCHAIN_CACHE_ROOT)),
+                writable_roots=writable,
+            ),
+            None,
+        )
+
+    def _git_metadata_mounts(
+        self, worktree: Path, *, writable: bool
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """NEW-228 review 3, finding 2: this ChangeSet's Git metadata only, derived from
+        the trusted roots (never from the worktree's agent-writable .git file), as
+        (read-only, writable) mounts: ``metadata_root/<repository>/<id>.git`` and the
+        objects of its canonical mirror read-only; for a maker, which commits, also its
+        own admin directory (index, HEAD) and the commondir's objects/, refs/ and logs/
+        (NEW-221b: what a commit writes; config and the rest stay read-only). Anything
+        else (not a ChangeSet worktree, metadata missing or not sealed): no Git mounts."""
+        try:
+            if worktree.is_symlink():
+                return (), ()
+            resolved = worktree.resolve()
+            if resolved.parent.parent != self.settings.worktree_root.resolve():
+                return (), ()
+            UUID(resolved.name)
+            repository = resolved.parent.name
+            metadata_parent = self.settings.worktree_metadata_root.resolve() / repository
+            metadata = self.settings.worktree_metadata_root / repository / f"{resolved.name}.git"
+            if metadata.is_symlink() or metadata.resolve().parent != metadata_parent:
+                return (), ()
+            location = worktree_location(resolved, metadata.resolve())
+        except (OSError, ValueError, HardenedGitError):
+            return (), ()
+        common = location.common_dir
+        readable = [str(common)]
+        mirror = self.settings.mirror_root / f"{repository}.git"
+        if mirror.is_dir() and (mirror.resolve() / "objects").is_dir():
+            readable.append(str(mirror.resolve() / "objects"))
+        if not writable:
+            return tuple(readable), ()
+        written = [str(location.git_dir)]
+        for name in ("objects", "refs", "logs"):
+            directory = common / name
+            if directory.is_dir() and not directory.is_symlink():
+                written.append(str(directory))
+        return tuple(readable), tuple(written)
+
+    async def _scratch_worktree(
+        self,
+        request: AgentRequest,
+        copy_root: Path,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> Path | None:
+        """NEW-228: a private writable copy of the maker's worktree for the checker; None
+        (the checker reviews the worktree itself, as before) if it cannot be made."""
+        source = Path(request.working_directory)
+        copy = copy_root / (source.name or "worktree")
+        try:
+            await asyncio.to_thread(self._make_scratch_copy, source, copy_root, copy)
+        except (OSError, ScratchCopyError) as error:
+            await on_event(
+                {
+                    "type": "hermes.checker_scratch_copy",
+                    "status": "SKIPPED",
+                    "detail": error_detail(error, self.redactor),
+                }
+            )
+            return None
+        await on_event({"type": "hermes.checker_scratch_copy", "status": "READY"})
+        return copy
+
+    @staticmethod
+    def _make_scratch_copy(source: Path, copy_root: Path, copy: Path) -> None:
+        copy_root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if copy_root.parent.is_symlink():
+            raise ScratchCopyError("provider temporary root is a symlink")
+        copy_root.mkdir(mode=0o700)
+        copy_worktree(source, copy)
+
+    @staticmethod
+    def _scratch_copy_note(request: AgentRequest, copy: Path) -> str:
+        return (
+            "Hermes note (NEW-228): your working directory "
+            f"{copy} is a private, writable copy of the maker's worktree "
+            f"{request.working_directory}, made for this review (same files, same git "
+            "metadata, which stays read-only). Build and run the tests in the copy; the "
+            "original is read-only for you. Review and report on the same files and paths."
+        )
 
     def _capacity_retry_allowed(self, result: AgentResult, delay: float) -> bool:
         """Retry only a model-at-capacity failure, and only within the activity budget."""

@@ -88,9 +88,17 @@ delivery_control:
     # Hermes never merges CI or agent configuration changes (NEW-130 also refuses
     # .claude/, .codex/ and .mcp.json ChangeSets before they are published).
     protected_paths: [.github/, .claude/, .codex/, .mcp.json, CLAUDE.md, AGENTS.md]
+# NEW-228 (2026-10-19): 36 of 43 failed PR check runs (10-14..10-19) were the a11y and
+# visual browser suites, which makers and the checker could not run ("listen EPERM
+# ::1:4173"); the Claude checker could not build in the codex-runner-owned worktree.
+# Reduced scope: Claude makers/checkers only; Codex runs keep today's sandbox (no sockets).
+sandbox:
+  loopback_network: true      # Claude maker/checker commands may use 127.0.0.1 and ::1 only
+  checker_scratch_copy: true  # the Claude checker builds in a private copy of the worktree
 toolchain:
   # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree before
-  # the maker runs; makers and the checker have no network. NEW-159: Node 24 and the
+  # the maker runs; makers and the checker have no network (Claude ones: loopback only,
+  # NEW-228, sandbox above). NEW-159: Node 24 and the
   # pinned standalone pnpm (package.json packageManager pnpm@11.28.3, engines.node >=24).
   enabled: true
   node: "24"
@@ -170,6 +178,14 @@ maker_rules:
       or extend an existing example to demonstrate the new behaviour.
       apps/docs/test/docs-coverage.test.mjs (once present) must pass; never add to its known-gap
       lists. The checker rejects a change that ships behaviour no docs example shows.
+    - >-
+      Claude commands may bind and connect on loopback only (127.0.0.1 and ::1; Codex
+      commands have no sockets), and each command has a loopback of its own: start a
+      server in the same command as its client. When a change can affect the docs site, run `pnpm --filter
+      @gntik-ai/docs build`, then PLAYWRIGHT_CHROMIUM_EXECUTABLE=<the chrome under
+      /opt/engineering-browser/browsers/chromium-*/chrome-linux64/> `pnpm --filter
+      @gntik-ai/docs exec playwright test a11y` (it starts vite preview itself). Visual
+      baselines are recorded on the CI runner, so a local visual diff is informative only.
 dependencies: {}
 classification:
   product: true

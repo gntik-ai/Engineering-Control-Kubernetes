@@ -30,6 +30,7 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.activities.ui_plan_scan import UI_PLAN_SCAN_STEPS, UiPlanScanSteps
+from engineering_control.adapters.agent_sandbox import AGENT_SANDBOX_KEY
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
@@ -67,6 +68,7 @@ from engineering_control.engineering.toolchain import (
     baseline_requires_sandbox,
     cargo_config_violations,
     enabled_toolchain,
+    load_agent_sandbox,
     load_toolchain_policy,
     match_toolchain_test_command,
     payload_node_toolchain,
@@ -2639,8 +2641,14 @@ class ScanActivityHandler(UiPlanScanSteps):
             policy = load_toolchain_policy(
                 self.settings.project_config_root, str(payload["project"])
             )
+            # NEW-228: the agent sandbox opt-ins travel with the toolchain selection to the
+            # maker/checker invocations too (absent: today's sandbox).
+            agent_sandbox = load_agent_sandbox(
+                self.settings.project_config_root, str(payload["project"])
+            )
         except (OSError, ValueError) as error:
             return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        sandbox_selection = {AGENT_SANDBOX_KEY: agent_sandbox} if agent_sandbox else {}
         try:
             # NEW-159 review 3: a re-preparation in the same delivery (e.g. after dependency
             # resolution) keeps the selection it carries; only the first one reads the manifest.
@@ -2663,6 +2671,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "toolchain_preparation": {
                     "status": "TOOLCHAIN_SKIPPED",
                     **({"node_toolchain": selection} if selection is not None else {}),
+                    **sandbox_selection,
                 },
             }
         worktree = self._bounded_worktree(payload["source_worktree"])
@@ -2757,6 +2766,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         }
         if selection is not None:
             preparation["node_toolchain"] = selection
+        preparation.update(sandbox_selection)
         return {
             **payload,
             "status": "TOOLCHAIN_READY",
