@@ -47,7 +47,7 @@ MAX_INVENTORY_BYTES = 1_500_000
 MAX_ISSUES = 300
 MAX_ISSUE_BODY = 65_536
 _SHA = re.compile(r"^[a-f0-9]{40}$")
-_DOCUMENT_NAME = re.compile(r"^part-(frame|ep[0-9]{2})-[a-f0-9]{16}-(draft|review)-[123]\.json$")
+_DOCUMENT_NAME = re.compile(r"^part-(frame|ep[0-9]{2})-[a-f0-9]{16}-(draft|review)-[1-5]\.json$")
 
 
 def _issue(item: Any) -> IssueSnapshot:

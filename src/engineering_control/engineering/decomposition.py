@@ -68,6 +68,10 @@ DECOMPOSITION_PART_SCHEMAS: dict[str, dict[str, str]] = {
 }
 # Design section 3 budgets.
 MAX_PART_DRAFTS = 3
+# Operator 2026-10-23: drafts refused by Hermes's deterministic checks (or the provider's
+# schema boundary) before any review have their own per-part budget; a part still has
+# MAX_PART_DRAFTS reviewed drafts, so at most MAX_PART_DRAFTS + MAX_PART_REJECTIONS drafts.
+MAX_PART_REJECTIONS = 2
 MAX_PART_REVIEWS = 3
 MAX_PROVIDER_CALLS = 90
 MAX_INPUT_BYTES = 64 * 1024
