@@ -461,6 +461,26 @@ class DecompositionCreate(APIModel):
 class DecompositionApproval(APIModel):
     approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
     typed_confirmation: Literal["APPROVE_DECOMPOSITION"]
+    # NEW-234 PR6: the fan-out cap of this run (bounded by the configured maximum, default
+    # 250) and whether a task an existing unpublished request of its lineage superseded
+    # is fanned out again (a published one never is).
+    max_items: int | None = Field(default=None, ge=1, le=400)
+    replace: bool = False
+
+
+class DecompositionFanoutRetry(APIModel):
+    """NEW-234 PR6 (NEW-146 for flow D): reset FAILED fan-out tasks and fan out again."""
+
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["RETRY_DECOMPOSITION_FANOUT"]
+    max_items: int | None = Field(default=None, ge=1, le=400)
+    replace: bool = False
+
+
+class DecompositionApproveReady(APIModel):
+    """NEW-234 PR6: approve every ready request (the binding `-ready` printed)."""
+
+    ready_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class UiFanoutRetry(APIModel):

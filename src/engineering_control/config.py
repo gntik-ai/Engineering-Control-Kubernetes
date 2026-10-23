@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     # NEW-123: at most this many UI blueprint items become change-request drafts per fan-out
     # run; an approval replay resumes with the next items (idempotent, deterministic ids).
     ui_blueprint_fanout_max_items: int = Field(default=80, ge=1, le=600)
+    # NEW-234 PR6: at most this many backlog decomposition tasks become change requests per
+    # fan-out run (design section 4: 130-200 expected, default 250, hard limit 400).
+    backlog_decomposition_fanout_max_items: int = Field(default=250, ge=1, le=400)
     # NEW-131: pages per drafted blueprint batch (the frame is drafted first, alone).
     ui_plan_batch_pages: int = Field(default=8, ge=1, le=25)
     helm_executable: Path = Path("/usr/local/bin/helm")

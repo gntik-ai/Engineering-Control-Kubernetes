@@ -210,6 +210,11 @@ def ui_context_json(context: UiChangeContext) -> dict[str, Any]:
 
 _TASK_KEY_PATTERN = r"^[A-Z]{2,4}-[0-9]{2}\.t[0-9]{1,2}$"
 _STORY_KEY_PATTERN = r"^[A-Z]{2,4}-[0-9]{2}$"
+DecompositionTaskKey = Annotated[str, Field(pattern=_TASK_KEY_PATTERN)]
+# NEW-234 PR6: a published predecessor's issue, in any allowlisted repository.
+DecompositionIssueReference = Annotated[
+    str, Field(pattern=rf"^gntik-ai/({CHANGE_REQUEST_REPOSITORY_ALTERNATION})#[1-9][0-9]{{0,7}}$")
+]
 
 
 class DecompositionChangeContext(ChangeRequestModel):
@@ -224,11 +229,24 @@ class DecompositionChangeContext(ChangeRequestModel):
     story_key: str = Field(pattern=_STORY_KEY_PATTERN)
     story_issue: int = Field(ge=1, le=10_000_000)
     epic_issue: int = Field(ge=1, le=10_000_000)
+    # NEW-234 PR6: the plan's predecessor tasks (cross-story and cross-repository allowed)
+    # and the issue of each one already published, rendered as the dependency line the
+    # backlog import reads. Both are empty (and nothing is rendered) without dependencies.
+    depends_on_tasks: tuple[DecompositionTaskKey, ...] = Field(default=(), max_length=30)
+    depends_on: tuple[DecompositionIssueReference, ...] = Field(default=(), max_length=30)
 
     @model_validator(mode="after")
     def task_of_story(self) -> DecompositionChangeContext:
         if self.task_key.split(".", 1)[0] != self.story_key:
             raise ValueError("decomposition task key must belong to its story")
+        if self.task_key in self.depends_on_tasks:
+            raise ValueError("a decomposition task cannot depend on itself")
+        if len(set(self.depends_on_tasks)) != len(self.depends_on_tasks) or len(
+            set(self.depends_on)
+        ) != len(self.depends_on):
+            raise ValueError("decomposition dependencies are listed once each")
+        if len(self.depends_on) > len(self.depends_on_tasks):
+            raise ValueError("a decomposition dependency issue needs its predecessor task")
         return self
 
 
@@ -598,6 +616,15 @@ def _decomposition_context_lines(project: str, context: DecompositionChangeConte
         f"- Epic: {source}#{context.epic_issue}",
         f"- Task: `{context.task_key}`",
         f"- Plan: `{context.decomposition_id}` (sha256 `{context.plan_sha256}`)",
+        # NEW-234 PR6: only a task with predecessors has these lines; the issue references
+        # are filled in as each predecessor is published (the request is approvable only
+        # once all of them are, so an approved body names every one).
+        *(
+            ["- Predecessor tasks: " + ", ".join(f"`{key}`" for key in context.depends_on_tasks)]
+            if context.depends_on_tasks
+            else []
+        ),
+        *(["- Depends on: " + ", ".join(context.depends_on)] if context.depends_on else []),
         "",
         decomposition_marker(
             project=project,

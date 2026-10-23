@@ -28,9 +28,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # NEW-234: 0022 (backlog decompositions) follows 0021 (MERGED and gap consolidations),
-    # which follows 0020 (UI blueprints).
-    assert (head, parent) == ("0022", "0021")
+    # NEW-234 PR6: 0023 (one active request per decomposition lineage) follows 0022
+    # (backlog decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
+    assert (head, parent) == ("0023", "0022")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -54,9 +54,16 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     }
 
     assert "backlog_decompositions" in inspect(engine).get_table_names()
+    assert "uq_change_requests_active_decomposition_lineage" in {
+        index["name"] for index in inspect(engine).get_indexes("change_requests")
+    }
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "uq_change_requests_active_decomposition_lineage" not in {
+        index["name"] for index in inspect(engine).get_indexes("change_requests")
+    }
+    command.downgrade(config, "0021")
     assert "backlog_decompositions" not in inspect(engine).get_table_names()
     assert "decomposition_lineage" not in {
         column["name"] for column in inspect(engine).get_columns("change_requests")

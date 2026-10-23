@@ -550,7 +550,8 @@ def test_migration_0022_creates_exactly_the_model_schema_and_round_trips(
     assert "backlog_decompositions" not in inspect(engine).get_table_names()
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0022"
+        # NEW-234 PR6: 0023 (one active request per lineage) is the head.
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0023"
     engine.dispose()
 
 
@@ -566,7 +567,12 @@ def test_migration_0022_downgrade_refuses_decomposition_data(
     if kind == "decomposition":
         add_decomposition(repository, None)
     else:
-        decomposition_request(repository)
+        identity = decomposition_request(repository)
+        # An inactive request: 0023's downgrade passes, 0022's refuses its data.
+        with repository.sessions.begin() as session:
+            row = session.get(ChangeRequest, identity)
+            assert row is not None
+            row.status = "REJECTED"
     with pytest.raises(RuntimeError, match="revision 0022 downgrade refuses"):
         command.downgrade(config, "0021")
     with engine.connect() as connection:

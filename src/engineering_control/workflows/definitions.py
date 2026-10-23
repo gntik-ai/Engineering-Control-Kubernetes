@@ -22,6 +22,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
+    BacklogDecompositionFanOutInput,
     BacklogDecompositionPlanInput,
     ChangeRequestInput,
     CleanupInput,
@@ -7894,6 +7895,168 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
         return {**current, "blocker": "DECOMPOSITION_PART_REVIEW_UNRESOLVED"}
 
 
+@workflow.defn(name="BacklogDecompositionFanOutWorkflow")
+class BacklogDecompositionFanOutWorkflow(ControlledWorkflow):
+    """NEW-234 PR6 (design section 4): after the operator approves a backlog decomposition,
+    one change-request CANDIDATE per task. Modelled on UiBlueprintFanOutWorkflow (a new
+    workflow type; the UI fan-out and its markers are untouched).
+
+    Each task's proposal is rendered from the plan under a deterministic id (plan hash +
+    task key), routed to its target repository, reviewed once by Codex against that
+    repository's read-only snapshot (an unresolved review is persisted with its findings),
+    searched on GitHub by title (read-only) and persisted. Batches of FANOUT_BATCH, capped
+    at max_items per run, continue as new; idempotent and resumable. Hermes never
+    approves, publishes or edits an issue.
+    """
+
+    @workflow.run
+    async def run(self, request: BacklogDecompositionFanOutInput) -> dict[str, Any]:
+        plan = await self._step("decomposition_fanout.plan", asdict(request))
+        counts = {"drafted": request.drafted, "failed": request.failed,
+                  "skipped": request.skipped}  # fmt: skip
+        processed = request.processed
+        if plan.get("status") == "BLOCKED":
+            return await self._fanout_finalize(
+                request, plan, counts, processed, str(plan.get("blocker"))
+            )
+        items = [dict(item) for item in plan.get("items", [])]
+        worktrees = dict(request.worktrees or {})
+        for snapshot in plan.get("snapshots", []):
+            try:
+                taken = await self._step(
+                    "project.snapshot",
+                    {
+                        "project": snapshot.get("project"),
+                        "campaign_id": snapshot.get("campaign_id"),
+                    },
+                    timeout_minutes=60,
+                )
+            except ActivityError:
+                return await self._fanout_finalize(
+                    request, plan, counts, processed, "DECOMPOSITION_FANOUT_SNAPSHOT_UNAVAILABLE"
+                )
+            for repository, field in dict(snapshot.get("worktrees") or {}).items():
+                worktrees[str(repository)] = str(taken.get(str(field)) or "")
+        for item in items:
+            if not await self._checkpoint("DECOMPOSITION_FANOUT_ITEM"):
+                return await self._fanout_finalize(
+                    request, plan, counts, processed, "DECOMPOSITION_FANOUT_CANCELLED"
+                )
+            outcome = await self._fanout_item(
+                request, str(item["key"]), worktrees.get(str(item["repository"])) or ""
+            )
+            counts[outcome] += 1
+            processed += 1
+        pending_after = int(plan.get("pending_total") or 0) - len(items)
+        if items and pending_after > 0 and processed < request.max_items:
+            workflow.continue_as_new(
+                replace(
+                    request,
+                    processed=processed,
+                    worktrees=worktrees,
+                    drafted=counts["drafted"],
+                    failed=counts["failed"],
+                    skipped=counts["skipped"],
+                )
+            )
+        return await self._fanout_finalize(request, plan, counts, processed, None)
+
+    async def _fanout_finalize(
+        self,
+        request: BacklogDecompositionFanOutInput,
+        plan: dict[str, Any],
+        counts: dict[str, int],
+        processed: int,
+        blocker: str | None,
+    ) -> dict[str, Any]:
+        pending = max(0, int(plan.get("pending_total") or 0) - len(plan.get("items", [])))
+        finalized = await self._step(
+            "decomposition_fanout.finalize",
+            {
+                "decomposition_id": request.decomposition_id,
+                "project": plan.get("project"),
+                "max_items": request.max_items,
+                "replace": request.replace,
+                "processed": processed,
+                "pending_total": pending if blocker is None else plan.get("pending_total", 0),
+                "blocker": blocker,
+                **counts,
+            },
+        )
+        return {
+            "status": "BLOCKED" if blocker else "COMPLETED",
+            "decomposition_id": request.decomposition_id,
+            "error_code": blocker,
+            "processed": processed,
+            "pending": finalized.get("pending_total", pending),
+            **counts,
+            **(
+                {"failed_items": finalized["failed_items"]} if finalized.get("failed_items") else {}
+            ),
+        }
+
+    async def _fanout_item(
+        self, request: BacklogDecompositionFanOutInput, key: str, source_worktree: str
+    ) -> str:
+        context: dict[str, Any] = {"decomposition_id": request.decomposition_id, "item_key": key}
+        try:
+            context = await self._step(
+                "decomposition_fanout.prepare_item",
+                {
+                    "decomposition_id": request.decomposition_id,
+                    "item_key": key,
+                    "source_worktree": source_worktree,
+                    "replace": request.replace,
+                },
+            )
+            if context.get("status") == "SKIPPED":
+                return "skipped"
+            if context.get("status") != "PROPOSAL_READY":
+                return await self._fanout_item_failure(context, "draft")
+            context = await self._step("decomposition_fanout.prepare_review", context)
+            if context.get("status") != "REVIEW_READY":
+                return await self._fanout_item_failure(context, "draft")
+            context = await self._agent_step("change_request.review", context, timeout_minutes=70)
+            if context.get("status") != "SUCCESS":
+                return await self._fanout_item_failure(context, "review")
+            context = await self._step("change_request.record_review", context)
+            # The proposal is the plan's own: an unresolved review is persisted as a
+            # CANDIDATE with its findings (approved one by one, never in bulk).
+            if context.get("status") not in {"REVIEW_APPROVED", "REVIEW_REVISE"}:
+                return await self._fanout_item_failure(context, "review")
+            if context.get("dedupe_supported"):
+                try:
+                    context = await self._step("change_request.github_dedupe", context)
+                except ActivityError:
+                    context = {**context, "dedupe": dict(_UI_FANOUT_NO_DEDUPE)}
+            else:
+                context = {**context, "dedupe": dict(_UI_FANOUT_NO_DEDUPE)}
+            persisted = await self._step("change_request.persist", context)
+        except ActivityError:
+            return await self._fanout_item_failure(
+                {**context, "blocker": "STEP_FAILED"}, "internal"
+            )
+        return "drafted" if persisted.get("status") == "CANDIDATE" else "failed"
+
+    async def _fanout_item_failure(self, context: dict[str, Any], phase: str) -> str:
+        if not context.get("change_request_id") or not context.get("revision"):
+            return "failed"
+        try:
+            await self._step(
+                "change_request.record_failure",
+                {
+                    "change_request_id": context.get("change_request_id"),
+                    "revision": context.get("revision"),
+                    "failure_phase": phase,
+                    "blocker": str(context.get("blocker") or context.get("status") or "FAILED"),
+                    **_blocker_detail(context),
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning("decomposition fan-out item %s: failure not recorded", context)
+        return "failed"
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     MultiProjectAuditWorkflow,
@@ -7927,4 +8090,5 @@ ALL_WORKFLOWS = [
     UiBlueprintFanOutWorkflow,
     UiGapConsolidationPlanWorkflow,
     BacklogDecompositionPlanWorkflow,
+    BacklogDecompositionFanOutWorkflow,
 ]

@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import re
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from engineering_control.db.models import BacklogDecomposition, ChangeRequest, Run, UiBlueprint
+from engineering_control.db.models import (
+    ACTIVE_DECOMPOSITION_STATUSES,
+    BacklogDecomposition,
+    ChangeRequest,
+    Run,
+    UiBlueprint,
+)
 from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
 )
@@ -30,9 +39,18 @@ from engineering_control.engineering.change_requests import (
     approval_record,
     approval_record_matches,
     change_request_workflow_id,
+    decomposition_lineage,
     render_change_request,
     ui_context_json,
     validate_proposal,
+)
+from engineering_control.engineering.decomposition_fanout import (
+    DEPENDENCIES_AWAITING,
+    DEPENDENCIES_STALE,
+    LINEAGE_BLOCKING_STATUSES,
+    SUPERSEDED_BY_EXISTING,
+    import_risk,
+    lineage_of,
 )
 from engineering_control.security.redaction import SecretRedactor, bounded_detail
 
@@ -55,6 +73,15 @@ from engineering_control.engineering.ui_gap_consolidation import MAX_MERGE_HOPS 
 
 class ChangeRequestNotFoundError(ValueError):
     """The requested change request does not exist."""
+
+
+class DependenciesAwaitingError(ValueError):
+    """NEW-234 PR6: a decomposition request whose predecessors are not all published."""
+
+
+LOGGER = logging.getLogger(__name__)
+# NEW-234 PR6 review: the session flag of the one change-request lock a transaction takes.
+_REQUEST_LOCKS = "engineering_control.change_request_locks"
 
 
 class ChangeRequestRepository:
@@ -173,6 +200,170 @@ class ChangeRequestRepository:
             session.flush()
             return {**self._summary(row), "created": True}
 
+    def create_decomposition_task_sync(
+        self,
+        change_request_id: UUID,
+        intake: ChangeRequestIntake,
+        requested_by: str,
+        context: DecompositionChangeContext,
+        *,
+        fanout_writer: str,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """NEW-234 PR6: one fanned-out decomposition task, idempotent under its id.
+
+        Fenced by the decomposition's active fan-out marker (atomic with the row write). The
+        first dedupe of design section 4: another active request of the same lineage
+        (project:story:key: drafting, a candidate, approved or published, typically from an
+        earlier plan) supersedes this task (SKIPPED SUPERSEDED_BY_EXISTING). With
+        ``replace`` an unpublished one is rejected (an operator decision, recorded with the
+        approving operator) and this task is filed instead; a published one always
+        supersedes it. The partial unique index of migration 0023 (one active request per
+        lineage) makes the check race-proof across decompositions: a concurrent insert of
+        the same lineage fails and is reported as SKIPPED SUPERSEDED_BY_EXISTING."""
+        if not is_reauthenticated_backlog_operator(requested_by):
+            raise ValueError("change requests require an allowlisted operator channel")
+        stored_context = context.model_dump(mode="json")
+        lineage = decomposition_lineage(intake.project, context)
+        try:
+            with self.sessions.begin() as session:
+                return self._create_decomposition_task(
+                    session,
+                    change_request_id,
+                    intake,
+                    requested_by,
+                    context,
+                    stored_context,
+                    lineage,
+                    fanout_writer=fanout_writer,
+                    replace=replace,
+                )
+        except IntegrityError:
+            # Another decomposition filed this lineage (or this id) concurrently.
+            with self.sessions() as session:
+                existing = session.scalars(
+                    select(ChangeRequest)
+                    .where(
+                        (ChangeRequest.id == change_request_id)
+                        | (
+                            (ChangeRequest.decomposition_lineage == lineage)
+                            # The constraint's own predicate (migration 0023).
+                            & ChangeRequest.status.in_(ACTIVE_DECOMPOSITION_STATUSES)
+                        )
+                    )
+                    .order_by(ChangeRequest.created_at, ChangeRequest.id)
+                ).all()
+                return self._superseded_task(lineage, existing)
+
+    def _create_decomposition_task(
+        self,
+        session: Any,
+        change_request_id: UUID,
+        intake: ChangeRequestIntake,
+        requested_by: str,
+        context: DecompositionChangeContext,
+        stored_context: dict[str, Any],
+        lineage: str,
+        *,
+        fanout_writer: str,
+        replace: bool,
+    ) -> dict[str, Any]:
+        if not self._decomposition_fanout_owns(session, context.decomposition_id, fanout_writer):
+            return {"status": "SUPERSEDED", "blocker": DECOMPOSITION_FANOUT_SUPERSEDED}
+        active = list(
+            session.scalars(
+                select(ChangeRequest.id).where(
+                    ChangeRequest.decomposition_lineage == lineage,
+                    ChangeRequest.id != change_request_id,
+                    ChangeRequest.status.in_(sorted(LINEAGE_BLOCKING_STATUSES)),
+                )
+            ).all()
+        )
+        # The one change-request lock of this transaction: this id and its active matches.
+        locked = self._lock_requests(session, [change_request_id, *active])
+        row = locked.get(change_request_id)
+        if row is not None:
+            stored = (
+                row.decomposition_context_json
+                if isinstance(row.decomposition_context_json, dict)
+                else {}
+            )
+            if stored.get("task_key") != context.task_key or row.decomposition_lineage != lineage:
+                raise ValueError("change request id is bound to another decomposition task")
+            if stored.get("decomposition_id") != context.decomposition_id:
+                # The same task of an identical plan (same plan hash), fanned out by an
+                # earlier decomposition: that request stands for this task.
+                return self._superseded_task(lineage, [row])
+            return {**self._summary(row), "created": False}
+        existing = sorted(
+            (
+                item
+                for identity, item in locked.items()
+                if identity != change_request_id
+                and item.decomposition_lineage == lineage
+                and item.status in LINEAGE_BLOCKING_STATUSES
+            ),
+            key=lambda item: (self._iso(item.created_at) or "", str(item.id)),
+        )
+        matches = [self._lineage_match(item) for item in existing]
+        if existing and (not replace or any(item.status == "PUBLISHED" for item in existing)):
+            return self._superseded_task(lineage, existing)
+        now = datetime.now(UTC)
+        for item in existing:
+            # --replace: the operator decided this task replaces the unpublished request.
+            item.status = "REJECTED"
+            item.decided_by = requested_by
+            item.decided_at = now
+            item.decision_reason = (
+                f"replaced by backlog decomposition {context.decomposition_id} (--replace)"
+            )
+            item.decision_sequence += 1
+            item.updated_at = now
+        session.flush()
+        row = ChangeRequest(
+            id=change_request_id,
+            request_key=f"dcp-{change_request_id.hex}",
+            project=intake.project,
+            status="DRAFTING",
+            revision=1,
+            description_redacted=intake.description_redacted,
+            description_sha256=intake.description_sha256,
+            redacted=intake.redacted,
+            revision_note=None,
+            proposal_json={},
+            review_json={},
+            # Replaced lineage matches stay visible on the new request.
+            dedupe_json={"lineage_matches": matches[:5]} if matches else {},
+            target_repository=intake.target_repository,
+            requested_by=requested_by,
+            decomposition_context_json=stored_context,
+            decomposition_lineage=lineage,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        return {**self._summary(row), "created": True, "replaced": matches[:5]}
+
+    @staticmethod
+    def _lineage_match(item: ChangeRequest) -> dict[str, Any]:
+        return {
+            "change_request_id": str(item.id),
+            "status": item.status,
+            "issue_url": item.issue_url,
+            "decomposition_id": (item.decomposition_context_json or {}).get("decomposition_id"),
+        }
+
+    @classmethod
+    def _superseded_task(cls, lineage: str, existing: Sequence[ChangeRequest]) -> dict[str, Any]:
+        return {
+            "status": "SKIPPED",
+            "blocker": SUPERSEDED_BY_EXISTING,
+            "lineage": lineage,
+            "published": any(item.status == "PUBLISHED" for item in existing),
+            "existing": [cls._lineage_match(item) for item in existing][:5],
+        }
+
     def item_states_sync(self, change_request_ids: list[UUID]) -> dict[str, dict[str, Any]]:
         """NEW-123: the current status of fanned-out items (missing ids are absent)."""
         if not change_request_ids:
@@ -229,6 +420,14 @@ class ChangeRequestRepository:
                 # Only when a blocker was merged (e.g. a published body that still names a
                 # merged request): every blocker as the request it stands for now.
                 view["blocked_by_resolved"] = resolved
+            if row.decomposition_lineage and row.status == "CANDIDATE":
+                # NEW-234 PR6: approval is refused (409) until every predecessor is published.
+                _refs, awaiting = self._dependency_state(
+                    session, row.project, self._decomposition_dict(row)
+                )
+                view["awaiting_dependencies"] = awaiting
+                if awaiting:
+                    view["approve_command"] = None
             return view
 
     async def resolve(self, change_request_id: UUID) -> dict[str, Any]:
@@ -315,6 +514,7 @@ class ChangeRequestRepository:
     ) -> dict[str, Any]:
         if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("change request approval requires an allowlisted operator channel")
+        stale = False
         with self.sessions.begin() as session:
             row = self._locked(session, change_request_id)
             stored = row.approval_binding_sha256 or ""
@@ -334,6 +534,10 @@ class ChangeRequestRepository:
                 if not phrase_matches:
                     raise ValueError("typed confirmation does not bind to this change request")
                 self._verify_stored_content(row)
+                # NEW-234 PR6: a decomposition task is approvable only once every
+                # predecessor is published and its body names each one (final content).
+                stale = self._dependency_gate(session, row)
+            if replayed is None and not stale:
                 now = datetime.now(UTC)
                 row.status = "APPROVED"
                 row.decided_by = actor
@@ -344,7 +548,33 @@ class ChangeRequestRepository:
                 row.approval_snapshot_json = approval_record(**self._approval_fields(row))
                 session.flush()
                 replayed = {**self._view(row), "replayed": False}
+        if stale:
+            # A race left the body without a published predecessor: re-render it (a new
+            # binding) and refuse this approval of the old content.
+            self.refresh_dependencies_sync([change_request_id])
+            raise ValueError(
+                f"{DEPENDENCIES_STALE}: the request was re-rendered with its published "
+                "dependencies; approve it with its new binding"
+            )
+        if replayed is None:
+            raise ValueError("change request approval did not complete")
         return replayed
+
+    @classmethod
+    def _dependency_gate(cls, session: Any, row: ChangeRequest) -> bool:
+        """Refuse (409) a decomposition request with unpublished predecessors; True when
+        its body is stale (a predecessor published without its re-render)."""
+        if not row.decomposition_lineage:
+            return False
+        context = cls._decomposition_dict(row)
+        refs, awaiting = cls._dependency_state(session, row.project, context)
+        if awaiting:
+            raise DependenciesAwaitingError(
+                f"{DEPENDENCIES_AWAITING}: awaiting_dependencies "
+                + ", ".join(awaiting)
+                + " (approve after every predecessor is published)"
+            )
+        return refs != list(context.get("depends_on") or [])
 
     async def revise(self, change_request_id: UUID, note: str, actor: str) -> dict[str, Any]:
         return await asyncio.to_thread(self.revise_sync, change_request_id, note, actor)
@@ -355,11 +585,25 @@ class ChangeRequestRepository:
         safe_note = str(SecretRedactor().redact_text(note.strip()).value)
         if not 3 <= len(safe_note) <= 2000:
             raise ValueError("revision note must be 3 to 2000 characters")
+        try:
+            return self._revise(change_request_id, safe_note, actor)
+        except IntegrityError as error:
+            # NEW-234 PR6 review: a FAILED decomposition request whose lineage another
+            # active request took meanwhile (migration 0023's index).
+            raise ValueError(
+                f"{SUPERSEDED_BY_EXISTING}: another active request now holds this task"
+            ) from error
+
+    def _revise(self, change_request_id: UUID, safe_note: str, actor: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
             row = self._locked(session, change_request_id)
             if not self._decision_open(row, {"CANDIDATE", "FAILED"}):
                 raise ValueError(
                     "only a CANDIDATE, FAILED or unpublished APPROVED change request can be revised"
+                )
+            if row.status == "FAILED" and self._lineage_taken(session, row):
+                raise ValueError(
+                    f"{SUPERSEDED_BY_EXISTING}: another active request now holds this task"
                 )
             now = datetime.now(UTC)
             row.status = "DRAFTING"
@@ -462,7 +706,24 @@ class ChangeRequestRepository:
             row.published_at = datetime.now(UTC)
             row.error_code = None
             session.flush()
-            return {**self._view(row), "replayed": False}
+            published = {**self._view(row), "replayed": False}
+            dependents = self._dependents(session, row)
+        if not dependents:
+            return published
+        # NEW-234 PR6 review: the publication is committed first (the operator's issue
+        # exists; it is never rolled back over a re-render). Each dependent is then
+        # re-rendered with `Depends on: gntik-ai/<repo>#N` in its own transaction under
+        # the global lock order. A failed re-render is deferred, never lost: staleness is
+        # recomputed from the published predecessors, so approval refuses the old body
+        # (and re-renders it), and backlog-decomposition-ready repairs it before listing.
+        try:
+            rerendered = self.refresh_dependencies_sync(dependents)
+        except Exception:  # noqa: BLE001 - deferred; see above
+            LOGGER.warning(
+                "change request %s published; dependent re-render deferred", change_request_id
+            )
+            return {**published, "rerender_deferred": [str(item) for item in dependents]}
+        return {**published, **({"rerendered_dependents": rerendered} if rerendered else {})}
 
     async def record_start_failure(self, change_request_id: UUID, revision: int) -> None:
         await asyncio.to_thread(
@@ -503,10 +764,24 @@ class ChangeRequestRepository:
         with self.sessions.begin() as session:
             if not self._fanout_fence(session, change_request_id, revision, fanout_writer):
                 return self._fanout_superseded(session, change_request_id)
-            row = self._locked(session, change_request_id)
+            # NEW-234 PR6: the request and every request of its predecessor lineages, in
+            # the one ordered lock of this transaction (the global lock order); a
+            # predecessor published meanwhile is either seen here or re-renders this
+            # candidate after both commit.
+            row = self._lock_requests(
+                session, [change_request_id, *self._predecessor_ids(session, [change_request_id])]
+            ).get(change_request_id)
+            if row is None:
+                raise ChangeRequestNotFoundError("change request not found")
             if row.status != "DRAFTING" or row.revision != revision:
                 return {"status": "SUPERSEDED", "current_status": row.status}
             validate_proposal(proposal.model_dump(mode="json"), row.project, row.target_repository)
+            if row.decomposition_lineage:
+                context = self._decomposition_dict(row)
+                refs, _awaiting = self._dependency_state(session, row.project, context)
+                row.decomposition_context_json = DecompositionChangeContext.model_validate(
+                    {**context, "depends_on": refs}
+                ).model_dump(mode="json")
             rendered = render_change_request(
                 change_request_id=str(row.id),
                 revision=row.revision,
@@ -526,6 +801,25 @@ class ChangeRequestRepository:
                 return {"status": "FAILED", "error_code": error}
             row.proposal_json = proposal.model_dump(mode="json")
             row.review_json = review.model_dump(mode="json")
+            if row.decomposition_lineage:
+                # NEW-234 PR6: the import risk of the real rendered body, and any replaced
+                # lineage match, are kept with the request (not part of its binding).
+                kept = row.dedupe_json if isinstance(row.dedupe_json, dict) else {}
+                dedupe = {
+                    **dedupe,
+                    **(
+                        {"lineage_matches": kept["lineage_matches"]}
+                        if kept.get("lineage_matches")
+                        else {}
+                    ),
+                    "import_risk": import_risk(
+                        row.target_repository,
+                        proposal.kind,
+                        proposal.proposed_risk,
+                        rendered.title,
+                        rendered.body,
+                    ),
+                }
             row.dedupe_json = dedupe
             row.fingerprint = rendered.fingerprint
             row.issue_title = rendered.title
@@ -604,13 +898,208 @@ class ChangeRequestRepository:
                 failures.append(
                     {
                         "change_request_id": str(row.id),
-                        "item_key": context.get("item_key"),
+                        # NEW-234 PR6: a decomposition task is named by its task key.
+                        "item_key": context.get("item_key")
+                        or self._decomposition_dict(row).get("task_key"),
                         "revision": row.revision,
                         "error_code": row.error_code,
                         **self._failure(row),
                     }
                 )
             return failures
+
+    # NEW-234 PR6: decomposition dependency gating ---------------------------------------
+
+    def refresh_dependencies_sync(self, change_request_ids: list[UUID]) -> list[str]:
+        """Re-render every CANDIDATE among these decomposition requests whose body does not
+        name exactly its published predecessors (deterministic and idempotent: the repair
+        of a publication that raced the candidate's persist). Returns the re-rendered ids."""
+        if not change_request_ids:
+            return []
+        rerendered: list[str] = []
+        with self.sessions.begin() as session:
+            # The requests and all their predecessors in the one ordered lock.
+            locked = self._lock_requests(
+                session,
+                [*change_request_ids, *self._predecessor_ids(session, change_request_ids)],
+            )
+            for identity in sorted(set(change_request_ids)):
+                row = locked.get(identity)
+                if row is None or row.status != "CANDIDATE" or not row.decomposition_lineage:
+                    continue
+                context = self._decomposition_dict(row)
+                refs, _awaiting = self._dependency_state(session, row.project, context)
+                if refs != list(context.get("depends_on") or []):
+                    self._rerender_dependencies(row, refs)
+                    rerendered.append(str(row.id))
+            session.flush()
+        return rerendered
+
+    @staticmethod
+    def _decomposition_dict(row: ChangeRequest) -> dict[str, Any]:
+        value = row.decomposition_context_json
+        return dict(value) if isinstance(value, dict) else {}
+
+    @classmethod
+    def _dependency_state(
+        cls, session: Any, project: str, context: dict[str, Any]
+    ) -> tuple[list[str], list[str]]:
+        """(the published predecessors' issue references, in task order; the predecessor
+        task keys not yet published). A predecessor is any request of its lineage, so a
+        task superseded by an earlier plan's request waits for that request."""
+        keys = [str(key) for key in context.get("depends_on_tasks") or []]
+        if not keys:
+            return [], []
+        lineages = {lineage_of(project, key): key for key in keys}
+        rows = session.scalars(
+            select(ChangeRequest).where(ChangeRequest.decomposition_lineage.in_(sorted(lineages)))
+        ).all()
+        published: dict[str, ChangeRequest] = {}
+        for item in sorted(
+            rows, key=lambda value: (cls._iso(value.published_at) or "", str(value.id))
+        ):
+            lineage = str(item.decomposition_lineage)
+            if item.status == "PUBLISHED" and item.issue_number and lineage not in published:
+                published[lineage] = item
+        refs: list[str] = []
+        awaiting: list[str] = []
+        for lineage, key in lineages.items():
+            found = published.get(lineage)
+            if found is None:
+                awaiting.append(key)
+            else:
+                refs.append(f"{found.target_repository}#{found.issue_number}")
+        return list(dict.fromkeys(refs)), awaiting
+
+    @staticmethod
+    def _lock_requests(session: Any, identities: Iterable[UUID]) -> dict[UUID, ChangeRequest]:
+        """NEW-234 PR6 review: the global lock order. A transaction locks change requests
+        once: every row it may change or whose state it depends on, in one
+        SELECT ... FOR UPDATE ORDER BY id, after any blueprint or decomposition row (the
+        fan-out fences) and before nothing else. Two such transactions acquire their
+        common rows in the same order and none waits for a row while holding a later one,
+        so the decomposition paths (persist, re-render, publication, approval, bulk
+        approval, retry) cannot deadlock. A second lock in one transaction is refused."""
+        if session.info.get(_REQUEST_LOCKS):
+            raise RuntimeError("a transaction locks its change requests once (global lock order)")
+        session.info[_REQUEST_LOCKS] = True
+        ordered = sorted(set(identities))
+        if not ordered:
+            return {}
+        rows = session.scalars(
+            select(ChangeRequest)
+            .where(ChangeRequest.id.in_(ordered))
+            .order_by(ChangeRequest.id)
+            .with_for_update()
+        ).all()
+        return {row.id: row for row in rows}
+
+    @staticmethod
+    def _predecessor_ids(session: Any, change_request_ids: Iterable[UUID]) -> list[UUID]:
+        """Every request of these requests' predecessor lineages (read, not locked)."""
+        lineages: set[str] = set()
+        for project, context in session.execute(
+            select(ChangeRequest.project, ChangeRequest.decomposition_context_json).where(
+                ChangeRequest.id.in_(list(change_request_ids))
+            )
+        ).all():
+            if isinstance(context, dict):
+                lineages.update(
+                    lineage_of(str(project), str(key))
+                    for key in context.get("depends_on_tasks") or []
+                )
+        if not lineages:
+            return []
+        return list(
+            session.scalars(
+                select(ChangeRequest.id).where(
+                    ChangeRequest.decomposition_lineage.in_(sorted(lineages))
+                )
+            ).all()
+        )
+
+    @staticmethod
+    def _dependents(session: Any, published: ChangeRequest) -> list[UUID]:
+        """The CANDIDATE requests whose predecessor tasks include this one's lineage."""
+        lineage = published.decomposition_lineage
+        if not lineage:
+            return []
+        candidates = session.execute(
+            select(ChangeRequest.id, ChangeRequest.decomposition_context_json).where(
+                ChangeRequest.project == published.project,
+                ChangeRequest.decomposition_lineage.is_not(None),
+                ChangeRequest.status == "CANDIDATE",
+            )
+        ).all()
+        return sorted(
+            identity
+            for identity, context in candidates
+            if isinstance(context, dict)
+            and any(
+                lineage_of(published.project, str(key)) == lineage
+                for key in context.get("depends_on_tasks") or []
+            )
+        )
+
+    @staticmethod
+    def _lineage_taken(session: Any, row: ChangeRequest) -> bool:
+        """Another active request holds this decomposition request's lineage."""
+        if not row.decomposition_lineage:
+            return False
+        return (
+            session.scalar(
+                select(ChangeRequest.id)
+                .where(
+                    ChangeRequest.decomposition_lineage == row.decomposition_lineage,
+                    ChangeRequest.id != row.id,
+                    ChangeRequest.status.in_(sorted(LINEAGE_BLOCKING_STATUSES)),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    @classmethod
+    def _rerender_dependencies(cls, row: ChangeRequest, refs: list[str]) -> None:
+        """Re-render a CANDIDATE decomposition request with these predecessor issues: a new
+        body and binding (the operator approves the final content, never the old one)."""
+        context = DecompositionChangeContext.model_validate(
+            {**cls._decomposition_dict(row), "depends_on": refs}
+        )
+        proposal = validate_proposal(row.proposal_json, row.project, row.target_repository)
+        rendered = render_change_request(
+            change_request_id=str(row.id),
+            revision=row.revision,
+            project=row.project,
+            target_repository=row.target_repository,
+            proposal=proposal,
+            review=ChangeReviewRecord.model_validate(row.review_json),
+            description_redacted=row.description_redacted,
+            decomposition_context=context,
+        )
+        row.decomposition_context_json = context.model_dump(mode="json")
+        error = cls._render_error(rendered)
+        if error is not None:
+            row.status = "FAILED"
+            row.error_code = error
+            row.approval_binding_sha256 = None
+            return
+        row.fingerprint = rendered.fingerprint
+        row.issue_title = rendered.title
+        row.issue_body = rendered.body
+        row.approval_binding_sha256 = rendered.approval_binding
+        dedupe = row.dedupe_json if isinstance(row.dedupe_json, dict) else {}
+        row.dedupe_json = {
+            **dedupe,
+            "import_risk": import_risk(
+                row.target_repository,
+                proposal.kind,
+                proposal.proposed_risk,
+                rendered.title,
+                rendered.body,
+            ),
+        }
+        row.updated_at = datetime.now(UTC)
 
     # NEW-146 review 1: the fan-out ownership fence -----------------------------------------
 
@@ -737,10 +1226,12 @@ class ChangeRequestRepository:
 
     @staticmethod
     def _locked(session: Any, change_request_id: UUID) -> ChangeRequest:
-        row = session.get(ChangeRequest, change_request_id, with_for_update=True)
+        row = ChangeRequestRepository._lock_requests(session, [change_request_id]).get(
+            change_request_id
+        )
         if row is None:
             raise ChangeRequestNotFoundError("change request not found")
-        return row  # type: ignore[no-any-return]
+        return row
 
     @staticmethod
     def rendered(row: ChangeRequest) -> RenderedChangeRequest:

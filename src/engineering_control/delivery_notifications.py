@@ -43,6 +43,8 @@ MILESTONE_EVENTS = frozenset(
         "UI_FANOUT_DONE",
         # NEW-234 PR5: a backlog decomposition plan awaits the operator's approval.
         "DECOMPOSITION_READY",
+        # NEW-234 PR6: a decomposition fan-out run ended (its requests await approval).
+        "DECOMPOSITION_FANOUT_DONE",
     }
 )
 
@@ -642,6 +644,7 @@ def enqueue_milestone(
         "UI_BLUEPRINT_READY": "UI blueprint ready for approval",
         "UI_FANOUT_DONE": "UI fan-out done",
         "DECOMPOSITION_READY": "backlog decomposition ready for approval",
+        "DECOMPOSITION_FANOUT_DONE": "backlog decomposition fan-out done",
     }
     message = (
         f"Hermes {titles[event]}"
