@@ -7,6 +7,7 @@ recorded history replays against the current workflow code.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import shutil
 from collections.abc import Callable
@@ -17,8 +18,9 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from new_234_decomposition_fixtures import SOURCE_SHA, epic_output, frame_output, inventory
+from new_234_decomposition_fixtures import SOURCE_SHA, epic_output, frame, frame_output, inventory
 from new_234_plan_fixtures import (
+    EPICS,
     OPERATOR,
     WORKTREE,
     PlanHarness,
@@ -28,6 +30,7 @@ from new_234_plan_fixtures import (
     stage_document,
     stage_inputs,
 )
+from pre_contract_order_decomposition_workflow import PreContractOrderDecompositionPlanWorkflow
 from pre_rejection_budget_decomposition_workflow import (
     PreRejectionBudgetDecompositionPlanWorkflow,
 )
@@ -190,6 +193,7 @@ async def test_the_plan_reaches_candidate_with_one_review_per_part(tmp_path: Pat
         "decomposition.inventory",
         "decomposition.record_inputs",
         *PART,
+        "decomposition.order_epics",
         *PART,
         *PART,
         "decomposition.assemble",
@@ -504,4 +508,68 @@ async def test_a_pre_budget_history_replays_on_the_current_workflow(tmp_path: Pa
     # Replayed above on the current class (no marker in the history: the old budget).
     assert not any(
         event.HasField("marker_recorded_event_attributes") for event in harness.history.events
+    )
+
+
+# NEW-234 1.7.1: the contract-aware epic order -------------------------------------------
+
+
+def _api_first_frame() -> dict[str, Any]:
+    """RUN-01 consumes the Functions API (provided by API-01); the worker interface has no
+    provider story: EP-API (1) is now drafted before EP-RUN (2)."""
+    value = copy.deepcopy(frame())
+    value["contracts"][0]["provider_stories"] = []
+    value["contracts"][1]["consumer_stories"] = ["RUN-01"]
+    return value
+
+
+async def test_the_reviewed_frame_reorders_the_epic_batches(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    reviewed = _api_first_frame()
+    drafted: list[Any] = []
+
+    def draft(payload: dict[str, Any]) -> dict[str, Any]:
+        part = payload["part"]
+        drafted.append(part["number"])
+        if part["kind"] == "frame":
+            return agent_result(payload, frame_output(reviewed, part=payload["part_id"]))
+        content = EPICS[part["number"]]()
+        return agent_result(
+            payload,
+            epic_output(content, payload["part_id"], frame_sha256=part_content_sha256(reviewed)),
+        )
+
+    harness.responses["decomposition.draft"] = draft
+    result = await harness.run(created)
+    assert result["status"] == "CANDIDATE", result
+    # Recorded with the inputs: RUN (2) then API (1); re-ordered once the frame is approved.
+    assert drafted == [None, 1, 2]
+    # register, snapshot, issues, inventory, record_inputs, the frame part, then the order.
+    assert harness.calls.index("decomposition.order_epics") == 5 + len(PART)
+    assert harness.calls.count("decomposition.order_epics") == 1
+    markers = [
+        str(event.marker_recorded_event_attributes)
+        for event in harness.history.events
+        if event.HasField("marker_recorded_event_attributes")
+    ]
+    assert any("decomposition-contract-epic-order-v1" in marker for marker in markers)
+    # API's task depends on RUN-01.t1 (drafted later) and the plan still assembles.
+    row = harness.row(created)
+    assert row.status == "CANDIDATE"
+
+
+async def test_a_pre_contract_order_history_replays_on_the_current_workflow(
+    tmp_path: Path,
+) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    result = await harness.run(created, workflow_cls=PreContractOrderDecompositionPlanWorkflow)
+    assert result["status"] == "CANDIDATE", result
+    assert "decomposition.order_epics" not in harness.calls
+    # Replayed above on the current class: no marker, the order recorded with the inputs.
+    assert not any(
+        "decomposition-contract-epic-order-v1" in str(event.marker_recorded_event_attributes)
+        for event in harness.history.events
+        if event.HasField("marker_recorded_event_attributes")
     )

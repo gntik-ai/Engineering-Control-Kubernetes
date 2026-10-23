@@ -138,7 +138,7 @@ def test_registry_names_valid_schemas_roles_and_parts() -> None:
     assert set(part_schema("frame")["required"]) >= {"frame", "inputs"}
     assert set(part_schema("epic")["required"]) >= {"epic", "inputs"}
     assert "review" in review_schema()["required"]
-    assert AGENT_PACK_MIN_VERSION == (1, 7, 0)
+    assert AGENT_PACK_MIN_VERSION == (1, 7, 1)
     # The three allowed targets and their allowlisted test commands.
     assert {
         repo: (role, sorted(components)) for repo, (role, components) in TASK_TARGETS.items()
@@ -153,10 +153,10 @@ def test_registry_names_valid_schemas_roles_and_parts() -> None:
     )
 
 
-def test_pack_check_needs_profile_1_7_0_and_both_skills(tmp_path: Path) -> None:
+def test_pack_check_needs_profile_1_7_1_and_both_skills(tmp_path: Path) -> None:
     assert decomposition_pack_problems(build_decomposition_pack(tmp_path / "ok")) == []
     old = decomposition_pack_problems(build_decomposition_pack(tmp_path / "old", version="1.6.2"))
-    assert old == ["profile version 1.6.2 is older than 1.7.0"]
+    assert old == ["profile version 1.6.2 is older than 1.7.1"]
     missing = decomposition_pack_problems(
         build_decomposition_pack(
             tmp_path / "missing", skip=("skills/review-decomposition/SKILL.md",)
@@ -770,9 +770,9 @@ def test_cross_epic_dependencies_resolve_at_assembly() -> None:
 
 # Assembly ----------------------------------------------------------------------------------
 
-PLAN_SHA256 = "248aadc70ad1f1efe5f0d2562f031afce6ed0c6be5e682ecbdb16a41a1ba345f"
-PLAN_JSON_SHA256 = "f43770ed08d01aab445fcdfee33cef0818bf89d284a52af35344d537a0536408"
-MARKDOWN_SHA256 = "8e4044169f9e40f7f791b441b0bb0a2b7f28e47900593f438c985ef09771392d"
+PLAN_SHA256 = "cc96d2137e9f93358566416a9550339cc30215907759eb2e2842658e9b6487cd"
+PLAN_JSON_SHA256 = "24fe60a91759944cbb7814be52baaa77c3a551d144692b328c88e7041b4b826a"
+MARKDOWN_SHA256 = "11d4efb0c736b253e6b49187a7136882d64f5de781ce9fd96202b19d1b5caca4"
 
 
 def test_assembly_fills_issue_numbers_and_is_deterministic() -> None:

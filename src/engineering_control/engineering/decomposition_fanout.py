@@ -29,7 +29,11 @@ from engineering_control.engineering.change_requests import (
     DecompositionChangeContext,
     decomposition_lineage,
 )
-from engineering_control.engineering.decomposition import PROJECT, SOURCE_REPOSITORY
+from engineering_control.engineering.decomposition import (
+    PROJECT,
+    SOURCE_REPOSITORY,
+    resolved_dependencies,
+)
 
 FANOUT_BATCH = 10
 FANOUT_MAX_ITEMS_DEFAULT = 250
@@ -85,6 +89,9 @@ class FanoutTask:
     story_issue: int
     epic_issue: int
     task: Mapping[str, Any]
+    # The predecessor task keys with every `contract:<ctr-id>` bound to its provider tasks
+    # (decomposition.resolved_dependencies); what the change requests link.
+    dependencies: tuple[str, ...] = ()
 
     @property
     def repository(self) -> str:
@@ -96,11 +103,14 @@ class FanoutTask:
 
     @property
     def depends_on(self) -> tuple[str, ...]:
-        return tuple(short_key(str(item)) for item in self.task.get("depends_on") or ())
+        return tuple(short_key(item) for item in self.dependencies)
 
 
 def fanout_tasks(plan: Mapping[str, Any]) -> list[FanoutTask]:
-    """Every task of the plan, predecessors first (plan order breaks ties)."""
+    """Every task of the plan, predecessors first (plan order breaks ties); a contract
+    dependency counts as its provider tasks."""
+    stories = list(plan.get("stories") or [])
+    bound = resolved_dependencies(stories)
     tasks = [
         FanoutTask(
             key=str(task["key"]),
@@ -108,8 +118,9 @@ def fanout_tasks(plan: Mapping[str, Any]) -> list[FanoutTask]:
             story_issue=int(story["story_issue"]),
             epic_issue=int(story["epic_issue"]),
             task=task,
+            dependencies=bound.get(str(task["key"]), ()),
         )
-        for story in plan.get("stories") or []
+        for story in stories
         for task in story.get("tasks") or []
     ]
     by_key = {task.key: task for task in tasks}
@@ -121,11 +132,7 @@ def fanout_tasks(plan: Mapping[str, Any]) -> list[FanoutTask]:
     while remaining:
         progressed = False
         for task in list(remaining):
-            waiting = [
-                item
-                for item in task.task.get("depends_on") or ()
-                if item in by_key and item not in placed
-            ]
+            waiting = [item for item in task.dependencies if item in by_key and item not in placed]
             if not waiting:
                 ordered.append(task)
                 placed.add(task.key)
@@ -186,7 +193,7 @@ def task_description(task: FanoutTask, *, decomposition_id: str) -> str:
         f"{_joined(list(interfaces.get('consumes') or []))}.",
         f"Paths: {_joined(list(value.get('paths') or []))}.",
         f"Test commands: {_joined(list(value.get('test_commands') or []))}.",
-        f"Predecessor tasks: {_joined(list(value.get('depends_on') or []))}.",
+        f"Predecessor tasks: {_joined(list(task.dependencies))}.",
         f"Sources: {_joined(list(value.get('sources') or []))}.",
     ]
     text = "\n".join(lines)
