@@ -17,7 +17,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from new_234_decomposition_fixtures import SOURCE_SHA, inventory
+from new_234_decomposition_fixtures import SOURCE_SHA, epic_output, frame_output, inventory
 from new_234_plan_fixtures import (
     OPERATOR,
     WORKTREE,
@@ -33,6 +33,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
+from test_new_234_bounded_inputs import large_frame
 
 from engineering_control.activities import backlog_decomposition as activities
 from engineering_control.activities.core import ControlActivities
@@ -41,6 +42,7 @@ from engineering_control.engineering.decomposition import (
     DecompositionRejected,
     PlanProblem,
     decomposition_workflow_id,
+    part_content_sha256,
 )
 from engineering_control.workflows.definitions import BacklogDecompositionPlanWorkflow
 from engineering_control.workflows.inputs import BacklogDecompositionPlanInput
@@ -352,3 +354,30 @@ async def test_a_failed_provider_call_is_never_retried_uncharged(tmp_path: Path)
     assert harness.calls.count("decomposition.review") == 1
     assert (result["status"], result["error_code"]) == ("BLOCKED", "PROVIDER_ACTIVITY_FAILED")
     assert harness.row(created).provider_calls == 2
+
+
+async def test_a_large_frame_stages_the_epic_input_as_pieces_and_replays(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    big = large_frame()
+    prepared: list[dict[str, Any]] = []
+
+    def draft(payload: dict[str, Any]) -> dict[str, Any]:
+        prepared.append(payload)
+        if payload["part"]["kind"] == "frame":
+            return agent_result(payload, frame_output(big, part=payload["part_id"]))
+        content = draft_for(payload)["epic"]
+        output = epic_output(content, payload["part_id"], frame_sha256=part_content_sha256(big))
+        return agent_result(payload, output)
+
+    harness.responses["decomposition.draft"] = draft
+    result = await harness.run(created)
+    assert result["status"] == "CANDIDATE", result
+    epics = [payload for payload in prepared if payload["part"]["kind"] == "epic"]
+    for payload in epics:
+        files = payload["part_input_files"]
+        # The epic input carries the 60-contract frame: staged as pieces, all prompted.
+        assert len(files) > 1 and payload["part_input"] == files[0]
+        assert all(item["bytes"] <= 64 * 1024 for item in files)
+        prompt = payload["draft_request"]["prompt"]
+        assert all(item["path"] in prompt for item in files)

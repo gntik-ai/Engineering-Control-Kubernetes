@@ -7574,6 +7574,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                     redraft={
                         "part_id": entry["part_id"],
                         "part_input": entry["part_input"],
+                        "part_input_files": entry.get("part_input_files"),
                         "first_attempt": int(entry["attempt"]) + 1,
                         "rejection": {
                             "code": "ASSEMBLY_INVALID",
@@ -7627,6 +7628,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             "content_sha256": outcome.get("content_sha256"),
             "attempt": int(outcome.get("draft_attempt") or 1),
             "part_input": outcome.get("part_input"),
+            "part_input_files": outcome.get("part_input_files"),
         }
 
     @staticmethod
@@ -7730,14 +7732,18 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 "blocker": str(staged.get("blocker") or "DECOMPOSITION_INPUTS_UNAVAILABLE"),
                 "blockers": staged.get("blockers"),
             }
-        name = str(prepared.get("input_name"))
+        # An input over 64 KiB is staged as numbered pieces (data only: no new command).
+        names = [str(item) for item in prepared.get("input_files") or [prepared.get("input_name")]]
         return {
             "status": prepared.get("status"),
             "part_id": prepared.get("part_id"),
             "content_sha256": prepared.get("content_sha256"),
             "draft_attempt": prepared.get("draft_attempt"),
-            "part_input": receipts.get(name),
-            "reference_files": {key: value for key, value in receipts.items() if key != name},
+            "part_input": receipts.get(names[0]),
+            "part_input_files": [receipts.get(name) for name in names],
+            "reference_files": {
+                key: value for key, value in receipts.items() if key not in set(names)
+            },
         }
 
     async def _decomposition_part(
@@ -7761,6 +7767,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 "part": part,
                 "part_id": staged.get("part_id"),
                 "part_input": staged.get("part_input"),
+                "part_input_files": staged.get("part_input_files"),
                 "reference_files": staged.get("reference_files"),
                 "part_rounds": [],
             }
@@ -7771,6 +7778,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 "part": part,
                 "part_id": redraft["part_id"],
                 "part_input": redraft["part_input"],
+                "part_input_files": redraft.get("part_input_files"),
                 "part_rounds": [],
                 "rejection": redraft["rejection"],
             }

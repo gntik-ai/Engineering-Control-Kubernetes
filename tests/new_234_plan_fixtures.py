@@ -104,10 +104,15 @@ def draft_for(payload: dict[str, Any], contents: dict[int, dict[str, Any]] | Non
 
 def review_for(payload: dict[str, Any], decision: str = "APPROVE", **review: Any) -> Any:
     epic = payload["part"]["kind"] == EPIC
+    frames = [
+        item["content_sha256"]
+        for item in payload.get("approved_parts") or []
+        if item.get("kind") == FRAME
+    ]
     value = review_output(
         payload["part_id"],
         draft_sha256=payload["draft_sha256"],
-        frame_sha256=FRAME_CONTENT_SHA if epic else None,
+        frame_sha256=(frames[0] if frames else FRAME_CONTENT_SHA) if epic else None,
     )
     value["review"]["decision"] = decision
     if decision == "REVISE":
@@ -152,6 +157,8 @@ def drive(
     *,
     decide: Callable[[dict[str, Any], int], str] | None = None,
     draft: Callable[[dict[str, Any], int], Any] | None = None,
+    stage_files: Callable[[dict[str, Any]], dict[str, Any]] = stage_inputs,
+    stage_part_document: Callable[[dict[str, Any]], dict[str, Any]] = stage_document,
 ) -> dict[str, Any]:
     """Run one plan's controller steps in BacklogDecompositionPlanWorkflow's order (the
     scan, GitHub and provider steps scripted); return the persisted result."""
@@ -186,8 +193,12 @@ def drive(
             "decomposition.prepare_part_input",
             {**context, "approved_parts": approved, "part": part},
         )
-        staged = stage_inputs(prepared)
-        name = prepared["input_name"]
+        staged = stage_files(
+            {"decomposition_id": decomposition_id, "files": prepared.get("files") or {}}
+        )
+        assert staged["status"] == "STAGED", staged
+        names = prepared.get("input_files") or [prepared["input_name"]]
+        name = names[0]
         if prepared["status"] == "PART_REUSED":
             approved.append(
                 {
@@ -206,7 +217,8 @@ def drive(
             "part": part,
             "part_id": prepared["part_id"],
             "part_input": staged["files"][name],
-            "reference_files": {k: v for k, v in staged["files"].items() if k != name},
+            "part_input_files": [staged["files"][item] for item in names],
+            "reference_files": {k: v for k, v in staged["files"].items() if k not in names},
         }
         for attempt in (1, 2, 3):
             current = harness.step(
@@ -222,11 +234,13 @@ def drive(
             )
             if recorded_draft["status"] != "DRAFT_RECORDED":
                 return recorded_draft
-            draft_file = stage_document(
+            draft_file = stage_part_document(
                 {
+                    "decomposition_id": decomposition_id,
+                    "project": "falcone-serverless",
                     "name": f"part-{current['part_id']}-draft-{attempt}.json",
                     "document": recorded_draft["document"],
-                }  # fmt: skip
+                }
             )["document"]
             current = {**recorded_draft, "draft_file": draft_file}
             current.pop("document")
@@ -257,7 +271,14 @@ def drive(
             if reviewed["status"] != "PART_REVISE":
                 return reviewed
             current = {key: value for key, value in reviewed.items() if key != "document"}
-            current["review_file"] = {"path": f"{INPUT_DIRECTORY}/review-{attempt}.json"}
+            current["review_file"] = stage_part_document(
+                {
+                    "decomposition_id": decomposition_id,
+                    "project": "falcone-serverless",
+                    "name": f"part-{current['part_id']}-review-{attempt}.json",
+                    "document": reviewed["document"],
+                }
+            )["document"]
     assembled = harness.step("decomposition.assemble", {**context, "approved_parts": approved})
     if assembled["status"] != "ASSEMBLED":
         return assembled

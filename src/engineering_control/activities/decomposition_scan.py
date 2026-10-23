@@ -30,8 +30,10 @@ from engineering_control.engineering.decomposition_inventory import (
     SOURCE_INVALID,
     DecompositionSourceError,
     IssueSnapshot,
+    bounded_json_files,
     build_inventory,
     read_sources,
+    reassemble_pieces,
     stage_files,
 )
 from engineering_control.security.redaction import SecretRedactor
@@ -174,16 +176,22 @@ class DecompositionScanSteps(UiPlanScanSteps):
         match = _DOCUMENT_NAME.fullmatch(name)
         if match is None:
             raise ValueError("decomposition document name is invalid")
-        text = json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        staged = self._decomposition_stage(payload, {name: text})
+        # Each staged file stays within 64 KiB: a larger document is staged as pieces.
+        files = bounded_json_files(name, document)
+        staged = self._decomposition_stage(payload, files)
         if staged["status"] != "STAGED":
             return staged
-        receipt = dict(staged["files"][name])
+        receipts = [dict(staged["files"][piece]) for piece in files]
+        receipt = dict(receipts[0])
+        if len(receipts) > 1:
+            receipt["files"] = receipts
         if match.group(2) == "draft":
-            # Hermes's hash of exactly the part content the reviewer reads.
-            written = json.loads(text)
+            # Hermes's hash of exactly the part content the reviewer reads (reassembled
+            # from the staged pieces).
+            texts = [json.loads(text) for text in files.values()]
+            written = texts[0] if len(texts) == 1 else reassemble_pieces(texts)
             kind = FRAME if match.group(1) == FRAME else EPIC
-            if not isinstance(written.get(kind), dict):
+            if not isinstance(written, dict) or not isinstance(written.get(kind), dict):
                 raise ValueError("a staged decomposition draft carries no part")
             receipt["document_sha256"] = canonical_sha256(written)
             receipt["part_sha256"] = part_content_sha256(written[kind])
