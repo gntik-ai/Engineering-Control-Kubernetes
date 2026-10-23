@@ -189,13 +189,12 @@ maker_rules:
       apps/docs/test/docs-coverage.test.mjs (once present) must pass; never add to its known-gap
       lists. The checker rejects a change that ships behaviour no docs example shows.
     - >-
-      Claude commands may bind and connect on loopback only (127.0.0.1 and ::1; Codex
-      commands have no sockets), and each command has a loopback of its own: start a
-      server in the same command as its client. When a change can affect the docs site, run `pnpm --filter
-      @gntik-ai/docs build`, then PLAYWRIGHT_CHROMIUM_EXECUTABLE=<the chrome under
-      /opt/engineering-browser/browsers/chromium-*/chrome-linux64/> `pnpm --filter
-      @gntik-ai/docs exec playwright test a11y` (it starts vite preview itself). Visual
-      baselines are recorded on the CI runner, so a local visual diff is informative only.
+      Do not run the docs Playwright suites (a11y, visual, or any spec that launches
+      Chromium) on the worker: they run in PR CI (visual stays non-blocking there). Five
+      Claude checkers on 2026-10-22/23 were killed with SIGABRT shortly after starting the
+      full a11y suite.
+      Report those checks as SKIPPED ("browser suites run in PR CI"); unit tests, build,
+      lint, typecheck, registry:check and docs-coverage still run locally.
 dependencies: {}
 classification:
   product: true
