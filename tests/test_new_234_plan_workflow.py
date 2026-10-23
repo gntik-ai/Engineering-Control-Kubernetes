@@ -28,6 +28,9 @@ from new_234_plan_fixtures import (
     stage_document,
     stage_inputs,
 )
+from pre_rejection_budget_decomposition_workflow import (
+    PreRejectionBudgetDecompositionPlanWorkflow,
+)
 from sqlalchemy import select, update
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -118,7 +121,9 @@ class WorkflowHarness(PlanHarness):
 
         return execute_control_step
 
-    async def run(self, created: dict[str, Any]) -> dict[str, Any]:
+    async def run(
+        self, created: dict[str, Any], *, workflow_cls: type = BacklogDecompositionPlanWorkflow
+    ) -> dict[str, Any]:
         assert _TEMPORAL_CLI is not None
         request = BacklogDecompositionPlanInput(
             decomposition_id=created["id"], project="falcone-serverless", requested_by=OPERATOR
@@ -140,12 +145,12 @@ class WorkflowHarness(PlanHarness):
                         Worker(
                             env.client,
                             task_queue=queue,
-                            workflows=[BacklogDecompositionPlanWorkflow],
+                            workflows=[workflow_cls],
                             activities=[activity_fn],
                         )
                     )
                 handle = await env.client.start_workflow(
-                    BacklogDecompositionPlanWorkflow.run,
+                    workflow_cls.run,
                     request,
                     id=decomposition_workflow_id("falcone-serverless", created["id"]),
                     task_queue=CONTROL_TASK_QUEUE,
@@ -153,7 +158,9 @@ class WorkflowHarness(PlanHarness):
                 )
                 result: dict[str, Any] = await handle.result()
                 history = await handle.fetch_history()
+        # Every history (one the pre-budget class recorded included) replays on the current.
         await Replayer(workflows=[BacklogDecompositionPlanWorkflow]).replay_workflow(history)
+        self.history = history
         return result
 
     def row(self, created: dict[str, Any]) -> BacklogDecomposition:
@@ -381,3 +388,120 @@ async def test_a_large_frame_stages_the_epic_input_as_pieces_and_replays(tmp_pat
         assert all(item["bytes"] <= 64 * 1024 for item in files)
         prompt = payload["draft_request"]["prompt"]
         assert all(item["path"] in prompt for item in files)
+
+
+# The per-part rejection budget (operator 2026-10-23, run 46ffe364) ---------------------------
+
+
+def _rejecting(harness: WorkflowHarness, number: int | None, times: int) -> list[int]:
+    """Drafts of part `number` (None: the frame) bound to another design, `times` times,
+    so Hermes's checks refuse them before any review; the attempts are recorded."""
+    attempts: list[int] = []
+
+    def draft(payload: dict[str, Any]) -> dict[str, Any]:
+        output = draft_for(payload)
+        if payload["part"]["number"] == number:
+            attempts.append(payload["draft_attempt"])
+            if len(attempts) <= times:
+                output["inputs"]["design_sha256"] = "0" * 64
+        return agent_result(payload, output)
+
+    harness.responses["decomposition.draft"] = draft
+    return attempts
+
+
+def _revising(harness: WorkflowHarness, number: int | None, times: int) -> list[str]:
+    decisions: list[str] = []
+
+    def review(payload: dict[str, Any]) -> dict[str, Any]:
+        mine = payload["part"]["number"] == number
+        decision = "REVISE" if mine and decisions.count("REVISE") < times else "APPROVE"
+        if mine:
+            decisions.append(decision)
+        return agent_result(payload, review_for(payload, decision))
+
+    harness.responses["decomposition.review"] = review
+    return decisions
+
+
+async def test_a_hermes_rejection_does_not_consume_a_reviewed_draft(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    attempts = _rejecting(harness, 2, times=1)
+    decisions = _revising(harness, 2, times=2)
+    result = await harness.run(created)
+    # One refused draft, then three reviewed drafts (two REVISE): before the budget the
+    # third draft was the last, and its REVISE left the part unresolved.
+    assert result["status"] == "CANDIDATE", result
+    assert attempts == [1, 2, 3, 4] and decisions == ["REVISE", "REVISE", "APPROVE"]
+    run = next(
+        entry for entry in harness.row(created).parts_json["parts"].values() if entry["number"] == 2
+    )
+    assert run["approved_attempt"] == 4 and [r["attempt"] for r in run["rejections"]] == [1]
+
+
+async def test_three_reviewed_drafts_still_end_unresolved(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    _rejecting(harness, None, times=1)
+    decisions = _revising(harness, None, times=9)
+    result = await harness.run(created)
+    assert (result["status"], result["error_code"]) == (
+        "BLOCKED",
+        "DECOMPOSITION_PART_REVIEW_UNRESOLVED",
+    )
+    assert decisions == ["REVISE"] * 3
+    assert harness.calls.count("decomposition.draft") == 4
+
+
+async def test_a_third_rejection_blocks_the_part_with_its_own_code(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    attempts = _rejecting(harness, None, times=9)
+    result = await harness.run(created)
+    assert (result["status"], result["error_code"]) == (
+        "BLOCKED",
+        "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED",
+    )
+    assert attempts == [1, 2, 3] and harness.calls.count("decomposition.review") == 0
+    assert harness.row(created).provider_calls == 3
+
+
+async def test_rejections_stay_within_the_plans_provider_call_cap(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    with harness.repository.sessions.begin() as session:
+        session.execute(
+            update(BacklogDecomposition)
+            .where(BacklogDecomposition.id == UUID(created["id"]))
+            .values(
+                parts_json={
+                    "requested_epics": None,
+                    "parts": {},
+                    "calls": [f"earlier-{index}" for index in range(88)],
+                }
+            )
+        )
+    _rejecting(harness, None, times=2)
+    result = await harness.run(created)
+    # Two refused frame drafts use the last two calls; the third draft is refused.
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "DECOMPOSITION_BUDGET_EXHAUSTED")
+    assert harness.row(created).provider_calls == 90
+
+
+async def test_a_pre_budget_history_replays_on_the_current_workflow(tmp_path: Path) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    _rejecting(harness, None, times=1)
+    _revising(harness, None, times=9)
+    # The pre-budget class: the refused draft used one of three drafts, so two reviews.
+    result = await harness.run(created, workflow_cls=PreRejectionBudgetDecompositionPlanWorkflow)
+    assert (result["status"], result["error_code"]) == (
+        "BLOCKED",
+        "DECOMPOSITION_PART_REVIEW_UNRESOLVED",
+    )
+    assert harness.calls.count("decomposition.review") == 2
+    # Replayed above on the current class (no marker in the history: the old budget).
+    assert not any(
+        event.HasField("marker_recorded_event_attributes") for event in harness.history.events
+    )

@@ -7377,6 +7377,12 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
 
     # Design section 3 (engineering.decomposition.MAX_PART_DRAFTS / MAX_PART_REVIEWS).
     _MAX_PART_DRAFTS = 3
+    # Operator 2026-10-23 (run 46ffe364): a draft Hermes's deterministic checks (or the
+    # provider's schema boundary) refuse has its own budget, MAX_PART_REJECTIONS; a part has
+    # up to three reviewed drafts besides. Suffixed per part (like NEW-138's marker): a
+    # part replayed from before the change memoizes false for its own id only.
+    _REJECTION_BUDGET_PATCH = "decomposition-part-rejection-budget-v1"
+    _MAX_PART_REJECTIONS = 2
     _ASSEMBLY_ROUNDS = 3
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s).
     _PART_TIMEOUT_MINUTES = 40
@@ -7563,7 +7569,9 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                         context, "FAILED", "DECOMPOSITION_PART_UNKNOWN"
                     )
                 entry = approved[index]
-                if int(entry["attempt"]) >= self._MAX_PART_DRAFTS:
+                # Under the rejection budget the limit is the part's reviewed drafts.
+                used = entry.get("reviewed", entry["attempt"])
+                if int(used) >= self._MAX_PART_DRAFTS:
                     return await self._decomposition_terminal(
                         context, "BLOCKED", "ASSEMBLY_INVALID", self._redraft_blockers([redraft])
                     )
@@ -7576,6 +7584,11 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                         "part_input": entry["part_input"],
                         "part_input_files": entry.get("part_input_files"),
                         "first_attempt": int(entry["attempt"]) + 1,
+                        **(
+                            {"part_budget": entry["part_budget"]}
+                            if isinstance(entry.get("part_budget"), dict)
+                            else {}
+                        ),
                         "rejection": {
                             "code": "ASSEMBLY_INVALID",
                             "details": list(redraft.get("problems") or [])[:50],
@@ -7629,6 +7642,15 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             "attempt": int(outcome.get("draft_attempt") or 1),
             "part_input": outcome.get("part_input"),
             "part_input_files": outcome.get("part_input_files"),
+            # Under the rejection budget (data only; absent before it).
+            **(
+                {
+                    "part_budget": outcome["part_budget"],
+                    "reviewed": int(outcome["part_budget"].get("reviewed") or 0),
+                }
+                if isinstance(outcome.get("part_budget"), dict)
+                else {}
+            ),
         }
 
     @staticmethod
@@ -7686,6 +7708,10 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
         }
         redraft = {key: value for key, value in current.items() if key not in dropped}
         redraft["rejection"] = {"code": code, "details": list(details)[:50]}
+        budget = current.get("part_budget")
+        if isinstance(budget, dict):
+            # The rejection budget counts this refusal (data only).
+            redraft["part_budget"] = {**budget, "rejected": int(budget.get("rejected") or 0) + 1}
         if isinstance(usage, dict):
             # Recorded by decomposition.prepare_part (the refused call consumed tokens).
             redraft["rejected_usage"] = {
@@ -7694,6 +7720,30 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 "attempt": current.get("draft_attempt"),
             }
         return redraft
+
+    def _part_drafts_left(self, current: dict[str, Any], attempt: int, budgeted: bool) -> bool:
+        """Before the rejection budget: three drafts in all; under it, three reviewed
+        drafts (the rejections are bounded where they happen)."""
+        if not budgeted:
+            return attempt < self._MAX_PART_DRAFTS
+        budget = current.get("part_budget") or {}
+        return int(budget.get("reviewed") or 0) < self._MAX_PART_DRAFTS
+
+    def _rejection_left(self, current: dict[str, Any]) -> bool:
+        budget = current.get("part_budget") or {}
+        return int(budget.get("rejected") or 0) < self._MAX_PART_REJECTIONS
+
+    def _rejections_exhausted(self, current: dict[str, Any], code: str) -> dict[str, Any]:
+        return {
+            **current,
+            "blocker": "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED",
+            "blockers": [
+                f"part {current.get('part_id')}: {self._MAX_PART_REJECTIONS + 1} drafts were "
+                f"refused before review ({code})",
+                *[str(item) for item in current.get("blockers") or []],
+                *[str(item) for item in current.get("failed_schema_findings") or []],
+            ][:50],
+        }
 
     @staticmethod
     def _provider_blocker(phase: str, context: dict[str, Any]) -> str:
@@ -7783,7 +7833,22 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 "rejection": redraft["rejection"],
             }
             attempt = int(redraft["first_attempt"]) - 1
-        while attempt < self._MAX_PART_DRAFTS:
+        budgeted = workflow.patched(
+            f"{self._REJECTION_BUDGET_PATCH}-{part.get('kind')}-{part.get('number')}"
+        )
+        if budgeted:
+            prior = (redraft or {}).get("part_budget")
+            # A part approved before the budget (or adopted from an earlier plan) counts
+            # every earlier attempt as reviewed.
+            current["part_budget"] = (
+                {
+                    "reviewed": int(prior.get("reviewed") or 0),
+                    "rejected": int(prior.get("rejected") or 0),
+                }
+                if isinstance(prior, dict)
+                else {"reviewed": attempt, "rejected": 0}
+            )
+        while self._part_drafts_left(current, attempt, budgeted):
             attempt += 1
             if not await self._checkpoint("DECOMPOSITION_PART_DRAFT"):
                 return {**current, "terminal": "FAILED", "blocker": "DECOMPOSITION_CANCELLED"}
@@ -7805,9 +7870,12 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 retry_policy=SINGLE_ATTEMPT,
             )
             if current.get("status") != "SUCCESS":
-                if attempt < self._MAX_PART_DRAFTS and current.get("blocker") == "SchemaViolation":
+                if current.get("blocker") == "SchemaViolation" and (
+                    self._rejection_left(current) if budgeted else attempt < self._MAX_PART_DRAFTS
+                ):
                     # The provider boundary refused the output against the part schema; its
-                    # findings use one of the part's redrafts.
+                    # findings use one of the part's redrafts (under the rejection budget,
+                    # one of its rejections).
                     current = self._structural_redraft(
                         current,
                         "DRAFT_SCHEMA_INVALID",
@@ -7815,13 +7883,15 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                         current.get("failed_agent_usage"),
                     )
                     continue
+                if budgeted and current.get("blocker") == "SchemaViolation":
+                    return self._rejections_exhausted(current, "DRAFT_SCHEMA_INVALID")
                 return {**current, "blocker": self._provider_blocker("DRAFT", current)}
             recorded = await self._step("decomposition.record_part_draft", current)
             if recorded.get("status") != "DRAFT_RECORDED":
-                if (
-                    attempt < self._MAX_PART_DRAFTS
-                    and recorded.get("blocker") in self._STRUCTURAL_REJECTIONS
-                ):
+                structural = recorded.get("blocker") in self._STRUCTURAL_REJECTIONS
+                if budgeted and structural and not self._rejection_left(recorded):
+                    return self._rejections_exhausted(recorded, str(recorded.get("blocker")))
+                if structural and (budgeted or attempt < self._MAX_PART_DRAFTS):
                     # Hermes's own deterministic findings use one of the part's redrafts,
                     # like a REVISE (no review of the rejected draft).
                     current = self._structural_redraft(
@@ -7873,6 +7943,13 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 return {**current, "blocker": self._provider_blocker("REVIEW", current)}
             reviewed = await self._step("decomposition.record_part_review", current)
             current = {key: value for key, value in reviewed.items() if key != "document"}
+            budget = current.get("part_budget")
+            if budgeted and isinstance(budget, dict):
+                # One more reviewed draft (data only).
+                current["part_budget"] = {
+                    **budget,
+                    "reviewed": int(budget.get("reviewed") or 0) + 1,
+                }
             if reviewed.get("status") == "PART_APPROVED":
                 return current
             if reviewed.get("status") != "PART_REVISE":

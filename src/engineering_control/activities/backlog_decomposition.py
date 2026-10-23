@@ -38,6 +38,7 @@ from engineering_control.engineering.decomposition import (
     EPIC,
     FRAME,
     MAX_PART_DRAFTS,
+    MAX_PART_REJECTIONS,
     MAX_REVIEW_CHARACTERS,
     PART_ID,
     PROJECT,
@@ -601,6 +602,40 @@ class DecompositionActivityHandler:
             "not drafted yet; Hermes checks those when it assembles the plan."
         )
 
+    @staticmethod
+    def _part_budget(payload: dict[str, Any]) -> dict[str, int] | None:
+        """The workflow's per-part counters under the rejection budget (None before it):
+        reviewed drafts and Hermes rejections so far."""
+        raw = payload.get("part_budget")
+        if not isinstance(raw, dict):
+            return None
+        reviewed, rejected = raw.get("reviewed"), raw.get("rejected")
+        if type(reviewed) is not int or type(rejected) is not int:
+            return None
+        return {"reviewed": reviewed, "rejected": rejected}
+
+    @staticmethod
+    def _max_attempt(budget: dict[str, int] | None) -> int:
+        return MAX_PART_DRAFTS + (MAX_PART_REJECTIONS if budget is not None else 0)
+
+    @staticmethod
+    def _redraft_position(attempt: int, budget: dict[str, int] | None) -> tuple[str, bool, bool]:
+        """(how the prompt names this redraft, whether another rejection blocks the plan,
+        whether this is the part's last reviewed draft)."""
+        if budget is None:
+            final = attempt == MAX_PART_DRAFTS
+            return f"redraft {attempt - 1} of at most {MAX_PART_DRAFTS - 1}", final, final
+        which = (
+            f"draft {attempt} (reviewed drafts so far: {budget['reviewed']} of at most "
+            f"{MAX_PART_DRAFTS}; drafts refused by Hermes so far: {budget['rejected']} of at "
+            f"most {MAX_PART_REJECTIONS})"
+        )
+        return (
+            which,
+            budget["rejected"] >= MAX_PART_REJECTIONS,
+            budget["reviewed"] >= MAX_PART_DRAFTS - 1,
+        )
+
     def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
         decomposition_id = self._decomposition_id(payload)
         part_id, kind, number = self._part_id(payload)
@@ -617,9 +652,10 @@ class DecompositionActivityHandler:
             )
             if entry is not None:
                 self.repository.record_usage_sync(decomposition_id, entry)
+        budget = self._part_budget(payload)
         if (
             type(attempt) is not int
-            or attempt not in range(1, MAX_PART_DRAFTS + 1)
+            or attempt not in range(1, self._max_attempt(budget) + 1)
             or not payload.get("source_worktree")
             or not self._input_files(payload)
         ):
@@ -655,8 +691,7 @@ class DecompositionActivityHandler:
             self._prior_findings(decomposition_id, part_id, attempt) if attempt >= 2 else ([], 0)
         )
         if attempt >= 2:
-            which = f"redraft {attempt - 1} of at most {MAX_PART_DRAFTS - 1}"
-            final = attempt == MAX_PART_DRAFTS
+            which, final_rejection, final_review = self._redraft_position(attempt, budget)
             cumulative = (
                 "Every finding on this part so far, from every earlier round, labelled by "
                 "round (deduplicated). Resolve all of them in this draft, not only the latest "
@@ -669,7 +704,7 @@ class DecompositionActivityHandler:
                     "approved, but Hermes assembled the whole plan and found the problems "
                     "below in this part (deterministic plan checks across every batch). Fix "
                     "each of them without breaking any other rule. "
-                    + ("Another failure blocks the plan.\n" if final else "\n")
+                    + ("Another failure blocks the plan.\n" if final_review else "\n")
                     + _fenced(
                         "hermes assembly findings",
                         _bounded_json(rejection.get("details") or [], 40_000),
@@ -682,7 +717,7 @@ class DecompositionActivityHandler:
                     f"deterministically ({rejection.get('code')}): it violates the output "
                     "schema or the plan rules. Fix every finding below while keeping every "
                     "rule. "
-                    + ("Another rejection blocks the plan.\n" if final else "\n")
+                    + ("Another rejection blocks the plan.\n" if final_rejection else "\n")
                     + _fenced(
                         "hermes findings", _bounded_json(rejection.get("details") or [], 40_000)
                     )
@@ -866,7 +901,9 @@ class DecompositionActivityHandler:
         result = {**base, "part_rounds": rounds, "content_sha256": reviewed_sha256}
         if review["decision"] == "APPROVE":
             return {**result, "status": "PART_APPROVED"}
-        if attempt >= MAX_PART_DRAFTS:
+        budget = self._part_budget(payload)
+        reviewed_drafts = attempt if budget is None else budget["reviewed"] + 1
+        if reviewed_drafts >= MAX_PART_DRAFTS:
             findings = [
                 f"[{item['category']}] {item.get('subject') or '-'}: {item['detail']}"
                 for item in review["findings"]

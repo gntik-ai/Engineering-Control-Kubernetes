@@ -236,7 +236,7 @@ def test_the_scan_worker_stages_inputs_and_documents_and_publishes_the_plan(
     )["document"]
     written = json.loads(Path(document["path"]).read_text())
     assert document["part_sha256"] == part_content_sha256(written["epic"])
-    for name in ("../x.json", f"part-{part}-draft-4.json", "draft-1.json"):
+    for name in ("../x.json", f"part-{part}-draft-6.json", "draft-1.json"):
         with pytest.raises(ValueError, match="name is invalid"):
             scan._decomposition_stage_document({**base, "name": name, "document": draft})
     plan = {"schema": "backlog-decomposition-v1", "stories": []}
