@@ -148,6 +148,8 @@
         "path",
         "summary",
         "consumers",
+        "provider_stories",
+        "consumer_stories",
         "sources"
       ],
       "properties": {
@@ -196,6 +198,26 @@
             ]
           },
           "minItems": 1
+        },
+        "provider_stories": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 7,
+            "pattern": "^[A-Z]{2,4}-[0-9]{2}$"
+          }
+        },
+        "consumer_stories": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 7,
+            "pattern": "^[A-Z]{2,4}-[0-9]{2}$"
+          }
         },
         "sources": {
           "type": "array",

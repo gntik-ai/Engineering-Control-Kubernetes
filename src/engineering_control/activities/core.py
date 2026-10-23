@@ -254,6 +254,7 @@ class ControlActivities:
         "decomposition.read_issues",
         "decomposition.inventory",
         "decomposition.record_inputs",
+        "decomposition.order_epics",
         "decomposition.prepare_part_input",
         "decomposition.stage_inputs",
         "decomposition.prepare_part",

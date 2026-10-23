@@ -7368,7 +7368,8 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
     UI workflows and their patch markers are untouched).
 
     snapshot at the pinned source SHA -> read-only GitHub issue snapshot -> deterministic
-    inventory -> the frame, then one batch per epic (PR 4's epic_order): Claude drafts
+    inventory -> the frame, then one batch per epic (PR 4's epic_order, re-ordered by the
+    reviewed frame's contracts once the frame is approved): Claude drafts
     (decompose-backlog), Codex reviews (review-decomposition), at most three drafts and
     three reviews per part -> assembly, where a whole-plan problem a part owns goes back to
     that part as a redraft -> CANDIDATE with its approval binding. It never approves,
@@ -7383,6 +7384,10 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
     # part replayed from before the change memoizes false for its own id only.
     _REJECTION_BUDGET_PATCH = "decomposition-part-rejection-budget-v1"
     _MAX_PART_REJECTIONS = 2
+    # NEW-234 1.7.1 (operator 2026-10-23): once the frame is approved, the epic batches are
+    # re-ordered by decomposition.order_epics (an epic providing a contract before the
+    # epics consuming it). A plan replayed from before the change keeps its recorded order.
+    _CONTRACT_ORDER_PATCH = "decomposition-contract-epic-order-v1"
     _ASSEMBLY_ROUNDS = 3
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s).
     _PART_TIMEOUT_MINUTES = 40
@@ -7524,13 +7529,30 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             return {"status": "SUPERSEDED", "decomposition_id": request.decomposition_id}
         context = {key: value for key, value in recorded.items() if key != "status"}
         approved: list[dict[str, Any]] = []
-        for part in list(context.get("parts") or []):
+        parts = list(context.get("parts") or [])
+        position = 0
+        while position < len(parts):
+            part = parts[position]
             outcome = await self._decomposition_part(
                 request, {**context, "approved_parts": list(approved)}, part
             )
             if outcome.get("status") != "PART_APPROVED":
                 return await self._part_terminal(context, outcome)
             approved.append(self._approved_entry(part, outcome))
+            position += 1
+            if part.get("kind") == "frame" and workflow.patched(self._CONTRACT_ORDER_PATCH):
+                ordered = await self._step(
+                    "decomposition.order_epics", {**context, "approved_parts": list(approved)}
+                )
+                epics = [item for item in ordered.get("parts") or [] if isinstance(item, dict)]
+                if ordered.get("status") != "EPICS_ORDERED" or sorted(
+                    int(item.get("number") or 0) for item in epics
+                ) != sorted(int(item.get("number") or 0) for item in parts[position:]):
+                    return await self._decomposition_terminal(
+                        context, "FAILED", "DECOMPOSITION_EPIC_ORDER_INVALID"
+                    )
+                parts = [*parts[:position], *epics]
+                context = {**context, "parts": parts}
         assembled: dict[str, Any] = {}
         for assembly_round in range(self._ASSEMBLY_ROUNDS + 1):
             if not await self._checkpoint("DECOMPOSITION_ASSEMBLE"):

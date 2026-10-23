@@ -47,8 +47,9 @@ from engineering_control.engineering.ui_blueprint import (
 PROJECT: Final = "falcone-serverless"
 DECOMPOSITION_PROJECTS = frozenset({PROJECT})
 PLAN_SCHEMA_ID: Final = "backlog-decomposition-v1"
-# Profile 1.7.0 releases the decompose-backlog and review-decomposition skills.
-AGENT_PACK_MIN_VERSION = (1, 7, 0)
+# Profile 1.7.0 released the decompose-backlog and review-decomposition skills; 1.7.1 adds
+# `contract:<ctr-id>` dependencies and the frame contracts' provider and consumer stories.
+AGENT_PACK_MIN_VERSION = (1, 7, 1)
 DECOMPOSE_SKILL: Final = "decompose-backlog"
 REVIEW_SKILL: Final = "review-decomposition"
 # skill id -> (role, the skill's output schema in the agent pack and in this package)
@@ -129,6 +130,11 @@ TEST_COMMANDS: dict[str, tuple[str, ...]] = {
 }
 TASK_KEY = re.compile(r"^falcone-serverless:([A-Z]{2,4}-[0-9]{2})\.t([1-9][0-9]?)$")
 STORY_KEY = re.compile(r"^[A-Z]{2,4}-[0-9]{2}$")
+# A dependency on a frame contract (profile 1.7.1): bound at assembly to every task whose
+# interfaces.provides names the contract.
+CONTRACT_DEPENDENCY = re.compile(r"^contract:(ctr-[a-z0-9][a-z0-9-]{0,43})$")
+# DecompositionChangeContext.depends_on_tasks holds at most this many predecessor tasks.
+MAX_RESOLVED_DEPENDENCIES = 30
 CRITERION_KEY = re.compile(r"^([A-Z]{2,4}-[0-9]{2})#ac([1-9][0-9]?)$")
 REQUIREMENT_KEY = re.compile(r"^FR-[A-Za-z0-9][A-Za-z0-9.-]{0,15}$")
 PART_ID = re.compile(r"^(frame|ep([0-9]{2}))-[a-f0-9]{16}$")
@@ -339,11 +345,8 @@ def dependency_closure(facts: Mapping[str, StoryFacts]) -> dict[str, frozenset[s
     return closure
 
 
-def epic_order(inventory: Mapping[str, Any]) -> list[int]:
-    """The epic batch drafting order: by the shallowest story-dependency depth of the
-    epic's stories (roots first), then by epic number. The epic graph has cycles, so a
-    task may still depend on a story of a later batch (checked at assembly)."""
-    facts = story_facts(inventory)
+def _story_ranks(facts: Mapping[str, StoryFacts]) -> dict[str, int]:
+    """story -> its story-dependency depth (a root is 0)."""
     depth: dict[str, int] = {}
 
     def level(story: str) -> int:
@@ -352,11 +355,74 @@ def epic_order(inventory: Mapping[str, Any]) -> list[int]:
             depth[story] = 1 + max((level(item) for item in dependencies), default=-1)
         return depth[story]
 
+    for story in facts:
+        level(story)
+    return depth
+
+
+def _contract_stories(contract: Mapping[str, Any], field: str) -> list[str]:
+    value = contract.get(field)
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def epic_order(inventory: Mapping[str, Any], frame: Mapping[str, Any] | None = None) -> list[int]:
+    """The epic batch drafting order.
+
+    Without a frame (the order recorded with the inputs): by the shallowest story-dependency
+    depth of the epic's stories (roots first), then by epic number.
+
+    With the reviewed frame (NEW-234 1.7.1, computed once the frame is approved): an epic
+    whose stories provide a contract (frame `contracts[].provider_stories`) is drafted
+    before the epics whose stories consume it (`consumer_stories`), then story
+    dependencies decide. Greedily, the next epic is the undrafted one with the smallest
+    (undrafted epics providing a contract it consumes, undrafted epics owning a story its
+    stories depend on, shallowest story depth, epic number): an epic whose providers are
+    all drafted always goes first, and a contract cycle is broken by the epic waiting on the
+    fewest providers, then on the fewest story prerequisites, then the shallower, then the
+    lower-numbered epic. A task may still depend on a later batch (a task key or a
+    `contract:<ctr-id>`, checked at assembly).
+    """
+    facts = story_facts(inventory)
+    rank = _story_ranks(facts)
+    epics = {int(epic["number"]): [str(s) for s in epic["stories"]] for epic in inventory["epics"]}
     ranks = {
-        int(epic["number"]): min((level(str(s)) for s in epic["stories"]), default=0)
-        for epic in inventory["epics"]
+        number: min((rank[s] for s in stories if s in rank), default=0)
+        for number, stories in epics.items()
     }
-    return sorted(ranks, key=lambda number: (ranks[number], number))
+    if frame is None:
+        return sorted(ranks, key=lambda number: (ranks[number], number))
+    epic_of = {story: facts[story].epic_number for story in facts}
+    providers: dict[int, set[int]] = {number: set() for number in epics}
+    prerequisites: dict[int, set[int]] = {number: set() for number in epics}
+    for contract in frame.get("contracts") or []:
+        provided = {
+            epic_of[s] for s in _contract_stories(contract, "provider_stories") if s in epic_of
+        }
+        for story in _contract_stories(contract, "consumer_stories"):
+            consumer = epic_of.get(story)
+            if consumer in providers:
+                providers[consumer] |= {item for item in provided if item in epics} - {consumer}
+    for known in facts.values():
+        epic = known.epic_number
+        if epic in prerequisites:
+            prerequisites[epic] |= {
+                epic_of[d] for d in known.dependencies if epic_of.get(d) in epics
+            } - {epic}
+    order: list[int] = []
+    left = set(epics)
+    while left:
+        chosen = min(
+            left,
+            key=lambda number: (
+                len(providers[number] & left),
+                len(prerequisites[number] & left),
+                ranks[number],
+                number,
+            ),
+        )
+        order.append(chosen)
+        left.remove(chosen)
+    return order
 
 
 # --------------------------------------------------------------------------------------
@@ -548,9 +614,13 @@ def _duplicates(values: Iterable[str]) -> list[str]:
     return sorted(repeated)
 
 
-def frame_problems(frame: Mapping[str, Any]) -> list[PlanProblem]:
-    """Contract identity and paths (the frame defines every contract exactly once)."""
+def frame_problems(
+    frame: Mapping[str, Any], stories: Iterable[str] | None = None
+) -> list[PlanProblem]:
+    """Contract identity and paths (the frame defines every contract exactly once); with
+    the inventory's `stories`, every provider and consumer story is one of them."""
     contracts = list(frame["contracts"])
+    known = None if stories is None else frozenset(stories)
     problems = [
         _problem("CONTRACT_DUPLICATE", "contract", identity, "is defined more than once")
         for identity in _duplicates(str(item["id"]) for item in contracts)
@@ -575,6 +645,19 @@ def frame_problems(frame: Mapping[str, Any]) -> list[PlanProblem]:
                     f"owner {contract['owner_repository']} is not a decomposition target",
                 )
             )
+        if known is None:
+            continue
+        for field in ("provider_stories", "consumer_stories"):
+            for story in _contract_stories(contract, field):
+                if story not in known:
+                    problems.append(
+                        _problem(
+                            "CONTRACT_STORY_UNKNOWN",
+                            "contract",
+                            str(contract["id"]),
+                            f"{field} names {story}, which is not a story of the inventory",
+                        )
+                    )
     return problems
 
 
@@ -778,6 +861,29 @@ def _task_problems(
             problems.append(
                 _problem("CONTRACT_UNKNOWN", "contract", key, f"consumes unknown {contract}")
             )
+    consumed = {str(item) for item in task["interfaces"]["consumes"]}
+    for dependency in task["depends_on"]:
+        match = CONTRACT_DEPENDENCY.fullmatch(str(dependency))
+        if match is None:
+            continue
+        if match.group(1) not in contracts:
+            problems.append(
+                _problem(
+                    "CONTRACT_UNKNOWN",
+                    "contract",
+                    key,
+                    f"depends on {dependency}, which the frame does not declare",
+                )
+            )
+        elif match.group(1) not in consumed:
+            problems.append(
+                _problem(
+                    "CONTRACT_DEPENDENCY_UNCONSUMED",
+                    "contract",
+                    key,
+                    f"depends on {dependency}, which its interfaces.consumes does not name",
+                )
+            )
     criteria = set(_effective(facts.criteria, amendment.removed_criteria, amendment.added_criteria))
     for item in task["acceptance_criteria"]:
         for covered in item["covers"]:
@@ -971,6 +1077,7 @@ def _prerequisite_problems(
     graph: Mapping[str, Sequence[str]],
     resolved: Mapping[str, tuple[str, Sequence[str]]],
     drafted: frozenset[str],
+    providers: Mapping[str, Sequence[str]],
 ) -> list[PlanProblem]:
     """Every (amended) prerequisite story V of a story S orders S's work: some task of S
     depends, directly or through other tasks, on a task of V. A prerequisite whose batch
@@ -979,7 +1086,7 @@ def _prerequisite_problems(
     for story in stories:
         story_id = str(story["story_id"])
         reached: set[str] = set()
-        stack = [str(d) for task in story["tasks"] for d in task["depends_on"]]
+        stack = [d for task in story["tasks"] for d in _bound_dependencies(task, providers)[0]]
         seen: set[str] = set()
         while stack:
             key = stack.pop()
@@ -1004,6 +1111,47 @@ def _prerequisite_problems(
                     )
                 )
     return problems
+
+
+def _contract_providers(tasks: Iterable[Mapping[str, Any]]) -> dict[str, list[str]]:
+    """contract id -> the keys of the tasks whose interfaces.provides names it, in order."""
+    providers: dict[str, list[str]] = {}
+    for task in tasks:
+        for contract in task["interfaces"]["provides"]:
+            keys = providers.setdefault(str(contract), [])
+            if str(task["key"]) not in keys:
+                keys.append(str(task["key"]))
+    return providers
+
+
+def _bound_dependencies(
+    task: Mapping[str, Any], providers: Mapping[str, Sequence[str]]
+) -> tuple[list[str], list[str]]:
+    """(the task's predecessor task keys, each `contract:<ctr-id>` replaced in place by the
+    tasks providing it (the task itself excluded), first occurrence kept; the contract ids
+    no other task provides)."""
+    key = str(task["key"])
+    keys: list[str] = []
+    missing: list[str] = []
+    for dependency in task["depends_on"]:
+        match = CONTRACT_DEPENDENCY.fullmatch(str(dependency))
+        if match is None:
+            found = [str(dependency)]
+        else:
+            found = [item for item in providers.get(match.group(1), ()) if item != key]
+            if not found:
+                missing.append(match.group(1))
+        keys += [item for item in found if item not in keys]
+    return keys, missing
+
+
+def resolved_dependencies(stories: Sequence[Mapping[str, Any]]) -> dict[str, tuple[str, ...]]:
+    """task key -> its predecessor task keys once every `contract:<ctr-id>` dependency is
+    bound to the plan tasks providing that contract (what the fan-out links). An assembled
+    plan has a provider for every contract dependency (CONTRACT_PROVIDER_MISSING)."""
+    tasks = [task for story in stories for task in story["tasks"]]
+    providers = _contract_providers(tasks)
+    return {str(task["key"]): tuple(_bound_dependencies(task, providers)[0]) for task in tasks}
 
 
 def _stories_problems(
@@ -1049,14 +1197,47 @@ def _stories_problems(
                 )
             )
     closure = {story: _reach(graph, story) for story in graph}
+    # A task's own dependency rules cover its task-key dependencies; a `contract:<ctr-id>`
+    # one has its own (the frame declares the contract and the task consumes it) and binds to
+    # every task providing the contract, with no story-dependency rule.
     own = {
-        str(task["key"]): (str(story["story_id"]), tuple(task["depends_on"]))
+        str(task["key"]): (
+            str(story["story_id"]),
+            tuple(d for d in task["depends_on"] if not CONTRACT_DEPENDENCY.fullmatch(str(d))),
+        )
         for story in stories
         for task in story["tasks"]
     }
     every = [
         (str(story["story_id"]), task) for story in (*earlier, *stories) for task in story["tasks"]
     ]
+    providers = _contract_providers(task for _story, task in every)
+    bound = {str(task["key"]): _bound_dependencies(task, providers) for _story, task in every}
+    for story in stories:
+        for task in story["tasks"]:
+            key = str(task["key"])
+            keys, missing = bound[key]
+            for contract in missing:
+                if contract in contracts and not deferred:
+                    problems.append(
+                        _problem(
+                            "CONTRACT_PROVIDER_MISSING",
+                            "dependency",
+                            key,
+                            f"depends on contract:{contract}, which no plan task provides "
+                            "(interfaces.provides); depend on a task key or drop it",
+                        )
+                    )
+            if len(keys) > MAX_RESOLVED_DEPENDENCIES:
+                problems.append(
+                    _problem(
+                        "DEPENDENCY_TOO_MANY",
+                        "dependency",
+                        key,
+                        f"depends on {len(keys)} tasks once its contract dependencies are "
+                        f"bound; at most {MAX_RESOLVED_DEPENDENCIES}",
+                    )
+                )
     problems += [
         _problem("TASK_KEY_DUPLICATE", "duplicate_task", key, "is used by more than one task")
         for key in _duplicates(str(task["key"]) for _story, task in every)
@@ -1067,13 +1248,16 @@ def _stories_problems(
             " ".join(str(task["title"]).split()).casefold() for _s, task in every
         )
     ]
-    resolved = {str(task["key"]): (story_id, tuple(task["depends_on"])) for story_id, task in every}
+    resolved = {
+        str(task["key"]): (story_id, tuple(bound[str(task["key"])][0])) for story_id, task in every
+    }
     problems += _graph_problems(own, closure, resolved=resolved, deferred=deferred)
     problems += _prerequisite_problems(
         [story for story in stories if str(story["story_id"]) in own_stories],
         graph,
         resolved,
         frozenset(facts) - deferred,
+        providers,
     )
     return problems
 
@@ -1138,12 +1322,15 @@ def _checked_part(
     return content
 
 
-def check_frame_draft(value: Any, inputs: DecompositionInputs, part: str) -> dict[str, Any]:
-    """Validate one frame draft (schema, binding, text and contract rules); return it."""
+def check_frame_draft(
+    value: Any, inputs: DecompositionInputs, part: str, *, stories: Iterable[str] | None = None
+) -> dict[str, Any]:
+    """Validate one frame draft (schema, binding, text and contract rules, the contracts'
+    provider and consumer stories against the inventory's `stories`); return it."""
     if _part_kind(part)[0] != FRAME:
         raise ValueError("a frame draft needs a frame part id")
     frame = _checked_part(value, FRAME, inputs, part, {})
-    problems = text_problems(frame, "frame") + frame_problems(frame)
+    problems = text_problems(frame, "frame") + frame_problems(frame, stories)
     if problems:
         raise DecompositionRejected("DRAFT_STRUCTURE_INVALID", problems)
     return frame
@@ -1444,6 +1631,19 @@ def _text(value: Any, limit: int = 300) -> str:
     return flattened if len(flattened) <= limit else flattened[: limit - 3] + "..."
 
 
+def _dependency_cell(task: Mapping[str, Any], providers: Mapping[str, Sequence[str]]) -> str:
+    """The task's dependencies; a contract dependency with the tasks it binds to."""
+    cells = []
+    for dependency in task["depends_on"]:
+        match = CONTRACT_DEPENDENCY.fullmatch(str(dependency))
+        if match is None:
+            cells.append(f"`{dependency}`")
+            continue
+        bound = [key for key in providers.get(match.group(1), ()) if key != task["key"]]
+        cells.append(f"`{dependency}` ({', '.join(f'`{key}`' for key in bound) or 'unbound'})")
+    return ", ".join(cells) or "-"
+
+
 def render_markdown(
     plan: Mapping[str, Any],
     *,
@@ -1454,6 +1654,7 @@ def render_markdown(
     """The operator's summary of one plan (deterministic; model text is inert)."""
     risks = {item["key"]: item for item in risk_preview(plan)}
     tasks = [task for story in plan["stories"] for task in story["tasks"]]
+    providers = _contract_providers(tasks)
     per_repository = {
         repository: sum(1 for task in tasks if task["target"]["repository"] == repository)
         for repository in TASK_TARGETS
@@ -1511,7 +1712,7 @@ def render_markdown(
                 f"`{task['target']['repository']}` {task['target']['component']} | "
                 f"{task['kind']} | {task['size']} | "
                 f"{risk['proposed_risk']} / {risk['calculated_risk']}{flag} | "
-                f"{', '.join(f'`{key}`' for key in task['depends_on']) or '-'} |"
+                f"{_dependency_cell(task, providers)} |"
             )
         amendment = story["story_amendment"]
         if amendment:

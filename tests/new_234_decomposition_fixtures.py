@@ -237,6 +237,8 @@ def frame() -> dict[str, Any]:
                 "path": "wit/invoke.wit",
                 "summary": "The worker invocation interface.",
                 "consumers": ["gntik-ai/falcone"],
+                "provider_stories": ["RUN-01"],
+                "consumer_stories": ["API-01"],
                 "sources": ["design §3"],
             },
             {
@@ -246,6 +248,8 @@ def frame() -> dict[str, Any]:
                 "path": "services/functions/openapi.yaml",
                 "summary": "The public Functions API.",
                 "consumers": ["gntik-ai/falcone-serverless", "gntik-ai/falcone-charts"],
+                "provider_stories": ["API-01"],
+                "consumer_stories": ["API-01"],
                 "sources": ["design §4"],
             },
         ],
@@ -417,7 +421,7 @@ def mutated(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_decomposition_pack(
-    root: Path, *, version: str = "1.7.0", skip: tuple[str, ...] = ()
+    root: Path, *, version: str = "1.7.1", skip: tuple[str, ...] = ()
 ) -> Path:
     """A minimal released agent pack with the two decomposition skills (synced schemas)."""
     written = {

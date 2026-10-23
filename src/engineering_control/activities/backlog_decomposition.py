@@ -4,14 +4,16 @@ Modelled on UiPlanActivityHandler (activities/ui_plan.py, batched plan): the con
 the durable BacklogDecomposition row and builds the native-provider requests. Claude drafts
 each part with the decompose-backlog skill (role backlog-decomposer): first the frame (the
 cross-repository contracts and global decisions), then one batch per epic in PR 4's
-epic_order, each against the reviewed frame and the reviewed contents of the batches
-before it. Codex independently reviews each part with the review-decomposition skill (role
-decomposition-reviewer). Hermes checks every draft and review deterministically, carries
-every finding of a part (review and Hermes rejection, every round) into its redraft and
-re-review, assembles the reviewed parts, maps any whole-plan problem back to the part that
-owns it for a redraft, and persists the plan as an approvable CANDIDATE. Budgets (design
-section 3): at most 3 drafts and 3 reviews per part, 90 provider calls in all, 64 KiB per
-staged input, 40 000 characters per review. Hermes never publishes and never edits an issue.
+epic_order (re-ordered by decomposition.order_epics once the frame is approved: an epic
+providing a contract before the epics consuming it), each against the reviewed frame and
+the reviewed contents of the batches before it. Codex independently reviews each part
+with the review-decomposition skill (role decomposition-reviewer). Hermes checks every
+draft and review deterministically, carries every finding of a part (review and Hermes
+rejection, every round) into its redraft and re-review, assembles the reviewed parts, maps
+any whole-plan problem back to the part that owns it for a redraft, and persists the plan
+as an approvable CANDIDATE. Budgets (design section 3): at most 3 drafts and 3 reviews per
+part, 90 provider calls in all, 64 KiB per staged input, 40 000 characters per review.
+Hermes never publishes and never edits an issue.
 """
 
 from __future__ import annotations
@@ -126,6 +128,7 @@ class DecompositionActivityHandler:
         {
             "decomposition.register",
             "decomposition.record_inputs",
+            "decomposition.order_epics",
             "decomposition.prepare_part_input",
             "decomposition.prepare_part",
             "decomposition.record_part_draft",
@@ -150,6 +153,7 @@ class DecompositionActivityHandler:
         handlers = {
             "decomposition.register": self._register,
             "decomposition.record_inputs": self._record_inputs,
+            "decomposition.order_epics": self._order_epics,
             "decomposition.prepare_part_input": self._prepare_part_input,
             "decomposition.prepare_part": self._prepare_part,
             "decomposition.record_part_draft": self._record_part_draft,
@@ -300,6 +304,35 @@ class DecompositionActivityHandler:
             "stories": len(scoped["stories"]),
         }
 
+    def _order_epics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-234 1.7.1: once the frame is approved, the epic batches not drafted yet in
+        the contract-aware order (epic_order with the reviewed frame: an epic providing a
+        contract before the epics consuming it). Deterministic over the stored inventory,
+        epic scope and the reviewed frame the workflow carries (re-verified)."""
+        decomposition_id = self._decomposition_id(payload)
+        base = self._base(payload)
+        frame, _frame_sha256, earlier = self._epic_context(decomposition_id, payload)
+        _full, scoped, _revision = self._inputs(decomposition_id)
+        drafted = {part.number for part in earlier}
+        pending = [
+            item
+            for item in payload.get("parts") or []
+            if isinstance(item, dict) and item.get("kind") == EPIC
+        ]
+        numbers = [int(item["number"]) for item in pending]
+        order = [number for number in epic_order(scoped, frame) if number not in drafted]
+        if sorted(order) != sorted(n for n in numbers if n not in drafted):
+            raise ApplicationError(
+                "decomposition epic batches differ from the plan's scope",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        return {
+            **base,
+            "status": "EPICS_ORDERED",
+            "parts": [{"kind": EPIC, "number": number} for number in order],
+        }
+
     # Parts ------------------------------------------------------------------------------
 
     def _inputs(self, decomposition_id: UUID) -> tuple[dict[str, Any], dict[str, Any], str]:
@@ -384,10 +417,12 @@ class DecompositionActivityHandler:
         part_id: str,
         kind: str,
     ) -> dict[str, Any]:
-        _full, scoped, _revision = self._inputs(decomposition_id)
+        full, scoped, _revision = self._inputs(decomposition_id)
         inputs = DecompositionInputs.of(scoped)
         if kind == FRAME:
-            return check_frame_draft(value, inputs, part_id)
+            return check_frame_draft(
+                value, inputs, part_id, stories=[str(story["id"]) for story in full["stories"]]
+            )
         frame, frame_sha256, earlier = self._epic_context(decomposition_id, payload)
         return check_epic_draft(
             value,
@@ -599,7 +634,10 @@ class DecompositionActivityHandler:
             "the story issue's body must change; the operator publishes it, Hermes never "
             "edits an issue). depends_on may name tasks of the epic batches reviewed before "
             "this one (earlier_task_keys in the input) and tasks of stories whose batch is "
-            "not drafted yet; Hermes checks those when it assembles the plan."
+            "not drafted yet; Hermes checks those when it assembles the plan. When a "
+            "consumed contract's provider task is in an epic not yet drafted, depend on "
+            "contract:<ctr-id> (a frame contract the task consumes); Hermes binds it to the "
+            "tasks providing that contract at assembly."
         )
 
     @staticmethod
