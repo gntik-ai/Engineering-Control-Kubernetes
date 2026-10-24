@@ -1029,9 +1029,12 @@ class BacklogDecompositionRepository:
         number: int | None,
         attempt: int,
         content: dict[str, Any],
+        *,
+        continued_from: dict[str, Any] | None = None,
     ) -> str:
         """Store one Hermes-checked part draft (idempotent per attempt). A new draft of
-        an approved part (an assembly redraft) withdraws that approval."""
+        an approved part (an assembly redraft) withdraws that approval. `continued_from`
+        is the earlier plan and draft a continued first draft revised."""
         digest = part_content_sha256(content)
         with self.sessions.begin() as session:
             row = self._locked(session, decomposition_id)
@@ -1044,6 +1047,8 @@ class BacklogDecompositionRepository:
             ] + [{"attempt": attempt, "content": content, "content_sha256": digest}]
             if entry.get("approved_attempt") is not None and entry["approved_attempt"] < attempt:
                 entry["approved_attempt"] = None
+            if continued_from is not None:
+                entry["continued_from"] = continued_from
             row.parts_json = parts
             return digest
 
@@ -1170,6 +1175,61 @@ class BacklogDecompositionRepository:
                             "content_sha256": version["content_sha256"],
                             "review": copy.deepcopy(version["review"]),
                         }
+        return None
+
+    def previous_unresolved_sync(
+        self, decomposition_id: UUID, project: str, part_id: str
+    ) -> dict[str, Any] | None:
+        """Cross-run continuation (as NEW-142): the most recent earlier, ended plan of the
+        project that drafted this exact part (same id: same input and pack revision) and
+        never approved it, with the part's last reviewed draft and every review and Hermes
+        rejection of it in that plan. None when that plan approved the part (reuse wins)
+        or reviewed no draft of it whose hashes still match."""
+        with self.sessions() as session:
+            row = session.get(BacklogDecomposition, decomposition_id)
+            if row is None:
+                raise DecompositionNotFoundError("backlog decomposition not found")
+            rows = session.scalars(
+                select(BacklogDecomposition)
+                .where(BacklogDecomposition.project == project)
+                .where(BacklogDecomposition.id != decomposition_id)
+                .where(BacklogDecomposition.status != "DRAFTING")
+                .where(BacklogDecomposition.created_at <= row.created_at)
+                .order_by(BacklogDecomposition.created_at.desc())
+                .limit(REUSE_SEARCH)
+            ).all()
+            for other in rows:
+                entry = ((other.parts_json or {}).get("parts") or {}).get(part_id)
+                if not isinstance(entry, dict) or entry.get("reused_from"):
+                    continue
+                if entry.get("approved_attempt") is not None:
+                    return None
+                reviewed = [
+                    version
+                    for version in entry.get("versions") or []
+                    if isinstance(version.get("review"), dict)
+                    and version["review"].get("decision") == "REVISE"
+                    and type(version.get("attempt")) is int
+                    and isinstance(version.get("content"), dict)
+                    and part_content_sha256(version["content"])
+                    == version.get("content_sha256")
+                    == version.get("reviewed_sha256")
+                ]
+                if not reviewed:
+                    return None
+                last = max(reviewed, key=lambda version: int(version["attempt"]))
+                return {
+                    "decomposition_id": str(other.id),
+                    "attempt": int(last["attempt"]),
+                    "content": copy.deepcopy(last["content"]),
+                    "content_sha256": last["content_sha256"],
+                    "reviews": [
+                        {"attempt": version["attempt"], **copy.deepcopy(version["review"])}
+                        for version in entry.get("versions") or []
+                        if isinstance(version.get("review"), dict)
+                    ],
+                    "rejections": copy.deepcopy(list(entry.get("rejections") or [])),
+                }
         return None
 
     def adopt_part_sync(
@@ -1423,6 +1483,7 @@ class BacklogDecompositionRepository:
                 "rejections": len(entry.get("rejections") or []),
                 "approved_attempt": entry.get("approved_attempt"),
                 "reused_from": entry.get("reused_from"),
+                "continued_from": entry.get("continued_from"),
             }
             for part_id, entry in (parts.get("parts") or {}).items()
             if isinstance(entry, dict)
