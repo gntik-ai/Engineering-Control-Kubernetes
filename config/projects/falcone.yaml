@@ -190,6 +190,10 @@ delivery_control:
 # blocks and templates read built-in labels from the en/es catalogs (gntik-ui #685), which
 # the first u1 page delivery (falcone #1215) needed. The digest is the multi-arch index of
 # ghcr.io/gntik-ai/gntik-ui-mcp:sha-8a43a41.
+# Bump to 0.11.0 (released 2026-10-24 from main 2f83673, Version Packages gntik-ui#690): the
+# u1 kit gaps gntik-ui #693 (detail card and page header options), #694 (LogViewer levels and wrap) and #695
+# (shell-less resource detail with caller tabs). The digest is the multi-arch index of
+# ghcr.io/gntik-ai/gntik-ui-mcp:sha-2f83673.
 ui_migration:
   legacy_app: apps/web-console
   target_app: apps/web-console-next
@@ -197,10 +201,10 @@ ui_migration:
   gntik_ui:
     registry: registry.npmjs.org
     scope: "@gntik-ai"
-    version: 0.10.0
+    version: 0.11.0
   mcp:
     image: ghcr.io/gntik-ai/gntik-ui-mcp
-    digest: sha256:cc188548db99d0c0fc1228ba5c427524e7e7bc951eced286ee017a1a57b9d728
+    digest: sha256:f07840f66bacee065b6bff1535edca9478a895a2af434ac8b2f2bd7b6e406788
     socket: /run/gntik-ui-mcp/mcp.sock
   route_tables:
     control_plane_routes: apps/control-plane/routes.mjs
