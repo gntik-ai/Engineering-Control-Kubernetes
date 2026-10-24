@@ -39,8 +39,10 @@ from engineering_control.engineering.decomposition import (
     APPROVAL_PHRASE,
     DECOMPOSITION_PROJECTS,
     EPIC_SELECTOR,
+    FINAL_REFUSAL,
     MAX_EPIC_SELECTORS,
     MAX_PROVIDER_CALLS,
+    REJECTIONS_EXHAUSTED,
     SOURCE_REPOSITORY,
     WORKFLOW_PREFIX,
     approval_binding,
@@ -72,8 +74,31 @@ _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _CALL_KEY = re.compile(r"^(?:frame|ep[0-9]{2})-[a-f0-9]{16}:(?:draft|review):[1-9]$")
 # How many earlier plans of the project are searched for a reusable reviewed part.
 REUSE_SEARCH = 20
-# Cross-run continuation: earlier plans searched for a part's unresolved draft.
-CONTINUATION_SEARCH = 200
+
+
+def _with_terminal_refusal(
+    row: BacklogDecomposition, part_id: str, entry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The part's stored rejections, plus the provider schema refusal that ended it when
+    the plan stopped on it: a plan that ended before that refusal was recorded as a
+    rejection (_record_final_refusal) keeps it only in its terminal blockers."""
+    rejections = copy.deepcopy(list(entry.get("rejections") or []))
+    blockers = [str(item) for item in row.blockers_json or []]
+    match = FINAL_REFUSAL.fullmatch(blockers[0]) if blockers else None
+    if row.error_code != REJECTIONS_EXHAUSTED or match is None or match.group(1) != part_id:
+        return rejections
+    attempt = 1 + max(
+        [0]
+        + [int(item.get("attempt") or 0) for item in entry.get("versions") or []]
+        + [int(item.get("attempt") or 0) for item in rejections]
+    )
+    terminal = {"attempt": attempt, "code": "DRAFT_SCHEMA_INVALID", "details": blockers[1:50]}
+    if any(
+        item.get("code") == terminal["code"] and item.get("details") == terminal["details"]
+        for item in rejections
+    ):
+        return rejections  # recorded by _record_final_refusal
+    return [*rejections, terminal]
 
 
 class DecompositionNotFoundError(ValueError):
@@ -1181,8 +1206,8 @@ class BacklogDecompositionRepository:
         project that reviewed a draft of this exact part (same id: same input and pack
         revision) and never approved it, with the part's last reviewed draft and every
         review and Hermes rejection of it in that plan. None when that plan approved the
-        part (reuse wins). Plans that never reviewed a draft of the part are skipped, up to
-        CONTINUATION_SEARCH plans."""
+        part (reuse wins). Plans that never reviewed a draft of the part are skipped; the
+        search pages through every earlier ended plan of the project."""
         with self.sessions() as session:
             row = session.get(BacklogDecomposition, decomposition_id)
             if row is None:
@@ -1196,15 +1221,17 @@ class BacklogDecompositionRepository:
                 .order_by(BacklogDecomposition.created_at.desc(), BacklogDecomposition.id)
             )
             # Paged, so plans that never drafted the part do not hide an older one.
-            for offset in range(0, CONTINUATION_SEARCH, REUSE_SEARCH):
+            offset = 0
+            while True:
                 rows = session.scalars(query.offset(offset).limit(REUSE_SEARCH)).all()
+                offset += len(rows)
                 for other in rows:
                     entry = ((other.parts_json or {}).get("parts") or {}).get(part_id)
                     if not isinstance(entry, dict) or entry.get("reused_from"):
                         continue
                     if entry.get("approved_attempt") is not None:
                         return None
-                    found = self._unresolved_source(other, entry, None, None)
+                    found = self._unresolved_source(other, part_id, entry, None, None)
                     if found is not None:
                         return found
                 if len(rows) < REUSE_SEARCH:
@@ -1214,6 +1241,7 @@ class BacklogDecompositionRepository:
     @staticmethod
     def _unresolved_source(
         row: BacklogDecomposition,
+        part_id: str,
         entry: dict[str, Any],
         attempt: int | None,
         content_sha256: str | None,
@@ -1248,7 +1276,7 @@ class BacklogDecompositionRepository:
                 for version in entry.get("versions") or []
                 if isinstance(version.get("review"), dict)
             ],
-            "rejections": copy.deepcopy(list(entry.get("rejections") or [])),
+            "rejections": _with_terminal_refusal(row, part_id, entry),
         }
 
     def pin_continuation_sync(
@@ -1295,7 +1323,11 @@ class BacklogDecompositionRepository:
             if row is None or not isinstance(entry, dict):
                 return True, None
             return True, self._unresolved_source(
-                row, entry, int(pin.get("attempt") or 0), str(pin.get("content_sha256"))
+                row,
+                part_id,
+                entry,
+                int(pin.get("attempt") or 0),
+                str(pin.get("content_sha256")),
             )
 
     def adopt_part_sync(

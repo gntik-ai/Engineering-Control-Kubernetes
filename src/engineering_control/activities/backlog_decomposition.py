@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import re
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -39,12 +38,14 @@ from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.decomposition import (
     APPROVAL_PHRASE,
     EPIC,
+    FINAL_REFUSAL,
     FRAME,
     MAX_PART_DRAFTS,
     MAX_PART_REJECTIONS,
     MAX_REVIEW_CHARACTERS,
     PART_ID,
     PROJECT,
+    REJECTIONS_EXHAUSTED,
     DecompositionInputs,
     DecompositionRejected,
     EpicPart,
@@ -97,12 +98,8 @@ _PROVIDER_RESULT_KEYS = frozenset(
     }
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
-# The workflow's _rejections_exhausted summary when a provider schema refusal ends a part.
-REJECTIONS_EXHAUSTED = "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED"
-_FINAL_REFUSAL = re.compile(
-    r"part ((?:frame|ep([0-9]{2}))-[a-f0-9]{16}): [0-9]+ drafts were refused before review "
-    r"\(DRAFT_SCHEMA_INVALID\)"
-)
+# What a continuation pin (continued_from) names.
+_PIN_KEYS = ("decomposition_id", "attempt", "content_sha256")
 # Carried between two steps but never into the next request.
 _TRANSIENT_KEYS = frozenset(
     {"document", "markdown", "files", "file_hashes", "inventory", "rejected_usage"}
@@ -621,7 +618,20 @@ class DecompositionActivityHandler:
             )
             return {}
         if not pinned:
-            self.repository.pin_continuation_sync(decomposition_id, part_id, kind, number, previous)
+            winner = self.repository.pin_continuation_sync(
+                decomposition_id, part_id, kind, number, previous
+            )
+            if any(str(winner.get(key)) != str(previous[key]) for key in _PIN_KEYS):
+                # An overlapping attempt pinned another source first: stage exactly that one.
+                _pinned, previous = self.repository.pinned_continuation_sync(
+                    decomposition_id, part_id
+                )
+                if previous is None:
+                    return {}
+                try:
+                    files = self._previous_files(part_id, kind, previous)
+                except DecompositionSourceError:
+                    return {}
         return files
 
     def _continuation(
@@ -1255,7 +1265,7 @@ class DecompositionActivityHandler:
         that exhausts the rejection budget ends the part first. Record it from the
         terminal blockers, so a later plan continuing the part sees it."""
         blockers = [str(item) for item in payload.get("blockers") or []]
-        match = _FINAL_REFUSAL.fullmatch(blockers[0]) if blockers else None
+        match = FINAL_REFUSAL.fullmatch(blockers[0]) if blockers else None
         if payload.get("blocker") != REJECTIONS_EXHAUSTED or match is None:
             return
         part_id = match.group(1)

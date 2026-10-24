@@ -18,6 +18,7 @@ import pytest
 from new_234_plan_fixtures import PlanHarness, draft_for, drive, stage_inputs
 from sqlalchemy import update
 
+from engineering_control.db import backlog_decompositions as decompositions_db
 from engineering_control.db.backlog_decompositions import REUSE_SEARCH
 from engineering_control.db.models import BacklogDecomposition
 from engineering_control.engineering.decomposition import part_content_sha256
@@ -350,9 +351,14 @@ def test_the_pinned_source_survives_an_older_plan_ending_later(tmp_path: Path) -
     assert f"previous run {middle['id'][:8]}" not in review
 
 
-def test_the_final_schema_refusal_is_kept_for_a_continuation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ended_before_deploy", [False, True])
+def test_the_final_schema_refusal_is_kept_for_a_continuation(
+    tmp_path: Path, ended_before_deploy: bool
+) -> None:
     """Finding 3: REVISE on draft 1, schema refusals of drafts 2-4; the last refusal ends
-    the part before any next draft records it, so record_terminal records it."""
+    the part before any next draft records it, so record_terminal records it. A plan that
+    ended before that (round 2, finding 1) keeps it only in its terminal blockers, and the
+    continuation recovers it from there."""
     harness = PlanHarness(tmp_path)
     created = harness.create()
 
@@ -408,12 +414,16 @@ def test_the_final_schema_refusal_is_kept_for_a_continuation(tmp_path: Path) -> 
         (4, "DRAFT_SCHEMA_INVALID"),
     ]
     assert entry["rejections"][-1]["details"] == ["draft 4 schema"]
+    if ended_before_deploy:
+        parts = _parts(harness, created["id"])
+        parts["parts"][part_id]["rejections"].pop()
+        _set_parts(harness, created["id"], parts)
     harness.requests.clear()
     second = harness.create()
     assert drive(harness, second["id"])["status"] == "CANDIDATE"
     [draft] = _run_prompts(harness, "claude")
     assert "Hermes rejection DRAFT_SCHEMA_INVALID of draft 4" in draft
-    assert "draft 4 schema" in draft
+    assert draft.count("draft 4 schema") == 1
 
 
 class _Stop(Exception):
@@ -460,3 +470,69 @@ def test_continued_from_is_recorded_when_the_continued_draft_is_refused(
     result = drive(harness, second["id"], draft=draft)
     assert result["blocker"] == "DRAFT_BINDING_MISMATCH", result
     assert _part(harness, second, 2)["continued_from"]["decomposition_id"] == first["id"]
+
+
+# Review findings (Codex round 2, d9b4201) -----------------------------------------------
+
+
+def test_the_search_is_not_capped_by_a_plan_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: the part filter applies to every earlier ended plan, so any number of
+    newer plans without the part (here 12 pages of 2) never hides the unresolved one."""
+    monkeypatch.setattr(decompositions_db, "REUSE_SEARCH", 2)
+    # d9b4201 capped the search at CONTINUATION_SEARCH plans; no cap may apply now.
+    monkeypatch.setattr(decompositions_db, "CONTINUATION_SEARCH", 10, raising=False)
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    fillers = [harness.create() for _ in range(23)]
+    second = harness.create()
+    with harness.repository.sessions.begin() as session:
+        for offset, item in enumerate([first, *fillers, second]):
+            values: dict[str, Any] = {"created_at": base + timedelta(minutes=offset)}
+            if item in fillers:
+                values["status"] = "FAILED"
+            session.execute(
+                update(BacklogDecomposition)
+                .where(BacklogDecomposition.id == UUID(item["id"]))
+                .values(**values)
+            )
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    assert _part(harness, second, 2)["continued_from"]["decomposition_id"] == first["id"]
+
+
+def test_the_files_come_from_the_winning_pin(tmp_path: Path) -> None:
+    """Finding 3: an overlapping activity attempt pinned an older source first; the
+    attempt that selected the newer one stages the winner, matching continued_from."""
+    harness = PlanHarness(tmp_path)
+    older = _unresolved_run(harness)
+    newer = _unresolved_run(harness)
+    second = harness.create()
+    part_id = next(
+        key
+        for key, entry in _parts(harness, older["id"])["parts"].items()
+        if entry.get("number") == 2
+    )
+    source = harness.repository.previous_unresolved_sync(UUID(newer["id"]), PROJECT, part_id)
+    assert source is not None and source["decomposition_id"] == older["id"]
+    repository = harness.repository
+    read = repository.pinned_continuation_sync
+    calls = {"n": 0}
+
+    def racing(decomposition_id: UUID, wanted: str) -> tuple[bool, dict[str, Any] | None]:
+        if str(decomposition_id) == second["id"] and wanted == part_id and calls["n"] == 0:
+            calls["n"] += 1
+            # Read before the other attempt pinned; that attempt pins `older` now.
+            repository.pin_continuation_sync(UUID(second["id"]), part_id, "epic", 2, source)
+            return False, None
+        return read(decomposition_id, wanted)
+
+    repository.pinned_continuation_sync = racing  # type: ignore[method-assign]
+    harness.requests.clear()
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    assert calls["n"] == 1
+    assert _part(harness, second, 2)["continued_from"]["decomposition_id"] == older["id"]
+    [review] = _run_prompts(harness, "codex")
+    assert f"previous run {older['id'][:8]}" in review
+    assert f"previous run {newer['id'][:8]}" not in review
