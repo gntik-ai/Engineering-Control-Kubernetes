@@ -81,7 +81,7 @@ def _with_terminal_refusal(
 ) -> list[dict[str, Any]]:
     """The part's stored rejections, plus the provider schema refusal that ended it when
     the plan stopped on it: a plan that ended before that refusal was recorded as a
-    rejection (_record_final_refusal) keeps it only in its terminal blockers."""
+    terminal rejection (_record_final_refusal) keeps it only in its terminal blockers."""
     rejections = copy.deepcopy(list(entry.get("rejections") or []))
     blockers = [str(item) for item in row.blockers_json or []]
     match = FINAL_REFUSAL.fullmatch(blockers[0]) if blockers else None
@@ -92,12 +92,9 @@ def _with_terminal_refusal(
         + [int(item.get("attempt") or 0) for item in entry.get("versions") or []]
         + [int(item.get("attempt") or 0) for item in rejections]
     )
-    terminal = {"attempt": attempt, "code": "DRAFT_SCHEMA_INVALID", "details": blockers[1:50]}
-    if any(
-        item.get("code") == terminal["code"] and item.get("details") == terminal["details"]
-        for item in rejections
-    ):
+    if any(item.get("terminal") is True for item in rejections):
         return rejections  # recorded by _record_final_refusal
+    terminal = {"attempt": attempt, "code": "DRAFT_SCHEMA_INVALID", "details": blockers[1:50]}
     return [*rejections, terminal]
 
 
@@ -1083,9 +1080,12 @@ class BacklogDecompositionRepository:
         attempt: int,
         code: str,
         details: list[Any],
+        *,
+        terminal: bool = False,
     ) -> None:
         """A Hermes rejection of a part draft (or of the assembled plan, for its owning
-        part), kept for every later redraft and re-review of the part."""
+        part), kept for every later redraft and re-review of the part; `terminal` marks
+        the provider schema refusal that ended the part (see _with_terminal_refusal)."""
         with self.sessions.begin() as session:
             row = self._locked(session, decomposition_id)
             if row.status != "DRAFTING":
@@ -1094,7 +1094,14 @@ class BacklogDecompositionRepository:
             entry = self._part_entry(parts, part_id, kind, number)
             entry["rejections"] = [
                 item for item in entry["rejections"] if item.get("attempt") != attempt
-            ] + [{"attempt": attempt, "code": code[:80], "details": list(details)[:50]}]
+            ] + [
+                {
+                    "attempt": attempt,
+                    "code": code[:80],
+                    "details": list(details)[:50],
+                    **({"terminal": True} if terminal else {}),
+                }
+            ]
             row.parts_json = parts
 
     def mark_part_reviewed_sync(

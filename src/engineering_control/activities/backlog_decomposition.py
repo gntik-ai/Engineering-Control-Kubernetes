@@ -79,6 +79,7 @@ from engineering_control.engineering.ui_blueprint import AGENT_PACK_SKILL_MISSIN
 from engineering_control.engineering.ui_blueprint_parts import PART_TIMEOUT_SECONDS, usage_entry
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
+from engineering_control.security.redaction import SecretRedactor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -98,6 +99,8 @@ _PROVIDER_RESULT_KEYS = frozenset(
     }
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
+# An earlier draft whose staged continuation the redaction would change: drafted fresh.
+CONTINUATION_NOT_STAGEABLE = "DECOMPOSITION_CONTINUATION_NOT_STAGEABLE"
 # What a continuation pin (continued_from) names.
 _PIN_KEYS = ("decomposition_id", "attempt", "content_sha256")
 # Carried between two steps but never into the next request.
@@ -557,7 +560,8 @@ class DecompositionActivityHandler:
     def _previous_files(self, part_id: str, kind: str, previous: dict[str, Any]) -> dict[str, str]:
         """The staged files of an earlier plan's unresolved part: its last reviewed draft
         and every finding of that plan on it (all rounds, all rejections), complete and
-        hash-bound with the draft; the prompts' lists are bounded."""
+        hash-bound with the draft; the prompts' lists are bounded. Text the scan boundary's
+        redaction would change (its hash check would block the run) is not staged."""
         prior, _omitted = plan_review.cumulative_findings(
             [], [], 1, self._previous_history(previous), bounded=False
         )
@@ -572,7 +576,10 @@ class DecompositionActivityHandler:
             "prior_reviews": previous["reviews"],
             "prior_rejections": previous["rejections"],
         }
-        return bounded_json_files(part_previous_name(part_id), document)
+        files = bounded_json_files(part_previous_name(part_id), document)
+        if any(SecretRedactor().redact_text(text).value != text for text in files.values()):
+            raise DecompositionSourceError(CONTINUATION_NOT_STAGEABLE)
+        return files
 
     @staticmethod
     def _previous_history(previous: dict[str, Any]) -> dict[str, Any]:
@@ -1290,6 +1297,7 @@ class DecompositionActivityHandler:
             attempt,
             "DRAFT_SCHEMA_INVALID",
             blockers[1:50],
+            terminal=True,
         )
 
     def _finalize_run(self, payload: dict[str, Any]) -> dict[str, Any]:

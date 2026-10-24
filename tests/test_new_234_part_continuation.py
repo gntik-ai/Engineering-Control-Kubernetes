@@ -382,7 +382,9 @@ def test_the_final_schema_refusal_is_kept_for_a_continuation(
     part_id = current["part_id"]
     budget = {"reviewed": 1, "rejected": 0}
     for attempt in (2, 3, 4):
-        refusal = {"code": "DRAFT_SCHEMA_INVALID", "details": [f"draft {attempt - 1} schema"]}
+        # Identical details each time (Codex round 3, finding 2): the text cannot tell
+        # the terminal refusal from an earlier one.
+        refusal = {"code": "DRAFT_SCHEMA_INVALID", "details": ["draft schema invalid"]}
         prepared = original(
             "decomposition.prepare_part",
             {
@@ -402,7 +404,7 @@ def test_the_final_schema_refusal_is_kept_for_a_continuation(
             "blocker": "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED",
             "blockers": [
                 f"part {part_id}: 3 drafts were refused before review (DRAFT_SCHEMA_INVALID)",
-                "draft 4 schema",
+                "draft schema invalid",
             ],
         },
     )
@@ -413,7 +415,8 @@ def test_the_final_schema_refusal_is_kept_for_a_continuation(
         (3, "DRAFT_SCHEMA_INVALID"),
         (4, "DRAFT_SCHEMA_INVALID"),
     ]
-    assert entry["rejections"][-1]["details"] == ["draft 4 schema"]
+    assert entry["rejections"][-1]["details"] == ["draft schema invalid"]
+    assert entry["rejections"][-1]["terminal"] is True
     if ended_before_deploy:
         parts = _parts(harness, created["id"])
         parts["parts"][part_id]["rejections"].pop()
@@ -422,8 +425,8 @@ def test_the_final_schema_refusal_is_kept_for_a_continuation(
     second = harness.create()
     assert drive(harness, second["id"])["status"] == "CANDIDATE"
     [draft] = _run_prompts(harness, "claude")
-    assert "Hermes rejection DRAFT_SCHEMA_INVALID of draft 4" in draft
-    assert draft.count("draft 4 schema") == 1
+    for attempt in (2, 3, 4):
+        assert draft.count(f"Hermes rejection DRAFT_SCHEMA_INVALID of draft {attempt}") == 1
 
 
 class _Stop(Exception):
@@ -536,3 +539,27 @@ def test_the_files_come_from_the_winning_pin(tmp_path: Path) -> None:
     [review] = _run_prompts(harness, "codex")
     assert f"previous run {older['id'][:8]}" in review
     assert f"previous run {newer['id'][:8]}" not in review
+
+
+# Review findings (Codex round 3, a161287) -----------------------------------------------
+
+
+def test_a_continuation_the_redaction_would_change_is_drafted_fresh(tmp_path: Path) -> None:
+    """Finding 1: a finding naming contract ctr-cookie is formatted as "ctr-cookie: ...",
+    which the scan boundary's redaction changes; the continuation is skipped instead of
+    staging a file whose hash check would block the whole run."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    parts = _parts(harness, first["id"])
+    for entry in parts["parts"].values():
+        for version in entry.get("versions") or []:
+            for finding in (version.get("review") or {}).get("findings") or []:
+                finding["subject"] = "ctr-cookie"
+                finding["detail"] = "Make the consumer story explicit."
+    _set_parts(harness, first["id"], parts)
+    second = harness.create()
+    harness.requests.clear()
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    assert _part(harness, second, 2).get("continued_from") is None
+    [draft] = _run_prompts(harness, "claude")
+    assert "continues an earlier plan run" not in draft
