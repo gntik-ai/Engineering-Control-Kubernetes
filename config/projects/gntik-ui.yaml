@@ -195,6 +195,13 @@ maker_rules:
       full a11y suite.
       Report those checks as SKIPPED ("browser suites run in PR CI"); unit tests, build,
       lint, typecheck, registry:check and docs-coverage still run locally.
+    - >-
+      Exception, bug reproduction only (2026-10-24, gntik-ui #104): when a defect shows only
+      in a real browser (forced colours, layout or focus rendering jsdom cannot evaluate),
+      write one focused spec under apps/docs/e2e/ and run only that file with
+      `timeout 600 pnpm --filter @gntik-ai/docs exec playwright test <file> --workers=1`,
+      red before the fix and green after; the checker may re-run that one file the same
+      way. Never run the a11y or visual suites, or more than one spec file, on the worker.
 dependencies: {}
 classification:
   product: true
