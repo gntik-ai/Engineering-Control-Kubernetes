@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -96,6 +97,12 @@ _PROVIDER_RESULT_KEYS = frozenset(
     }
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
+# The workflow's _rejections_exhausted summary when a provider schema refusal ends a part.
+REJECTIONS_EXHAUSTED = "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED"
+_FINAL_REFUSAL = re.compile(
+    r"part ((?:frame|ep([0-9]{2}))-[a-f0-9]{16}): [0-9]+ drafts were refused before review "
+    r"\(DRAFT_SCHEMA_INVALID\)"
+)
 # Carried between two steps but never into the next request.
 _TRANSIENT_KEYS = frozenset(
     {"document", "markdown", "files", "file_hashes", "inventory", "rejected_usage"}
@@ -487,7 +494,7 @@ class DecompositionActivityHandler:
         # Cross-run continuation (as NEW-142): an earlier plan's unresolved draft of this
         # exact part is staged beside its input (data only: the workflow stages and
         # hash-verifies every file, and carries the receipts as reference_files).
-        previous = self._continuation_files(decomposition_id, payload, part_id, kind)
+        previous = self._continuation_files(decomposition_id, payload, part_id, kind, number)
         if previous:
             files = {**files, **previous}
             staged["files"] = files
@@ -550,17 +557,10 @@ class DecompositionActivityHandler:
             "blockers": [],
         }
 
-    def _previous_part(
-        self, decomposition_id: UUID, payload: dict[str, Any], part_id: str, kind: str
-    ) -> tuple[dict[str, Any] | None, dict[str, str]]:
-        """(the earlier plan's unresolved part, its staged files): its last reviewed draft
+    def _previous_files(self, part_id: str, kind: str, previous: dict[str, Any]) -> dict[str, str]:
+        """The staged files of an earlier plan's unresolved part: its last reviewed draft
         and every finding of that plan on it (all rounds, all rejections), complete and
         hash-bound with the draft; the prompts' lists are bounded."""
-        previous = self.repository.previous_unresolved_sync(
-            decomposition_id, str(payload["project"]), part_id
-        )
-        if previous is None:
-            return None, {}
         prior, _omitted = plan_review.cumulative_findings(
             [], [], 1, self._previous_history(previous), bounded=False
         )
@@ -575,7 +575,7 @@ class DecompositionActivityHandler:
             "prior_reviews": previous["reviews"],
             "prior_rejections": previous["rejections"],
         }
-        return previous, bounded_json_files(part_previous_name(part_id), document)
+        return bounded_json_files(part_previous_name(part_id), document)
 
     @staticmethod
     def _previous_history(previous: dict[str, Any]) -> dict[str, Any]:
@@ -586,18 +586,32 @@ class DecompositionActivityHandler:
         }
 
     def _continuation_files(
-        self, decomposition_id: UUID, payload: dict[str, Any], part_id: str, kind: str
+        self,
+        decomposition_id: UUID,
+        payload: dict[str, Any],
+        part_id: str,
+        kind: str,
+        number: int | None,
     ) -> dict[str, str]:
-        """The files to stage for a continued part. Fails closed: an earlier draft that no
-        longer passes the current checks is ignored (the part drafts from scratch)."""
+        """The files to stage for a continued part. The source is selected once and pinned
+        in this plan (continued_from); every later step of the part reads the pin, so a
+        plan ending meanwhile never changes it. Fails closed: an earlier draft that no
+        longer passes the current checks is not selected (the part drafts from scratch)."""
+        pinned, previous = self.repository.pinned_continuation_sync(decomposition_id, part_id)
         try:
-            previous, files = self._previous_part(decomposition_id, payload, part_id, kind)
+            if not pinned:
+                previous = self.repository.previous_unresolved_sync(
+                    decomposition_id, str(payload["project"]), part_id
+                )
+                if previous is None:
+                    return {}
+                output = self._bound_output(
+                    decomposition_id, payload, part_id, kind, previous["content"]
+                )
+                self._check_draft(decomposition_id, payload, output, part_id, kind)
             if previous is None:
                 return {}
-            output = self._bound_output(
-                decomposition_id, payload, part_id, kind, previous["content"]
-            )
-            self._check_draft(decomposition_id, payload, output, part_id, kind)
+            files = self._previous_files(part_id, kind, previous)
         except (DecompositionRejected, DecompositionSourceError) as error:
             LOGGER.warning(
                 "decomposition %s part %s: no continuation: %s",
@@ -606,30 +620,44 @@ class DecompositionActivityHandler:
                 getattr(error, "code", type(error).__name__),
             )
             return {}
+        if not pinned:
+            self.repository.pin_continuation_sync(decomposition_id, part_id, kind, number, previous)
         return files
 
     def _continuation(
         self, decomposition_id: UUID, payload: dict[str, Any], part_id: str, kind: str
     ) -> dict[str, Any] | None:
-        """The continuation this part's input staged (see _prepare_part_input): the earlier
-        plan's part, rebuilt and matched against the staged receipts the workflow carries
-        (reference_files); None when nothing (or something else) was staged."""
-        receipts = payload.get("reference_files")
-        if not isinstance(receipts, dict) or not any(
-            str(name).startswith(f"part-{part_id}-previous") for name in receipts
-        ):
+        """The continuation this part pinned (see _continuation_files), re-read from the
+        database: an assembly redraft carries no staged receipts. The staged files are
+        described from the receipts when the workflow carries them (they must match),
+        else from the part input's directory, where they were staged."""
+        _pinned, previous = self.repository.pinned_continuation_sync(decomposition_id, part_id)
+        if previous is None:
             return None
         try:
-            previous, files = self._previous_part(decomposition_id, payload, part_id, kind)
+            files = self._previous_files(part_id, kind, previous)
         except DecompositionSourceError:
             return None
-        staged = [receipts.get(name) for name in files]
-        if previous is None or not all(
-            isinstance(item, dict)
-            and item.get("sha256") == hashlib.sha256(text.encode("utf-8")).hexdigest()
-            for item, text in zip(staged, files.values(), strict=True)
-        ):
-            return None
+        receipts = payload.get("reference_files")
+        inputs = self._input_files(payload)
+        directory = str((inputs[0] if inputs else {}).get("path") or "").rpartition("/")[0]
+        staged = []
+        for name, text in files.items():
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            receipt = receipts.get(name) if isinstance(receipts, dict) else None
+            if isinstance(receipts, dict) and receipts and receipt is None:
+                return None
+            if isinstance(receipt, dict) and receipt.get("sha256") != digest:
+                return None
+            staged.append(
+                receipt
+                if isinstance(receipt, dict)
+                else {
+                    "path": f"{directory}/{name}",
+                    "sha256": digest,
+                    "bytes": len(text.encode("utf-8")),
+                }
+            )
         return {
             "decomposition_id": previous["decomposition_id"],
             "attempt": previous["attempt"],
@@ -965,27 +993,7 @@ class DecompositionActivityHandler:
                 decomposition_id, part_id, kind, number, attempt, rejected.code, rejected.details
             )
             return self._rejected(base, rejected)
-        continuation = (
-            self._continuation(decomposition_id, payload, part_id, kind) if attempt == 1 else None
-        )
-        self.repository.record_part_sync(
-            decomposition_id,
-            part_id,
-            kind,
-            number,
-            attempt,
-            content,
-            # The provenance of a continued draft (backlog-decomposition-status).
-            continued_from=(
-                {
-                    "decomposition_id": continuation["decomposition_id"],
-                    "attempt": continuation["attempt"],
-                    "content_sha256": continuation["content_sha256"],
-                }
-                if continuation
-                else None
-            ),
-        )
+        self.repository.record_part_sync(decomposition_id, part_id, kind, number, attempt, content)
         return {
             **base,
             "status": "DRAFT_RECORDED",
@@ -1229,6 +1237,7 @@ class DecompositionActivityHandler:
             )
             if entry is not None:
                 self.repository.record_usage_sync(decomposition_id, entry)
+        self._record_final_refusal(decomposition_id, payload)
         result = self.repository.record_terminal_sync(
             decomposition_id,
             status,
@@ -1240,6 +1249,38 @@ class DecompositionActivityHandler:
             "project": payload.get("project"),
             **result,
         }
+
+    def _record_final_refusal(self, decomposition_id: UUID, payload: dict[str, Any]) -> None:
+        """A provider schema refusal is durable only once the next draft starts; the one
+        that exhausts the rejection budget ends the part first. Record it from the
+        terminal blockers, so a later plan continuing the part sees it."""
+        blockers = [str(item) for item in payload.get("blockers") or []]
+        match = _FINAL_REFUSAL.fullmatch(blockers[0]) if blockers else None
+        if payload.get("blocker") != REJECTIONS_EXHAUSTED or match is None:
+            return
+        part_id = match.group(1)
+        entry = self.repository.part_sync(decomposition_id, part_id) or {}
+        usage = payload.get("part_usage")
+        attempt = usage.get("attempt") if isinstance(usage, dict) else None
+        if type(attempt) is not int or (usage or {}).get("part_id") != part_id:
+            # The refused draft follows every recorded draft and rejection of the part.
+            attempt = 1 + max(
+                [0]
+                + [int(item.get("attempt") or 0) for item in entry.get("versions") or []]
+                + [int(item.get("attempt") or 0) for item in entry.get("rejections") or []]
+            )
+        if any(item.get("attempt") == attempt for item in entry.get("rejections") or []):
+            return
+        kind, number = (FRAME, None) if match.group(2) is None else (EPIC, int(match.group(2)))
+        self.repository.record_part_rejection_sync(
+            decomposition_id,
+            part_id,
+            kind,
+            number,
+            attempt,
+            "DRAFT_SCHEMA_INVALID",
+            blockers[1:50],
+        )
 
     def _finalize_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         workflow_id = str(self._orchestration(payload).get("workflow_id") or "")

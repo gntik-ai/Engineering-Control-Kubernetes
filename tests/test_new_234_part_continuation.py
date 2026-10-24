@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from new_234_plan_fixtures import PlanHarness, drive, stage_inputs
+import pytest
+from new_234_plan_fixtures import PlanHarness, draft_for, drive, stage_inputs
 from sqlalchemy import update
 
+from engineering_control.db.backlog_decompositions import REUSE_SEARCH
 from engineering_control.db.models import BacklogDecomposition
 from engineering_control.engineering.decomposition import part_content_sha256
 from engineering_control.engineering.decomposition_inventory import (
@@ -226,21 +229,44 @@ def test_an_earlier_draft_failing_the_current_checks_is_not_continued(tmp_path: 
     assert "continues an earlier plan run" not in _run_prompts(harness, "claude")[0]
 
 
-def test_a_continuation_needs_its_staged_receipts(tmp_path: Path) -> None:
-    """A draft step whose payload does not carry the staged file (an in-flight plan whose
-    part input predates the change), or carries another file, drafts from scratch."""
-    harness = PlanHarness(tmp_path)
-    first = _unresolved_run(harness)
-    second = harness.create()
+def _capture(harness: PlanHarness, name: str) -> tuple[list[dict[str, Any]], Any]:
+    """Record the payloads of step `name` for the RUN epic; returns (seen, original step)."""
     seen: list[dict[str, Any]] = []
     original = harness.step
 
-    def step(name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if name == "decomposition.prepare_part" and _run_epic(payload):
+    def step(called: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if called == name and _run_epic(payload):
             seen.append(copy.deepcopy(payload))
-        return original(name, payload)
+        return original(called, payload)
 
     harness.step = step  # type: ignore[method-assign]
+    return seen, original
+
+
+def _set_parts(harness: PlanHarness, identity: str, parts: dict[str, Any]) -> None:
+    with harness.repository.sessions.begin() as session:
+        session.execute(
+            update(BacklogDecomposition)
+            .where(BacklogDecomposition.id == UUID(identity))
+            .values(parts_json=parts)
+        )
+
+
+def _parts(harness: PlanHarness, identity: str) -> dict[str, Any]:
+    with harness.repository.sessions() as session:
+        row = session.get(BacklogDecomposition, UUID(identity))
+        assert row is not None
+        return copy.deepcopy(row.parts_json)
+
+
+def test_a_continuation_is_used_only_as_pinned_and_staged(tmp_path: Path) -> None:
+    """A draft step carrying a staged file that differs from the pinned source, or a part
+    that pinned nothing (an in-flight plan whose part input predates the change), drafts
+    from scratch."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    second = harness.create()
+    seen, original = _capture(harness, "decomposition.prepare_part")
     drive(harness, second["id"])
     harness.step = original  # type: ignore[method-assign]
     payload = seen[0]
@@ -250,10 +276,187 @@ def test_a_continuation_needs_its_staged_receipts(tmp_path: Path) -> None:
         "continues an earlier plan run"
         in original("decomposition.prepare_part", payload)["draft_request"]["prompt"]
     )
-    without = {**payload, "reference_files": {}}
     tampered = copy.deepcopy(payload)
     tampered["reference_files"][name]["sha256"] = "0" * 64
-    for variant in (without, tampered):
-        prompt = original("decomposition.prepare_part", variant)["draft_request"]["prompt"]
+    parts = _parts(harness, second["id"])
+    parts["parts"][payload["part_id"]].pop("continued_from")
+    prompts = [original("decomposition.prepare_part", tampered)["draft_request"]["prompt"]]
+    _set_parts(harness, second["id"], parts)
+    prompts.append(original("decomposition.prepare_part", payload)["draft_request"]["prompt"])
+    for prompt in prompts:
         assert "continues an earlier plan run" not in prompt
         assert f"previous run {first['id'][:8]}" not in prompt
+
+
+# Review findings (Codex, ae4c70c) ---------------------------------------------------------
+
+
+def test_an_assembly_redraft_keeps_the_previous_runs_findings(tmp_path: Path) -> None:
+    """Finding 1: the workflow's assembly redraft carries no staged receipts; the pinned
+    continuation is re-read from the database for the redraft and its review."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    second = harness.create()
+    seen, original = _capture(harness, "decomposition.prepare_part_review")
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    harness.step = original  # type: ignore[method-assign]
+    reviewed = seen[0]
+    # As BacklogDecompositionPlanWorkflow's assembly redraft builds it: no reference_files.
+    redraft = {
+        key: value
+        for key, value in reviewed.items()
+        if key not in {"reference_files", "draft_file", "draft_sha256", "status"}
+    }
+    redraft["rejection"] = {"code": "ASSEMBLY_INVALID", "details": ["RUN-01.t1 depends on x"]}
+    label = f"previous run {first['id'][:8]}, round 3 (review of draft 3)"
+    prepared = original("decomposition.prepare_part", {**redraft, "draft_attempt": 2})
+    assert label in prepared["draft_request"]["prompt"]
+    review = original(
+        "decomposition.prepare_part_review",
+        {**redraft, "draft_attempt": 2, "draft_sha256": "1" * 64, "draft_file": {"path": "d"}},
+    )
+    assert label in review["review_request"]["prompt"]
+
+
+def test_the_pinned_source_survives_an_older_plan_ending_later(tmp_path: Path) -> None:
+    """Finding 2: the source selected when the input is staged is pinned; a plan that
+    ends meanwhile (and would now be the latest eligible one) does not replace it."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    middle = harness.create()
+
+    def decide(payload: dict[str, Any], attempt: int) -> str:
+        return "REVISE" if _run_epic(payload) else "APPROVE"
+
+    middle_result = drive(harness, middle["id"], decide=decide)  # still DRAFTING
+    second = harness.create()
+    seen, original = _capture(harness, "decomposition.prepare_part")
+
+    def step(called: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if called == "decomposition.prepare_part" and _run_epic(payload) and not seen:
+            _end(harness, middle, middle_result)
+        return original(called, payload)
+
+    harness.step = step  # type: ignore[method-assign]
+    harness.requests.clear()
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    harness.step = original  # type: ignore[method-assign]
+    run = _part(harness, second, 2)
+    assert run["continued_from"]["decomposition_id"] == first["id"]
+    [draft] = _run_prompts(harness, "claude")
+    assert f"decomposition {first['id']}" in draft
+    [review] = _run_prompts(harness, "codex")
+    assert f"previous run {first['id'][:8]}" in review
+    assert f"previous run {middle['id'][:8]}" not in review
+
+
+def test_the_final_schema_refusal_is_kept_for_a_continuation(tmp_path: Path) -> None:
+    """Finding 3: REVISE on draft 1, schema refusals of drafts 2-4; the last refusal ends
+    the part before any next draft records it, so record_terminal records it."""
+    harness = PlanHarness(tmp_path)
+    created = harness.create()
+
+    def decide(payload: dict[str, Any], attempt: int) -> str:
+        return "REVISE" if _run_epic(payload) else "APPROVE"
+
+    original = harness.step
+
+    def step(called: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # Stop where the workflow would prepare draft 2 (after the REVISE of draft 1).
+        if called == "decomposition.prepare_part" and _run_epic(payload):
+            if payload["draft_attempt"] == 2:
+                raise _Stop(payload)
+        return original(called, payload)
+
+    harness.step = step  # type: ignore[method-assign]
+    with pytest.raises(_Stop) as stopped:
+        drive(harness, created["id"], decide=decide)
+    current = {key: value for key, value in stopped.value.payload.items() if key != "draft_attempt"}
+    harness.step = original  # type: ignore[method-assign]
+    part_id = current["part_id"]
+    budget = {"reviewed": 1, "rejected": 0}
+    for attempt in (2, 3, 4):
+        refusal = {"code": "DRAFT_SCHEMA_INVALID", "details": [f"draft {attempt - 1} schema"]}
+        prepared = original(
+            "decomposition.prepare_part",
+            {
+                **current,
+                "draft_attempt": attempt,
+                "part_budget": budget,
+                **({"rejection": refusal} if attempt > 2 else {}),
+            },
+        )
+        assert prepared["status"] == "DRAFT_READY", prepared
+        budget = {**budget, "rejected": budget["rejected"] + (attempt > 2)}
+    # The workflow's _rejections_exhausted and _part_terminal for draft 4.
+    _end(
+        harness,
+        created,
+        {
+            "blocker": "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED",
+            "blockers": [
+                f"part {part_id}: 3 drafts were refused before review (DRAFT_SCHEMA_INVALID)",
+                "draft 4 schema",
+            ],
+        },
+    )
+    entry = harness.repository.part_sync(UUID(created["id"]), part_id)
+    assert entry is not None
+    assert [(item["attempt"], item["code"]) for item in entry["rejections"]] == [
+        (2, "DRAFT_SCHEMA_INVALID"),
+        (3, "DRAFT_SCHEMA_INVALID"),
+        (4, "DRAFT_SCHEMA_INVALID"),
+    ]
+    assert entry["rejections"][-1]["details"] == ["draft 4 schema"]
+    harness.requests.clear()
+    second = harness.create()
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    [draft] = _run_prompts(harness, "claude")
+    assert "Hermes rejection DRAFT_SCHEMA_INVALID of draft 4" in draft
+    assert "draft 4 schema" in draft
+
+
+class _Stop(Exception):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__("stop")
+        self.payload = payload
+
+
+def test_plans_that_never_drafted_the_part_do_not_hide_an_older_one(tmp_path: Path) -> None:
+    """Finding 4: more than REUSE_SEARCH newer ended plans without the part."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    fillers = [harness.create() for _ in range(REUSE_SEARCH + 5)]
+    second = harness.create()
+    with harness.repository.sessions.begin() as session:
+        for offset, item in enumerate([first, *fillers, second]):
+            values: dict[str, Any] = {"created_at": base + timedelta(minutes=offset)}
+            if item in fillers:
+                values["status"] = "FAILED"
+            session.execute(
+                update(BacklogDecomposition)
+                .where(BacklogDecomposition.id == UUID(item["id"]))
+                .values(**values)
+            )
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    assert _part(harness, second, 2)["continued_from"]["decomposition_id"] == first["id"]
+
+
+def test_continued_from_is_recorded_when_the_continued_draft_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Finding 5: the provenance is pinned when the continuation is selected."""
+    harness = PlanHarness(tmp_path)
+    first = _unresolved_run(harness)
+    second = harness.create()
+
+    def draft(payload: dict[str, Any], attempt: int) -> Any:
+        value = draft_for(payload)
+        if _run_epic(payload):
+            value["inputs"]["design_sha256"] = "0" * 64  # bound to another design
+        return value
+
+    result = drive(harness, second["id"], draft=draft)
+    assert result["blocker"] == "DRAFT_BINDING_MISMATCH", result
+    assert _part(harness, second, 2)["continued_from"]["decomposition_id"] == first["id"]
