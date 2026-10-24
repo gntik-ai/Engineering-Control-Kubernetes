@@ -18,6 +18,7 @@ import pytest
 from new_234_plan_fixtures import PlanHarness, draft_for, drive, stage_inputs
 from sqlalchemy import update
 
+from engineering_control.activities import backlog_decomposition as decomposition_activities
 from engineering_control.db import backlog_decompositions as decompositions_db
 from engineering_control.db.backlog_decompositions import REUSE_SEARCH
 from engineering_control.db.models import BacklogDecomposition
@@ -557,6 +558,26 @@ def test_a_continuation_the_redaction_would_change_is_drafted_fresh(tmp_path: Pa
                 finding["subject"] = "ctr-cookie"
                 finding["detail"] = "Make the consumer story explicit."
     _set_parts(harness, first["id"], parts)
+    second = harness.create()
+    harness.requests.clear()
+    assert drive(harness, second["id"])["status"] == "CANDIDATE"
+    assert _part(harness, second, 2).get("continued_from") is None
+    [draft] = _run_prompts(harness, "claude")
+    assert "continues an earlier plan run" not in draft
+
+
+# Review findings (Codex round 4, 0226148) -----------------------------------------------
+
+
+def test_a_continuation_too_large_for_the_activity_result_is_drafted_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 1: every staged file is bounded, but all of them travel in one activity
+    result, which Temporal refuses over 2 MiB; a continuation that would not fit is
+    skipped and nothing is pinned."""
+    monkeypatch.setattr(decomposition_activities, "CONTINUATION_RESULT_LIMIT", 1)
+    harness = PlanHarness(tmp_path)
+    _unresolved_run(harness)
     second = harness.create()
     harness.requests.clear()
     assert drive(harness, second["id"])["status"] == "CANDIDATE"

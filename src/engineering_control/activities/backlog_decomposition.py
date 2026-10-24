@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -83,6 +84,18 @@ from engineering_control.security.redaction import SecretRedactor
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _json_bytes(value: Any) -> int:
+    return len(json.dumps(value, default=str).encode("utf-8"))
+
+
+def _check_fits(staged_bytes: int, files: dict[str, str]) -> None:
+    """The continuation files are returned with the staged input (their hashes are small):
+    staged_bytes plus their serialized size must stay within the limit."""
+    if staged_bytes + _json_bytes(files) > CONTINUATION_RESULT_LIMIT:
+        raise DecompositionSourceError(CONTINUATION_NOT_STAGEABLE, ["result too large"])
+
+
 BUDGET_EXHAUSTED = "DECOMPOSITION_BUDGET_EXHAUSTED"
 EPIC_UNKNOWN = "DECOMPOSITION_EPIC_UNKNOWN"
 INVENTORY_MISMATCH = "DECOMPOSITION_INVENTORY_MISMATCH"
@@ -99,8 +112,10 @@ _PROVIDER_RESULT_KEYS = frozenset(
     }
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
-# An earlier draft whose staged continuation the redaction would change: drafted fresh.
+# An earlier draft whose staged continuation the redaction would change, or that would
+# not fit the activity result (Temporal refuses payloads over 2 MiB): drafted fresh.
 CONTINUATION_NOT_STAGEABLE = "DECOMPOSITION_CONTINUATION_NOT_STAGEABLE"
+CONTINUATION_RESULT_LIMIT = 1_500_000
 # What a continuation pin (continued_from) names.
 _PIN_KEYS = ("decomposition_id", "attempt", "content_sha256")
 # Carried between two steps but never into the next request.
@@ -494,7 +509,9 @@ class DecompositionActivityHandler:
         # Cross-run continuation (as NEW-142): an earlier plan's unresolved draft of this
         # exact part is staged beside its input (data only: the workflow stages and
         # hash-verifies every file, and carries the receipts as reference_files).
-        previous = self._continuation_files(decomposition_id, payload, part_id, kind, number)
+        previous = self._continuation_files(
+            decomposition_id, payload, part_id, kind, number, _json_bytes(staged)
+        )
         if previous:
             files = {**files, **previous}
             staged["files"] = files
@@ -596,8 +613,11 @@ class DecompositionActivityHandler:
         part_id: str,
         kind: str,
         number: int | None,
+        staged_bytes: int,
     ) -> dict[str, str]:
-        """The files to stage for a continued part. The source is selected once and pinned
+        """The files to stage for a continued part, when the activity result carrying them
+        beside the `staged_bytes` input still fits CONTINUATION_RESULT_LIMIT. The source is
+        selected once and pinned
         in this plan (continued_from); every later step of the part reads the pin, so a
         plan ending meanwhile never changes it. Fails closed: an earlier draft that no
         longer passes the current checks is not selected (the part drafts from scratch)."""
@@ -616,6 +636,7 @@ class DecompositionActivityHandler:
             if previous is None:
                 return {}
             files = self._previous_files(part_id, kind, previous)
+            _check_fits(staged_bytes, files)
         except (DecompositionRejected, DecompositionSourceError) as error:
             LOGGER.warning(
                 "decomposition %s part %s: no continuation: %s",
@@ -637,6 +658,7 @@ class DecompositionActivityHandler:
                     return {}
                 try:
                     files = self._previous_files(part_id, kind, previous)
+                    _check_fits(staged_bytes, files)
                 except DecompositionSourceError:
                     return {}
         return files
