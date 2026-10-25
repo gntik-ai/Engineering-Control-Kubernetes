@@ -78,7 +78,7 @@ _DEPENDS = re.compile(r"^\s*[-*]?\s*Depends on:\s*(.*?)\s*$", re.IGNORECASE)
 _NO_DEPENDENCY = frozenset({"", "none", "-", "n/a"})
 _ADR_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.md$")
 _STAGED_NAME = re.compile(
-    r"^part-(?:frame|ep[0-9]{2})-[a-f0-9]{16}-(?:input|brief|draft-[1-5]|review-[1-5])"
+    r"^part-(?:frame|ep[0-9]{2})-[a-f0-9]{16}-(?:input|brief|previous|draft-[1-5]|review-[1-5])"
     r"(?:_[0-9]{2}-of-[0-9]{2})?\.json$"
     r"|^reference-[a-z0-9][a-z0-9.-]{0,90}(?:_[0-9]{2}-of-[0-9]{2})?\.md$"
 )
@@ -1067,6 +1067,13 @@ def part_input_name(part: str) -> str:
     if PART_ID.fullmatch(part) is None:
         raise ValueError("decomposition part id is invalid")
     return f"part-{part}-input.json"
+
+
+def part_previous_name(part: str) -> str:
+    """The staged file of an earlier plan's unresolved draft a part continues."""
+    if PART_ID.fullmatch(part) is None:
+        raise ValueError("decomposition part id is invalid")
+    return f"part-{part}-previous.json"
 
 
 def reference_name(path: str) -> str:

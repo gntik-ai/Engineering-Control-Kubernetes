@@ -78,6 +78,13 @@ MAX_PROVIDER_CALLS = 90
 MAX_INPUT_BYTES = 64 * 1024
 MAX_REVIEW_CHARACTERS = 40_000
 MAX_PROBLEMS = 50
+# The workflow's _rejections_exhausted summary when a provider schema refusal ends a part:
+# its first blocker names the part, and that last refusal is not yet a stored rejection.
+REJECTIONS_EXHAUSTED = "DECOMPOSITION_PART_REJECTIONS_EXHAUSTED"
+FINAL_REFUSAL = re.compile(
+    r"part ((?:frame|ep([0-9]{2}))-[a-f0-9]{16}): [0-9]+ drafts were refused before review "
+    r"\(DRAFT_SCHEMA_INVALID\)"
+)
 
 SOURCE_REPOSITORY: Final = project_repositories(PROJECT)[0]
 REPOSITORY_FALCONE: Final = "gntik-ai/falcone"
