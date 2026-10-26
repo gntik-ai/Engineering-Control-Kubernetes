@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,14 @@ STAGING_GITOPS_MARKER = re.compile(
     r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
 )
 _SAFE_PULL_REQUEST_TITLE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'()-]{1,240}$")
+# NEW-237: GitHub's GraphQL gateway times out now and then on large statusCheckRollup
+# reads (HTTP 504). A read is safe to repeat, so these few server errors retry. All
+# attempts and backoffs share one budget: the staging pr_checks step heartbeats only on
+# entry (2-minute timeout) and its log reads may run until about 90 s after it.
+_TRANSIENT_GITHUB_ERROR = re.compile(r"\bHTTP 50[234]\b")
+_READ_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_READ_BUDGET_SECONDS = 45.0
+_READ_MINIMUM_ATTEMPT_SECONDS = 10.0
 
 
 class GhCliAuthError(RuntimeError):
@@ -296,7 +305,7 @@ class GhCliBroker:
         if number < 1:
             raise GhCliPolicyError("pull request number is invalid")
         value = self._json(
-            self._run(
+            self._run_read(
                 [
                     "pr",
                     "view",
@@ -1610,13 +1619,32 @@ class GhCliBroker:
                 "gh",
                 arguments,
                 cwd=self.working_directory,
-                timeout_seconds=120,
+                timeout_seconds=timeout_seconds,
                 environment=environment,
             )
         except CommandFailure as error:
             if check_auth or arguments[:2] == ["api", "user"]:
                 raise GhCliAuthError("GitHub CLI authentication is unavailable") from error
             raise
+
+    def _run_read(self, arguments: list[str]) -> CommandResult:
+        """Run a read-only command, repeating it after a transient GitHub server error.
+
+        Every attempt and backoff fits in one _READ_BUDGET_SECONDS budget: each attempt's
+        timeout is the time left, and a retry starts only if its backoff still leaves
+        _READ_MINIMUM_ATTEMPT_SECONDS for the attempt."""
+        deadline = time.monotonic() + _READ_BUDGET_SECONDS
+        for delay in (*_READ_RETRY_DELAYS_SECONDS, None):
+            remaining = deadline - time.monotonic()
+            try:
+                return self._run(arguments, timeout_seconds=max(1, int(remaining)))
+            except CommandFailure as error:
+                if delay is None or not _TRANSIENT_GITHUB_ERROR.search(str(error)):
+                    raise
+                if deadline - time.monotonic() < delay + _READ_MINIMUM_ATTEMPT_SECONDS:
+                    raise
+            time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _run_with_environment(self, arguments: list[str], extra: dict[str, str]) -> CommandResult:
         environment = {
