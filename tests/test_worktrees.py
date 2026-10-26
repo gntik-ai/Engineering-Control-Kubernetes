@@ -293,6 +293,25 @@ def test_whitespace_check_treats_git_warnings_on_a_clean_exit_as_clean(
     assert "--no-renames" not in seen[0]
 
 
+def test_whitespace_check_reports_problems_despite_git_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-236: falcone #1243 (2026-10-26) failed closed on exit 2 with warnings only.
+    manager, worktree, sha = _whitespace_allocation(tmp_path)
+    real_run = subprocess.run
+    warning = b"warning: in the working copy of 'a', LF will be replaced by CRLF\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        if "--check" in args:
+            return subprocess.CompletedProcess(
+                args, 2, b"a:1: trailing whitespace.\n", warning + warning
+            )
+        return real_run(args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    assert manager.whitespace_check_failed(worktree, base_sha=sha) is True
+
+
 def test_whitespace_check_failure_names_the_output_shape_not_its_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
