@@ -1057,10 +1057,11 @@ class GitWorktreeManager:
         Whitespace errors are the maker's to fix in a correction round, not a policy
         violation (gntik-ui #16: a generated snapshot kept rendered trailing spaces).
         The output is never parsed or returned: Git prints file names and offending
-        lines verbatim. Exit 2 with silent stderr is Git's "problems found" result;
-        anything else (errors, unexpected output) fails closed. Exit 0 with only
-        `warning:` lines on stderr is clean: Git warns there without failing (falcone
-        #1223 and gntik-ui #247, 2026-10-22, failed closed on such a result). The
+        lines verbatim. Exit 2 with output is Git's "problems found" result;
+        anything else (errors, unexpected output) fails closed. Only `warning:` lines
+        on stderr never change the verdict: Git warns there without failing (falcone
+        #1223 and gntik-ui #247, 2026-10-22, failed closed on a clean exit with
+        warnings; NEW-236, falcone #1243, 2026-10-26, on exit 2 with warnings). The
         failure message names only the shape of the output, never its text.
         """
         root = self.worktree_root.resolve()
@@ -1086,7 +1087,7 @@ class GitWorktreeManager:
         )
         if result.returncode == 0 and not result.stdout and _only_git_warnings(result.stderr):
             return False
-        if result.returncode == 2 and result.stdout and not result.stderr:
+        if result.returncode == 2 and result.stdout and _only_git_warnings(result.stderr):
             return True
         raise WorktreeError(
             f"unexpected git diff --check result ({result.returncode}; "
