@@ -179,6 +179,24 @@ def test_a_revise_redrafts_the_part_with_every_earlier_finding(tmp_path: Path) -
     assert any("This is the review of draft 3 of this part" in text for text in reviews)
 
 
+def test_every_draft_and_review_prompt_says_design_sha256_is_the_composite_hash(
+    tmp_path: Path,
+) -> None:
+    # NEW-239: reviewers BLOCKED three live plans by comparing design_sha256 with the hash of
+    # docs/falcone-serverless-design.md alone.
+    harness = PlanHarness(tmp_path)
+    created = harness.create()
+    result = drive(harness, created["id"])
+    assert result["status"] == "CANDIDATE", result
+    assert {item["provider"] for item in harness.requests} == {"claude", "codex"}
+    for item in harness.requests:
+        prompt = item["prompt"]
+        binding = prompt.index(f"inputs.design_sha256 = {inventory()['design_sha256']}")
+        rule = prompt.index(activities._DESIGN_HASH_RULE)
+        assert binding < rule
+    assert "not the SHA256 of docs/falcone-serverless-design.md" in activities._DESIGN_HASH_RULE
+
+
 def test_three_revisions_leave_the_part_unresolved(tmp_path: Path) -> None:
     harness = PlanHarness(tmp_path)
     created = harness.create()
