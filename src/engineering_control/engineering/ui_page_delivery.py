@@ -9,8 +9,8 @@ review-ui-page). Every other delivery is unchanged.
 
 Everything here is pure and deterministic: the page context the delivery carries, the
 bounded legacy drift of the page's closure since the blueprint's source commit (git output
-in, text out), the bounded kit snapshot excerpt, the maker and checker input section (under
-24 KiB, the AGENTS.md bound per model input) and the mapping of both skills' released
+in, text out), the bounded kit snapshot excerpt, the maker and checker input section (at
+most INPUT_BUDGET, 48 KiB: an operator exception to AGENTS.md's 24 KiB, NEW-238) and the mapping of both skills' released
 outputs to the delivery maker result and checker verdict the workflow consumes.
 """
 
