@@ -9,9 +9,10 @@ review-ui-page). Every other delivery is unchanged.
 
 Everything here is pure and deterministic: the page context the delivery carries, the
 bounded legacy drift of the page's closure since the blueprint's source commit (git output
-in, text out), the bounded kit snapshot excerpt, the maker and checker input section (under
-24 KiB, the AGENTS.md bound per model input) and the mapping of both skills' released
-outputs to the delivery maker result and checker verdict the workflow consumes.
+in, text out), the bounded kit snapshot excerpt, the maker and checker input section (at
+most INPUT_BUDGET, 48 KiB: an operator exception to AGENTS.md's 24 KiB, NEW-238) and the
+mapping of both skills' released outputs to the delivery maker result and checker verdict
+the workflow consumes.
 """
 
 from __future__ import annotations
@@ -76,8 +77,13 @@ CHANGED_FILES_SHOWN = 60
 # exceed AGENTS.md's usual 24 KiB (32 KiB), and maker and checker share one spec limit,
 # so a spec the maker can build is never too large to review (falcone #1215 was 15158
 # bytes fenced, #1223 17934: both blocked under the old 16/12 KiB limits).
-INPUT_BUDGET = 32_768
-SPEC_LIMIT = {"maker": 20_480, "checker": 20_480}
+# NEW-238 (operator decision 2026-10-27): falcone #1239 (login-page) was 28555 bytes
+# fenced, and 24 of blueprint 57f536f4's 50 migrated pages exceed 20 KiB (the largest,
+# console-storage-page, about 32 KiB). The spec limit is 36 KiB and the section 48 KiB, so
+# a page at the spec limit still fits the kit excerpt and the maker's evidence, with the
+# drift cut to the rest.
+INPUT_BUDGET = 49_152
+SPEC_LIMIT = {"maker": 36_864, "checker": 36_864}
 KIT_BUDGET = 3_584
 DRIFT_BUDGET = 5_120
 EVIDENCE_BUDGET = 4_096
