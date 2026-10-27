@@ -39,6 +39,7 @@ from engineering_control.engineering.decomposition_inventory import (
     IssueSnapshot,
     acceptance_criteria,
     body_dependencies,
+    bounded_json_files,
     build_inventory,
     design_sections,
     epic_input,
@@ -47,6 +48,7 @@ from engineering_control.engineering.decomposition_inventory import (
     inventory_sha256,
     part_input_name,
     read_sources,
+    reassemble_pieces,
     reference_files,
     stage_files,
 )
@@ -461,13 +463,24 @@ def test_the_real_documentation_fits_every_part_input(tmp_path: Path) -> None:
         for item in items
     ]
     real = build_inventory(source_sha=sha, files=sources, issues=snapshot)
-    assert len(real["epics"]) == 14 and len(real["stories"]) == 42
+    # The mirror follows main, so the counts come from its backlog.json: ADR 0010 (OCI
+    # mode and base catalog, 2026-10-27) took the backlog from 14 epics and 42 stories to
+    # 16 and 58.
+    epics = sum(1 for item in items if item["type"] == "epic")
+    assert len(real["epics"]) == epics and len(real["stories"]) == len(items) - epics
     assert all(len(story["acceptance_criteria"]) >= 1 for story in real["stories"])
-    assert len(input_text(frame_input(real)).encode()) <= MAX_INPUT_BYTES
-    for epic in real["epics"]:
-        text = input_text(epic_input(real, epic["number"], frame=frame(), frame_sha256=FRAME_SHA))
-        assert len(text.encode()) <= MAX_INPUT_BYTES
-    assert sorted(epic_order(real)) == list(range(1, 15))
+    # A part input larger than MAX_INPUT_BYTES is staged as bounded pieces (as the
+    # decomposition activity does); the real frame no longer fits one file since ADR 0010.
+    documents = [frame_input(real)] + [
+        epic_input(real, epic["number"], frame=frame(), frame_sha256=FRAME_SHA)
+        for epic in real["epics"]
+    ]
+    for document in documents:
+        files = bounded_json_files("part-frame-0123456789abcdef-input.json", document)
+        assert all(len(text.encode()) <= MAX_INPUT_BYTES for text in files.values())
+        if len(files) > 1:
+            assert reassemble_pieces([json.loads(text) for text in files.values()]) == document
+    assert sorted(epic_order(real)) == list(range(1, epics + 1))
 
 
 def test_a_parent_swapped_for_a_symlink_after_opening_is_never_followed(
