@@ -543,7 +543,7 @@ def _large_page() -> tuple[dict[str, Any], dict[str, Any]]:
             "endpoint_refs": [],
             "permission": "SA",
         }
-        for n in range(46)
+        for n in range(90)
     ]
     ui_page = {**_ui_page(), "page_sha256": canonical_sha256(large["pages"][0])}
     return large, ui_page
@@ -627,6 +627,24 @@ def test_a_spec_the_maker_can_build_is_never_too_large_for_the_checker() -> None
     for role, result in (("maker", None), ("checker", {})):
         section = input_section(
             view, large_page, _inputs(), role=role, fence=_untrusted_block, maker_result=result
+        )
+        assert spec in section
+        assert len(section.encode("utf-8")) <= INPUT_BUDGET
+
+
+def test_a_login_sized_spec_fits_both_roles_within_the_budget() -> None:
+    # NEW-238 (falcone #1239, 2026-10-27): the login-page spec was 28555 bytes fenced and
+    # BLOCKed UI_PAGE_SPEC_TOO_LARGE under the 20 KiB limit; 24 of 50 pages exceeded it.
+    assert SPEC_LIMIT["maker"] >= 32_768
+    page, ui_page = _large_page()
+    page["pages"][0]["behaviour"]["actions"] = page["pages"][0]["behaviour"]["actions"][:70]
+    ui_page = {**ui_page, "page_sha256": canonical_sha256(page["pages"][0])}
+    view = page_view(page, ui_page)
+    spec = json.dumps(view["page"], sort_keys=True, separators=(",", ":"))
+    assert len(spec.encode("utf-8")) > 26_000
+    for role, result in (("maker", None), ("checker", {})):
+        section = input_section(
+            view, ui_page, _inputs(), role=role, fence=_untrusted_block, maker_result=result
         )
         assert spec in section
         assert len(section.encode("utf-8")) <= INPUT_BUDGET
