@@ -4103,8 +4103,13 @@ class MetadataActivityHandler:
         prompt = (
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
-            "repository tests, then create one local commit on the assigned branch. Preserve all "
-            "existing safety gates.\n"
+            "repository tests, then commit your work locally on the assigned branch: one commit "
+            "or more. Correct a mistake in your own commit, such as an unrelated file or "
+            "snapshot it touched, with a further commit; never rewrite, amend or squash. "
+            "Preserve all existing safety gates.\n"
+            # NEW-240: "create one local commit" read as exactly one: gntik-ui #112's maker
+            # stopped (SOURCE_MAKER_DID_NOT_COMPLETE) instead of committing the restore of
+            # a snapshot it had reformatted, and falcone #1310's skipped its red commit.
             # NEW-171 (operator decision 2026-10-09): falcone #975's deployment maker fixed
             # the chart contract (checker PASS) but reported two suites FAIL that it could
             # not run in the sandbox (subprocess stdin EPERM, timeouts), which blocked

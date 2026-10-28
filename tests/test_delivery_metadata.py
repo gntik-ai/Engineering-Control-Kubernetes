@@ -748,6 +748,11 @@ def test_correction_attempt_maker_sees_the_previous_checker_findings(tmp_path: P
     assert "upload cap runs after the body is spooled" in prompt
     assert "five substantive issues" in prompt
     assert "Independent checker findings" not in first_attempt
+    # NEW-240: a maker may correct its own commit with a further commit, never by rewriting.
+    for text in (prompt, first_attempt):
+        assert "create one local commit" not in text
+        assert "one commit or more" in text
+        assert "with a further commit; never rewrite, amend or squash" in text
 
 
 def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
