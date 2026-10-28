@@ -4125,6 +4125,15 @@ class MetadataActivityHandler:
             "stall or timeout caused by the environment) is SKIPPED with that exact reason in "
             "the summary: the pull request's CI checks and merge gate decide on it. Never "
             "mark a real assertion failure as SKIPPED.\n"
+            # NEW-241: falcone #1310 and gntik-ui #141 committed a complete change (focused
+            # tests green) but returned BLOCKED because the full suite failed or timed out in
+            # tests the change does not touch, so neither the base rerun nor PR CI ran.
+            "Return decision COMPLETE once your change is committed and the tests that "
+            "cover it pass. A failure or skip in a test your change does not touch is "
+            "reported as its FAIL or SKIPPED row, as above, and is never by itself a reason "
+            "for decision BLOCKED: the base-commit rerun and the pull request's CI decide "
+            "whether it blocks. Return BLOCKED only when you could not implement or commit "
+            "the change, or its own tests fail.\n"
             # NEW-177: falcone #1008, #967 and #1099 each blocked on a suite main already
             # failed, because the maker reported it through a /tmp loader, without --test or
             # through a wrapper script, which the base-commit rerun (NEW-161) cannot run.

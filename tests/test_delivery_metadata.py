@@ -753,6 +753,9 @@ def test_correction_attempt_maker_sees_the_previous_checker_findings(tmp_path: P
         assert "create one local commit" not in text
         assert "one commit or more" in text
         assert "with a further commit; never rewrite, amend or squash" in text
+        # NEW-241: unrelated failures are FAIL/SKIPPED rows, not a reason to return BLOCKED.
+        assert "Return decision COMPLETE once your change is committed" in text
+        assert "is never by itself a reason for decision BLOCKED" in text
 
 
 def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
