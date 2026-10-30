@@ -42,6 +42,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+WORKTREE_OWNERSHIP_EVENT = "hermes.worktree_ownership"
 _PATH_FLAGS = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 _LIST_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 
@@ -86,6 +87,11 @@ class WalkReport:
     foreign_device: list[Parts] = field(default_factory=list)
     # Directories this identity could not list.
     unlisted: list[Parts] = field(default_factory=list)
+    # Entries that are a mount point (another mount id than the root's, e.g. a bind mount
+    # of the same filesystem): never changed or entered.
+    mount_points: list[Parts] = field(default_factory=list)
+    # Entries whose mount id could not be read (fail closed: skipped).
+    mount_unknown: int = 0
     # Entries that could not be inspected or opened for another reason.
     errors: int = 0
     stopped: str | None = None
@@ -93,7 +99,7 @@ class WalkReport:
     @property
     def complete(self) -> bool:
         """True only when every entry below the root was visited: nothing unlisted,
-        raced, errored, stopped by the budget or skipped on another filesystem."""
+        raced, errored, stopped by the budget, or skipped on another filesystem or mount."""
         return self.reason is None
 
     @property
@@ -104,6 +110,10 @@ class WalkReport:
             return "unlisted"
         if self.foreign_device:
             return "foreign_device"
+        if self.mount_points:
+            return "mount_point"
+        if self.mount_unknown:
+            return "mount_info_unavailable"
         if self.raced:
             return "raced"
         if self.errors:
@@ -138,6 +148,20 @@ def open_child_strict(parent: int, name: str) -> int:
     if "/" in name or name in {"", ".", ".."}:
         raise ValueError(f"refusing path component {name!r}")
     return os.open(name, _PATH_FLAGS | os.O_DIRECTORY, dir_fd=parent)
+
+
+def mount_id(descriptor: int) -> int | None:
+    """The mount id of an open descriptor (``mnt_id`` in /proc/self/fdinfo), or None when
+    it cannot be read. Two entries of one filesystem in different mounts (a bind mount)
+    share st_dev but not the mount id."""
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1])
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def fd_path(descriptor: int) -> str:
@@ -184,6 +208,11 @@ def walk(
     root_info = os.fstat(root)
     if not stat.S_ISDIR(root_info.st_mode):
         raise NotADirectoryError("walk root is not a directory")
+    root_mount = mount_id(root)
+    if root_mount is None:
+        # Without mount identities no mount crossing can be excluded: change nothing.
+        report.stopped = "mount_info_unavailable"
+        return report
     visit(root, root_info, (), None)
     report.entries += 1
     try:
@@ -208,7 +237,7 @@ def walk(
                 stack.pop()
                 _leave(level, root)
                 continue
-            descriptor = _open_entry(level, entry.name, root_info, report)
+            descriptor = _open_entry(level, entry.name, root_info, root_mount, report)
             if descriptor is None:
                 continue
             keep = False
@@ -241,10 +270,11 @@ def _leave(level: _Level, root: int) -> None:
 
 
 def _open_entry(
-    level: _Level, name: str, root_info: os.stat_result, report: WalkReport
+    level: _Level, name: str, root_info: os.stat_result, root_mount: int, report: WalkReport
 ) -> int | None:
     """An O_PATH descriptor of the directory or regular file ``name`` once it is proven to
-    be the entry that was listed (same inode, type and filesystem); None to skip it."""
+    be the entry that was listed (same inode, type and filesystem) in the root's mount;
+    None to skip it."""
     try:
         listed = os.stat(name, dir_fd=level.directory, follow_symlinks=False)
     except FileNotFoundError:
@@ -273,6 +303,14 @@ def _open_entry(
         os.close(descriptor)
         report.raced += 1
         return None
+    entry_mount = mount_id(descriptor)
+    if entry_mount != root_mount:
+        os.close(descriptor)
+        if entry_mount is None:
+            report.mount_unknown += 1
+        else:
+            report.mount_points.append((*level.parts, name))
+        return None
     return descriptor
 
 
@@ -298,6 +336,7 @@ class NormalisationReport:
     raced: int = 0
     unlisted: int = 0
     foreign_device: int = 0
+    mount_points: int = 0
     errors: int = 0
     complete: bool = True
     reason: str | None = None
@@ -342,6 +381,7 @@ def normalise_owned_tree(
         raced=report.raced,
         unlisted=len(report.unlisted),
         foreign_device=len(report.foreign_device),
+        mount_points=len(report.mount_points) + report.mount_unknown,
         errors=report.errors,
         complete=report.complete and not failed,
         reason=reason,

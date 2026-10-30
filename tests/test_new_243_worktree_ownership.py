@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
@@ -28,7 +28,8 @@ from engineering_control.agents.instructions import InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import ModelClass, Project, Provider, RunStatus
-from engineering_control.worktrees import ownership_repair
+from engineering_control.observability.agent import AgentTranscriptRecorder
+from engineering_control.worktrees import ownership, ownership_repair
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -671,3 +672,137 @@ def test_repair_exits_non_zero_when_a_walk_is_incomplete(
     assert code == 3
     assert f"incomplete worktrees/falcone/{IDENTITY}: unlisted" in captured.out
     assert "NOT COMPLETE" in captured.err
+
+
+# --- final review: mount identity, bounded publication, transcript --------------------------
+
+
+def _bind_mounted(monkeypatch: pytest.MonkeyPatch, name: str, value: int | None = 2) -> None:
+    """As if ``name`` were a bind mount of the same filesystem: same st_dev, another mount
+    id (``value``; None: the mount id cannot be read)."""
+    real = ownership.mount_id
+
+    def fake(descriptor: int) -> int | None:
+        if os.readlink(f"/proc/self/fd/{descriptor}").endswith(f"/{name}"):
+            return value
+        return real(descriptor)
+
+    monkeypatch.setattr(ownership, "mount_id", fake)
+    monkeypatch.setattr(ownership_repair, "mount_id", fake)
+
+
+def test_mount_id_is_read_from_a_path_descriptor(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path, os.O_PATH | os.O_DIRECTORY)
+    try:
+        assert isinstance(ownership.mount_id(descriptor), int)
+    finally:
+        os.close(descriptor)
+
+
+def test_a_same_device_bind_mount_is_neither_changed_nor_entered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "worktree"
+    (tree / "bind").mkdir(parents=True)
+    (tree / "bind" / "inner").write_text("x")
+    (tree / "bind" / "inner").chmod(0o600)
+    (tree / "bind").chmod(0o700)
+    (tree / "own").write_text("y")
+    (tree / "own").chmod(0o600)
+    _bind_mounted(monkeypatch, "bind")
+    report = normalise_owned_tree(tree)
+    monkeypatch.undo()
+    assert _mode(tree / "bind") == 0o700 and _mode(tree / "bind" / "inner") == 0o600
+    assert _mode(tree / "own") == 0o660  # the rest is still normalised
+    assert not report.complete and report.reason == "mount_point" and report.mount_points == 1
+
+
+def test_unreadable_mount_information_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "worktree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub").chmod(0o700)
+    _bind_mounted(monkeypatch, "sub", None)
+    entry = normalise_owned_tree(tree)
+    monkeypatch.setattr(ownership, "mount_id", lambda descriptor: None)
+    root = normalise_owned_tree(tree)
+    monkeypatch.undo()
+    assert not entry.complete and entry.reason == "mount_info_unavailable"
+    assert not root.complete and root.reason == "mount_info_unavailable" and root.scanned == 0
+    assert _mode(tree / "sub") == 0o700
+
+
+def test_repair_exits_non_zero_at_a_bind_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root, worktree, _metadata = _platform(tmp_path)
+    _bind_mounted(monkeypatch, "dist")
+    code = ownership_repair.main(["--platform-root", str(root), "--manager", _me()])
+    _bind_mounted(monkeypatch, IDENTITY)  # the ChangeSet directory itself a mount
+    second = ownership_repair.main(["--platform-root", str(root), "--manager", _me()])
+    monkeypatch.undo()
+    out = capsys.readouterr().out
+    assert code == 3 and second == 3
+    assert f"incomplete worktrees/falcone/{IDENTITY}: mount_point" in out
+    assert f"refused worktrees/falcone/{IDENTITY}: another filesystem or mount" in out
+    assert _mode(worktree / "dist") == 0o700
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_event_callback_does_not_hold_the_provider_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, worktree = _provider_handler(tmp_path, monkeypatch, str(uuid4()))
+    handler._normalise_seconds = 0.05
+    handler._normalise_grace_seconds = 0.05
+    handler._normalise_publish_seconds = 5.0  # capped by the shared deadline
+    stalled: list[str] = []
+
+    async def stall(event: dict[str, Any]) -> None:
+        stalled.append(event["status"])
+        await asyncio.sleep(30)
+
+    request = AgentRequest.model_validate(
+        _agent_request(worktree, writable=True, role="implementer")
+    )
+    started = time.monotonic()
+    await handler._normalise_worktree_ownership(request, stall)
+    assert time.monotonic() - started < 1.0
+    assert stalled == ["NORMALISED"]
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.asyncio
+async def test_the_recorder_keeps_the_ownership_event_for_both_providers(
+    provider: Literal["codex", "claude"],
+) -> None:
+    recorder = AgentTranscriptRecorder(
+        Settings(),
+        uuid4(),
+        provider,
+        client=object(),  # type: ignore[arg-type]
+    )
+    await recorder.event(
+        {
+            "type": "hermes.worktree_ownership",
+            "status": "INCOMPLETE",
+            "scanned": 12,
+            "changed": 3,
+            "failed": 0,
+            "mount_points": 1,
+            "reason": "mount_point",
+        }
+    )
+    await recorder.event(
+        {"type": "hermes.worktree_ownership", "status": "FAILED", "detail": "OSError: x"}
+    )
+    lines = [(chunk.stream, chunk.redacted_text) for chunk in recorder.buffer]
+    assert lines == [
+        (
+            "system",
+            "Worktree ownership normalisation: INCOMPLETE (scanned 12, changed 3, failed 0, "
+            "mount_points 1); reason mount_point",
+        ),
+        ("system", "Worktree ownership normalisation: FAILED; OSError: x"),
+    ]

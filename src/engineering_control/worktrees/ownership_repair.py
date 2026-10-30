@@ -38,6 +38,7 @@ from engineering_control.worktrees.ownership import (
     Budget,
     Parts,
     fd_path,
+    mount_id,
     normalised_mode,
     open_child_strict,
     open_directory_strict,
@@ -60,6 +61,11 @@ class RepairReport:
     # the repair is not complete and the run exits non-zero.
     incomplete: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)
+
+
+def _place(descriptor: int) -> tuple[int, int | None]:
+    """Filesystem and mount of a descriptor: a bind mount shares the first, not the second."""
+    return os.fstat(descriptor).st_dev, mount_id(descriptor)
 
 
 def _readable_mask(mode: int) -> int:
@@ -156,7 +162,10 @@ def _repair_kind(
     owner: tuple[int, int],
     apply: bool,
 ) -> None:
-    base_device = os.fstat(base).st_dev
+    base_device = (os.fstat(base).st_dev, mount_id(base))
+    if base_device[1] is None:
+        report.incomplete.append(f"{label}: mount_info_unavailable")
+        return
     for repository in _children(base):
         try:
             repository_fd = open_child_strict(base, repository)
@@ -164,8 +173,8 @@ def _repair_kind(
             report.refused.append(f"{label}/{repository}: not a real directory")
             continue
         try:
-            if os.fstat(repository_fd).st_dev != base_device:
-                report.refused.append(f"{label}/{repository}: another filesystem")
+            if _place(repository_fd) != base_device:
+                report.refused.append(f"{label}/{repository}: another filesystem or mount")
                 continue
             for name in _children(repository_fd):
                 identity = name.removesuffix(suffix) if suffix else name
@@ -178,8 +187,8 @@ def _repair_kind(
                     report.refused.append(f"{shown}: not a real directory")
                     continue
                 try:
-                    if os.fstat(changeset).st_dev != base_device:
-                        report.refused.append(f"{shown}: another filesystem")
+                    if _place(changeset) != base_device:
+                        report.refused.append(f"{shown}: another filesystem or mount")
                         continue
                     if kind == "worktree":
                         report.worktrees += 1
@@ -207,7 +216,7 @@ def _repair_metadata(
     report: RepairReport,
     owner: tuple[int, int],
     apply: bool,
-    device: int,
+    device: tuple[int, int | None],
 ) -> None:
     for sub in ("objects", "refs", "logs"):
         try:
@@ -218,8 +227,8 @@ def _repair_metadata(
             report.refused.append(f"{label}/{sub}: not a real directory")
             continue
         try:
-            if os.fstat(root).st_dev != device:
-                report.refused.append(f"{label}/{sub}: another filesystem")
+            if _place(root) != device:
+                report.refused.append(f"{label}/{sub}: another filesystem or mount")
                 continue
             if sub == "objects":
                 _repair_tree(

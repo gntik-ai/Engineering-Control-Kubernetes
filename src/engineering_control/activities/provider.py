@@ -69,6 +69,7 @@ from engineering_control.security.redaction import (
 )
 from engineering_control.worktrees.hardened_git import HardenedGitError, worktree_location
 from engineering_control.worktrees.ownership import (
+    WORKTREE_OWNERSHIP_EVENT,
     Budget,
     NormalisationReport,
     normalise_owned_tree,
@@ -551,6 +552,7 @@ class ProviderActivityHandler:
     _normalise_seconds = 60.0
     _normalise_max_entries = 1_000_000
     _normalise_grace_seconds = 5.0
+    _normalise_publish_seconds = 5.0
 
     async def _normalise_worktree_ownership(
         self,
@@ -559,12 +561,17 @@ class ProviderActivityHandler:
     ) -> None:
         """NEW-243 phase 0: after a writable run, restore the ACL mask on what this runner
         created in its ChangeSet worktree, so the manager, the checker, the publishing
-        identities and the cleanup see it as granted.
-        Only this runner's own files, only inside worktree_root/<repository>/<ChangeSet>,
-        within a budget; it never fails the run (a leftover makes the next hand-off fail
-        closed instead). An incomplete walk is recorded and logged."""
+        identities and the cleanup see it as granted. Only this runner's own files, only
+        inside worktree_root/<repository>/<ChangeSet>, within a budget. The walk and the
+        publication of its event share one deadline (at most _normalise_seconds +
+        _normalise_grace_seconds): nothing here delays the provider result beyond it or
+        fails it. An incomplete walk is recorded and logged."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._normalise_seconds + self._normalise_grace_seconds
+        # The publication keeps a share of the grace; the walk may use the rest.
+        reserve = min(self._normalise_publish_seconds, self._normalise_grace_seconds)
         stop = threading.Event()
-        event: dict[str, Any] = {"type": "hermes.worktree_ownership"}
+        event: dict[str, Any] = {"type": WORKTREE_OWNERSHIP_EVENT}
         work = asyncio.ensure_future(
             asyncio.to_thread(
                 self._normalise_changeset_worktree, Path(request.working_directory), stop
@@ -574,8 +581,7 @@ class ProviderActivityHandler:
         work.add_done_callback(lambda done: done.cancelled() or done.exception())
         try:
             report = await asyncio.wait_for(
-                asyncio.shield(work),
-                timeout=self._normalise_seconds + self._normalise_grace_seconds,
+                asyncio.shield(work), timeout=max(deadline - reserve - loop.time(), 0.0)
             )
         except TimeoutError:
             stop.set()
@@ -596,6 +602,7 @@ class ProviderActivityHandler:
                 "raced": report.raced,
                 "unlisted": report.unlisted,
                 "foreign_device": report.foreign_device,
+                "mount_points": report.mount_points,
                 "errors": report.errors,
             }
             if report.reason is not None:
@@ -607,8 +614,22 @@ class ProviderActivityHandler:
                 request.run_id,
                 {key: value for key, value in event.items() if key != "type"},
             )
-        with suppress(Exception):  # observability cannot change provider work
-            await on_event(event)
+        publish = min(self._normalise_publish_seconds, deadline - loop.time())
+        if publish <= 0:
+            _LOGGER.warning("worktree ownership event of run %s not published", request.run_id)
+            return
+        try:
+            await asyncio.wait_for(on_event(event), timeout=publish)
+        except TimeoutError:
+            _LOGGER.warning(
+                "worktree ownership event of run %s not published within %.1f s",
+                request.run_id,
+                publish,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001, S110 - observability cannot change provider work
+            pass
 
     def _normalise_detached(self, request: AgentRequest) -> None:
         """The same bounded normalisation in a daemon thread, for a cancelled run: the
