@@ -80,11 +80,19 @@ WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
 # campaign approved before a project joined still lists exactly that release's set until
 # its terminal disable (scripts/reconcile-backlog-github-policy.py
 # HISTORICAL_SAFE_REPOSITORIES); sets are only ever added, never rotated out.
+# Before falcone-workflow joined (NEW-242):
+PREVIOUS_WRITE_REPOSITORIES = WRITE_REPOSITORIES - {"gntik-ai/falcone-workflow"}
 # Before falcone-serverless joined:
-PREVIOUS_WRITE_REPOSITORIES = WRITE_REPOSITORIES - {"gntik-ai/falcone-serverless"}
+PRE_FALCONE_SERVERLESS_WRITE_REPOSITORIES = PREVIOUS_WRITE_REPOSITORIES - {
+    "gntik-ai/falcone-serverless"
+}
 # Before gntik-ui joined (NEW-160):
-PRE_GNTIK_UI_WRITE_REPOSITORIES = PREVIOUS_WRITE_REPOSITORIES - {"gntik-ai/gntik-ui"}
-HISTORICAL_WRITE_REPOSITORIES = (PREVIOUS_WRITE_REPOSITORIES, PRE_GNTIK_UI_WRITE_REPOSITORIES)
+PRE_GNTIK_UI_WRITE_REPOSITORIES = PRE_FALCONE_SERVERLESS_WRITE_REPOSITORIES - {"gntik-ai/gntik-ui"}
+HISTORICAL_WRITE_REPOSITORIES = (
+    PREVIOUS_WRITE_REPOSITORIES,
+    PRE_FALCONE_SERVERLESS_WRITE_REPOSITORIES,
+    PRE_GNTIK_UI_WRITE_REPOSITORIES,
+)
 
 
 class GitHubWriteDenialReason(StrEnum):

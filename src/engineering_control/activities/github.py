@@ -30,8 +30,10 @@ from engineering_control.engineering.backlog import (
     valid_issue_label,
 )
 from engineering_control.engineering.change_requests import project_repositories
-from engineering_control.engineering.decomposition import DECOMPOSITION_PROJECTS
-from engineering_control.engineering.decomposition_inventory import ISSUE_MARKER
+from engineering_control.engineering.decomposition import (
+    DECOMPOSITION_PROJECTS,
+    decomposition_profile,
+)
 from engineering_control.projects import PROJECT_REPOSITORY_SLUGS, ProjectName
 from engineering_control.projects import default_branch as project_default_branch
 from engineering_control.security.redaction import SecretRedactor
@@ -153,6 +155,7 @@ class GitHubActivityHandler:
                 non_retryable=True,
             )
         repository = project_repositories(str(project))[0]
+        marker = decomposition_profile(str(project)).issue_marker
         try:
             listed = self.broker.list_issue_snapshot(repository)
         except (GhCliAuthError, GhCliPolicyError, CommandFailure, OSError, ValueError) as error:
@@ -166,7 +169,7 @@ class GitHubActivityHandler:
         issues: list[dict[str, Any]] = []
         for item in listed:
             body = item.get("body")
-            if not isinstance(body, str) or not ISSUE_MARKER.search(body):
+            if not isinstance(body, str) or not marker.search(body):
                 continue
             number, title, state = item.get("number"), item.get("title"), item.get("state")
             labels, parent = item.get("labels") or [], item.get("parent")

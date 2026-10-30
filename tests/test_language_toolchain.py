@@ -772,7 +772,10 @@ def test_language_toolchains_are_opt_in_and_verified() -> None:
 
 def test_bootstrap_installs_falcone_serverless_without_runtime_material() -> None:
     worker = BOOTSTRAP.read_text()
-    assert "if [[ ${project} == gntik-ui || ${project} == falcone-serverless ]]; then" in worker
+    assert (
+        "if [[ ${project} == gntik-ui || ${project} == falcone-serverless"
+        " || ${project} == falcone-workflow ]]; then" in worker
+    )
     result = subprocess.run(  # noqa: S603 - fixed shell, syntax check only
         ["/bin/bash", "-n", str(BOOTSTRAP)], check=False
     )

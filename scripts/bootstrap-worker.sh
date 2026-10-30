@@ -354,9 +354,9 @@ install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
 for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui \
-  falcone-serverless \
+  falcone-serverless falcone-workflow \
   gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy \
-  gntik-ai-llmwiki gntik-ai-gntik-ui gntik-ai-falcone-serverless; do
+  gntik-ai-llmwiki gntik-ai-gntik-ui gntik-ai-falcone-serverless gntik-ai-falcone-workflow; do
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
@@ -392,14 +392,14 @@ RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
 }
 RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
-for project in falcone musematic llmwiki gntik-ui falcone-serverless; do
+for project in falcone musematic llmwiki gntik-ui falcone-serverless falcone-workflow; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
     "${CONFIG_ROOT}/projects.d/${project}.yaml"
   # NEW-160: credentials, personas and flows exist only for projects with a runtime;
-  # gntik-ui (a UI kit) and falcone-serverless (no runtime adapter yet), both delivered
-  # by a protected merge, have none.
-  if [[ ${project} == gntik-ui || ${project} == falcone-serverless ]]; then
+  # gntik-ui (a UI kit), falcone-serverless and falcone-workflow (no runtime adapter
+  # yet), all delivered by a protected merge, have none.
+  if [[ ${project} == gntik-ui || ${project} == falcone-serverless || ${project} == falcone-workflow ]]; then
     continue
   fi
   if [[ ${project} == falcone || ${project} == musematic ]]; then

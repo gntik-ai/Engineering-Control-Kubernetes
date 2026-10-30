@@ -76,6 +76,8 @@ def test_only_gntik_ui_and_falcone_serverless_exempt_their_listed_roots() -> Non
         "gntik-ui": frozenset({"destructive", "production"}),
         # falcone-serverless: "production" only; destructive and data migration stay R3.
         "falcone-serverless": frozenset({"production"}),
+        # NEW-242: falcone-workflow mirrors falcone-serverless (merge-only, no runtime yet).
+        "falcone-workflow": frozenset({"production"}),
     }
     assert repository_r3_keyword_exemptions(GNTIK) == {"destructive", "production"}
     for project, pair in PROJECT_REPOSITORIES.items():

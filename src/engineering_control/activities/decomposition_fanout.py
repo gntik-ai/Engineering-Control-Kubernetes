@@ -4,7 +4,8 @@ section 4).
 Modelled on the UI blueprint fan-out (UiPlanActivityHandler, NEW-123/NEW-146): after the
 operator approves a plan, every task becomes one change request under its deterministic
 id, its proposal rendered from the plan (no model drafts it), routed to its target
-repository (falcone-serverless, or the falcone / falcone-charts cross-repository targets),
+repository (the project's own, e.g. falcone-serverless or falcone-workflow, or the falcone /
+falcone-charts cross-repository targets),
 reviewed by Codex (code-reviewer) against that repository's read-only snapshot and
 persisted as a CANDIDATE. Dedupe: an existing request of the same lineage supersedes the
 task (unless --replace), the GitHub worker searches open issues by title (read-only) and
@@ -186,11 +187,11 @@ class DecompositionFanoutActivityHandler:
         if loaded["status"] != "APPROVED":
             return {**base, "status": "BLOCKED", "blocker": NOT_APPROVED}
         root = self.settings.agent_pack_root
-        problems = decomposition_pack_problems(root)
+        problems = decomposition_pack_problems(root, project=str(loaded["project"]))
         if problems:
             return {**base, "status": "BLOCKED", "blocker": AGENT_PACK_SKILL_MISSING,
                     "blockers": problems, "project": loaded["project"]}  # fmt: skip
-        if pack_revision(root) != loaded["pack_revision"]:
+        if pack_revision(root, str(loaded["project"])) != loaded["pack_revision"]:
             return {**base, "status": "BLOCKED", "blocker": PACK_DRIFT,
                     "project": loaded["project"]}  # fmt: skip
         workflow_id = self._workflow_id(payload)
@@ -265,7 +266,7 @@ class DecompositionFanoutActivityHandler:
         change_request_id = task_change_request_id(digest, task.key)
         context = task_context(task, decomposition_id=str(decomposition_id), plan_sha256=digest)
         intake = prepare_intake(
-            PROJECT,
+            task.project,
             task_description(task, decomposition_id=str(decomposition_id)),
             task.repository,
         )
@@ -281,7 +282,7 @@ class DecompositionFanoutActivityHandler:
             "decomposition_id": str(decomposition_id),
             "item_key": task.key,
             "change_request_id": str(change_request_id),
-            "project": PROJECT,
+            "project": task.project,
             "target_repository": task.repository,
             "source_worktree": payload.get("source_worktree"),
             "description_redacted": intake.description_redacted,
@@ -313,7 +314,7 @@ class DecompositionFanoutActivityHandler:
         if created["status"] != "DRAFTING" or int(created["revision"]) != 1:
             return {**base, "status": "SKIPPED", "current_status": created["status"]}
         try:
-            proposal = validate_proposal(task_proposal(task.task), PROJECT, task.repository)
+            proposal = validate_proposal(task_proposal(task.task), task.project, task.repository)
         except ValueError:
             return {**base, "status": "FAILED", "blocker": "DRAFT_SCHEMA_INVALID"}
         return {**base, "status": "PROPOSAL_READY", "proposal": proposal.model_dump(mode="json")}
@@ -326,7 +327,8 @@ class DecompositionFanoutActivityHandler:
             return {**payload, "status": "FAILED", "blocker": "DRAFT_SCHEMA_INVALID"}
         sections = [
             "Independently review the change proposal for one task of an approved backlog "
-            f"decomposition of {PROJECT} against the task statement and the read-only "
+            f"decomposition of {payload.get('project') or PROJECT} against the task statement "
+            "and the read-only "
             f"snapshot of its target repository {payload['target_repository']} (your working "
             "directory). You are the checker: do not modify files, publish, approve on the "
             "operator's behalf or implement anything. There is no diff or test evidence: the "
@@ -402,7 +404,7 @@ class DecompositionFanoutActivityHandler:
         workflow_id = str(orchestration.get("workflow_id") or "")
         commands = [
             f"{CTL} backlog-decomposition-ready {decomposition_id}",
-            f"{CTL} changes --project {PROJECT} --status CANDIDATE",
+            f"{CTL} changes --project {payload.get('project') or PROJECT} --status CANDIDATE",
             *(
                 [
                     f"{CTL} backlog-decomposition-fanout-retry "

@@ -22,6 +22,7 @@ REQUIRED_REPOSITORIES = (
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
     "gntik-ai/falcone-serverless",
+    "gntik-ai/falcone-workflow",
 )
 
 

@@ -136,6 +136,11 @@ class AgentInstructionPack:
         if step in self._pinned_schema_steps and request.output_schema != schema:
             # NEW-131: a batched plan part sends one of the skill's released part schemas.
             part = self._part_schema(catalog, skill, request.output_schema)
+            if part is None and step.startswith("decomposition."):
+                # NEW-242: another project's released schema variants, with its reference.
+                part = self._project_schema(
+                    catalog, skill, request.project.value, request.output_schema, sources
+                )
             if part is None:
                 flow = "decomposition" if step.startswith("decomposition.") else "ui plan"
                 raise ValueError(f"{flow} request drifted from the released skill output schema")
@@ -146,6 +151,7 @@ class AgentInstructionPack:
                 raise ValueError("agent-pack output schema is invalid") from error
             sources[name] = payload
             source_names = (*source_names, name)
+            source_names = (*source_names, *(item for item in sources if item not in source_names))
 
         digest = self._digest(sources)
         allowed_tools = tuple(
@@ -203,6 +209,46 @@ class AgentInstructionPack:
             if isinstance(schema, dict) and schema == requested:
                 return relative, payload, schema
         return None
+
+    def _project_schema(
+        self,
+        catalog: dict[str, Any],
+        skill: str,
+        project: str,
+        requested: Any,
+        sources: dict[str, bytes],
+    ) -> tuple[str, bytes, dict[str, Any]] | None:
+        """NEW-242: a decomposition project's released schema variant the request sends
+        (skills/<skill>/references/projects/<project>/: output.schema.json or a catalog
+        part schema name). Its project reference joins the bundle sources; falcone-serverless
+        sends the skill's own schemas and never reaches this."""
+        if not self._project_name.fullmatch(project):
+            return None
+        directory = f"skills/{skill}/references/projects/{project}"
+        records = [
+            record
+            for record in catalog.get("skills") or []
+            if isinstance(record, dict) and record.get("id") == skill
+        ]
+        parts = records[0].get("part_output_schemas") if len(records) == 1 else None
+        names = ["output.schema.json", *(parts.values() if isinstance(parts, dict) else [])]
+        for name in names:
+            if not isinstance(name, str) or not self._part_schema_name.fullmatch(name):
+                raise ValueError("agent-pack part schema name is invalid")
+            relative = f"{directory}/{name}"
+            try:
+                payload = self._read(relative)
+            except FileNotFoundError:
+                continue
+            schema = json.loads(payload.decode("utf-8"))
+            if isinstance(schema, dict) and schema == requested:
+                reference = f"{directory}/{self._project_reference}"
+                sources[reference] = self._read(reference)
+                return relative, payload, schema
+        return None
+
+    _project_name = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+    _project_reference = "project.md"
 
     def _skill(self, step: str) -> str:
         try:
@@ -309,7 +355,7 @@ class AgentInstructionPack:
         domain_name = f"domain-packs/{request.project.value}/domains.yaml"
         schema_name = f"skills/{skill}/references/output.schema.json"
         schema_sha = hashlib.sha256(sources[schema_name]).hexdigest()
-        sections = (
+        sections: tuple[tuple[str, bytes], ...] = (
             ("Canonical role", sources[f"roles/{request.role}.yaml"]),
             ("Provider-specific generated role", sources[provider_asset]),
             ("Common policy", sources["domain-packs/common/POLICIES.md"]),
@@ -326,6 +372,10 @@ class AgentInstructionPack:
             "The control-plane supplied structured output schema is authoritative. "
             "Treat every boundary below as mandatory and do not load unrelated agent history."
         )
+        reference = f"skills/{skill}/references/projects/{request.project.value}/project.md"
+        if reference in sources:
+            # NEW-242: the project's adaptation of a skill written for another project.
+            sections = (*sections, ("Project skill reference", sources[reference]))
         rendered = [header]
         for title, payload in sections:
             rendered.append(f"## {title}\n\n{payload.decode('utf-8').strip()}")

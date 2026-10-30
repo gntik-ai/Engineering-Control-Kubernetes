@@ -30,8 +30,9 @@ from engineering_control.engineering.change_requests import (
     decomposition_lineage,
 )
 from engineering_control.engineering.decomposition import (
+    DECOMPOSITION_PROFILES,
     PROJECT,
-    SOURCE_REPOSITORY,
+    decomposition_profile,
     resolved_dependencies,
 )
 
@@ -54,7 +55,8 @@ DEPENDENCIES_STALE: Final = "DECOMPOSITION_DEPENDENCIES_STALE"
 IMPORT_BODY_EXCERPT = 6000
 AMENDMENT_MARKER_PREFIX: Final = "<!-- hermes-decomposition-amendment"
 _RISK_ORDER = ("R0", "R1", "R2", "R3")
-_PLAN_KEY = re.compile(r"^falcone-serverless:([A-Z]{2,4}-[0-9]{2})\.(t[1-9][0-9]?)$")
+# falcone-serverless's plan task key (NEW-234); NEW-242: each project's is its profile's.
+_PLAN_KEY = decomposition_profile(PROJECT).plan_key
 
 
 def fanout_workflow_id(decomposition_id: str, sequence: int) -> str:
@@ -70,8 +72,16 @@ def task_change_request_id(plan_sha256: str, key: str) -> UUID:
 
 
 def short_key(key: str) -> str:
-    """`falcone-serverless:API-01.t2` -> `API-01.t2` (the change-request context form)."""
-    match = _PLAN_KEY.fullmatch(key)
+    """`falcone-serverless:API-01.t2` -> `API-01.t2` (the change-request context form).
+    NEW-242: the key's own project prefix selects the profile (names never overlap)."""
+    match = next(
+        (
+            found
+            for profile in DECOMPOSITION_PROFILES.values()
+            if (found := profile.plan_key.fullmatch(key)) is not None
+        ),
+        None,
+    )
     if match is None:
         raise ValueError(f"decomposition task key {key!r} is invalid")
     return f"{match.group(1)}.{match.group(2)}"
@@ -92,6 +102,8 @@ class FanoutTask:
     # The predecessor task keys with every `contract:<ctr-id>` bound to its provider tasks
     # (decomposition.resolved_dependencies); what the change requests link.
     dependencies: tuple[str, ...] = ()
+    # NEW-242: the plan's project (its source repository holds the story issues).
+    project: str = PROJECT
 
     @property
     def repository(self) -> str:
@@ -110,6 +122,7 @@ def fanout_tasks(plan: Mapping[str, Any]) -> list[FanoutTask]:
     """Every task of the plan, predecessors first (plan order breaks ties); a contract
     dependency counts as its provider tasks."""
     stories = list(plan.get("stories") or [])
+    project = decomposition_profile(str(plan.get("project", PROJECT))).project
     bound = resolved_dependencies(stories)
     tasks = [
         FanoutTask(
@@ -119,6 +132,7 @@ def fanout_tasks(plan: Mapping[str, Any]) -> list[FanoutTask]:
             epic_issue=int(story["epic_issue"]),
             task=task,
             dependencies=bound.get(str(task["key"]), ()),
+            project=project,
         )
         for story in stories
         for task in story.get("tasks") or []
@@ -160,8 +174,8 @@ def task_context(
 
 
 def task_lineage(task: FanoutTask, context: DecompositionChangeContext) -> str:
-    lineage = decomposition_lineage(PROJECT, context)
-    if lineage != lineage_of(PROJECT, task.short_key):
+    lineage = decomposition_lineage(task.project, context)
+    if lineage != lineage_of(task.project, task.short_key):
         raise ValueError("decomposition lineage does not match its task")
     return lineage
 
@@ -184,7 +198,7 @@ def task_description(task: FanoutTask, *, decomposition_id: str) -> str:
     )
     lines = [
         f"Backlog decomposition {decomposition_id}, task {task.key} of story {task.story_id} "
-        f"({SOURCE_REPOSITORY}#{task.story_issue}).",
+        f"({decomposition_profile(task.project).source_repository}#{task.story_issue}).",
         f"Target: {target['repository']} ({target['role']}), component {target['component']}; "
         f"size {value['size']}, about {value['estimated_files']} files.",
         f"Covers: {_joined(covers)}; requirements: "
@@ -370,8 +384,8 @@ def _dependency_edits(
     return unapplied
 
 
-def amendment_marker(*, decomposition_id: str, story_id: str) -> str:
-    return f"{AMENDMENT_MARKER_PREFIX} plan={decomposition_id} story={PROJECT}:{story_id} -->"
+def amendment_marker(*, decomposition_id: str, story_id: str, project: str = PROJECT) -> str:
+    return f"{AMENDMENT_MARKER_PREFIX} plan={decomposition_id} story={project}:{story_id} -->"
 
 
 def amended_story_body(
@@ -381,6 +395,7 @@ def amended_story_body(
     *,
     decomposition_id: str,
     plan_sha256: str,
+    project: str = PROJECT,
 ) -> tuple[str, list[dict[str, Any]]]:
     """The story issue body with the amendment applied (deterministic), and the changes
     that could not be placed in the body's own sections (kept, verbatim, in the appended
@@ -428,7 +443,10 @@ def amended_story_body(
         footer.append(
             f"- {_SECTION_TITLES[str(change['section'])]} ({change['action']}{target}): {text}"
         )
-    footer += ["", amendment_marker(decomposition_id=decomposition_id, story_id=story_id)]
+    footer += [
+        "",
+        amendment_marker(decomposition_id=decomposition_id, story_id=story_id, project=project),
+    ]
     rendered = "\n".join([*amended, *footer]) + "\n"
     return rendered, [
         {key: change[key] for key in ("section", "action", "target")}

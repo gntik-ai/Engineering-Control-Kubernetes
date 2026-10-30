@@ -2768,6 +2768,7 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
             "llmwiki",
             "gntik-ui",
             "falcone-serverless",
+            "falcone-workflow",
         }:
             raise ApplicationError(
                 "existing GitHub backlog project is not allowlisted",
@@ -2811,15 +2812,17 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 # gitops.pr_heads).
 _PUBLICATION_PR_URL = re.compile(
     r"https://github\.com/gntik-ai/"
-    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless)"
+    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless"
+    r"|falcone-workflow)"
     r"/pull/[1-9][0-9]{0,9}"
 )
 _PUBLICATION_REPOSITORY = re.compile(
     r"gntik-ai/"
-    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless)"
+    r"(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui|falcone-serverless"
+    r"|falcone-workflow)"
 )
 _PUBLICATION_BRANCH = re.compile(
-    r"agent/(?:falcone|musematic|llmwiki|gntik-ui|falcone-serverless)"
+    r"agent/(?:falcone|musematic|llmwiki|gntik-ui|falcone-serverless|falcone-workflow)"
     r"/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
 )
 _AMEND_ISSUE_REPOSITORIES = frozenset(
@@ -2831,6 +2834,7 @@ _AMEND_ISSUE_REPOSITORIES = frozenset(
         "gntik-ai/llmwiki",
         "gntik-ai/gntik-ui",
         "gntik-ai/falcone-serverless",
+        "gntik-ai/falcone-workflow",
     }
 )
 
@@ -3885,6 +3889,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             "llmwiki",
             "gntik-ui",
             "falcone-serverless",
+            "falcone-workflow",
         }:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",

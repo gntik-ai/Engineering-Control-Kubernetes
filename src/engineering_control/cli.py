@@ -441,7 +441,7 @@ def parser() -> argparse.ArgumentParser:
     )
     # NEW-234 PR5: the backlog decomposition plan -> CANDIDATE -> approval (decision only).
     decompose = commands.add_parser("backlog-decompose")
-    decompose.add_argument("project", choices=("falcone-serverless",))
+    decompose.add_argument("project", choices=("falcone-serverless", "falcone-workflow"))
     decompose.add_argument("--source-sha", help="expected project main head (full SHA)")
     decompose.add_argument(
         "--epic",
@@ -451,7 +451,7 @@ def parser() -> argparse.ArgumentParser:
         help="plan only this epic (id such as EP-API, or its number); repeatable",
     )
     decompositions = commands.add_parser("backlog-decompositions")
-    decompositions.add_argument("--project", choices=("falcone-serverless",))
+    decompositions.add_argument("--project", choices=("falcone-serverless", "falcone-workflow"))
     decompositions.add_argument(
         "--status",
         choices=("DRAFTING", "BLOCKED", "FAILED", "CANDIDATE", "APPROVED", "SUPERSEDED"),

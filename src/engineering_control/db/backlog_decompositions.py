@@ -43,9 +43,9 @@ from engineering_control.engineering.decomposition import (
     MAX_EPIC_SELECTORS,
     MAX_PROVIDER_CALLS,
     REJECTIONS_EXHAUSTED,
-    SOURCE_REPOSITORY,
     WORKFLOW_PREFIX,
     approval_binding,
+    decomposition_profile,
     decomposition_workflow_id,
     part_content_sha256,
     plan_problems,
@@ -619,6 +619,8 @@ class BacklogDecompositionRepository:
             plan = dict(row.plan_json or {})
             inventory = dict((row.parts_json or {}).get("inventory") or {})
             stories = {str(item["id"]): item for item in inventory.get("stories") or []}
+            project = decomposition_profile(str(row.project)).project
+            source_repository = decomposition_profile(project).source_repository
             amendments: list[dict[str, Any]] = []
             for story in plan.get("stories") or []:
                 amendment = story.get("story_amendment")
@@ -632,19 +634,20 @@ class BacklogDecompositionRepository:
                     amendment,
                     decomposition_id=str(row.id),
                     plan_sha256=str(row.plan_sha256),
+                    project=project,
                 )
                 issue = int(story["story_issue"])
                 amendments.append(
                     {
                         "story_id": str(story["story_id"]),
-                        "repository": SOURCE_REPOSITORY,
+                        "repository": source_repository,
                         "issue": issue,
                         "reason": amendment.get("reason"),
                         "current_body_sha256": str(bound["body_sha256"]),
                         "amended_body": amended,
                         "amended_body_sha256": body_sha256(amended),
                         "diff": amendment_diff(
-                            current, amended, repository=SOURCE_REPOSITORY, issue=issue
+                            current, amended, repository=source_repository, issue=issue
                         ),
                         "manual": manual,
                     }

@@ -43,13 +43,24 @@ SAFE_REPOSITORIES = (
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
     "gntik-ai/falcone-serverless",
+    "gntik-ai/falcone-workflow",
 )
 # NEW-160: every allowlist an earlier release installed or queued. A policy that an
 # approved campaign enabled before a project joined (and an activation request it queued)
 # still carries that release's set; it stays valid until that campaign's terminal disable,
 # so a deploy never strands its owner. Sets are only ever added here, never rotated out.
-# Before falcone-serverless joined:
+# Before falcone-workflow joined (NEW-242):
 PREVIOUS_SAFE_REPOSITORIES = (
+    "gntik-ai/falcone",
+    "gntik-ai/falcone-charts",
+    "gntik-ai/musematic",
+    "gntik-ai/musematic-deploy",
+    "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
+    "gntik-ai/falcone-serverless",
+)
+# Before falcone-serverless joined:
+PRE_FALCONE_SERVERLESS_SAFE_REPOSITORIES = (
     "gntik-ai/falcone",
     "gntik-ai/falcone-charts",
     "gntik-ai/musematic",
@@ -65,7 +76,11 @@ PRE_GNTIK_UI_SAFE_REPOSITORIES = (
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
 )
-HISTORICAL_SAFE_REPOSITORIES = (PREVIOUS_SAFE_REPOSITORIES, PRE_GNTIK_UI_SAFE_REPOSITORIES)
+HISTORICAL_SAFE_REPOSITORIES = (
+    PREVIOUS_SAFE_REPOSITORIES,
+    PRE_FALCONE_SERVERLESS_SAFE_REPOSITORIES,
+    PRE_GNTIK_UI_SAFE_REPOSITORIES,
+)
 ACCEPTED_SAFE_REPOSITORIES = frozenset({SAFE_REPOSITORIES, *HISTORICAL_SAFE_REPOSITORIES})
 PRE_APPROVAL_STATUSES = frozenset({"IMPORTED", "PLANNED", "AWAITING_APPROVAL"})
 UNAPPROVED_EVIDENCE_STATUSES = PRE_APPROVAL_STATUSES | frozenset(
@@ -146,6 +161,7 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
         "llmwiki",
         "gntik-ui",
         "falcone-serverless",
+        "falcone-workflow",
     }:
         raise ValueError("GitHub policy project is invalid")
     requested = tuple(value["safe_repositories"])
@@ -268,6 +284,7 @@ def validate_campaign(
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
         "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
         "falcone-serverless": ["gntik-ai/falcone-serverless", "gntik-ai/falcone-serverless"],
+        "falcone-workflow": ["gntik-ai/falcone-workflow", "gntik-ai/falcone-workflow"],
     }[campaign.project]
     if binding.get("paired_repositories") != expected_pair:
         raise ValueError("GitHub campaign pair changed")
@@ -306,6 +323,7 @@ def verified_owner_expiry(campaign: GitHubBacklogCampaign, now: datetime) -> dat
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
         "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
         "falcone-serverless": ["gntik-ai/falcone-serverless", "gntik-ai/falcone-serverless"],
+        "falcone-workflow": ["gntik-ai/falcone-workflow", "gntik-ai/falcone-workflow"],
     }.get(campaign.project)
     if (
         not isinstance(raw_binding, dict)

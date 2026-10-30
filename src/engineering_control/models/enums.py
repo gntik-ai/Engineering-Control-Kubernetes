@@ -7,6 +7,7 @@ class Project(StrEnum):
     LLMWIKI = "llmwiki"
     GNTIK_UI = "gntik-ui"
     FALCONE_SERVERLESS = "falcone-serverless"
+    FALCONE_WORKFLOW = "falcone-workflow"
 
 
 class Provider(StrEnum):
