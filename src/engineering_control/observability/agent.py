@@ -895,14 +895,20 @@ class AgentTranscriptRecorder:
         pending = self.buffer
         self.buffer = []
         self.buffer_bytes = 0
-        accepted = await self.client.logs(
-            self.execution_id,
-            LogBatchInput(
-                chunks=pending,
-                output_truncated=self.output_truncated,
-                transcript_incomplete=self.transcript_incomplete,
-            ),
-        )
+        try:
+            accepted = await self.client.logs(
+                self.execution_id,
+                LogBatchInput(
+                    chunks=pending,
+                    output_truncated=self.output_truncated,
+                    transcript_incomplete=self.transcript_incomplete,
+                ),
+            )
+        except asyncio.CancelledError:
+            # NEW-243: a cancelled upload (for example a bounded event publication) has
+            # already taken this batch out of the buffer, so the transcript is incomplete.
+            self.transcript_incomplete = True
+            raise
         if not accepted:
             self.transcript_incomplete = True
 

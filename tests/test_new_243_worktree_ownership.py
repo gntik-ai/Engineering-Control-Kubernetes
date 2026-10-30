@@ -806,3 +806,27 @@ async def test_the_recorder_keeps_the_ownership_event_for_both_providers(
         ),
         ("system", "Worktree ownership normalisation: FAILED; OSError: x"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_flush_marks_the_transcript_incomplete() -> None:
+    """Codex review of 5cc233e: a bounded publication can cancel a flush after the batch
+    left the buffer; the transcript must then report itself incomplete."""
+
+    class StalledClient:
+        async def logs(self, *_args: Any, **_kwargs: Any) -> bool:
+            await asyncio.sleep(30)
+            return True
+
+    recorder = AgentTranscriptRecorder(
+        Settings(),
+        uuid4(),
+        "codex",
+        client=StalledClient(),  # type: ignore[arg-type]
+    )
+    await recorder.event({"type": "hermes.worktree_ownership", "status": "NORMALISED"})
+    assert recorder.buffer and recorder.transcript_incomplete is False
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(recorder.flush(), timeout=0.05)
+    assert recorder.buffer == []
+    assert recorder.transcript_incomplete is True
