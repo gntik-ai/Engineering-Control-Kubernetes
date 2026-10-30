@@ -16,6 +16,7 @@ from pydantic import (
 )
 
 from engineering_control.models.reconciliation import MergeDeliveryPolicy, StagingFlowPolicy
+from engineering_control.policy.rotation import ProviderRotationPolicy
 from engineering_control.projects import (
     REPOSITORY_SLUG_ALTERNATION,
     SELF_CONTAINED_REPOSITORIES,
@@ -539,6 +540,8 @@ class ProjectManifest(EngineeringModel):
     maker_rules: MakerRules | None = None
     # NEW-228: see AgentSandboxPolicy.
     sandbox: AgentSandboxPolicy | None = None
+    # NEW-243: provider rotation for agent roles (policy/rotation.py); absent = disabled.
+    provider_rotation: ProviderRotationPolicy | None = None
 
     @model_validator(mode="after")
     def deployment_pin_requires_a_pair(self) -> ProjectManifest:
