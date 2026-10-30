@@ -96,13 +96,13 @@ maker_rules:
       admission) or gntik-ai/falcone-charts (Helm charts), with the evidence, and keep this
       change within falcone-workflow.
     - >-
-      Cluster test namespaces are a switch. By default (FS_TEST_NAMESPACE_MODE or
-      FW_TEST_NAMESPACE_MODE=create) keep today's behaviour: create and delete a dedicated
-      fs-test-*/fw-test-* namespace, failing before any mutation if namespace creation is
-      denied, with a message naming the switch. Also support mode shared: never create or
-      delete namespaces, use the existing namespace in FS_TEST_NAMESPACE/FW_TEST_NAMESPACE,
-      suffix every object with the run id, label it falcone.test/run=<id> and delete only
-      objects with that label. Use the shared harness helper where one exists.
+      Cluster test namespaces are a switch. Default (FS_TEST_NAMESPACE_MODE or
+      FW_TEST_NAMESPACE_MODE=create): create and delete a dedicated fs-test-*/fw-test-*
+      namespace as today; if creation is denied, fail before any mutation naming the switch.
+      Mode shared: never create or delete namespaces; use the namespace in
+      FS_TEST_NAMESPACE/FW_TEST_NAMESPACE; create only new objects named with the run id and
+      labelled falcone.test/run=<id>; never update, patch, relabel or delete an object
+      unless its label equals this run's id.
 dependencies: {}
 classification:
   product: true
