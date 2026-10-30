@@ -148,6 +148,14 @@ from engineering_control.operations.issue_delivery_approval import (
 )
 from engineering_control.operations.publication_authority import persist_publication_intent
 from engineering_control.policy.approvals import ApprovalService
+from engineering_control.policy.rotation import (
+    CODE_REVIEWER,
+    IMPLEMENTER,
+    SPEC_ARCHITECT,
+    ProviderRotationPolicy,
+    RotationDecision,
+)
+from engineering_control.policy.rotation import choose as rotation_choose
 from engineering_control.projects import (
     GLOBAL_PROJECT_SET,
     PROJECT_REPOSITORY_SLUGS,
@@ -3139,18 +3147,36 @@ class MetadataActivityHandler:
     def _route_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
         risk = RiskClass(str(payload["risk_class"]))
         broker = self._quota_broker()
-        maker = broker.route(role="implementer", model_class=ModelClass.WORKER, risk_class=risk)
-        spec = broker.route(
-            role="product-spec-architect",
-            model_class=ModelClass.JUDGE,
-            risk_class=risk,
-        )
-        if maker.primary is None or maker.checker is None or spec.primary is None:
-            return {
-                **payload,
-                "status": "RATE_LIMITED" if maker.status == "RATE_LIMITED" else "BLOCKED",
-                "routing_reason": f"maker={maker.reason};spec={spec.reason}",
-            }
+        # NEW-243: a ChangeSet under provider rotation has its maker chosen once (and
+        # recorded); every later attempt reads it back. None: today's routing, unchanged.
+        rotation = self._delivery_rotation(payload, broker, risk)
+        if rotation is not None:
+            if rotation["status"] != "ROUTED":
+                return {
+                    **payload,
+                    "status": rotation["status"],
+                    "routing_reason": rotation["reason"],
+                }
+            maker_provider = Provider(rotation["maker"]["provider"])
+            checker_provider = Provider(rotation["checker"]["provider"])
+            spec_provider = Provider(rotation["spec"]["provider"])
+            routing_reason = rotation["reason"]
+        else:
+            maker = broker.route(role="implementer", model_class=ModelClass.WORKER, risk_class=risk)
+            spec = broker.route(
+                role="product-spec-architect",
+                model_class=ModelClass.JUDGE,
+                risk_class=risk,
+            )
+            if maker.primary is None or maker.checker is None or spec.primary is None:
+                return {
+                    **payload,
+                    "status": "RATE_LIMITED" if maker.status == "RATE_LIMITED" else "BLOCKED",
+                    "routing_reason": f"maker={maker.reason};spec={spec.reason}",
+                }
+            maker_provider, checker_provider = maker.primary, maker.checker
+            spec_provider = spec.primary
+            routing_reason = f"maker={maker.reason};spec={spec.reason}"
         try:
             # NEW-227: an issue published from a blueprint page is delivered with the UI
             # page skills; recognised from Hermes's own records before any worktree exists.
@@ -3173,8 +3199,8 @@ class MetadataActivityHandler:
             "deployment_repository": payload["deployment_repository"],
             "deployment_base_sha": payload["deployment_base_sha"],
             "deployment_base_ref": payload["deployment_base_ref"],
-            "maker_provider": maker.primary.value,
-            "checker_provider": maker.checker.value,
+            "maker_provider": maker_provider.value,
+            "checker_provider": checker_provider.value,
         }
         merge_forward = self._merge_forward_requirement(UUID(str(payload["change_set_id"])))
         if merge_forward is not None:
@@ -3188,15 +3214,190 @@ class MetadataActivityHandler:
         return {
             **payload,
             "status": "ROUTED",
-            "spec_provider": spec.primary.value,
-            "maker_provider": maker.primary.value,
-            "checker_provider": maker.checker.value,
-            "routing_reason": f"maker={maker.reason};spec={spec.reason}",
+            "spec_provider": spec_provider.value,
+            "maker_provider": maker_provider.value,
+            "checker_provider": checker_provider.value,
+            "routing_reason": routing_reason,
             "allocation_request": allocation,
             # NEW-214a: completed by the allocation with the base tip, else None.
             "merge_forward": merge_forward,
             **({"ui_page": ui_page} if ui_page is not None else {}),
+            # NEW-243 (additive, rotation only): providers, models and why, per role.
+            **({"rotation": rotation} if rotation is not None else {}),
         }
+
+    _ROTATION_FLOW = "delivery"
+
+    def _provider_rotation(self, project: Project) -> ProviderRotationPolicy | None:
+        """NEW-243: the project's provider_rotation block, re-read on every call (a change
+        needs no deploy); None when the manifest or the block is absent."""
+        root = self.settings.project_config_root.resolve()
+        path = (root / f"{project.value}.yaml").resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            return None
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("project") != project.value:
+            raise ValueError("project manifest identity is invalid")
+        value = raw.get("provider_rotation")
+        if value is None:
+            return None
+        try:
+            return ProviderRotationPolicy.model_validate(value)
+        except ValidationError as error:
+            raise ValueError(f"project provider_rotation is invalid: {error}") from error
+
+    def _delivery_rotation(
+        self, payload: dict[str, Any], broker: QuotaBroker, risk: RiskClass
+    ) -> dict[str, Any] | None:
+        """NEW-243 phase 1: the providers of a rotated ChangeSet, or None (today's routing).
+
+        A ChangeSet is rotated when its first routing happens under an enabled policy and
+        it was created at or after ``enabled_at`` without recorded providers (in-flight
+        ChangeSets keep today's routing). The first routing chooses maker, checker (always
+        the maker's opposite) and spec author and records them in
+        ``recovery_json["rotation"]``; every later attempt, correction and CI repair reads
+        the maker and spec author back and never flips them: if the pinned provider is
+        unavailable the attempt waits (RATE_LIMITED, with the reason) instead."""
+        change_set_id = UUID(str(payload["change_set_id"]))
+        project = Project(str(payload["project"]))
+        reserve = risk is RiskClass.R3
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id, with_for_update=True)
+            if change_set is None:
+                return None
+            recovery = dict(change_set.recovery_json or {})
+            recorded = recovery.get("rotation")
+            policy = self._provider_rotation(project)
+            if isinstance(recorded, dict):
+                return self._pinned_rotation(recorded, policy, broker, reserve)
+            if policy is None or not policy.enabled or policy.enabled_at is None:
+                return None
+            created = change_set.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            if created < policy.enabled_at or "provider_chain" in recovery:
+                return None
+            # In flight: an earlier delivery run of this ChangeSet was routed without
+            # rotation (e.g. created after enabled_at but before the policy was installed).
+            current_run = payload.get("run_id")
+            earlier = (
+                select(func.count())
+                .select_from(Run)
+                .where(Run.change_set_id == change_set_id, Run.run_type == "issue-delivery")
+            )
+            if current_run is not None:
+                earlier = earlier.where(Run.id != UUID(str(current_run)))
+            if session.scalar(earlier):
+                return None
+            subject = str(change_set_id)
+
+            def decide(role: str, author: Provider | None = None) -> RotationDecision:
+                return rotation_choose(
+                    policy,
+                    project=project.value,
+                    flow=self._ROTATION_FLOW,
+                    role=role,
+                    subject_id=subject,
+                    quota=broker,
+                    author=author,
+                    reserve_work=reserve,
+                )
+
+            maker = decide(IMPLEMENTER)
+            if maker.provider is None:
+                return {"status": maker.status, "reason": f"rotation:maker:{maker.reason}"}
+            checker = decide(CODE_REVIEWER, maker.provider)
+            if checker.provider is None:
+                return {"status": checker.status, "reason": f"rotation:checker:{checker.reason}"}
+            spec = decide(SPEC_ARCHITECT)
+            if spec.provider is None:
+                return {"status": spec.status, "reason": f"rotation:spec:{spec.reason}"}
+            record = {
+                "policy_hash": maker.policy_hash,
+                "chosen_at": datetime.now(UTC).isoformat(),
+                "maker": maker.record(),
+                "checker": checker.record(),
+                "spec": spec.record(),
+            }
+            recovery["rotation"] = record
+            change_set.recovery_json = recovery
+        return self._rotation_result(record, pinned=False)
+
+    def _pinned_rotation(
+        self,
+        recorded: dict[str, Any],
+        policy: ProviderRotationPolicy | None,
+        broker: QuotaBroker,
+        reserve: bool,
+    ) -> dict[str, Any]:
+        """The recorded maker and spec author again (never flipped), the checker the
+        maker's opposite; models follow the current configuration when it names one."""
+        record = json.loads(json.dumps(recorded))
+        maker = Provider(str(record["maker"]["provider"]))
+        ok, why = broker.available(maker, reserve_work=reserve)
+        if not ok:
+            return {
+                "status": "RATE_LIMITED",
+                "reason": f"rotation:pinned maker {maker.value} unavailable: {why}",
+            }
+        checker = Provider.CLAUDE if maker is Provider.CODEX else Provider.CODEX
+        checker_ok, checker_why = broker.available(checker, reserve_work=True)
+        if not checker_ok:
+            return {
+                "status": "BLOCKED",
+                "reason": f"rotation:checker {checker.value} unavailable: {checker_why}",
+            }
+        spec = Provider(str(record["spec"]["provider"]))
+        spec_ok, spec_why = broker.available(spec, reserve_work=reserve)
+        if not spec_ok:
+            return {
+                "status": "RATE_LIMITED",
+                "reason": f"rotation:pinned spec author {spec.value} unavailable: {spec_why}",
+            }
+        record["checker"]["provider"] = checker.value
+        if policy is not None:
+            for key, role, provider in (
+                ("maker", IMPLEMENTER, maker),
+                ("checker", CODE_REVIEWER, checker),
+                ("spec", SPEC_ARCHITECT, spec),
+            ):
+                configured = policy.model_for(role, provider)
+                if configured is not None:
+                    record[key]["model"] = configured
+        return self._rotation_result(record, pinned=True)
+
+    @staticmethod
+    def _rotation_result(record: dict[str, Any], *, pinned: bool) -> dict[str, Any]:
+        def part(key: str) -> str:
+            value = record[key]
+            return f"{key}={value['provider']}/{value.get('model') or 'default'}"
+
+        reason = ";".join(
+            (
+                f"rotation:{str(record['policy_hash'])[:12]}",
+                "pinned" if pinned else "chosen",
+                part("maker"),
+                part("checker"),
+                part("spec"),
+                f"maker_reason={record['maker'].get('reason')}",
+                *(
+                    [f"fallback={record['maker']['fallback']}"]
+                    if record["maker"].get("fallback")
+                    else []
+                ),
+            )
+        )
+        return {**record, "status": "ROUTED", "pinned": pinned, "reason": reason}
+
+    @staticmethod
+    def _rotated_model(payload: dict[str, Any], key: str) -> str | None:
+        """NEW-243: the model rotation chose for ``key`` (maker, checker, spec), if any."""
+        rotation = payload.get("rotation")
+        if not isinstance(rotation, dict):
+            return None
+        part = rotation.get(key)
+        model = part.get("model") if isinstance(part, dict) else None
+        return model if isinstance(model, str) and model else None
 
     def _ui_page_context(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         """NEW-227: the approved blueprint page the delivered issue was published from.
@@ -3493,7 +3694,8 @@ class MetadataActivityHandler:
             timeout_seconds=3600,
             effort=resolve_agent_effort(ModelClass.JUDGE),
             # NEW-53: optional pin; only meaningful for the Claude CLI.
-            model=self.settings.claude_spec_model if provider is Provider.CLAUDE else None,
+            model=self._rotated_model(payload, "spec")
+            or (self.settings.claude_spec_model if provider is Provider.CLAUDE else None),
             writable=False,
             change_set_id=change_set_id,
         )
@@ -4261,6 +4463,8 @@ class MetadataActivityHandler:
             output_schema=ui_maker_schema() if ui_page is not None else self._maker_output_schema(),
             timeout_seconds=7200,
             effort=resolve_agent_effort(ModelClass.WORKER, writable=True),
+            # NEW-243: the maker model rotation configured, else today's default (None).
+            model=self._rotated_model(payload, "maker"),
             writable=True,
             change_set_id=change_set_id,
         )
@@ -4505,7 +4709,8 @@ class MetadataActivityHandler:
             timeout_seconds=5400,
             effort=resolve_agent_effort(ModelClass.JUDGE),
             # NEW-53: optional pin; only meaningful for the Claude CLI.
-            model=self.settings.claude_checker_model if provider is Provider.CLAUDE else None,
+            model=self._rotated_model(payload, "checker")
+            or (self.settings.claude_checker_model if provider is Provider.CLAUDE else None),
             writable=False,
             change_set_id=change_set_id,
         )
