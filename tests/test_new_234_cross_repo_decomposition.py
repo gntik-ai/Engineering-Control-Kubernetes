@@ -208,11 +208,16 @@ def test_story_and_epic_lines_are_never_backlog_dependencies() -> None:
 
 
 def test_cross_repository_targets_are_only_falcone_serverless_to_falcone_and_charts() -> None:
+    # NEW-242: falcone-workflow has exactly the same targets (operator decision 2026-10-30).
     assert CROSS_REPOSITORY_TARGETS == {
         "falcone-serverless": {
             "gntik-ai/falcone": "source",
             "gntik-ai/falcone-charts": "deployment",
-        }
+        },
+        "falcone-workflow": {
+            "gntik-ai/falcone": "source",
+            "gntik-ai/falcone-charts": "deployment",
+        },
     }
     assert target_repository_allowed(PROJECT, "gntik-ai/falcone")
     assert target_repository_allowed(PROJECT, "gntik-ai/falcone-charts")

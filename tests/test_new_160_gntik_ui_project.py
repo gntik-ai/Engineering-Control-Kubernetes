@@ -1038,8 +1038,9 @@ async def test_the_controller_selects_and_completes_a_merge_only_delivery(
 # -- the root reconciler: gntik-ui joins without stranding an in-flight campaign -------------
 
 SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py"))
-# The allowlist before the newest project joined (gntik-ui at NEW-160, now
-# falcone-serverless): an in-flight campaign's policy and queued request stay valid.
+# The allowlist before the newest project joined (gntik-ui at NEW-160, then
+# falcone-serverless, now falcone-workflow at NEW-242): an in-flight campaign's policy and
+# queued request stay valid.
 PREVIOUS = [
     "gntik-ai/falcone",
     "gntik-ai/falcone-charts",
@@ -1047,10 +1048,13 @@ PREVIOUS = [
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
+    "gntik-ai/falcone-serverless",
 ]
-NEWEST = "gntik-ai/falcone-serverless"
-# The set before gntik-ui joined (NEW-160): still accepted, never rotated out.
-PRE_GNTIK_UI = PREVIOUS[:-1]
+NEWEST = "gntik-ai/falcone-workflow"
+# The sets before falcone-serverless and before gntik-ui joined: still accepted, never
+# rotated out.
+PRE_FALCONE_SERVERLESS = PREVIOUS[:-1]
+PRE_GNTIK_UI = PRE_FALCONE_SERVERLESS[:-1]
 
 
 def _request(tmp_path: Path, repositories: list[str], project: str = "falcone") -> Path:
@@ -1076,11 +1080,12 @@ def _request(tmp_path: Path, repositories: list[str], project: str = "falcone") 
 def test_the_reconciler_accepts_new_and_in_flight_requests(tmp_path: Path) -> None:
     assert SCRIPT["SAFE_REPOSITORIES"] == (*PREVIOUS, NEWEST)
     read = SCRIPT["read_request"]
-    assert read(_request(tmp_path, [*PREVIOUS, NEWEST], "falcone-serverless"), os.getuid())
+    assert read(_request(tmp_path, [*PREVIOUS, NEWEST], "falcone-workflow"), os.getuid())
     # NEW-160: a request queued by the previous release is still honoured.
     assert read(_request(tmp_path, PREVIOUS), os.getuid())["project"] == "falcone"
+    assert read(_request(tmp_path, PRE_FALCONE_SERVERLESS), os.getuid())["project"] == "falcone"
     assert read(_request(tmp_path, PRE_GNTIK_UI), os.getuid())["project"] == "falcone"
-    for other in (PREVIOUS[:-2], [NEWEST], [*PREVIOUS, NEWEST, "gntik-ai/x"]):
+    for other in (PRE_GNTIK_UI[:-1], [NEWEST], [*PREVIOUS, NEWEST, "gntik-ai/x"]):
         with pytest.raises(ValueError, match="repository set changed"):
             read(_request(tmp_path, other), os.getuid())
 
@@ -1119,10 +1124,12 @@ def _root_policy(
         ([*PREVIOUS, NEWEST], True),
         # The policy the running campaign enabled before this release.
         (PREVIOUS, True),
-        # The policy a campaign enabled before gntik-ui joined (review 1: never rotated out).
+        # The policies campaigns enabled before falcone-serverless and before gntik-ui joined
+        # (review 1: never rotated out).
+        (PRE_FALCONE_SERVERLESS, True),
         (PRE_GNTIK_UI, True),
         (None, True),
-        (PREVIOUS[:-2], False),
+        (PRE_GNTIK_UI[:-1], False),
         ([NEWEST], False),
     ],
 )
@@ -1160,8 +1167,16 @@ def test_the_worker_write_policy_accepts_the_in_flight_allowlist() -> None:
     )
 
     assert set(PREVIOUS) == PREVIOUS_WRITE_REPOSITORIES
-    assert HISTORICAL_WRITE_REPOSITORIES == (set(PREVIOUS), set(PRE_GNTIK_UI))
-    assert SCRIPT["HISTORICAL_SAFE_REPOSITORIES"] == (tuple(PREVIOUS), tuple(PRE_GNTIK_UI))
+    assert HISTORICAL_WRITE_REPOSITORIES == (
+        set(PREVIOUS),
+        set(PRE_FALCONE_SERVERLESS),
+        set(PRE_GNTIK_UI),
+    )
+    assert SCRIPT["HISTORICAL_SAFE_REPOSITORIES"] == (
+        tuple(PREVIOUS),
+        tuple(PRE_FALCONE_SERVERLESS),
+        tuple(PRE_GNTIK_UI),
+    )
     assert WRITE_REPOSITORIES == {*PREVIOUS, NEWEST}
     document = GitHubWritePolicyDocument(enabled=True, safe_repositories=tuple(PREVIOUS))
     assert NEWEST not in document.safe_repositories

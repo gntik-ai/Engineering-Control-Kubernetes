@@ -20,6 +20,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, Final
 
@@ -44,8 +45,6 @@ from engineering_control.engineering.ui_blueprint import (
     schema_errors,
 )
 
-PROJECT: Final = "falcone-serverless"
-DECOMPOSITION_PROJECTS = frozenset({PROJECT})
 PLAN_SCHEMA_ID: Final = "backlog-decomposition-v1"
 # Profile 1.7.0 released the decompose-backlog and review-decomposition skills; 1.7.1 adds
 # `contract:<ctr-id>` dependencies and the frame contracts' provider and consumer stories.
@@ -86,20 +85,8 @@ FINAL_REFUSAL = re.compile(
     r"\(DRAFT_SCHEMA_INVALID\)"
 )
 
-SOURCE_REPOSITORY: Final = project_repositories(PROJECT)[0]
 REPOSITORY_FALCONE: Final = "gntik-ai/falcone"
 REPOSITORY_FALCONE_CHARTS: Final = "gntik-ai/falcone-charts"
-# The three allowed (repository, role, components) targets (operator decision 2026-10-22).
-TASK_TARGETS: dict[str, tuple[str, frozenset[str]]] = {
-    SOURCE_REPOSITORY: ("source", frozenset({"worker", "controller"})),
-    REPOSITORY_FALCONE: ("source", frozenset({"functions-api", "quotas", "admission"})),
-    REPOSITORY_FALCONE_CHARTS: ("deployment", frozenset({"chart"})),
-}
-for _repository, (_role, _components) in TASK_TARGETS.items():
-    if _repository != SOURCE_REPOSITORY and (
-        CROSS_REPOSITORY_TARGETS.get(PROJECT, {}).get(_repository) != _role
-    ):
-        raise RuntimeError(f"decomposition target {_repository} is not a cross-repository target")
 # The per-repository test-command allowlist an epic batch may plan (exact strings). Only
 # hermetic commands: no cluster, kind, docker, network or live-mode suite. Excluded on
 # purpose (falcone-charts and falcone at their 2026-10-22 heads):
@@ -110,32 +97,146 @@ for _repository, (_role, _components) in TASK_TARGETS.items():
 # - falcone `pnpm test`: it runs the e2e, resilience and workflow suites, not only unit,
 #   adapter and contract tests.
 # The charts entries name single files that only run `helm template`.
-TEST_COMMANDS: dict[str, tuple[str, ...]] = {
-    SOURCE_REPOSITORY: (
-        "cargo fmt --all --check",
-        "cargo clippy --workspace --all-targets --locked -- -D warnings",
-        "cargo test --workspace --locked",
-        "gofmt -l controller",
-        "go -C controller vet ./...",
-        "go -C controller test ./...",
-    ),
-    REPOSITORY_FALCONE: (
-        "pnpm run test:unit",
-        "pnpm run test:contracts",
-        "pnpm run test:adapters",
-        "pnpm run lint",
-    ),
-    REPOSITORY_FALCONE_CHARTS: (
-        "helm lint charts/in-falcone",
-        "helm template in-falcone charts/in-falcone",
-        "node --test tests/apisix-standalone-routes-chart.test.mjs",
-        "node --test tests/networkpolicy-selector-reality.test.mjs",
-        "node --test tests/openshift-build-from-source-chart.test.mjs",
-        "node --test tests/blackbox/deployment-packaging/"
-        "node-numeric-image-identity-contract.test.mjs",
-    ),
+FALCONE_TEST_COMMANDS: tuple[str, ...] = (
+    "pnpm run test:unit",
+    "pnpm run test:contracts",
+    "pnpm run test:adapters",
+    "pnpm run lint",
+)
+FALCONE_CHARTS_TEST_COMMANDS: tuple[str, ...] = (
+    "helm lint charts/in-falcone",
+    "helm template in-falcone charts/in-falcone",
+    "node --test tests/apisix-standalone-routes-chart.test.mjs",
+    "node --test tests/networkpolicy-selector-reality.test.mjs",
+    "node --test tests/openshift-build-from-source-chart.test.mjs",
+    "node --test tests/blackbox/deployment-packaging/node-numeric-image-identity-contract.test.mjs",
+)
+_PROFILE_PROJECT = re.compile(r"[a-z][a-z0-9-]{0,39}")
+
+
+@dataclass(frozen=True, eq=False)
+class DecompositionProfile:
+    """NEW-242: what makes a backlog decomposition project-specific.
+
+    The project's own repository is the first target; the others must be the project's
+    cross-repository targets (change_requests.CROSS_REPOSITORY_TARGETS) with their role.
+    The backlog's issue marker, the issue-title prefix and the task key are derived from
+    the project name exactly as falcone-serverless (NEW-234) spelled them, so its plans,
+    part ids and hashes are unchanged."""
+
+    project: str
+    # The design document the inventory splits into numbered sections.
+    design_path: str
+    # repository -> (role, components), in input order (the project's own repository first).
+    task_targets: Mapping[str, tuple[str, frozenset[str]]]
+    # repository -> the exact test commands a task in it may plan.
+    test_commands: Mapping[str, tuple[str, ...]]
+    task_key: re.Pattern[str] = dataclass_field(init=False)
+    issue_marker: re.Pattern[str] = dataclass_field(init=False)
+    title_prefix: re.Pattern[str] = dataclass_field(init=False)
+    plan_key: re.Pattern[str] = dataclass_field(init=False)
+
+    def __post_init__(self) -> None:
+        project = self.project
+        # A plain name (letters, digits, hyphens) is literal in every pattern below.
+        if not _PROFILE_PROJECT.fullmatch(project):
+            raise RuntimeError(f"decomposition project {project!r} is not a plain name")
+        targets = list(self.task_targets)
+        if not targets or targets[0] != project_repositories(project)[0]:
+            raise RuntimeError(f"{project}: the first decomposition target must be its source")
+        for repository, (role, _components) in list(self.task_targets.items())[1:]:
+            if CROSS_REPOSITORY_TARGETS.get(project, {}).get(repository) != role:
+                raise RuntimeError(
+                    f"decomposition target {repository} is not a cross-repository target"
+                )
+        if list(self.test_commands) != targets:
+            raise RuntimeError(f"{project}: test commands must cover exactly the targets")
+        derived = {
+            "task_key": rf"^{project}:([A-Z]{{2,4}}-[0-9]{{2}})\.t([1-9][0-9]?)$",
+            "issue_marker": rf"<!--\s*{project}:([A-Z]{{2,4}}-[0-9]{{2}}|EP-[A-Z]{{2,4}})\s*-->",
+            "title_prefix": rf"^\[{project}\]\[[A-Z0-9-]+\]\s*",
+            "plan_key": rf"^{project}:([A-Z]{{2,4}}-[0-9]{{2}})\.(t[1-9][0-9]?)$",
+        }
+        for name, pattern in derived.items():
+            object.__setattr__(self, name, re.compile(pattern))
+
+    @property
+    def source_repository(self) -> str:
+        return next(iter(self.task_targets))
+
+    @property
+    def task_key_format(self) -> str:
+        return f"{self.project}:<STORY>.t<n>"
+
+
+# The three allowed (repository, role, components) targets (operator decision 2026-10-22).
+FALCONE_SERVERLESS = DecompositionProfile(
+    project="falcone-serverless",
+    design_path="docs/falcone-serverless-design.md",
+    task_targets={
+        "gntik-ai/falcone-serverless": ("source", frozenset({"worker", "controller"})),
+        REPOSITORY_FALCONE: ("source", frozenset({"functions-api", "quotas", "admission"})),
+        REPOSITORY_FALCONE_CHARTS: ("deployment", frozenset({"chart"})),
+    },
+    test_commands={
+        "gntik-ai/falcone-serverless": (
+            "cargo fmt --all --check",
+            "cargo clippy --workspace --all-targets --locked -- -D warnings",
+            "cargo test --workspace --locked",
+            "gofmt -l controller",
+            "go -C controller vet ./...",
+            "go -C controller test ./...",
+        ),
+        REPOSITORY_FALCONE: FALCONE_TEST_COMMANDS,
+        REPOSITORY_FALCONE_CHARTS: FALCONE_CHARTS_TEST_COMMANDS,
+    },
+)
+# NEW-242 (operator decision 2026-10-30): the engine and its workers live in
+# falcone-workflow; the facade, routing, console, quotas and admission changes in falcone;
+# the chart changes in falcone-charts. Its source commands are the planned pnpm workspace
+# scripts of the TypeScript repository (config/projects/falcone-workflow.yaml).
+FALCONE_WORKFLOW = DecompositionProfile(
+    project="falcone-workflow",
+    design_path="docs/falcone-workflow-design.md",
+    task_targets={
+        "gntik-ai/falcone-workflow": ("source", frozenset({"engine", "worker"})),
+        REPOSITORY_FALCONE: (
+            "source",
+            frozenset({"workflow-facade", "routing", "console", "quotas", "admission"}),
+        ),
+        REPOSITORY_FALCONE_CHARTS: ("deployment", frozenset({"chart"})),
+    },
+    test_commands={
+        "gntik-ai/falcone-workflow": (
+            "pnpm run lint",
+            "pnpm run typecheck",
+            "pnpm run test",
+        ),
+        REPOSITORY_FALCONE: FALCONE_TEST_COMMANDS,
+        REPOSITORY_FALCONE_CHARTS: FALCONE_CHARTS_TEST_COMMANDS,
+    },
+)
+DECOMPOSITION_PROFILES: Final[Mapping[str, DecompositionProfile]] = {
+    profile.project: profile for profile in (FALCONE_SERVERLESS, FALCONE_WORKFLOW)
 }
-TASK_KEY = re.compile(r"^falcone-serverless:([A-Z]{2,4}-[0-9]{2})\.t([1-9][0-9]?)$")
+DECOMPOSITION_PROJECTS = frozenset(DECOMPOSITION_PROFILES)
+
+
+def decomposition_profile(project: str) -> DecompositionProfile:
+    """The decomposition profile of a configured project (ValueError otherwise)."""
+    profile = DECOMPOSITION_PROFILES.get(project)
+    if profile is None:
+        raise ValueError(f"backlog decomposition is not configured for {project}")
+    return profile
+
+
+# The NEW-234 module names, kept for falcone-serverless (the first decomposition project):
+# code that knows its project reads decomposition_profile(project) instead.
+PROJECT: Final = FALCONE_SERVERLESS.project
+SOURCE_REPOSITORY: Final = FALCONE_SERVERLESS.source_repository
+TASK_TARGETS = FALCONE_SERVERLESS.task_targets
+TEST_COMMANDS = FALCONE_SERVERLESS.test_commands
+TASK_KEY = FALCONE_SERVERLESS.task_key
 STORY_KEY = re.compile(r"^[A-Z]{2,4}-[0-9]{2}$")
 # A dependency on a frame contract (profile 1.7.1): bound at assembly to every task whose
 # interfaces.provides names the contract.
@@ -216,22 +317,43 @@ def part_schema(kind: str) -> dict[str, Any]:
     return load_schema(DECOMPOSITION_PART_SCHEMAS[DECOMPOSE_SKILL][kind])
 
 
-def decomposition_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> list[str]:
-    """What the released agent pack lacks for the decomposition (empty when usable)."""
-    return agent_pack_problems(
+def decomposition_pack_problems(
+    root: Path, skills: tuple[str, ...] | None = None, *, project: str | None = None
+) -> list[str]:
+    """What the released agent pack lacks for the decomposition (empty when usable).
+
+    NEW-242: with `project`, also that the released decomposition schemas accept that
+    project and the pack has its domain pack (falcone-serverless always passes both with
+    the NEW-234 pack, so its result is unchanged)."""
+    problems = agent_pack_problems(
         root,
         skills,
         registry=DECOMPOSITION_SKILLS,
         part_schemas=DECOMPOSITION_PART_SCHEMAS,
         min_version=AGENT_PACK_MIN_VERSION,
     )
+    if project is None:
+        return problems
+    names = [
+        *(schema for _role, schema in DECOMPOSITION_SKILLS.values()),
+        *(name for parts in DECOMPOSITION_PART_SCHEMAS.values() for name in parts.values()),
+    ]
+    for name in dict.fromkeys(names):
+        accepted = load_schema(name).get("properties", {}).get("project")
+        if not isinstance(accepted, dict) or schema_errors(project, accepted):
+            problems.append(f"{name} does not accept project {project}")
+    if _pack_bytes(root, f"domain-packs/{project}/domains.yaml") is None:
+        problems.append(f"missing domain-packs/{project}/domains.yaml")
+    return problems
 
 
-def decomposition_provenance(root: Path, skill: str = DECOMPOSE_SKILL) -> str:
+def decomposition_provenance(
+    root: Path, skill: str = DECOMPOSE_SKILL, project: str = PROJECT
+) -> str:
     """The released instruction sources and schemas a drafted part depends on."""
     return plan_provenance(
         root,
-        PROJECT,
+        project,
         skill,
         registry=DECOMPOSITION_SKILLS,
         part_schemas=DECOMPOSITION_PART_SCHEMAS,
@@ -587,10 +709,12 @@ def task_proposal(task: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _proposal_problems(task: Mapping[str, Any], subject: str) -> list[PlanProblem]:
+def _proposal_problems(
+    task: Mapping[str, Any], subject: str, project: str = PROJECT
+) -> list[PlanProblem]:
     repository = str(task["target"]["repository"])
     try:
-        validate_proposal(task_proposal(task), PROJECT, repository)
+        validate_proposal(task_proposal(task), project, repository)
     except ValidationError as error:
         return [
             _problem(
@@ -622,7 +746,7 @@ def _duplicates(values: Iterable[str]) -> list[str]:
 
 
 def frame_problems(
-    frame: Mapping[str, Any], stories: Iterable[str] | None = None
+    frame: Mapping[str, Any], stories: Iterable[str] | None = None, *, project: str = PROJECT
 ) -> list[PlanProblem]:
     """Contract identity and paths (the frame defines every contract exactly once); with
     the inventory's `stories`, every provider and consumer story is one of them."""
@@ -643,7 +767,7 @@ def frame_problems(
                     f"path {contract['path']} {reason}",
                 )
             )
-        if contract["owner_repository"] not in TASK_TARGETS:
+        if contract["owner_repository"] not in decomposition_profile(project).task_targets:
             problems.append(
                 _problem(
                     "CONTRACT_OWNER_INVALID",
@@ -780,17 +904,18 @@ def _task_problems(
     facts: StoryFacts,
     amendment: _Amendment,
     contracts: Mapping[str, str],
+    profile: DecompositionProfile = FALCONE_SERVERLESS,
 ) -> list[PlanProblem]:
     key = str(task["key"])
     problems: list[PlanProblem] = []
-    match = TASK_KEY.fullmatch(key)
+    match = profile.task_key.fullmatch(key)
     if match is None:
         problems.append(
             _problem(
                 "TASK_KEY_INVALID",
                 "other",
                 key,
-                "must be falcone-serverless:<STORY>.t<n> with n from 1 to 99, no leading zero",
+                f"must be {profile.task_key_format} with n from 1 to 99, no leading zero",
             )
         )
     elif match.group(1) != facts.story_id:
@@ -804,7 +929,7 @@ def _task_problems(
         )
     target = task["target"]
     repository = str(target["repository"])
-    allowed = TASK_TARGETS.get(repository)
+    allowed = profile.task_targets.get(repository)
     if allowed is None or target["role"] != allowed[0] or target["component"] not in allowed[1]:
         problems.append(
             _problem(
@@ -837,7 +962,7 @@ def _task_problems(
                 problems.append(
                     _problem("PATH_REFUSED", "forbidden_path", key, f"{field} entry {reason}")
                 )
-    allowlist = TEST_COMMANDS.get(repository, ())
+    allowlist = profile.test_commands.get(repository, ())
     for command in task["test_commands"]:
         if command not in allowlist:
             problems.append(
@@ -918,7 +1043,7 @@ def _task_problems(
             )
     if key in task["depends_on"]:
         problems.append(_problem("DEPENDENCY_SELF", "dependency", key, "depends on itself"))
-    problems += _proposal_problems(task, key)
+    problems += _proposal_problems(task, key, profile.project)
     return problems
 
 
@@ -927,13 +1052,14 @@ def _story_problems(
     facts: StoryFacts,
     all_stories: Mapping[str, StoryFacts],
     contracts: Mapping[str, str],
+    profile: DecompositionProfile = FALCONE_SERVERLESS,
 ) -> tuple[_Amendment, list[PlanProblem]]:
     """The story's tasks against the amended story: every criterion and requirement of the
     amended story (an added one included, a replaced one still) is covered."""
     amendment, problems = _amendment(story, facts, all_stories)
     tasks = list(story["tasks"])
     for task in tasks:
-        problems += _task_problems(task, facts, amendment, contracts)
+        problems += _task_problems(task, facts, amendment, contracts, profile)
     covered = {
         criterion
         for task in tasks
@@ -1034,6 +1160,7 @@ def _graph_problems(
     *,
     resolved: Mapping[str, tuple[str, Sequence[str]]],
     deferred: frozenset[str] = frozenset(),
+    profile: DecompositionProfile = FALCONE_SERVERLESS,
 ) -> list[PlanProblem]:
     """`tasks` (key -> story, depends_on) are checked; `resolved` is every task they may
     name (themselves included); a key of a `deferred` story (not drafted yet) is checked
@@ -1044,7 +1171,7 @@ def _graph_problems(
         for dependency in dependencies:
             if dependency == key:
                 continue
-            match = TASK_KEY.fullmatch(dependency)
+            match = profile.task_key.fullmatch(dependency)
             other = match.group(1) if match else None
             if dependency not in resolved and other not in deferred:
                 problems.append(
@@ -1085,6 +1212,7 @@ def _prerequisite_problems(
     resolved: Mapping[str, tuple[str, Sequence[str]]],
     drafted: frozenset[str],
     providers: Mapping[str, Sequence[str]],
+    profile: DecompositionProfile = FALCONE_SERVERLESS,
 ) -> list[PlanProblem]:
     """Every (amended) prerequisite story V of a story S orders S's work: some task of S
     depends, directly or through other tasks, on a task of V. A prerequisite whose batch
@@ -1100,7 +1228,7 @@ def _prerequisite_problems(
             if key in seen:
                 continue
             seen.add(key)
-            match = TASK_KEY.fullmatch(key)
+            match = profile.task_key.fullmatch(key)
             if match is not None:
                 reached.add(match.group(1))
             if key in resolved:
@@ -1171,6 +1299,7 @@ def _stories_problems(
 ) -> list[PlanProblem]:
     """Every story, task, uniqueness and dependency rule over `stories`; `earlier` are the
     reviewed stories they may also depend on; `deferred` stories are not drafted yet."""
+    profile = decomposition_profile(str(inventory.get("project", PROJECT)))
     facts = story_facts(inventory)
     contracts = {str(item["id"]): str(item["owner_repository"]) for item in frame["contracts"]}
     problems: list[PlanProblem] = []
@@ -1188,7 +1317,7 @@ def _stories_problems(
             )
             continue
         own_stories.add(story_id)
-        amendment, found = _story_problems(story, facts[story_id], facts, contracts)
+        amendment, found = _story_problems(story, facts[story_id], facts, contracts, profile)
         amendments[story_id] = amendment
         problems += found
     # The amended story graph stays acyclic (an amendment may not invert a prerequisite).
@@ -1258,13 +1387,14 @@ def _stories_problems(
     resolved = {
         str(task["key"]): (story_id, tuple(bound[str(task["key"])][0])) for story_id, task in every
     }
-    problems += _graph_problems(own, closure, resolved=resolved, deferred=deferred)
+    problems += _graph_problems(own, closure, resolved=resolved, deferred=deferred, profile=profile)
     problems += _prerequisite_problems(
         [story for story in stories if str(story["story_id"]) in own_stories],
         graph,
         resolved,
         frozenset(facts) - deferred,
         providers,
+        profile,
     )
     return problems
 
@@ -1337,7 +1467,9 @@ def check_frame_draft(
     if _part_kind(part)[0] != FRAME:
         raise ValueError("a frame draft needs a frame part id")
     frame = _checked_part(value, FRAME, inputs, part, {})
-    problems = text_problems(frame, "frame") + frame_problems(frame, stories)
+    problems = text_problems(frame, "frame") + frame_problems(
+        frame, stories, project=inputs.project
+    )
     if problems:
         raise DecompositionRejected("DRAFT_STRUCTURE_INVALID", problems)
     return frame
@@ -1453,8 +1585,8 @@ class EpicPart:
 def plan_problems(plan: Mapping[str, Any], inventory: Mapping[str, Any]) -> list[PlanProblem]:
     """Every plan rule over a whole plan (assembly, and re-validation of a stored plan)."""
     problems: list[PlanProblem] = []
-    expected_inputs = DecompositionInputs.of(inventory).plan_inputs()
-    if plan.get("project") != PROJECT or plan.get("inputs") != expected_inputs:
+    inputs = DecompositionInputs.of(inventory)
+    if plan.get("project") != inputs.project or plan.get("inputs") != inputs.plan_inputs():
         problems.append(
             _problem("PLAN_BINDING_MISMATCH", "other", "inputs", "differs from the inventory")
         )
@@ -1491,7 +1623,7 @@ def plan_problems(plan: Mapping[str, Any], inventory: Mapping[str, Any]) -> list
             )
     frame = plan["frame"]
     problems += text_problems(plan, "")
-    problems += frame_problems(frame)
+    problems += frame_problems(frame, project=inputs.project)
     problems += _stories_problems(stories, inventory, frame)
     return problems
 
@@ -1546,10 +1678,11 @@ def assemble_plan(
             )
     if problems:
         raise DecompositionRejected("ASSEMBLY_INVALID", problems)
+    inputs = DecompositionInputs.of(inventory)
     plan: dict[str, Any] = {
         "schema": PLAN_SCHEMA_ID,
-        "project": PROJECT,
-        "inputs": DecompositionInputs.of(inventory).plan_inputs(),
+        "project": inputs.project,
+        "inputs": inputs.plan_inputs(),
         "frame": copy.deepcopy(dict(frame)),
         "stories": stories,
     }
@@ -1599,7 +1732,7 @@ def _preview_body(proposal: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def task_risk(task: Mapping[str, Any]) -> dict[str, Any]:
+def task_risk(task: Mapping[str, Any], project: str = PROJECT) -> dict[str, Any]:
     """The import risk Hermes calculates for a task's change request, and the effective
     (higher) one. Never rewords a task; an escalation is shown to the operator."""
     proposal = task_proposal(task)
@@ -1607,7 +1740,7 @@ def task_risk(task: Mapping[str, Any]) -> dict[str, Any]:
     calculated = calculated_issue_risk(
         repository,
         (CHANGE_REQUEST_LABEL, str(task["kind"])),
-        issue_title(validate_proposal(proposal, PROJECT, repository)),
+        issue_title(validate_proposal(proposal, project, repository)),
         _preview_body(proposal),
     )
     proposed = str(task["proposed_risk"])
@@ -1623,7 +1756,8 @@ def task_risk(task: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def risk_preview(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
-    return [task_risk(task) for story in plan["stories"] for task in story["tasks"]]
+    project = str(plan.get("project", PROJECT))
+    return [task_risk(task, project) for story in plan["stories"] for task in story["tasks"]]
 
 
 # --------------------------------------------------------------------------------------
@@ -1664,7 +1798,7 @@ def render_markdown(
     providers = _contract_providers(tasks)
     per_repository = {
         repository: sum(1 for task in tasks if task["target"]["repository"] == repository)
-        for repository in TASK_TARGETS
+        for repository in decomposition_profile(str(plan["project"])).task_targets
     }
     inputs = plan["inputs"]
     lines = [
@@ -1756,7 +1890,7 @@ def decomposition_workflow_id(project: str, decomposition_id: str) -> str:
     return f"{WORKFLOW_PREFIX}{project}-{decomposition_id}"
 
 
-def pack_revision(root: Path) -> str:
+def pack_revision(root: Path, project: str = PROJECT) -> str:
     """The released agent-pack revision a plan is drafted and reviewed under: the
     provenance of both skills (their instruction sources, roles, profile, catalog records
     and schemas). Bound into every part id and into the approval, so a pack change between
@@ -1773,7 +1907,8 @@ def pack_revision(root: Path) -> str:
         {
             "kind": "hermes-backlog-decomposition-pack-v2",
             "skills": {
-                skill: decomposition_provenance(root, skill) for skill in DECOMPOSITION_SKILLS
+                skill: decomposition_provenance(root, skill, project)
+                for skill in DECOMPOSITION_SKILLS
             },
             "released_schemas": released,
         }
@@ -1868,6 +2003,7 @@ def assembly_redrafts(
     id names its story's epic batch; a duplicate title names the last batch (in drafting
     order) with a task of that title. Returns (part id -> its problems, in `parts` order;
     the problems no part owns)."""
+    task_key = decomposition_profile(str(inventory.get("project", PROJECT))).task_key
     facts = story_facts(inventory)
     by_epic = {part.number: part.part_id for part in parts}
     titles: dict[str, str] = {}
@@ -1880,7 +2016,7 @@ def assembly_redrafts(
     unowned: list[dict[str, Any]] = []
     for problem in problems:
         subject = str(problem.get("subject") or "")
-        match = TASK_KEY.fullmatch(subject)
+        match = task_key.fullmatch(subject)
         story = match.group(1) if match else subject if STORY_KEY.fullmatch(subject) else None
         owner: str | None = None
         if story is not None and story in facts:

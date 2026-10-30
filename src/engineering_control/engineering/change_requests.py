@@ -47,11 +47,16 @@ UI_KIT_REPOSITORIES: dict[str, tuple[str, ...]] = {"falcone": ("gntik-ai/gntik-u
 # role each one plays. A backlog decomposition of falcone-serverless files its technical
 # issues in falcone (source) and falcone-charts (deployment); the request keeps its own
 # project, and the operator publishes with their own gh, as for every change request.
+# NEW-242: falcone-workflow has the same targets (operator decision 2026-10-30).
 CROSS_REPOSITORY_TARGETS: dict[str, dict[str, Literal["source", "deployment"]]] = {
     "falcone-serverless": {
         "gntik-ai/falcone": "source",
         "gntik-ai/falcone-charts": "deployment",
-    }
+    },
+    "falcone-workflow": {
+        "gntik-ai/falcone": "source",
+        "gntik-ai/falcone-charts": "deployment",
+    },
 }
 # NEW-157: the registry's repositories plus the UI-kit ones, de-duplicated in order.
 CHANGE_REQUEST_REPOSITORY_ALTERNATION = alternation(

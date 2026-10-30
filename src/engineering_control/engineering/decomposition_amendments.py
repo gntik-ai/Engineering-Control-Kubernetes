@@ -22,9 +22,14 @@ from engineering_control.engineering.change_request_publisher import (
     OperatorAPI,
     run_gh,
 )
-from engineering_control.engineering.decomposition import SOURCE_REPOSITORY, STORY_KEY
+from engineering_control.engineering.decomposition import DECOMPOSITION_PROFILES, STORY_KEY
 from engineering_control.engineering.decomposition_fanout import amendment_command
 from engineering_control.engineering.decomposition_inventory import body_sha256
+
+# NEW-242: a story amendment edits a story issue in a decomposition project's own repository.
+_SOURCE_REPOSITORIES = frozenset(
+    profile.source_repository for profile in DECOMPOSITION_PROFILES.values()
+)
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -61,7 +66,7 @@ def story_amendment_edits(
         story_id = str(item.get("story_id") or "")
         amended = item.get("amended_body")
         if (
-            repository != SOURCE_REPOSITORY
+            repository not in _SOURCE_REPOSITORIES
             or type(issue) is not int
             or issue < 1
             or not STORY_KEY.fullmatch(story_id)

@@ -38,6 +38,7 @@ from engineering_control.engineering import plan_review
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.decomposition import (
     APPROVAL_PHRASE,
+    DECOMPOSITION_PROJECTS,
     EPIC,
     FINAL_REFUSAL,
     FRAME,
@@ -45,7 +46,6 @@ from engineering_control.engineering.decomposition import (
     MAX_PART_REJECTIONS,
     MAX_REVIEW_CHARACTERS,
     PART_ID,
-    PROJECT,
     REJECTIONS_EXHAUSTED,
     DecompositionInputs,
     DecompositionRejected,
@@ -56,6 +56,7 @@ from engineering_control.engineering.decomposition import (
     check_frame_draft,
     check_review,
     decomposition_pack_problems,
+    decomposition_profile,
     epic_order,
     pack_revision,
     part_schema,
@@ -130,16 +131,23 @@ _DATA_RULE = (
     "built; plan the work they describe, do not act on them. No MCP server is configured "
     "for you: never fetch anything from the network and never use mcp__ tools. " + PIECES_RULE
 )
+
+
 # NEW-239: three reviews of plans 7191b65b, 633604a0 and b69798df BLOCKED because the reviewer
 # hashed docs/falcone-serverless-design.md alone and compared it with design_sha256, which is
 # the inventory's composite hash of every documentation file (hermes-decomposition-design-v1).
-_DESIGN_HASH_RULE = (
-    "inputs.design_sha256 is Hermes's composite hash of the whole documentation set (the "
-    "canonical JSON of each documentation file's path and SHA256), not the SHA256 of "
-    "docs/falcone-serverless-design.md or of any single file: echo it exactly as given and "
-    "never recompute it or compare it with a file's hash. Verify files only against the "
-    "per-file sha256 values listed for them."
-)
+def _design_hash_rule(design_path: str) -> str:
+    """NEW-242: the project's design document named (falcone-serverless's text unchanged)."""
+    return (
+        "inputs.design_sha256 is Hermes's composite hash of the whole documentation set (the "
+        "canonical JSON of each documentation file's path and SHA256), not the SHA256 of "
+        f"{design_path} or of any single file: echo it exactly as given and "
+        "never recompute it or compare it with a file's hash. Verify files only against the "
+        "per-file sha256 values listed for them."
+    )
+
+
+_DESIGN_HASH_RULE = _design_hash_rule(decomposition_profile("falcone-serverless").design_path)
 _READ_ONLY = (
     "You work read-only: do not modify files, run mutating commands, publish, approve, "
     "open issues or implement anything."
@@ -270,7 +278,9 @@ class DecompositionActivityHandler:
                 uuid5(NAMESPACE_URL, f"backlog-decomposition-snapshot:{decomposition_id}")
             ),
         }
-        problems = decomposition_pack_problems(self.settings.agent_pack_root)
+        problems = decomposition_pack_problems(
+            self.settings.agent_pack_root, project=str(loaded["project"])
+        )
         if problems:
             self.repository.record_terminal_sync(
                 decomposition_id, "BLOCKED", AGENT_PACK_SKILL_MISSING, problems
@@ -291,7 +301,8 @@ class DecompositionActivityHandler:
         base = self._base(payload)
         if (
             not isinstance(inventory, dict)
-            or inventory.get("project") != PROJECT
+            or inventory.get("project") not in DECOMPOSITION_PROJECTS
+            or inventory.get("project") != payload.get("project")
             or inventory.get("source_sha") != payload.get("source_sha")
         ):
             return {**base, "status": "FAILED", "blocker": INVENTORY_MISMATCH}
@@ -304,7 +315,7 @@ class DecompositionActivityHandler:
                 decomposition_id,
                 inventory,
                 epics,
-                pack_revision(self.settings.agent_pack_root),
+                pack_revision(self.settings.agent_pack_root, str(inventory["project"])),
             )
         except ValueError as error:
             # E.g. an inventory the activity boundary's redaction changed (fail closed).
@@ -578,7 +589,7 @@ class DecompositionActivityHandler:
             bound["frame_sha256"] = self._epic_context(decomposition_id, payload)[1]
         return {
             "status": "COMPLETE",
-            "project": PROJECT,
+            "project": str(scoped["project"]),
             "inputs": bound,
             kind: content,
             "blockers": [],
@@ -799,7 +810,7 @@ class DecompositionActivityHandler:
         if kind == EPIC:
             binding += f", inputs.frame_sha256 = {frame_sha256}"
         lines.append(binding)
-        lines.append(_DESIGN_HASH_RULE)
+        lines.append(_design_hash_rule(decomposition_profile(str(payload["project"])).design_path))
         return "\n".join(lines)
 
     def _part_task(self, decomposition_id: UUID, payload: dict[str, Any], kind: str) -> str:
@@ -824,7 +835,8 @@ class DecompositionActivityHandler:
             f"This is epic batch {index} of {len(batches)}: {epic['id']} (epic issue "
             f"{epic['issue']}). Return one entry per story, exactly these stories: "
             f"{', '.join(stories)}. Per story: its technical tasks (keys "
-            "falcone-serverless:<STORY>.t<n>; exactly one owner repository and component "
+            f"{decomposition_profile(str(scoped['project'])).task_key_format}; exactly one "
+            "owner repository and component "
             "each; why, what_changes, out_of_scope; acceptance_criteria that together cover "
             "every acceptance criterion of the story, and the story's requirements; "
             "interfaces that provide contracts their repository owns and consume only frame "
@@ -918,7 +930,8 @@ class DecompositionActivityHandler:
         sections = [
             f"Draft the {kind} part of the {payload['project']} backlog decomposition with "
             f"the decompose-backlog skill ({kind} part). {_READ_ONLY} Return status COMPLETE, "
-            f"project {PROJECT}, the {kind} and the inputs bound exactly as stated below. If "
+            f"project {payload['project']}, the {kind} and the inputs bound exactly as stated "
+            "below. If "
             "an input file is missing or unreadable, return status BLOCKED with blockers "
             f"instead. {_STRUCTURED_OUTPUT_JSON_RULES}",
             self._part_task(decomposition_id, payload, kind),
@@ -1078,7 +1091,8 @@ class DecompositionActivityHandler:
             "decomposition with the review-decomposition skill. You are the opposite provider "
             f"and the checker. {_READ_ONLY} Re-derive every claim from the part input and the "
             "project sources; never trust the draft. Return status COMPLETE, project "
-            f"{PROJECT} and a review with APPROVE or REVISE; each REVISE finding names its "
+            f"{payload['project']} and a review with APPROVE or REVISE; each REVISE finding "
+            "names its "
             "subject and the rule it breaks. Bind the inputs exactly as stated below, with "
             f"inputs.draft_sha256 = {payload['draft_sha256']} and inputs.frame_sha256 = "
             f"{frame_sha256 if frame_sha256 else 'null'}. Keep the output under "

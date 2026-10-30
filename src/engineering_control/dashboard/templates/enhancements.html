@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="page-heading"><div><p class="eyebrow">Persisted enhancement candidates</p><h2>Enhancements</h2></div><a href="/commands">Back to commands</a></section>
-<form id="enhancements-filters" class="filters"><label>Project<select name="project"><option value="">All</option><option>falcone</option><option>musematic</option><option>llmwiki</option><option>gntik-ui</option><option>falcone-serverless</option></select></label><label>Limit<input name="limit" type="number" min="1" max="200" value="100"></label><button type="submit">Apply</button></form>
+<form id="enhancements-filters" class="filters"><label>Project<select name="project"><option value="">All</option><option>falcone</option><option>musematic</option><option>llmwiki</option><option>gntik-ui</option><option>falcone-serverless</option><option>falcone-workflow</option></select></label><label>Limit<input name="limit" type="number" min="1" max="200" value="100"></label><button type="submit">Apply</button></form>
 <p id="enhancements-error" class="alert error hidden" role="alert" aria-live="polite"></p><p id="enhancements-refreshed" class="muted"></p>
 <div class="table-shell"><table><thead><tr><th>Enhancement</th><th>Project</th><th>Campaign</th><th>Persona</th><th>Repository</th><th>Risk</th><th>Status</th><th>Summary</th><th>Updated</th></tr></thead><tbody id="enhancements-rows"></tbody></table></div>
 <p id="enhancements-empty" class="empty hidden">No persisted enhancements match this filter.</p>

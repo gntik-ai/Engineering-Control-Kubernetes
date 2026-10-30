@@ -100,7 +100,11 @@ from engineering_control.db.ui_gap_consolidations import (
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.engineering.change_requests import prepare_intake
 from engineering_control.engineering.decomposition import (
+    DECOMPOSITION_PROJECTS,
     decomposition_pack_problems,
+)
+from engineering_control.engineering.decomposition import (
+    PROJECT as DECOMPOSITION_PROJECT,
 )
 from engineering_control.engineering.decomposition import (
     pack_revision as decomposition_pack_revision,
@@ -1964,13 +1968,21 @@ def create_app(
             "usage": (view or {}).get("usage") or {},
         }
 
-    async def decomposition_pack() -> tuple[str, list[str]]:
-        """The released agent pack now: a plan drafted under another pack is refused."""
+    async def decomposition_pack(
+        repository: BacklogDecompositionRepository, decomposition_id: UUID
+    ) -> tuple[str, list[str]]:
+        """The released agent pack now: a plan drafted under another pack is refused.
+        NEW-242: the revision binds the plan's project (its domain pack); an unknown id
+        keeps falcone-serverless's, and the repository then refuses it (not found)."""
+        view = await repository.get(decomposition_id)
+        project = str((view or {}).get("project") or "")
+        if project not in DECOMPOSITION_PROJECTS:
+            project = DECOMPOSITION_PROJECT
         current_pack = await asyncio.to_thread(
-            decomposition_pack_revision, resolved.agent_pack_root
+            decomposition_pack_revision, resolved.agent_pack_root, project
         )
         pack_problems = await asyncio.to_thread(
-            decomposition_pack_problems, resolved.agent_pack_root
+            decomposition_pack_problems, resolved.agent_pack_root, project=project
         )
         return current_pack, pack_problems
 
@@ -1985,7 +1997,7 @@ def create_app(
         """Approve the plan (PR5) and start or join its fan-out (NEW-234 PR6). A replay
         re-runs the plan and pack checks and resumes the fan-out."""
         actor = approval_actor(subject)
-        current_pack, pack_problems = await decomposition_pack()
+        current_pack, pack_problems = await decomposition_pack(repository, decomposition_id)
         try:
             approved = await repository.approve(
                 decomposition_id,
@@ -2037,7 +2049,7 @@ def create_app(
         actor = approval_actor(subject)
         limit = resolved.backlog_decomposition_fanout_max_items
         max_items = min(body.max_items or limit, limit)
-        current_pack, pack_problems = await decomposition_pack()
+        current_pack, pack_problems = await decomposition_pack(repository, decomposition_id)
         try:
             await repository.check_retry(
                 decomposition_id,

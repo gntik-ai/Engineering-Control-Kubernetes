@@ -183,6 +183,7 @@ def test_controller_bootstrap_installs_every_declared_project_manifest() -> None
 
     assert declared_projects == [
         "falcone-serverless.yaml",
+        "falcone-workflow.yaml",
         "falcone.yaml",
         "gntik-ui.yaml",
         "llmwiki.yaml",
@@ -300,7 +301,7 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     assert "set -euo pipefail" in script
     assert (
         "repositories=(falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui "
-        "falcone-serverless)" in script
+        "falcone-serverless falcone-workflow)" in script
     )
     assert "if [[ ! -e ${target} ]]; then" in script
     assert "-- --mirror" in script
@@ -585,6 +586,7 @@ def test_documented_worker_then_mirror_bootstrap_order_dry_run(tmp_path: Path) -
         "llmwiki",
         "gntik-ui",
         "falcone-serverless",
+        "falcone-workflow",
     ):
         target = root / f"{repository}.git"
         assert target.is_dir()

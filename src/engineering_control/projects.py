@@ -20,7 +20,9 @@ ORGANIZATION: Final = "gntik-ai"
 
 # mypy cannot build a Literal from a tuple, so the Literal is the source and the tuples
 # are derived from it.
-ProjectName = Literal["falcone", "musematic", "llmwiki", "gntik-ui", "falcone-serverless"]
+ProjectName = Literal[
+    "falcone", "musematic", "llmwiki", "gntik-ui", "falcone-serverless", "falcone-workflow"
+]
 # Projects of the global / multi-project campaign paths (all-project audit, backlog
 # campaign id maps). A project may be registered without joining them.
 GlobalProjectName = Literal["falcone", "musematic", "llmwiki"]
@@ -33,6 +35,7 @@ RepositorySlug = Literal[
     "llmwiki",
     "gntik-ui",
     "falcone-serverless",
+    "falcone-workflow",
 ]
 BranchName = Literal["main", "master"]
 RepositoryFullName = Literal[
@@ -43,6 +46,7 @@ RepositoryFullName = Literal[
     "gntik-ai/llmwiki",
     "gntik-ai/gntik-ui",
     "gntik-ai/falcone-serverless",
+    "gntik-ai/falcone-workflow",
 ]
 
 PROJECTS: Final[tuple[ProjectName, ...]] = get_args(ProjectName)
@@ -66,6 +70,9 @@ PROJECT_REPOSITORY_SLUGS: Final[MappingProxyType[str, tuple[str, str]]] = Mappin
         # The Falcone serverless runtime (Rust worker, Go controller). No runtime adapter
         # yet: delivery ends at Hermes's protected merge, as for gntik-ui.
         "falcone-serverless": ("falcone-serverless", "falcone-serverless"),
+        # NEW-242: the Falcone durable-workflow engine and workers (TypeScript/Node). No
+        # runtime adapter yet: delivery ends at Hermes's protected merge.
+        "falcone-workflow": ("falcone-workflow", "falcone-workflow"),
     }
 )
 # project -> (source full name, deployment full name)
@@ -115,6 +122,7 @@ DEFAULT_BRANCH: Final[MappingProxyType[str, BranchName]] = MappingProxyType(
         "llmwiki": "master",
         "gntik-ui": "main",
         "falcone-serverless": "main",
+        "falcone-workflow": "main",
     }
 )
 

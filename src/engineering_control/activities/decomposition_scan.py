@@ -19,9 +19,9 @@ from uuid import UUID
 from engineering_control.activities.ui_plan_scan import UiPlanScanSteps
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.decomposition import (
+    DECOMPOSITION_PROJECTS,
     EPIC,
     FRAME,
-    PROJECT,
     part_content_sha256,
     plan_json,
 )
@@ -82,8 +82,12 @@ class DecompositionScanSteps(UiPlanScanSteps):
     model input root is the provisioned UI plan input root (one directory per plan id)."""
 
     def _decomposition_inventory(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if payload.get("project") != PROJECT:
-            raise ValueError("decomposition inventory is configured only for falcone-serverless")
+        project = payload.get("project")
+        if project not in DECOMPOSITION_PROJECTS:
+            raise ValueError(
+                "decomposition inventory is configured only for "
+                + ", ".join(sorted(DECOMPOSITION_PROJECTS))
+            )
         snapshot = payload.get("snapshot")
         if not isinstance(snapshot, dict):
             raise ValueError("decomposition inventory requires the immutable source snapshot")
@@ -99,7 +103,10 @@ class DecompositionScanSteps(UiPlanScanSteps):
                 raise DecompositionSourceError(SOURCE_INVALID, ["the issue snapshot is invalid"])
             issues = [_issue(item) for item in raw]
             inventory = build_inventory(
-                source_sha=source_sha, files=read_sources(worktree), issues=issues
+                source_sha=source_sha,
+                files=read_sources(worktree, str(project)),
+                issues=issues,
+                project=str(project),
             )
         except DecompositionSourceError as error:
             return {"status": "BLOCKED", "blocker": error.code, "blockers": error.details}

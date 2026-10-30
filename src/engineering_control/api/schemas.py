@@ -421,6 +421,7 @@ class ChangeRequestCreate(APIModel):
             "gntik-ai/llmwiki",
             "gntik-ai/gntik-ui",
             "gntik-ai/falcone-serverless",
+            "gntik-ai/falcone-workflow",
         ]
         | None
     ) = None
@@ -449,7 +450,7 @@ class UiBlueprintApproval(APIModel):
 class DecompositionCreate(APIModel):
     """NEW-234 PR5: start a backlog decomposition plan for one configured project."""
 
-    project: Literal["falcone-serverless"]
+    project: Literal["falcone-serverless", "falcone-workflow"]
     # Optional expected project main head; the snapshot refuses any other commit.
     source_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
     # Optional epic scope (ids such as EP-API or numbers); default every epic.
@@ -523,7 +524,7 @@ class ChangeRequestPublication(APIModel):
         pattern=(
             r"^https://github\.com/gntik-ai/"
             r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui"
-            r"|falcone-serverless)"
+            r"|falcone-serverless|falcone-workflow)"
             r"/issues/[1-9][0-9]*$"
         )
     )

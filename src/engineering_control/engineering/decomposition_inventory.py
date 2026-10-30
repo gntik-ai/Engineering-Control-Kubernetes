@@ -32,13 +32,14 @@ from engineering_control.engineering.decomposition import (
     PART_ID,
     PROJECT,
     STORY_KEY,
-    TASK_TARGETS,
-    TEST_COMMANDS,
+    DecompositionProfile,
+    decomposition_profile,
 )
 from engineering_control.engineering.safe_files import open_directory_no_follow, write_text_at
 
 INVENTORY_KIND: Final = "hermes-backlog-decomposition-inventory-v1"
-DESIGN_PATH: Final = "docs/falcone-serverless-design.md"
+# falcone-serverless's (NEW-234); a project's own is its profile's design_path (NEW-242).
+DESIGN_PATH: Final = decomposition_profile(PROJECT).design_path
 BACKLOG_PATH: Final = "docs/backlog.json"
 AGENTS_PATH: Final = "AGENTS.md"
 ARCHITECTURE_REVIEW_PATH: Final = "docs/architecture-review.md"
@@ -63,12 +64,14 @@ HERMES_FILLS = (
     "Depends on: lines",
     "the change-request identity",
 )
-TASK_KEY_FORMAT = f"{PROJECT}:<STORY>.t<n>"
-_MARKER = re.compile(r"<!--\s*falcone-serverless:([A-Z]{2,4}-[0-9]{2}|EP-[A-Z]{2,4})\s*-->")
+# falcone-serverless's task-key format, issue marker and title prefix (NEW-234); NEW-242:
+# every project's are its DecompositionProfile's.
+TASK_KEY_FORMAT = decomposition_profile(PROJECT).task_key_format
+_MARKER = decomposition_profile(PROJECT).issue_marker
 # NEW-234 PR5: the GitHub snapshot step keeps only the issues carrying a backlog marker.
 ISSUE_MARKER = _MARKER
 _EPIC_ID = re.compile(r"^EP-([A-Z]{2,4})$")
-_TITLE_PREFIX = re.compile(r"^\[falcone-serverless\]\[[A-Z0-9-]+\]\s*")
+_TITLE_PREFIX = decomposition_profile(PROJECT).title_prefix
 _HEADING = re.compile(r"^(#{2,3}) +(\S.*?)\s*$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _NUMBERED = re.compile(r"^([0-9]{1,2})\.\s+(\S.*)$")
@@ -252,12 +255,13 @@ def _read_regular(root: int, relative: str) -> bytes | None:
             os.close(parent)
 
 
-def read_sources(root: Path) -> dict[str, bytes]:
+def read_sources(root: Path, project: str = PROJECT) -> dict[str, bytes]:
     """The documentation files the inventory reads, from a checked-out snapshot."""
+    design_path = decomposition_profile(project).design_path
     files: dict[str, bytes] = {}
     pinned = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        for relative in (DESIGN_PATH, BACKLOG_PATH, AGENTS_PATH, ARCHITECTURE_REVIEW_PATH):
+        for relative in (design_path, BACKLOG_PATH, AGENTS_PATH, ARCHITECTURE_REVIEW_PATH):
             data = _read_regular(pinned, relative)
             if data is not None:
                 files[relative] = data
@@ -401,8 +405,9 @@ def body_dependencies(body: str) -> list[str] | None:
     return None
 
 
-def _title(value: str) -> str:
-    return _TITLE_PREFIX.sub("", value).strip()
+def _title(value: str, profile: DecompositionProfile | None = None) -> str:
+    prefix = _TITLE_PREFIX if profile is None else profile.title_prefix
+    return prefix.sub("", value).strip()
 
 
 def _summary(text: str) -> tuple[str, str]:
@@ -428,7 +433,7 @@ def _summary(text: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------------------
 
 
-def _backlog(raw: bytes) -> dict[str, Any]:
+def _backlog(raw: bytes, project: str = PROJECT) -> dict[str, Any]:
     try:
         value = json.loads(_decode(BACKLOG_PATH, raw))
     except json.JSONDecodeError as error:
@@ -436,18 +441,20 @@ def _backlog(raw: bytes) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
         or value.get("schema_version") != 1
-        or value.get("project") != PROJECT
+        or value.get("project") != project
         or not isinstance(value.get("issues"), list)
         or not isinstance(value.get("requirements"), list)
     ):
         raise DecompositionSourceError(
-            SOURCE_INVALID, [f"{BACKLOG_PATH} is not a schema 1 {PROJECT} backlog"]
+            SOURCE_INVALID, [f"{BACKLOG_PATH} is not a schema 1 {project} backlog"]
         )
     return value
 
 
 def _backlog_items(
-    backlog: dict[str, Any], sections: Mapping[str, dict[str, Any]]
+    backlog: dict[str, Any],
+    sections: Mapping[str, dict[str, Any]],
+    marker: re.Pattern[str] = _MARKER,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
     problems: list[str] = []
     requirements: dict[str, str] = {}
@@ -464,7 +471,7 @@ def _backlog_items(
             continue
         identity = str(item.get("id"))
         body = str(item.get("body") or "")
-        markers = _MARKER.findall(body)
+        markers = marker.findall(body)
         if markers != [identity]:
             problems.append(f"{identity} body does not carry exactly its own marker")
         if item.get("type") == "epic":
@@ -575,7 +582,10 @@ def _cycle_problems(graph: Mapping[str, Sequence[str]]) -> list[str]:
 
 
 def _join_issues(
-    epics: list[dict[str, Any]], stories: list[dict[str, Any]], issues: Sequence[IssueSnapshot]
+    epics: list[dict[str, Any]],
+    stories: list[dict[str, Any]],
+    issues: Sequence[IssueSnapshot],
+    profile: DecompositionProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Bind every backlog item to the one GitHub issue carrying its marker; any
     disagreement between GitHub and backlog.json is drift."""
@@ -584,7 +594,9 @@ def _join_issues(
     for issue in sorted(issues, key=lambda item: item.number):
         if type(issue.number) is not int or issue.number < 1:
             raise DecompositionSourceError(SOURCE_INVALID, ["an issue number is invalid"])
-        markers = sorted(set(_MARKER.findall(issue.body)))
+        markers = sorted(
+            set((_MARKER if profile is None else profile.issue_marker).findall(issue.body))
+        )
         if len(markers) > 1:
             drift.append(f"issue {issue.number} carries markers {', '.join(markers)}")
         for marker in markers:
@@ -653,7 +665,7 @@ def _join_issues(
         item["state"] = issue.state
         item["body"] = _normalized(issue.body)
         item["body_sha256"] = body_sha256(issue.body)
-        item["title"] = _title(item["title"])
+        item["title"] = _title(item["title"], profile)
         snapshot.append(
             {
                 "number": issue.number,
@@ -671,22 +683,28 @@ def _join_issues(
 
 
 def build_inventory(
-    *, source_sha: str, files: Mapping[str, bytes], issues: Sequence[IssueSnapshot]
+    *,
+    source_sha: str,
+    files: Mapping[str, bytes],
+    issues: Sequence[IssueSnapshot],
+    project: str = PROJECT,
 ) -> dict[str, Any]:
     """The deterministic inventory of one snapshot (see the module docstring)."""
+    profile = decomposition_profile(project)
+    design_path = profile.design_path
     if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
         raise DecompositionSourceError(SOURCE_INVALID, ["source SHA is invalid"])
-    missing = [path for path in (DESIGN_PATH, BACKLOG_PATH, AGENTS_PATH) if path not in files]
+    missing = [path for path in (design_path, BACKLOG_PATH, AGENTS_PATH) if path not in files]
     if missing:
         raise DecompositionSourceError(SOURCE_INVALID, [f"missing {path}" for path in missing])
     for path, data in files.items():
         if len(data) > MAX_SOURCE_BYTES:
             raise DecompositionSourceError(SOURCE_INVALID, [f"{path} exceeds the source bound"])
-    sections = design_sections(_decode(DESIGN_PATH, files[DESIGN_PATH]))
+    sections = design_sections(_decode(design_path, files[design_path]))
     by_id = {section["id"]: section for section in sections}
-    backlog = _backlog(files[BACKLOG_PATH])
-    epics, stories, _requirements = _backlog_items(backlog, by_id)
-    snapshot = _join_issues(epics, stories, issues)
+    backlog = _backlog(files[BACKLOG_PATH], project)
+    epics, stories, _requirements = _backlog_items(backlog, by_id, profile.issue_marker)
+    snapshot = _join_issues(epics, stories, issues, profile)
     reference_paths = sorted(
         path
         for path in files
@@ -709,14 +727,14 @@ def build_inventory(
                 "text": text,
             }
         )
-    documentation = [DESIGN_PATH, AGENTS_PATH, *reference_paths]
+    documentation = [design_path, AGENTS_PATH, *reference_paths]
     documents = [
         {"path": path, "sha256": _sha256(files[path]), "bytes": len(files[path])}
         for path in documentation
     ]
     inventory: dict[str, Any] = {
         "kind": INVENTORY_KIND,
-        "project": PROJECT,
+        "project": project,
         "source_sha": source_sha,
         "design_sha256": canonical_sha256(
             {
@@ -729,7 +747,7 @@ def build_inventory(
             {"kind": "hermes-decomposition-issues-v1", "issues": snapshot}
         ),
         "documents": documents,
-        "design": {"path": DESIGN_PATH, "sections": sections},
+        "design": {"path": design_path, "sections": sections},
         "agents_md": _normalized(_decode(AGENTS_PATH, files[AGENTS_PATH])),
         "references": references,
         "epics": epics,
@@ -749,6 +767,7 @@ def inventory_sha256(inventory: Mapping[str, Any]) -> str:
 
 
 def _common(inventory: Mapping[str, Any], kind: str) -> dict[str, Any]:
+    profile = decomposition_profile(str(inventory["project"]))
     return {
         "kind": kind,
         "project": inventory["project"],
@@ -758,10 +777,12 @@ def _common(inventory: Mapping[str, Any], kind: str) -> dict[str, Any]:
         "issues_sha256": inventory["issues_sha256"],
         "repositories": [
             {"repository": repository, "role": role, "components": sorted(components)}
-            for repository, (role, components) in TASK_TARGETS.items()
+            for repository, (role, components) in profile.task_targets.items()
         ],
-        "test_commands": {repository: list(items) for repository, items in TEST_COMMANDS.items()},
-        "task_key_format": TASK_KEY_FORMAT,
+        "test_commands": {
+            repository: list(items) for repository, items in profile.test_commands.items()
+        },
+        "task_key_format": profile.task_key_format,
         "hermes_fills": list(HERMES_FILLS),
     }
 

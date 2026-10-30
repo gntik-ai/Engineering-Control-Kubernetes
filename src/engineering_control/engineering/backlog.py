@@ -993,10 +993,14 @@ _R3_KEYWORDS = re.compile(r"(?<![a-z0-9])(?:" + "|".join(_R3_KEYWORD_ROOTS) + r"
 # ordinary design vocabulary (production-ready worker, production profile) and no Hermes
 # delivery reaches a production environment, so it is exempt. Every sandbox, egress,
 # secret, credential, destructive and data-migration root and every security signal stay.
+# NEW-242: falcone-workflow likewise (merge-only, no runtime adapter yet): "production" is
+# exempt; every other root (data migration, secret lifecycle, credential rotation, ...) and
+# every security signal (tenant isolation, authorization bypass, ...) stay R3 triggers.
 PROJECT_R3_KEYWORD_EXEMPTIONS: Final[MappingProxyType[str, frozenset[str]]] = MappingProxyType(
     {
         "gntik-ui": frozenset({"destructive", "production"}),
         "falcone-serverless": frozenset({"production"}),
+        "falcone-workflow": frozenset({"production"}),
     }
 )
 for _project, _names in PROJECT_R3_KEYWORD_EXEMPTIONS.items():
