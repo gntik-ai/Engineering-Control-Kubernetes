@@ -248,6 +248,14 @@ maker_rules:
       names and descriptions, commit messages and docs in English. User-facing copy in
       apps/web-console-next goes into both the en and es catalogs. Do not translate or
       rewrite existing Spanish text unless the issue asks for it.
+    - >-
+      Cluster test namespaces are a switch. Default (FS_TEST_NAMESPACE_MODE or
+      FW_TEST_NAMESPACE_MODE=create): create and delete a dedicated fs-test-*/fw-test-*
+      namespace as today; if creation is denied, fail before any mutation naming the switch.
+      Mode shared: never create or delete namespaces; use the namespace in
+      FS_TEST_NAMESPACE/FW_TEST_NAMESPACE; create only new objects named with the run id and
+      labelled falcone.test/run=<id>; never update, patch, relabel or delete an object
+      unless its label equals this run's id.
   deployment:
     - >-
       Chart changes must survive `helm upgrade --reuse-values` from an existing release:
@@ -267,3 +275,11 @@ maker_rules:
       check as SKIPPED ("pin converges after the deployment maker; PR CI runs it").
       Run the file with FALCONE_CHART_PATH=<charts worktree>/charts/in-falcone; every
       other assertion in it must pass.
+    - >-
+      Cluster test namespaces are a switch. Default (FS_TEST_NAMESPACE_MODE or
+      FW_TEST_NAMESPACE_MODE=create): create and delete a dedicated fs-test-*/fw-test-*
+      namespace as today; if creation is denied, fail before any mutation naming the switch.
+      Mode shared: never create or delete namespaces; use the namespace in
+      FS_TEST_NAMESPACE/FW_TEST_NAMESPACE; create only new objects named with the run id and
+      labelled falcone.test/run=<id>; never update, patch, relabel or delete an object
+      unless its label equals this run's id.
