@@ -637,7 +637,8 @@ def test_worker_memory_budget_fits_the_worker_host() -> None:
     for unit in ("engineering-worker@.service", "engineering-release-worker.service"):
         text = (systemd / unit).read_text(encoding="utf-8")
         assert _unit_setting(text, "Slice") == ["engineering-workers.slice"], unit
-    for agent, high, maximum in (("codex", "7G", "8G"), ("claude", "6G", "7G")):
+    # NEW-243: claude makers under provider rotation get codex's budget (runs capped at 6G).
+    for agent, high, maximum in (("codex", "7G", "8G"), ("claude", "7G", "8G")):
         dropin = (systemd / f"engineering-worker@{agent}.service.d" / "50-memory.conf").read_text(
             encoding="utf-8"
         )

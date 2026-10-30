@@ -2,6 +2,8 @@
 # engineering-worker@claude), nested in engineering-workers.slice (the name's prefix).
 # Each may use up to 7G alone; together never more than 9G, leaving the rest of the
 # workers' 13G for browser, scan, delivery and release.
+# NEW-243 (2026-10-30): unchanged at 10.5G although claude now also has 8G alone (makers
+# under provider rotation): the same totals as two codex makers.
 # NEW-226 (2026-10-19): 10.5G for two codex makers (codex 8G, claude 7G alone). The other
 # workers keep 2.5G of the 13G: idle they hold ~150M each, and the scan worker's 1.6G
 # Trivy cache left its tmpfs for disk (reclaimable page cache).
