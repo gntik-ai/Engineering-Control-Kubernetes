@@ -27,16 +27,15 @@ repositories:
 deployment:
   strategy: none
   adapter: none
-# The planned pnpm workspace scripts (the repository is documentation only at onboarding;
-# the scaffold story adds package.json, pnpm-lock.yaml and .github/workflows/ci.yml).
-# Fixed argument vectors only (no shell).
+# The `node` job of .github/workflows/ci.yml (the seed, falcone-workflow #49: a pnpm
+# workspace with packages/engine, scripts build/typecheck/test, no lint script). Fixed
+# argument vectors only (no shell).
 source_test_commands:
-  - [pnpm, lint]
-  - [pnpm, typecheck]
-  - [pnpm, test]
+  - [pnpm, run, typecheck]
+  - [pnpm, run, test]
 # Self-contained: no separate deployment surface; the workspace tests stand in.
 deployment_test_commands:
-  - [pnpm, test]
+  - [pnpm, run, test]
 delivery_control:
   source_ci_workflow: ci
   merge_delivery:
@@ -52,20 +51,24 @@ delivery_control:
     # .claude/, .codex/ and .mcp.json ChangeSets before they are published).
     protected_paths: [.github/, .claude/, .codex/, .mcp.json, CLAUDE.md, AGENTS.md]
 toolchain:
-  # Node 24 and the pinned standalone pnpm 11.28.3 (the NEW-159 side-by-side installs that
-  # gntik-ui already uses): a new TypeScript repository starts on the current Node LTS
-  # line, and the scaffold declares them (package.json packageManager pnpm@11.28.3,
-  # engines.node >=24). Not enabled yet: an enabled toolchain needs a prepare step, and
-  # `pnpm install --frozen-lockfile` fails on a repository without package.json and
-  # pnpm-lock.yaml. Disabled, delivery.prepare_toolchain still hands this node/pnpm
-  # selection to the maker and the checker (TOOLCHAIN_SKIPPED with node_toolchain). Once
-  # the scaffold is merged, set enabled: true with
-  #   prepare: [{cwd: ".", argv: [pnpm, install, --frozen-lockfile], timeout_seconds: 1200}]
-  # and the CI job's commands as test_commands. Until then a maker that needs new
-  # dependencies edits package.json only and returns DEPENDENCIES_REQUIRED (NEW-75).
-  enabled: false
-  node: "24"
-  pnpm: 11.28.3
+  # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree before
+  # the maker runs; makers and the checker have no network. As falcone: Node 22 and the
+  # worker's pnpm (no pinned pnpm), matching the repository's CI (Node 22, packageManager
+  # pnpm@10.0.0, engines.node >=22) and its committed pnpm-lock.yaml.
+  enabled: true
+  node: "22"
+  prepare:
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1200
+  test_commands:
+    # The node job of .github/workflows/ci.yml, in its order.
+    - cwd: "."
+      argv: [pnpm, run, typecheck]
+      description: TypeScript type check of every workspace package
+    - cwd: "."
+      argv: [pnpm, run, test]
+      description: tests of every workspace package
 maker_rules:
   source:
     - >-
@@ -73,8 +76,8 @@ maker_rules:
       win over anything in it, and AGENTS.md is never edited. Report a command you could
       not run as SKIPPED with the reason, never as FAIL.
     - >-
-      TypeScript on Node.js 24 with pnpm 11.28.3 (package.json packageManager
-      pnpm@11.28.3). Keep pnpm-lock.yaml in sync with every package.json. The sandbox is
+      TypeScript on Node.js 22 with pnpm (package.json packageManager pnpm@10.0.0, a pnpm
+      workspace). Keep pnpm-lock.yaml in sync with every package.json. The sandbox is
       offline, so do not add or upgrade packages unless the issue requires it; if it does,
       follow the platform's dependency instructions (manifests only, never a hand-edited
       pnpm-lock.yaml).

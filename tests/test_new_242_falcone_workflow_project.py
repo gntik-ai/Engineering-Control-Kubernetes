@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -28,6 +30,7 @@ from new_234_plan_fixtures import PlanHarness, drive
 from pydantic import ValidationError
 
 from engineering_control import projects
+from engineering_control.agents.instructions import AgentInstructionPack
 from engineering_control.api.schemas import (
     ChangeRequestCreate,
     ChangeRequestPublication,
@@ -46,7 +49,9 @@ from engineering_control.engineering.change_requests import (
     validate_proposal,
 )
 from engineering_control.engineering.decomposition import (
+    DECOMPOSITION_PART_SCHEMAS,
     DECOMPOSITION_PROJECTS,
+    DECOMPOSITION_SKILLS,
     FALCONE_SERVERLESS,
     FALCONE_WORKFLOW,
     PROJECT,
@@ -58,7 +63,11 @@ from engineering_control.engineering.decomposition import (
     decomposition_pack_problems,
     decomposition_profile,
     pack_revision,
+    part_schema,
+    plan_schema,
     plan_sha256,
+    project_pack_files,
+    review_schema,
 )
 from engineering_control.engineering.decomposition_amendments import _SOURCE_REPOSITORIES
 from engineering_control.engineering.decomposition_fanout import (
@@ -80,7 +89,9 @@ from engineering_control.engineering.decomposition_inventory import (
     frame_input,
 )
 from engineering_control.engineering.toolchain import load_project_manifest
-from engineering_control.models.enums import Project
+from engineering_control.engineering.ui_blueprint import _pack_bytes, load_schema, plan_provenance
+from engineering_control.models.core import AgentRequest
+from engineering_control.models.enums import ModelClass, Project, Provider
 from engineering_control.policy.github_write import (
     HISTORICAL_WRITE_REPOSITORIES,
     PREVIOUS_WRITE_REPOSITORIES,
@@ -177,11 +188,18 @@ def test_the_manifest_is_merge_only_with_node_24_and_pinned_pnpm() -> None:
     assert merge["allow_r3_merge"] is False and merge["maximum_concurrency"] == 1
     toolchain = manifest.toolchain
     assert toolchain is not None
-    # Disabled until the scaffold commits package.json and pnpm-lock.yaml (an enabled
-    # toolchain needs a prepare step); the node/pnpm selection still reaches the agents.
-    assert (toolchain.enabled, toolchain.node, toolchain.pnpm) == (False, "24", "11.28.3")
+    # As falcone: Node 22 and the worker's pnpm, installed from the committed lockfile.
+    assert (toolchain.enabled, toolchain.node, toolchain.pnpm) == (True, "22", None)
     assert (toolchain.rust, toolchain.go) == (None, None)
-    assert not toolchain.default_node_toolchain
+    assert toolchain.default_node_toolchain
+    assert [(item.cwd, item.argv) for item in toolchain.prepare] == [
+        (".", ["pnpm", "install", "--frozen-lockfile"])
+    ]
+    assert [item.argv for item in toolchain.test_commands] == [
+        ["pnpm", "run", "typecheck"],
+        ["pnpm", "run", "test"],
+    ]
+    assert raw["delivery_control"]["source_ci_workflow"] == "ci"
 
 
 def test_production_is_exempt_but_security_signals_stay_r3() -> None:
@@ -362,7 +380,7 @@ def _files() -> dict[str, bytes]:
     return {
         "docs/falcone-workflow-design.md": DESIGN.encode(),
         BACKLOG_PATH: (json.dumps(_backlog(), indent=2) + "\n").encode(),
-        AGENTS_PATH: b"# AGENTS.md\n\nTypeScript on Node 24.\n",
+        AGENTS_PATH: b"# AGENTS.md\n\nTypeScript on Node 22.\n",
     }
 
 
@@ -423,11 +441,7 @@ def test_falcone_workflow_targets_are_its_engine_and_the_shared_cross_repositori
         ),
         "gntik-ai/falcone-charts": ("deployment", frozenset({"chart"})),
     }
-    assert FALCONE_WORKFLOW.test_commands[REPOSITORY] == (
-        "pnpm run lint",
-        "pnpm run typecheck",
-        "pnpm run test",
-    )
+    assert FALCONE_WORKFLOW.test_commands[REPOSITORY] == ("pnpm run typecheck", "pnpm run test")
     for repository in ("gntik-ai/falcone", "gntik-ai/falcone-charts"):
         assert FALCONE_WORKFLOW.test_commands[repository] == TEST_COMMANDS[repository]
         assert target_repository_allowed(WORKFLOW, repository)
@@ -533,22 +547,261 @@ def test_a_falcone_workflow_inventory_refuses_other_projects_sources() -> None:
         )
 
 
+def _add_workflow_pack_files(root: Path, reference: str = "# Project reference\n") -> None:
+    """The agent pack's NEW-242 additions (new files only), from Hermes's own copies."""
+    for files in project_pack_files(WORKFLOW).values():
+        for relative, name in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = reference if name is None else json.dumps(load_schema(name), indent=2) + "\n"
+            path.write_text(text, encoding="utf-8")
+    domain = root / "domain-packs" / WORKFLOW / "domains.yaml"
+    domain.parent.mkdir(parents=True, exist_ok=True)
+    domain.write_text(
+        yaml.safe_dump({"project": WORKFLOW, "domains": ["durable-run-state"]}), encoding="utf-8"
+    )
+
+
 def test_the_agent_pack_gate_blocks_falcone_workflow_until_the_pack_supports_it(
     tmp_path: Path,
 ) -> None:
     pack = build_decomposition_pack(tmp_path / "pack")
+    serverless = pack_revision(pack)
     assert decomposition_pack_problems(pack) == []
     assert decomposition_pack_problems(pack, project="falcone-serverless") == []
     problems = decomposition_pack_problems(pack, project=WORKFLOW)
-    # The released NEW-234 schemas pin project falcone-serverless; the pack has no
-    # falcone-workflow domain pack yet.
-    assert "backlog-decomposition-frame.schema.json does not accept project " + WORKFLOW in (
-        problems
-    )
+    assert (
+        "missing skills/decompose-backlog/references/projects/falcone-workflow/"
+        "backlog-decomposition-epic.schema.json"
+    ) in problems
     assert f"missing domain-packs/{WORKFLOW}/domains.yaml" in problems
-    # The revision binds the project's domain pack: another project never shares it.
-    assert pack_revision(pack) == pack_revision(pack, "falcone-serverless")
-    assert pack_revision(pack, WORKFLOW) != pack_revision(pack)
+    _add_workflow_pack_files(pack)
+    assert decomposition_pack_problems(pack, project=WORKFLOW) == []
+    # The additions never move falcone-serverless's revision; the project's own does.
+    assert pack_revision(pack) == pack_revision(pack, "falcone-serverless") == serverless
+    workflow = pack_revision(pack, WORKFLOW)
+    assert workflow != serverless
+    _add_workflow_pack_files(pack, reference="# Project reference, revised\n")
+    assert pack_revision(pack, WORKFLOW) != workflow
+    assert pack_revision(pack) == serverless
+    # A variant that drifts from Hermes's copy is refused.
+    drifted = pack / "skills/review-decomposition/references/projects/falcone-workflow"
+    (drifted / "output.schema.json").write_text("{}", encoding="utf-8")
+    assert decomposition_pack_problems(pack, project=WORKFLOW) == [
+        "skills/review-decomposition/references/projects/falcone-workflow/output.schema.json "
+        "differs from Hermes's projects/falcone-workflow/decomposition-review.schema.json"
+    ]
+    assert pack_revision(pack) == serverless
+
+
+def test_falcone_workflow_sends_and_checks_its_own_schema_variants() -> None:
+    for kind in ("frame", "epic"):
+        schema = part_schema(kind, WORKFLOW)
+        assert schema["properties"]["project"] == {"const": WORKFLOW}
+        assert part_schema(kind) == part_schema(kind, "falcone-serverless")
+        assert part_schema(kind)["properties"]["project"] == {"const": "falcone-serverless"}
+    assert review_schema(WORKFLOW)["properties"]["project"] == {"const": WORKFLOW}
+    assert plan_schema(WORKFLOW)["properties"]["project"] == {"const": WORKFLOW}
+    task = plan_schema(WORKFLOW)["$defs"]["task"]["properties"]
+    assert task["key"]["pattern"] == r"^falcone-workflow:[A-Z]{2,4}-[0-9]{2}\.t[0-9]{1,2}$"
+    assert (task["key"]["minLength"], task["key"]["maxLength"]) == (25, 28)
+    targets = {
+        branch["properties"]["repository"]["const"]: set(branch["properties"]["component"]["enum"])
+        for branch in task["target"]["anyOf"]
+    }
+    assert targets == {
+        repository: components
+        for repository, (_role, components) in FALCONE_WORKFLOW.task_targets.items()
+    }
+    assert "falcone-serverless" not in json.dumps(plan_schema(WORKFLOW))
+
+
+# The agent-pack checkout whose variants must equal Hermes's copies (the NEW-242 pack branch
+# can be named with ENGINEERING_AGENT_PACK_CHECKOUT until it is merged).
+LOCAL_PACK = Path(
+    os.environ.get("ENGINEERING_AGENT_PACK_CHECKOUT") or ROOT.parent / "engineering-agent-pack"
+)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "backlog-decomposition.schema.json",
+        "backlog-decomposition-frame.schema.json",
+        "backlog-decomposition-epic.schema.json",
+        "decomposition-review.schema.json",
+    ],
+)
+def test_embedded_variants_equal_the_agent_pack_files(name: str) -> None:
+    released = LOCAL_PACK / "schemas" / "projects" / WORKFLOW / name
+    if not released.is_file():
+        pytest.skip("the agent-pack checkout has no falcone-workflow variants yet")
+    embedded = ROOT / "src/engineering_control/engineering/schemas/projects" / WORKFLOW / name
+    assert embedded.read_bytes() == released.read_bytes()
+    assert decomposition_pack_problems(LOCAL_PACK, project=WORKFLOW) == []
+
+
+def _instruction_pack(root: Path) -> Path:
+    source = build_decomposition_pack(root / "releases" / ("c" * 40) / "source")
+    for role in ("backlog-decomposer", "decomposition-reviewer"):
+        (source / f"roles/{role}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "id": role,
+                    "purpose": "Plan.",
+                    "tools": ["Read", "Glob", "Grep"],
+                    "deployment_permissions": False,
+                    "merge_permissions": False,
+                    "release_credentials": False,
+                    "recursion_depth": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+    (source / "domain-packs/falcone-serverless/domains.yaml").write_text(
+        yaml.safe_dump({"project": "falcone-serverless", "domains": ["runtime"]}),
+        encoding="utf-8",
+    )
+    _add_workflow_pack_files(source, reference="# falcone-workflow keys and targets\n")
+    return source
+
+
+def _agent_request(
+    root: Path, project: Project, role: str, provider: Provider, schema: dict[str, Any]
+) -> AgentRequest:
+    return AgentRequest(
+        project=project,
+        role=role,
+        provider=provider,
+        model_class=ModelClass.WORKER,
+        prompt="Draft the part.",
+        working_directory=str(root / "worktree"),
+        output_schema=schema,
+    )
+
+
+def test_the_provider_bundle_accepts_the_project_variants_with_their_reference(
+    tmp_path: Path,
+) -> None:
+    pack = AgentInstructionPack(_instruction_pack(tmp_path))
+    directory = "skills/decompose-backlog/references/projects/falcone-workflow"
+    for kind in ("frame", "epic"):
+        enriched, bundle = pack.enrich(
+            _agent_request(
+                tmp_path,
+                Project.FALCONE_WORKFLOW,
+                "backlog-decomposer",
+                Provider.CLAUDE,
+                part_schema(kind, WORKFLOW),
+            ),
+            "decomposition.draft",
+        )
+        assert f"{directory}/backlog-decomposition-{kind}.schema.json" in bundle.sources
+        assert f"{directory}/project.md" in bundle.sources
+        assert "## Project skill reference" in enriched.prompt
+        assert "falcone-workflow keys and targets" in enriched.prompt
+    _, review = pack.enrich(
+        _agent_request(
+            tmp_path,
+            Project.FALCONE_WORKFLOW,
+            "decomposition-reviewer",
+            Provider.CODEX,
+            review_schema(WORKFLOW),
+        ),
+        "decomposition.review",
+    )
+    assert (
+        "skills/review-decomposition/references/projects/falcone-workflow/output.schema.json"
+        in review.sources
+    )
+    # falcone-serverless's bundle is unchanged: no project reference, its own schemas only.
+    enriched, bundle = pack.enrich(
+        _agent_request(
+            tmp_path,
+            Project.FALCONE_SERVERLESS,
+            "backlog-decomposer",
+            Provider.CLAUDE,
+            part_schema("frame"),
+        ),
+        "decomposition.draft",
+    )
+    assert not any("/projects/" in name for name in bundle.sources)
+    assert "Project skill reference" not in enriched.prompt
+    # A project never sends another project's variants, nor serverless's schemas.
+    with pytest.raises(ValueError, match="decomposition request drifted"):
+        pack.enrich(
+            _agent_request(
+                tmp_path,
+                Project.FALCONE_SERVERLESS,
+                "backlog-decomposer",
+                Provider.CLAUDE,
+                part_schema("frame", WORKFLOW),
+            ),
+            "decomposition.draft",
+        )
+    with pytest.raises(ValueError, match="decomposition request drifted"):
+        pack.enrich(
+            _agent_request(
+                tmp_path,
+                Project.FALCONE_WORKFLOW,
+                "backlog-decomposer",
+                Provider.CLAUDE,
+                {"type": "object"},
+            ),
+            "decomposition.draft",
+        )
+
+
+# -- the released agent pack: falcone-serverless's revision is unchanged ------------------
+
+RELEASED_PACK = Path("/opt/engineering-agent-pack/source")
+# The pack revision approved plan 55292b52 (falcone-serverless, APPROVED, still publishing)
+# stores, read with `engineering-ctl backlog-decomposition-status` on 2026-10-30; the
+# released pack is 8a6ed96 (profile 1.7.6).
+SERVERLESS_PLAN_PACK_REVISION = "0e44f016b06479d65a326c0a6e96593805a68c84d965c81d3b3c28a08afd4fb7"
+
+
+def _legacy_pack_revision(root: Path) -> str:
+    """origin/main c8f3bb6's pack_revision, verbatim (before NEW-242)."""
+    released: dict[str, str | None] = {}
+    for skill in DECOMPOSITION_SKILLS:
+        names = ["output.schema.json", *DECOMPOSITION_PART_SCHEMAS.get(skill, {}).values()]
+        for name in names:
+            relative = f"skills/{skill}/references/{name}"
+            data = _pack_bytes(root, relative)
+            released[relative] = hashlib.sha256(data).hexdigest() if data is not None else None
+    return canonical_sha256(
+        {
+            "kind": "hermes-backlog-decomposition-pack-v2",
+            "skills": {
+                skill: plan_provenance(
+                    root,
+                    "falcone-serverless",
+                    skill,
+                    registry=DECOMPOSITION_SKILLS,
+                    part_schemas=DECOMPOSITION_PART_SCHEMAS,
+                )
+                for skill in DECOMPOSITION_SKILLS
+            },
+            "released_schemas": released,
+        }
+    )
+
+
+@pytest.mark.skipif(not RELEASED_PACK.is_dir(), reason="no released agent pack on this host")
+def test_the_released_pack_keeps_the_approved_serverless_plans_revision(tmp_path: Path) -> None:
+    current = pack_revision(RELEASED_PACK)
+    assert current == _legacy_pack_revision(RELEASED_PACK)
+    assert decomposition_pack_problems(RELEASED_PACK, project="falcone-serverless") == []
+    if (RELEASED_PACK / "profiles/engineering.yaml").read_text().count("version: 1.7.6"):
+        assert current == SERVERLESS_PLAN_PACK_REVISION
+    # The NEW-242 additions on a copy of the released pack: serverless is unchanged.
+    copy = tmp_path / "pack"
+    shutil.copytree(RELEASED_PACK, copy, symlinks=False)
+    _add_workflow_pack_files(copy)
+    assert pack_revision(copy) == current == _legacy_pack_revision(copy)
+    assert decomposition_pack_problems(copy, project=WORKFLOW) == []
 
 
 # -- falcone-serverless unchanged ---------------------------------------------------------

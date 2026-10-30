@@ -131,6 +131,9 @@ class DecompositionProfile:
     task_targets: Mapping[str, tuple[str, frozenset[str]]]
     # repository -> the exact test commands a task in it may plan.
     test_commands: Mapping[str, tuple[str, ...]]
+    # NEW-242: where Hermes's copies of the project's decomposition schema variants live
+    # (under engineering/schemas/); None: the NEW-234 (falcone-serverless) schemas.
+    schema_directory: str | None = None
     task_key: re.Pattern[str] = dataclass_field(init=False)
     issue_marker: re.Pattern[str] = dataclass_field(init=False)
     title_prefix: re.Pattern[str] = dataclass_field(init=False)
@@ -193,8 +196,8 @@ FALCONE_SERVERLESS = DecompositionProfile(
 )
 # NEW-242 (operator decision 2026-10-30): the engine and its workers live in
 # falcone-workflow; the facade, routing, console, quotas and admission changes in falcone;
-# the chart changes in falcone-charts. Its source commands are the planned pnpm workspace
-# scripts of the TypeScript repository (config/projects/falcone-workflow.yaml).
+# the chart changes in falcone-charts. Its source commands are the `node` CI job's (the
+# TypeScript pnpm workspace; config/projects/falcone-workflow.yaml).
 FALCONE_WORKFLOW = DecompositionProfile(
     project="falcone-workflow",
     design_path="docs/falcone-workflow-design.md",
@@ -207,14 +210,12 @@ FALCONE_WORKFLOW = DecompositionProfile(
         REPOSITORY_FALCONE_CHARTS: ("deployment", frozenset({"chart"})),
     },
     test_commands={
-        "gntik-ai/falcone-workflow": (
-            "pnpm run lint",
-            "pnpm run typecheck",
-            "pnpm run test",
-        ),
+        "gntik-ai/falcone-workflow": ("pnpm run typecheck", "pnpm run test"),
         REPOSITORY_FALCONE: FALCONE_TEST_COMMANDS,
         REPOSITORY_FALCONE_CHARTS: FALCONE_CHARTS_TEST_COMMANDS,
     },
+    # The agent pack's variants (schemas/projects/falcone-workflow/), copied byte for byte.
+    schema_directory="projects/falcone-workflow",
 )
 DECOMPOSITION_PROFILES: Final[Mapping[str, DecompositionProfile]] = {
     profile.project: profile for profile in (FALCONE_SERVERLESS, FALCONE_WORKFLOW)
@@ -305,16 +306,49 @@ def _problem(code: str, category: str, subject: str, detail: str) -> PlanProblem
 # --------------------------------------------------------------------------------------
 
 
-def plan_schema() -> dict[str, Any]:
-    return load_schema(DECOMPOSITION_SKILLS[DECOMPOSE_SKILL][1])
+def decomposition_schema_name(name: str, project: str = PROJECT) -> str:
+    """NEW-242: Hermes's copy of a decomposition schema for `project` (falcone-serverless:
+    the NEW-234 schema itself; another project: its variant from the agent pack)."""
+    directory = decomposition_profile(project).schema_directory
+    return name if directory is None else f"{directory}/{name}"
 
 
-def review_schema() -> dict[str, Any]:
-    return load_schema(DECOMPOSITION_SKILLS[REVIEW_SKILL][1])
+def plan_schema(project: str = PROJECT) -> dict[str, Any]:
+    return load_schema(decomposition_schema_name(DECOMPOSITION_SKILLS[DECOMPOSE_SKILL][1], project))
 
 
-def part_schema(kind: str) -> dict[str, Any]:
-    return load_schema(DECOMPOSITION_PART_SCHEMAS[DECOMPOSE_SKILL][kind])
+def review_schema(project: str = PROJECT) -> dict[str, Any]:
+    return load_schema(decomposition_schema_name(DECOMPOSITION_SKILLS[REVIEW_SKILL][1], project))
+
+
+def part_schema(kind: str, project: str = PROJECT) -> dict[str, Any]:
+    return load_schema(
+        decomposition_schema_name(DECOMPOSITION_PART_SCHEMAS[DECOMPOSE_SKILL][kind], project)
+    )
+
+
+# NEW-242: the agent pack publishes another project's decomposition contract as new files
+# only, beside each skill's references: the schema variants under the released names and a
+# project reference (agent pack skills/decomposition-projects.yaml).
+PROJECT_REFERENCE: Final = "project.md"
+
+
+def project_pack_files(project: str) -> dict[str, dict[str, str | None]]:
+    """skill -> released pack path -> Hermes's schema copy (None: the project reference)
+    of a project with schema variants; empty for falcone-serverless."""
+    if decomposition_profile(project).schema_directory is None:
+        return {}
+    files: dict[str, dict[str, str | None]] = {}
+    for skill, (_role, schema) in DECOMPOSITION_SKILLS.items():
+        directory = f"skills/{skill}/references/projects/{project}"
+        released: dict[str, str | None] = {
+            f"{directory}/output.schema.json": decomposition_schema_name(schema, project)
+        }
+        for name in DECOMPOSITION_PART_SCHEMAS.get(skill, {}).values():
+            released[f"{directory}/{name}"] = decomposition_schema_name(name, project)
+        released[f"{directory}/{PROJECT_REFERENCE}"] = None
+        files[skill] = released
+    return files
 
 
 def decomposition_pack_problems(
@@ -322,9 +356,9 @@ def decomposition_pack_problems(
 ) -> list[str]:
     """What the released agent pack lacks for the decomposition (empty when usable).
 
-    NEW-242: with `project`, also that the released decomposition schemas accept that
-    project and the pack has its domain pack (falcone-serverless always passes both with
-    the NEW-234 pack, so its result is unchanged)."""
+    NEW-242: falcone-serverless (or no project) is checked exactly as before. Another
+    project also needs its released schema variants (equal to Hermes's copies), its project
+    references and its domain pack."""
     problems = agent_pack_problems(
         root,
         skills,
@@ -332,17 +366,26 @@ def decomposition_pack_problems(
         part_schemas=DECOMPOSITION_PART_SCHEMAS,
         min_version=AGENT_PACK_MIN_VERSION,
     )
-    if project is None:
+    if project is None or project == PROJECT:
         return problems
-    names = [
-        *(schema for _role, schema in DECOMPOSITION_SKILLS.values()),
-        *(name for parts in DECOMPOSITION_PART_SCHEMAS.values() for name in parts.values()),
-    ]
-    for name in dict.fromkeys(names):
-        accepted = load_schema(name).get("properties", {}).get("project")
-        if not isinstance(accepted, dict) or schema_errors(project, accepted):
-            problems.append(f"{name} does not accept project {project}")
-    if _pack_bytes(root, f"domain-packs/{project}/domains.yaml") is None:
+    for skill, files in project_pack_files(project).items():
+        if skills is not None and skill not in skills:
+            continue
+        for relative, name in files.items():
+            released = _pack_bytes(root, relative)
+            if released is None:
+                problems.append(f"missing {relative}")
+                continue
+            if name is None:
+                continue
+            try:
+                same = json.loads(released) == load_schema(name)
+            except json.JSONDecodeError:
+                same = False
+            if not same:
+                problems.append(f"{relative} differs from Hermes's {name}")
+    domain = _pack_bytes(root, f"domain-packs/{project}/domains.yaml")
+    if domain is None:
         problems.append(f"missing domain-packs/{project}/domains.yaml")
     return problems
 
@@ -350,13 +393,38 @@ def decomposition_pack_problems(
 def decomposition_provenance(
     root: Path, skill: str = DECOMPOSE_SKILL, project: str = PROJECT
 ) -> str:
-    """The released instruction sources and schemas a drafted part depends on."""
-    return plan_provenance(
-        root,
-        project,
-        skill,
-        registry=DECOMPOSITION_SKILLS,
-        part_schemas=DECOMPOSITION_PART_SCHEMAS,
+    """The released instruction sources and schemas a drafted part depends on.
+
+    NEW-242: falcone-serverless's is computed exactly as before (an approved plan binds it
+    through pack_revision); another project's also binds its schema variants and project
+    reference, and never reads falcone-serverless's domain pack."""
+    if project == PROJECT:
+        return plan_provenance(
+            root,
+            project,
+            skill,
+            registry=DECOMPOSITION_SKILLS,
+            part_schemas=DECOMPOSITION_PART_SCHEMAS,
+        )
+    registry = {
+        name: (role, decomposition_schema_name(schema, project))
+        for name, (role, schema) in DECOMPOSITION_SKILLS.items()
+    }
+    parts = {
+        name: {kind: decomposition_schema_name(schema, project) for kind, schema in kinds.items()}
+        for name, kinds in DECOMPOSITION_PART_SCHEMAS.items()
+    }
+    released: dict[str, str | None] = {}
+    for relative in project_pack_files(project).get(skill, {}):
+        data = _pack_bytes(root, relative)
+        released[relative] = hashlib.sha256(data).hexdigest() if data is not None else None
+    return canonical_sha256(
+        {
+            "kind": "hermes-backlog-decomposition-project-provenance-v1",
+            "project": project,
+            "skill": plan_provenance(root, project, skill, registry=registry, part_schemas=parts),
+            "project_files": released,
+        }
     )
 
 
@@ -1439,7 +1507,7 @@ def _part_kind(part: str) -> tuple[str, int | None]:
 def _checked_part(
     value: Any, kind: str, inputs: DecompositionInputs, part: str, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
-    errors = schema_errors(value, part_schema(kind))
+    errors = schema_errors(value, part_schema(kind, inputs.project))
     if errors:
         raise DecompositionRejected(
             "DRAFT_SCHEMA_INVALID",
@@ -1540,7 +1608,7 @@ def check_review(
             "REVIEW_TOO_LARGE",
             [_problem("REVIEW_TOO_LARGE", "other", part, f"over {MAX_REVIEW_CHARACTERS} chars")],
         )
-    errors = schema_errors(value, review_schema())
+    errors = schema_errors(value, review_schema(inputs.project))
     if errors:
         raise DecompositionRejected(
             "REVIEW_SCHEMA_INVALID",
@@ -1686,7 +1754,7 @@ def assemble_plan(
         "frame": copy.deepcopy(dict(frame)),
         "stories": stories,
     }
-    errors = schema_errors(plan, plan_schema())
+    errors = schema_errors(plan, plan_schema(inputs.project))
     if errors:
         raise DecompositionRejected(
             "ASSEMBLY_SCHEMA_INVALID",
@@ -1894,7 +1962,10 @@ def pack_revision(root: Path, project: str = PROJECT) -> str:
     """The released agent-pack revision a plan is drafted and reviewed under: the
     provenance of both skills (their instruction sources, roles, profile, catalog records
     and schemas). Bound into every part id and into the approval, so a pack change between
-    the plan's start and its approval refuses the approval."""
+    the plan's start and its approval refuses the approval.
+
+    NEW-242: falcone-serverless's is computed exactly as before (approved plans bind it);
+    another project's binds its own schema variants, references and domain pack only."""
     released: dict[str, str | None] = {}
     for skill in DECOMPOSITION_SKILLS:
         # NEW-234 PR5 review: the released schema bytes too, not only Hermes's own copies.
@@ -1903,9 +1974,21 @@ def pack_revision(root: Path, project: str = PROJECT) -> str:
             relative = f"skills/{skill}/references/{name}"
             data = _pack_bytes(root, relative)
             released[relative] = hashlib.sha256(data).hexdigest() if data is not None else None
+    if project == PROJECT:
+        return canonical_sha256(
+            {
+                "kind": "hermes-backlog-decomposition-pack-v2",
+                "skills": {
+                    skill: decomposition_provenance(root, skill) for skill in DECOMPOSITION_SKILLS
+                },
+                "released_schemas": released,
+            }
+        )
+    decomposition_profile(project)
     return canonical_sha256(
         {
-            "kind": "hermes-backlog-decomposition-pack-v2",
+            "kind": "hermes-backlog-decomposition-project-pack-v1",
+            "project": project,
             "skills": {
                 skill: decomposition_provenance(root, skill, project)
                 for skill in DECOMPOSITION_SKILLS
