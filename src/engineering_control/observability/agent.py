@@ -22,6 +22,7 @@ from engineering_control.db.models import AgentExecution, AgentLogChunk, Dashboa
 from engineering_control.observability.cgroup_memory import EVENT_TYPE as MEMORY_PRESSURE_EVENT
 from engineering_control.projects import ProjectName
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.ownership import WORKTREE_OWNERSHIP_EVENT
 
 TranscriptStream = Literal["system", "progress", "assistant", "tool", "test", "stderr"]
 AgentRole = Literal["maker", "checker", "auditor", "reviewer", "verifier"]
@@ -203,6 +204,9 @@ class TranscriptNormalizer:
         if event_type == MEMORY_PRESSURE_EVENT:
             # NEW-226: Hermes' own reading of the worker's memory state on a failed step.
             return self._line("system", event.get("summary"), now)
+        if event_type == WORKTREE_OWNERSHIP_EVENT:
+            # NEW-243: Hermes' post-step normalisation of the maker's own worktree files.
+            return self._line("system", self._worktree_ownership(event), now)
         if provider == "codex":
             return self._codex(event_type, event, now)
         return self._claude(event_type, event, now)
@@ -266,6 +270,35 @@ class TranscriptNormalizer:
         if event_type in {"error", "failed"} or event_type.endswith("failed"):
             return self._line("stderr", self._error_text(event, event_type), now)
         return []
+
+    _OWNERSHIP_COUNTERS = (
+        "scanned",
+        "changed",
+        "failed",
+        "raced",
+        "unlisted",
+        "foreign_device",
+        "mount_points",
+        "errors",
+    )
+
+    @classmethod
+    def _worktree_ownership(cls, event: dict[str, Any]) -> str:
+        status = cls._safe_name(event.get("status") or "UNKNOWN")
+        counters = ", ".join(
+            f"{name} {value}"
+            for name in cls._OWNERSHIP_COUNTERS
+            if isinstance(value := event.get(name), int) and not isinstance(value, bool)
+        )
+        text = f"Worktree ownership normalisation: {status}"
+        if counters:
+            text += f" ({counters})"
+        if event.get("reason") is not None:
+            text += f"; reason {cls._safe_name(event.get('reason'))}"
+        detail = event.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            text += f"; {' '.join(detail.split())[:300]}"
+        return text
 
     def _claude_tool_errors(
         self, event: dict[str, Any], now: datetime
@@ -862,14 +895,20 @@ class AgentTranscriptRecorder:
         pending = self.buffer
         self.buffer = []
         self.buffer_bytes = 0
-        accepted = await self.client.logs(
-            self.execution_id,
-            LogBatchInput(
-                chunks=pending,
-                output_truncated=self.output_truncated,
-                transcript_incomplete=self.transcript_incomplete,
-            ),
-        )
+        try:
+            accepted = await self.client.logs(
+                self.execution_id,
+                LogBatchInput(
+                    chunks=pending,
+                    output_truncated=self.output_truncated,
+                    transcript_incomplete=self.transcript_incomplete,
+                ),
+            )
+        except asyncio.CancelledError:
+            # NEW-243: a cancelled upload (for example a bounded event publication) has
+            # already taken this batch out of the buffer, so the transcript is incomplete.
+            self.transcript_incomplete = True
+            raise
         if not accepted:
             self.transcript_incomplete = True
 
