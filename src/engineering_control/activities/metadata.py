@@ -3251,13 +3251,20 @@ class MetadataActivityHandler:
     ) -> dict[str, Any] | None:
         """NEW-243 phase 1: the providers of a rotated ChangeSet, or None (today's routing).
 
-        A ChangeSet is rotated when its first routing happens under an enabled policy and
-        it was created at or after ``enabled_at`` without recorded providers (in-flight
-        ChangeSets keep today's routing). The first routing chooses maker, checker (always
-        the maker's opposite) and spec author and records them in
-        ``recovery_json["rotation"]``; every later attempt, correction and CI repair reads
-        the maker and spec author back and never flips them: if the pinned provider is
-        unavailable the attempt waits (RATE_LIMITED, with the reason) instead."""
+        A ChangeSet is enrolled in rotation by its first routing under an enabled policy
+        when it was created at or after ``enabled_at``, has no recorded providers and no
+        earlier delivery run (in-flight ChangeSets keep today's routing). Enrolment always
+        records maker and spec author in ``recovery_json["rotation"]``, also when that
+        routing cannot proceed (the pin or ratio choice a subject waits for; a fallback
+        taken when its choice was unavailable): so a retry, correction or CI repair, which
+        is another run of the same ChangeSet, reads them back instead of meeting the
+        in-flight rule. Pinned providers never flip: an unavailable maker or spec author
+        waits (RATE_LIMITED), an unavailable checker (the maker's opposite) blocks.
+
+        The single documented exception to disabled-mode equivalence: a ChangeSet already
+        enrolled keeps its pinned providers (and its rotation payload and routing_reason)
+        after its project disables rotation or removes the block; its models then return
+        to today's defaults. Every other ChangeSet routes exactly as before NEW-243."""
         change_set_id = UUID(str(payload["change_set_id"]))
         project = Project(str(payload["project"]))
         reserve = risk is RiskClass.R3
@@ -3269,7 +3276,7 @@ class MetadataActivityHandler:
             recorded = recovery.get("rotation")
             policy = self._provider_rotation(project)
             if isinstance(recorded, dict):
-                return self._pinned_rotation(recorded, policy, broker, reserve)
+                return self._pinned_rotation(recorded, policy, broker, reserve, pinned=True)
             if policy is None or not policy.enabled or policy.enabled_at is None:
                 return None
             created = change_set.created_at
@@ -3279,6 +3286,7 @@ class MetadataActivityHandler:
                 return None
             # In flight: an earlier delivery run of this ChangeSet was routed without
             # rotation (e.g. created after enabled_at but before the policy was installed).
+            # A rotated ChangeSet's own runs never get here: its first routing enrolled it.
             current_run = payload.get("run_id")
             earlier = (
                 select(func.count())
@@ -3291,7 +3299,7 @@ class MetadataActivityHandler:
                 return None
             subject = str(change_set_id)
 
-            def decide(role: str, author: Provider | None = None) -> RotationDecision:
+            def decide(role: str) -> RotationDecision:
                 return rotation_choose(
                     policy,
                     project=project.value,
@@ -3299,29 +3307,31 @@ class MetadataActivityHandler:
                     role=role,
                     subject_id=subject,
                     quota=broker,
-                    author=author,
                     reserve_work=reserve,
                 )
 
-            maker = decide(IMPLEMENTER)
-            if maker.provider is None:
-                return {"status": maker.status, "reason": f"rotation:maker:{maker.reason}"}
-            checker = decide(CODE_REVIEWER, maker.provider)
-            if checker.provider is None:
-                return {"status": checker.status, "reason": f"rotation:checker:{checker.reason}"}
-            spec = decide(SPEC_ARCHITECT)
-            if spec.provider is None:
-                return {"status": spec.status, "reason": f"rotation:spec:{spec.reason}"}
+            maker, spec = decide(IMPLEMENTER), decide(SPEC_ARCHITECT)
+            maker_provider = maker.provider or maker.intended
+            if maker_provider is None:
+                raise ValueError("rotation chose no maker")
+            checker = Provider.CLAUDE if maker_provider is Provider.CODEX else Provider.CODEX
             record = {
                 "policy_hash": maker.policy_hash,
                 "chosen_at": datetime.now(UTC).isoformat(),
                 "maker": maker.record(),
-                "checker": checker.record(),
+                "checker": {
+                    "role": CODE_REVIEWER,
+                    "provider": checker.value,
+                    "model": policy.model_for(CODE_REVIEWER, checker),
+                    "reason": f"opposite of {maker_provider.value}",
+                    "policy_hash": maker.policy_hash,
+                    "fallback": None,
+                },
                 "spec": spec.record(),
             }
             recovery["rotation"] = record
             change_set.recovery_json = recovery
-        return self._rotation_result(record, pinned=False)
+        return self._pinned_rotation(record, policy, broker, reserve, pinned=False)
 
     def _pinned_rotation(
         self,
@@ -3329,42 +3339,48 @@ class MetadataActivityHandler:
         policy: ProviderRotationPolicy | None,
         broker: QuotaBroker,
         reserve: bool,
+        *,
+        pinned: bool,
     ) -> dict[str, Any]:
-        """The recorded maker and spec author again (never flipped), the checker the
-        maker's opposite; models follow the current configuration when it names one."""
+        """The recorded maker and spec author (never flipped), the checker the maker's
+        opposite, each available now or the reason it is not. Models come from the current
+        configuration of an enabled policy, else today's defaults (None)."""
         record = json.loads(json.dumps(recorded))
         maker = Provider(str(record["maker"]["provider"]))
+        checker = Provider.CLAUDE if maker is Provider.CODEX else Provider.CODEX
+        spec = Provider(str(record["spec"]["provider"]))
+        record["checker"]["provider"] = checker.value
+        enabled = policy is not None and policy.enabled
+        for key, role, provider in (
+            ("maker", IMPLEMENTER, maker),
+            ("checker", CODE_REVIEWER, checker),
+            ("spec", SPEC_ARCHITECT, spec),
+        ):
+            record[key]["model"] = (
+                policy.model_for(role, provider) if policy is not None and enabled else None
+            )
         ok, why = broker.available(maker, reserve_work=reserve)
         if not ok:
             return {
+                **record,
                 "status": "RATE_LIMITED",
                 "reason": f"rotation:pinned maker {maker.value} unavailable: {why}",
             }
-        checker = Provider.CLAUDE if maker is Provider.CODEX else Provider.CODEX
         checker_ok, checker_why = broker.available(checker, reserve_work=True)
         if not checker_ok:
             return {
+                **record,
                 "status": "BLOCKED",
                 "reason": f"rotation:checker {checker.value} unavailable: {checker_why}",
             }
-        spec = Provider(str(record["spec"]["provider"]))
         spec_ok, spec_why = broker.available(spec, reserve_work=reserve)
         if not spec_ok:
             return {
+                **record,
                 "status": "RATE_LIMITED",
                 "reason": f"rotation:pinned spec author {spec.value} unavailable: {spec_why}",
             }
-        record["checker"]["provider"] = checker.value
-        if policy is not None:
-            for key, role, provider in (
-                ("maker", IMPLEMENTER, maker),
-                ("checker", CODE_REVIEWER, checker),
-                ("spec", SPEC_ARCHITECT, spec),
-            ):
-                configured = policy.model_for(role, provider)
-                if configured is not None:
-                    record[key]["model"] = configured
-        return self._rotation_result(record, pinned=True)
+        return self._rotation_result(record, pinned=pinned)
 
     @staticmethod
     def _rotation_result(record: dict[str, Any], *, pinned: bool) -> dict[str, Any]:

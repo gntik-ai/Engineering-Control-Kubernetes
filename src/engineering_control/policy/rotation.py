@@ -128,11 +128,15 @@ class RotationDecision:
     policy_hash: str
     fallback: str | None = None
     status: Literal["READY", "RATE_LIMITED", "BLOCKED"] = "READY"
+    # An author role's pin or ratio choice, also when nobody is available now (then the
+    # provider a pinned subject waits for).
+    intended: Provider | None = None
 
     def record(self) -> dict[str, str | None]:
+        provider = self.provider or self.intended
         return {
             "role": self.role,
-            "provider": self.provider.value if self.provider is not None else None,
+            "provider": provider.value if provider is not None else None,
             "model": self.model,
             "reason": self.reason,
             "policy_hash": self.policy_hash,
@@ -202,7 +206,12 @@ def choose(
     ok, why = quota.available(wanted, reserve_work=reserve_work)
     if ok:
         return RotationDecision(
-            role, wanted, policy.model_for(role, wanted), f"{how}:{wanted.value}:{why}", digest
+            role,
+            wanted,
+            policy.model_for(role, wanted),
+            f"{how}:{wanted.value}:{why}",
+            digest,
+            intended=wanted,
         )
     other = opposite(wanted)
     other_ok, other_why = quota.available(other, reserve_work=reserve_work)
@@ -210,10 +219,11 @@ def choose(
         return RotationDecision(
             role,
             None,
-            None,
+            policy.model_for(role, wanted),
             f"{how}:{wanted.value}:{why};{other.value}:{other_why}",
             digest,
             status="RATE_LIMITED",
+            intended=wanted,
         )
     return RotationDecision(
         role,
@@ -222,4 +232,5 @@ def choose(
         f"{how}:{wanted.value}:{why};fallback:{other.value}:{other_why}",
         digest,
         fallback=f"{wanted.value}:{why}",
+        intended=wanted,
     )

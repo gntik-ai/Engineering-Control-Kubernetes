@@ -616,18 +616,160 @@ def test_a_fallback_at_the_first_choice_is_recorded_and_then_pinned(tmp_path: Pa
     )
     change_set_id, run_id = _change_set(handler)
     routed = _route(handler, _payload(change_set_id, run_id), _broker(codex=False))
-    # Codex (pinned) is rate limited: Claude makes, and the checker would be Codex, which
-    # is unavailable: today's blocking, nothing recorded yet.
-    assert routed["status"] == "BLOCKED" and "rotation" not in _recovery(handler, change_set_id)
+    # Codex (pinned) is rate limited: Claude makes (recorded fallback), and the checker
+    # would be Codex, which is unavailable: today's blocking. The choice is recorded now.
+    assert routed["status"] == "BLOCKED"
+    record = _recovery(handler, change_set_id)["rotation"]
+    assert record["maker"]["provider"] == "claude"
+    assert record["maker"]["fallback"] == "codex:provider_rate_limited"
     reserve = _broker(codex=0.1)  # Codex only keeps its verification reserve
-    routed = _route(handler, _payload(change_set_id, run_id), reserve)
+    routed = _route(handler, _payload(change_set_id, _add_run(handler, change_set_id)), reserve)
     assert routed["status"] == "ROUTED"
     assert (routed["maker_provider"], routed["checker_provider"]) == ("claude", "codex")
-    record = _recovery(handler, change_set_id)["rotation"]
-    assert record["maker"]["fallback"] == "codex:verification_reserve_protected"
-    assert "fallback=codex:verification_reserve_protected" in routed["routing_reason"]
-    later = _route(handler, _payload(change_set_id, uuid4()), _broker())
+    assert "fallback=codex:provider_rate_limited" in routed["routing_reason"]
+    later = _route(handler, _payload(change_set_id, _add_run(handler, change_set_id)), _broker())
     assert later["maker_provider"] == "claude"  # the fallback is the ChangeSet's maker now
+
+
+def _add_run(handler: MetadataActivityHandler, change_set_id: UUID) -> UUID:
+    """Another delivery run (a retry, correction or CI repair) of the same ChangeSet."""
+    run_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=run_id,
+                campaign_id=None,
+                change_set_id=change_set_id,
+                workflow_id=f"delivery-{change_set_id}-{run_id}",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+    return run_id
+
+
+def _set_rotation(handler: MetadataActivityHandler, rotation: dict[str, Any] | None) -> None:
+    path = Path(handler.settings.project_config_root) / "falcone.yaml"
+    manifest = yaml.safe_load(path.read_text())
+    manifest.pop("provider_rotation", None)
+    if rotation is not None:
+        manifest["provider_rotation"] = rotation
+    path.write_text(yaml.safe_dump(manifest))
+
+
+def test_an_unsuccessful_first_routing_still_pins_the_maker(tmp_path: Path) -> None:
+    """Codex review: a first attempt that could not route saved nothing, so the retry (a
+    distinct run) met the in-flight rule and the legacy broker chose, then flipped."""
+    handler = _handler(
+        tmp_path,
+        {
+            "enabled": True,
+            "enabled_at": ENABLED_AT.isoformat(),
+            "roles": {IMPLEMENTER: {"pin": "claude"}, SPEC_ARCHITECT: {"pin": "claude"}},
+        },
+    )
+    change_set_id, run_id = _change_set(handler)
+    first = _route(handler, _payload(change_set_id, run_id), _broker(False, False))
+    assert first["status"] == "RATE_LIMITED"
+    assert (
+        first["routing_reason"] == "rotation:pinned maker claude unavailable: provider_rate_limited"
+    )
+    assert _recovery(handler, change_set_id)["rotation"]["maker"]["provider"] == "claude"
+    # Retry (distinct run): only Codex is available. Today's broker would choose Codex.
+    retry = _route(
+        handler,
+        _payload(change_set_id, _add_run(handler, change_set_id)),
+        _broker(codex=True, claude=False),
+    )
+    assert retry["status"] == "RATE_LIMITED" and "maker_provider" not in retry
+    # Next attempt: both available: the pin holds.
+    routed = _route(handler, _payload(change_set_id, _add_run(handler, change_set_id)), _broker())
+    assert (routed["maker_provider"], routed["checker_provider"]) == ("claude", "codex")
+    # Quota pressure on Claude (only its verification reserve left): today's broker would
+    # flip the maker to Codex; the pinned maker waits instead.
+    pressed = _route(
+        handler,
+        _payload(change_set_id, _add_run(handler, change_set_id)),
+        _broker(codex=True, claude=0.1),
+    )
+    assert pressed["status"] == "RATE_LIMITED"
+    assert pressed["routing_reason"].startswith("rotation:pinned maker claude unavailable")
+    again = _route(handler, _payload(change_set_id, _add_run(handler, change_set_id)), _broker())
+    assert again["maker_provider"] == "claude"
+
+
+MODELS = {
+    IMPLEMENTER: {"models": {"claude": "claude-sonnet-5-5", "codex": "gpt-6.1-sol"}},
+    CODE_REVIEWER: {"models": {"claude": "claude-opus-5-5"}},
+}
+
+
+def test_models_follow_the_current_configuration_and_return_to_defaults(
+    tmp_path: Path,
+) -> None:
+    enabled = {
+        "enabled": True,
+        "enabled_at": ENABLED_AT.isoformat(),
+        "roles": {**MODELS, IMPLEMENTER: {**MODELS[IMPLEMENTER], "pin": "claude"}},
+    }
+    handler = _handler(tmp_path, enabled)
+    change_set_id, run_id = _change_set(handler)
+    routed = _route(handler, _payload(change_set_id, run_id), _broker())
+    assert routed["rotation"]["maker"]["model"] == "claude-sonnet-5-5"
+    assert routed["rotation"]["checker"]["model"] is None  # Codex reviewer: its default
+
+    def again() -> dict[str, Any]:
+        result: dict[str, Any] = _route(
+            handler, _payload(change_set_id, _add_run(handler, change_set_id)), _broker()
+        )
+        return result
+
+    # The override is removed: today's default model, the provider stays pinned.
+    _set_rotation(handler, {**enabled, "roles": {IMPLEMENTER: {"pin": "codex"}}})
+    removed = again()
+    assert removed["maker_provider"] == "claude"
+    assert removed["rotation"]["maker"]["model"] is None
+    assert "maker=claude/default" in removed["routing_reason"]
+    # The whole pilot block is reverted: still pinned (decision 2), models default.
+    _set_rotation(handler, None)
+    reverted = again()
+    assert reverted["maker_provider"] == "claude"
+    assert all(reverted["rotation"][key]["model"] is None for key in ("maker", "checker", "spec"))
+    # The recorded choice keeps the model chosen at enrolment for the audit.
+    assert _recovery(handler, change_set_id)["rotation"]["maker"]["model"] == "claude-sonnet-5-5"
+
+
+@pytest.mark.parametrize("off", [{"enabled": False}, None], ids=["disabled", "block-removed"])
+def test_after_disabling_fresh_change_sets_route_as_today_and_rotated_ones_stay_pinned(
+    tmp_path: Path, off: dict[str, Any] | None
+) -> None:
+    enabled = {
+        "enabled": True,
+        "enabled_at": ENABLED_AT.isoformat(),
+        "roles": MODELS,
+        "ratio": {"codex": 0, "claude": 1},
+    }
+    handler = _handler(tmp_path, enabled)
+    rotated, run_id = _change_set(handler)
+    first = _route(handler, _payload(rotated, run_id), _broker())
+    assert first["maker_provider"] == "claude"
+    _set_rotation(handler, off)
+    # The single documented exception: the enrolled ChangeSet keeps its providers (and
+    # its rotation keys and routing_reason), with today's default models.
+    kept = _route(handler, _payload(rotated, _add_run(handler, rotated)), _broker())
+    assert (kept["maker_provider"], kept["checker_provider"]) == ("claude", "codex")
+    assert kept["routing_reason"].startswith("rotation:") and ";pinned;" in kept["routing_reason"]
+    assert all(kept["rotation"][key]["model"] is None for key in ("maker", "checker", "spec"))
+    # Every other ChangeSet routes exactly as origin/main did.
+    for (codex, claude), risk in itertools.product(QUOTA_STATES, ("R2", "R3")):
+        change_set_id, fresh_run = _change_set(handler)
+        routed = _route(handler, _payload(change_set_id, fresh_run, risk), _broker(codex, claude))
+        status, maker, checker, spec, reason = TODAY[(codex, claude, risk)]
+        assert (routed["status"], routed["routing_reason"]) == (status, reason)
+        assert routed.get("maker_provider") == maker and routed.get("spec_provider") == spec
+        assert routed.get("checker_provider") == checker and "rotation" not in routed
+        assert _recovery(handler, change_set_id) == {}
 
 
 @pytest.mark.parametrize(
