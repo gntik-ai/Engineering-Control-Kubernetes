@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
+import threading
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -66,8 +68,16 @@ from engineering_control.security.redaction import (
     redact_detail_text,
 )
 from engineering_control.worktrees.hardened_git import HardenedGitError, worktree_location
+from engineering_control.worktrees.ownership import (
+    Budget,
+    NormalisationReport,
+    normalise_owned_tree,
+)
 
 _PYDANTIC_MESSAGE_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -> str:
@@ -500,7 +510,19 @@ class ProviderActivityHandler:
             options["sandbox"] = sandbox
         if not scratch_copy:
             # The default toolchain and sandbox call the adapter exactly as before.
-            return await self.adapter.execute(request, on_event, **options)
+            if not request.writable:
+                return await self.adapter.execute(request, on_event, **options)
+            try:
+                result = await self.adapter.execute(request, on_event, **options)
+            except asyncio.CancelledError:
+                # Cancellation cleanup never waits on it: a bounded walk in the background.
+                self._normalise_detached(request)
+                raise
+            except BaseException:
+                await self._normalise_worktree_ownership(request, on_event)
+                raise
+            await self._normalise_worktree_ownership(request, on_event)
+            return result
         copy_root = (
             self.settings.temporary_root
             / self.provider.value
@@ -523,6 +545,111 @@ class ProviderActivityHandler:
         finally:
             with suppress(OSError):  # a leftover copy only costs disk, never the result
                 await asyncio.to_thread(remove_tree, copy_root)
+
+    # NEW-243 review: the post-step normalisation is bounded (entries and time) and stoppable;
+    # it never blocks or fails the provider result.
+    _normalise_seconds = 60.0
+    _normalise_max_entries = 1_000_000
+    _normalise_grace_seconds = 5.0
+
+    async def _normalise_worktree_ownership(
+        self,
+        request: AgentRequest,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """NEW-243 phase 0: after a writable run, restore the ACL mask on what this runner
+        created in its ChangeSet worktree, so the manager, the checker, the publishing
+        identities and the cleanup see it as granted.
+        Only this runner's own files, only inside worktree_root/<repository>/<ChangeSet>,
+        within a budget; it never fails the run (a leftover makes the next hand-off fail
+        closed instead). An incomplete walk is recorded and logged."""
+        stop = threading.Event()
+        event: dict[str, Any] = {"type": "hermes.worktree_ownership"}
+        work = asyncio.ensure_future(
+            asyncio.to_thread(
+                self._normalise_changeset_worktree, Path(request.working_directory), stop
+            )
+        )
+        # A walk outliving the wait is stopped through ``stop``; its outcome is consumed.
+        work.add_done_callback(lambda done: done.cancelled() or done.exception())
+        try:
+            report = await asyncio.wait_for(
+                asyncio.shield(work),
+                timeout=self._normalise_seconds + self._normalise_grace_seconds,
+            )
+        except TimeoutError:
+            stop.set()
+            event |= {"status": "INCOMPLETE", "reason": "timeout"}
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        except Exception as error:  # noqa: BLE001 - never fails the provider result
+            event |= {"status": "FAILED", "detail": error_detail(error, self.redactor)}
+        else:
+            if report is None:
+                return
+            event |= {
+                "status": "NORMALISED" if report.complete else "INCOMPLETE",
+                "scanned": report.scanned,
+                "changed": report.changed,
+                "failed": report.failed,
+                "raced": report.raced,
+                "unlisted": report.unlisted,
+                "foreign_device": report.foreign_device,
+                "errors": report.errors,
+            }
+            if report.reason is not None:
+                event["reason"] = report.reason
+        if event["status"] != "NORMALISED":
+            _LOGGER.warning(
+                "worktree ownership normalisation %s for run %s: %s",
+                event["status"],
+                request.run_id,
+                {key: value for key, value in event.items() if key != "type"},
+            )
+        with suppress(Exception):  # observability cannot change provider work
+            await on_event(event)
+
+    def _normalise_detached(self, request: AgentRequest) -> None:
+        """The same bounded normalisation in a daemon thread, for a cancelled run: the
+        cancellation is not delayed; the outcome is only logged."""
+        worktree = Path(request.working_directory)
+
+        def run() -> None:
+            try:
+                report = self._normalise_changeset_worktree(worktree, threading.Event())
+            except Exception as error:  # noqa: BLE001 - a background best effort
+                _LOGGER.warning("worktree ownership normalisation failed: %s", error)
+                return
+            if report is not None and not report.complete:
+                _LOGGER.warning(
+                    "worktree ownership normalisation incomplete for run %s: %s",
+                    request.run_id,
+                    report,
+                )
+
+        threading.Thread(target=run, name="worktree-ownership", daemon=True).start()
+
+    def _normalise_changeset_worktree(
+        self, worktree: Path, stop: threading.Event
+    ) -> NormalisationReport | None:
+        """The bounded normalisation of ``worktree`` when it is a ChangeSet worktree
+        (worktree_root/<repository>/<uuid>, not a symlink); None otherwise."""
+        try:
+            if worktree.is_symlink():
+                return None
+            resolved = worktree.resolve()
+            if resolved.parent.parent != self.settings.worktree_root.resolve():
+                return None
+            UUID(resolved.name)
+        except (OSError, ValueError):
+            return None
+        return normalise_owned_tree(
+            resolved,
+            budget=Budget.seconds(
+                self._normalise_seconds, max_entries=self._normalise_max_entries, stop=stop
+            ),
+        )
 
     def _agent_sandbox_problem(
         self, sandbox: AgentSandbox | None, request: AgentRequest
