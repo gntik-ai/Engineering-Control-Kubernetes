@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     private_tmp_sweep_idle_minutes: int = Field(default=90, ge=15, le=1440)
     private_tmp_sweep_interval_seconds: int = Field(default=900, ge=60, le=86400)
     # NEW-226: one provider run's cgroup memory.max (MiB). Unset: the worker's MemoryHigh
-    # less 1 GiB (codex 6G, claude 5G), so a runaway command is OOM-killed in its own run.
+    # less 1 GiB (6G for both since NEW-243), so a runaway command is OOM-killed in its run.
     agent_run_memory_max_mib: int | None = Field(default=None, ge=512, le=65536)
     codex_executable: Path = Path("/usr/local/bin/codex")
     # NEW-36: pin the Codex model instead of inheriting the CLI default, which changed
