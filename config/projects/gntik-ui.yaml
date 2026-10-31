@@ -202,6 +202,30 @@ maker_rules:
       `timeout 600 pnpm --filter @gntik-ai/docs exec playwright test <file> --workers=1`,
       red before the fix and green after; the checker may re-run that one file the same
       way. Never run the a11y or visual suites, or more than one spec file, on the worker.
+    - >-
+      Checker (NEW-243, either provider): you are read-only on the maker's worktree. Run the
+      listed commands and report each real PASS or FAIL. One that fails only because it
+      cannot write (EACCES, EROFS, read-only file system on dist/, .next/, caches or
+      tsbuildinfo) is not a defect of the change: report it as "NOT RUN: read-only checker,
+      write denied" with the error line, and judge the build from the maker's run and the
+      diff; PR CI runs the full build. Request changes only for defects in the change.
+# NEW-243 phase 1 pilot (2026-10-31): rotate the delivery maker between Codex and Claude
+# 50/50, chosen once per ChangeSet (kept for its retries, corrections and CI repairs); the
+# checker is always the other provider. Models stay today's defaults (no overrides), so the
+# pilot changes only who makes and who checks. ChangeSets created before enabled_at keep
+# today's routing; enabled_at must be the install time or later. checker_scratch_copy stays
+# off (10-22 precondition above); a Codex checker reviews read-only, like today's Claude
+# checker on gntik-ui, and PR CI runs the full suites. Revert this block alone to stop the
+# pilot; rotated ChangeSets keep their recorded providers.
+provider_rotation:
+  enabled: true
+  enabled_at: "2026-10-31T06:00:00+00:00"
+  ratio:
+    codex: 1
+    claude: 1
+  roles:
+    product-spec-architect:
+      pin: claude   # today's spec routing prefers Claude; only the maker/checker pairing rotates
 dependencies: {}
 classification:
   product: true

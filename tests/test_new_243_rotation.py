@@ -828,7 +828,31 @@ def test_the_gntik_ui_rotation_proposal_validates() -> None:
         pytest.skip("the gntik-ui proposal is not in this tree")
     rotation = manifest.provider_rotation
     assert rotation.enabled and rotation.ratio.codex == rotation.ratio.claude
-    assert rotation.model_for(IMPLEMENTER, Provider.CLAUDE) == "claude-sonnet-5-5"
-    assert rotation.model_for(IMPLEMENTER, Provider.CODEX) == "gpt-6.1-sol"
-    assert rotation.model_for(CODE_REVIEWER, Provider.CLAUDE) == "claude-opus-5-5"
-    assert rotation.model_for(CODE_REVIEWER, Provider.CODEX) is None
+    # The pilot keeps today's default models for every role: only the pairing rotates.
+    for role in (IMPLEMENTER, CODE_REVIEWER):
+        for provider in (Provider.CLAUDE, Provider.CODEX):
+            assert rotation.model_for(role, provider) is None
+    assert rotation.enabled_at is not None
+
+
+def test_a_pinned_spec_author_keeps_todays_routing_at_every_attempt(tmp_path: Path) -> None:
+    """Pilot review: a pinned spec author fell back to Codex under Claude quota pressure and
+    stayed there after Claude recovered. It now follows today's preference at every routing:
+    the pin, the other provider while the pin is unavailable, the pin again once it recovers."""
+    handler = _handler(
+        tmp_path,
+        {
+            "enabled": True,
+            "enabled_at": ENABLED_AT.isoformat(),
+            "roles": {IMPLEMENTER: {"pin": "codex"}, SPEC_ARCHITECT: {"pin": "claude"}},
+        },
+    )
+    change_set_id, run_id = _change_set(handler)
+    pressed = _route(handler, _payload(change_set_id, run_id), _broker(codex=True, claude=0.1))
+    assert (pressed["maker_provider"], pressed["checker_provider"]) == ("codex", "claude")
+    assert pressed["spec_provider"] == "codex"
+    recovered = _route(
+        handler, _payload(change_set_id, _add_run(handler, change_set_id)), _broker()
+    )
+    assert recovered["spec_provider"] == "claude"
+    assert (recovered["maker_provider"], recovered["checker_provider"]) == ("codex", "claude")
