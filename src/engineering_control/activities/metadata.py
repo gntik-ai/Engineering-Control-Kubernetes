@@ -3373,6 +3373,18 @@ class MetadataActivityHandler:
                 "status": "BLOCKED",
                 "reason": f"rotation:checker {checker.value} unavailable: {checker_why}",
             }
+        spec_pin = policy.roles.get(SPEC_ARCHITECT) if policy is not None and enabled else None
+        if spec_pin is not None and spec_pin.pin is not None:
+            # A pinned spec author keeps today's routing at every attempt: the pin first, the
+            # other provider when the pin is unavailable, back to the pin once it recovers.
+            # Never frozen to a fallback (NEW-243 pilot review): only the maker/checker
+            # pairing rotates.
+            preferred = Provider(spec_pin.pin)
+            spec = preferred
+            if not broker.available(preferred, reserve_work=reserve)[0]:
+                spec = Provider.CLAUDE if preferred is Provider.CODEX else Provider.CODEX
+            record["spec"]["provider"] = spec.value
+            record["spec"]["model"] = policy.model_for(SPEC_ARCHITECT, spec) if policy else None
         spec_ok, spec_why = broker.available(spec, reserve_work=reserve)
         if not spec_ok:
             return {
