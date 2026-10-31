@@ -191,3 +191,27 @@ def test_invalid_manifest_blocks_the_verifier_snapshot(tmp_path: Path) -> None:
     snapshot = _snapshot(Settings(project_config_root=root), tmp_path, "falcone-serverless")
     assert snapshot["toolchain_preparation"]["blocker"] == "TOOLCHAIN_CONTRACT_INVALID"
     UUID(snapshot["finding_id"])
+
+
+def test_missing_manifest_blocks_the_verifier_like_the_maker(tmp_path: Path) -> None:
+    # Codex review 1: never the system toolchain for a configured project's verifier.
+    root = _manifests(tmp_path, "falcone", {})
+    (root / "falcone-serverless.yaml").unlink()
+    settings = Settings(project_config_root=root, **_language_installs(tmp_path))
+    snapshot = _snapshot(settings, tmp_path, "falcone-serverless")
+    assert snapshot["toolchain_preparation"]["status"] == "BLOCKED"
+    assert snapshot["toolchain_preparation"]["blocker"] == "TOOLCHAIN_CONTRACT_INVALID"
+    prepared, _ = _prepare(tmp_path, "falcone-serverless", snapshot)
+    assert (prepared["status"], prepared["blocker"]) == ("BLOCKED", "TOOLCHAIN_CONTRACT_INVALID")
+
+
+def test_malformed_yaml_blocks_the_verifier_snapshot(tmp_path: Path) -> None:
+    # Codex review 2: a YAML parse error is a contract blocker, never an activity failure.
+    root = _manifests(tmp_path, "falcone", {})
+    (root / "falcone-serverless.yaml").write_text(
+        "project: falcone-serverless\ntoolchain: [\n", encoding="utf-8"
+    )
+    settings = Settings(project_config_root=root, **_language_installs(tmp_path))
+    snapshot = _snapshot(settings, tmp_path, "falcone-serverless")
+    assert snapshot["toolchain_preparation"]["status"] == "BLOCKED"
+    assert snapshot["toolchain_preparation"]["blocker"] == "TOOLCHAIN_CONTRACT_INVALID"

@@ -78,7 +78,6 @@ from engineering_control.engineering.toolchain import (
     payload_node_toolchain,
     platform_language_variables,
     prepare_executables,
-    project_node_toolchain,
     render_argv,
     resolve_node_toolchain,
 )
@@ -1219,15 +1218,18 @@ class ScanActivityHandler(DecompositionScanSteps):
         """The toolchain selection this project's makers get from delivery.prepare_toolchain
         (the same resolution on this host), for the finding verifiers of a fresh snapshot.
 
-        Empty for the default toolchain (every project without a toolchain block), so their
-        verifier requests are exactly as before. A selection that is not installed here,
-        or an invalid manifest, is a BLOCKED preparation the verifier fails closed on.
+        Empty for the default toolchain (a valid manifest without a toolchain block), so
+        those verifier requests are exactly as before. Like the maker's preparation, a
+        missing, unreadable or malformed manifest is TOOLCHAIN_CONTRACT_INVALID and a
+        selection not installed here its TOOLCHAIN_*_UNAVAILABLE: a BLOCKED preparation
+        the verifier fails closed on.
         """
         try:
-            selection = project_node_toolchain(self.settings, project).selection()
+            policy = load_toolchain_policy(self.settings.project_config_root, project)
+            selection = resolve_node_toolchain(self.settings, policy).selection()
         except ToolchainUnavailableError as error:
             blocker, detail = error.blocker, str(error)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, yaml.YAMLError) as error:
             blocker, detail = "TOOLCHAIN_CONTRACT_INVALID", str(error)
         else:
             return {} if selection is None else {"node_toolchain": selection}
