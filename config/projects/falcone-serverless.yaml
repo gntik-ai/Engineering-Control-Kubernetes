@@ -135,8 +135,8 @@ maker_rules:
       diff; PR CI runs the full build. Request changes only for defects in the change.
 # NEW-243 rotation (2026-10-31, after the gntik-ui pilot): rotate the delivery maker between
 # Codex and Claude 50/50, chosen once per ChangeSet (kept for its retries, corrections and CI
-# repairs); the checker is always the other provider; models stay today's defaults; the spec
-# architect stays on Claude. ChangeSets created before enabled_at keep today's routing;
+# repairs); the checker is always the other provider; a Claude maker uses Sonnet 5.5, every
+# other role keeps today's default model; the spec architect stays on Claude. ChangeSets created before enabled_at keep today's routing;
 # enabled_at must be the install time or later. Revert this block alone to stop rotation for
 # falcone-serverless; rotated ChangeSets keep their recorded providers.
 provider_rotation:
@@ -148,6 +148,9 @@ provider_rotation:
   roles:
     product-spec-architect:
       pin: claude   # today's spec routing prefers Claude; only the maker/checker pairing rotates
+    implementer:
+      models:
+        claude: claude-sonnet-5-5   # operator 2026-10-31: a Claude maker always uses Sonnet 5.5
 dependencies: {}
 classification:
   product: true
