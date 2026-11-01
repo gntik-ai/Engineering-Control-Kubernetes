@@ -354,6 +354,189 @@ def test_the_sweep_removes_nothing_while_a_step_runs(
     assert all(entry.exists() for entry in selected)
 
 
+def test_a_busy_worker_removes_only_what_finished_steps_wrote(tmp_path: Path) -> None:
+    root = tmp_path / "tmp"
+    (root / "rv121" / "target").mkdir(parents=True)
+    (root / "rv121" / "target" / "out").write_text("x")
+    (root / "loose.txt").write_text("x")
+    time.sleep(0.05)
+    with tmp_sweep.running_step():
+        time.sleep(0.05)
+        (root / "written-by-a-running-step").mkdir()
+        # Without a busy idle time the pass still removes nothing while a step runs.
+        assert tmp_sweep.sweep(root, idle_seconds=-60, protected=()).removed == 0
+        # Busy: idle for the busy time is not enough, nobody may have written it since
+        # the oldest running step started (a negative idle time stands for "much later").
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+        assert result == tmp_sweep.SweepResult(removed=1, failed=0)
+        # A file waits for an idle worker: its old mtime could be a restored one.
+        assert sorted(entry.name for entry in root.iterdir()) == [
+            "loose.txt",
+            "written-by-a-running-step",
+        ]
+    # And the busy idle time still applies to what finished steps wrote.
+    (root / "fresh").mkdir()
+    time.sleep(0.05)
+    with tmp_sweep.running_step():
+        kept = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=600)
+    assert kept.removed == 0
+    assert (root / "fresh").exists()
+
+
+def test_a_step_starting_during_a_busy_pass_stops_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tmp"
+    root.mkdir()
+    for name in ("a", "b", "c"):
+        (root / name).mkdir()
+    time.sleep(0.05)
+    real = tmp_sweep.remove_tree
+
+    def start_a_step(path: Path) -> bool:
+        tmp_sweep._STARTED[0] += 1  # noqa: SLF001
+        return real(path)
+
+    monkeypatch.setattr(tmp_sweep, "remove_tree", start_a_step)
+    with tmp_sweep.running_step():
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+    assert result.removed == 1
+    assert len(list(root.iterdir())) == 2
+
+
+def test_a_write_during_the_busy_revalidation_puts_the_entry_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tmp"
+    (root / "reused" / "target").mkdir(parents=True)
+    (root / "reused" / "target" / "a").write_text("old")
+    (root / "reused" / "target" / "b").write_text("old")
+    time.sleep(0.05)
+    walk = tmp_sweep._newest_change  # noqa: SLF001
+    calls: list[Path] = []
+
+    def write_after_the_walk(path: Path, *args: Any, **kwargs: Any) -> float | None:
+        newest = walk(path, *args, **kwargs)
+        calls.append(path)
+        if len(calls) == 2:  # the pre-rename revalidation: a live step writes "a" after it
+            (path / "target" / "a").write_text("written by a live step")
+        return newest
+
+    monkeypatch.setattr(tmp_sweep, "_newest_change", write_after_the_walk)
+    with tmp_sweep.running_step():
+        time.sleep(0.05)
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+    assert result.removed == 0
+    assert (root / "reused" / "target" / "a").read_text() == "written by a live step"
+    assert sorted(entry.name for entry in root.iterdir()) == ["reused"]
+    # Once that step has ended and nothing writes in it, it is removed, renamed out of
+    # reach first: no quarantine name is left behind.
+    monkeypatch.setattr(tmp_sweep, "_newest_change", walk)
+    time.sleep(0.05)
+    with tmp_sweep.running_step():
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+    assert result == tmp_sweep.SweepResult(removed=1, failed=0)
+    assert list(root.iterdir()) == []
+
+
+def test_a_put_back_entry_never_replaces_a_new_one_of_that_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / "tmp"
+    (root / "cache").mkdir(parents=True)
+    (root / "cache" / "old").write_text("old")
+    time.sleep(0.05)
+    walk = tmp_sweep._newest_change  # noqa: SLF001
+
+    def recreate_during_the_final_walk(path: Path, *args: Any, **kwargs: Any) -> float | None:
+        if kwargs.get("renamed"):
+            (path / "old").write_text("written before the rename")  # forces a put-back
+            (root / "cache").mkdir()  # a live step makes a new "cache" meanwhile
+            (root / "cache" / "new").write_text("new")
+        return walk(path, *args, **kwargs)
+
+    monkeypatch.setattr(tmp_sweep, "_newest_change", recreate_during_the_final_walk)
+    with tmp_sweep.running_step():
+        time.sleep(0.05)
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+    assert result.removed == 0
+    assert (root / "cache" / "new").read_text() == "new"  # not replaced
+    kept = [entry for entry in root.iterdir() if entry.name.startswith(".hermes-sweep-")]
+    assert len(kept) == 1
+    assert (kept[0] / "old").read_text() == "written before the rename"  # not lost
+    assert "private /tmp sweep kept cache as .hermes-sweep-" in caplog.text
+
+
+def test_an_entry_replaced_before_the_rename_goes_back_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tmp"
+    (root / "out").mkdir(parents=True)
+    time.sleep(0.05)
+    real = tmp_sweep._rename_noreplace  # noqa: SLF001
+    old = time.time() - 86400
+
+    def replace_then_rename(source: Path, target: Path) -> bool:
+        if source.name == "out" and source.is_dir():
+            # A live step removes the old empty directory and copies a file with an old
+            # mtime to that name (cp -p) just before the sweep renames it.
+            source.rmdir()
+            source.write_text("new content")
+            os.utime(source, (old, old))
+        return real(source, target)
+
+    monkeypatch.setattr(tmp_sweep, "_rename_noreplace", replace_then_rename)
+    with tmp_sweep.running_step():
+        time.sleep(0.05)
+        result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)
+    assert result.removed == 0
+    assert (root / "out").read_text() == "new content"
+    assert [entry.name for entry in root.iterdir()] == ["out"]
+
+
+def test_rename_noreplace_refuses_an_existing_target(tmp_path: Path) -> None:
+    (tmp_path / "a").write_text("a")
+    (tmp_path / "b").write_text("b")
+    assert tmp_sweep._rename_noreplace(tmp_path / "a", tmp_path / "b") is False  # noqa: SLF001
+    assert (tmp_path / "b").read_text() == "b"
+    assert tmp_sweep._rename_noreplace(tmp_path / "a", tmp_path / "c") is True  # noqa: SLF001
+    assert (tmp_path / "c").read_text() == "a"
+
+
+def test_a_busy_pass_keeps_live_run_directories(tmp_path: Path) -> None:
+    root = tmp_path / "tmp"
+    (root / "keep" / "run").mkdir(parents=True)
+    time.sleep(0.05)
+    with tmp_sweep.running_step():
+        result = tmp_sweep.sweep(
+            root, idle_seconds=5400, protected={root / "keep" / "run"}, busy_idle_seconds=-60
+        )
+    assert result.removed == 0
+    assert (root / "keep" / "run").exists()
+
+
+def test_the_role_worker_sweeps_busy_with_the_configured_idle_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engineering_control.workflows import role_worker
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(tmp_sweep, "is_private_tmp", lambda: True)
+    monkeypatch.setattr(role_worker, "retry_unremoved", lambda: None)
+
+    def fake_sweep(root: Path, **kwargs: Any) -> tmp_sweep.SweepResult:
+        seen.update(kwargs, root=root)
+        return tmp_sweep.SweepResult(0, 0)
+
+    monkeypatch.setattr(tmp_sweep, "sweep", fake_sweep)
+    role_worker.sweep_temporaries(
+        Settings(private_tmp_sweep_busy_idle_minutes=12), protected=frozenset()
+    )
+    assert seen["busy_idle_seconds"] == 720
+    assert seen["idle_seconds"] == 5400
+    assert Settings().private_tmp_sweep_interval_seconds == 300
+
+
 def test_running_steps_are_tracked_until_they_end() -> None:
     assert tmp_sweep.oldest_running_step() is None
     with tmp_sweep.running_step():

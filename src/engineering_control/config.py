@@ -74,9 +74,11 @@ class Settings(BaseSettings):
     # NEW-226: provider runs get their own TMPDIR under temporary_root/<provider>; this
     # sweep is the backstop for the role worker's private /tmp (PrivateTmp, a tmpfs held
     # in RAM). On start and every interval it removes entries nobody wrote for the idle
-    # time and none a running step wrote; node-compile-cache stays.
+    # time and none a running step wrote; node-compile-cache stays. While steps run, it
+    # removes only entries idle for the busy idle time that no running step wrote.
     private_tmp_sweep_idle_minutes: int = Field(default=90, ge=15, le=1440)
-    private_tmp_sweep_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    private_tmp_sweep_busy_idle_minutes: int = Field(default=10, ge=5, le=1440)
+    private_tmp_sweep_interval_seconds: int = Field(default=300, ge=60, le=86400)
     # NEW-226: one provider run's cgroup memory.max (MiB). Unset: the worker's MemoryHigh
     # less 1 GiB (6G for both since NEW-243), so a runaway command is OOM-killed in its run.
     agent_run_memory_max_mib: int | None = Field(default=None, ge=512, le=65536)
