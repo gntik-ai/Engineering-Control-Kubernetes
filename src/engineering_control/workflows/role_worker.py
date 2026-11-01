@@ -51,6 +51,7 @@ def sweep_temporaries(settings: Settings, *, protected: frozenset[Path]) -> None
         Path("/tmp"),  # noqa: S108 - the unit's PrivateTmp, checked just above
         idle_seconds=settings.private_tmp_sweep_idle_minutes * 60,
         protected=protected,
+        busy_idle_seconds=settings.private_tmp_sweep_busy_idle_minutes * 60,
     )
     if result.removed or result.failed:
         LOGGER.info("private /tmp sweep; removed=%s failed=%s", result.removed, result.failed)
