@@ -126,6 +126,31 @@ maker_rules:
       FS_TEST_NAMESPACE/FW_TEST_NAMESPACE; create only new objects named with the run id and
       labelled falcone.test/run=<id>; never update, patch, relabel or delete an object
       unless its label equals this run's id.
+    - >-
+      Checker (NEW-243, either provider): you are read-only on the maker's worktree. Run the
+      listed commands and report each real PASS or FAIL. One that fails only because it
+      cannot write (EACCES, EROFS, read-only file system on dist/, build output, caches or
+      tsbuildinfo) is not a defect of the change: report it as "NOT RUN: read-only checker,
+      write denied" with the error line, and judge the build from the maker's run and the
+      diff; PR CI runs the full build. Request changes only for defects in the change.
+# NEW-243 rotation (2026-10-31, after the gntik-ui pilot): rotate the delivery maker between
+# Codex and Claude 50/50, chosen once per ChangeSet (kept for its retries, corrections and CI
+# repairs); the checker is always the other provider; a Claude maker uses Sonnet 5.5, every
+# other role keeps today's default model; the spec architect stays on Claude. ChangeSets created before enabled_at keep today's routing;
+# enabled_at must be the install time or later. Revert this block alone to stop rotation for
+# falcone-serverless; rotated ChangeSets keep their recorded providers.
+provider_rotation:
+  enabled: true
+  enabled_at: "2026-11-01T01:00:00+00:00"
+  ratio:
+    codex: 1
+    claude: 1
+  roles:
+    product-spec-architect:
+      pin: claude   # today's spec routing prefers Claude; only the maker/checker pairing rotates
+    implementer:
+      models:
+        claude: claude-sonnet-5-5   # operator 2026-10-31: a Claude maker always uses Sonnet 5.5
 dependencies: {}
 classification:
   product: true
