@@ -141,7 +141,7 @@ maker_rules:
 # falcone-serverless; rotated ChangeSets keep their recorded providers.
 provider_rotation:
   enabled: true
-  enabled_at: "2026-11-01T00:00:00+00:00"
+  enabled_at: "2026-11-01T01:00:00+00:00"
   ratio:
     codex: 1
     claude: 1
