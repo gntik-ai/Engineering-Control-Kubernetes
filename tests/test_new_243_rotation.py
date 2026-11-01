@@ -828,10 +828,12 @@ def test_the_gntik_ui_rotation_proposal_validates() -> None:
         pytest.skip("the gntik-ui proposal is not in this tree")
     rotation = manifest.provider_rotation
     assert rotation.enabled and rotation.ratio.codex == rotation.ratio.claude
-    # The pilot keeps today's default models for every role: only the pairing rotates.
-    for role in (IMPLEMENTER, CODE_REVIEWER):
-        for provider in (Provider.CLAUDE, Provider.CODEX):
-            assert rotation.model_for(role, provider) is None
+    # Operator 2026-10-31: a Claude maker uses Sonnet 5.5; every other role keeps today's
+    # default model (the Codex maker, both checkers).
+    assert rotation.model_for(IMPLEMENTER, Provider.CLAUDE) == "claude-sonnet-5-5"
+    assert rotation.model_for(IMPLEMENTER, Provider.CODEX) is None
+    for provider in (Provider.CLAUDE, Provider.CODEX):
+        assert rotation.model_for(CODE_REVIEWER, provider) is None
     assert rotation.enabled_at is not None
 
 

@@ -2259,6 +2259,15 @@ class MetadataActivityHandler:
         ordinal = int(payload["ordinal"])
         if ordinal not in {1, 2}:
             raise ValueError("verification ordinal must be one or two")
+        toolchain = snapshot.get("toolchain_preparation")
+        if isinstance(toolchain, dict) and toolchain.get("status") == "BLOCKED":
+            # The project's toolchain could not be resolved for this snapshot: never a
+            # verifier with another Go/Rust/Node than the maker's (fail closed).
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": str(toolchain.get("blocker") or "TOOLCHAIN_CONTRACT_INVALID"),
+            }
         maker = Provider(str(finding["discoverer_provider"]))
         risk = RiskClass(str(finding["risk_class"]))
         routing = self._quota_broker().route(
@@ -2318,6 +2327,7 @@ class MetadataActivityHandler:
             f"Deployment worktree: {snapshot['deployment_worktree']}\n"
             f"Fresh snapshot evidence SHA256: {anchor}\n"
             f"Independent reproduction ordinal: {ordinal}\n"
+            + self._toolchain_prompt(finding, role="verifier")
         )
         request = AgentRequest(
             run_id=run_id,
@@ -2333,11 +2343,19 @@ class MetadataActivityHandler:
             writable=False,
             campaign_id=UUID(str(finding["campaign_id"])),
         )
+        # The maker's selection (finding.fresh_snapshot resolved it like
+        # delivery.prepare_toolchain) selects the same sandbox PATH, GOROOT, CARGO_HOME.
+        selection = toolchain.get("node_toolchain") if isinstance(toolchain, dict) else None
         return {
             **payload,
             "provider": routing.primary.value,
             "routing_reason": routing.reason,
             "verifier_request": request.model_dump(mode="json"),
+            **(
+                {"toolchain_preparation": {"node_toolchain": selection}}
+                if selection is not None
+                else {}
+            ),
             "status": "READY",
         }
 
@@ -4632,13 +4650,24 @@ class MetadataActivityHandler:
         )
 
     def _toolchain_prompt(self, payload: dict[str, Any], *, role: str) -> str:
-        """Tell makers/the checker which prepared test commands to run (source worktree)."""
+        """Tell makers/the checker which prepared test commands to run (source worktree),
+        and finding verifiers which project commands their toolchain runs."""
         try:
             policy = enabled_toolchain(self.settings.project_config_root, str(payload["project"]))
         except (OSError, ValueError):
             return ""  # advisory only: the checker still demands real test evidence
         if policy is None or not policy.test_commands:
             return ""
+        if role == "verifier":
+            # Read-only and from a fresh snapshot: nothing was prepared in it.
+            return (
+                "Toolchain: the project's pinned toolchain (the one its makers and checker "
+                "use) is on PATH. Dependencies were not prepared in this snapshot and only "
+                "the shared offline caches are available; do not install anything (no "
+                "network) and do not modify files. When the reproduction or a control needs "
+                "a build or test, use these project commands:\n"
+                + "".join(f"{line}\n" for line in toolchain_test_command_lines(policy))
+            )
         if role == "maker":
             instruction = (
                 "Run these before committing, and report each as a tests[] entry with its "
