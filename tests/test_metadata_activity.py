@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import yaml
 from jsonschema.validators import Draft202012Validator
 from sqlalchemy import func, select
 from temporalio.exceptions import ApplicationError
@@ -779,12 +781,20 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
 @pytest.mark.asyncio
 async def test_delivery_transaction_routes_and_leases_both_worktrees(tmp_path: Path) -> None:
     worktree_root = tmp_path / "worktrees"
+    # NEW-243: falcone rotates the maker since 2026-11-01 (a hash of the random finding id),
+    # so this test pins today's non-rotated routing with a copy of the configs without it.
+    project_config_root = tmp_path / "projects"
+    shutil.copytree(Path(__file__).parents[1] / "config/projects", project_config_root)
+    falcone_config = project_config_root / "falcone.yaml"
+    manifest = yaml.safe_load(falcone_config.read_text())
+    manifest.pop("provider_rotation", None)
+    falcone_config.write_text(yaml.safe_dump(manifest, sort_keys=False))
     handler = MetadataActivityHandler(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'delivery.sqlite'}",
             worktree_root=worktree_root,
             state_root=tmp_path / "state",
-            project_config_root=Path(__file__).parents[1] / "config/projects",
+            project_config_root=project_config_root,
         )
     )
     Base.metadata.create_all(handler.engine)
