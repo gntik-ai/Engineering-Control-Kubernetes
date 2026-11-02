@@ -7394,6 +7394,24 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
     # epics consuming it). A plan replayed from before the change keeps its recorded order.
     _CONTRACT_ORDER_PATCH = "decomposition-contract-epic-order-v1"
     _ASSEMBLY_ROUNDS = 3
+    # NEW-244: an approved part whose assembly problems are all declaration problems (its
+    # tasks' depends_on and interfaces) gets one targeted fix-up per plan instead of a full
+    # redraft and re-review; a refused or failed fix-up falls back to the redraft. A plan
+    # replayed from before the change always redrafts. Mirrors
+    # engineering.decomposition.DECLARATION_CODES (the workflow imports no engineering code).
+    _DECLARATION_FIXUP_PATCH = "decomposition-declaration-fixup-v1"
+    _DECLARATION_CODES = frozenset(
+        {
+            "DEPENDENCY_UNRESOLVED",
+            "DEPENDENCY_INCONSISTENT",
+            "PREREQUISITE_UNORDERED",
+            "DEPENDENCY_CYCLE",
+            "DEPENDENCY_SELF",
+            "DEPENDENCY_TOO_MANY",
+            "CONTRACT_PROVIDER_MISSING",
+            "CONTRACT_DEPENDENCY_UNCONSUMED",
+        }
+    )
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s).
     _PART_TIMEOUT_MINUTES = 40
     _STRUCTURAL_REJECTIONS = frozenset(
@@ -7559,6 +7577,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 parts = [*parts[:position], *epics]
                 context = {**context, "parts": parts}
         assembled: dict[str, Any] = {}
+        fixed_up: set[str] = set()
         for assembly_round in range(self._ASSEMBLY_ROUNDS + 1):
             if not await self._checkpoint("DECOMPOSITION_ASSEMBLE"):
                 return await self._decomposition_terminal(
@@ -7596,6 +7615,21 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                         context, "FAILED", "DECOMPOSITION_PART_UNKNOWN"
                     )
                 entry = approved[index]
+                problems = list(redraft.get("problems") or [])
+                if (
+                    entry.get("kind") == "epic"
+                    and entry["part_id"] not in fixed_up
+                    and problems
+                    and all(str(item.get("code")) in self._DECLARATION_CODES for item in problems)
+                    and workflow.patched(self._DECLARATION_FIXUP_PATCH)
+                ):
+                    fixed_up.add(entry["part_id"])
+                    fixed = await self._declaration_fixup(
+                        request, context, approved, index, problems
+                    )
+                    if fixed is not None:
+                        approved[index] = fixed
+                        continue
                 # Under the rejection budget the limit is the part's reviewed drafts.
                 used = entry.get("reviewed", entry["attempt"])
                 if int(used) >= self._MAX_PART_DRAFTS:
@@ -7657,6 +7691,68 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             "parts": len(approved),
             "stories": persisted.get("stories"),
             "tasks": persisted.get("tasks"),
+        }
+
+    async def _declaration_fixup(
+        self,
+        request: BacklogDecompositionPlanInput,
+        context: dict[str, Any],
+        approved: list[dict[str, Any]],
+        index: int,
+        problems: list[Any],
+    ) -> dict[str, Any] | None:
+        """NEW-244: one targeted fix-up of approved part `index` (Claude may change only its
+        tasks' declarations; Hermes checks and records it as a version derived from the
+        reviewed one). The part's new approved entry, or None to redraft it in full."""
+        entry = approved[index]
+        if not await self._checkpoint("DECOMPOSITION_PART_FIXUP"):
+            return None
+        base_attempt = int(entry["attempt"])
+        prepared = await self._step(
+            "decomposition.prepare_part_fixup",
+            {
+                **context,
+                "approved_parts": approved[:index],
+                "part": {"kind": entry["kind"], "number": entry["number"]},
+                "part_id": entry["part_id"],
+                "part_input": entry["part_input"],
+                "part_input_files": entry.get("part_input_files"),
+                "fixup": {
+                    "base_attempt": base_attempt,
+                    "content_sha256": entry["content_sha256"],
+                    "problems": problems[:50],
+                },
+            },
+        )
+        if prepared.get("status") != "FIXUP_READY":
+            return None
+        drafted = await self._agent_step(
+            "decomposition.draft",
+            prepared,
+            timeout_minutes=self._PART_TIMEOUT_MINUTES,
+            retry_policy=SINGLE_ATTEMPT,
+        )
+        recorded = await self._step("decomposition.record_part_fixup", drafted)
+        if recorded.get("status") != "FIXUP_APPLIED":
+            return None
+        prior = entry.get("part_budget")
+        # The fix-up uses an attempt number, not a reviewed draft or a rejection (a part
+        # adopted from an earlier plan counts its attempts as reviewed, as a redraft does).
+        budget = (
+            {
+                "reviewed": int(prior.get("reviewed") or 0),
+                "rejected": int(prior.get("rejected") or 0),
+            }
+            if isinstance(prior, dict)
+            else {"reviewed": base_attempt, "rejected": 0}
+        )
+        budget["fixups"] = 1
+        return {
+            **entry,
+            "content_sha256": recorded.get("content_sha256"),
+            "attempt": int(recorded.get("draft_attempt") or base_attempt + 1),
+            "part_budget": budget,
+            "reviewed": budget["reviewed"],
         }
 
     @staticmethod
@@ -7871,6 +7967,8 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                 {
                     "reviewed": int(prior.get("reviewed") or 0),
                     "rejected": int(prior.get("rejected") or 0),
+                    # NEW-244: a fixed-up part's extra attempt number (data only).
+                    **({"fixups": int(prior["fixups"])} if prior.get("fixups") else {}),
                 }
                 if isinstance(prior, dict)
                 else {"reviewed": attempt, "rejected": 0}

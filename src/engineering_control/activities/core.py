@@ -264,6 +264,10 @@ class ControlActivities:
         "decomposition.prepare_part_review",
         "decomposition.review",
         "decomposition.record_part_review",
+        # NEW-244: the declaration fix-up of an approved part (draft through
+        # decomposition.draft).
+        "decomposition.prepare_part_fixup",
+        "decomposition.record_part_fixup",
         "decomposition.assemble",
         "decomposition.persist",
         "decomposition.record_terminal",

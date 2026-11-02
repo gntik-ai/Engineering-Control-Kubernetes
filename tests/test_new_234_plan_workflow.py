@@ -269,8 +269,9 @@ async def test_an_assembly_problem_is_redrafted_by_its_part(
         if len(calls) == 1:
             raise DecompositionRejected(
                 "ASSEMBLY_INVALID",
-                [PlanProblem("DEPENDENCY_UNRESOLVED", "dependency",
-                             "falcone-serverless:RUN-01.t1", "depends on a missing task")],
+                # NEW-244: not a declaration problem (those get a fix-up first).
+                [PlanProblem("COVERS_UNKNOWN", "unsupported_claim",
+                             "falcone-serverless:RUN-01.t1", "covers an unknown criterion")],
             )  # fmt: skip
         return real(scoped, frame, epics)
 
@@ -290,10 +291,10 @@ async def test_an_assembly_problem_is_redrafted_by_its_part(
             "code": "ASSEMBLY_INVALID",
             "details": [
                 {
-                    "code": "DEPENDENCY_UNRESOLVED",
-                    "category": "dependency",
+                    "code": "COVERS_UNKNOWN",
+                    "category": "unsupported_claim",
                     "subject": "falcone-serverless:RUN-01.t1",
-                    "detail": "depends on a missing task",
+                    "detail": "covers an unknown criterion",
                 }
             ],
         }

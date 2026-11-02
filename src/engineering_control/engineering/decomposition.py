@@ -1462,6 +1462,152 @@ def normalize_epic_output(
     return {**value, EPIC: content}, records
 
 
+# NEW-244: assembly problems a part can resolve by changing only its tasks' depends_on and
+# interfaces (and a dependency-only story amendment): a targeted fix-up, not a redraft.
+DECLARATION_CODES: Final = frozenset(
+    {
+        "DEPENDENCY_UNRESOLVED",
+        "DEPENDENCY_INCONSISTENT",
+        "PREREQUISITE_UNORDERED",
+        "DEPENDENCY_CYCLE",
+        "DEPENDENCY_SELF",
+        "DEPENDENCY_TOO_MANY",
+        "CONTRACT_PROVIDER_MISSING",
+        "CONTRACT_DEPENDENCY_UNCONSUMED",
+    }
+)
+# The task fields a declaration fix-up may change (dotted: interfaces.<name>).
+FIXUP_TASK_FIELDS: Final = ("depends_on", "interfaces.consumes", "interfaces.provides")
+
+
+def declaration_only(problems: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether every problem (plan-problem dicts) is a declaration problem."""
+    return bool(problems) and all(str(item.get("code")) in DECLARATION_CODES for item in problems)
+
+
+def _task_field(task: Mapping[str, Any], field: str) -> Any:
+    if field.startswith("interfaces."):
+        return (task.get("interfaces") or {}).get(field.split(".", 1)[1])
+    return task.get(field)
+
+
+def _without_declarations(task: Mapping[str, Any]) -> dict[str, Any]:
+    rest = {key: value for key, value in task.items() if key not in {"depends_on", "interfaces"}}
+    interfaces = task.get("interfaces")
+    if isinstance(interfaces, Mapping):
+        rest["interfaces"] = {
+            key: value for key, value in interfaces.items() if key not in {"consumes", "provides"}
+        }
+    else:
+        rest["interfaces"] = interfaces
+    return rest
+
+
+def _non_dependency_changes(amendment: Any) -> list[Any]:
+    if not isinstance(amendment, Mapping):
+        return []
+    return [
+        change
+        for change in amendment.get("changes") or []
+        if change.get("section") != "dependencies"
+    ]
+
+
+def declaration_changes(
+    base: Mapping[str, Any], fixed: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """(the changes from epic batch `base` to `fixed`, the reasons the fix-up is refused).
+    A change sets one task's depends_on, interfaces.consumes or interfaces.provides, or one
+    story's story_amendment, to its value in `fixed`; anything else that differs (a story or
+    task added, removed or re-ordered, a key, text, path, criterion or any other field, or a
+    story amendment change outside its dependencies) refuses the fix-up, as does no change."""
+    refusals: list[str] = []
+    changes: list[dict[str, Any]] = []
+    if {key: value for key, value in base.items() if key != "stories"} != {
+        key: value for key, value in fixed.items() if key != "stories"
+    }:
+        refusals.append("the batch changes a field outside its stories")
+    stories = list(base.get("stories") or [])
+    others = list(fixed.get("stories") or [])
+    if [s.get("story_id") for s in stories] != [s.get("story_id") for s in others]:
+        return [], [*refusals, "the batch adds, removes or re-orders a story"]
+    for story, other in zip(stories, others, strict=True):
+        story_id = str(story.get("story_id"))
+        rest = {key for key in (*story, *other) if key not in {"tasks", "story_amendment"}}
+        if any(story.get(key) != other.get(key) for key in rest):
+            refusals.append(f"{story_id}: a story field other than its tasks changes")
+        tasks, fixed_tasks = list(story.get("tasks") or []), list(other.get("tasks") or [])
+        if [t.get("key") for t in tasks] != [t.get("key") for t in fixed_tasks]:
+            refusals.append(f"{story_id}: a task is added, removed, re-keyed or re-ordered")
+            continue
+        for task, fixed_task in zip(tasks, fixed_tasks, strict=True):
+            key = str(task.get("key"))
+            if _without_declarations(task) != _without_declarations(fixed_task):
+                changed = sorted(
+                    name
+                    for name in {*task, *fixed_task}
+                    if name not in {"depends_on", "interfaces"}
+                    and task.get(name) != fixed_task.get(name)
+                ) or ["interfaces"]
+                refusals.append(f"{key}: changes {', '.join(changed)}")
+                continue
+            changes += [
+                {
+                    "task": key,
+                    "field": field,
+                    "value": copy.deepcopy(_task_field(fixed_task, field)),
+                }
+                for field in FIXUP_TASK_FIELDS
+                if _task_field(task, field) != _task_field(fixed_task, field)
+            ]
+        before, after = story.get("story_amendment"), other.get("story_amendment")
+        if before != after:
+            if _non_dependency_changes(before) != _non_dependency_changes(after):
+                refusals.append(f"{story_id}: the story amendment changes outside dependencies")
+            else:
+                changes.append(
+                    {"story": story_id, "field": "story_amendment", "value": copy.deepcopy(after)}
+                )
+    if not changes and not refusals:
+        refusals.append("the fix-up changes nothing")
+    return ([] if refusals else changes), refusals
+
+
+def apply_declaration_changes(
+    base: Mapping[str, Any], changes: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """`base` with `changes` (declaration_changes) replayed; ValueError on a change that
+    names no task or story of `base`, or a field a fix-up may not change."""
+    content = copy.deepcopy(dict(base))
+    tasks = {
+        str(task.get("key")): task
+        for story in content.get("stories") or []
+        for task in story.get("tasks") or []
+    }
+    stories = {str(story.get("story_id")): story for story in content.get("stories") or []}
+    for change in changes:
+        field = change.get("field")
+        if "task" in change and field in FIXUP_TASK_FIELDS:
+            task = tasks.get(str(change["task"]))
+            if task is None:
+                raise ValueError(f"a fix-up change names unknown task {change['task']}")
+            if str(field).startswith("interfaces."):
+                interfaces = task.get("interfaces")
+                if not isinstance(interfaces, dict):
+                    raise ValueError(f"task {change['task']} has no interfaces")
+                interfaces[str(field).split(".", 1)[1]] = copy.deepcopy(change["value"])
+            else:
+                task[str(field)] = copy.deepcopy(change["value"])
+        elif "story" in change and field == "story_amendment":
+            story = stories.get(str(change["story"]))
+            if story is None:
+                raise ValueError(f"a fix-up change names unknown story {change['story']}")
+            story["story_amendment"] = copy.deepcopy(change["value"])
+        else:
+            raise ValueError("a fix-up change is not a declaration change")
+    return content
+
+
 def _stories_problems(
     stories: Sequence[Mapping[str, Any]],
     inventory: Mapping[str, Any],

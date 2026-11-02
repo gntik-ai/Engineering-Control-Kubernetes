@@ -41,6 +41,7 @@ from engineering_control.engineering.decomposition import (
     DECOMPOSITION_PROJECTS,
     EPIC,
     FINAL_REFUSAL,
+    FIXUP_TASK_FIELDS,
     FRAME,
     MAX_PART_DRAFTS,
     MAX_PART_REJECTIONS,
@@ -56,6 +57,8 @@ from engineering_control.engineering.decomposition import (
     check_epic_draft,
     check_frame_draft,
     check_review,
+    declaration_changes,
+    declaration_only,
     decomposition_pack_problems,
     decomposition_profile,
     epic_order,
@@ -178,6 +181,8 @@ class DecompositionActivityHandler:
             "decomposition.record_part_draft",
             "decomposition.prepare_part_review",
             "decomposition.record_part_review",
+            "decomposition.prepare_part_fixup",
+            "decomposition.record_part_fixup",
             "decomposition.assemble",
             "decomposition.persist",
             "decomposition.record_terminal",
@@ -203,6 +208,8 @@ class DecompositionActivityHandler:
             "decomposition.record_part_draft": self._record_part_draft,
             "decomposition.prepare_part_review": self._prepare_part_review,
             "decomposition.record_part_review": self._record_part_review,
+            "decomposition.prepare_part_fixup": self._prepare_part_fixup,
+            "decomposition.record_part_fixup": self._record_part_fixup,
             "decomposition.assemble": self._assemble,
             "decomposition.persist": self._persist,
             "decomposition.record_terminal": self._record_terminal,
@@ -586,11 +593,18 @@ class DecompositionActivityHandler:
                 rejected.code,
             )
             return None
-        self.repository.adopt_part_sync(decomposition_id, part_id, kind, number, reused)
+        try:
+            self.repository.adopt_part_sync(decomposition_id, part_id, kind, number, reused)
+        except ValueError as error:
+            LOGGER.warning(
+                "decomposition %s part %s: no reuse: %s", decomposition_id, part_id, error
+            )
+            return None
         return {
             "content_sha256": reused["content_sha256"],
             "reused_from": reused["decomposition_id"],
-            "draft_attempt": 1,
+            # NEW-244: a reused fix-up is adopted as attempt 2 over its reviewed base.
+            "draft_attempt": 2 if isinstance(reused.get("fixup"), dict) else 1,
         }
 
     def _bound_output(
@@ -881,11 +895,18 @@ class DecompositionActivityHandler:
         reviewed, rejected = raw.get("reviewed"), raw.get("rejected")
         if type(reviewed) is not int or type(rejected) is not int:
             return None
+        # NEW-244: a declaration fix-up (at most one per part and plan) uses an attempt
+        # number but neither a reviewed draft nor a rejection.
+        fixups = raw.get("fixups")
+        if type(fixups) is int and fixups in (0, 1):
+            return {"reviewed": reviewed, "rejected": rejected, "fixups": fixups}
         return {"reviewed": reviewed, "rejected": rejected}
 
     @staticmethod
     def _max_attempt(budget: dict[str, int] | None) -> int:
-        return MAX_PART_DRAFTS + (MAX_PART_REJECTIONS if budget is not None else 0)
+        if budget is None:
+            return MAX_PART_DRAFTS
+        return MAX_PART_DRAFTS + MAX_PART_REJECTIONS + budget.get("fixups", 0)
 
     @staticmethod
     def _redraft_position(attempt: int, budget: dict[str, int] | None) -> tuple[str, bool, bool]:
@@ -1275,6 +1296,182 @@ class DecompositionActivityHandler:
                 "blockers": [f"part {part_id}: {review['summary']}", *findings][:50],
             }
         return {**result, "status": "PART_REVISE", "document": review}
+
+    # NEW-244: declaration fix-up of an approved part ---------------------------------------
+
+    # The approved batch is fenced into the prompt; a larger one is redrafted instead.
+    _FIXUP_CONTENT_LIMIT = 60_000
+
+    @staticmethod
+    def _fixup_request(payload: dict[str, Any]) -> tuple[int, str, list[Any]] | None:
+        raw = payload.get("fixup")
+        if not isinstance(raw, dict):
+            return None
+        base_attempt, problems = raw.get("base_attempt"), raw.get("problems")
+        if type(base_attempt) is not int or not 1 <= base_attempt <= 8:
+            return None
+        if not isinstance(problems, list) or not declaration_only(problems):
+            return None
+        return base_attempt, str(raw.get("content_sha256") or ""), problems[:50]
+
+    def _prepare_part_fixup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One targeted fix-up of an approved epic batch whose assembly problems are all
+        declaration problems: the drafter may change only depends_on, interfaces.consumes
+        and interfaces.provides (and a dependency-only story amendment). FIXUP_SKIPPED
+        (anything not eligible) sends the part to its full redraft."""
+        decomposition_id = self._decomposition_id(payload)
+        part_id, kind, number = self._part_id(payload)
+        base = self._base(payload)
+        request = self._fixup_request(payload)
+        if kind != EPIC or request is None:
+            return {**base, "status": "FIXUP_SKIPPED", "blocker": "FIXUP_NOT_ELIGIBLE"}
+        base_attempt, expected_sha256, problems = request
+        entry = self.repository.part_sync(decomposition_id, part_id) or {}
+        try:
+            approved = self.repository.approved_content_sync(decomposition_id, part_id)
+        except ValueError as error:
+            return {**base, "status": "FIXUP_SKIPPED", "blocker": "FIXUP_BASE_INVALID",
+                    "blockers": [str(error)]}  # fmt: skip
+        if (
+            approved.get("attempt") != base_attempt
+            or approved["content_sha256"] != expected_sha256
+            or "fixup" in approved
+            or isinstance(entry.get("fixup"), dict)
+        ):
+            return {**base, "status": "FIXUP_SKIPPED", "blocker": "FIXUP_BASE_INVALID"}
+        content_text = json.dumps(approved["content"], indent=2, sort_keys=True, ensure_ascii=False)
+        if len(content_text) > self._FIXUP_CONTENT_LIMIT:
+            return {**base, "status": "FIXUP_SKIPPED", "blocker": "FIXUP_CONTENT_TOO_LARGE"}
+        # Durable, as a redraft records it: every later draft and review of the part sees it.
+        self.repository.record_part_rejection_sync(
+            decomposition_id, part_id, kind, number, base_attempt, "ASSEMBLY_INVALID", problems
+        )
+        try:
+            self._reserve(decomposition_id, part_id, "fixup", base_attempt)
+        except DecompositionBudgetExhaustedError as error:
+            return self._blocked(base, BUDGET_EXHAUSTED, [str(error)])
+        frame_sha256 = self._epic_context(decomposition_id, payload)[1]
+        fields = ", ".join(FIXUP_TASK_FIELDS)
+        sections = [
+            f"Fix the declarations of one approved epic batch of the {payload['project']} "
+            "backlog decomposition with the decompose-backlog skill (epic part). "
+            f"{_READ_ONLY} Return status COMPLETE, project {payload['project']}, the epic "
+            "and the inputs bound exactly as stated below. If an input file is missing or "
+            "unreadable, return status BLOCKED with blockers instead. "
+            f"{_STRUCTURED_OUTPUT_JSON_RULES}",
+            "The batch below was independently reviewed and approved. Hermes then assembled "
+            "the whole plan and found only declaration problems in it (listed below). This "
+            "is a targeted fix-up, not a redraft: return the approved batch exactly as given, "
+            f"changing only these task fields: {fields}, and a story's story_amendment only "
+            "by changes in its dependencies section. Do not add, remove, re-order or re-key a "
+            "story or task, and do not change any text, path, test command, acceptance "
+            "criterion, requirement, size, risk or any other field. Hermes compares your "
+            "batch with the approved one field by field and refuses any other change (the "
+            "part is then redrafted in full). depends_on may name tasks of every other "
+            "batch of the plan (the problems name them) and contract:<ctr-id> for a frame "
+            "contract the task consumes.",
+            _DATA_RULE,
+            self._part_section(payload, part_id, kind, frame_sha256),
+            _fenced(
+                "hermes assembly findings (declaration problems)",
+                _bounded_json(problems, 20_000),
+            ),
+            _fenced(
+                f"approved batch, attempt {base_attempt}, part content sha256 "
+                f"{approved['content_sha256']} (field epic)",
+                content_text,
+            ),
+        ]
+        attempt = base_attempt + 1
+        agent_request = AgentRequest(
+            run_id=uuid5(
+                NAMESPACE_URL,
+                f"decomposition-part-fixup:{decomposition_id}:{part_id}:{base_attempt}:"
+                f"{self._workflow_run(payload)}",
+            ),
+            project=Project(str(payload["project"])),
+            role="backlog-decomposer",
+            provider=Provider.CLAUDE,
+            model_class=ModelClass.WORKER,
+            prompt="\n\n".join(sections),
+            working_directory=str(payload["source_worktree"]),
+            output_schema=part_schema(EPIC, str(payload["project"])),
+            timeout_seconds=PART_TIMEOUT_SECONDS,
+            # A narrow, mechanical edit checked field by field by Hermes.
+            effort="medium",
+            model=self.settings.claude_spec_model,
+            writable=False,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **base,
+            "status": "FIXUP_READY",
+            "provider": Provider.CLAUDE.value,
+            "draft_attempt": attempt,
+            "draft_request": agent_request.model_dump(mode="json"),
+        }
+
+    def _record_part_fixup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Accept the fix-up only when it changes declarations alone, passes every draft
+        check against the earlier approved batches, and its changes replay onto the
+        approved version exactly; store it as a derived version and make it the approved
+        one. Anything else is FIXUP_REFUSED (the part is redrafted in full)."""
+        decomposition_id = self._decomposition_id(payload)
+        part_id, kind, _number = self._part_id(payload)
+        base = self._base(payload)
+        request = self._fixup_request(payload)
+        attempt = int(payload.get("draft_attempt") or 0)
+        usage = payload.get("agent_result")
+        if not isinstance(usage, dict):
+            usage = payload.get("failed_agent_usage")
+        entry = usage_entry(usage, part_id=part_id, phase="fixup", attempt=max(1, attempt))
+        if entry is not None:
+            self.repository.record_usage_sync(decomposition_id, entry)
+        if kind != EPIC or request is None:
+            return {**base, "status": "FIXUP_REFUSED", "blocker": "FIXUP_NOT_ELIGIBLE"}
+        base_attempt, _expected, problems = request
+
+        def refused(blocker: str, reasons: list[str]) -> dict[str, Any]:
+            self.repository.record_fixup_refusal_sync(
+                decomposition_id, part_id, base_attempt, [blocker, *reasons]
+            )
+            return {**base, "status": "FIXUP_REFUSED", "blocker": blocker,
+                    "blockers": reasons[:50]}  # fmt: skip
+
+        if payload.get("status") != "SUCCESS" or attempt != base_attempt + 1:
+            return refused("FIXUP_PROVIDER_FAILED", [str(payload.get("blocker") or "")])
+        frame = self._epic_context(decomposition_id, payload)[0]
+        structured, _records = normalize_epic_output(
+            self._structured(payload), list(frame["contracts"]), str(payload["project"])
+        )
+        try:
+            fixed = self._check_draft(decomposition_id, payload, structured, part_id, kind)
+            approved = self.repository.approved_content_sync(decomposition_id, part_id)
+        except DecompositionRejected as rejected:
+            return refused(
+                rejected.code,
+                [f"[{item.code}] {item.subject}: {item.detail}" for item in rejected.problems],
+            )
+        except ValueError as error:
+            return refused("FIXUP_BASE_INVALID", [str(error)])
+        # The changes are taken against the stored approved content (as reviewed), so
+        # replaying them on it reproduces the fixed batch exactly.
+        changes, reasons = declaration_changes(approved["content"], fixed)
+        if reasons:
+            return refused("FIXUP_CHANGES_REFUSED", reasons)
+        try:
+            digest = self.repository.record_part_fixup_sync(
+                decomposition_id, part_id, base_attempt, attempt, fixed, changes, problems
+            )
+        except ValueError as error:
+            return refused("FIXUP_NOT_RECORDED", [str(error)])
+        return {
+            **base,
+            "status": "FIXUP_APPLIED",
+            "content_sha256": digest,
+            "draft_attempt": attempt,
+            "fixup_changes": len(changes),
+        }
 
     # Assembly and the candidate ---------------------------------------------------------
 

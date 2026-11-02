@@ -44,6 +44,7 @@ from engineering_control.engineering.decomposition import (
     MAX_PROVIDER_CALLS,
     REJECTIONS_EXHAUSTED,
     WORKFLOW_PREFIX,
+    apply_declaration_changes,
     approval_binding,
     decomposition_profile,
     decomposition_workflow_id,
@@ -71,9 +72,59 @@ from engineering_control.engineering.ui_blueprint_parts import usage_summary
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
-_CALL_KEY = re.compile(r"^(?:frame|ep[0-9]{2})-[a-f0-9]{16}:(?:draft|review):[1-9]$")
+# NEW-244: a declaration fix-up is its own provider call (`<part>:fixup:<base attempt>`).
+_CALL_KEY = re.compile(r"^(?:frame|ep[0-9]{2})-[a-f0-9]{16}:(?:draft|review|fixup):[1-9]$")
 # How many earlier plans of the project are searched for a reusable reviewed part.
 REUSE_SEARCH = 20
+
+
+def _strictly_reviewed(version: dict[str, Any]) -> bool:
+    """The version's content is exactly what its review bound (content and review hashes)."""
+    content = version.get("content")
+    return (
+        isinstance(content, dict)
+        and "fixup" not in version
+        and part_content_sha256(content)
+        == version.get("content_sha256")
+        == version.get("reviewed_sha256")
+    )
+
+
+def _derived_from_review(entry: dict[str, Any], version: dict[str, Any]) -> bool:
+    """NEW-244: a declaration fix-up's version: its base version (fixup.base_attempt) is
+    strictly reviewed with the review hash and review it carries, and replaying its changes
+    on that base reproduces its content and content_sha256 exactly."""
+    fixup = version.get("fixup")
+    content = version.get("content")
+    if not isinstance(fixup, dict) or not isinstance(content, dict):
+        return False
+    bases = [
+        item
+        for item in entry.get("versions") or []
+        if item is not version and item.get("attempt") == fixup.get("base_attempt")
+    ]
+    if len(bases) != 1 or not _strictly_reviewed(bases[0]):
+        return False
+    base = bases[0]
+    if not (
+        base["reviewed_sha256"] == fixup.get("base_sha256") == version.get("reviewed_sha256")
+        and base.get("review") == version.get("review")
+        and isinstance(fixup.get("changes"), list)
+        and fixup["changes"]
+    ):
+        return False
+    try:
+        replayed = apply_declaration_changes(base["content"], fixup["changes"])
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return False
+    digest = part_content_sha256(content)
+    return part_content_sha256(replayed) == digest and digest == str(version["content_sha256"])
+
+
+def reviewed_version(entry: dict[str, Any], version: dict[str, Any]) -> bool:
+    """A version whose content its review covers: strictly, or (NEW-244) as a fix-up
+    derived from a strictly reviewed base. Everything else is refused."""
+    return _strictly_reviewed(version) or _derived_from_review(entry, version)
 
 
 def _with_terminal_refusal(
@@ -1175,11 +1226,8 @@ class BacklogDecompositionRepository:
             raise ValueError(f"decomposition part {part_id} has no approved version")
         version = versions[0]
         content = version["content"]
-        if not (
-            part_content_sha256(content)
-            == version["content_sha256"]
-            == version.get("reviewed_sha256")
-        ):
+        assert entry is not None
+        if not reviewed_version(entry, version):
             raise ValueError(f"decomposition part {part_id} no longer matches its review")
         return {"content": content, "content_sha256": version["content_sha256"], **version}
 
@@ -1207,17 +1255,28 @@ class BacklogDecompositionRepository:
                         version.get("attempt") == attempt
                         and isinstance(content, dict)
                         and isinstance(version.get("review"), dict)
-                        and part_content_sha256(content)
-                        == version.get("content_sha256")
-                        == version.get("reviewed_sha256")
+                        and reviewed_version(entry, version)
                     ):
-                        return {
+                        found = {
                             "decomposition_id": str(row.id),
                             "attempt": attempt,
                             "content": copy.deepcopy(content),
                             "content_sha256": version["content_sha256"],
                             "review": copy.deepcopy(version["review"]),
                         }
+                        if "fixup" in version:
+                            # NEW-244: adopted with its reviewed base, so it stays verifiable.
+                            base = next(
+                                item
+                                for item in entry["versions"]
+                                if item.get("attempt") == version["fixup"]["base_attempt"]
+                            )
+                            found["fixup"] = copy.deepcopy(version["fixup"])
+                            found["base"] = {
+                                "content": copy.deepcopy(base["content"]),
+                                "content_sha256": base["content_sha256"],
+                            }
+                        return found
         return None
 
     def previous_unresolved_sync(
@@ -1278,9 +1337,7 @@ class BacklogDecompositionRepository:
             and version["review"].get("decision") == "REVISE"
             and type(version.get("attempt")) is int
             and isinstance(version.get("content"), dict)
-            and part_content_sha256(version["content"])
-            == version.get("content_sha256")
-            == version.get("reviewed_sha256")
+            and reviewed_version(entry, version)
             and (attempt is None or version["attempt"] == attempt)
             and (content_sha256 is None or version["content_sha256"] == content_sha256)
         ]
@@ -1351,6 +1408,80 @@ class BacklogDecompositionRepository:
                 str(pin.get("content_sha256")),
             )
 
+    def record_part_fixup_sync(
+        self,
+        decomposition_id: UUID,
+        part_id: str,
+        base_attempt: int,
+        attempt: int,
+        content: dict[str, Any],
+        changes: list[dict[str, Any]],
+        problems: list[Any],
+    ) -> str:
+        """NEW-244: store a declaration fix-up of the part's approved, strictly reviewed
+        version `base_attempt` as version `attempt` (its review and review hash copied
+        from the base, `fixup` recording how it derives) and make it the approved one. At
+        most one fix-up per part and plan; the changes must reproduce `content`."""
+        digest = part_content_sha256(content)
+        with self.sessions.begin() as session:
+            row = self._locked(session, decomposition_id)
+            if row.status != "DRAFTING":
+                raise ValueError("only a DRAFTING decomposition records a fix-up")
+            parts = copy.deepcopy(dict(row.parts_json or {}))
+            entry = (parts.get("parts") or {}).get(part_id)
+            if not isinstance(entry, dict) or entry.get("approved_attempt") != base_attempt:
+                raise ValueError("the fix-up's base is not the part's approved version")
+            if isinstance(entry.get("fixup"), dict) or any(
+                "fixup" in item for item in entry.get("versions") or []
+            ):
+                raise ValueError("the part already had a fix-up")
+            if any(item.get("attempt") == attempt for item in entry.get("versions") or []):
+                raise ValueError("the fix-up's attempt is already recorded")
+            bases = [item for item in entry["versions"] if item.get("attempt") == base_attempt]
+            if len(bases) != 1 or not _strictly_reviewed(bases[0]):
+                raise ValueError("the fix-up's base no longer matches its review")
+            base = bases[0]
+            version = {
+                "attempt": attempt,
+                "content": content,
+                "content_sha256": digest,
+                "reviewed_sha256": base["reviewed_sha256"],
+                "review": copy.deepcopy(base["review"]),
+                "fixup": {
+                    "base_attempt": base_attempt,
+                    "base_sha256": base["reviewed_sha256"],
+                    "changes": changes,
+                    "problems": list(problems)[:50],
+                },
+            }
+            entry["versions"].append(version)
+            if not _derived_from_review(entry, version):
+                raise ValueError("the fix-up's changes do not reproduce its content")
+            entry["approved_attempt"] = attempt
+            entry["fixup"] = {"status": "APPLIED", "base_attempt": base_attempt, "attempt": attempt}
+            row.parts_json = parts
+            return digest
+
+    def record_fixup_refusal_sync(
+        self, decomposition_id: UUID, part_id: str, base_attempt: int, reasons: list[str]
+    ) -> None:
+        """NEW-244: a refused declaration fix-up (the part is redrafted instead); it also
+        uses the part's one fix-up in this plan."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, decomposition_id)
+            if row.status != "DRAFTING":
+                return
+            parts = copy.deepcopy(dict(row.parts_json or {}))
+            entry = (parts.get("parts") or {}).get(part_id)
+            if not isinstance(entry, dict) or isinstance(entry.get("fixup"), dict):
+                return
+            entry["fixup"] = {
+                "status": "REFUSED",
+                "base_attempt": base_attempt,
+                "reasons": [str(item)[:300] for item in reasons][:20],
+            }
+            row.parts_json = parts
+
     def adopt_part_sync(
         self,
         decomposition_id: UUID,
@@ -1377,6 +1508,31 @@ class BacklogDecompositionRepository:
                 }
             ]
             entry["approved_attempt"] = 1
+            if isinstance(reused.get("fixup"), dict):
+                # NEW-244: a fix-up's version is adopted as attempt 2 over its reviewed
+                # base (attempt 1), so its review hash and changes stay verifiable.
+                base = reused["base"]
+                fixup = reused["fixup"]
+                entry["versions"] = [
+                    {
+                        "attempt": 1,
+                        "content": base["content"],
+                        "content_sha256": base["content_sha256"],
+                        "reviewed_sha256": base["content_sha256"],
+                        "review": reused["review"],
+                    },
+                    {
+                        "attempt": 2,
+                        "content": reused["content"],
+                        "content_sha256": digest,
+                        "reviewed_sha256": base["content_sha256"],
+                        "review": reused["review"],
+                        "fixup": {**fixup, "base_attempt": 1},
+                    },
+                ]
+                entry["approved_attempt"] = 2
+                if not reviewed_version(entry, entry["versions"][1]):
+                    raise ValueError("the reused fix-up no longer matches its reviewed base")
             entry["reused_from"] = {
                 "decomposition_id": reused["decomposition_id"],
                 "attempt": reused["attempt"],
