@@ -1357,6 +1357,111 @@ def resolved_dependencies(stories: Sequence[Mapping[str, Any]]) -> dict[str, tup
     return {str(task["key"]): tuple(_bound_dependencies(task, providers)[0]) for task in tasks}
 
 
+# --------------------------------------------------------------------------------------
+# NEW-244: deterministic declaration normalization
+# --------------------------------------------------------------------------------------
+
+# The rules that add a registered frame contract to a task's interfaces.consumes:
+# N1 a `contract:<ctr-id>` dependency, N2 a provided contract (a task that changes a
+# contract's definition implements and tests against it), N3 a task path that is the
+# contract's registered path or lies under it (in the contract's owner repository).
+NORMALIZATION_RULES: Final = {
+    "N1": "depends_on names contract:<ctr-id>",
+    "N2": "interfaces.provides names the contract",
+    "N3": "a task path is the contract's registered path or lies under it",
+}
+# The part schemas bound interfaces.consumes to 20 entries; normalization never exceeds it.
+MAX_CONSUMES = 20
+
+
+def _contract_paths(contracts: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+    """(contract id, owner repository, registered path without a trailing slash)."""
+    found: list[tuple[str, str, str]] = []
+    for contract in contracts:
+        path = str(contract.get("path") or "").strip().rstrip("/")
+        if path:
+            found.append((str(contract["id"]), str(contract.get("owner_repository")), path))
+    return found
+
+
+def _under(path: str, contract_path: str) -> bool:
+    candidate = str(path).strip()
+    return candidate == contract_path or candidate.startswith(contract_path + "/")
+
+
+def normalize_declarations(
+    stories: Sequence[Mapping[str, Any]], contracts: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """(the stories with every inferable consumed contract added, one record per added
+    entry: {task, contract, rule}). Deterministic and idempotent: only registered frame
+    contracts (`contracts`, the frame's registry) are added, only to
+    interfaces.consumes, in rule order (N1, N2, N3) after the existing entries, at most
+    MAX_CONSUMES in all; nothing else changes (task keys, order and every other field).
+    No plan rule reads interfaces.consumes except CONTRACT_UNKNOWN (registered ids only
+    are added) and CONTRACT_DEPENDENCY_UNCONSUMED (which an addition only resolves), so
+    an addition never creates a problem: dependency edges come from depends_on and
+    interfaces.provides alone."""
+    registered = {str(contract["id"]) for contract in contracts}
+    paths = _contract_paths(contracts)
+    normalized = copy.deepcopy([dict(story) for story in stories])
+    records: list[dict[str, str]] = []
+    for story in normalized:
+        for task in story.get("tasks") or []:
+            interfaces = task.get("interfaces")
+            if not isinstance(interfaces, dict) or not isinstance(interfaces.get("consumes"), list):
+                continue
+            key = str(task.get("key"))
+            consumes: list[Any] = interfaces["consumes"]
+            candidates: list[tuple[str, str]] = []
+            for dependency in task.get("depends_on") or []:
+                match = CONTRACT_DEPENDENCY.fullmatch(str(dependency))
+                if match is not None:
+                    candidates.append((match.group(1), "N1"))
+            candidates += [(str(item), "N2") for item in interfaces.get("provides") or []]
+            repository = str((task.get("target") or {}).get("repository"))
+            for path in task.get("paths") or []:
+                candidates += [
+                    (identity, "N3")
+                    for identity, owner, contract_path in paths
+                    if owner == repository and _under(str(path), contract_path)
+                ]
+            for contract, rule in candidates:
+                if contract not in registered or contract in consumes:
+                    continue
+                if len(consumes) >= MAX_CONSUMES:
+                    break
+                consumes.append(contract)
+                records.append({"task": key, "contract": contract, "rule": rule})
+    return normalized, records
+
+
+def normalize_epic_content(
+    content: Mapping[str, Any], contracts: Sequence[Mapping[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """An epic batch's content ({"stories": [...]}) normalized (normalize_declarations);
+    every other field is kept."""
+    stories, records = normalize_declarations(list(content.get("stories") or []), contracts)
+    return {**copy.deepcopy(dict(content)), "stories": stories}, records
+
+
+def normalize_epic_output(
+    value: Any, contracts: Sequence[Mapping[str, Any]], project: str = PROJECT
+) -> tuple[Any, list[dict[str, str]]]:
+    """A drafter's epic-batch output with its batch normalized, when it is a COMPLETE,
+    schema-valid output (anything else is returned unchanged, for the checks to refuse)."""
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "COMPLETE"
+        or not isinstance(value.get(EPIC), dict)
+        or schema_errors(value, part_schema(EPIC, project))
+    ):
+        return value, []
+    content, records = normalize_epic_content(value[EPIC], contracts)
+    if not records:
+        return value, []
+    return {**value, EPIC: content}, records
+
+
 def _stories_problems(
     stories: Sequence[Mapping[str, Any]],
     inventory: Mapping[str, Any],

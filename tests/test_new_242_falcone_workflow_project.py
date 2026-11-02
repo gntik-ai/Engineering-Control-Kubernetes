@@ -807,19 +807,23 @@ def test_the_released_pack_keeps_the_approved_serverless_plans_revision(tmp_path
 # -- falcone-serverless unchanged ---------------------------------------------------------
 
 # Computed with these fixtures on origin/main c8f3bb6 (before NEW-242).
+# NEW-244 re-pinned plan_sha256, requests, prompts, fanout and SERVERLESS_FANOUT_REVIEWS on
+# purpose: the provider tasks now also consume the contracts they provide (rule N2) and
+# the epic review prompt carries the declaration guidance. The part ids, inventory,
+# frame input and pack revision are unchanged.
 SERVERLESS_PINS = {
     "inventory_sha256": "811f33b9f2c00ae155e116304056e31ca8d186bc5ff55fa006d32bc3d0fee123",
     "frame_input": "311482cbaa416d7579c4fdf9c0aa2f6e2ed43a16d11dfc6b51dfa81453d3d85d",
     "part_ids": ["frame-113b3701556bd625", "ep02-65b4d5b97643eb11", "ep01-316c27edf208cb99"],
-    "plan_sha256": "0b29b5ae410d28c5219f4f573109219532aa0a1384cb7d05453124278750d289",
+    "plan_sha256": "4fb410fcd19e8d2e6b03e094eaff83449044fec10585027ecd8a49e7966d4c3e",
     "pack_revision": "b4cf73e3a38f2035257069f0ba893e7f73848d41779f8261afcf107f91511a3a",
     # Every draft and review request (prompt, schema, role, files), the random ids masked.
-    "requests": "05f476b69b6927de86c7f0e471005946767caeb665eb9907b6cb584549170698",
-    "prompts": "94f9a878a62b0e375ab847186ded35610a75bbbf3d429675f8b6059d76e392d3",
-    "fanout": "fd24be03398a6da597051869d40310392427c722cfd1b65566a600e5289f8726",
+    "requests": "5b9e2b47e9abd200081931c9c2d87fe2d5724ead4f7d222aa6db4614eba278ab",
+    "prompts": "a2a4aed45428a9d84adbf80f802ad5fde4babaa9900462d8fdfdb7f3adfc55d8",
+    "fanout": "a177596f6c2f51cdfd0b88a6953ff8733a28d470b904b1751180d6ac0a7c4b45",
 }
 # The fan-out's Codex review requests and its summary, ids masked (same origin).
-SERVERLESS_FANOUT_REVIEWS = "7af4ebeb94303738492f075ac5857067147f57665bf3e0d967427cca1ec0dba3"
+SERVERLESS_FANOUT_REVIEWS = "01251b95a895c3d7fe896bcbe70c95e32c9554ddae8592eafba041252fd9c478"
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 

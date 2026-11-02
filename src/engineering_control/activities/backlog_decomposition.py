@@ -45,6 +45,7 @@ from engineering_control.engineering.decomposition import (
     MAX_PART_DRAFTS,
     MAX_PART_REJECTIONS,
     MAX_REVIEW_CHARACTERS,
+    NORMALIZATION_RULES,
     PART_ID,
     REJECTIONS_EXHAUSTED,
     DecompositionInputs,
@@ -58,6 +59,8 @@ from engineering_control.engineering.decomposition import (
     decomposition_pack_problems,
     decomposition_profile,
     epic_order,
+    normalize_epic_content,
+    normalize_epic_output,
     pack_revision,
     part_schema,
     plan_sha256,
@@ -439,6 +442,17 @@ class DecompositionActivityHandler:
                 earlier.append(
                     EpicPart(int(item["number"]), str(item["part_id"]), stored["content"])
                 )
+        if frame is not None:
+            # NEW-244: every check and the assembly read the approved batches with their
+            # inferable consumed contracts (in memory: the stored content and its review
+            # hashes are unchanged, so an approved or reused part stays reusable).
+            contracts = list(frame["contracts"])
+            earlier = [
+                EpicPart(
+                    part.number, part.part_id, normalize_epic_content(part.content, contracts)[0]
+                )
+                for part in earlier
+            ]
         return frame, frame_sha256, earlier
 
     def _epic_context(
@@ -555,7 +569,12 @@ class DecompositionActivityHandler:
         )
         if reused is None:
             return None
-        output = self._bound_output(decomposition_id, payload, part_id, kind, reused["content"])
+        content = reused["content"]
+        if kind == EPIC:
+            # NEW-244: re-checked as every later read sees it (normalized in memory).
+            frame = self._epic_context(decomposition_id, payload)[0]
+            content = normalize_epic_content(content, list(frame["contracts"]))[0]
+        output = self._bound_output(decomposition_id, payload, part_id, kind, content)
         try:
             self._check_draft(decomposition_id, payload, output, part_id, kind)
         except DecompositionRejected as rejected:
@@ -1049,6 +1068,13 @@ class DecompositionActivityHandler:
         base = self._base(payload)
         attempt = int(payload.get("draft_attempt") or 1)
         structured = self._structured(payload)
+        normalized: list[dict[str, str]] = []
+        if kind == EPIC:
+            # NEW-244: the stored, hashed, staged and reviewed draft is the normalized one.
+            frame = self._epic_context(decomposition_id, payload)[0]
+            structured, normalized = normalize_epic_output(
+                structured, list(frame["contracts"]), str(payload["project"])
+            )
         try:
             content = self._check_draft(decomposition_id, payload, structured, part_id, kind)
         except DecompositionRejected as rejected:
@@ -1056,7 +1082,9 @@ class DecompositionActivityHandler:
                 decomposition_id, part_id, kind, number, attempt, rejected.code, rejected.details
             )
             return self._rejected(base, rejected)
-        self.repository.record_part_sync(decomposition_id, part_id, kind, number, attempt, content)
+        self.repository.record_part_sync(
+            decomposition_id, part_id, kind, number, attempt, content, normalized=normalized
+        )
         return {
             **base,
             "status": "DRAFT_RECORDED",
@@ -1075,6 +1103,47 @@ class DecompositionActivityHandler:
         "subject. A later review of the redraft must not find a violation already present "
         "in this draft. APPROVE only when the checklist finds none."
     )
+
+    # NEW-244: the review schema has no severity, so a finding Hermes's normalization
+    # makes moot (or one whose only fix is a consumes entry) is kept off REVISE in words.
+    _DECLARATION_GUIDANCE = (
+        "Declared interfaces: Hermes normalizes every epic batch deterministically before "
+        "it is stored, reviewed and assembled, adding a registered frame contract to a "
+        "task's interfaces.consumes when: "
+        + "; ".join(f"{rule}) {text}" for rule, text in NORMALIZATION_RULES.items())
+        + " (N3 only for a task targeting the contract's owner repository). Never report "
+        "a consumes entry these rules infer as missing. A finding whose only fix is adding "
+        "an interfaces.consumes entry Hermes cannot infer needs no redraft: report it with "
+        "a detail starting 'note:' and never make it the sole reason for REVISE (APPROVE "
+        "may carry it; this is the one exception to approving only a clean checklist). "
+        "Nothing else changes: a provided contract the task's repository does not own, a "
+        "contract:<ctr-id> dependency no plan task provides, a contract the task changes "
+        "but does not list in interfaces.provides, and a wrong or missing dependency stay "
+        "REVISE findings."
+    )
+
+    def _declaration_guidance(self, decomposition_id: UUID, part_id: str, attempt: int) -> str:
+        entry = self.repository.part_sync(decomposition_id, part_id) or {}
+        records = next(
+            (
+                list(version.get("normalized") or [])
+                for version in entry.get("versions") or []
+                if version.get("attempt") == attempt
+            ),
+            [],
+        )
+        applied = (
+            "Normalizations Hermes applied to this draft (already in the draft you read): "
+            + "; ".join(
+                f"{item['task']} consumes {item['contract']} ({item['rule']})"
+                for item in records[:60]
+            )
+            + (f"; and {len(records) - 60} more" if len(records) > 60 else "")
+            + "."
+            if records
+            else "Hermes applied no normalization to this draft."
+        )
+        return f"{self._DECLARATION_GUIDANCE}\n{applied}"
 
     def _prepare_part_review(self, payload: dict[str, Any]) -> dict[str, Any]:
         decomposition_id = self._decomposition_id(payload)
@@ -1105,6 +1174,8 @@ class DecompositionActivityHandler:
             f"{payload['draft_sha256']}).",
             self._EXHAUSTIVE_REVIEW,
         ]
+        if kind == EPIC:
+            sections.append(self._declaration_guidance(decomposition_id, part_id, attempt))
         continuation = self._continuation(decomposition_id, payload, part_id, kind)
         history, omitted = (
             self._prior_findings(decomposition_id, part_id, attempt, continuation)

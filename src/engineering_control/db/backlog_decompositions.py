@@ -1056,9 +1056,13 @@ class BacklogDecompositionRepository:
         number: int | None,
         attempt: int,
         content: dict[str, Any],
+        *,
+        normalized: list[dict[str, str]] | None = None,
     ) -> str:
         """Store one Hermes-checked part draft (idempotent per attempt). A new draft of
-        an approved part (an assembly redraft) withdraws that approval."""
+        an approved part (an assembly redraft) withdraws that approval. NEW-244:
+        `normalized` are the consumed contracts Hermes added to the draft (kept with the
+        version only when there are any)."""
         digest = part_content_sha256(content)
         with self.sessions.begin() as session:
             row = self._locked(session, decomposition_id)
@@ -1068,7 +1072,14 @@ class BacklogDecompositionRepository:
             entry = self._part_entry(parts, part_id, kind, number)
             entry["versions"] = [
                 item for item in entry["versions"] if item.get("attempt") != attempt
-            ] + [{"attempt": attempt, "content": content, "content_sha256": digest}]
+            ] + [
+                {
+                    "attempt": attempt,
+                    "content": content,
+                    "content_sha256": digest,
+                    **({"normalized": list(normalized)} if normalized else {}),
+                }
+            ]
             if entry.get("approved_attempt") is not None and entry["approved_attempt"] < attempt:
                 entry["approved_attempt"] = None
             row.parts_json = parts
