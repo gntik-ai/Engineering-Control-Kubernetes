@@ -30,7 +30,10 @@ from test_new_234_plan_surfaces import FakeManager, Scan
 
 from engineering_control.config import Settings
 from engineering_control.engineering import decomposition_inventory as inventory_module
-from engineering_control.engineering.decomposition import part_content_sha256
+from engineering_control.engineering.decomposition import (
+    normalize_epic_content,
+    part_content_sha256,
+)
 from engineering_control.engineering.decomposition_inventory import (
     MAX_INPUT_BYTES,
     PIECE_KIND,
@@ -235,7 +238,9 @@ def test_a_redraft_with_a_large_frame_and_previous_draft_stages_within_the_bound
     # The reviewed hash is the reassembled draft's, so the large draft was approved as staged.
     draft_two = sorted(name for name in pieced if name.startswith(f"part-{epic_part}-draft-2_"))
     pieces = [json.loads((directory / name).read_text()) for name in draft_two]
-    assert part_content_sha256(reassemble_pieces(pieces)["epic"]) == part_content_sha256(big_epic)
+    # NEW-244: the staged draft is the normalized one (provided contracts are consumed).
+    normalized = normalize_epic_content(big_epic, big_frame["contracts"])[0]
+    assert part_content_sha256(reassemble_pieces(pieces)["epic"]) == part_content_sha256(normalized)
     sizes = {
         "frame_draft": sum(
             v for k, v in staged.items() if k.startswith("part-frame-") and "draft" in k

@@ -1357,6 +1357,276 @@ def resolved_dependencies(stories: Sequence[Mapping[str, Any]]) -> dict[str, tup
     return {str(task["key"]): tuple(_bound_dependencies(task, providers)[0]) for task in tasks}
 
 
+# --------------------------------------------------------------------------------------
+# NEW-244: deterministic declaration normalization
+# --------------------------------------------------------------------------------------
+
+# The rules that add a registered frame contract to a task's interfaces.consumes:
+# N1 a `contract:<ctr-id>` dependency, N2 a provided contract (a task that changes a
+# contract's definition implements and tests against it), N3 a task path that is the
+# contract's registered path or lies under it (in the contract's owner repository).
+NORMALIZATION_RULES: Final = {
+    "N1": "depends_on names contract:<ctr-id>",
+    "N2": "interfaces.provides names the contract",
+    "N3": "a task path is the contract's registered path or lies under it",
+}
+# The part schemas bound interfaces.consumes to 20 entries; normalization never exceeds it.
+MAX_CONSUMES = 20
+
+
+def _contract_paths(contracts: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+    """(contract id, owner repository, registered path without a trailing slash)."""
+    found: list[tuple[str, str, str]] = []
+    for contract in contracts:
+        path = str(contract.get("path") or "").strip().rstrip("/")
+        if path:
+            found.append((str(contract["id"]), str(contract.get("owner_repository")), path))
+    return found
+
+
+def _under(path: str, contract_path: str) -> bool:
+    candidate = str(path).strip()
+    return candidate == contract_path or candidate.startswith(contract_path + "/")
+
+
+def normalize_declarations(
+    stories: Sequence[Mapping[str, Any]], contracts: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """(the stories with every inferable consumed contract added, one record per added
+    entry: {task, contract, rule}). Deterministic and idempotent: only registered frame
+    contracts (`contracts`, the frame's registry) are added, only to
+    interfaces.consumes, in rule order (N1, N2, N3) after the existing entries, at most
+    MAX_CONSUMES in all; nothing else changes (task keys, order and every other field).
+    No plan rule reads interfaces.consumes except CONTRACT_UNKNOWN (registered ids only
+    are added) and CONTRACT_DEPENDENCY_UNCONSUMED (which an addition only resolves), so
+    an addition never creates a problem: dependency edges come from depends_on and
+    interfaces.provides alone."""
+    registered = {str(contract["id"]) for contract in contracts}
+    paths = _contract_paths(contracts)
+    normalized = copy.deepcopy([dict(story) for story in stories])
+    records: list[dict[str, str]] = []
+    for story in normalized:
+        for task in story.get("tasks") or []:
+            interfaces = task.get("interfaces")
+            if not isinstance(interfaces, dict) or not isinstance(interfaces.get("consumes"), list):
+                continue
+            key = str(task.get("key"))
+            consumes: list[Any] = interfaces["consumes"]
+            candidates: list[tuple[str, str]] = []
+            for dependency in task.get("depends_on") or []:
+                match = CONTRACT_DEPENDENCY.fullmatch(str(dependency))
+                if match is not None:
+                    candidates.append((match.group(1), "N1"))
+            candidates += [(str(item), "N2") for item in interfaces.get("provides") or []]
+            repository = str((task.get("target") or {}).get("repository"))
+            for path in task.get("paths") or []:
+                candidates += [
+                    (identity, "N3")
+                    for identity, owner, contract_path in paths
+                    if owner == repository and _under(str(path), contract_path)
+                ]
+            for contract, rule in candidates:
+                if contract not in registered or contract in consumes:
+                    continue
+                if len(consumes) >= MAX_CONSUMES:
+                    break
+                consumes.append(contract)
+                records.append({"task": key, "contract": contract, "rule": rule})
+    return normalized, records
+
+
+def normalize_epic_content(
+    content: Mapping[str, Any], contracts: Sequence[Mapping[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """An epic batch's content ({"stories": [...]}) normalized (normalize_declarations);
+    every other field is kept."""
+    stories, records = normalize_declarations(list(content.get("stories") or []), contracts)
+    return {**copy.deepcopy(dict(content)), "stories": stories}, records
+
+
+def normalize_epic_output(
+    value: Any, contracts: Sequence[Mapping[str, Any]], project: str = PROJECT
+) -> tuple[Any, list[dict[str, str]]]:
+    """A drafter's epic-batch output with its batch normalized, when it is a COMPLETE,
+    schema-valid output (anything else is returned unchanged, for the checks to refuse)."""
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "COMPLETE"
+        or not isinstance(value.get(EPIC), dict)
+        or schema_errors(value, part_schema(EPIC, project))
+    ):
+        return value, []
+    content, records = normalize_epic_content(value[EPIC], contracts)
+    if not records:
+        return value, []
+    return {**value, EPIC: content}, records
+
+
+# NEW-244: assembly problems a part can resolve by changing only its tasks' depends_on and
+# interfaces (and a dependency-only story amendment): a targeted fix-up, not a redraft.
+DECLARATION_CODES: Final = frozenset(
+    {
+        "DEPENDENCY_UNRESOLVED",
+        "DEPENDENCY_INCONSISTENT",
+        "PREREQUISITE_UNORDERED",
+        "DEPENDENCY_CYCLE",
+        "DEPENDENCY_SELF",
+        "DEPENDENCY_TOO_MANY",
+        "CONTRACT_PROVIDER_MISSING",
+        "CONTRACT_DEPENDENCY_UNCONSUMED",
+    }
+)
+# The task fields a declaration fix-up may change (dotted: interfaces.<name>).
+FIXUP_TASK_FIELDS: Final = ("depends_on", "interfaces.consumes", "interfaces.provides")
+
+
+def declaration_only(problems: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether every problem (plan-problem dicts) is a declaration problem."""
+    return bool(problems) and all(str(item.get("code")) in DECLARATION_CODES for item in problems)
+
+
+def _task_field(task: Mapping[str, Any], field: str) -> Any:
+    if field.startswith("interfaces."):
+        return (task.get("interfaces") or {}).get(field.split(".", 1)[1])
+    return task.get(field)
+
+
+def _without_declarations(task: Mapping[str, Any]) -> dict[str, Any]:
+    rest = {key: value for key, value in task.items() if key not in {"depends_on", "interfaces"}}
+    interfaces = task.get("interfaces")
+    if isinstance(interfaces, Mapping):
+        rest["interfaces"] = {
+            key: value for key, value in interfaces.items() if key not in {"consumes", "provides"}
+        }
+    else:
+        rest["interfaces"] = interfaces
+    return rest
+
+
+def _non_dependency_changes(amendment: Any) -> list[Any]:
+    if not isinstance(amendment, Mapping):
+        return []
+    return [
+        change
+        for change in amendment.get("changes") or []
+        if change.get("section") != "dependencies"
+    ]
+
+
+def amendment_change_allowed(before: Any, after: Any) -> bool:
+    """Whether a fix-up may change a story amendment from `before` to `after`: its changes
+    outside the dependencies section stay exactly the same (shared by the diff that records
+    a fix-up and the replay that verifies one)."""
+    if after is not None and not isinstance(after, Mapping):
+        return False
+    if after is not None and any(
+        not isinstance(change, Mapping) for change in after.get("changes") or []
+    ):
+        return False
+    return _non_dependency_changes(before) == _non_dependency_changes(after)
+
+
+def declaration_changes(
+    base: Mapping[str, Any], fixed: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """(the changes from epic batch `base` to `fixed`, the reasons the fix-up is refused).
+    A change sets one task's depends_on, interfaces.consumes or interfaces.provides, or one
+    story's story_amendment, to its value in `fixed`; anything else that differs (a story or
+    task added, removed or re-ordered, a key, text, path, criterion or any other field, or a
+    story amendment change outside its dependencies) refuses the fix-up, as does no change."""
+    refusals: list[str] = []
+    changes: list[dict[str, Any]] = []
+    if {key: value for key, value in base.items() if key != "stories"} != {
+        key: value for key, value in fixed.items() if key != "stories"
+    }:
+        refusals.append("the batch changes a field outside its stories")
+    stories = list(base.get("stories") or [])
+    others = list(fixed.get("stories") or [])
+    if [s.get("story_id") for s in stories] != [s.get("story_id") for s in others]:
+        return [], [*refusals, "the batch adds, removes or re-orders a story"]
+    for story, other in zip(stories, others, strict=True):
+        story_id = str(story.get("story_id"))
+        rest = {key for key in (*story, *other) if key not in {"tasks", "story_amendment"}}
+        if any(story.get(key) != other.get(key) for key in rest):
+            refusals.append(f"{story_id}: a story field other than its tasks changes")
+        tasks, fixed_tasks = list(story.get("tasks") or []), list(other.get("tasks") or [])
+        if [t.get("key") for t in tasks] != [t.get("key") for t in fixed_tasks]:
+            refusals.append(f"{story_id}: a task is added, removed, re-keyed or re-ordered")
+            continue
+        for task, fixed_task in zip(tasks, fixed_tasks, strict=True):
+            key = str(task.get("key"))
+            if _without_declarations(task) != _without_declarations(fixed_task):
+                changed = sorted(
+                    name
+                    for name in {*task, *fixed_task}
+                    if name not in {"depends_on", "interfaces"}
+                    and task.get(name) != fixed_task.get(name)
+                ) or ["interfaces"]
+                refusals.append(f"{key}: changes {', '.join(changed)}")
+                continue
+            changes += [
+                {
+                    "task": key,
+                    "field": field,
+                    "value": copy.deepcopy(_task_field(fixed_task, field)),
+                }
+                for field in FIXUP_TASK_FIELDS
+                if _task_field(task, field) != _task_field(fixed_task, field)
+            ]
+        before, after = story.get("story_amendment"), other.get("story_amendment")
+        if before != after:
+            if not amendment_change_allowed(before, after):
+                refusals.append(f"{story_id}: the story amendment changes outside dependencies")
+            else:
+                changes.append(
+                    {"story": story_id, "field": "story_amendment", "value": copy.deepcopy(after)}
+                )
+    if not changes and not refusals:
+        refusals.append("the fix-up changes nothing")
+    return ([] if refusals else changes), refusals
+
+
+def apply_declaration_changes(
+    base: Mapping[str, Any], changes: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """`base` with `changes` (declaration_changes) replayed; ValueError on a change that
+    names no task or story of `base`, or a field a fix-up may not change."""
+    content = copy.deepcopy(dict(base))
+    tasks = {
+        str(task.get("key")): task
+        for story in content.get("stories") or []
+        for task in story.get("tasks") or []
+    }
+    stories = {str(story.get("story_id")): story for story in content.get("stories") or []}
+    for change in changes:
+        field = change.get("field")
+        if "task" in change and field in FIXUP_TASK_FIELDS:
+            task = tasks.get(str(change["task"]))
+            if task is None:
+                raise ValueError(f"a fix-up change names unknown task {change['task']}")
+            if str(field).startswith("interfaces."):
+                interfaces = task.get("interfaces")
+                if not isinstance(interfaces, dict):
+                    raise ValueError(f"task {change['task']} has no interfaces")
+                interfaces[str(field).split(".", 1)[1]] = copy.deepcopy(change["value"])
+            else:
+                task[str(field)] = copy.deepcopy(change["value"])
+        elif "story" in change and field == "story_amendment":
+            story = stories.get(str(change["story"]))
+            if story is None:
+                raise ValueError(f"a fix-up change names unknown story {change['story']}")
+            # The replay keeps the recording restriction: a story amendment may change only
+            # in its dependencies section.
+            if not amendment_change_allowed(story.get("story_amendment"), change["value"]):
+                raise ValueError(
+                    f"a fix-up change edits story {change['story']} outside its dependencies"
+                )
+            story["story_amendment"] = copy.deepcopy(change["value"])
+        else:
+            raise ValueError("a fix-up change is not a declaration change")
+    return content
+
+
 def _stories_problems(
     stories: Sequence[Mapping[str, Any]],
     inventory: Mapping[str, Any],
