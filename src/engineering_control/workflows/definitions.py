@@ -7624,12 +7624,15 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
                     and workflow.patched(self._DECLARATION_FIXUP_PATCH)
                 ):
                     fixed_up.add(entry["part_id"])
-                    fixed = await self._declaration_fixup(
+                    fixed, consumed = await self._declaration_fixup(
                         request, context, approved, index, problems
                     )
                     if fixed is not None:
                         approved[index] = fixed
                         continue
+                    if consumed is not None:
+                        # The fix-up's attempt number is used: the redraft follows it.
+                        entry = consumed
                 # Under the rejection budget the limit is the part's reviewed drafts.
                 used = entry.get("reviewed", entry["attempt"])
                 if int(used) >= self._MAX_PART_DRAFTS:
@@ -7700,13 +7703,15 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
         approved: list[dict[str, Any]],
         index: int,
         problems: list[Any],
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """NEW-244: one targeted fix-up of approved part `index` (Claude may change only its
         tasks' declarations; Hermes checks and records it as a version derived from the
-        reviewed one). The part's new approved entry, or None to redraft it in full."""
+        reviewed one). (the part's new approved entry, None) on success; otherwise (None,
+        the entry its full redraft continues from: past the fix-up's attempt number once
+        the fix-up was prepared, or None when it never was)."""
         entry = approved[index]
         if not await self._checkpoint("DECOMPOSITION_PART_FIXUP"):
-            return None
+            return None, None
         base_attempt = int(entry["attempt"])
         prepared = await self._step(
             "decomposition.prepare_part_fixup",
@@ -7725,7 +7730,7 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             },
         )
         if prepared.get("status") != "FIXUP_READY":
-            return None
+            return None, None
         drafted = await self._agent_step(
             "decomposition.draft",
             prepared,
@@ -7733,8 +7738,6 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             retry_policy=SINGLE_ATTEMPT,
         )
         recorded = await self._step("decomposition.record_part_fixup", drafted)
-        if recorded.get("status") != "FIXUP_APPLIED":
-            return None
         prior = entry.get("part_budget")
         # The fix-up uses an attempt number, not a reviewed draft or a rejection (a part
         # adopted from an earlier plan counts its attempts as reviewed, as a redraft does).
@@ -7747,13 +7750,16 @@ class BacklogDecompositionPlanWorkflow(ControlledWorkflow):
             else {"reviewed": base_attempt, "rejected": 0}
         )
         budget["fixups"] = 1
-        return {
+        used = {
             **entry,
-            "content_sha256": recorded.get("content_sha256"),
-            "attempt": int(recorded.get("draft_attempt") or base_attempt + 1),
+            "attempt": base_attempt + 1,
             "part_budget": budget,
             "reviewed": budget["reviewed"],
         }
+        if recorded.get("status") != "FIXUP_APPLIED":
+            # Never redraft over the fix-up's attempt number, whatever was stored.
+            return None, used
+        return {**used, "content_sha256": recorded.get("content_sha256")}, None
 
     @staticmethod
     def _approved_entry(part: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:

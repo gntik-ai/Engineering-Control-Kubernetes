@@ -19,7 +19,14 @@ from uuid import UUID
 
 import pytest
 from new_234_decomposition_fixtures import api_epic, epic_output, frame, run_epic
-from new_234_plan_fixtures import FRAME_CONTENT_SHA, PlanHarness, agent_result, draft_for, drive
+from new_234_plan_fixtures import (
+    FRAME_CONTENT_SHA,
+    PlanHarness,
+    agent_result,
+    draft_for,
+    drive,
+    review_for,
+)
 from pre_declaration_fixup_decomposition_workflow import (
     PreDeclarationFixupDecompositionPlanWorkflow,
 )
@@ -27,7 +34,10 @@ from sqlalchemy import update
 from test_new_234_plan_workflow import PART_LOOP, WorkflowHarness
 
 from engineering_control.activities import backlog_decomposition as activities
-from engineering_control.db.backlog_decompositions import reviewed_version
+from engineering_control.db.backlog_decompositions import (
+    DecompositionPartConflictError,
+    reviewed_version,
+)
 from engineering_control.db.models import BacklogDecomposition
 from engineering_control.engineering.decomposition import (
     DECLARATION_CODES,
@@ -405,8 +415,9 @@ async def test_a_refused_fixup_falls_back_to_the_full_redraft(
     run = next(e for e in row.parts_json["parts"].values() if e.get("number") == 2)
     assert run["fixup"]["status"] == "REFUSED"
     assert any("acceptance_criteria" in reason for reason in run["fixup"]["reasons"])
-    # The redraft uses the attempt the refused fix-up never stored.
-    assert run["approved_attempt"] == 2
+    # The redraft follows the fix-up's attempt number, though the refusal stored nothing.
+    assert run["approved_attempt"] == 3
+    assert [version["attempt"] for version in run["versions"]] == [1, 3]
     assert all("fixup" not in version for version in run["versions"])
     assert harness.calls.count("decomposition.review") == 4
     assert row.provider_calls == 9
@@ -427,3 +438,187 @@ async def test_a_history_from_before_the_fixup_replays_unchanged(
     assembly = harness.calls.index("decomposition.assemble")
     assert harness.calls[assembly + 1 : assembly + 1 + len(PART_LOOP)] == PART_LOOP
     assert not any("decomposition-declaration-fixup-v1" in item for item in _markers(harness))
+
+
+# Review findings: replay restriction and idempotent recording -------------------------------
+
+
+def _amendment(section: str) -> dict[str, Any]:
+    return {
+        "reason": "r",
+        "sources": ["RUN-01#ac1"],
+        "changes": [
+            {"section": section, "action": "REPLACE", "target": "RUN-01#ac1", "text": "Altered."}
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"story": "RUN-01", "field": "story_amendment", "value": _amendment("acceptance_criteria")},
+        {"task": RUN_T1, "field": "paths", "value": ["worker/src/other.rs"]},
+        {"task": RUN_T1, "field": "key", "value": "falcone-serverless:RUN-01.t9"},
+    ],
+)
+def test_a_derived_version_changing_anything_but_declarations_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: dict[str, Any]
+) -> None:
+    harness = PlanHarness(tmp_path)
+    first = harness.create()
+    assert drive(harness, first["id"])["status"] == "CANDIDATE"
+    parts = _parts(harness, first["id"])
+    run_id = next(key for key, entry in parts["parts"].items() if entry.get("number") == 2)
+    entry = parts["parts"][run_id]
+    base = entry["versions"][0]
+    # Hand-built, with a content hash that matches its (forbidden) change.
+    content = copy.deepcopy(base["content"])
+    if "story" in change:
+        content["stories"][0]["story_amendment"] = change["value"]
+    else:
+        _run_task(content)[change["field"]] = change["value"]
+    with pytest.raises(ValueError):
+        apply_declaration_changes(base["content"], [change])
+    version = {
+        "attempt": 2,
+        "content": content,
+        "content_sha256": part_content_sha256(content),
+        "reviewed_sha256": base["reviewed_sha256"],
+        "review": copy.deepcopy(base["review"]),
+        "fixup": {
+            "base_attempt": 1,
+            "base_sha256": base["reviewed_sha256"],
+            "changes": [change],
+            "problems": [],
+        },
+    }
+    entry["versions"].append(version)
+    entry["approved_attempt"] = 2
+    assert not reviewed_version(entry, version)
+    _store(harness, first["id"], parts)
+    with pytest.raises(ValueError, match="no longer matches its review"):
+        harness.repository.approved_content_sync(UUID(first["id"]), run_id)
+    assert harness.repository.reusable_part_sync(UUID(int=0), "falcone-serverless", run_id) is None
+    seen: list[Any] = []
+    monkeypatch.setattr(activities, "assemble_plan", lambda *args: seen.append(args))
+    approved = [
+        {"part_id": key, "kind": item["kind"], "number": item["number"],
+         "content_sha256": next(v for v in item["versions"]
+                                if v["attempt"] == item["approved_attempt"])["content_sha256"]}
+        for key, item in parts["parts"].items()
+    ]  # fmt: skip
+    with pytest.raises(ValueError):
+        harness.step(
+            "decomposition.assemble",
+            {"decomposition_id": first["id"], "project": "falcone-serverless",
+             "approved_parts": approved},
+        )  # fmt: skip
+    assert seen == []
+
+
+def _retried_fixup_record(harness: WorkflowHarness, *, lose_completion: bool) -> list[Any]:
+    """record_part_fixup runs twice with the same input (Temporal's retry after a lost
+    completion); with `lose_completion` the workflow instead sees a refusal of the fix-up
+    the first call committed."""
+    results: list[Any] = []
+    handle = harness.handler.handle
+
+    async def retried(step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step != "decomposition.record_part_fixup":
+            return await handle(step, payload)
+        first = await handle(step, copy.deepcopy(payload))
+        if lose_completion:
+            results.append(first)
+            return {**first, "status": "FIXUP_REFUSED", "blocker": "FIXUP_LOST"}
+        second = await handle(step, payload)
+        results.append((first, second))
+        return second
+
+    harness.handler.handle = retried  # type: ignore[method-assign]
+    return results
+
+
+@needs_temporal
+async def test_a_retried_fixup_record_returns_the_recorded_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    _flaky_assembly(monkeypatch)
+    _fixup_drafter(
+        harness, lambda c: _run_task(c)["interfaces"]["consumes"].append("ctr-functions-api")
+    )
+    results = _retried_fixup_record(harness, lose_completion=False)
+    result = await harness.run(created)
+    assert result["status"] == "CANDIDATE", result
+    [(first, second)] = results
+    assert first["status"] == "FIXUP_APPLIED" and second == first
+    assert harness.calls.count("decomposition.review") == 3
+    run = next(e for e in harness.row(created).parts_json["parts"].values() if e.get("number") == 2)
+    assert run["approved_attempt"] == 2 and run["fixup"]["status"] == "APPLIED"
+    assert len(run["versions"]) == 2
+
+
+@needs_temporal
+async def test_after_a_fallback_revise_nothing_reports_the_part_approved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = WorkflowHarness(tmp_path)
+    created = harness.create()
+    _flaky_assembly(monkeypatch)
+    _fixup_drafter(
+        harness, lambda c: _run_task(c)["interfaces"]["consumes"].append("ctr-functions-api")
+    )
+    # The fix-up commits, but the workflow sees a refusal and redrafts the part in full.
+    results = _retried_fixup_record(harness, lose_completion=True)
+
+    def review(payload: dict[str, Any]) -> dict[str, Any]:
+        revise = payload["part"]["number"] == 2 and int(payload["draft_attempt"]) >= 3
+        return agent_result(payload, review_for(payload, "REVISE" if revise else "APPROVE"))
+
+    harness.responses["decomposition.review"] = review
+    result = await harness.run(created)
+    assert (result["status"], result["error_code"]) == (
+        "BLOCKED",
+        "DECOMPOSITION_PART_REVIEW_UNRESOLVED",
+    )
+    assert results[0]["status"] == "FIXUP_APPLIED"
+    row = harness.row(created)
+    run_id, run = next(
+        (key, e) for key, e in row.parts_json["parts"].items() if e.get("number") == 2
+    )
+    # The redrafts never reuse the fix-up's attempt; the first one withdrew the approval.
+    assert [version["attempt"] for version in run["versions"]] == [1, 2, 3, 4]
+    assert run["approved_attempt"] is None
+    with pytest.raises(ValueError, match="no approved version"):
+        harness.repository.approved_content_sync(UUID(created["id"]), run_id)
+    other = harness.create()
+    assert (
+        harness.repository.reusable_part_sync(UUID(other["id"]), "falcone-serverless", run_id)
+        is None
+    )
+
+
+def test_a_draft_never_replaces_a_reviewed_or_fixed_up_version(tmp_path: Path) -> None:
+    harness = PlanHarness(tmp_path)
+    first = harness.create()
+    assert drive(harness, first["id"])["status"] == "CANDIDATE"
+    parts = _parts(harness, first["id"])
+    run_id = next(key for key, entry in parts["parts"].items() if entry.get("number") == 2)
+    _derive(parts["parts"][run_id], _fixed_run(parts["parts"][run_id]))
+    _store(harness, first["id"], parts)
+    with harness.repository.sessions.begin() as session:
+        session.execute(
+            update(BacklogDecomposition)
+            .where(BacklogDecomposition.id == UUID(first["id"]))
+            .values(status="DRAFTING")
+        )
+    content = parts["parts"][run_id]["versions"][0]["content"]
+    for attempt in (1, 2):
+        with pytest.raises(DecompositionPartConflictError):
+            harness.repository.record_part_sync(
+                UUID(first["id"]), run_id, "epic", 2, attempt, content
+            )
+    harness.repository.record_part_sync(UUID(first["id"]), run_id, "epic", 2, 3, content)
+    entry = harness.repository.part_sync(UUID(first["id"]), run_id)
+    assert entry is not None and entry["approved_attempt"] is None

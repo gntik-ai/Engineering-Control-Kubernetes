@@ -32,6 +32,7 @@ from engineering_control.config import Settings
 from engineering_control.db.backlog_decompositions import (
     BacklogDecompositionRepository,
     DecompositionBudgetExhaustedError,
+    DecompositionPartConflictError,
 )
 from engineering_control.delivery_notifications import CTL, enqueue_milestone, literal
 from engineering_control.engineering import plan_review
@@ -1103,9 +1104,13 @@ class DecompositionActivityHandler:
                 decomposition_id, part_id, kind, number, attempt, rejected.code, rejected.details
             )
             return self._rejected(base, rejected)
-        self.repository.record_part_sync(
-            decomposition_id, part_id, kind, number, attempt, content, normalized=normalized
-        )
+        try:
+            self.repository.record_part_sync(
+                decomposition_id, part_id, kind, number, attempt, content, normalized=normalized
+            )
+        except DecompositionPartConflictError as error:
+            # NEW-244: never over a reviewed or fixed-up version (fail closed).
+            return self._blocked(base, "PART_VERSION_CONFLICT", [f"{part_id}: {error}"])
         return {
             **base,
             "status": "DRAFT_RECORDED",
@@ -1454,9 +1459,28 @@ class DecompositionActivityHandler:
             )
         except ValueError as error:
             return refused("FIXUP_BASE_INVALID", [str(error)])
-        # The changes are taken against the stored approved content (as reviewed), so
-        # replaying them on it reproduces the fixed batch exactly.
-        changes, reasons = declaration_changes(approved["content"], fixed)
+        # The changes are taken against the reviewed base as stored, so replaying them on it
+        # reproduces the fixed batch exactly. A retry after this fix-up was recorded (its
+        # completion lost) finds its own derived version approved: it diffs against that
+        # version's base, and record_part_fixup_sync returns the recorded result.
+        if "fixup" in approved:
+            fixup = approved["fixup"]
+            entry = self.repository.part_sync(decomposition_id, part_id) or {}
+            bases = [
+                version["content"]
+                for version in entry.get("versions") or []
+                if version.get("attempt") == base_attempt and "fixup" not in version
+            ]
+            if (
+                approved.get("attempt") != attempt
+                or fixup.get("base_attempt") != base_attempt
+                or len(bases) != 1
+            ):
+                return refused("FIXUP_BASE_INVALID", ["the approved version is another fix-up"])
+            base_content = bases[0]
+        else:
+            base_content = approved["content"]
+        changes, reasons = declaration_changes(base_content, fixed)
         if reasons:
             return refused("FIXUP_CHANGES_REFUSED", reasons)
         try:

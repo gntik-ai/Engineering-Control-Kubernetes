@@ -46,6 +46,7 @@ from engineering_control.engineering.decomposition import (
     WORKFLOW_PREFIX,
     apply_declaration_changes,
     approval_binding,
+    declaration_changes,
     decomposition_profile,
     decomposition_workflow_id,
     part_content_sha256,
@@ -76,6 +77,10 @@ _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _CALL_KEY = re.compile(r"^(?:frame|ep[0-9]{2})-[a-f0-9]{16}:(?:draft|review|fixup):[1-9]$")
 # How many earlier plans of the project are searched for a reusable reviewed part.
 REUSE_SEARCH = 20
+
+
+class DecompositionPartConflictError(ValueError):
+    """NEW-244: a draft would replace a reviewed or fixed-up part version."""
 
 
 def _strictly_reviewed(version: dict[str, Any]) -> bool:
@@ -115,7 +120,12 @@ def _derived_from_review(entry: dict[str, Any], version: dict[str, Any]) -> bool
         return False
     try:
         replayed = apply_declaration_changes(base["content"], fixup["changes"])
+        # The same field-by-field restriction the fix-up was recorded under: only
+        # declarations (and dependency-only amendments) may differ from the reviewed base.
+        _changes, refusals = declaration_changes(base["content"], replayed)
     except (ValueError, TypeError, AttributeError, KeyError):
+        return False
+    if refusals:
         return False
     digest = part_content_sha256(content)
     return part_content_sha256(replayed) == digest and digest == str(version["content_sha256"])
@@ -1121,6 +1131,16 @@ class BacklogDecompositionRepository:
                 raise ValueError("only a DRAFTING decomposition records part drafts")
             parts = copy.deepcopy(dict(row.parts_json or {}))
             entry = self._part_entry(parts, part_id, kind, number)
+            # NEW-244: a draft never replaces a reviewed or fixed-up version (only its own
+            # unreviewed retry), so an attempt number is never reused.
+            if any(
+                item.get("attempt") == attempt
+                and (isinstance(item.get("review"), dict) or "fixup" in item)
+                for item in entry["versions"]
+            ):
+                raise DecompositionPartConflictError(
+                    f"decomposition part attempt {attempt} is already reviewed"
+                )
             entry["versions"] = [
                 item for item in entry["versions"] if item.get("attempt") != attempt
             ] + [
@@ -1131,7 +1151,9 @@ class BacklogDecompositionRepository:
                     **({"normalized": list(normalized)} if normalized else {}),
                 }
             ]
-            if entry.get("approved_attempt") is not None and entry["approved_attempt"] < attempt:
+            # A new draft of an approved part withdraws the approval (NEW-244: also one at
+            # the approved attempt's number, which the check above already refuses).
+            if entry.get("approved_attempt") is not None and entry["approved_attempt"] <= attempt:
                 entry["approved_attempt"] = None
             row.parts_json = parts
             return digest
@@ -1429,7 +1451,25 @@ class BacklogDecompositionRepository:
                 raise ValueError("only a DRAFTING decomposition records a fix-up")
             parts = copy.deepcopy(dict(row.parts_json or {}))
             entry = (parts.get("parts") or {}).get(part_id)
-            if not isinstance(entry, dict) or entry.get("approved_attempt") != base_attempt:
+            if not isinstance(entry, dict):
+                raise ValueError("the fix-up's base is not the part's approved version")
+            recorded = [
+                item
+                for item in entry.get("versions") or []
+                if item.get("attempt") == attempt and isinstance(item.get("fixup"), dict)
+            ]
+            if (
+                recorded
+                and entry.get("approved_attempt") == attempt
+                and (entry.get("fixup") or {}).get("status") == "APPLIED"
+                and recorded[0]["fixup"].get("base_attempt") == base_attempt
+                and recorded[0]["content_sha256"] == digest
+                and recorded[0]["fixup"].get("changes") == changes
+                and _derived_from_review(entry, recorded[0])
+            ):
+                # Idempotent: a retry of the recorded fix-up (its completion was lost).
+                return digest
+            if entry.get("approved_attempt") != base_attempt:
                 raise ValueError("the fix-up's base is not the part's approved version")
             if isinstance(entry.get("fixup"), dict) or any(
                 "fixup" in item for item in entry.get("versions") or []

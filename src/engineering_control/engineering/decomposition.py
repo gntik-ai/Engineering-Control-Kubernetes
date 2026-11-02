@@ -1513,6 +1513,19 @@ def _non_dependency_changes(amendment: Any) -> list[Any]:
     ]
 
 
+def amendment_change_allowed(before: Any, after: Any) -> bool:
+    """Whether a fix-up may change a story amendment from `before` to `after`: its changes
+    outside the dependencies section stay exactly the same (shared by the diff that records
+    a fix-up and the replay that verifies one)."""
+    if after is not None and not isinstance(after, Mapping):
+        return False
+    if after is not None and any(
+        not isinstance(change, Mapping) for change in after.get("changes") or []
+    ):
+        return False
+    return _non_dependency_changes(before) == _non_dependency_changes(after)
+
+
 def declaration_changes(
     base: Mapping[str, Any], fixed: Mapping[str, Any]
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1562,7 +1575,7 @@ def declaration_changes(
             ]
         before, after = story.get("story_amendment"), other.get("story_amendment")
         if before != after:
-            if _non_dependency_changes(before) != _non_dependency_changes(after):
+            if not amendment_change_allowed(before, after):
                 refusals.append(f"{story_id}: the story amendment changes outside dependencies")
             else:
                 changes.append(
@@ -1602,6 +1615,12 @@ def apply_declaration_changes(
             story = stories.get(str(change["story"]))
             if story is None:
                 raise ValueError(f"a fix-up change names unknown story {change['story']}")
+            # The replay keeps the recording restriction: a story amendment may change only
+            # in its dependencies section.
+            if not amendment_change_allowed(story.get("story_amendment"), change["value"]):
+                raise ValueError(
+                    f"a fix-up change edits story {change['story']} outside its dependencies"
+                )
             story["story_amendment"] = copy.deepcopy(change["value"])
         else:
             raise ValueError("a fix-up change is not a declaration change")
