@@ -63,6 +63,8 @@ class CleanupInspectionOutcomeTests(IsolatedAsyncioTestCase):
             instance = CleanupWorkflow()
             with (
                 patch.object(instance, "_step", side_effect=step),
+                # NEW-245: the legacy (unpaged) path's command contract.
+                patch.object(instance, "_paged_cleanup_patched", return_value=False),
                 patch(
                     "engineering_control.workflows.definitions.workflow.patched",
                     # Merged with main: the dry run also consults main's NEW-85 marker,

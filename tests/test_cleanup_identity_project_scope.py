@@ -277,6 +277,8 @@ async def _run_scripted(
     instance = CleanupWorkflow()
     with (
         patch.object(instance, "_step", side_effect=step),
+        # NEW-245: these scripts exercise the legacy (unpaged) path step by step.
+        patch.object(instance, "_paged_cleanup_patched", return_value=False),
         patch("engineering_control.workflows.definitions.workflow.patched", return_value=True),
     ):
         result = await instance.run(CleanupInput(dry_run=dry_run))
@@ -863,6 +865,21 @@ class _PreScopeCleanupWorkflow(CleanupWorkflow):
     def _identity_project_scope_patched(self) -> bool:
         return False
 
+    def _paged_cleanup_patched(self) -> bool:
+        return False
+
+
+@workflow.defn(name="CleanupWorkflow", sandboxed=False)
+class _PrePagedCleanupWorkflow(CleanupWorkflow):
+    """CleanupWorkflow exactly as it ran before NEW-245's cleanup-paged-candidates-v1."""
+
+    @workflow.run
+    async def run(self, request: CleanupInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _paged_cleanup_patched(self) -> bool:
+        return False
+
 
 async def _run_to_history(workflow_cls: type, fixture: Fixture) -> tuple[Any, dict]:
     @activity.defn(name="execute_control_step")
@@ -917,7 +934,8 @@ def _has_marker(history: Any, name: str) -> bool:
 
 @requires_temporal
 async def test_new_history_is_partial_and_replays() -> None:
-    history, result = await _run_to_history(CleanupWorkflow, Fixture(MUSEMATIC_BLOCKED))
+    # NEW-245: the unpaged history; the paged one is covered in test_new_245_*.
+    history, result = await _run_to_history(_PrePagedCleanupWorkflow, Fixture(MUSEMATIC_BLOCKED))
 
     assert result["status"] == "PARTIAL"
     assert result["blocked_projects"] == MUSEMATIC_BLOCKED

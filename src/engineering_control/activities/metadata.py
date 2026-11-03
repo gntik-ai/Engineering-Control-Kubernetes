@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.cleanup_store import CleanupPagingSteps
 from engineering_control.activities.retention import (
     FileCleanupCandidate,
     PreviewNamespaceCleanupCandidate,
@@ -176,6 +177,7 @@ from engineering_control.security.redaction import (
     bounded_detail,
     redact_detail_text,
 )
+from engineering_control.workflows.cleanup_paging import CLEANUP_STORE_MODE
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
     CLEANUP_IDENTITY_BLOCKED_SUMMARY,
@@ -497,7 +499,7 @@ def _untrusted_block(label: str, content: str) -> str:
     )
 
 
-class MetadataActivityHandler:
+class MetadataActivityHandler(CleanupPagingSteps):
     """Controller-side authoritative metadata writes for idempotent activity results."""
 
     _provider_request_keys = {
@@ -598,6 +600,11 @@ class MetadataActivityHandler:
             "cleanup.authorize",
             "cleanup.execute_metadata",
             "cleanup.finalize",
+            # NEW-245: the paged cleanup's controller steps (stored candidate lists).
+            "cleanup.stored",
+            "cleanup.page",
+            "cleanup.decide_orphan_worktrees",
+            "cleanup.record_orphan_worktrees",
             "quota.persist",
             "observability.register",
             "observability.prepare_codex",
@@ -820,7 +827,17 @@ class MetadataActivityHandler:
             if step == "recovery.record_failure":
                 return await asyncio.to_thread(self._record_recovery_failure, payload)
             if step == "cleanup.discover":
+                if payload.get("cleanup_store_mode") == CLEANUP_STORE_MODE:
+                    return await asyncio.to_thread(self._discover_cleanup_stored, payload)
                 return await asyncio.to_thread(self._discover_cleanup, payload)
+            if step == "cleanup.stored":
+                return await asyncio.to_thread(self._cleanup_stored, payload)
+            if step == "cleanup.page":
+                return await asyncio.to_thread(self._cleanup_page, payload)
+            if step == "cleanup.decide_orphan_worktrees":
+                return await asyncio.to_thread(self._decide_orphan_worktrees, payload)
+            if step == "cleanup.record_orphan_worktrees":
+                return await asyncio.to_thread(self._record_orphan_worktrees, payload)
             if step == "cleanup.authorize":
                 return await asyncio.to_thread(self._authorize_cleanup, payload)
             if step == "cleanup.execute_metadata":
