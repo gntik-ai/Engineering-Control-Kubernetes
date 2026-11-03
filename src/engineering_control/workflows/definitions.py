@@ -734,6 +734,7 @@ class ControlledWorkflow:
             "cleanup.prune_orphan_worktrees",
             "cleanup.list_orphan_worktrees",
             "cleanup.apply_orphan_worktrees",
+            "cleanup.resolve_worktree_paths",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
             "ui.inventory",
@@ -2498,12 +2499,37 @@ class CleanupWorkflow(ControlledWorkflow):
         page and records its outcome. Stages run from ``plan``; at a page boundary a long
         run continues as new from the same position.
         """
-        resume = dict(request.resume or {})
+        resume: dict[str, Any] = {}
+        self._cleanup_dry_run = request.dry_run
+        if request.resume is not None:
+            # Only this workflow's own continue-as-new may resume, and the position, mode
+            # and context come from the controller's checkpoint, never from the request.
+            continued = self._continued_run_id()
+            token = request.resume.get("checkpoint") if isinstance(request.resume, dict) else None
+            if (
+                continued is None
+                or not isinstance(token, dict)
+                or set(request.resume) != {"checkpoint"}
+            ):
+                raise ApplicationError(
+                    "a cleanup resume is accepted only from its own continue-as-new",
+                    type="CleanupResumeRefused",
+                    non_retryable=True,
+                )
+            resumed = await self._step(
+                "cleanup.resume",
+                {"cleanup_checkpoint": token, "cleanup_continued_run_id": continued},
+            )
+            resume = dict(resumed["cleanup_resume_state"])
+            self._cleanup_dry_run = resumed["dry_run"] is not False
         self._cleanup_state: dict[str, Any] = {
             "plan": list(resume.get("plan") or _PAGED_CLEANUP_DISCOVERY),
             "context": dict(
                 resume.get("context")
-                or {"dry_run": request.dry_run, "retention_policy": request.retention_policy}
+                or {
+                    "dry_run": self._cleanup_dry_run,
+                    "retention_policy": request.retention_policy,
+                }
             ),
             "blocked_projects": dict(resume.get("blocked_projects") or {}),
             "cursor": dict(resume.get("cursor") or {}),
@@ -2541,6 +2567,9 @@ class CleanupWorkflow(ControlledWorkflow):
             state["context"] = await self._step(
                 "cleanup.discover", {**context, "cleanup_store_mode": CLEANUP_STORE_MODE}
             )
+        elif stage == "resolve_protected":
+            if workflow.patched("cleanup-orphan-worktrees-v1"):
+                await self._paged_cleanup_phase(stage, request)
         elif stage in CLEANUP_PHASES:
             if CLEANUP_PHASES[stage].executes:
                 state["context"] = {**context, "dry_run": False}
@@ -2572,8 +2601,8 @@ class CleanupWorkflow(ControlledWorkflow):
                 assert scope is not None
                 state["context"] = scope
                 state["blocked_projects"] = blocked_projects = dict(outcome["blocked_projects"])
-            if request.dry_run:
-                state["plan"].extend(["orphans", "finalize"])
+            if self._cleanup_dry_run:
+                state["plan"].extend(["resolve_protected", "orphans", "finalize"])
             else:
                 state["plan"].extend(
                     [
@@ -2586,6 +2615,7 @@ class CleanupWorkflow(ControlledWorkflow):
                         "execute_codex",
                         "execute_preview",
                         "execute_worktrees",
+                        "resolve_protected",
                         "orphans",
                         "execute_metadata",
                         "finalize",
@@ -2640,7 +2670,11 @@ class CleanupWorkflow(ControlledWorkflow):
             )
         elif stage == "finalize":
             terminal = (
-                "DRY_RUN" if request.dry_run else "PARTIAL" if blocked_projects else "COMPLETE"
+                "DRY_RUN"
+                if self._cleanup_dry_run
+                else "PARTIAL"
+                if blocked_projects
+                else "COMPLETE"
             )
             context = await self._stored_cleanup(
                 "cleanup.finalize", {**context, "terminal_status": terminal}
@@ -2671,6 +2705,7 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup_phase": name,
                     "cleanup_page": page,
                     "cleanup_page_outcome": outcome,
+                    "cleanup_authorization_sha256": context.get("cleanup_authorization_sha256"),
                 },
             )
             if loaded.get("cleanup_page_done") is True:
@@ -2682,7 +2717,7 @@ class CleanupWorkflow(ControlledWorkflow):
             }
             page += 1
             state["cursor"] = {"page": page, "outcome": outcome}
-            self._continue_paged_cleanup_if_long(request)
+            await self._continue_paged_cleanup_if_long(request)
 
     async def _paged_orphan_worktrees(self, request: CleanupInput) -> None:
         """The worker lists orphans, the controller decides, the worker prunes approved."""
@@ -2694,7 +2729,7 @@ class CleanupWorkflow(ControlledWorkflow):
         context = state["context"]
         reference = context.get(CLEANUP_STORE_KEY)
         excluded = context.get("cleanup_identity_blocked_repositories", [])
-        dry_run = request.dry_run  # as the legacy call's explicit dry_run
+        dry_run = self._cleanup_dry_run  # as the legacy call's explicit dry_run
         while removed < CLEANUP_ORPHAN_REMOVAL_LIMIT:
             listed = await self._step(
                 "cleanup.list_orphan_worktrees",
@@ -2711,7 +2746,7 @@ class CleanupWorkflow(ControlledWorkflow):
                     "dry_run": dry_run,
                     "cleanup_identity_blocked_repositories": excluded,
                     "orphan_listing": listed.get("orphan_listing", []),
-                    "orphan_removed_count": removed,
+                    "orphan_page": page,
                 },
             )
             if decided.get("orphan_approved_count"):
@@ -2733,7 +2768,7 @@ class CleanupWorkflow(ControlledWorkflow):
             if listing_cursor is None:
                 return
             state["cursor"] = {"orphan_cursor": listing_cursor, "page": page, "removed": removed}
-            self._continue_paged_cleanup_if_long(request)
+            await self._continue_paged_cleanup_if_long(request)
 
     def _paged_cleanup_history_long(self) -> bool:
         info = workflow.info()
@@ -2743,15 +2778,27 @@ class CleanupWorkflow(ControlledWorkflow):
             or info.get_current_history_size() > CLEANUP_HISTORY_BYTES
         )
 
-    def _continue_paged_cleanup_if_long(self, request: CleanupInput) -> None:
-        if self._paged_cleanup_history_long():
-            workflow.continue_as_new(
-                CleanupInput(
-                    dry_run=request.dry_run,
-                    retention_policy=request.retention_policy,
-                    resume=dict(self._cleanup_state),
-                )
+    def _continued_run_id(self) -> str | None:
+        return workflow.info().continued_run_id
+
+    async def _continue_paged_cleanup_if_long(self, request: CleanupInput) -> None:
+        if not self._paged_cleanup_history_long():
+            return
+        # The controller keeps the position; the next run carries only its reference.
+        checkpoint = await self._step(
+            "cleanup.checkpoint",
+            {
+                CLEANUP_STORE_KEY: self._cleanup_state["context"].get(CLEANUP_STORE_KEY),
+                "cleanup_checkpoint_state": dict(self._cleanup_state),
+            },
+        )
+        workflow.continue_as_new(
+            CleanupInput(
+                dry_run=self._cleanup_dry_run,
+                retention_policy=request.retention_policy,
+                resume={"checkpoint": checkpoint["cleanup_checkpoint"]},
             )
+        )
 
 
 # NEW-245: the paged run's opening stages; "scope" appends the rest (as the legacy branches).

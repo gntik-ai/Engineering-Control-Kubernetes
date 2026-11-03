@@ -5,20 +5,25 @@ from the stored lists and call the same discovery, authorization, metadata execu
 finalization and identity scoping code; the worker steps run unchanged on one page at a
 time (each page carries its own authorization digest, computed exactly as the full one).
 Only orphan pruning is inverted, because the worker cannot hold the protected path set:
-it lists orphan candidates, the controller decides each against the stored protections,
-and the worker removes exactly the approved paths.
+the worker resolves the protected paths, lists orphan candidates, the controller decides
+each one exactly as prune_orphan_worktrees did, and the worker removes exactly the
+approved paths of a page the controller bound to this workflow.
+
+Each discovery attempt stores an immutable generation of lists; the workflow carries the
+accepted generation, so a superseded (timed-out) attempt can never replace what it uses.
 """
 
 from __future__ import annotations
 
-import os
+import hashlib
+import json
+import re
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
-from pathlib import PurePosixPath
+from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
@@ -31,6 +36,7 @@ from engineering_control.workflows.cleanup_paging import (
     CLEANUP_PHASES,
     CLEANUP_STORE_KEY,
     CLEANUP_STORE_MODE,
+    orphan_apply_sha256,
 )
 from engineering_control.workflows.cleanup_scope import (
     rescope_after_recovery,
@@ -66,6 +72,7 @@ CLEANUP_STORED_LISTS = frozenset(
         "cleaned_preview_deployment_ids",
         "orphan_worktrees",
         "orphan_worktrees_kept",
+        "resolved_protected_paths",
     }
 )
 CLEANUP_STORED_MAPS = frozenset({"file_cleanup_candidate_projects"})
@@ -79,7 +86,38 @@ _STORED_INNER = frozenset(
         "cleanup.rescope_identity",
     }
 )
+# The protection lists orphan pruning needs; a missing one fails closed, never empty.
+_PROTECTION_KEYS = (
+    "leased_worktree_paths",
+    "cleanup_candidates",
+    "eligible_candidates",
+    "protected_candidates",
+)
 _PAGES = "pages:"
+_META = "meta"
+_CHECKPOINT = "checkpoint"
+_RESOLVED_COMPLETE = "resolved_protected_complete"
+_GENERATION = re.compile(r"[0-9a-f]{16}")
+_AUTHORIZED = (
+    "authorized_candidates",
+    "authorized_file_candidates",
+    "authorized_component_lease_candidates",
+    "authorized_preview_namespace_candidates",
+)
+
+
+@dataclass(frozen=True)
+class CleanupStore:
+    """One discovery generation of one cleanup Run's stored lists."""
+
+    run_id: UUID
+    generation: str
+
+    def name(self, key: str) -> str:
+        return f"{self.generation}/{key}"
+
+    def reference(self, **extra: Any) -> dict[str, Any]:
+        return {"run_id": str(self.run_id), "generation": self.generation, **extra}
 
 
 def split_cleanup_context(context: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -89,13 +127,19 @@ def split_cleanup_context(context: dict[str, Any]) -> tuple[dict[str, Any], dict
     return small, stored
 
 
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
 def _chunks(items: list[Any], size: int) -> list[list[Any]]:
     # An empty list is still one (empty) chunk: the key stays present, as in the context.
     return [items[start : start + size] for start in range(0, len(items), size)] or [[]]
 
 
 def save_cleanup_lists(
-    session: Session, run_id: UUID, values: dict[str, Any], *, chunk: int
+    session: Session, store: CleanupStore, values: dict[str, Any], *, chunk: int
 ) -> None:
     """Replace each named list (or map) with ``values``' contents, in chunks."""
     for key, value in values.items():
@@ -107,69 +151,88 @@ def save_cleanup_lists(
             items = value
         else:
             raise ValueError(f"stored cleanup list {key} is invalid")
-        session.execute(
-            delete(CleanupRunItem).where(
-                CleanupRunItem.run_id == run_id, CleanupRunItem.list_name == key
-            )
-        )
+        _delete_key(session, store, key)
         for ordinal, part in enumerate(_chunks(items, chunk)):
             session.add(
-                CleanupRunItem(run_id=run_id, list_name=key, ordinal=ordinal, items_json=part)
+                CleanupRunItem(
+                    run_id=store.run_id, list_name=store.name(key), ordinal=ordinal, items_json=part
+                )
             )
     session.flush()
 
 
 def save_cleanup_chunk(
-    session: Session, run_id: UUID, key: str, ordinal: int, items: list[Any]
+    session: Session, store: CleanupStore, key: str, ordinal: int, items: list[Any]
 ) -> None:
     """Upsert one chunk; a retried page rewrites its own chunk, never appends."""
     row = session.scalar(
         select(CleanupRunItem).where(
-            CleanupRunItem.run_id == run_id,
-            CleanupRunItem.list_name == key,
+            CleanupRunItem.run_id == store.run_id,
+            CleanupRunItem.list_name == store.name(key),
             CleanupRunItem.ordinal == ordinal,
         )
     )
     if row is None:
-        session.add(CleanupRunItem(run_id=run_id, list_name=key, ordinal=ordinal, items_json=items))
+        session.add(
+            CleanupRunItem(
+                run_id=store.run_id, list_name=store.name(key), ordinal=ordinal, items_json=items
+            )
+        )
     else:
         row.items_json = items
     session.flush()
 
 
 def load_cleanup_lists(
-    session: Session, run_id: UUID, keys: Iterable[str] = CLEANUP_STORED_KEYS
+    session: Session, store: CleanupStore, keys: Iterable[str] = CLEANUP_STORED_KEYS
 ) -> dict[str, Any]:
-    wanted = sorted(set(keys))
+    names = {store.name(key): key for key in set(keys)}
     values: dict[str, Any] = {}
     rows = session.execute(
         select(CleanupRunItem.list_name, CleanupRunItem.items_json)
-        .where(CleanupRunItem.run_id == run_id, CleanupRunItem.list_name.in_(wanted))
+        .where(CleanupRunItem.run_id == store.run_id, CleanupRunItem.list_name.in_(sorted(names)))
         .order_by(CleanupRunItem.list_name, CleanupRunItem.ordinal)
     )
-    for key, items in rows:
-        values.setdefault(str(key), []).extend(items)
+    for name, items in rows:
+        values.setdefault(names[str(name)], []).extend(items)
     for key in CLEANUP_STORED_MAPS & set(values):
         values[key] = {str(name): item for name, item in values[key]}
     return values
 
 
-def _chunk_count(session: Session, run_id: UUID, key: str) -> int:
+def _required_lists(session: Session, store: CleanupStore, keys: Iterable[str]) -> dict[str, Any]:
+    wanted = list(keys)
+    values = load_cleanup_lists(session, store, wanted)
+    missing = [key for key in wanted if not isinstance(values.get(key), list)]
+    if missing:
+        raise ValueError(f"stored cleanup lists are missing: {', '.join(sorted(missing))}")
+    return values
+
+
+def _delete_key(session: Session, store: CleanupStore, key: str) -> None:
+    session.execute(
+        delete(CleanupRunItem).where(
+            CleanupRunItem.run_id == store.run_id, CleanupRunItem.list_name == store.name(key)
+        )
+    )
+
+
+def _chunk_count(session: Session, store: CleanupStore, key: str) -> int:
     return int(
         session.scalar(
             select(func.count(CleanupRunItem.id)).where(
-                CleanupRunItem.run_id == run_id, CleanupRunItem.list_name == key
+                CleanupRunItem.run_id == store.run_id, CleanupRunItem.list_name == store.name(key)
             )
         )
         or 0
     )
 
 
-def _load_chunk(session: Session, run_id: UUID, key: str, ordinal: int) -> list[Any]:
+def _load_chunk(session: Session, store: CleanupStore, key: str, ordinal: int) -> list[Any]:
     items = session.scalar(
         select(CleanupRunItem.items_json).where(
-            CleanupRunItem.run_id == run_id,
-            CleanupRunItem.list_name == key,
+            CleanupRunItem.run_id == store.run_id,
+            CleanupRunItem.list_name == store.name(key),
             CleanupRunItem.ordinal == ordinal,
         )
     )
@@ -182,6 +245,18 @@ def _strings(value: Any, label: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{label} are invalid")
     return value
+
+
+def _protected_paths(stored: dict[str, Any]) -> list[str]:
+    """The paths cleanup.prune_orphan_worktrees excluded (leased and every candidate)."""
+    paths = set(_strings(stored["leased_worktree_paths"], "leased worktree paths"))
+    for key in ("cleanup_candidates", "eligible_candidates", "protected_candidates"):
+        for record in stored[key]:
+            path = record.get("worktree_path") if isinstance(record, dict) else None
+            if not isinstance(path, str) or not path:
+                raise ValueError("cleanup worktree record lacks its path")
+            paths.add(path)
+    return sorted(paths)
 
 
 class CleanupPagingSteps:
@@ -203,41 +278,84 @@ class CleanupPagingSteps:
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
-    def _cleanup_store_run(self, session: Session, payload: dict[str, Any]) -> UUID:
-        """The stored lists' cleanup Run, bound to this workflow."""
+    @staticmethod
+    def _orchestration(payload: dict[str, Any], key: str = "workflow_id") -> str:
+        value = payload.get("orchestration", {}).get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"cleanup orchestration {key} is missing")
+        return value
+
+    def _cleanup_run_finished(self, session: Session, payload: dict[str, Any]) -> bool:
         reference = payload.get(CLEANUP_STORE_KEY)
-        workflow_id = payload.get("orchestration", {}).get("workflow_id")
-        if not isinstance(reference, dict) or not isinstance(workflow_id, str):
+        run = (
+            session.get(Run, UUID(str(reference.get("run_id"))))
+            if isinstance(reference, dict)
+            else None
+        )
+        return (
+            run is not None
+            and run.workflow_id == self._orchestration(payload)
+            and run.finished_at is not None
+        )
+
+    def _cleanup_store(
+        self, session: Session, reference: Any, payload: dict[str, Any]
+    ) -> tuple[CleanupStore, dict[str, Any]]:
+        """The accepted generation of this workflow's live cleanup Run, and its mode."""
+        if (
+            not isinstance(reference, dict)
+            or not isinstance(reference.get("generation"), str)
+            or not _GENERATION.fullmatch(reference["generation"])
+        ):
             raise ValueError("cleanup store reference is missing")
         run = session.get(Run, UUID(str(reference.get("run_id"))))
-        if run is None or run.workflow_id != workflow_id:
+        if run is None or run.workflow_id != self._orchestration(payload):
             raise ValueError("cleanup store reference does not belong to this workflow")
-        return run.id
+        if run.finished_at is not None:
+            raise ValueError("cleanup store reference belongs to a finished run")
+        store = CleanupStore(run.id, reference["generation"])
+        meta = session.scalar(
+            select(CleanupRunItem.items_json).where(
+                CleanupRunItem.run_id == run.id,
+                CleanupRunItem.list_name == store.name(_META),
+                CleanupRunItem.ordinal == 0,
+            )
+        )
+        if not isinstance(meta, list) or len(meta) != 1 or not isinstance(meta[0], dict):
+            raise ValueError("cleanup store generation is unknown")
+        return store, meta[0]
 
     def _discover_cleanup_stored(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # A fresh discovery takes no lists, store reference or resume state from its input.
+        if set(payload) & (CLEANUP_STORED_KEYS | {CLEANUP_STORE_KEY, "resume"}):
+            raise ValueError("cleanup discovery input carries stored cleanup state")
         result = self._discover_cleanup(payload)
         small, stored = split_cleanup_context(result)
-        workflow_id = str(payload["orchestration"]["workflow_id"])
+        workflow_id = self._orchestration(payload)
         with self.sessions.begin() as session:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
                 raise ValueError("cleanup discovery Run is missing")
-            # Lists left by a run that finished, or that never reached finalization.
-            cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
+            # Only lists of finished runs are swept; a live run's lists are never touched.
             session.execute(
                 delete(CleanupRunItem).where(
                     CleanupRunItem.run_id != run.id,
-                    or_(
-                        CleanupRunItem.run_id.in_(
-                            select(Run.id).where(Run.finished_at.is_not(None))
-                        ),
-                        CleanupRunItem.created_at < cutoff,
-                    ),
+                    CleanupRunItem.run_id.in_(select(Run.id).where(Run.finished_at.is_not(None))),
                 )
             )
-            save_cleanup_lists(session, run.id, stored, chunk=self.settings.cleanup_page_size)
+            # Each attempt writes its own immutable generation.
+            store = CleanupStore(run.id, uuid4().hex[:16])
+            save_cleanup_lists(session, store, stored, chunk=self.settings.cleanup_page_size)
+            session.add(
+                CleanupRunItem(
+                    run_id=run.id,
+                    list_name=store.name(_META),
+                    ordinal=0,
+                    items_json=[{"dry_run": payload.get("dry_run") is not False}],
+                )
+            )
             counts = {key: len(value) for key, value in sorted(stored.items())}
-            return {**small, CLEANUP_STORE_KEY: {"run_id": str(run.id), "counts": counts}}
+            return {**small, CLEANUP_STORE_KEY: store.reference(counts=counts)}
 
     def _cleanup_stored(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run one legacy controller step over the context rebuilt from storage."""
@@ -248,13 +366,22 @@ class CleanupPagingSteps:
         if set(small) & CLEANUP_STORED_KEYS:
             raise ValueError("a stored cleanup list was carried in the workflow context")
         if CLEANUP_STORE_KEY not in small:
-            # Discovery failed before storing anything: finalize the run as it stands.
-            if inner != "cleanup.finalize":
+            # Discovery failed before storing anything: only a blocked finalization.
+            if inner != "cleanup.finalize" or small.get("terminal_status") != "BLOCKED":
                 raise ValueError("cleanup store reference is missing")
             return self._finalize_cleanup(small)
         with self.sessions() as session:
-            run_id = self._cleanup_store_run(session, small)
-            hydrated = {**small, **load_cleanup_lists(session, run_id)}
+            if inner == "cleanup.finalize" and self._cleanup_run_finished(session, small):
+                # A retried finalization: the run is final and its lists are gone, so the
+                # legacy step answers from the Run alone, as it always has.
+                return self._finalize_cleanup(small)
+            store, meta = self._cleanup_store(session, small[CLEANUP_STORE_KEY], small)
+            if (
+                inner in {"cleanup.authorize", "cleanup.execute_metadata"}
+                and meta.get("dry_run") is not False
+            ):
+                raise ValueError("a dry-run cleanup cannot authorize or execute removals")
+            hydrated = {**small, **load_cleanup_lists(session, store)}
         extra: dict[str, Any] = {}
         if inner == "cleanup.authorize":
             result = self._authorize_cleanup(hydrated)
@@ -281,11 +408,39 @@ class CleanupPagingSteps:
         changed = {key: value for key, value in stored.items() if hydrated.get(key) is not value}
         with self.sessions.begin() as session:
             if inner == "cleanup.finalize":
-                session.execute(delete(CleanupRunItem).where(CleanupRunItem.run_id == run_id))
+                session.execute(delete(CleanupRunItem).where(CleanupRunItem.run_id == store.run_id))
             elif changed:
-                save_cleanup_lists(session, run_id, changed, chunk=self.settings.cleanup_page_size)
+                save_cleanup_lists(session, store, changed, chunk=self.settings.cleanup_page_size)
         small_result.pop("cleanup_scope_blocked_projects", None)
         return {**small_result, **extra}
+
+    def _phase_records(
+        self, session: Session, store: CleanupStore, name: str, payload: dict[str, Any]
+    ) -> list[Any]:
+        phase = CLEANUP_PHASES[name]
+        if name == "resolve_protected":
+            return _protected_paths(_required_lists(session, store, _PROTECTION_KEYS))
+        if phase.executes:
+            # Execution pages come only from the authorization the workflow accepted.
+            authorized = _required_lists(session, store, _AUTHORIZED)
+            expected = cleanup_authorization_sha256(
+                workflow_id=self._orchestration(payload),
+                worktrees=authorized["authorized_candidates"],
+                files=authorized["authorized_file_candidates"],
+                component_leases=authorized["authorized_component_lease_candidates"],
+                preview_namespaces=authorized["authorized_preview_namespace_candidates"],
+            )
+            if payload.get("cleanup_authorization_sha256") != expected:
+                raise ValueError("stored cleanup authorization does not match the accepted one")
+            records: list[Any] = authorized[phase.input_key]
+        else:
+            records = _required_lists(session, store, [phase.input_key])[phase.input_key]
+        return [
+            record
+            for record in records
+            if phase.worker is None
+            or (isinstance(record, dict) and record.get("worker") == phase.worker)
+        ]
 
     def _cleanup_page(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Record page k-1's worker outcome, then hand out page k of the phase's list."""
@@ -296,9 +451,11 @@ class CleanupPagingSteps:
             raise ValueError("cleanup page request is invalid")
         index = list(CLEANUP_PHASES).index(str(name))
         pages = f"{_PAGES}{name}"
-        workflow_id = str(payload["orchestration"]["workflow_id"])
+        workflow_id = self._orchestration(payload)
         with self.sessions.begin() as session:
-            run_id = self._cleanup_store_run(session, payload)
+            store, meta = self._cleanup_store(session, payload.get(CLEANUP_STORE_KEY), payload)
+            if phase.executes and meta.get("dry_run") is not False:
+                raise ValueError("a dry-run cleanup cannot execute removals")
             outcome = payload.get("cleanup_page_outcome")
             if outcome is not None:
                 values = outcome.get("values") if isinstance(outcome, dict) else None
@@ -311,44 +468,26 @@ class CleanupPagingSteps:
                     raise ValueError("cleanup page outcome does not match its page")
                 for key in phase.outputs:
                     save_cleanup_chunk(
-                        session, run_id, key, index * CLEANUP_PHASE_STRIDE + page - 1, values[key]
+                        session, store, key, index * CLEANUP_PHASE_STRIDE + page - 1, values[key]
                     )
             if page == 0:
-                records = load_cleanup_lists(session, run_id, [phase.input_key]).get(
-                    phase.input_key
-                )
-                if not isinstance(records, list):
-                    raise ValueError(f"cleanup phase input {phase.input_key} is missing")
-                selected = [
-                    record
-                    for record in records
-                    if phase.worker is None
-                    or (isinstance(record, dict) and record.get("worker") == phase.worker)
-                ]
+                selected = self._phase_records(session, store, str(name), payload)
                 save_cleanup_lists(
-                    session, run_id, {pages: selected}, chunk=self.settings.cleanup_page_size
+                    session, store, {pages: selected}, chunk=self.settings.cleanup_page_size
                 )
-            count = _chunk_count(session, run_id, pages)
+            count = _chunk_count(session, store, pages)
             if page >= count:
-                session.execute(
-                    delete(CleanupRunItem).where(
-                        CleanupRunItem.run_id == run_id, CleanupRunItem.list_name == pages
-                    )
-                )
+                if name == "resolve_protected":
+                    self._mark_resolved(session, store, pages)
+                _delete_key(session, store, pages)
                 return {"status": "CLEANUP_PHASE_COMPLETE", "cleanup_page_done": True}
-            items = _load_chunk(session, run_id, pages, page)
+            items = _load_chunk(session, store, pages, page)
         worker: dict[str, Any] = {
             "dry_run": False if phase.executes else payload.get("dry_run", True),
             phase.input_key: items,
         }
         if phase.executes:
-            lists = {
-                "authorized_candidates": [],
-                "authorized_file_candidates": [],
-                "authorized_component_lease_candidates": [],
-                "authorized_preview_namespace_candidates": [],
-                phase.input_key: items,
-            }
+            lists = {key: [] for key in _AUTHORIZED} | {phase.input_key: items}
             worker.update(lists)
             worker.update({key: [] for key in phase.outputs})
             # The page's own digest, computed as cleanup.authorize computes the full one.
@@ -369,47 +508,66 @@ class CleanupPagingSteps:
             "cleanup_page_outcome_keys": list(phase.outputs),
         }
 
+    @staticmethod
+    def _mark_resolved(session: Session, store: CleanupStore, pages: str) -> None:
+        """Record that every protected path was resolved (each page's outcome present)."""
+        index = list(CLEANUP_PHASES).index("resolve_protected")
+        expected = [
+            len(items)
+            for items in session.scalars(
+                select(CleanupRunItem.items_json)
+                .where(
+                    CleanupRunItem.run_id == store.run_id,
+                    CleanupRunItem.list_name == store.name(pages),
+                )
+                .order_by(CleanupRunItem.ordinal)
+            )
+        ]
+        resolved = {
+            int(ordinal) - index * CLEANUP_PHASE_STRIDE: len(items)
+            for ordinal, items in session.execute(
+                select(CleanupRunItem.ordinal, CleanupRunItem.items_json).where(
+                    CleanupRunItem.run_id == store.run_id,
+                    CleanupRunItem.list_name == store.name("resolved_protected_paths"),
+                )
+            )
+        }
+        if resolved != dict(enumerate(expected)):
+            raise ValueError("protected worktree paths were not all resolved")
+        save_cleanup_lists(session, store, {_RESOLVED_COMPLETE: [sum(expected)]}, chunk=1)
+
     def _decide_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Approve listed orphan directories against every stored protection."""
+        """Approve listed orphan directories exactly as prune_orphan_worktrees excluded."""
         listing = payload.get("orphan_listing")
+        page = payload.get("orphan_page")
         # The scan worker pages by its own cleanup_page_size (at most 1,000).
-        if not isinstance(listing, list) or len(listing) > 1_000:
+        if (
+            not isinstance(listing, list)
+            or len(listing) > 1_000
+            or not isinstance(page, int)
+            or page < 0
+        ):
             raise ValueError("orphan worktree listing is invalid")
-        excluded_repositories = set(
-            _strings(
-                payload.get("cleanup_identity_blocked_repositories", []),
-                "identity-blocked cleanup repositories",
+        excluded_repositories = sorted(
+            set(
+                _strings(
+                    payload.get("cleanup_identity_blocked_repositories", []),
+                    "identity-blocked cleanup repositories",
+                )
             )
         )
         with self.sessions() as session:
-            run_id = self._cleanup_store_run(session, payload)
-            stored = load_cleanup_lists(
-                session,
-                run_id,
-                [
-                    "leased_worktree_paths",
-                    "cleanup_candidates",
-                    "eligible_candidates",
-                    "protected_candidates",
-                ],
+            store, meta = self._cleanup_store(session, payload.get(CLEANUP_STORE_KEY), payload)
+            stored = _required_lists(
+                session, store, ["resolved_protected_paths", _RESOLVED_COMPLETE]
             )
-        # The same protected set cleanup.prune_orphan_worktrees built from the context.
-        protected_paths = set(
-            _strings(stored.get("leased_worktree_paths", []), "leased worktree paths")
-        )
-        for key in ("cleanup_candidates", "eligible_candidates", "protected_candidates"):
-            records = stored.get(key, [])
-            if not isinstance(records, list):
-                raise ValueError("cleanup worktree records are invalid")
-            for record in records:
-                path = record.get("worktree_path") if isinstance(record, dict) else None
-                if not isinstance(path, str) or not path:
-                    raise ValueError("cleanup worktree record lacks its path")
-                protected_paths.add(path)
-        # The worker resolved paths on its own host; matching also on <repository>/<id>
-        # only ever protects more, never less.
-        normalized = {os.path.normpath(path) for path in protected_paths}
-        identities = {PurePosixPath(path).parts[-2:] for path in normalized}
+            # The limit counts this run's recorded removals, never a workflow-supplied count.
+            removed = len(
+                load_cleanup_lists(session, store, ["orphan_worktrees"]).get("orphan_worktrees", [])
+            )
+        resolved = set(_strings(stored["resolved_protected_paths"], "resolved protected paths"))
+        if stored[_RESOLVED_COMPLETE] != [len(stored["resolved_protected_paths"])]:
+            raise ValueError("protected worktree paths were not all resolved")
         approved: list[dict[str, str]] = []
         for entry in listing:
             if not isinstance(entry, dict) or not all(
@@ -417,25 +575,28 @@ class CleanupPagingSteps:
                 for key in ("path", "resolved", "repository", "name", "modified_at")
             ):
                 raise ValueError("orphan worktree listing entry is invalid")
+            # As before: the target, or what it resolves to, is a resolved protected path.
             if (
                 entry["repository"] in excluded_repositories
-                or os.path.normpath(entry["path"]) in normalized
-                or os.path.normpath(entry["resolved"]) in normalized
-                or (entry["repository"], entry["name"]) in identities
+                or entry["path"] in resolved
+                or entry["resolved"] in resolved
             ):
                 continue
             approved.append({key: entry[key] for key in ("path", "repository", "name")})
+        apply = {
+            CLEANUP_STORE_KEY: store.reference(),
+            "orphan_page": page,
+            # A dry-run cleanup's orphans are only ever reported.
+            "dry_run": payload.get("dry_run") is not False or meta.get("dry_run") is not False,
+            "cleanup_identity_blocked_repositories": excluded_repositories,
+            "orphan_approved": approved,
+            "orphan_limit": max(0, CLEANUP_ORPHAN_REMOVAL_LIMIT - removed),
+        }
+        apply["orphan_apply_sha256"] = orphan_apply_sha256(self._orchestration(payload), apply)
         return {
             "status": "ORPHAN_WORKTREES_DECIDED",
             "orphan_approved_count": len(approved),
-            "orphan_apply_payload": {
-                "dry_run": payload.get("dry_run", True),
-                "cleanup_identity_blocked_repositories": sorted(excluded_repositories),
-                "orphan_approved": approved,
-                "orphan_limit": max(
-                    0, CLEANUP_ORPHAN_REMOVAL_LIMIT - int(payload.get("orphan_removed_count", 0))
-                ),
-            },
+            "orphan_apply_payload": apply,
         }
 
     def _record_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -450,23 +611,101 @@ class CleanupPagingSteps:
         ):
             raise ValueError("orphan worktree outcome is invalid")
         with self.sessions.begin() as session:
-            run_id = self._cleanup_store_run(session, payload)
-            save_cleanup_chunk(session, run_id, "orphan_worktrees", page, removed)
+            store, _meta = self._cleanup_store(session, payload.get(CLEANUP_STORE_KEY), payload)
+            save_cleanup_chunk(session, store, "orphan_worktrees", page, removed)
             # As before, at most 50 kept (failed) orphans are reported; a retried page
             # counts only the other pages' entries.
             earlier = session.scalars(
                 select(CleanupRunItem.items_json).where(
-                    CleanupRunItem.run_id == run_id,
-                    CleanupRunItem.list_name == "orphan_worktrees_kept",
+                    CleanupRunItem.run_id == store.run_id,
+                    CleanupRunItem.list_name == store.name("orphan_worktrees_kept"),
                     CleanupRunItem.ordinal != page,
                 )
             ).all()
             room = max(0, CLEANUP_ORPHAN_KEPT_LIMIT - sum(len(items) for items in earlier))
-            save_cleanup_chunk(session, run_id, "orphan_worktrees_kept", page, kept[:room])
-            total = load_cleanup_lists(session, run_id, ["orphan_worktrees"]).get(
+            save_cleanup_chunk(session, store, "orphan_worktrees_kept", page, kept[:room])
+            total = load_cleanup_lists(session, store, ["orphan_worktrees"]).get(
                 "orphan_worktrees", []
             )
         return {"status": "ORPHAN_WORKTREES_RECORDED", "orphan_removed_count": len(total)}
+
+    def _checkpoint_sha256(
+        self, workflow_id: str, store: CleanupStore, ordinal: int, state: Any, dry_run: Any
+    ) -> str:
+        return _canonical_sha256(
+            {
+                "workflow_id": workflow_id,
+                "store": store.reference(),
+                "ordinal": ordinal,
+                "dry_run": dry_run,
+                "state": state,
+            }
+        )
+
+    def _checkpoint_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Store the paged run's position before it continues as new."""
+        state = payload.get("cleanup_checkpoint_state")
+        workflow_id = self._orchestration(payload)
+        writer = self._orchestration(payload, "workflow_run_id")
+        if not isinstance(state, dict) or not isinstance(state.get("context"), dict):
+            raise ValueError("cleanup checkpoint state is invalid")
+        if set(state["context"]) & CLEANUP_STORED_KEYS:
+            raise ValueError("a stored cleanup list was carried in the workflow context")
+        with self.sessions.begin() as session:
+            store, meta = self._cleanup_store(session, payload.get(CLEANUP_STORE_KEY), payload)
+            if state["context"].get(CLEANUP_STORE_KEY) != payload.get(CLEANUP_STORE_KEY):
+                raise ValueError("cleanup checkpoint names another store")
+            ordinal = _chunk_count(session, store, _CHECKPOINT)
+            digest = self._checkpoint_sha256(
+                workflow_id, store, ordinal, state, meta.get("dry_run")
+            )
+            record = {"state": state, "sha256": digest, "written_by": writer, "consumed_by": None}
+            save_cleanup_chunk(session, store, _CHECKPOINT, ordinal, [record])
+        return {
+            "status": "CLEANUP_CHECKPOINTED",
+            "cleanup_checkpoint": store.reference(ordinal=ordinal, sha256=digest),
+        }
+
+    def _resume_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Hand a continued run the position its own predecessor stored (once)."""
+        token = payload.get("cleanup_checkpoint")
+        continued = payload.get("cleanup_continued_run_id")
+        workflow_id = self._orchestration(payload)
+        reader = self._orchestration(payload, "workflow_run_id")
+        if not isinstance(token, dict) or not isinstance(continued, str) or not continued:
+            raise ValueError("cleanup resume is not a continuation")
+        ordinal = token.get("ordinal")
+        if not isinstance(ordinal, int) or ordinal < 0:
+            raise ValueError("cleanup checkpoint reference is invalid")
+        with self.sessions.begin() as session:
+            reference = {key: token.get(key) for key in ("run_id", "generation")}
+            store, meta = self._cleanup_store(session, reference, payload)
+            row = session.scalar(
+                select(CleanupRunItem).where(
+                    CleanupRunItem.run_id == store.run_id,
+                    CleanupRunItem.list_name == store.name(_CHECKPOINT),
+                    CleanupRunItem.ordinal == ordinal,
+                )
+            )
+            record = row.items_json[0] if row is not None and row.items_json else None
+            if row is None or not isinstance(record, dict):
+                raise ValueError("cleanup checkpoint is unknown")
+            digest = self._checkpoint_sha256(
+                workflow_id, store, ordinal, record.get("state"), meta.get("dry_run")
+            )
+            if (
+                record.get("sha256") != digest
+                or token.get("sha256") != digest
+                or record.get("written_by") != continued
+                or record.get("consumed_by") not in {None, reader}
+            ):
+                raise ValueError("cleanup checkpoint does not belong to this continuation")
+            row.items_json = [{**record, "consumed_by": reader}]
+        return {
+            "status": "CLEANUP_RESUMED",
+            "cleanup_resume_state": record["state"],
+            "dry_run": meta.get("dry_run") is not False,
+        }
 
 
 __all__ = [
@@ -474,6 +713,7 @@ __all__ = [
     "CLEANUP_STORE_MODE",
     "CLEANUP_STORED_KEYS",
     "CleanupPagingSteps",
+    "CleanupStore",
     "load_cleanup_lists",
     "save_cleanup_lists",
     "split_cleanup_context",

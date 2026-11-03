@@ -120,6 +120,7 @@ from engineering_control.projects import (
     SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
 )
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.workflows.cleanup_paging import orphan_apply_sha256
 from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.hardened_git import (
     SUBMODULES,
@@ -270,6 +271,7 @@ class ScanActivityHandler(DecompositionScanSteps):
             # NEW-245: orphan pruning inverted (list, controller decides, apply).
             "cleanup.list_orphan_worktrees",
             "cleanup.apply_orphan_worktrees",
+            "cleanup.resolve_worktree_paths",
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
@@ -400,6 +402,8 @@ class ScanActivityHandler(DecompositionScanSteps):
                 return await asyncio.to_thread(self._list_orphan_worktrees, payload)
             if step == "cleanup.apply_orphan_worktrees":
                 return await asyncio.to_thread(self._apply_orphan_worktrees, payload)
+            if step == "cleanup.resolve_worktree_paths":
+                return await asyncio.to_thread(self._resolve_worktree_paths, payload)
             if step == "reconcile.apply_promotion":
                 return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
@@ -883,8 +887,34 @@ class ScanActivityHandler(DecompositionScanSteps):
             "orphan_next_cursor": list(after) if after is not None else None,
         }
 
+    @staticmethod
+    def _resolve_worktree_paths(payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-245: resolve one page of protected paths on this host, as pruning always has."""
+        paths = payload.get("orphan_protected_paths")
+        if (
+            not isinstance(paths, list)
+            or len(paths) > 1_000
+            or not all(isinstance(path, str) and path for path in paths)
+        ):
+            raise ValueError("protected worktree paths are invalid")
+        return {
+            "status": "WORKTREE_PATHS_RESOLVED",
+            "resolved_protected_paths": [str(Path(path).resolve(strict=False)) for path in paths],
+        }
+
     def _apply_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-245: prune only the controller-approved orphans (dry-run reports only)."""
+        orchestration = self._find_mapping(payload, "orchestration")
+        workflow_id = orchestration.get("workflow_id") if orchestration is not None else None
+        # The controller bound this exact page to this workflow and its stored run.
+        if not isinstance(workflow_id, str) or payload.get(
+            "orphan_apply_sha256"
+        ) != orphan_apply_sha256(workflow_id, payload):
+            raise ApplicationError(
+                "orphan removal was not approved for this cleanup run",
+                type="SecurityBlocker",
+                non_retryable=True,
+            )
         dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
         cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
         approved = payload.get("orphan_approved")

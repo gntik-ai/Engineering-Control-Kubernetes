@@ -12,7 +12,6 @@ import json
 import os
 import shutil
 from collections.abc import Callable
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,7 @@ from unittest.mock import patch
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
-from sqlalchemy import func, insert, select
+from sqlalchemy import delete, func, insert, select
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
@@ -53,6 +52,7 @@ _SCAN_STEPS = {
     "cleanup.prune_orphan_worktrees",
     "cleanup.list_orphan_worktrees",
     "cleanup.apply_orphan_worktrees",
+    "cleanup.resolve_worktree_paths",
 }
 
 
@@ -112,6 +112,7 @@ class Seed:
         self.leases: list[dict[str, Any]] = []
         self.invocations: list[dict[str, Any]] = []
         self.directories: list[tuple[str, bool]] = []  # (relative path, recent)
+        self.aliases: list[tuple[str, str]] = []  # (relative symlink, relative target)
 
     def lease(
         self,
@@ -219,6 +220,8 @@ class Seed:
                     os.utime(path / "out.log", (old, old))
             if not recent:
                 os.utime(path, (old, old))
+        for link, target in self.aliases:
+            (root / link).symlink_to(root / target, target_is_directory=True)
         for directory in ("tmp/codex", "worktrees", "runs", "evidence/browser"):
             (root / directory).mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +232,7 @@ class Harness:
     def __init__(self, root: Path, settings: Settings, blockers: dict[str, str]) -> None:
         self.root = root
         self.workflow_id = f"cleanup-new-245-{uuid4()}"
+        self.workflow_run_id = str(uuid4())
         self.metadata = MetadataActivityHandler(settings)
         Base.metadata.create_all(self.metadata.engine)
         self.scan = ScanActivityHandler(settings)
@@ -282,7 +286,13 @@ class Harness:
         raise AssertionError(f"unrouted cleanup step {name}")
 
     async def step(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        payload = {**payload, "orchestration": {"workflow_id": self.workflow_id}}
+        payload = {
+            **payload,
+            "orchestration": {
+                "workflow_id": self.workflow_id,
+                "workflow_run_id": self.workflow_run_id,
+            },
+        }
         self.order.append(name)
         if name in self.metadata.supported_steps:
             result = await self.metadata.handle(name, payload)
@@ -385,6 +395,10 @@ async def _run_fixture(
     return harness, result
 
 
+def _is_dir(path: str) -> bool:
+    return Path(path).is_dir()
+
+
 def _mkdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -451,6 +465,16 @@ async def test_paged_cleanup_removes_and_protects_exactly_what_the_legacy_run_do
     assert len(blocked_orphans) == (0 if blockers else 1)
     # Paged: only references in the context, lists deleted at finalization.
     assert paged.stored_rows() == 0
+    # A retried finalization answers from the finished Run, as the legacy step does.
+    retried = await paged.step(
+        "cleanup.stored",
+        {
+            **paged_result["context"],
+            "terminal_status": expected,
+            "cleanup_inner": "cleanup.finalize",
+        },
+    )
+    assert retried["status"] == expected
     assert "cleanup_candidates" not in paged_result["context"]
     assert "cleanup.stored" in paged.order and "cleanup.authorize" not in paged.order
     legacy.metadata.engine.dispose()
@@ -485,29 +509,32 @@ async def test_resumed_run_after_continue_as_new_finishes_identically(tmp_path: 
     seed.install(tmp_path / "resumed", harness.metadata)
 
     class Continued(Exception):
-        def __init__(self, state: dict[str, Any]) -> None:
-            self.state = state
+        def __init__(self, request: CleanupInput) -> None:
+            self.request = request
 
-    resumes: list[dict[str, Any]] = []
-    calls = 0
+    def continue_as_new(request: CleanupInput) -> None:
+        raise Continued(request)
 
-    def continue_if_long(instance: CleanupWorkflow) -> Callable[[CleanupInput], None]:
-        def check(request: CleanupInput) -> None:
-            nonlocal calls
-            calls += 1
-            if calls % 4 == 0:  # continue as new at every fourth page boundary
-                raise Continued(json.loads(json.dumps(instance._cleanup_state)))
+    checks = 0
 
-        return check
+    def long_history() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks % 4 == 0  # continue as new at every fourth page boundary
 
     request = CleanupInput(dry_run=False)
+    previous: str | None = None
+    continuations = 0
     while True:
         instance = CleanupWorkflow()
         with (
             patch.object(instance, "_step", side_effect=harness.step),
             patch.object(instance, "_paged_cleanup_patched", return_value=True),
-            patch.object(
-                instance, "_continue_paged_cleanup_if_long", side_effect=continue_if_long(instance)
+            patch.object(instance, "_paged_cleanup_history_long", side_effect=long_history),
+            patch.object(instance, "_continued_run_id", return_value=previous),
+            patch(
+                "engineering_control.workflows.definitions.workflow.continue_as_new",
+                side_effect=continue_as_new,
             ),
             patch("engineering_control.workflows.definitions.workflow.patched", return_value=True),
         ):
@@ -515,10 +542,13 @@ async def test_resumed_run_after_continue_as_new_finishes_identically(tmp_path: 
                 result = await instance.run(request)
                 break
             except Continued as continued:
-                resumes.append(continued.state)
-                request = CleanupInput(dry_run=False, resume=deepcopy(continued.state))
+                continuations += 1
+                # Only the controller's checkpoint reference crosses the boundary.
+                assert set(continued.request.resume or {}) == {"checkpoint"}
+                request = continued.request
+                previous, harness.workflow_run_id = harness.workflow_run_id, str(uuid4())
 
-    assert len(resumes) >= 3
+    assert continuations >= 3
     assert result["status"] == straight_result["status"] == "COMPLETE"
     assert harness.effects == {
         key: values
@@ -622,58 +652,376 @@ def test_orphan_listing_and_removal_follow_the_controller_decision(tmp_path: Pat
     assert not snapshots[1].exists() and not snapshots[2].exists()
 
 
+async def _discover(harness: Harness, *, dry_run: bool = False) -> dict[str, Any]:
+    return await harness.step(
+        "cleanup.discover",
+        {"dry_run": dry_run, "retention_policy": "standard", "cleanup_store_mode": "paged-v1"},
+    )
+
+
+async def _phase(harness: Harness, context: dict[str, Any], name: str) -> None:
+    """Page one phase exactly as CleanupWorkflow._paged_cleanup_phase does."""
+    page, outcome = 0, None
+    while True:
+        loaded = await harness.step(
+            "cleanup.page",
+            {
+                "cleanup_store": context["cleanup_store"],
+                "dry_run": context.get("dry_run", True),
+                "cleanup_phase": name,
+                "cleanup_page": page,
+                "cleanup_page_outcome": outcome,
+                "cleanup_authorization_sha256": context.get("cleanup_authorization_sha256"),
+            },
+        )
+        if loaded["cleanup_page_done"]:
+            return
+        result = await harness.step(CLEANUP_PHASES[name].step, loaded["cleanup_page_payload"])
+        outcome = {
+            "page": page,
+            "values": {key: result[key] for key in loaded["cleanup_page_outcome_keys"]},
+        }
+        page += 1
+
+
+def _entry(root: Path, repository: str, name: str, resolved: str | None = None) -> dict[str, str]:
+    path = str(root / repository / name)
+    return {
+        "path": path,
+        "resolved": resolved or path,
+        "repository": repository,
+        "name": name,
+        "modified_at": OLD.isoformat(),
+    }
+
+
+async def _decide(
+    harness: Harness, context: dict[str, Any], listing: list[dict[str, str]], **extra: Any
+) -> dict[str, Any]:
+    return await harness.step(
+        "cleanup.decide_orphan_worktrees",
+        {
+            "cleanup_store": context["cleanup_store"],
+            "dry_run": False,
+            "cleanup_identity_blocked_repositories": ["musematic-deploy"],
+            "orphan_listing": listing,
+            "orphan_page": 0,
+            **extra,
+        },
+    )
+
+
 async def test_the_controller_rejects_tracked_and_protected_orphans(tmp_path: Path) -> None:
     seed = Seed()
     seed.lease("tracked-active", released=False)
     seed.lease("eligible")
-    settings = _settings(tmp_path, "decide.sqlite")
-    harness = Harness(tmp_path, settings, {})
+    harness = Harness(tmp_path, _settings(tmp_path, "decide.sqlite"), {})
     seed.install(tmp_path, harness.metadata)
-    discovered = await harness.step(
-        "cleanup.discover",
-        {"dry_run": True, "retention_policy": "standard", "cleanup_store_mode": "paged-v1"},
-    )
     root = (tmp_path / "worktrees").resolve()
+    context = await _discover(harness)
+    await _phase(harness, context, "protect")
+    await _phase(harness, context, "resolve_protected")
 
-    def entry(repository: str, name: str, resolved: str | None = None) -> dict[str, str]:
-        path = str(root / repository / name)
-        return {
-            "path": path,
-            "resolved": resolved or path,
-            "repository": repository,
-            "name": name,
-            "modified_at": OLD.isoformat(),
-        }
-
-    tracked = entry("falcone", str(_id("cs:tracked-active")))
-    candidate = entry("falcone", str(_id("cs:eligible")))
-    linked = entry("falcone", str(uuid4()), resolved=tracked["path"])
-    blocked = entry("musematic-deploy", str(uuid4()))
-    orphan = entry("falcone", str(uuid4()))
-    decided = await harness.step(
-        "cleanup.decide_orphan_worktrees",
-        {
-            "cleanup_store": discovered["cleanup_store"],
-            "dry_run": False,
-            "cleanup_identity_blocked_repositories": ["musematic-deploy"],
-            "orphan_listing": [tracked, candidate, linked, blocked, orphan],
-            "orphan_removed_count": 199,
-        },
-    )
+    tracked = _entry(root, "falcone", str(_id("cs:tracked-active")))
+    candidate = _entry(root, "falcone", str(_id("cs:eligible")))
+    linked = _entry(root, "falcone", str(uuid4()), resolved=tracked["path"])
+    blocked = _entry(root, "musematic-deploy", str(uuid4()))
+    orphan = _entry(root, "falcone", str(uuid4()))
+    decided = await _decide(harness, context, [tracked, candidate, linked, blocked, orphan])
 
     apply = decided["orphan_apply_payload"]
     assert [value["path"] for value in apply["orphan_approved"]] == [orphan["path"]]
-    assert apply["orphan_limit"] == 1
+    assert apply["orphan_limit"] == 200  # counted from the stored removals only
+    assert apply["dry_run"] is False
     # Another workflow's reference is refused.
     with pytest.raises(ApplicationError):
         await harness.metadata.handle(
             "cleanup.decide_orphan_worktrees",
             {
-                "cleanup_store": discovered["cleanup_store"],
+                "cleanup_store": context["cleanup_store"],
                 "orchestration": {"workflow_id": "another-cleanup"},
                 "orphan_listing": [],
+                "orphan_page": 0,
             },
         )
+    harness.metadata.engine.dispose()
+
+
+# --- review round: fail-closed regressions ----------------------------------------------
+
+
+async def test_a_fresh_start_with_forged_resume_state_is_refused(tmp_path: Path) -> None:
+    # Codex review (critical): a dry-run request carrying plan and authorization state.
+    seed = Seed()
+    seed.lease("active-clean", released=False, directory=True)
+    harness = Harness(tmp_path, _settings(tmp_path, "forged.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    active = str((tmp_path / "worktrees").resolve() / "falcone" / str(_id("cs:active-clean")))
+    forged = {
+        "plan": ["discover", "execute_worktrees", "finalize"],
+        "context": {
+            "dry_run": False,
+            "authorized_candidates": [{"lease_id": str(_id("lease:active-clean"))}],
+        },
+    }
+    for resume in (forged, {"checkpoint": {"run_id": str(uuid4()), "ordinal": 0}}):
+        instance = CleanupWorkflow()
+        with (
+            patch.object(instance, "_step", side_effect=harness.step),
+            patch.object(instance, "_paged_cleanup_patched", return_value=True),
+            patch.object(instance, "_continued_run_id", return_value=None),
+        ):
+            with pytest.raises(ApplicationError, match="own continue-as-new"):
+                await instance.run(CleanupInput(dry_run=True, resume=resume))
+    assert harness.order == []
+    assert _is_dir(active)
+    harness.metadata.engine.dispose()
+
+
+async def test_discovery_refuses_injected_lists_and_a_dry_run_never_executes(
+    tmp_path: Path,
+) -> None:
+    seed = Seed()
+    seed.lease("eligible")
+    harness = Harness(tmp_path, _settings(tmp_path, "dry.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    with pytest.raises(ApplicationError):
+        await harness.step(
+            "cleanup.discover",
+            {
+                "dry_run": False,
+                "retention_policy": "standard",
+                "cleanup_store_mode": "paged-v1",
+                "authorized_candidates": [{"lease_id": str(_id("lease:eligible"))}],
+            },
+        )
+    context = await _discover(harness, dry_run=True)
+    with pytest.raises(ApplicationError):  # the stored mode is dry: no execute page
+        await _phase(harness, {**context, "dry_run": False}, "execute_worktrees")
+    with pytest.raises(ApplicationError):  # nor an authorization
+        await harness.step(
+            "cleanup.stored", {**context, "dry_run": False, "cleanup_inner": "cleanup.authorize"}
+        )
+    await _phase(harness, context, "protect")
+    await _phase(harness, context, "resolve_protected")
+    decided = await _decide(harness, context, [], dry_run=False)
+    assert decided["orphan_apply_payload"]["dry_run"] is True
+    assert "cleanup.execute" not in harness.order
+    harness.metadata.engine.dispose()
+
+
+async def test_an_execute_page_needs_the_accepted_authorization(tmp_path: Path) -> None:
+    seed = Seed()
+    seed.lease("eligible")
+    harness = Harness(tmp_path, _settings(tmp_path, "digest.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    context = await _discover(harness)
+    await _phase(harness, context, "protect")
+    for name in ("inspect_evidence", "inspect_delivery", "inspect_browser", "inspect_codex"):
+        await _phase(harness, context, name)
+    await _phase(harness, context, "inspect_preview")
+    authorized = await harness.step(
+        "cleanup.stored", {**context, "dry_run": False, "cleanup_inner": "cleanup.authorize"}
+    )
+    with pytest.raises(ApplicationError):
+        await _phase(
+            harness, {**authorized, "cleanup_authorization_sha256": "0" * 64}, "execute_worktrees"
+        )
+    with pytest.raises(ApplicationError):
+        await _phase(
+            harness, {**authorized, "cleanup_authorization_sha256": None}, "execute_worktrees"
+        )
+    await _phase(harness, authorized, "execute_worktrees")
+    assert harness.effects["authorized_worktrees"] == {str(_id("lease:eligible"))}
+    harness.metadata.engine.dispose()
+
+
+async def test_a_resume_checkpoint_is_bound_to_its_own_continuation(tmp_path: Path) -> None:
+    seed = Seed()
+    seed.lease("eligible")
+    harness = Harness(tmp_path, _settings(tmp_path, "resume.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    context = await _discover(harness)
+    writer = harness.workflow_run_id
+    state = {"plan": ["protect", "scope"], "context": context, "blocked_projects": {}, "cursor": {}}
+    token = (
+        await harness.step(
+            "cleanup.checkpoint",
+            {"cleanup_store": context["cleanup_store"], "cleanup_checkpoint_state": state},
+        )
+    )["cleanup_checkpoint"]
+    harness.workflow_run_id = reader = str(uuid4())
+
+    async def resume(**changes: Any) -> dict[str, Any]:
+        payload = {"cleanup_checkpoint": token, "cleanup_continued_run_id": writer, **changes}
+        return await harness.step("cleanup.resume", payload)
+
+    for bad in (
+        {"cleanup_continued_run_id": str(uuid4())},  # not this checkpoint's writer
+        {"cleanup_checkpoint": {**token, "sha256": "0" * 64}},
+        {"cleanup_checkpoint": {**token, "generation": "0" * 16}},
+    ):
+        with pytest.raises(ApplicationError):
+            await resume(**bad)
+    resumed = await resume()
+    assert resumed["cleanup_resume_state"] == state and resumed["dry_run"] is False
+    assert (await resume())["cleanup_resume_state"] == state  # the same run's retry
+    harness.workflow_run_id = str(uuid4())
+    with pytest.raises(ApplicationError):  # already consumed by its continuation
+        await resume()
+    harness.workflow_run_id, original = reader, harness.workflow_id
+    harness.workflow_id = "another-cleanup"
+    with pytest.raises(ApplicationError):
+        await resume()
+    # A checkpoint never carries stored lists in its context.
+    harness.workflow_id = original
+    with pytest.raises(ApplicationError):
+        await harness.step(
+            "cleanup.checkpoint",
+            {
+                "cleanup_store": context["cleanup_store"],
+                "cleanup_checkpoint_state": {
+                    **state,
+                    "context": {**context, "cleanup_candidates": []},
+                },
+            },
+        )
+    harness.metadata.engine.dispose()
+
+
+async def test_the_sweep_keeps_a_live_runs_lists_and_missing_protections_fail_closed(
+    tmp_path: Path,
+) -> None:
+    seed = Seed()
+    seed.lease("eligible")
+    harness = Harness(tmp_path, _settings(tmp_path, "sweep.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    context = await _discover(harness)
+    first = harness.workflow_id
+    with harness.metadata.sessions.begin() as session:
+        for row in session.scalars(select(CleanupRunItem)):
+            row.created_at = OLD - timedelta(days=365)  # long past any retention
+    harness.workflow_id = f"cleanup-new-245-second-{uuid4()}"
+    second = await _discover(harness)
+    harness.workflow_id = first
+    await _phase(harness, context, "protect")  # the first, still running, reads its lists
+    # A missing protection list is an error, never an empty set.
+    with harness.metadata.sessions.begin() as session:
+        session.execute(
+            delete(CleanupRunItem).where(
+                CleanupRunItem.list_name
+                == f"{context['cleanup_store']['generation']}/leased_worktree_paths"
+            )
+        )
+    with pytest.raises(ApplicationError):
+        await _phase(harness, context, "resolve_protected")
+    with pytest.raises(ApplicationError):
+        await _decide(harness, context, [])
+    # Lists of a finished run are swept by the next discovery.
+    with harness.metadata.sessions.begin() as session:
+        run = session.scalar(select(Run).where(Run.workflow_id == first))
+        assert run is not None
+        run.finished_at = datetime.now(UTC)
+        run_id = run.id
+    harness.workflow_id = f"cleanup-new-245-third-{uuid4()}"
+    await _discover(harness)
+    with harness.metadata.sessions() as session:
+        runs = set(session.scalars(select(CleanupRunItem.run_id)))
+    assert run_id not in runs and UUID(second["cleanup_store"]["run_id"]) in runs
+    harness.metadata.engine.dispose()
+
+
+async def test_a_superseded_discovery_attempt_cannot_replace_the_accepted_lists(
+    tmp_path: Path,
+) -> None:
+    seed = Seed()
+    seed.lease("tracked-active", released=False)
+    harness = Harness(tmp_path, _settings(tmp_path, "generation.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    accepted = await _discover(harness)
+    # A timed-out attempt finishing late, after another lease appeared, writes its own
+    # generation; the accepted one is untouched.
+    late_seed = Seed()
+    late_seed.lease("late-active", released=False)
+    late_seed.install(tmp_path, harness.metadata)
+    late = await _discover(harness)
+    assert late["cleanup_store"]["generation"] != accepted["cleanup_store"]["generation"]
+    with harness.metadata.sessions() as session:
+        from engineering_control.activities.cleanup_store import CleanupStore, load_cleanup_lists
+
+        store = CleanupStore(
+            UUID(accepted["cleanup_store"]["run_id"]), accepted["cleanup_store"]["generation"]
+        )
+        paths = load_cleanup_lists(session, store, ["leased_worktree_paths"])
+    assert [Path(path).name for path in paths["leased_worktree_paths"]] == [
+        str(_id("cs:tracked-active"))
+    ]
+    forged = {**accepted["cleanup_store"], "generation": "f" * 16}
+    with pytest.raises(ApplicationError):
+        await _phase(harness, {**accepted, "cleanup_store": forged}, "protect")
+    harness.metadata.engine.dispose()
+
+
+async def test_a_symlinked_protected_path_keeps_its_target_as_the_legacy_run_did(
+    tmp_path: Path,
+) -> None:
+    # Codex review: protected /worktrees/falcone/A -> detached worktree B; B must be kept.
+    seed = Seed()
+    seed.lease("aliased-active", released=False)
+    seed.orphan("falcone", "alias-target")
+    seed.orphan("falcone", "plain")
+    seed.aliases.append(
+        (
+            f"worktrees/falcone/{_id('cs:aliased-active')}",
+            f"worktrees/falcone/{_id('orphan:alias-target')}",
+        )
+    )
+    results = {}
+    for paged in (False, True):
+        root = tmp_path / ("paged" if paged else "legacy")
+        harness, result = await _run_fixture(root, seed, paged=paged, blockers={})
+        assert result["status"] == "COMPLETE"
+        results[paged] = _relative(root, harness.effects.get("orphans_kept", set()))
+        harness.metadata.engine.dispose()
+    target = f"worktrees/falcone/{_id('orphan:alias-target')}"
+    assert results[True] == results[False] == {f"worktrees/falcone/{_id('orphan:plain')}"}
+    assert target not in results[True]
+
+
+async def test_an_orphan_apply_page_is_bound_to_its_run_and_exact_paths(tmp_path: Path) -> None:
+    seed = Seed()
+    seed.orphan("falcone", "approved")
+    seed.orphan("falcone", "extra")
+    harness = Harness(tmp_path, _settings(tmp_path, "apply.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    root = (tmp_path / "worktrees").resolve()
+    context = await _discover(harness)
+    await _phase(harness, context, "protect")
+    await _phase(harness, context, "resolve_protected")
+    approved = _entry(root, "falcone", str(_id("orphan:approved")))
+    apply = (await _decide(harness, context, [approved]))["orphan_apply_payload"]
+    extra = {
+        "path": str(root / "falcone" / str(_id("orphan:extra"))),
+        "repository": "falcone",
+        "name": str(_id("orphan:extra")),
+    }
+    for tampered in (
+        {**apply, "orphan_approved": [*apply["orphan_approved"], extra]},
+        {**apply, "orphan_limit": 1_000},
+        {**apply, "dry_run": not apply["dry_run"]},
+    ):
+        with pytest.raises(ApplicationError):
+            await harness.step("cleanup.apply_orphan_worktrees", tampered)
+    original = harness.workflow_id
+    harness.workflow_id = "another-cleanup"  # replayed under another cleanup run
+    with pytest.raises(ApplicationError):
+        await harness.step("cleanup.apply_orphan_worktrees", apply)
+    harness.workflow_id = original
+    applied = await harness.step("cleanup.apply_orphan_worktrees", apply)
+    assert [Path(item["path"]).name for item in applied["orphan_worktrees_kept"]] == [
+        str(_id("orphan:approved"))
+    ]
+    assert (root / "falcone" / str(_id("orphan:extra"))).is_dir()
     harness.metadata.engine.dispose()
 
 

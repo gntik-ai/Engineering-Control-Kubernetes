@@ -605,6 +605,8 @@ class MetadataActivityHandler(CleanupPagingSteps):
             "cleanup.page",
             "cleanup.decide_orphan_worktrees",
             "cleanup.record_orphan_worktrees",
+            "cleanup.checkpoint",
+            "cleanup.resume",
             "quota.persist",
             "observability.register",
             "observability.prepare_codex",
@@ -838,6 +840,10 @@ class MetadataActivityHandler(CleanupPagingSteps):
                 return await asyncio.to_thread(self._decide_orphan_worktrees, payload)
             if step == "cleanup.record_orphan_worktrees":
                 return await asyncio.to_thread(self._record_orphan_worktrees, payload)
+            if step == "cleanup.checkpoint":
+                return await asyncio.to_thread(self._checkpoint_cleanup, payload)
+            if step == "cleanup.resume":
+                return await asyncio.to_thread(self._resume_cleanup, payload)
             if step == "cleanup.authorize":
                 return await asyncio.to_thread(self._authorize_cleanup, payload)
             if step == "cleanup.execute_metadata":

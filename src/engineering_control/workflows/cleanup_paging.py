@@ -10,7 +10,10 @@ controller records the page's outcome. Imported by the workflow, so data only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
+from typing import Any
 
 CLEANUP_PAGED_PATCH = "cleanup-paged-candidates-v1"
 CLEANUP_STORE_MODE = "paged-v1"
@@ -100,5 +103,30 @@ CLEANUP_PHASES: dict[str, CleanupPhase] = {
         ("removed_lease_ids", "already_absent_lease_ids", "protected_cleanup_candidates"),
         executes=True,
     ),
+    # Orphan pruning's protected set (every leased and candidate path), resolved on the
+    # scan worker exactly as prune_orphan_worktrees resolved it (symlink aliases).
+    "resolve_protected": CleanupPhase(
+        "cleanup.resolve_worktree_paths",
+        "orphan_protected_paths",
+        ("resolved_protected_paths",),
+    ),
 }
 CLEANUP_PHASE_STRIDE = 1_000_000
+
+
+def orphan_apply_sha256(workflow_id: str, payload: dict[str, Any]) -> str:
+    """The controller's binding of one orphan-removal page to its workflow and store."""
+    canonical = json.dumps(
+        {
+            "workflow_id": workflow_id,
+            "store": payload.get(CLEANUP_STORE_KEY),
+            "page": payload.get("orphan_page"),
+            "dry_run": payload.get("dry_run"),
+            "limit": payload.get("orphan_limit"),
+            "excluded": payload.get("cleanup_identity_blocked_repositories"),
+            "approved": payload.get("orphan_approved"),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
