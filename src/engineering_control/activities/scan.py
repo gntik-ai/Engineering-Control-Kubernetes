@@ -120,7 +120,11 @@ from engineering_control.projects import (
     SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
 )
 from engineering_control.security.redaction import SecretRedactor
-from engineering_control.workflows.cleanup_paging import orphan_apply_sha256
+from engineering_control.workflows.cleanup_paging import (
+    CLEANUP_ORPHAN_HOST_MISMATCH,
+    CLEANUP_ORPHAN_HOST_UNKNOWN,
+    orphan_apply_sha256,
+)
 from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.hardened_git import (
     SUBMODULES,
@@ -138,6 +142,8 @@ from engineering_control.worktrees.manager import (
 )
 
 _T = TypeVar("_T")
+# NEW-245: the stable host identity the orphan-pruning phase is bound to.
+MACHINE_ID_PATH = Path("/etc/machine-id")
 _TOOLCHAIN_STDERR_TAIL = 2000
 # Final review: no platform dependency resolution under a pinned Rust/Go toolchain.
 DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN = "DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN"
@@ -883,12 +889,33 @@ class ScanActivityHandler(DecompositionScanSteps):
         )
         return {
             "status": "ORPHAN_WORKTREES_LISTED",
+            "orphan_host": self._orphan_host(),
             "orphan_listing": listed,
             "orphan_next_cursor": list(after) if after is not None else None,
         }
 
-    @staticmethod
-    def _resolve_worktree_paths(payload: dict[str, Any]) -> dict[str, Any]:
+    def _orphan_host(self) -> dict[str, str]:
+        """NEW-245: this host's identity, so the orphan phase stays on one filesystem."""
+        try:
+            machine_id = MACHINE_ID_PATH.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ApplicationError(
+                "this scan worker's machine identity is unreadable",
+                type=CLEANUP_ORPHAN_HOST_UNKNOWN,
+                non_retryable=True,
+            ) from error
+        if not re.fullmatch(r"[0-9a-f]{32}", machine_id):
+            raise ApplicationError(
+                "this scan worker's machine identity is invalid",
+                type=CLEANUP_ORPHAN_HOST_UNKNOWN,
+                non_retryable=True,
+            )
+        return {
+            "machine_id": machine_id,
+            "worktree_root": str(self.settings.worktree_root.resolve()),
+        }
+
+    def _resolve_worktree_paths(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-245: resolve one page of protected paths on this host, as pruning always has."""
         paths = payload.get("orphan_protected_paths")
         if (
@@ -899,6 +926,7 @@ class ScanActivityHandler(DecompositionScanSteps):
             raise ValueError("protected worktree paths are invalid")
         return {
             "status": "WORKTREE_PATHS_RESOLVED",
+            "orphan_host": self._orphan_host(),
             "resolved_protected_paths": [str(Path(path).resolve(strict=False)) for path in paths],
         }
 
@@ -913,6 +941,14 @@ class ScanActivityHandler(DecompositionScanSteps):
             raise ApplicationError(
                 "orphan removal was not approved for this cleanup run",
                 type="SecurityBlocker",
+                non_retryable=True,
+            )
+        # ... on the very host that resolved the protected paths and listed these orphans.
+        host = self._orphan_host()
+        if payload.get("orphan_host") != host:
+            raise ApplicationError(
+                "orphan removal was approved for another scan host",
+                type=CLEANUP_ORPHAN_HOST_MISMATCH,
                 non_retryable=True,
             )
         dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
@@ -935,6 +971,7 @@ class ScanActivityHandler(DecompositionScanSteps):
         )
         return {
             "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",
+            "orphan_host": host,
             "orphan_worktrees": result["removed"],
             "orphan_worktrees_kept": result["kept"],
         }

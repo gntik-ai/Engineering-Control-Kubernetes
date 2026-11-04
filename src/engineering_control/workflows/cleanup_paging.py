@@ -25,6 +25,10 @@ CLEANUP_HISTORY_BYTES = 16 * 1024 * 1024
 # Orphan removals per run, as GitWorktreeManager.prune_orphan_worktrees(limit=200).
 CLEANUP_ORPHAN_REMOVAL_LIMIT = 200
 CLEANUP_ORPHAN_KEPT_LIMIT = 50
+# The orphan phase (resolve, list, apply) must see one filesystem: every scan-side step
+# reports its host (machine id and real worktree root), and any other host blocks the run.
+CLEANUP_ORPHAN_HOST_MISMATCH = "CLEANUP_ORPHAN_HOST_MISMATCH"
+CLEANUP_ORPHAN_HOST_UNKNOWN = "CLEANUP_ORPHAN_HOST_UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,8 @@ class CleanupPhase:
     # Only records for this worker kind are paged (the worker skips the others anyway).
     worker: str | None = None
     executes: bool = False
+    # Its worker reports ``orphan_host``; the controller binds the phase to that host.
+    reports_host: bool = False
 
 
 _FILE_INSPECTION = ("inspected_file_candidates",)
@@ -109,6 +115,7 @@ CLEANUP_PHASES: dict[str, CleanupPhase] = {
         "cleanup.resolve_worktree_paths",
         "orphan_protected_paths",
         ("resolved_protected_paths",),
+        reports_host=True,
     ),
 }
 CLEANUP_PHASE_STRIDE = 1_000_000
@@ -121,6 +128,7 @@ def orphan_apply_sha256(workflow_id: str, payload: dict[str, Any]) -> str:
             "workflow_id": workflow_id,
             "store": payload.get(CLEANUP_STORE_KEY),
             "page": payload.get("orphan_page"),
+            "host": payload.get("orphan_host"),
             "dry_run": payload.get("dry_run"),
             "limit": payload.get("orphan_limit"),
             "excluded": payload.get("cleanup_identity_blocked_repositories"),

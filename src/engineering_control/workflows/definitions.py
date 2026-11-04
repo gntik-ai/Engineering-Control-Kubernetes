@@ -17,6 +17,8 @@ from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from engineering_control.workflows.cleanup_paging import (
     CLEANUP_HISTORY_BYTES,
     CLEANUP_HISTORY_EVENTS,
+    CLEANUP_ORPHAN_HOST_MISMATCH,
+    CLEANUP_ORPHAN_HOST_UNKNOWN,
     CLEANUP_ORPHAN_REMOVAL_LIMIT,
     CLEANUP_PAGED_PATCH,
     CLEANUP_PHASES,
@@ -2543,14 +2545,18 @@ class CleanupWorkflow(ControlledWorkflow):
                 if result is not None:
                     return result
             raise ApplicationError("paged cleanup ended without finalization", non_retryable=True)
-        except ActivityError:
+        except ActivityError as error:
+            cause = error.cause
+            # The orphan phase crossed scan hosts (or one had no identity): say so.
+            blocker = (
+                cause.type
+                if isinstance(cause, ApplicationError)
+                and cause.type in {CLEANUP_ORPHAN_HOST_MISMATCH, CLEANUP_ORPHAN_HOST_UNKNOWN}
+                else "CLEANUP_ACTIVITY_FAILED"
+            )
             context = await self._stored_cleanup(
                 "cleanup.finalize",
-                {
-                    **state["context"],
-                    "terminal_status": "BLOCKED",
-                    "blocker": "CLEANUP_ACTIVITY_FAILED",
-                },
+                {**state["context"], "terminal_status": "BLOCKED", "blocker": blocker},
             )
             return {"status": "BLOCKED", "context": context}
 
@@ -2747,6 +2753,7 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup_identity_blocked_repositories": excluded,
                     "orphan_listing": listed.get("orphan_listing", []),
                     "orphan_page": page,
+                    "orphan_host": listed.get("orphan_host"),
                 },
             )
             if decided.get("orphan_approved_count"):
@@ -2758,6 +2765,7 @@ class CleanupWorkflow(ControlledWorkflow):
                     {
                         CLEANUP_STORE_KEY: reference,
                         "orphan_page": page,
+                        "orphan_host": applied.get("orphan_host"),
                         "orphan_worktrees": applied.get("orphan_worktrees", []),
                         "orphan_worktrees_kept": applied.get("orphan_worktrees_kept", []),
                     },

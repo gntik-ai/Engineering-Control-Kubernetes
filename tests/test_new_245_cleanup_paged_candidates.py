@@ -21,7 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pytest
 from sqlalchemy import delete, func, insert, select
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -233,6 +233,8 @@ class Harness:
         self.root = root
         self.workflow_id = f"cleanup-new-245-{uuid4()}"
         self.workflow_run_id = str(uuid4())
+        # As Temporal delivers it: a failed activity reaches the workflow as ActivityError.
+        self.wrap_errors = False
         self.metadata = MetadataActivityHandler(settings)
         Base.metadata.create_all(self.metadata.engine)
         self.scan = ScanActivityHandler(settings)
@@ -286,6 +288,22 @@ class Harness:
         raise AssertionError(f"unrouted cleanup step {name}")
 
     async def step(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.wrap_errors:
+            return await self._step(name, payload)
+        try:
+            return await self._step(name, payload)
+        except ApplicationError as error:
+            raise ActivityError(
+                str(error),
+                scheduled_event_id=0,
+                started_event_id=0,
+                identity="new-245-harness",
+                activity_type="execute_control_step",
+                activity_id=name,
+                retry_state=None,
+            ) from error
+
+    async def _step(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {
             **payload,
             "orchestration": {
@@ -706,6 +724,7 @@ async def _decide(
             "cleanup_identity_blocked_repositories": ["musematic-deploy"],
             "orphan_listing": listing,
             "orphan_page": 0,
+            "orphan_host": harness.scan._orphan_host(),
             **extra,
         },
     )
@@ -1023,6 +1042,156 @@ async def test_an_orphan_apply_page_is_bound_to_its_run_and_exact_paths(tmp_path
     ]
     assert (root / "falcone" / str(_id("orphan:extra"))).is_dir()
     harness.metadata.engine.dispose()
+
+
+# --- review round 2: one scan host for the orphan phase; resolve retry -----------------
+
+_HOST_A = {"machine_id": "a" * 32, "worktree_root": "/srv/engineering/worktrees"}
+_HOST_B = {"machine_id": "b" * 32, "worktree_root": "/srv/engineering/worktrees"}
+
+
+def _orphan_seed() -> Seed:
+    seed = Seed()
+    seed.lease("eligible")
+    seed.orphan("falcone", "one")
+    seed.orphan("falcone", "two")
+    return seed
+
+
+async def test_resolve_and_list_on_different_scan_hosts_block_the_run(tmp_path: Path) -> None:
+    # Codex review 2: worker A resolved the protected paths, worker B listed the orphans.
+    harness = Harness(tmp_path, _settings(tmp_path, "hosts.sqlite"), {})
+    _orphan_seed().install(tmp_path, harness.metadata)
+    harness.wrap_errors = True
+    route = {"current": ""}
+    original = harness._step
+
+    async def tracked(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        route["current"] = name
+        return await original(name, payload)
+
+    harness._step = tracked  # type: ignore[method-assign]
+    hosts = {"cleanup.resolve_worktree_paths": _HOST_A, "cleanup.list_orphan_worktrees": _HOST_B}
+    with patch.object(
+        harness.scan, "_orphan_host", side_effect=lambda: dict(hosts.get(route["current"], _HOST_A))
+    ):
+        result = await harness.run(paged=True)
+
+    assert result["status"] == "BLOCKED"
+    run = harness.cleanup_run()
+    assert (run.status, run.error_code) == ("BLOCKED", "CLEANUP_ORPHAN_HOST_MISMATCH")
+    assert "cleanup.apply_orphan_worktrees" not in harness.order
+    assert "orphans_kept" not in harness.effects and "orphans_removed" not in harness.effects
+    for name in ("one", "two"):
+        assert _is_dir(str(tmp_path / "worktrees" / "falcone" / str(_id(f"orphan:{name}"))))
+    harness.metadata.engine.dispose()
+
+
+async def test_an_unreadable_machine_id_blocks_orphan_pruning(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, _settings(tmp_path, "nomachine.sqlite"), {})
+    _orphan_seed().install(tmp_path, harness.metadata)
+    harness.wrap_errors = True
+    with patch("engineering_control.activities.scan.MACHINE_ID_PATH", tmp_path / "no-machine-id"):
+        result = await harness.run(paged=True)
+
+    assert result["status"] == "BLOCKED"
+    assert harness.cleanup_run().error_code == "CLEANUP_ORPHAN_HOST_UNKNOWN"
+    assert "cleanup.apply_orphan_worktrees" not in harness.order
+    assert "cleanup.list_orphan_worktrees" not in harness.order
+    harness.metadata.engine.dispose()
+
+
+async def test_an_orphan_page_approved_for_one_host_is_refused_on_another(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path, _settings(tmp_path, "applyhost.sqlite"), {})
+    _orphan_seed().install(tmp_path, harness.metadata)
+    root = (tmp_path / "worktrees").resolve()
+    context = await _discover(harness)
+    await _phase(harness, context, "protect")
+    await _phase(harness, context, "resolve_protected")
+    target = _entry(root, "falcone", str(_id("orphan:one")))
+    apply = (await _decide(harness, context, [target]))["orphan_apply_payload"]
+    assert apply["orphan_host"] == harness.scan._orphan_host()
+    # The listing from another host is refused, so is the signed page on another host.
+    with pytest.raises(ApplicationError, match="different scan hosts"):
+        await _decide(harness, context, [target], orphan_host=_HOST_B)
+    with patch.object(harness.scan, "_orphan_host", return_value=dict(_HOST_B)):
+        with pytest.raises(ApplicationError, match="another scan host"):
+            await harness.step("cleanup.apply_orphan_worktrees", apply)
+    # Re-pointing the page at that host breaks the controller's signature.
+    with patch.object(harness.scan, "_orphan_host", return_value=dict(_HOST_B)):
+        with pytest.raises(ApplicationError, match="not approved"):
+            await harness.step("cleanup.apply_orphan_worktrees", {**apply, "orphan_host": _HOST_B})
+    assert _is_dir(target["path"])
+    # The same host still applies the page (a non-Git directory is kept, not removed).
+    applied = await harness.step("cleanup.apply_orphan_worktrees", apply)
+    assert [item["path"] for item in applied["orphan_worktrees_kept"]] == [target["path"]]
+    with pytest.raises(ApplicationError, match="different scan hosts"):
+        await harness.step(
+            "cleanup.record_orphan_worktrees",
+            {
+                "cleanup_store": context["cleanup_store"],
+                "orphan_page": 0,
+                "orphan_host": _HOST_B,
+                "orphan_worktrees": [],
+                "orphan_worktrees_kept": [],
+            },
+        )
+    harness.metadata.engine.dispose()
+
+
+async def test_a_retried_resolve_completion_returns_its_recorded_result(tmp_path: Path) -> None:
+    # Codex review 2 (minor): the completion's response is lost and the call is retried.
+    seed = Seed()
+    for index in range(5):
+        seed.lease(f"eligible-{index}")
+    harness = Harness(tmp_path, _settings(tmp_path, "retry.sqlite"), {})
+    seed.install(tmp_path, harness.metadata)
+    context = await _discover(harness)
+    await _phase(harness, context, "protect")
+    page, outcome, last = 0, None, {}
+    while True:
+        last = {
+            "cleanup_store": context["cleanup_store"],
+            "dry_run": False,
+            "cleanup_phase": "resolve_protected",
+            "cleanup_page": page,
+            "cleanup_page_outcome": outcome,
+        }
+        loaded = await harness.step("cleanup.page", last)
+        if loaded["cleanup_page_done"]:
+            break
+        result = await harness.step(
+            "cleanup.resolve_worktree_paths", loaded["cleanup_page_payload"]
+        )
+        outcome = {
+            "page": page,
+            "values": {key: result[key] for key in loaded["cleanup_page_outcome_keys"]},
+        }
+        page += 1
+    assert page == 2  # five paths, pages of three
+
+    retried = await harness.step("cleanup.page", last)
+    assert retried["cleanup_page_done"] is True
+    decided = await _decide(harness, context, [])
+    assert decided["orphan_approved_count"] == 0
+    # A retry whose resolved set no longer matches the recorded completion still fails.
+    with harness.metadata.sessions.begin() as session:
+        session.execute(
+            delete(CleanupRunItem).where(
+                CleanupRunItem.list_name
+                == f"{context['cleanup_store']['generation']}/resolved_protected_paths",
+                CleanupRunItem.ordinal != _resolve_base(),
+            )
+        )
+    with pytest.raises(ApplicationError):
+        await harness.step("cleanup.page", {**last, "cleanup_page_outcome": None})
+    harness.metadata.engine.dispose()
+
+
+def _resolve_base() -> int:
+    return list(CLEANUP_PHASES).index("resolve_protected") * 1_000_000
 
 
 @pytest.mark.parametrize("worker", ["controller", "codex", "browser", "delivery", "release"])

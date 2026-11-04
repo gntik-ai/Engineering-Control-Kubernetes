@@ -25,11 +25,14 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
+from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.config import Settings
 from engineering_control.db.models import CleanupRunItem, Run
 from engineering_control.workflows.cleanup_paging import (
+    CLEANUP_ORPHAN_HOST_MISMATCH,
+    CLEANUP_ORPHAN_HOST_UNKNOWN,
     CLEANUP_ORPHAN_KEPT_LIMIT,
     CLEANUP_ORPHAN_REMOVAL_LIMIT,
     CLEANUP_PHASE_STRIDE,
@@ -97,6 +100,8 @@ _PAGES = "pages:"
 _META = "meta"
 _CHECKPOINT = "checkpoint"
 _RESOLVED_COMPLETE = "resolved_protected_complete"
+_ORPHAN_HOST = "orphan_host"
+_MACHINE_ID = re.compile(r"[0-9a-f]{32}")
 _GENERATION = re.compile(r"[0-9a-f]{16}")
 _AUTHORIZED = (
     "authorized_candidates",
@@ -245,6 +250,48 @@ def _strings(value: Any, label: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{label} are invalid")
     return value
+
+
+def _orphan_host(value: Any) -> dict[str, str]:
+    """A scan worker's reported host identity; anything else blocks the run."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"machine_id", "worktree_root"}
+        or not isinstance(value["machine_id"], str)
+        or not _MACHINE_ID.fullmatch(value["machine_id"])
+        or not isinstance(value["worktree_root"], str)
+        or not value["worktree_root"].startswith("/")
+    ):
+        raise ApplicationError(
+            "a scan worker reported no usable host identity for orphan pruning",
+            type=CLEANUP_ORPHAN_HOST_UNKNOWN,
+            non_retryable=True,
+        )
+    return {"machine_id": value["machine_id"], "worktree_root": value["worktree_root"]}
+
+
+def _bind_orphan_host(
+    session: Session, store: CleanupStore, reported: Any, *, first: bool = False
+) -> dict[str, str]:
+    """The orphan phase's one host: set by the first resolve page, then only compared."""
+    host = _orphan_host(reported)
+    stored = load_cleanup_lists(session, store, [_ORPHAN_HOST]).get(_ORPHAN_HOST)
+    if not stored:
+        if not first:
+            raise ApplicationError(
+                "orphan pruning has no resolved host for this cleanup run",
+                type=CLEANUP_ORPHAN_HOST_MISMATCH,
+                non_retryable=True,
+            )
+        save_cleanup_lists(session, store, {_ORPHAN_HOST: [host]}, chunk=1)
+        return host
+    if stored != [host]:
+        raise ApplicationError(
+            "orphan pruning steps ran on different scan hosts; nothing is approved",
+            type=CLEANUP_ORPHAN_HOST_MISMATCH,
+            non_retryable=True,
+        )
+    return host
 
 
 def _protected_paths(stored: dict[str, Any]) -> list[str]:
@@ -462,10 +509,12 @@ class CleanupPagingSteps:
                 if (
                     not isinstance(values, dict)
                     or outcome.get("page") != page - 1
-                    or set(values) != set(phase.outputs)
+                    or set(values) != set(self._outcome_keys(phase))
                     or not all(isinstance(values[key], list) for key in phase.outputs)
                 ):
                     raise ValueError("cleanup page outcome does not match its page")
+                if phase.reports_host:
+                    _bind_orphan_host(session, store, values[_ORPHAN_HOST], first=page == 1)
                 for key in phase.outputs:
                     save_cleanup_chunk(
                         session, store, key, index * CLEANUP_PHASE_STRIDE + page - 1, values[key]
@@ -478,7 +527,7 @@ class CleanupPagingSteps:
             count = _chunk_count(session, store, pages)
             if page >= count:
                 if name == "resolve_protected":
-                    self._mark_resolved(session, store, pages)
+                    self._mark_resolved(session, store, pages, count)
                 _delete_key(session, store, pages)
                 return {"status": "CLEANUP_PHASE_COMPLETE", "cleanup_page_done": True}
             items = _load_chunk(session, store, pages, page)
@@ -505,13 +554,28 @@ class CleanupPagingSteps:
             "cleanup_page_done": False,
             "cleanup_page_count": count,
             "cleanup_page_payload": worker,
-            "cleanup_page_outcome_keys": list(phase.outputs),
+            "cleanup_page_outcome_keys": self._outcome_keys(phase),
         }
 
     @staticmethod
-    def _mark_resolved(session: Session, store: CleanupStore, pages: str) -> None:
+    def _outcome_keys(phase: Any) -> list[str]:
+        return [*phase.outputs, *([_ORPHAN_HOST] if phase.reports_host else [])]
+
+    @staticmethod
+    def _mark_resolved(session: Session, store: CleanupStore, pages: str, count: int) -> None:
         """Record that every protected path was resolved (each page's outcome present)."""
         index = list(CLEANUP_PHASES).index("resolve_protected")
+        resolved_paths = load_cleanup_lists(session, store, ["resolved_protected_paths"]).get(
+            "resolved_protected_paths", []
+        )
+        marker = {"count": len(resolved_paths), "sha256": _canonical_sha256(resolved_paths)}
+        if count == 0:
+            # A retried completion (its response was lost): the pages are already gone and
+            # the recorded completion must match the resolved set exactly.
+            done = load_cleanup_lists(session, store, [_RESOLVED_COMPLETE]).get(_RESOLVED_COMPLETE)
+            if done != [marker]:
+                raise ValueError("protected worktree paths were not all resolved")
+            return
         expected = [
             len(items)
             for items in session.scalars(
@@ -532,9 +596,9 @@ class CleanupPagingSteps:
                 )
             )
         }
-        if resolved != dict(enumerate(expected)):
+        if resolved != dict(enumerate(expected)) or marker["count"] != sum(expected):
             raise ValueError("protected worktree paths were not all resolved")
-        save_cleanup_lists(session, store, {_RESOLVED_COMPLETE: [sum(expected)]}, chunk=1)
+        save_cleanup_lists(session, store, {_RESOLVED_COMPLETE: [marker]}, chunk=1)
 
     def _decide_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Approve listed orphan directories exactly as prune_orphan_worktrees excluded."""
@@ -561,12 +625,19 @@ class CleanupPagingSteps:
             stored = _required_lists(
                 session, store, ["resolved_protected_paths", _RESOLVED_COMPLETE]
             )
+            # The listing must come from the host that resolved the protected paths.
+            host = _bind_orphan_host(session, store, payload.get(_ORPHAN_HOST))
             # The limit counts this run's recorded removals, never a workflow-supplied count.
             removed = len(
                 load_cleanup_lists(session, store, ["orphan_worktrees"]).get("orphan_worktrees", [])
             )
         resolved = set(_strings(stored["resolved_protected_paths"], "resolved protected paths"))
-        if stored[_RESOLVED_COMPLETE] != [len(stored["resolved_protected_paths"])]:
+        if stored[_RESOLVED_COMPLETE] != [
+            {
+                "count": len(stored["resolved_protected_paths"]),
+                "sha256": _canonical_sha256(stored["resolved_protected_paths"]),
+            }
+        ]:
             raise ValueError("protected worktree paths were not all resolved")
         approved: list[dict[str, str]] = []
         for entry in listing:
@@ -586,6 +657,7 @@ class CleanupPagingSteps:
         apply = {
             CLEANUP_STORE_KEY: store.reference(),
             "orphan_page": page,
+            _ORPHAN_HOST: host,
             # A dry-run cleanup's orphans are only ever reported.
             "dry_run": payload.get("dry_run") is not False or meta.get("dry_run") is not False,
             "cleanup_identity_blocked_repositories": excluded_repositories,
@@ -612,6 +684,7 @@ class CleanupPagingSteps:
             raise ValueError("orphan worktree outcome is invalid")
         with self.sessions.begin() as session:
             store, _meta = self._cleanup_store(session, payload.get(CLEANUP_STORE_KEY), payload)
+            _bind_orphan_host(session, store, payload.get(_ORPHAN_HOST))
             save_cleanup_chunk(session, store, "orphan_worktrees", page, removed)
             # As before, at most 50 kept (failed) orphans are reported; a retried page
             # counts only the other pages' entries.
