@@ -177,7 +177,10 @@ from engineering_control.security.redaction import (
     bounded_detail,
     redact_detail_text,
 )
-from engineering_control.workflows.cleanup_paging import CLEANUP_STORE_MODE
+from engineering_control.workflows.cleanup_paging import (
+    CLEANUP_ORPHAN_PRUNING_SKIPPED,
+    CLEANUP_STORE_MODE,
+)
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
     CLEANUP_IDENTITY_BLOCKED_SUMMARY,
@@ -603,8 +606,6 @@ class MetadataActivityHandler(CleanupPagingSteps):
             # NEW-245: the paged cleanup's controller steps (stored candidate lists).
             "cleanup.stored",
             "cleanup.page",
-            "cleanup.decide_orphan_worktrees",
-            "cleanup.record_orphan_worktrees",
             "cleanup.checkpoint",
             "cleanup.resume",
             "quota.persist",
@@ -836,10 +837,6 @@ class MetadataActivityHandler(CleanupPagingSteps):
                 return await asyncio.to_thread(self._cleanup_stored, payload)
             if step == "cleanup.page":
                 return await asyncio.to_thread(self._cleanup_page, payload)
-            if step == "cleanup.decide_orphan_worktrees":
-                return await asyncio.to_thread(self._decide_orphan_worktrees, payload)
-            if step == "cleanup.record_orphan_worktrees":
-                return await asyncio.to_thread(self._record_orphan_worktrees, payload)
             if step == "cleanup.checkpoint":
                 return await asyncio.to_thread(self._checkpoint_cleanup, payload)
             if step == "cleanup.resume":
@@ -9182,6 +9179,13 @@ class MetadataActivityHandler(CleanupPagingSteps):
             "deleted_operation_export_count": deleted_operation_exports,
         }
 
+    @staticmethod
+    def _orphan_pruning_summary(summary: str, payload: dict[str, Any]) -> str:
+        # NEW-245: a paged run does not prune orphan worktrees; say so on the Run.
+        if payload.get("orphan_pruning") == CLEANUP_ORPHAN_PRUNING_SKIPPED:
+            return f"{summary}; orphan worktree pruning skipped (paged cleanup)"
+        return summary
+
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         terminal = str(payload.get("terminal_status", ""))
@@ -9321,6 +9325,7 @@ class MetadataActivityHandler(CleanupPagingSteps):
                     f"{len(authorized_component_ids)} component leases, "
                     f"{len(authorized_preview_ids)} preview namespaces"
                 )
+                run.summary = self._orphan_pruning_summary(run.summary, payload)
                 if protected_ids:
                     # The lease stays held and is re-authorized daily until an operator
                     # fixes the worktree; record which ones and why, durably on the Run.
@@ -9350,7 +9355,9 @@ class MetadataActivityHandler(CleanupPagingSteps):
                     )
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
-                run.summary = "cleanup dry run completed without mutation"
+                run.summary = self._orphan_pruning_summary(
+                    "cleanup dry run completed without mutation", payload
+                )
             else:
                 run.status = "BLOCKED"
                 run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))

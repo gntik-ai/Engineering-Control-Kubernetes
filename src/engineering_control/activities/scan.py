@@ -120,11 +120,6 @@ from engineering_control.projects import (
     SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS,
 )
 from engineering_control.security.redaction import SecretRedactor
-from engineering_control.workflows.cleanup_paging import (
-    CLEANUP_ORPHAN_HOST_MISMATCH,
-    CLEANUP_ORPHAN_HOST_UNKNOWN,
-    orphan_apply_sha256,
-)
 from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.hardened_git import (
     SUBMODULES,
@@ -142,8 +137,6 @@ from engineering_control.worktrees.manager import (
 )
 
 _T = TypeVar("_T")
-# NEW-245: the stable host identity the orphan-pruning phase is bound to.
-MACHINE_ID_PATH = Path("/etc/machine-id")
 _TOOLCHAIN_STDERR_TAIL = 2000
 # Final review: no platform dependency resolution under a pinned Rust/Go toolchain.
 DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN = "DEPENDENCY_RESOLUTION_UNSUPPORTED_FOR_TOOLCHAIN"
@@ -274,10 +267,6 @@ class ScanActivityHandler(DecompositionScanSteps):
             "cleanup.protect_active",
             "cleanup.execute",
             "cleanup.prune_orphan_worktrees",
-            # NEW-245: orphan pruning inverted (list, controller decides, apply).
-            "cleanup.list_orphan_worktrees",
-            "cleanup.apply_orphan_worktrees",
-            "cleanup.resolve_worktree_paths",
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
@@ -404,12 +393,6 @@ class ScanActivityHandler(DecompositionScanSteps):
                 return await asyncio.to_thread(self._execute_cleanup, payload)
             if step == "cleanup.prune_orphan_worktrees":
                 return await asyncio.to_thread(self._prune_orphan_worktrees, payload)
-            if step == "cleanup.list_orphan_worktrees":
-                return await asyncio.to_thread(self._list_orphan_worktrees, payload)
-            if step == "cleanup.apply_orphan_worktrees":
-                return await asyncio.to_thread(self._apply_orphan_worktrees, payload)
-            if step == "cleanup.resolve_worktree_paths":
-                return await asyncio.to_thread(self._resolve_worktree_paths, payload)
             if step == "reconcile.apply_promotion":
                 return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
@@ -862,118 +845,6 @@ class ScanActivityHandler(DecompositionScanSteps):
             "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",
             "orphan_worktrees": result["removed"][:200],
             "orphan_worktrees_kept": result["kept"][:50],
-        }
-
-    @staticmethod
-    def _orphan_excluded_repositories(payload: dict[str, Any]) -> frozenset[str]:
-        excluded = payload.get("cleanup_identity_blocked_repositories", [])
-        if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
-            raise ValueError("identity-blocked cleanup repositories are invalid")
-        return frozenset(excluded)
-
-    def _list_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """NEW-245: one page of orphan candidates; this worker never decides protection."""
-        cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
-        cursor = payload.get("orphan_cursor")
-        if cursor is not None and (
-            not isinstance(cursor, list)
-            or len(cursor) != 2
-            or not all(isinstance(item, str) for item in cursor)
-        ):
-            raise ValueError("orphan worktree cursor is invalid")
-        listed, after = self.manager.list_orphan_worktrees(
-            older_than=cutoff,
-            limit=self.settings.cleanup_page_size,
-            after=(cursor[0], cursor[1]) if cursor is not None else None,
-            excluded_repositories=self._orphan_excluded_repositories(payload),
-        )
-        return {
-            "status": "ORPHAN_WORKTREES_LISTED",
-            "orphan_host": self._orphan_host(),
-            "orphan_listing": listed,
-            "orphan_next_cursor": list(after) if after is not None else None,
-        }
-
-    def _orphan_host(self) -> dict[str, str]:
-        """NEW-245: this host's identity, so the orphan phase stays on one filesystem."""
-        try:
-            machine_id = MACHINE_ID_PATH.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeDecodeError) as error:
-            raise ApplicationError(
-                "this scan worker's machine identity is unreadable",
-                type=CLEANUP_ORPHAN_HOST_UNKNOWN,
-                non_retryable=True,
-            ) from error
-        if not re.fullmatch(r"[0-9a-f]{32}", machine_id):
-            raise ApplicationError(
-                "this scan worker's machine identity is invalid",
-                type=CLEANUP_ORPHAN_HOST_UNKNOWN,
-                non_retryable=True,
-            )
-        return {
-            "machine_id": machine_id,
-            "worktree_root": str(self.settings.worktree_root.resolve()),
-        }
-
-    def _resolve_worktree_paths(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """NEW-245: resolve one page of protected paths on this host, as pruning always has."""
-        paths = payload.get("orphan_protected_paths")
-        if (
-            not isinstance(paths, list)
-            or len(paths) > 1_000
-            or not all(isinstance(path, str) and path for path in paths)
-        ):
-            raise ValueError("protected worktree paths are invalid")
-        return {
-            "status": "WORKTREE_PATHS_RESOLVED",
-            "orphan_host": self._orphan_host(),
-            "resolved_protected_paths": [str(Path(path).resolve(strict=False)) for path in paths],
-        }
-
-    def _apply_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """NEW-245: prune only the controller-approved orphans (dry-run reports only)."""
-        orchestration = self._find_mapping(payload, "orchestration")
-        workflow_id = orchestration.get("workflow_id") if orchestration is not None else None
-        # The controller bound this exact page to this workflow and its stored run.
-        if not isinstance(workflow_id, str) or payload.get(
-            "orphan_apply_sha256"
-        ) != orphan_apply_sha256(workflow_id, payload):
-            raise ApplicationError(
-                "orphan removal was not approved for this cleanup run",
-                type="SecurityBlocker",
-                non_retryable=True,
-            )
-        # ... on the very host that resolved the protected paths and listed these orphans.
-        host = self._orphan_host()
-        if payload.get("orphan_host") != host:
-            raise ApplicationError(
-                "orphan removal was approved for another scan host",
-                type=CLEANUP_ORPHAN_HOST_MISMATCH,
-                non_retryable=True,
-            )
-        dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
-        cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
-        approved = payload.get("orphan_approved")
-        limit = payload.get("orphan_limit")
-        if (
-            not isinstance(approved, list)
-            or not all(isinstance(item, dict) for item in approved)
-            or not isinstance(limit, int)
-            or limit < 0
-        ):
-            raise ValueError("approved orphan worktrees are invalid")
-        result = self.manager.apply_orphan_worktrees(
-            approved,
-            older_than=cutoff,
-            dry_run=dry_run,
-            limit=limit,
-            excluded_repositories=self._orphan_excluded_repositories(payload),
-        )
-        return {
-            "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",
-            "orphan_host": host,
-            "orphan_worktrees": result["removed"],
-            "orphan_worktrees_kept": result["kept"],
         }
 
     def _runtime_deterministic_checks(self, payload: dict[str, Any]) -> dict[str, Any]:

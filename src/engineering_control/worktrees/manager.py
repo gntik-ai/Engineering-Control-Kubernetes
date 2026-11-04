@@ -1337,127 +1337,26 @@ class GitWorktreeManager:
                 modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
                 if modified > older_than:
                     continue
-                self._prune_orphan_target(
-                    slug, identity, target, modified, dry_run=dry_run, removed=removed, kept=kept
-                )
-        return {"removed": removed, "kept": kept}
-
-    def _prune_orphan_target(
-        self,
-        slug: str,
-        identity: UUID,
-        target: Path,
-        modified: datetime,
-        *,
-        dry_run: bool,
-        removed: list[dict[str, str]],
-        kept: list[dict[str, str]],
-    ) -> None:
-        record = {
-            "path": str(target),
-            "modified_at": modified.isoformat(),
-            "kind": "SNAPSHOT",
-        }
-        try:
-            if self._git(self._worktree_git(target), ["branch", "--show-current"]):
-                return  # a ChangeSet worktree: lease-based cleanup only
-            metadata = self.metadata_path(slug, identity)
-            if dry_run:
-                removed.append(record)
-                return
-            metadata_git = self._metadata_git(slug, metadata)
-            self._git(metadata_git, ["worktree", "remove", "--force", str(target)])
-            remaining = self._git(metadata_git, ["worktree", "list", "--porcelain"])
-            if remaining.count("worktree ") <= 1 and metadata.is_dir():
-                shutil.rmtree(metadata)
-            removed.append(record)
-        except (WorktreeError, OSError) as error:
-            kept.append({**record, "reason": str(error)[:200]})
-
-    def list_orphan_worktrees(
-        self,
-        *,
-        older_than: datetime,
-        limit: int,
-        after: tuple[str, str] | None = None,
-        excluded_repositories: frozenset[str] = frozenset(),
-    ) -> tuple[list[dict[str, str]], tuple[str, str] | None]:
-        """NEW-245: one page of orphan-pruning candidates, in prune_orphan_worktrees' order.
-
-        Only the walk's own checks apply here; the controller decides each candidate
-        against every lease and protection, and apply_orphan_worktrees re-checks the
-        rest. Returns the page and the cursor of its last entry (None when exhausted).
-        """
-        root = self.worktree_root.resolve()
-        slugs = sorted(
-            {self._slug(repository) for repository in self._repositories}
-            - {self._slug(repository) for repository in excluded_repositories}
-        )
-        listed: list[dict[str, str]] = []
-        for slug in slugs:
-            repository_dir = root / slug
-            if repository_dir.is_symlink() or not repository_dir.is_dir():
-                continue
-            for target in sorted(repository_dir.iterdir()):
-                if after is not None and (slug, target.name) <= after:
-                    continue
+                record = {
+                    "path": str(target),
+                    "modified_at": modified.isoformat(),
+                    "kind": "SNAPSHOT",
+                }
                 try:
-                    UUID(target.name)
-                except ValueError:
-                    continue
-                if target.is_symlink() or not target.is_dir():
-                    continue
-                modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
-                if modified > older_than:
-                    continue
-                listed.append(
-                    {
-                        "path": str(target),
-                        "resolved": str(target.resolve()),
-                        "repository": slug,
-                        "name": target.name,
-                        "modified_at": modified.isoformat(),
-                    }
-                )
-                if len(listed) >= limit:
-                    return listed, (slug, target.name)
-        return listed, None
-
-    def apply_orphan_worktrees(
-        self,
-        approved: list[dict[str, str]],
-        *,
-        older_than: datetime,
-        dry_run: bool,
-        limit: int,
-        excluded_repositories: frozenset[str] = frozenset(),
-    ) -> dict[str, list[dict[str, str]]]:
-        """NEW-245: prune exactly the controller-approved orphans (re-checked here)."""
-        root = self.worktree_root.resolve()
-        slugs = {self._slug(repository) for repository in self._repositories} - {
-            self._slug(repository) for repository in excluded_repositories
-        }
-        removed: list[dict[str, str]] = []
-        kept: list[dict[str, str]] = []
-        for entry in approved:
-            if len(removed) >= limit:
-                break
-            slug, name = entry.get("repository"), entry.get("name")
-            if slug not in slugs or not isinstance(name, str):
-                continue
-            try:
-                identity = UUID(name)
-            except ValueError:
-                continue
-            target = root / slug / name
-            if str(target) != entry.get("path") or target.is_symlink() or not target.is_dir():
-                continue
-            modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
-            if modified > older_than:
-                continue
-            self._prune_orphan_target(
-                slug, identity, target, modified, dry_run=dry_run, removed=removed, kept=kept
-            )
+                    if self._git(self._worktree_git(target), ["branch", "--show-current"]):
+                        continue  # a ChangeSet worktree: lease-based cleanup only
+                    metadata = self.metadata_path(slug, identity)
+                    if dry_run:
+                        removed.append(record)
+                        continue
+                    metadata_git = self._metadata_git(slug, metadata)
+                    self._git(metadata_git, ["worktree", "remove", "--force", str(target)])
+                    remaining = self._git(metadata_git, ["worktree", "list", "--porcelain"])
+                    if remaining.count("worktree ") <= 1 and metadata.is_dir():
+                        shutil.rmtree(metadata)
+                    removed.append(record)
+                except (WorktreeError, OSError) as error:
+                    kept.append({**record, "reason": str(error)[:200]})
         return {"removed": removed, "kept": kept}
 
     def cleanup(

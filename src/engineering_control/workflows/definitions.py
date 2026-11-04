@@ -17,9 +17,7 @@ from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from engineering_control.workflows.cleanup_paging import (
     CLEANUP_HISTORY_BYTES,
     CLEANUP_HISTORY_EVENTS,
-    CLEANUP_ORPHAN_HOST_MISMATCH,
-    CLEANUP_ORPHAN_HOST_UNKNOWN,
-    CLEANUP_ORPHAN_REMOVAL_LIMIT,
+    CLEANUP_ORPHAN_PRUNING_SKIPPED,
     CLEANUP_PAGED_PATCH,
     CLEANUP_PHASES,
     CLEANUP_STORE_KEY,
@@ -734,9 +732,6 @@ class ControlledWorkflow:
             "cleanup.protect_active",
             "cleanup.execute",
             "cleanup.prune_orphan_worktrees",
-            "cleanup.list_orphan_worktrees",
-            "cleanup.apply_orphan_worktrees",
-            "cleanup.resolve_worktree_paths",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
             "ui.inventory",
@@ -2531,6 +2526,8 @@ class CleanupWorkflow(ControlledWorkflow):
                 or {
                     "dry_run": self._cleanup_dry_run,
                     "retention_policy": request.retention_policy,
+                    # Orphan worktrees are not pruned on the paged path (see cleanup_paging).
+                    "orphan_pruning": CLEANUP_ORPHAN_PRUNING_SKIPPED,
                 }
             ),
             "blocked_projects": dict(resume.get("blocked_projects") or {}),
@@ -2545,18 +2542,14 @@ class CleanupWorkflow(ControlledWorkflow):
                 if result is not None:
                     return result
             raise ApplicationError("paged cleanup ended without finalization", non_retryable=True)
-        except ActivityError as error:
-            cause = error.cause
-            # The orphan phase crossed scan hosts (or one had no identity): say so.
-            blocker = (
-                cause.type
-                if isinstance(cause, ApplicationError)
-                and cause.type in {CLEANUP_ORPHAN_HOST_MISMATCH, CLEANUP_ORPHAN_HOST_UNKNOWN}
-                else "CLEANUP_ACTIVITY_FAILED"
-            )
+        except ActivityError:
             context = await self._stored_cleanup(
                 "cleanup.finalize",
-                {**state["context"], "terminal_status": "BLOCKED", "blocker": blocker},
+                {
+                    **state["context"],
+                    "terminal_status": "BLOCKED",
+                    "blocker": "CLEANUP_ACTIVITY_FAILED",
+                },
             )
             return {"status": "BLOCKED", "context": context}
 
@@ -2573,9 +2566,6 @@ class CleanupWorkflow(ControlledWorkflow):
             state["context"] = await self._step(
                 "cleanup.discover", {**context, "cleanup_store_mode": CLEANUP_STORE_MODE}
             )
-        elif stage == "resolve_protected":
-            if workflow.patched("cleanup-orphan-worktrees-v1"):
-                await self._paged_cleanup_phase(stage, request)
         elif stage in CLEANUP_PHASES:
             if CLEANUP_PHASES[stage].executes:
                 state["context"] = {**context, "dry_run": False}
@@ -2608,7 +2598,7 @@ class CleanupWorkflow(ControlledWorkflow):
                 state["context"] = scope
                 state["blocked_projects"] = blocked_projects = dict(outcome["blocked_projects"])
             if self._cleanup_dry_run:
-                state["plan"].extend(["resolve_protected", "orphans", "finalize"])
+                state["plan"].extend(["finalize"])
             else:
                 state["plan"].extend(
                     [
@@ -2621,8 +2611,6 @@ class CleanupWorkflow(ControlledWorkflow):
                         "execute_codex",
                         "execute_preview",
                         "execute_worktrees",
-                        "resolve_protected",
-                        "orphans",
                         "execute_metadata",
                         "finalize",
                     ]
@@ -2666,10 +2654,6 @@ class CleanupWorkflow(ControlledWorkflow):
             state["context"] = await self._step(
                 "identity.recover_stale", {**context, "dry_run": False}
             )
-        elif stage == "orphans":
-            if workflow.patched("cleanup-orphan-worktrees-v1"):
-                # NEW-85: snapshot/acceptance leftovers no lease tracks (dry runs report).
-                await self._paged_orphan_worktrees(request)
         elif stage == "execute_metadata":
             state["context"] = await self._stored_cleanup(
                 "cleanup.execute_metadata", {**context, "dry_run": False}
@@ -2723,59 +2707,6 @@ class CleanupWorkflow(ControlledWorkflow):
             }
             page += 1
             state["cursor"] = {"page": page, "outcome": outcome}
-            await self._continue_paged_cleanup_if_long(request)
-
-    async def _paged_orphan_worktrees(self, request: CleanupInput) -> None:
-        """The worker lists orphans, the controller decides, the worker prunes approved."""
-        state = self._cleanup_state
-        cursor = state["cursor"]
-        listing_cursor = cursor.get("orphan_cursor")
-        page = int(cursor.get("page", 0))
-        removed = int(cursor.get("removed", 0))
-        context = state["context"]
-        reference = context.get(CLEANUP_STORE_KEY)
-        excluded = context.get("cleanup_identity_blocked_repositories", [])
-        dry_run = self._cleanup_dry_run  # as the legacy call's explicit dry_run
-        while removed < CLEANUP_ORPHAN_REMOVAL_LIMIT:
-            listed = await self._step(
-                "cleanup.list_orphan_worktrees",
-                {
-                    "dry_run": dry_run,
-                    "cleanup_identity_blocked_repositories": excluded,
-                    "orphan_cursor": listing_cursor,
-                },
-            )
-            decided = await self._step(
-                "cleanup.decide_orphan_worktrees",
-                {
-                    CLEANUP_STORE_KEY: reference,
-                    "dry_run": dry_run,
-                    "cleanup_identity_blocked_repositories": excluded,
-                    "orphan_listing": listed.get("orphan_listing", []),
-                    "orphan_page": page,
-                    "orphan_host": listed.get("orphan_host"),
-                },
-            )
-            if decided.get("orphan_approved_count"):
-                applied = await self._step(
-                    "cleanup.apply_orphan_worktrees", decided["orphan_apply_payload"]
-                )
-                recorded = await self._step(
-                    "cleanup.record_orphan_worktrees",
-                    {
-                        CLEANUP_STORE_KEY: reference,
-                        "orphan_page": page,
-                        "orphan_host": applied.get("orphan_host"),
-                        "orphan_worktrees": applied.get("orphan_worktrees", []),
-                        "orphan_worktrees_kept": applied.get("orphan_worktrees_kept", []),
-                    },
-                )
-                removed = int(recorded.get("orphan_removed_count", removed))
-                page += 1
-            listing_cursor = listed.get("orphan_next_cursor")
-            if listing_cursor is None:
-                return
-            state["cursor"] = {"orphan_cursor": listing_cursor, "page": page, "removed": removed}
             await self._continue_paged_cleanup_if_long(request)
 
     def _paged_cleanup_history_long(self) -> bool:

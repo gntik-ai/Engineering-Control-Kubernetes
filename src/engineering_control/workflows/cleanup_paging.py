@@ -10,10 +10,7 @@ controller records the page's outcome. Imported by the workflow, so data only.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
-from typing import Any
 
 CLEANUP_PAGED_PATCH = "cleanup-paged-candidates-v1"
 CLEANUP_STORE_MODE = "paged-v1"
@@ -22,13 +19,9 @@ CLEANUP_STORE_KEY = "cleanup_store"
 # Continue as new well before Temporal's history limits (51,200 events, 50 MB).
 CLEANUP_HISTORY_EVENTS = 20_000
 CLEANUP_HISTORY_BYTES = 16 * 1024 * 1024
-# Orphan removals per run, as GitWorktreeManager.prune_orphan_worktrees(limit=200).
-CLEANUP_ORPHAN_REMOVAL_LIMIT = 200
-CLEANUP_ORPHAN_KEPT_LIMIT = 50
-# The orphan phase (resolve, list, apply) must see one filesystem: every scan-side step
-# reports its host (machine id and real worktree root), and any other host blocks the run.
-CLEANUP_ORPHAN_HOST_MISMATCH = "CLEANUP_ORPHAN_HOST_MISMATCH"
-CLEANUP_ORPHAN_HOST_UNKNOWN = "CLEANUP_ORPHAN_HOST_UNKNOWN"
+# NEW-245: the paged run does not prune orphan worktrees (legacy runs still do); orphan
+# pruning returns as its own change, resolving, deciding and deleting in one activity.
+CLEANUP_ORPHAN_PRUNING_SKIPPED = "SKIPPED_PAGED"
 
 
 @dataclass(frozen=True)
@@ -41,8 +34,6 @@ class CleanupPhase:
     # Only records for this worker kind are paged (the worker skips the others anyway).
     worker: str | None = None
     executes: bool = False
-    # Its worker reports ``orphan_host``; the controller binds the phase to that host.
-    reports_host: bool = False
 
 
 _FILE_INSPECTION = ("inspected_file_candidates",)
@@ -109,32 +100,5 @@ CLEANUP_PHASES: dict[str, CleanupPhase] = {
         ("removed_lease_ids", "already_absent_lease_ids", "protected_cleanup_candidates"),
         executes=True,
     ),
-    # Orphan pruning's protected set (every leased and candidate path), resolved on the
-    # scan worker exactly as prune_orphan_worktrees resolved it (symlink aliases).
-    "resolve_protected": CleanupPhase(
-        "cleanup.resolve_worktree_paths",
-        "orphan_protected_paths",
-        ("resolved_protected_paths",),
-        reports_host=True,
-    ),
 }
 CLEANUP_PHASE_STRIDE = 1_000_000
-
-
-def orphan_apply_sha256(workflow_id: str, payload: dict[str, Any]) -> str:
-    """The controller's binding of one orphan-removal page to its workflow and store."""
-    canonical = json.dumps(
-        {
-            "workflow_id": workflow_id,
-            "store": payload.get(CLEANUP_STORE_KEY),
-            "page": payload.get("orphan_page"),
-            "host": payload.get("orphan_host"),
-            "dry_run": payload.get("dry_run"),
-            "limit": payload.get("orphan_limit"),
-            "excluded": payload.get("cleanup_identity_blocked_repositories"),
-            "approved": payload.get("orphan_approved"),
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return hashlib.sha256(canonical).hexdigest()
