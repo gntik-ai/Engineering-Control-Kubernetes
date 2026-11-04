@@ -13,6 +13,7 @@ import new_234_fixtures as fixtures
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from engineering_control.db import models  # noqa: F401
@@ -555,8 +556,9 @@ def test_migration_0022_creates_exactly_the_model_schema_and_round_trips(
     assert "backlog_decompositions" not in inspect(engine).get_table_names()
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        # NEW-234 PR6: 0023 (one active request per lineage) is the head.
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0023"
+        # Upgrading again reaches the repository's current head.
+        head = ScriptDirectory.from_config(config).get_current_head()
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head
     engine.dispose()
 
 
