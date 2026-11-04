@@ -167,6 +167,23 @@ class Step(UUIDPrimaryKey, Timestamps, Base):
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class CleanupRunItem(UUIDPrimaryKey, Timestamps, Base):
+    """NEW-245: one stored chunk of a cleanup run's candidate or outcome list.
+
+    The CleanupWorkflow carries only a reference to these rows, never the lists, so no
+    Temporal payload grows with the retention backlog. They are deleted at finalization.
+    """
+
+    __tablename__ = "cleanup_run_items"
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    list_name: Mapped[str] = mapped_column(String(80))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    items_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    __table_args__ = (
+        UniqueConstraint("run_id", "list_name", "ordinal", name="uq_cleanup_run_items_chunk"),
+    )
+
+
 class AgentInvocation(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "agent_invocations"
     run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)

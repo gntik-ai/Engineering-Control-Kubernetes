@@ -14,6 +14,15 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
+from engineering_control.workflows.cleanup_paging import (
+    CLEANUP_HISTORY_BYTES,
+    CLEANUP_HISTORY_EVENTS,
+    CLEANUP_ORPHAN_PRUNING_SKIPPED,
+    CLEANUP_PAGED_PATCH,
+    CLEANUP_PHASES,
+    CLEANUP_STORE_KEY,
+    CLEANUP_STORE_MODE,
+)
 from engineering_control.workflows.cleanup_scope import (
     rescope_after_recovery,
     scope_identity_blockers,
@@ -2343,7 +2352,11 @@ class ConnectionsRefreshWorkflow(ControlledWorkflow):
 class CleanupWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: CleanupInput) -> dict[str, Any]:
-        context: dict[str, Any] = asdict(request)
+        if self._paged_cleanup_patched():
+            return await self._run_paged(request)
+        context: dict[str, Any] = {
+            key: value for key, value in asdict(request).items() if key != "resume"
+        }
         try:
             context = await self._step("cleanup.discover", context)
             context = await self._step("cleanup.protect_active", context)
@@ -2470,6 +2483,275 @@ class CleanupWorkflow(ControlledWorkflow):
     def _identity_project_scope_patched(self) -> bool:
         # NEW-119: confine identity-recovery blockers to the projects they name.
         return workflow.patched("cleanup-identity-blocker-project-scope-v1")
+
+    def _paged_cleanup_patched(self) -> bool:
+        # NEW-245: candidate lists stored by the controller and paged (bounded payloads).
+        return workflow.patched(CLEANUP_PAGED_PATCH)
+
+    async def _run_paged(self, request: CleanupInput) -> dict[str, Any]:
+        """NEW-245: the sequence above, with every candidate list stored by the controller.
+
+        The context carries only small fields and a reference to the stored lists. Worker
+        steps run once per page (at least once, as before); the controller hands out each
+        page and records its outcome. Stages run from ``plan``; at a page boundary a long
+        run continues as new from the same position.
+        """
+        resume: dict[str, Any] = {}
+        self._cleanup_dry_run = request.dry_run
+        if request.resume is not None:
+            # Only this workflow's own continue-as-new may resume, and the position, mode
+            # and context come from the controller's checkpoint, never from the request.
+            continued = self._continued_run_id()
+            token = request.resume.get("checkpoint") if isinstance(request.resume, dict) else None
+            if (
+                continued is None
+                or not isinstance(token, dict)
+                or set(request.resume) != {"checkpoint"}
+            ):
+                raise ApplicationError(
+                    "a cleanup resume is accepted only from its own continue-as-new",
+                    type="CleanupResumeRefused",
+                    non_retryable=True,
+                )
+            resumed = await self._step(
+                "cleanup.resume",
+                {"cleanup_checkpoint": token, "cleanup_continued_run_id": continued},
+            )
+            resume = dict(resumed["cleanup_resume_state"])
+            self._cleanup_dry_run = resumed["dry_run"] is not False
+        self._cleanup_state: dict[str, Any] = {
+            "plan": list(resume.get("plan") or _PAGED_CLEANUP_DISCOVERY),
+            "context": dict(
+                resume.get("context")
+                or {
+                    "dry_run": self._cleanup_dry_run,
+                    "retention_policy": request.retention_policy,
+                    # Orphan worktrees are not pruned on the paged path (see cleanup_paging).
+                    "orphan_pruning": CLEANUP_ORPHAN_PRUNING_SKIPPED,
+                }
+            ),
+            "blocked_projects": dict(resume.get("blocked_projects") or {}),
+            "cursor": dict(resume.get("cursor") or {}),
+        }
+        state = self._cleanup_state
+        try:
+            while state["plan"]:
+                result = await self._paged_cleanup_stage(state["plan"][0], request)
+                state["plan"].pop(0)
+                state["cursor"] = {}
+                if result is not None:
+                    return result
+            raise ApplicationError("paged cleanup ended without finalization", non_retryable=True)
+        except ActivityError:
+            context = await self._stored_cleanup(
+                "cleanup.finalize",
+                {
+                    **state["context"],
+                    "terminal_status": "BLOCKED",
+                    "blocker": "CLEANUP_ACTIVITY_FAILED",
+                },
+            )
+            return {"status": "BLOCKED", "context": context}
+
+    async def _stored_cleanup(self, inner: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._step("cleanup.stored", {**payload, "cleanup_inner": inner})
+
+    async def _paged_cleanup_stage(
+        self, stage: str, request: CleanupInput
+    ) -> dict[str, Any] | None:
+        state = self._cleanup_state
+        context: dict[str, Any] = state["context"]
+        blocked_projects: dict[str, str] = state["blocked_projects"]
+        if stage == "discover":
+            state["context"] = await self._step(
+                "cleanup.discover", {**context, "cleanup_store_mode": CLEANUP_STORE_MODE}
+            )
+        elif stage in CLEANUP_PHASES:
+            if CLEANUP_PHASES[stage].executes:
+                state["context"] = {**context, "dry_run": False}
+            await self._paged_cleanup_phase(stage, request)
+        elif stage == "identity_inspect":
+            state["context"] = await self._step("identity.inspect_stale", context)
+        elif stage == "scope":
+            if workflow.patched("cleanup-inspection-outcome-v1") and context.get(
+                "identity_recovery_blockers"
+            ):
+                scope = (
+                    await self._stored_cleanup("cleanup.scope_identity", context)
+                    if self._identity_project_scope_patched()
+                    else None
+                )
+                outcome = scope.pop("cleanup_scope") if scope is not None else None
+                if outcome is None or outcome["blocked_all"]:
+                    blocked_finalization = {
+                        **context,
+                        "terminal_status": "BLOCKED",
+                        "blocker": "CLEANUP_IDENTITY_INSPECTION_BLOCKED",
+                    }
+                    if outcome is not None:
+                        blocked_finalization["cleanup_blocked_projects"] = outcome[
+                            "blocked_projects"
+                        ]
+                    context = await self._stored_cleanup("cleanup.finalize", blocked_finalization)
+                    return {"status": "BLOCKED", "context": context}
+                assert scope is not None
+                state["context"] = scope
+                state["blocked_projects"] = blocked_projects = dict(outcome["blocked_projects"])
+            if self._cleanup_dry_run:
+                state["plan"].extend(["finalize"])
+            else:
+                state["plan"].extend(
+                    [
+                        "authorize",
+                        *(["recover_scoped"] if blocked_projects else []),
+                        "execute_evidence",
+                        "execute_delivery",
+                        "execute_browser",
+                        *([] if blocked_projects else ["recover"]),
+                        "execute_codex",
+                        "execute_preview",
+                        "execute_worktrees",
+                        "execute_metadata",
+                        "finalize",
+                    ]
+                )
+        elif stage == "authorize":
+            state["context"] = await self._stored_cleanup("cleanup.authorize", context)
+            if state["context"].get("status") == "BLOCKED":
+                context = await self._stored_cleanup(
+                    "cleanup.finalize", {**state["context"], "terminal_status": "BLOCKED"}
+                )
+                return {"status": "BLOCKED", "context": context}
+        elif stage == "recover_scoped":
+            # NEW-119: on the scoped path identity recovery runs before any removal.
+            context = await self._step("identity.recover_stale", {**context, "dry_run": False})
+            state["context"] = context
+            if context.get("identity_recovery_blockers") or context.get("status") != "PASS":
+                rescope = await self._stored_cleanup(
+                    "cleanup.rescope_identity",
+                    {**context, "cleanup_scope_blocked_projects": blocked_projects},
+                )
+                outcome = rescope.pop("cleanup_scope")
+                if outcome["blocked_all"]:
+                    context = await self._stored_cleanup(
+                        "cleanup.finalize",
+                        {
+                            **context,
+                            "terminal_status": "BLOCKED",
+                            "blocker": "CLEANUP_IDENTITY_RECOVERY_BLOCKED",
+                        },
+                    )
+                    return {"status": "BLOCKED", "context": context}
+                state["blocked_projects"] = dict(outcome["blocked_projects"])
+                # The withheld candidates leave the authorization: authorize again.
+                state["context"] = await self._stored_cleanup("cleanup.authorize", rescope)
+                if state["context"].get("status") == "BLOCKED":
+                    context = await self._stored_cleanup(
+                        "cleanup.finalize", {**state["context"], "terminal_status": "BLOCKED"}
+                    )
+                    return {"status": "BLOCKED", "context": context}
+        elif stage == "recover":
+            state["context"] = await self._step(
+                "identity.recover_stale", {**context, "dry_run": False}
+            )
+        elif stage == "execute_metadata":
+            state["context"] = await self._stored_cleanup(
+                "cleanup.execute_metadata", {**context, "dry_run": False}
+            )
+        elif stage == "finalize":
+            terminal = (
+                "DRY_RUN"
+                if self._cleanup_dry_run
+                else "PARTIAL"
+                if blocked_projects
+                else "COMPLETE"
+            )
+            context = await self._stored_cleanup(
+                "cleanup.finalize", {**context, "terminal_status": terminal}
+            )
+            if blocked_projects:
+                return {
+                    "status": terminal,
+                    "blocked_projects": blocked_projects,
+                    "context": context,
+                }
+            return {"status": terminal, "context": context}
+        else:
+            raise ApplicationError(f"unknown paged cleanup stage {stage}", non_retryable=True)
+        return None
+
+    async def _paged_cleanup_phase(self, name: str, request: CleanupInput) -> None:
+        """Page one worker step over its stored list; the controller records each page."""
+        state = self._cleanup_state
+        page = int(state["cursor"].get("page", 0))
+        outcome = state["cursor"].get("outcome")
+        while True:
+            context = state["context"]
+            loaded = await self._step(
+                "cleanup.page",
+                {
+                    CLEANUP_STORE_KEY: context.get(CLEANUP_STORE_KEY),
+                    "dry_run": context.get("dry_run", True),
+                    "cleanup_phase": name,
+                    "cleanup_page": page,
+                    "cleanup_page_outcome": outcome,
+                    "cleanup_authorization_sha256": context.get("cleanup_authorization_sha256"),
+                },
+            )
+            if loaded.get("cleanup_page_done") is True:
+                return
+            result = await self._step(CLEANUP_PHASES[name].step, loaded["cleanup_page_payload"])
+            outcome = {
+                "page": page,
+                "values": {key: result.get(key) for key in loaded["cleanup_page_outcome_keys"]},
+            }
+            page += 1
+            state["cursor"] = {"page": page, "outcome": outcome}
+            await self._continue_paged_cleanup_if_long(request)
+
+    def _paged_cleanup_history_long(self) -> bool:
+        info = workflow.info()
+        return (
+            info.is_continue_as_new_suggested()
+            or info.get_current_history_length() > CLEANUP_HISTORY_EVENTS
+            or info.get_current_history_size() > CLEANUP_HISTORY_BYTES
+        )
+
+    def _continued_run_id(self) -> str | None:
+        return workflow.info().continued_run_id
+
+    async def _continue_paged_cleanup_if_long(self, request: CleanupInput) -> None:
+        if not self._paged_cleanup_history_long():
+            return
+        # The controller keeps the position; the next run carries only its reference.
+        checkpoint = await self._step(
+            "cleanup.checkpoint",
+            {
+                CLEANUP_STORE_KEY: self._cleanup_state["context"].get(CLEANUP_STORE_KEY),
+                "cleanup_checkpoint_state": dict(self._cleanup_state),
+            },
+        )
+        workflow.continue_as_new(
+            CleanupInput(
+                dry_run=self._cleanup_dry_run,
+                retention_policy=request.retention_policy,
+                resume={"checkpoint": checkpoint["cleanup_checkpoint"]},
+            )
+        )
+
+
+# NEW-245: the paged run's opening stages; "scope" appends the rest (as the legacy branches).
+_PAGED_CLEANUP_DISCOVERY = (
+    "discover",
+    "protect",
+    "inspect_evidence",
+    "inspect_delivery",
+    "inspect_browser",
+    "identity_inspect",
+    "inspect_codex",
+    "inspect_preview",
+    "scope",
+)
 
 
 @workflow.defn(name="AcceptanceLifecycleWorkflow")

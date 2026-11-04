@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.cleanup_store import CleanupPagingSteps
 from engineering_control.activities.retention import (
     FileCleanupCandidate,
     PreviewNamespaceCleanupCandidate,
@@ -175,6 +176,10 @@ from engineering_control.security.redaction import (
     SecretRedactor,
     bounded_detail,
     redact_detail_text,
+)
+from engineering_control.workflows.cleanup_paging import (
+    CLEANUP_ORPHAN_PRUNING_SKIPPED,
+    CLEANUP_STORE_MODE,
 )
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
@@ -497,7 +502,7 @@ def _untrusted_block(label: str, content: str) -> str:
     )
 
 
-class MetadataActivityHandler:
+class MetadataActivityHandler(CleanupPagingSteps):
     """Controller-side authoritative metadata writes for idempotent activity results."""
 
     _provider_request_keys = {
@@ -598,6 +603,11 @@ class MetadataActivityHandler:
             "cleanup.authorize",
             "cleanup.execute_metadata",
             "cleanup.finalize",
+            # NEW-245: the paged cleanup's controller steps (stored candidate lists).
+            "cleanup.stored",
+            "cleanup.page",
+            "cleanup.checkpoint",
+            "cleanup.resume",
             "quota.persist",
             "observability.register",
             "observability.prepare_codex",
@@ -820,7 +830,17 @@ class MetadataActivityHandler:
             if step == "recovery.record_failure":
                 return await asyncio.to_thread(self._record_recovery_failure, payload)
             if step == "cleanup.discover":
+                if payload.get("cleanup_store_mode") == CLEANUP_STORE_MODE:
+                    return await asyncio.to_thread(self._discover_cleanup_stored, payload)
                 return await asyncio.to_thread(self._discover_cleanup, payload)
+            if step == "cleanup.stored":
+                return await asyncio.to_thread(self._cleanup_stored, payload)
+            if step == "cleanup.page":
+                return await asyncio.to_thread(self._cleanup_page, payload)
+            if step == "cleanup.checkpoint":
+                return await asyncio.to_thread(self._checkpoint_cleanup, payload)
+            if step == "cleanup.resume":
+                return await asyncio.to_thread(self._resume_cleanup, payload)
             if step == "cleanup.authorize":
                 return await asyncio.to_thread(self._authorize_cleanup, payload)
             if step == "cleanup.execute_metadata":
@@ -9159,6 +9179,13 @@ class MetadataActivityHandler:
             "deleted_operation_export_count": deleted_operation_exports,
         }
 
+    @staticmethod
+    def _orphan_pruning_summary(summary: str, payload: dict[str, Any]) -> str:
+        # NEW-245: a paged run does not prune orphan worktrees; say so on the Run.
+        if payload.get("orphan_pruning") == CLEANUP_ORPHAN_PRUNING_SKIPPED:
+            return f"{summary}; orphan worktree pruning skipped (paged cleanup)"
+        return summary
+
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         terminal = str(payload.get("terminal_status", ""))
@@ -9298,6 +9325,7 @@ class MetadataActivityHandler:
                     f"{len(authorized_component_ids)} component leases, "
                     f"{len(authorized_preview_ids)} preview namespaces"
                 )
+                run.summary = self._orphan_pruning_summary(run.summary, payload)
                 if protected_ids:
                     # The lease stays held and is re-authorized daily until an operator
                     # fixes the worktree; record which ones and why, durably on the Run.
@@ -9327,7 +9355,9 @@ class MetadataActivityHandler:
                     )
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
-                run.summary = "cleanup dry run completed without mutation"
+                run.summary = self._orphan_pruning_summary(
+                    "cleanup dry run completed without mutation", payload
+                )
             else:
                 run.status = "BLOCKED"
                 run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))

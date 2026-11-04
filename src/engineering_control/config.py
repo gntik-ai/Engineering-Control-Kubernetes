@@ -246,6 +246,9 @@ class Settings(BaseSettings):
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
+    # NEW-245: candidate records per paged cleanup activity (the lists themselves are
+    # stored in cleanup_run_items, never carried in the workflow context).
+    cleanup_page_size: int = Field(default=100, ge=1, le=1000)
     # NEW-214 Stage 2 (operator 2026-10-18): implementation leases one project may hold at
     # once. One is always left for the BACK slot of a pipelined loop.
     implementation_leases_per_project: int = Field(default=3, ge=1, le=4)

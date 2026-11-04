@@ -123,6 +123,8 @@ class ConnectionsRefreshInput:
 class CleanupInput:
     dry_run: bool = True
     retention_policy: str = "standard"
+    # NEW-245: the paged run's position when it continues as new (None on a fresh run).
+    resume: dict[str, Any] | None = None
 
 
 @dataclass
