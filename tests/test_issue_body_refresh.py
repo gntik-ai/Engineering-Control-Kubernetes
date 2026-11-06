@@ -156,3 +156,36 @@ async def test_refresh_refuses_a_body_edited_after_approval(tmp_path: Any) -> No
     ).handle("delivery.refresh_issue_body", request)
     assert same["status"] == "ISSUE_BODY_REFRESHED"
     assert same["source_body_sha256"] == approved_sha
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_refresh_keeps_a_ui_migration_issue_whole(tmp_path: Any) -> None:
+    # NEW-246: falcone #1262 (42 753 chars) lost its middle, the blueprint's continued
+    # requirements, under the 20000 bound, and its spec architect blocked twice.
+    body = "## Operator decisions\n" + "requirement line\n" * 2_500 + "## Operator description"
+    assert github_activity.ISSUE_BODY_REFRESH_LIMIT < len(body)
+    assert len(body) <= github_activity.DELIVERY_ISSUE_BODY_LIMIT
+    payload = {"issue_repository": "gntik-ai/falcone", "issue_number": 1262}
+    handler = _handler(tmp_path, _Broker({"state": "OPEN", "body": body}))
+
+    delivery = await handler.handle(
+        "delivery.refresh_issue_body", {**payload, "body_limit": "delivery"}
+    )
+    default = await handler.handle("delivery.refresh_issue_body", payload)
+
+    assert delivery["body_excerpt"] == body and delivery["body_truncated"] is False
+    assert default["body_truncated"] is True
+    assert len(default["body_excerpt"]) <= github_activity.ISSUE_BODY_REFRESH_LIMIT
+
+
+def test_a_delivery_bound_keeps_head_and_tail_of_a_longer_body() -> None:
+    body = "H" * 20_000 + "m" * 60_000 + "T" * 20_000
+    excerpt, truncated = github_activity.bounded_issue_body(
+        body,
+        github_activity.DELIVERY_ISSUE_BODY_LIMIT,
+        github_activity.DELIVERY_ISSUE_BODY_HEAD,
+    )
+    assert truncated is True
+    assert len(excerpt) <= github_activity.DELIVERY_ISSUE_BODY_LIMIT
+    assert excerpt.startswith("H" * github_activity.DELIVERY_ISSUE_BODY_HEAD)
+    assert excerpt.endswith("T" * 20_000)

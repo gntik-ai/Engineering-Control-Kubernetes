@@ -47,13 +47,23 @@ from .gitops import GitOpsGitHubHandler
 # with an explicit omission marker in between.
 ISSUE_BODY_REFRESH_LIMIT = 20_000
 ISSUE_BODY_REFRESH_HEAD = 6_000
+# NEW-246: 20000 cut the middle of every Falcone UI-migration issue (21-43 KB: operator
+# decisions at the top, the blueprint's continued requirements in the middle), so spec
+# architects blocked on missing scope. An issue delivery asks for this larger bound
+# (body_limit "delivery"); its spec agent sees the whole body, and makers and checkers
+# keep the issue-context budget with the OpenSpec as their scope. Finding revalidation
+# keeps the default: it copies actual_behavior into several nested payloads.
+DELIVERY_ISSUE_BODY_LIMIT = 48_000
+DELIVERY_ISSUE_BODY_HEAD = 12_000
 
 
-def bounded_issue_body(body: str, limit: int = ISSUE_BODY_REFRESH_LIMIT) -> tuple[str, bool]:
+def bounded_issue_body(
+    body: str, limit: int = ISSUE_BODY_REFRESH_LIMIT, head_length: int = ISSUE_BODY_REFRESH_HEAD
+) -> tuple[str, bool]:
     """Return at most ``limit`` chars: the whole body, or its head and tail with a marker."""
     if len(body) <= limit:
         return body, False
-    head = body[:ISSUE_BODY_REFRESH_HEAD]
+    head = body[:head_length]
     marker_template = (
         "\n\n[Hermes omitted {omitted} characters from the middle of this issue; "
         "the opening and the most recent text, where operator decisions are appended, "
@@ -248,7 +258,12 @@ class GitHubActivityHandler:
         body = str(SecretRedactor().redact_text(str(value["body"])).value).strip()
         if not body:
             return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BODY_EMPTY"}
-        excerpt, truncated = bounded_issue_body(body)
+        if payload.get("body_limit") == "delivery":
+            excerpt, truncated = bounded_issue_body(
+                body, DELIVERY_ISSUE_BODY_LIMIT, DELIVERY_ISSUE_BODY_HEAD
+            )
+        else:
+            excerpt, truncated = bounded_issue_body(body)
         return {
             "status": "ISSUE_BODY_REFRESHED",
             "source_body_sha256": source_sha256,
