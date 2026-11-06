@@ -1727,6 +1727,10 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
         }
         if context.get("approved_issue_body_sha256") is not None:
             refresh_request["approved_issue_body_sha256"] = context["approved_issue_body_sha256"]
+        if workflow.patched("delivery-refresh-body-limit-v1"):
+            # NEW-246: only the delivery asks for the larger body; finding revalidation
+            # copies actual_behavior into several nested payloads and keeps the default.
+            refresh_request["body_limit"] = "delivery"
         refreshed = await self._step("delivery.refresh_issue_body", refresh_request)
         if refreshed.get("status") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL" and workflow.patched(
             "delivery-refresh-body-approval-scope-v1"

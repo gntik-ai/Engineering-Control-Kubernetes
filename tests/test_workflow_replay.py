@@ -2103,7 +2103,12 @@ async def test_issue_delivery_refreshes_an_existing_issue_body_and_replays() -> 
         "delivery.acquire_leases",
     ]
     refresh = requests[ensure + 1]["payload"]
-    assert refresh == {"issue_repository": "gntik-ai/musematic", "issue_number": 993}
+    # NEW-246: only an issue delivery asks for the larger body bound.
+    assert refresh == {
+        "issue_repository": "gntik-ai/musematic",
+        "issue_number": 993,
+        "body_limit": "delivery",
+    }
     assert requests[ensure + 2]["payload"]["actual_behavior"] == _REFRESHED_BODY
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 

@@ -1827,3 +1827,41 @@ async def test_a_separate_deployment_change_still_floors_at_r2(
         assert change_set is not None
         assert change_set.risk_class == expected
         assert change_set.recovery_json["release_impact"]["risk_floor"] == expected
+
+
+def test_new_246_makers_and_checker_see_a_whole_ui_migration_issue(tmp_path: Path) -> None:
+    # NEW-246: falcone #1263's UI page maker blocked on a 20000-char excerpt of a
+    # 33 858-char issue. With room in the prompt, every maker and the checker get it whole,
+    # and the prompt still leaves the instruction-prefix reserve under the 200000 limit.
+    from engineering_control.activities import metadata as metadata_module
+
+    handler, allocation = _lease_fixture(tmp_path)
+    body = "## Decisiones del operador\n" + "Requisito: Área de trabajo, Sí.\n" * 1_200
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-falcone-issue-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/falcone/issues/1263",
+        "risk_class": "R3",
+        "project": "falcone",
+        "openspec_document": {"decision": "READY", "title": "service accounts"},
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+        "expected_behavior": "The page matches the legacy behaviour.",
+        "actual_behavior": body,
+        "minimal_reproduction": {"steps": ["open /console/service-accounts"]},
+    }
+    prompts = [
+        handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"],
+        handler._prepare_maker(payload, deployment=True)["deployment_maker_request"]["prompt"],
+        handler._prepare_checker(payload)["checker_request"]["prompt"],
+    ]
+    for prompt in prompts:
+        assert "Requisito: Área de trabajo, Sí." * 1 in prompt
+        assert prompt.count("Requisito: Área de trabajo, Sí.") == 1_200
+        assert "[truncated:" not in prompt and "Hermes omitted" not in prompt
+        assert (
+            len(prompt) + metadata_module._INSTRUCTION_PREFIX_RESERVE
+            <= metadata_module._AGENT_PROMPT_LIMIT
+        )
