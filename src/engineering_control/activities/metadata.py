@@ -460,27 +460,56 @@ def _issue_content(payload: dict[str, Any]) -> str | None:
 _ISSUE_CONTEXT_BUDGET = 30_000
 
 
-def _issue_context(payload: dict[str, Any]) -> str:
+# NEW-246: a maker or checker prompt grows by the agent pack's instruction prefix at
+# enrich time (largest installed prefix about 49 KB, review-ui-page), and AgentRequest
+# caps the enriched prompt at 200000 chars; fence neutralization can lengthen the block.
+_AGENT_PROMPT_LIMIT = 200_000
+_INSTRUCTION_PREFIX_RESERVE = 60_000
+_ISSUE_CONTEXT_MARGIN = 4_000
+_ISSUE_CONTEXT_BUDGET_MAX = 56_000
+
+
+def _issue_context_room(prompt: str) -> int:
+    """Characters left for the issue block after ``prompt`` and the instruction prefix."""
+    return _AGENT_PROMPT_LIMIT - len(prompt) - _INSTRUCTION_PREFIX_RESERVE - _ISSUE_CONTEXT_MARGIN
+
+
+def _issue_context(payload: dict[str, Any], room: int | None = None) -> str:
     """NEW-92: makers and checker saw only the generated OpenSpec, which summarised exact
     issue values away (falcone-charts #47: a waiver ID, a CRD version), so they guessed or
     blocked. Give them the same fenced issue content as the spec agent."""
-    from engineering_control.activities.github import bounded_issue_body
+    from engineering_control.activities.github import (
+        DELIVERY_ISSUE_BODY_HEAD,
+        DELIVERY_ISSUE_BODY_LIMIT,
+        ISSUE_BODY_REFRESH_LIMIT,
+        bounded_issue_body,
+    )
 
+    # NEW-246: a delivery's body can be up to 48000 chars. Makers and checkers get all of
+    # it when their prompt has room (falcone #1263's UI page maker blocked on a 20000-char
+    # excerpt); otherwise they keep the 20000-char head and tail and the 30000-char block
+    # they had before, so no prompt grows past what the base already sent.
+    budget = _ISSUE_CONTEXT_BUDGET
+    if room is not None and room > budget:
+        budget = min(room, _ISSUE_CONTEXT_BUDGET_MAX)
     actual = payload.get("actual_behavior")
     if isinstance(actual, str):
-        # NEW-246: a delivery's spec agent now sees up to 48000 chars of the issue, but
-        # maker and checker prompts keep the 20000-char head and tail they had before:
-        # checker prompts already come close to AgentRequest's 200000-char limit, and the
-        # OpenSpec written from the whole body carries the scope.
-        payload = {**payload, "actual_behavior": bounded_issue_body(actual)[0]}
+        # The block also carries the expected behaviour and reproduction lines.
+        framing = len(_issue_content({**payload, "actual_behavior": ""}) or "")
+        limit = min(DELIVERY_ISSUE_BODY_LIMIT, budget - framing)
+        if budget > _ISSUE_CONTEXT_BUDGET and limit > ISSUE_BODY_REFRESH_LIMIT:
+            bounded, _ = bounded_issue_body(actual, limit, DELIVERY_ISSUE_BODY_HEAD)
+        else:
+            bounded, _ = bounded_issue_body(actual)
+        payload = {**payload, "actual_behavior": bounded}
     content = _issue_content(payload)
     if content is None:
         return ""
-    if len(content) > _ISSUE_CONTEXT_BUDGET:
+    if len(content) > budget:
         # Review: schema-valid findings can exceed the 200k prompt limit in aggregate; the
         # OpenSpec (always present) carries the intent, this block only exact values.
-        omitted = len(content) - _ISSUE_CONTEXT_BUDGET
-        content = content[:_ISSUE_CONTEXT_BUDGET] + f"\n[truncated: {omitted} characters omitted]"
+        omitted = len(content) - budget
+        content = content[:budget] + f"\n[truncated: {omitted} characters omitted]"
     return (
         "Where the OpenSpec needs exact values (identifiers, versions, names, paths) that "
         "the issue content below states, use them verbatim instead of inferring or blocking; "
@@ -4517,10 +4546,9 @@ class MetadataActivityHandler(CleanupPagingSteps):
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"
-            f"{_untrusted_block('issue-derived content', derived_content)}\n"
-            + ui_inputs
-            + _issue_context(payload)
+            f"{_untrusted_block('issue-derived content', derived_content)}\n" + ui_inputs
         )
+        prompt += _issue_context(payload, room=_issue_context_room(prompt))
         request = AgentRequest(
             run_id=uuid5(
                 NAMESPACE_URL,
@@ -4777,10 +4805,9 @@ class MetadataActivityHandler(CleanupPagingSteps):
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"
-            f"{_untrusted_block('issue-derived content', derived_content)}\n"
-            + ui_inputs
-            + _issue_context(payload)
+            f"{_untrusted_block('issue-derived content', derived_content)}\n" + ui_inputs
         )
+        prompt += _issue_context(payload, room=_issue_context_room(prompt))
         request = AgentRequest(
             run_id=uuid5(NAMESPACE_URL, f"delivery-checker:{workflow_id}:{change_set_id}"),
             project=Project(str(payload["project"])),
