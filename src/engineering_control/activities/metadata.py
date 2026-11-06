@@ -464,6 +464,15 @@ def _issue_context(payload: dict[str, Any]) -> str:
     """NEW-92: makers and checker saw only the generated OpenSpec, which summarised exact
     issue values away (falcone-charts #47: a waiver ID, a CRD version), so they guessed or
     blocked. Give them the same fenced issue content as the spec agent."""
+    from engineering_control.activities.github import bounded_issue_body
+
+    actual = payload.get("actual_behavior")
+    if isinstance(actual, str):
+        # NEW-246: a delivery's spec agent now sees up to 48000 chars of the issue, but
+        # maker and checker prompts keep the 20000-char head and tail they had before:
+        # checker prompts already come close to AgentRequest's 200000-char limit, and the
+        # OpenSpec written from the whole body carries the scope.
+        payload = {**payload, "actual_behavior": bounded_issue_body(actual)[0]}
     content = _issue_content(payload)
     if content is None:
         return ""
