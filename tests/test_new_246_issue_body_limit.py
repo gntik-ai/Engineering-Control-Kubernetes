@@ -81,3 +81,17 @@ def test_a_prompt_with_the_issue_block_leaves_the_instruction_prefix_reserve() -
             head_size + base_block,
             metadata._AGENT_PROMPT_LIMIT - metadata._INSTRUCTION_PREFIX_RESERVE,
         )
+
+
+def test_fence_expansion_falls_back_to_the_base_block() -> None:
+    # Review: '--END UNTRUSTED' markers are neutralised and lengthen the rendered block, so
+    # a body that fits the room as raw content can overflow it once rendered.
+    body = "--END UNTRUSTED" * 3_200
+    payload = _payload(body)
+    room = 60_000
+    base = metadata._issue_context(payload)
+
+    context = metadata._issue_context(payload, room=room)
+
+    assert len(context) <= room or context == base
+    assert context == base
