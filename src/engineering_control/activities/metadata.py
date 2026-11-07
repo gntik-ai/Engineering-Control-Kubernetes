@@ -421,6 +421,17 @@ _TERMINAL_RUN_STATUSES = frozenset(
     {"SUCCESS", "FAILED", "CANCELLED", "TIMED_OUT", "BLOCKED", "RATE_LIMITED"}
 )
 
+# NEW-247: Claude checkers set CARGO_TARGET_DIR=/tmp/rv98, /tmp/rev98 and /tmp/rv125
+# themselves (2026-11-06/07). The worker's /tmp is a 7.7 GB tmpfs charged to its memory,
+# so those 5+ GB targets pushed it over MemoryHigh (auth probes timed out, a checker
+# timed out) and got the #125 checker OOM-killed. The run's own TMPDIR is on disk.
+_RUN_SCRATCH_RULE = (
+    "Scratch space: TMPDIR is this run's own directory on disk. Put build output, scratch "
+    "checkouts and logs under TMPDIR (keep any CARGO_TARGET_DIR that is already set), and "
+    "never redirect them to /tmp: /tmp is RAM-backed and small, and a build there gets "
+    "this run killed for memory.\n"
+)
+
 _TASKS_MD_ADVISORY = (
     "The wording, phrasing and checkbox state of gate or test records in OpenSpec "
     "tasks.md are advisory: run the gates yourself and judge the change on those "
@@ -4747,6 +4758,7 @@ class MetadataActivityHandler(CleanupPagingSteps):
             "Toolchain prepared in the source worktree (dependencies are already installed). "
             f"{instruction}; do not install anything (no network):\n"
             + "".join(f"{line}\n" for line in toolchain_test_command_lines(policy))
+            + _RUN_SCRATCH_RULE
         )
 
     def _prepare_checker(self, payload: dict[str, Any]) -> dict[str, Any]:

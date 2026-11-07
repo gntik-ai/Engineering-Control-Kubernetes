@@ -12,7 +12,7 @@ from jsonschema import Draft202012Validator
 from publication_fixture import approved_publication
 from sqlalchemy import select
 
-from engineering_control.activities.metadata import MetadataActivityHandler
+from engineering_control.activities.metadata import _RUN_SCRATCH_RULE, MetadataActivityHandler
 from engineering_control.activities.provider import ProviderActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
@@ -1089,6 +1089,12 @@ def test_makers_and_checker_are_told_to_run_the_prepared_toolchain_tests(
         assert "do not install anything (no network)" in source
         assert 'evidence[] entry with kind "test"' in checker
         assert "`timeout --kill-after=30 900 .venv/bin/mypy src/platform`" in checker
+        # NEW-247: build output stays in the run's on-disk TMPDIR, never the RAM /tmp.
+        for prompt in (source, checker):
+            assert "never redirect them to /tmp" in prompt
+        # Only TMPDIR is on disk for every selection (a default GOCACHE is /tmp/go-build).
+        assert "GOCACHE" not in _RUN_SCRATCH_RULE and "TMPDIR is this run's own" in source
+    assert "never redirect them to /tmp" not in deployment
 
 
 def _spec_fixture(
