@@ -1821,9 +1821,10 @@ def failure_excerpt(
         ):
             # NEW-248: a repeated marker ("Error: strict mode violation …", "Expected substring:
             # …") adds no second block, so each distinct error of a many-test failure gets its
-            # context within the budget; short generic lines ("error: |-") still repeat.
+            # context within the budget; short generic lines ("error: |-") still repeat, and so
+            # does an assertion headline, whose diff (an axe rule ID) differs per failure.
             marker = line.strip()
-            if len(marker) >= _REPEATED_MARKER_MIN_CHARS:
+            if len(marker) >= _REPEATED_MARKER_MIN_CHARS and not _PLAYWRIGHT_ASSERTION.match(line):
                 if marker in markers:
                     continue
                 markers.add(marker)

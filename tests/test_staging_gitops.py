@@ -4002,6 +4002,18 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     assert "Distinct errors" not in single
     tap = failure_excerpt("".join(f"not ok {n} - t{n}\n  error: |-\n    e{n}\n" for n in range(3)))
     assert all(f"e{n}" in tap for n in range(3))
+    # NEW-248 review: two axe assertions share their headline but not their diff; both rule
+    # IDs and selectors stay.
+    axe = "".join(
+        f"  {n}) a.spec.mjs:{n}:1 › axe {rule} ───\n\n"
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n"
+        f'    +     "id": "{rule}",\n    +     "target": "#{rule}-node",\n\n'
+        f"    > {n} |   expect(violations).toEqual([]);\n"
+        for n, rule in ((1, "color-contrast"), (2, "aria-hidden-focus"))
+    )
+    both = failure_excerpt(axe)
+    for rule in ("color-contrast", "aria-hidden-focus"):
+        assert f'"id": "{rule}"' in both and f"#{rule}-node" in both
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
