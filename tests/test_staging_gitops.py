@@ -4064,6 +4064,22 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     )
     assert time.monotonic() - started < 2
     assert "Error: boom happened" in padded
+    # NEW-248 review 7: no pre-cut can leave a fragment (padding before a quoted secret), and
+    # private keys and escape openers without their terminator stay linear (8000 key
+    # openers took over 6 s).
+    precut = failure_excerpt("Error: boom\n" + " " * 1980 + 'secret: "SENSITIVE FIRST SECOND"\n')
+    assert "SENSITIVE" not in precut
+    assert "SENSITIVE" not in failure_excerpt("Error: boom\n" + "s" * 2500 + 'secret: "SENSITIVE"\n')
+    started = time.monotonic()
+    failure_excerpt("-----BEGIN PRIVATE KEY-----\n" * 8000 + "\x1b]unterminated\n" * 20000)
+    assert time.monotonic() - started < 2
+    key = (
+        "Error: one\n-----BEGIN RSA PRIVATE KEY-----\n" + "B" * 64 + "\n" + "C" * 64
+        + "\n-----END RSA PRIVATE KEY----- tail text\nError: two after the key\n"
+    )
+    redacted = failure_excerpt(key)
+    assert "B" * 64 not in redacted and "C" * 64 not in redacted
+    assert "[REDACTED]" in redacted and "Error: two after the key" in redacted
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------

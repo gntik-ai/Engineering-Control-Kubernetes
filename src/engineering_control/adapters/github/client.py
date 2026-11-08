@@ -15,7 +15,7 @@ from typing import Any, Literal
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
 from engineering_control.models.publication_authority import IssueRevisionObservation
 from engineering_control.projects import REPOSITORY_SET
-from engineering_control.security.redaction import SecretRedactor
+from engineering_control.security.redaction import REDACTED, SecretRedactor
 
 ALLOWED_REPOSITORIES = REPOSITORY_SET
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
@@ -1781,6 +1781,10 @@ _PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
 _ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
 _DISTINCT_ERROR_LINES = 10
 _WHITESPACE_RUN = re.compile(r"[ \t]{17,}")
+_REDACTED_LINE_CHARS = 2000
+_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+_PRIVATE_KEY_MAX_LINES = 200
 
 
 def failure_excerpt(
@@ -1793,25 +1797,7 @@ def failure_excerpt(
     (down to that table's closing ruling, without the inner rulings), so the package,
     patched versions and paths fit and no neighbouring advisory bleeds in.
     """
-    stripped: list[str] = []
-    for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines():
-        # NEW-248 review 6: the redactor's patterns backtrack through whitespace, so a long
-        # run inside a line is bounded and a line is cut well past the 300 characters the
-        # excerpt keeps (a credential starting there is still redacted whole) before redaction.
-        text = _WHITESPACE_RUN.sub(" " * 16, _ANSI.sub("", _LOG_PREFIX.sub("", line))[:2000])
-        # NEW-248 review 5: a run of blank or whitespace-only lines becomes one empty line.
-        # The redactor's multiline "^\s*" patterns rescan such runs from every line start,
-        # which made redacting a 2 MB log quadratic; blank lines carry no evidence.
-        if not text.strip():
-            if stripped and stripped[-1] == "":
-                continue
-            text = ""
-        stripped.append(text)
-    cleaned = "\n".join(stripped)
-    # NEW-248 review 4: redact the whole log before any line or budget cut, so no cut can
-    # split a credential (a token, or a multi-line private key) into an unmatched fragment.
-    # The callers' downstream redaction stays; it does not re-match "[REDACTED]".
-    lines = [line[:300] for line in SecretRedactor().redact_text(cleaned).value.splitlines()]
+    lines = _redacted_log_lines(raw[-JOB_LOG_TAIL_BYTES:])
     audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
     for index, line in enumerate(lines):
@@ -1895,6 +1881,47 @@ def failure_excerpt(
         kept.append(line)
         used += len(line) + 1
     return "\n".join(kept)
+
+
+def _redacted_log_lines(raw: str) -> list[str]:
+    """NEW-248: the log's lines, cleaned and redacted before any cut, in linear time.
+
+    Redaction comes before the 300-character line cut and the excerpt budget, so no cut can
+    split a credential into a fragment the redactor no longer matches (reviews 2-4). Each
+    step is linear (reviews 5-7): a run of blank lines is one empty line, a whitespace run
+    inside a line is at most 16 characters, a line still over 2000 characters is replaced
+    by a placeholder rather than cut, a private key spanning lines is redacted by a line
+    scan (fail-closed after 200 lines without its END), and SecretRedactor runs per line.
+    The callers' downstream redaction stays; it does not re-match "[REDACTED]".
+    """
+    redactor = SecretRedactor()
+    lines: list[str] = []
+    key_lines = 0
+    for line in raw.splitlines():
+        text = _WHITESPACE_RUN.sub(" " * 16, _ANSI.sub("", _LOG_PREFIX.sub("", line)))
+        if len(text) > _REDACTED_LINE_CHARS:
+            text = f"[line omitted: {len(text)} characters]"
+        if key_lines:
+            # Inside a private key every line up to its END is dropped (the BEGIN line already
+            # reads "[REDACTED]"); past the bound it is dropped too, failing closed.
+            key_lines -= 1
+            end = _PRIVATE_KEY_END.search(text)
+            if end is None:
+                continue
+            text = text[end.end() :]
+            key_lines = 0
+        begin = _PRIVATE_KEY_BEGIN.search(text)
+        if begin and not _PRIVATE_KEY_END.search(text, begin.end()):
+            prefix = str(redactor.redact_text(text[: begin.start()]).value)
+            lines.append((prefix + REDACTED)[:300])
+            key_lines = _PRIVATE_KEY_MAX_LINES
+            continue
+        if not text.strip():
+            if lines and lines[-1] == "":
+                continue
+            text = ""
+        lines.append(str(redactor.redact_text(text).value)[:300])
+    return lines
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:
