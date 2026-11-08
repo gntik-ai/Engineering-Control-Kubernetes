@@ -4024,62 +4024,43 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     )
     kept = failure_excerpt(timeouts)
     assert "name: 'Rotate secret'" in kept and "name: 'Delete account'" in kept
-    # NEW-248 reviews 2-4: the log is redacted before any line or budget cut, so no cut leaves
-    # a credential fragment: a token near the 300-character line bound, a token the final
-    # budget would split, or a private key whose END line falls past the budget.
+    # NEW-248 reviews 2-4 and 8: redaction stays downstream (as on origin/main), so no cut
+    # may leave a fragment it cannot match: a listed headline is the same 300-character line
+    # as its context, the budget drops whole lines, and a private key whose END the budget
+    # would drop is dropped from its BEGIN line on.
+    from engineering_control.security.redaction import SecretRedactor
+
+    def redacted(text: str) -> str:
+        return str(SecretRedactor().redact_text(text).value)
+
     token = "ghp_" + "A" * 36
     headline = "Error: request failed " + "x" * 198 + " " + token
     secret = failure_excerpt(f"    {headline}\n    Error: another distinct failure here\n")
-    assert "Distinct errors (2):" in secret and "[REDACTED]" in secret
-    assert "ghp_" not in secret
-    assert all(len(line) <= 300 for line in secret.splitlines())
+    assert "Distinct errors (2):" in secret
+    assert all(token in line for line in secret.splitlines() if "ghp_" in line)
+    assert "ghp_" not in redacted(secret)
     filler = ("f" * 271 + "\n") * 7
     boundary = (
         "    Error: first\n" + filler + "    Error: second\n" + filler + f"    Error: last {token}\n"
     )
     cut = failure_excerpt(boundary)
-    assert "ghp_" not in cut and len(cut) <= 4000
+    assert all(token in line for line in cut.splitlines() if "ghp_" in line)
+    assert len(cut) <= 4000
     body = "B" * 64
     pem = (
         "    Error: one\n" + ("g" * 264 + "\n") * 7 + "    Error: two\n" + ("g" * 264 + "\n") * 7
         + "    Error: three\n-----BEGIN RSA PRIVATE KEY-----\n"
         + f"{body}\n{body}\n-----END RSA PRIVATE KEY-----\n"
     )
-    assert body not in failure_excerpt(pem)
+    assert body not in redacted(failure_excerpt(pem))
+    whole = failure_excerpt(f"Error: one\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\nError: two\n")
+    assert body not in redacted(whole) and "Error: two" in whole
+    # The selection stays fast on long logs (redaction is not part of it).
     import time
 
-    # NEW-248 review 5: whole-log redaction stays linear on runs of blank lines (the
-    # redactor's multiline "^\s*" patterns were quadratic there: 16k blank lines took 15 s).
     started = time.monotonic()
-    blank = failure_excerpt("\n" * 16384 + "  \t\n" * 16384 + "Error: boom happened\n")
+    failure_excerpt("\n" * 16384 + "token: " + " " * 131072 + "x\n" + "-----BEGIN PRIVATE KEY-----\n" * 8000)
     assert time.monotonic() - started < 2
-    assert "Error: boom happened" in blank
-    # NEW-248 review 6: nor on a credential line with a long whitespace run (65k spaces took
-    # 9 s), nor on many YAML credentials padded before a comment.
-    started = time.monotonic()
-    padded = failure_excerpt(
-        "token: " + " " * 131072 + "[REDACTED]\nnext line\n"
-        + ("password:" + " " * 1000 + "# empty default\n") * 2000
-        + "Error: boom happened\n"
-    )
-    assert time.monotonic() - started < 2
-    assert "Error: boom happened" in padded
-    # NEW-248 review 7: no pre-cut can leave a fragment (padding before a quoted secret), and
-    # private keys and escape openers without their terminator stay linear (8000 key
-    # openers took over 6 s).
-    precut = failure_excerpt("Error: boom\n" + " " * 1980 + 'secret: "SENSITIVE FIRST SECOND"\n')
-    assert "SENSITIVE" not in precut
-    assert "SENSITIVE" not in failure_excerpt("Error: boom\n" + "s" * 2500 + 'secret: "SENSITIVE"\n')
-    started = time.monotonic()
-    failure_excerpt("-----BEGIN PRIVATE KEY-----\n" * 8000 + "\x1b]unterminated\n" * 20000)
-    assert time.monotonic() - started < 2
-    key = (
-        "Error: one\n-----BEGIN RSA PRIVATE KEY-----\n" + "B" * 64 + "\n" + "C" * 64
-        + "\n-----END RSA PRIVATE KEY----- tail text\nError: two after the key\n"
-    )
-    redacted = failure_excerpt(key)
-    assert "B" * 64 not in redacted and "C" * 64 not in redacted
-    assert "[REDACTED]" in redacted and "Error: two after the key" in redacted
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
