@@ -15,6 +15,7 @@ from typing import Any, Literal
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
 from engineering_control.models.publication_authority import IssueRevisionObservation
 from engineering_control.projects import REPOSITORY_SET
+from engineering_control.security.redaction import SecretRedactor
 
 ALLOWED_REPOSITORIES = REPOSITORY_SET
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
@@ -1791,10 +1792,13 @@ def failure_excerpt(
     (down to that table's closing ruling, without the inner rulings), so the package,
     patched versions and paths fit and no neighbouring advisory bleeds in.
     """
-    lines = [
-        _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
-        for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
-    ]
+    cleaned = "\n".join(
+        _ANSI.sub("", _LOG_PREFIX.sub("", line)) for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
+    )
+    # NEW-248 review 4: redact the whole log before any line or budget cut, so no cut can
+    # split a credential (a token, or a multi-line private key) into an unmatched fragment.
+    # The callers' downstream redaction stays; it does not re-match "[REDACTED]".
+    lines = [line[:300] for line in SecretRedactor().redact_text(cleaned).value.splitlines()]
     audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
     for index, line in enumerate(lines):

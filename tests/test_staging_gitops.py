@@ -4024,23 +4024,28 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     )
     kept = failure_excerpt(timeouts)
     assert "name: 'Rotate secret'" in kept and "name: 'Delete account'" in kept
-    # NEW-248 review 2: a listed headline is cut exactly like its context line, so a token
-    # near the 300-character line bound stays whole for the downstream redaction.
+    # NEW-248 reviews 2-4: the log is redacted before any line or budget cut, so no cut leaves
+    # a credential fragment: a token near the 300-character line bound, a token the final
+    # budget would split, or a private key whose END line falls past the budget.
     token = "ghp_" + "A" * 36
     headline = "Error: request failed " + "x" * 198 + " " + token
     secret = failure_excerpt(f"    {headline}\n    Error: another distinct failure here\n")
-    assert "Distinct errors (2):" in secret
-    assert all(token in line for line in secret.splitlines() if "ghp_" in line)
+    assert "Distinct errors (2):" in secret and "[REDACTED]" in secret
+    assert "ghp_" not in secret
     assert all(len(line) <= 300 for line in secret.splitlines())
-    # NEW-248 review 3: the character budget drops whole lines, so the final cut never leaves
-    # a token fragment in the context either.
     filler = ("f" * 271 + "\n") * 7
     boundary = (
         "    Error: first\n" + filler + "    Error: second\n" + filler + f"    Error: last {token}\n"
     )
     cut = failure_excerpt(boundary)
-    assert all(token in line for line in cut.splitlines() if "ghp_" in line)
-    assert len(cut) <= 4000
+    assert "ghp_" not in cut and len(cut) <= 4000
+    body = "B" * 64
+    pem = (
+        "    Error: one\n" + ("g" * 264 + "\n") * 7 + "    Error: two\n" + ("g" * 264 + "\n") * 7
+        + "    Error: three\n-----BEGIN RSA PRIVATE KEY-----\n"
+        + f"{body}\n{body}\n-----END RSA PRIVATE KEY-----\n"
+    )
+    assert body not in failure_excerpt(pem)
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
