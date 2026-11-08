@@ -3936,6 +3936,145 @@ def test_failure_excerpt_keeps_a_playwright_assertion_diff_new_198() -> None:
     assert "toHaveScreenshot(expected) failed" in failure_excerpt("ok 1 - x\n" * 30 + mismatch)
 
 
+def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
+    """NEW-248: falcone#1574's parity shard (2026-11-08) failed 22 tests with a few distinct
+    errors, but the excerpt was test names and "✘" progress lines (an "error-empty" test name
+    is a marker), so the CI repair never saw Playwright's error summary and returned BLOCKED."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    spec = "tests/parity/pages/console-service-accounts-page.spec.mjs"
+    cells = [
+        (n, journey, width)
+        for n, (journey, width) in enumerate(
+            (journey, width)
+            for width in (375, 768, 1280, 1440, 1920, 2560)
+            for journey in ("data", "action", "error-empty", "accessibility")
+        )
+    ][:22]
+    title = "console-service-accounts-page | tenant_owner | es | {} › {}"
+    progress = "".join(
+        f"  ✘  {n} {spec}:{232 + n}:5 › {title.format(width, journey)} (13.7s)\n"
+        + f"  ✓  {n + 100} {spec}:900:5 › {title.format(width, 'responsive')} (1.1s)\n"
+        for n, journey, width in cells
+    )
+    polite = "locator('[data-live-announcer=\"polite\"]')"
+    assertive = "locator('[data-live-announcer=\"assertive\"]')"
+    blocks = []
+    for n, journey, width in cells:
+        if journey == "data":
+            error = ["    Error: locator.dispatchEvent: Test timeout of 60000ms exceeded."]
+        else:
+            locator = assertive if journey != "action" else polite
+            error = [
+                "    Error: expect(locator).toContainText(expected) failed",
+                "",
+                f"    Locator: {locator}",
+                '    Expected substring: "No se pudo crear la cuenta de servicio"',
+                f"    Error: strict mode violation: {locator} resolved to 2 elements:",
+                '        1) <div class="sr-only" aria-live="polite">' + "x" * 200 + "</div>",
+                '        2) <div class="sr-only" aria-live="polite">' + "y" * 200 + "</div>",
+            ]
+        frame = [f"      {r} |       await expect(region).toBeVisible();" for r in range(370, 380)]
+        blocks.append(
+            "\n".join(
+                [f"  {n + 1}) {spec}:{232 + n}:5 › {title.format(width, journey)} ───", ""]
+                + error
+                + ["", *frame, "    > 380 |       await expect(assertive(p)).toContainText(t);"]
+            )
+        )
+    excerpt = failure_excerpt(progress + "\n".join(blocks) + "\n  22 failed\n")
+    lines = excerpt.splitlines()
+    assert lines[0] == "Failing tests (22):"
+    assert any(line.startswith("... and ") and line.endswith(" more") for line in lines)
+    for error in (
+        "Error: locator.dispatchEvent: Test timeout of 60000ms exceeded.",
+        f"Error: strict mode violation: {polite} resolved to 2 elements:",
+        f"Error: strict mode violation: {assertive} resolved to 2 elements:",
+    ):
+        assert error in lines, error
+    distinct = lines.index("Distinct errors (4):")
+    assert lines.index("Context:") > distinct
+    # A "✘" progress line is no marker: its passing neighbours never reach the context.
+    assert "responsive" not in excerpt
+    assert len(lines) <= 60 and len(excerpt) <= 4000
+    # A single error is not listed twice; a short generic marker keeps repeating per test.
+    single = failure_excerpt("  ✘  1 a.spec.mjs:1:1 › t (1s)\n    Error: boom happened here\n")
+    assert "Distinct errors" not in single
+    tap = failure_excerpt("".join(f"not ok {n} - t{n}\n  error: |-\n    e{n}\n" for n in range(3)))
+    assert all(f"e{n}" in tap for n in range(3))
+    # NEW-248 review: two axe assertions share their headline but not their diff; both rule
+    # IDs and selectors stay.
+    axe = "".join(
+        f"  {n}) a.spec.mjs:{n}:1 › axe {rule} ───\n\n"
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n"
+        f'    +     "id": "{rule}",\n    +     "target": "#{rule}-node",\n\n'
+        f"    > {n} |   expect(violations).toEqual([]);\n"
+        for n, rule in ((1, "color-contrast"), (2, "aria-hidden-focus"))
+    )
+    both = failure_excerpt(axe)
+    for rule in ("color-contrast", "aria-hidden-focus"):
+        assert f'"id": "{rule}"' in both and f"#{rule}-node" in both
+    # NEW-248 review 2: identical timeout headlines keep each failure's own call log.
+    timeouts = "".join(
+        f"  {n}) a.spec.mjs:{n}:1 › t{n} ───\n\n"
+        "    Error: locator.click: Test timeout of 30000ms exceeded.\n"
+        f"    Call log:\n      - waiting for getByRole('button', {{ name: '{name}' }})\n\n"
+        + "".join(f"      {row} |   await step{row}();\n" for row in range(20))
+        for n, name in ((1, "Rotate secret"), (2, "Delete account"))
+    )
+    kept = failure_excerpt(timeouts)
+    assert "name: 'Rotate secret'" in kept and "name: 'Delete account'" in kept
+    # NEW-248 reviews 2-4 and 8: redaction stays downstream (as on origin/main), so no cut
+    # may leave a fragment it cannot match: a listed headline is the same 300-character line
+    # as its context, the budget drops whole lines, and a private key whose END the budget
+    # would drop is dropped from its BEGIN line on.
+    from engineering_control.security.redaction import SecretRedactor
+
+    def redacted(text: str) -> str:
+        return str(SecretRedactor().redact_text(text).value)
+
+    token = "ghp_" + "A" * 36
+    headline = "Error: request failed " + "x" * 198 + " " + token
+    secret = failure_excerpt(f"    {headline}\n    Error: another distinct failure here\n")
+    assert "Distinct errors (2):" in secret
+    assert all(token in line for line in secret.splitlines() if "ghp_" in line)
+    assert "ghp_" not in redacted(secret)
+    filler = ("f" * 271 + "\n") * 7
+    boundary = (
+        "    Error: first\n"
+        + filler
+        + "    Error: second\n"
+        + filler
+        + f"    Error: last {token}\n"
+    )
+    cut = failure_excerpt(boundary)
+    assert all(token in line for line in cut.splitlines() if "ghp_" in line)
+    assert len(cut) <= 4000
+    body = "B" * 64
+    pem = (
+        "    Error: one\n"
+        + ("g" * 264 + "\n") * 7
+        + "    Error: two\n"
+        + ("g" * 264 + "\n") * 7
+        + "    Error: three\n-----BEGIN RSA PRIVATE KEY-----\n"
+        + f"{body}\n{body}\n-----END RSA PRIVATE KEY-----\n"
+    )
+    assert body not in redacted(failure_excerpt(pem))
+    whole = failure_excerpt(
+        f"Error: one\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n"
+        "-----END RSA PRIVATE KEY-----\nError: two\n"
+    )
+    assert body not in redacted(whole) and "Error: two" in whole
+    # The selection stays fast on long logs (redaction is not part of it).
+    import time
+
+    started = time.monotonic()
+    failure_excerpt(
+        "\n" * 16384 + "token: " + " " * 131072 + "x\n" + "-----BEGIN PRIVATE KEY-----\n" * 8000
+    )
+    assert time.monotonic() - started < 2
+
+
 # -- NEW-155: staging environment recovery ----------------------------------------------
 
 ESO_FUNCTION_INVOCATION = {

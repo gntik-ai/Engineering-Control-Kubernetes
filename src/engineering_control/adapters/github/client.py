@@ -1771,6 +1771,16 @@ _PLAYWRIGHT_NOISE_LINE = re.compile(
 _PLAYWRIGHT_ASSERTION = re.compile(r"^\s*Error: expect\(")
 _CODE_FRAME_FAILING_LINE = re.compile(r"^\s*>\s*\d+\s*\|")
 _ASSERTION_DIFF_LINES = 30
+# NEW-248: falcone#1574's parity shard (2026-11-08) failed 22 tests with three distinct errors,
+# but the excerpt was the 25 test names plus "✘" progress lines (an "error-empty" test name is
+# a marker) and never reached Playwright's error summary, so the CI repair returned BLOCKED.
+_PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
+# NEW-248: every distinct "Error: …" headline is listed once after the test names, so each
+# root cause is named even when the context budget runs out before its block.
+_ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
+_DISTINCT_ERROR_LINES = 10
+_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
 
 def failure_excerpt(
@@ -1804,6 +1814,8 @@ def failure_excerpt(
             and not _PASSING_LINE.match(line)
             and not _BUILD_ASSET_LINE.match(line)
             and not _PLAYWRIGHT_NOISE_LINE.match(line)
+            # NEW-248: a "✘" progress line is named in the header; its neighbours are progress.
+            and not _PLAYWRIGHT_PROGRESS_FAILURE.match(line)
         ):
             end = index + context
             if _PLAYWRIGHT_ASSERTION.match(line):
@@ -1823,9 +1835,28 @@ def failure_excerpt(
     header: list[str] = []
     if failing:
         shown = failing[:_FAILING_TEST_SUMMARY_LINES]
+        # NEW-248: the names take at most a quarter of the characters, so the context fits.
+        while len(shown) > 1 and sum(len(name) + 1 for name in shown) > max_chars // 4:
+            shown.pop()
         header = [f"Failing tests ({len(failing)}):", *shown]
         if len(failing) > len(shown):
             header.append(f"... and {len(failing) - len(shown)} more")
+    errors = list(
+        dict.fromkeys(
+            # Each line is already cut like every context line, so redaction sees the same text.
+            line.strip()
+            for line in lines
+            if _ERROR_HEADLINE.match(line) and not _PLAYWRIGHT_NOISE_LINE.match(line)
+        )
+    )
+    if len(errors) > 1:
+        header.append(f"Distinct errors ({len(errors)}):")
+        for error in errors[:_DISTINCT_ERROR_LINES]:
+            # Names and errors together take at most half the characters.
+            if sum(len(line) + 1 for line in header) + len(error) > max_chars // 2:
+                break
+            header.append(error)
+    if header:
         header.append("Context:")
     selected: list[str] = []
     last = -2
@@ -1839,7 +1870,27 @@ def failure_excerpt(
         last = index
         if len(header) + len(selected) >= max_lines:
             break
-    return "\n".join([*header, *selected][:max_lines])[:max_chars]
+    # NEW-248 review 3: the character budget drops whole lines, never cuts one, so a credential
+    # is either complete (and caught by the downstream redaction) or absent, never a fragment.
+    kept: list[str] = []
+    used = 0
+    for line in [*header, *selected][:max_lines]:
+        if used + len(line) > max_chars:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    # NEW-248 review 4: a private key the budget would split (its END line not kept) is
+    # dropped from its BEGIN line on, since the downstream redaction matches only whole keys.
+    opened: int | None = None
+    for index, line in enumerate(kept):
+        begin = _PRIVATE_KEY_BEGIN.search(line)
+        if opened is None and begin and not _PRIVATE_KEY_END.search(line, begin.end()):
+            opened = index
+        elif opened is not None and _PRIVATE_KEY_END.search(line):
+            opened = None
+    if opened is not None:
+        kept = kept[:opened]
+    return "\n".join(kept)
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:
