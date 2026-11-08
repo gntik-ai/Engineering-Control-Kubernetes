@@ -1868,7 +1868,16 @@ def failure_excerpt(
         last = index
         if len(header) + len(selected) >= max_lines:
             break
-    return "\n".join([*header, *selected][:max_lines])[:max_chars]
+    # NEW-248 review 3: the character budget drops whole lines, never cuts one, so a credential
+    # is either complete (and caught by the downstream redaction) or absent, never a fragment.
+    kept: list[str] = []
+    used = 0
+    for line in [*header, *selected][:max_lines]:
+        if used + len(line) > max_chars:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return "\n".join(kept)
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:

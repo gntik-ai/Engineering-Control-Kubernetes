@@ -4032,6 +4032,15 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     assert "Distinct errors (2):" in secret
     assert all(token in line for line in secret.splitlines() if "ghp_" in line)
     assert all(len(line) <= 300 for line in secret.splitlines())
+    # NEW-248 review 3: the character budget drops whole lines, so the final cut never leaves
+    # a token fragment in the context either.
+    filler = ("f" * 271 + "\n") * 7
+    boundary = (
+        "    Error: first\n" + filler + "    Error: second\n" + filler + f"    Error: last {token}\n"
+    )
+    cut = failure_excerpt(boundary)
+    assert all(token in line for line in cut.splitlines() if "ghp_" in line)
+    assert len(cut) <= 4000
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
