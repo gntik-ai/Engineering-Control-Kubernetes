@@ -4041,25 +4041,37 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     assert "ghp_" not in redacted(secret)
     filler = ("f" * 271 + "\n") * 7
     boundary = (
-        "    Error: first\n" + filler + "    Error: second\n" + filler + f"    Error: last {token}\n"
+        "    Error: first\n"
+        + filler
+        + "    Error: second\n"
+        + filler
+        + f"    Error: last {token}\n"
     )
     cut = failure_excerpt(boundary)
     assert all(token in line for line in cut.splitlines() if "ghp_" in line)
     assert len(cut) <= 4000
     body = "B" * 64
     pem = (
-        "    Error: one\n" + ("g" * 264 + "\n") * 7 + "    Error: two\n" + ("g" * 264 + "\n") * 7
+        "    Error: one\n"
+        + ("g" * 264 + "\n") * 7
+        + "    Error: two\n"
+        + ("g" * 264 + "\n") * 7
         + "    Error: three\n-----BEGIN RSA PRIVATE KEY-----\n"
         + f"{body}\n{body}\n-----END RSA PRIVATE KEY-----\n"
     )
     assert body not in redacted(failure_excerpt(pem))
-    whole = failure_excerpt(f"Error: one\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\nError: two\n")
+    whole = failure_excerpt(
+        f"Error: one\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n"
+        "-----END RSA PRIVATE KEY-----\nError: two\n"
+    )
     assert body not in redacted(whole) and "Error: two" in whole
     # The selection stays fast on long logs (redaction is not part of it).
     import time
 
     started = time.monotonic()
-    failure_excerpt("\n" * 16384 + "token: " + " " * 131072 + "x\n" + "-----BEGIN PRIVATE KEY-----\n" * 8000)
+    failure_excerpt(
+        "\n" * 16384 + "token: " + " " * 131072 + "x\n" + "-----BEGIN PRIVATE KEY-----\n" * 8000
+    )
     assert time.monotonic() - started < 2
 
 
