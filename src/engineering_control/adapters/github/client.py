@@ -1771,6 +1771,17 @@ _PLAYWRIGHT_NOISE_LINE = re.compile(
 _PLAYWRIGHT_ASSERTION = re.compile(r"^\s*Error: expect\(")
 _CODE_FRAME_FAILING_LINE = re.compile(r"^\s*>\s*\d+\s*\|")
 _ASSERTION_DIFF_LINES = 30
+# NEW-248: falcone#1574's parity shard (2026-11-08) failed 22 tests with three distinct errors,
+# but the excerpt was the 25 test names plus "✘" progress lines (an "error-empty" test name is
+# a marker) and never reached Playwright's error summary, so the CI repair returned BLOCKED.
+_PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
+# NEW-248: a marker line at least this long that repeats verbatim adds no second block.
+_REPEATED_MARKER_MIN_CHARS = 24
+# NEW-248: every distinct "Error: …" headline is listed once after the test names, so each
+# root cause is named even when the context budget runs out before its block.
+_ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
+_DISTINCT_ERROR_LINES = 10
+_DISTINCT_ERROR_CHARS = 240
 
 
 def failure_excerpt(
@@ -1789,6 +1800,7 @@ def failure_excerpt(
     ]
     audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
+    markers: set[str] = set()
     for index, line in enumerate(lines):
         if index in audit_tables:
             # Only a high/critical advisory is a finding; its table's rows are kept whole.
@@ -1804,7 +1816,17 @@ def failure_excerpt(
             and not _PASSING_LINE.match(line)
             and not _BUILD_ASSET_LINE.match(line)
             and not _PLAYWRIGHT_NOISE_LINE.match(line)
+            # NEW-248: a "✘" progress line is named in the header; its neighbours are progress.
+            and not _PLAYWRIGHT_PROGRESS_FAILURE.match(line)
         ):
+            # NEW-248: a repeated marker ("Error: strict mode violation …", "Expected substring:
+            # …") adds no second block, so each distinct error of a many-test failure gets its
+            # context within the budget; short generic lines ("error: |-") still repeat.
+            marker = line.strip()
+            if len(marker) >= _REPEATED_MARKER_MIN_CHARS:
+                if marker in markers:
+                    continue
+                markers.add(marker)
             end = index + context
             if _PLAYWRIGHT_ASSERTION.match(line):
                 bound = min(len(lines) - 1, index + _ASSERTION_DIFF_LINES)
@@ -1823,9 +1845,23 @@ def failure_excerpt(
     header: list[str] = []
     if failing:
         shown = failing[:_FAILING_TEST_SUMMARY_LINES]
+        # NEW-248: the names take at most a quarter of the characters, so the context fits.
+        while len(shown) > 1 and sum(len(name) + 1 for name in shown) > max_chars // 4:
+            shown.pop()
         header = [f"Failing tests ({len(failing)}):", *shown]
         if len(failing) > len(shown):
             header.append(f"... and {len(failing) - len(shown)} more")
+    errors = list(
+        dict.fromkeys(
+            line.strip()[:_DISTINCT_ERROR_CHARS]
+            for line in lines
+            if _ERROR_HEADLINE.match(line) and not _PLAYWRIGHT_NOISE_LINE.match(line)
+        )
+    )
+    if len(errors) > 1:
+        header.append(f"Distinct errors ({len(errors)}):")
+        header.extend(errors[:_DISTINCT_ERROR_LINES])
+    if header:
         header.append("Context:")
     selected: list[str] = []
     last = -2

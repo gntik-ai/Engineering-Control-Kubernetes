@@ -3936,6 +3936,74 @@ def test_failure_excerpt_keeps_a_playwright_assertion_diff_new_198() -> None:
     assert "toHaveScreenshot(expected) failed" in failure_excerpt("ok 1 - x\n" * 30 + mismatch)
 
 
+def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
+    """NEW-248: falcone#1574's parity shard (2026-11-08) failed 22 tests with a few distinct
+    errors, but the excerpt was test names and "✘" progress lines (an "error-empty" test name
+    is a marker), so the CI repair never saw Playwright's error summary and returned BLOCKED."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    spec = "tests/parity/pages/console-service-accounts-page.spec.mjs"
+    cells = [
+        (n, journey, width)
+        for n, (journey, width) in enumerate(
+            (journey, width)
+            for width in (375, 768, 1280, 1440, 1920, 2560)
+            for journey in ("data", "action", "error-empty", "accessibility")
+        )
+    ][:22]
+    title = "console-service-accounts-page | tenant_owner | es | {} › {}"
+    progress = "".join(
+        f"  ✘  {n} {spec}:{232 + n}:5 › {title.format(width, journey)} (13.7s)\n"
+        + f"  ✓  {n + 100} {spec}:900:5 › {title.format(width, 'responsive')} (1.1s)\n"
+        for n, journey, width in cells
+    )
+    polite = "locator('[data-live-announcer=\"polite\"]')"
+    assertive = "locator('[data-live-announcer=\"assertive\"]')"
+    blocks = []
+    for n, journey, width in cells:
+        if journey == "data":
+            error = ["    Error: locator.dispatchEvent: Test timeout of 60000ms exceeded."]
+        else:
+            locator = assertive if journey != "action" else polite
+            error = [
+                "    Error: expect(locator).toContainText(expected) failed",
+                "",
+                f"    Locator: {locator}",
+                '    Expected substring: "No se pudo crear la cuenta de servicio"',
+                f"    Error: strict mode violation: {locator} resolved to 2 elements:",
+                '        1) <div class="sr-only" aria-live="polite">' + "x" * 200 + "</div>",
+                '        2) <div class="sr-only" aria-live="polite">' + "y" * 200 + "</div>",
+            ]
+        frame = [f"      {r} |       await expect(region).toBeVisible();" for r in range(370, 380)]
+        blocks.append(
+            "\n".join(
+                [f"  {n + 1}) {spec}:{232 + n}:5 › {title.format(width, journey)} ───", ""]
+                + error
+                + ["", *frame, "    > 380 |       await expect(assertive(p)).toContainText(t);"]
+            )
+        )
+    excerpt = failure_excerpt(progress + "\n".join(blocks) + "\n  22 failed\n")
+    lines = excerpt.splitlines()
+    assert lines[0] == "Failing tests (22):"
+    assert any(line.startswith("... and ") and line.endswith(" more") for line in lines)
+    for error in (
+        "Error: locator.dispatchEvent: Test timeout of 60000ms exceeded.",
+        f"Error: strict mode violation: {polite} resolved to 2 elements:",
+        f"Error: strict mode violation: {assertive} resolved to 2 elements:",
+    ):
+        assert error in lines, error
+    distinct = lines.index("Distinct errors (4):")
+    assert lines.index("Context:") > distinct
+    # A "✘" progress line is no marker: its passing neighbours never reach the context.
+    assert "responsive" not in excerpt
+    assert len(lines) <= 60 and len(excerpt) <= 4000
+    # A single error is not listed twice; a short generic marker keeps repeating per test.
+    single = failure_excerpt("  ✘  1 a.spec.mjs:1:1 › t (1s)\n    Error: boom happened here\n")
+    assert "Distinct errors" not in single
+    tap = failure_excerpt("".join(f"not ok {n} - t{n}\n  error: |-\n    e{n}\n" for n in range(3)))
+    assert all(f"e{n}" in tap for n in range(3))
+
+
 # -- NEW-155: staging environment recovery ----------------------------------------------
 
 ESO_FUNCTION_INVOCATION = {
