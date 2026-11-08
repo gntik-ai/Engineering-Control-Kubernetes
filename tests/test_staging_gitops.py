@@ -4054,6 +4054,16 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     blank = failure_excerpt("\n" * 16384 + "  \t\n" * 16384 + "Error: boom happened\n")
     assert time.monotonic() - started < 2
     assert "Error: boom happened" in blank
+    # NEW-248 review 6: nor on a credential line with a long whitespace run (65k spaces took
+    # 9 s), nor on many YAML credentials padded before a comment.
+    started = time.monotonic()
+    padded = failure_excerpt(
+        "token: " + " " * 131072 + "[REDACTED]\nnext line\n"
+        + ("password:" + " " * 1000 + "# empty default\n") * 2000
+        + "Error: boom happened\n"
+    )
+    assert time.monotonic() - started < 2
+    assert "Error: boom happened" in padded
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------

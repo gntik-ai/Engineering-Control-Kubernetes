@@ -1780,6 +1780,7 @@ _PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
 # root cause is named even when the context budget runs out before its block.
 _ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
 _DISTINCT_ERROR_LINES = 10
+_WHITESPACE_RUN = re.compile(r"[ \t]{17,}")
 
 
 def failure_excerpt(
@@ -1794,7 +1795,10 @@ def failure_excerpt(
     """
     stripped: list[str] = []
     for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines():
-        text = _ANSI.sub("", _LOG_PREFIX.sub("", line))
+        # NEW-248 review 6: the redactor's patterns backtrack through whitespace, so a long
+        # run inside a line is bounded and a line is cut well past the 300 characters the
+        # excerpt keeps (a credential starting there is still redacted whole) before redaction.
+        text = _WHITESPACE_RUN.sub(" " * 16, _ANSI.sub("", _LOG_PREFIX.sub("", line))[:2000])
         # NEW-248 review 5: a run of blank or whitespace-only lines becomes one empty line.
         # The redactor's multiline "^\s*" patterns rescan such runs from every line start,
         # which made redacting a 2 MB log quadratic; blank lines carry no evidence.
