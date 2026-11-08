@@ -4014,6 +4014,24 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     both = failure_excerpt(axe)
     for rule in ("color-contrast", "aria-hidden-focus"):
         assert f'"id": "{rule}"' in both and f"#{rule}-node" in both
+    # NEW-248 review 2: identical timeout headlines keep each failure's own call log.
+    timeouts = "".join(
+        f"  {n}) a.spec.mjs:{n}:1 › t{n} ───\n\n"
+        "    Error: locator.click: Test timeout of 30000ms exceeded.\n"
+        f"    Call log:\n      - waiting for getByRole('button', {{ name: '{name}' }})\n\n"
+        + "".join(f"      {row} |   await step{row}();\n" for row in range(20))
+        for n, name in ((1, "Rotate secret"), (2, "Delete account"))
+    )
+    kept = failure_excerpt(timeouts)
+    assert "name: 'Rotate secret'" in kept and "name: 'Delete account'" in kept
+    # NEW-248 review 2: a listed headline is cut exactly like its context line, so a token
+    # near the 300-character line bound stays whole for the downstream redaction.
+    token = "ghp_" + "A" * 36
+    headline = "Error: request failed " + "x" * 198 + " " + token
+    secret = failure_excerpt(f"    {headline}\n    Error: another distinct failure here\n")
+    assert "Distinct errors (2):" in secret
+    assert all(token in line for line in secret.splitlines() if "ghp_" in line)
+    assert all(len(line) <= 300 for line in secret.splitlines())
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------

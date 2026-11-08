@@ -1775,13 +1775,10 @@ _ASSERTION_DIFF_LINES = 30
 # but the excerpt was the 25 test names plus "✘" progress lines (an "error-empty" test name is
 # a marker) and never reached Playwright's error summary, so the CI repair returned BLOCKED.
 _PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
-# NEW-248: a marker line at least this long that repeats verbatim adds no second block.
-_REPEATED_MARKER_MIN_CHARS = 24
 # NEW-248: every distinct "Error: …" headline is listed once after the test names, so each
 # root cause is named even when the context budget runs out before its block.
 _ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
 _DISTINCT_ERROR_LINES = 10
-_DISTINCT_ERROR_CHARS = 240
 
 
 def failure_excerpt(
@@ -1800,7 +1797,6 @@ def failure_excerpt(
     ]
     audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
-    markers: set[str] = set()
     for index, line in enumerate(lines):
         if index in audit_tables:
             # Only a high/critical advisory is a finding; its table's rows are kept whole.
@@ -1819,15 +1815,6 @@ def failure_excerpt(
             # NEW-248: a "✘" progress line is named in the header; its neighbours are progress.
             and not _PLAYWRIGHT_PROGRESS_FAILURE.match(line)
         ):
-            # NEW-248: a repeated marker ("Error: strict mode violation …", "Expected substring:
-            # …") adds no second block, so each distinct error of a many-test failure gets its
-            # context within the budget; short generic lines ("error: |-") still repeat, and so
-            # does an assertion headline, whose diff (an axe rule ID) differs per failure.
-            marker = line.strip()
-            if len(marker) >= _REPEATED_MARKER_MIN_CHARS and not _PLAYWRIGHT_ASSERTION.match(line):
-                if marker in markers:
-                    continue
-                markers.add(marker)
             end = index + context
             if _PLAYWRIGHT_ASSERTION.match(line):
                 bound = min(len(lines) - 1, index + _ASSERTION_DIFF_LINES)
@@ -1854,14 +1841,19 @@ def failure_excerpt(
             header.append(f"... and {len(failing) - len(shown)} more")
     errors = list(
         dict.fromkeys(
-            line.strip()[:_DISTINCT_ERROR_CHARS]
+            # Each line is already cut like every context line, so redaction sees the same text.
+            line.strip()
             for line in lines
             if _ERROR_HEADLINE.match(line) and not _PLAYWRIGHT_NOISE_LINE.match(line)
         )
     )
     if len(errors) > 1:
         header.append(f"Distinct errors ({len(errors)}):")
-        header.extend(errors[:_DISTINCT_ERROR_LINES])
+        for error in errors[:_DISTINCT_ERROR_LINES]:
+            # Names and errors together take at most half the characters.
+            if sum(len(line) + 1 for line in header) + len(error) > max_chars // 2:
+                break
+            header.append(error)
     if header:
         header.append("Context:")
     selected: list[str] = []
