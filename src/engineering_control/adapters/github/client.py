@@ -1792,9 +1792,18 @@ def failure_excerpt(
     (down to that table's closing ruling, without the inner rulings), so the package,
     patched versions and paths fit and no neighbouring advisory bleeds in.
     """
-    cleaned = "\n".join(
-        _ANSI.sub("", _LOG_PREFIX.sub("", line)) for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
-    )
+    stripped: list[str] = []
+    for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines():
+        text = _ANSI.sub("", _LOG_PREFIX.sub("", line))
+        # NEW-248 review 5: a run of blank or whitespace-only lines becomes one empty line.
+        # The redactor's multiline "^\s*" patterns rescan such runs from every line start,
+        # which made redacting a 2 MB log quadratic; blank lines carry no evidence.
+        if not text.strip():
+            if stripped and stripped[-1] == "":
+                continue
+            text = ""
+        stripped.append(text)
+    cleaned = "\n".join(stripped)
     # NEW-248 review 4: redact the whole log before any line or budget cut, so no cut can
     # split a credential (a token, or a multi-line private key) into an unmatched fragment.
     # The callers' downstream redaction stays; it does not re-match "[REDACTED]".

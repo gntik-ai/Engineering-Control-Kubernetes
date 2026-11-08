@@ -4046,6 +4046,14 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
         + f"{body}\n{body}\n-----END RSA PRIVATE KEY-----\n"
     )
     assert body not in failure_excerpt(pem)
+    import time
+
+    # NEW-248 review 5: whole-log redaction stays linear on runs of blank lines (the
+    # redactor's multiline "^\s*" patterns were quadratic there: 16k blank lines took 15 s).
+    started = time.monotonic()
+    blank = failure_excerpt("\n" * 16384 + "  \t\n" * 16384 + "Error: boom happened\n")
+    assert time.monotonic() - started < 2
+    assert "Error: boom happened" in blank
 
 
 # -- NEW-155: staging environment recovery ----------------------------------------------
