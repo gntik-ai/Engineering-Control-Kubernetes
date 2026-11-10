@@ -1779,6 +1779,19 @@ _PLAYWRIGHT_PROGRESS_FAILURE = re.compile(r"^\s*✘\s+\d+\s+\S")
 # root cause is named even when the context budget runs out before its block.
 _ERROR_HEADLINE = re.compile(r"^\s*Error: \S")
 _DISTINCT_ERROR_LINES = 10
+# NEW-249: falcone#1620's parity shard (2026-11-10) failed six accessibility cells on axe
+# "target-size", but the flagged elements sit deep in the Received diff (past the NEW-198
+# bound and the character budget), so two CI repairs checked the wrong button and made no
+# commit. Each violated rule is listed with the HTML of every node that violates it. In the
+# diff a node's "html" is indented 4 columns deeper than its violation's "id"; check ids and
+# relatedNodes html are deeper still. NEW-249 review 1: only an axe violation counts, that is
+# an "id" directly after a "helpUrl" on dequeuniversity.com/rules/axe at the same indent,
+# inside an assertion block (after an "Error: …" headline), so another toEqual diff with
+# "id" and "html" fields lists nothing.
+_AXE_DIFF_FIELD = re.compile(r'^\s*\+(\s*)"(id|html|helpUrl)": "(.*?)"?,?$')
+_AXE_HELP_URL = re.compile(r"^https://dequeuniversity\.com/rules/axe/")
+_AXE_NODE_INDENT = 4
+_AXE_VIOLATION_LINES = 8
 _PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
@@ -1856,6 +1869,14 @@ def failure_excerpt(
             if sum(len(line) + 1 for line in header) + len(error) > max_chars // 2:
                 break
             header.append(error)
+    violations = _axe_violations(lines)
+    if violations:
+        header.append(f"Axe violations ({len(violations)}):")
+        for violation in violations[:_AXE_VIOLATION_LINES]:
+            # Names, errors and violations together take at most three quarters.
+            if sum(len(line) + 1 for line in header) + len(violation) > max_chars * 3 // 4:
+                break
+            header.append(violation)
     if header:
         header.append("Context:")
     selected: list[str] = []
@@ -1891,6 +1912,35 @@ def failure_excerpt(
     if opened is not None:
         kept = kept[:opened]
     return "\n".join(kept)
+
+
+def _axe_violations(lines: list[str]) -> list[str]:
+    """NEW-249: "rule: <node html>" once per violating node of each axe assertion diff."""
+    found: list[str] = []
+    in_assertion = False
+    help_indent: int | None = None  # indent of the axe helpUrl just seen, if any
+    rule: str | None = None
+    rule_indent = 0
+    for line in lines:
+        if _ERROR_HEADLINE.match(line):
+            # A new assertion's diff starts after its headline.
+            in_assertion, help_indent, rule = True, None, None
+            continue
+        field = _AXE_DIFF_FIELD.match(line) if in_assertion else None
+        if not field:
+            continue
+        indent, name, value = len(field.group(1)), field.group(2), field.group(3)
+        if name == "helpUrl":
+            help_indent = indent if _AXE_HELP_URL.match(value) else None
+        elif name == "id":
+            if help_indent == indent:
+                rule, rule_indent = value, indent
+            elif rule is not None and indent <= rule_indent:
+                rule = None  # a sibling object that is no axe violation
+            help_indent = None
+        elif rule is not None and indent == rule_indent + _AXE_NODE_INDENT:
+            found.append(f"{rule}: " + value.replace('\\"', '"'))
+    return list(dict.fromkeys(found))
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:

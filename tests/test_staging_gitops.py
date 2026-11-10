@@ -4075,6 +4075,117 @@ def test_failure_excerpt_names_each_distinct_playwright_error_new_248() -> None:
     assert time.monotonic() - started < 2
 
 
+def _axe_assertion(rule: str, nodes: Sequence[str], related: str) -> str:
+    """One Playwright axe assertion, laid out like falcone#1620's parity log."""
+    node_blocks = "".join(
+        "    +       Object {\n"
+        '    +         "any": Array [\n'
+        "    +           Object {\n"
+        f'    +             "id": "{rule}-check",\n'
+        '    +             "relatedNodes": Array [\n'
+        "    +               Object {\n"
+        f'    +                 "html": "{related}",\n'
+        "    +               },\n"
+        "    +             ],\n"
+        "    +           },\n"
+        "    +         ],\n"
+        f'    +         "html": "{node}",\n'
+        "    +       },\n"
+        for node in nodes
+    )
+    return (
+        "    Error: accessibility: serious/critical axe violations\n\n"
+        "    expect(received).toEqual(expected) // deep equality\n\n"
+        "    + Array [\n"
+        "    +   Object {\n"
+        '    +     "description": "' + "d" * 200 + '",\n'
+        f'    +     "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/{rule}",\n'
+        f'    +     "id": "{rule}",\n'
+        '    +     "nodes": Array [\n'
+        f"{node_blocks}"
+        "    +     ],\n"
+        "    +   },\n"
+        "    + ]\n\n"
+        "    > 49 |   expect(result.violations).toEqual([]);\n"
+    )
+
+
+def test_failure_excerpt_lists_axe_violation_nodes_new_249() -> None:
+    """NEW-249: falcone#1620's parity shard (2026-11-10) failed six accessibility cells on axe
+    "target-size", but the flagged element sat deep in the Received diff, beyond the NEW-198
+    bound and the character budget, so two CI repairs checked the wrong button and made no
+    commit."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    clear = '<button type=\\"button\\" aria-label=\\"Sin rol inicial\\" class=\\"p-1\\">'
+    combobox = '<button role=\\"combobox\\" id=\\"base-ui-_r_14_\\">'
+    toast = '<div role=\\"alertdialog\\" aria-hidden=\\"true\\" tabindex=\\"0\\">'
+    cells = "".join(
+        f"  {n}) iam.spec.mjs:152:5 › iam | es | {width} › accessibility ───\n\n"
+        + _axe_assertion("target-size", [clear], combobox)
+        for n, width in enumerate((375, 768, 1280, 375, 768, 1280), start=1)
+    )
+    other = "  7) rotation.spec.mjs:1:1 › rotation › accessibility ───\n\n" + _axe_assertion(
+        "aria-hidden-focus", [toast, clear], combobox
+    )
+    excerpt = failure_excerpt(cells + other + "\n  7 failed\n")
+    lines = excerpt.splitlines()
+    unescaped = clear.replace('\\"', '"')
+    expected = [
+        f"target-size: {unescaped}",
+        "aria-hidden-focus: " + toast.replace('\\"', '"'),
+        f"aria-hidden-focus: {unescaped}",
+    ]
+    start = lines.index("Axe violations (3):")
+    # Each node once per rule, in order; a check id is no rule and a related node no node.
+    assert lines[start + 1 : start + 4] == expected
+    assert lines.index("Context:") > start + 3
+    assert not any(
+        line.startswith(("target-size-check", "target-size: <button role")) for line in lines
+    )
+    assert len(lines) <= 60 and len(excerpt) <= 4000
+    # NEW-249 review 1: only axe violations count. Fields before any assertion headline, and
+    # another toEqual diff with an "id" and an "html" four columns deeper, list nothing.
+    article = (
+        "    +   Object {\n"
+        '    +     "id": "article-{n}",\n'
+        '    +     "children": Array [\n'
+        "    +       Object {\n"
+        '    +         "html": "<p>paragraph {n}</p>",\n'
+        "    +       },\n"
+        "    +     ],\n"
+        "    +   },\n"
+    )
+    stray = (
+        '    +     "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/stray",\n'
+        '    +     "id": "stray",\n    +         "html": "<b>stray</b>",\n'
+    )
+    other = (
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n    + Array [\n"
+        + "".join(article.replace("{n}", str(n)) for n in range(10))
+        + "    + ]\n"
+    )
+    assert "Axe violations" not in failure_excerpt(stray + other)
+    # Mixed: a genuine violation after eight non-axe objects is still listed.
+    mixed = failure_excerpt(
+        other + "  2) iam.spec.mjs:1:1 › axe ───\n\n" + _axe_assertion("label", [clear], combobox)
+    )
+    assert mixed.splitlines()[mixed.splitlines().index("Axe violations (1):") + 1] == (
+        f"label: {unescaped}"
+    )
+    assert "paragraph" not in mixed.split("Context:")[0]
+    # Long node HTML (cut at 300 characters like every line) is kept within the budget.
+    wide = '<div class=\\"' + "w" * 400 + '\\">'
+    many = "".join(
+        f"  {n}) a.spec.mjs:{n}:1 › axe ───\n\n" + _axe_assertion(f"rule-{n}", [wide], combobox)
+        for n in range(12)
+    )
+    bounded = failure_excerpt(many)
+    listed = [line for line in bounded.splitlines() if line.startswith("rule-")]
+    assert 1 <= len(listed) <= 8
+    assert len(bounded) <= 4000
+
+
 # -- NEW-155: staging environment recovery ----------------------------------------------
 
 ESO_FUNCTION_INVOCATION = {
