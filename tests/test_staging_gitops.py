@@ -4099,6 +4099,7 @@ def _axe_assertion(rule: str, nodes: Sequence[str], related: str) -> str:
         "    + Array [\n"
         "    +   Object {\n"
         '    +     "description": "' + "d" * 200 + '",\n'
+        f'    +     "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/{rule}",\n'
         f'    +     "id": "{rule}",\n'
         '    +     "nodes": Array [\n'
         f"{node_blocks}"
@@ -4143,9 +4144,36 @@ def test_failure_excerpt_lists_axe_violation_nodes_new_249() -> None:
         line.startswith(("target-size-check", "target-size: <button role")) for line in lines
     )
     assert len(lines) <= 60 and len(excerpt) <= 4000
-    # An "id" before any assertion headline, or a diff without a node, lists nothing.
-    plain = failure_excerpt('    +     "id": "stray",\n    Error: boom happened here\n')
-    assert "Axe violations" not in plain
+    # NEW-249 review 1: only axe violations count. Fields before any assertion headline, and
+    # another toEqual diff with an "id" and an "html" four columns deeper, list nothing.
+    article = (
+        "    +   Object {\n"
+        '    +     "id": "article-{n}",\n'
+        '    +     "children": Array [\n'
+        "    +       Object {\n"
+        '    +         "html": "<p>paragraph {n}</p>",\n'
+        "    +       },\n"
+        "    +     ],\n"
+        "    +   },\n"
+    )
+    stray = (
+        '    +     "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/stray",\n'
+        '    +     "id": "stray",\n    +         "html": "<b>stray</b>",\n'
+    )
+    other = (
+        "    Error: expect(received).toEqual(expected) // deep equality\n\n    + Array [\n"
+        + "".join(article.replace("{n}", str(n)) for n in range(10))
+        + "    + ]\n"
+    )
+    assert "Axe violations" not in failure_excerpt(stray + other)
+    # Mixed: a genuine violation after eight non-axe objects is still listed.
+    mixed = failure_excerpt(
+        other + "  2) iam.spec.mjs:1:1 › axe ───\n\n" + _axe_assertion("label", [clear], combobox)
+    )
+    assert mixed.splitlines()[mixed.splitlines().index("Axe violations (1):") + 1] == (
+        f"label: {unescaped}"
+    )
+    assert "paragraph" not in mixed.split("Context:")[0]
     # Long node HTML (cut at 300 characters like every line) is kept within the budget.
     wide = '<div class=\\"' + "w" * 400 + '\\">'
     many = "".join(
