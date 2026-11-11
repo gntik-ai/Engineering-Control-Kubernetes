@@ -55,13 +55,6 @@ jobs:
           cache-dependency-path: requirements.lock
       - name: Install constrained project and development dependencies
         run: python -m pip install --constraint requirements.lock --editable ".[dev]"
-      - name: Install test facilities
-        # bubblewrap: the agent-sandbox tests check the binary. shellcheck is on the runner.
-        # The package mirror is occasionally unreachable from runners: retry, and install
-        # from the lists already on the image if refreshing them fails.
-        run: |
-          sudo apt-get -o Acquire::Retries=5 update || true
-          sudo apt-get -o Acquire::Retries=5 install --yes --no-install-recommends bubblewrap
       - name: Install the Temporal CLI (pinned, checksum verified)
         # With `temporal` on PATH the workflow replay tests run instead of skipping.
         env:

@@ -15,6 +15,7 @@ import json
 import os
 import shlex
 import shutil
+import sys
 import socket
 import stat
 import subprocess
@@ -244,6 +245,11 @@ async def test_claude_loopback_mounts_the_run_directories_and_pins_every_key(
 def test_loopback_shell_must_not_be_replaceable_by_the_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Without bubblewrap nothing else is checked.
+    monkeypatch.setattr(sandbox_module, "LOOPBACK_SHELL_BWRAP", tmp_path / "no-bwrap")
+    assert "is not executable" in str(loopback_shell_problem(Path("agent-loopback-shell")))
+    # The remaining checks do not depend on bubblewrap being installed on this machine.
+    monkeypatch.setattr(sandbox_module, "LOOPBACK_SHELL_BWRAP", Path(sys.executable))
     assert "not an absolute path" in str(loopback_shell_problem(Path("agent-loopback-shell")))
     assert "FileNotFoundError" in str(loopback_shell_problem(tmp_path / "missing"))
     script = tmp_path / "shell"
