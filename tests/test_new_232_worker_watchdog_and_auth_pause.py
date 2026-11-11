@@ -30,21 +30,6 @@ CAMPAIGN_ID = UUID("23232323-2323-4232-8232-232323232323")
 # -- A: the role worker unit's watchdog ----------------------------------------------------
 
 
-def test_the_role_worker_unit_is_watched_and_aborted_with_a_stack_dump() -> None:
-    unit = (REPOSITORY_ROOT / "systemd" / "engineering-worker@.service").read_text(encoding="utf-8")
-    for line in (
-        "Type=notify",
-        "NotifyAccess=main",
-        "WatchdogSec=600",
-        "TimeoutStartSec=infinity",
-        "WatchdogSignal=SIGABRT",
-        "LimitCORE=0",
-        "Restart=on-failure",
-    ):
-        assert f"\n{line}\n" in unit
-    assert "\nType=simple\n" not in unit
-
-
 def test_notify_sends_one_datagram_to_the_unit_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

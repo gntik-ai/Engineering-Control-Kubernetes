@@ -7,6 +7,12 @@ flows, a supervising agent and the options those two make necessary.
 Section 12 records the decisions taken on section 11 and takes precedence where it differs.
 Section 13 records the final decisions, corrects section 12.4 and gives the consolidated
 plan; it takes precedence over everything before it.
+Section 14 records that the system is built in this repository and what that changes.
+Section 15 adds tasks placed by drag and drop and flows created by talking to the supervisor.
+
+File paths in sections 3–5 and the appendices refer to the code as imported from
+`gntik-ai/engineering-control`; some of the host-only files they cite are no longer in this
+repository's working tree (section 14).
 
 This study answers two questions asked ahead of the Kubernetes migration:
 
@@ -80,6 +86,12 @@ Engineering Control; and the full restructuring with all 33 existing workflows i
 built-in flows. The consolidated plan is about 73–96 engineer-weeks, roughly eleven months
 for a team of three. Throughput will be set by the number of subscription accounts, not by
 the cluster.
+
+**Repository and later additions (sections 14 and 15).** The system is built in this
+repository, seeded from the original with its history; the original is left untouched and
+keeps running until each project is cut over. Flows are assembled by dragging tasks from a
+list, and can also be created by asking the supervisor in chat and accepting its proposal.
+The programme is about 76–100 engineer-weeks.
 
 ## 2. Scope and method
 
@@ -1065,7 +1077,8 @@ are sent instead.
 | Any action when the diagnosis is uncertain | The agent reports its confidence; below a threshold it asks |
 
 **Never.** Approve, merge, deploy, lower a risk class, bypass a gate, publish or edit a flow
-or prompt, or touch credentials. Unchanged from section 11.3.
+or prompt, or touch credentials. Unchanged from section 11.3. Section 15.2 adds that the supervisor may
+draft whole flows on request; they take effect only when the administrator accepts them.
 
 **Two additions that widen what the supervisor can usefully do without widening its
 authority:**
@@ -1340,6 +1353,138 @@ No decisions remain open. Three facts do, and each can change the plan:
    whether a sandboxed runtime is available.
 3. **Driving the clients' login from the console** (13.1). If it cannot be done, logging an
    account in remains a command-line task for the administrator.
+
+## 14. Repository (fifth iteration)
+
+**Decision.** The new system is built in `gntik-ai/Engineering-Control-Kubernetes`. The
+original repository, `gntik-ai/engineering-control`, is not changed.
+
+**How this repository was seeded.**
+
+- `main` is the original repository's `main`, imported with its full history (1,067
+  commits) and no modification.
+- The working branch adds, on top: the gntik-ui console, the removal of the old dashboard
+  pages, this study, and the removal of host-only files.
+- Left out of the working tree: `systemd/`, `docker/`, `caddy/`, `.go-status/`, and the
+  bootstrap and cut-over scripts, together with the tests that only checked those files.
+  They remain in this repository's history and in the original repository.
+- Still present and to be replaced as the plan proceeds: the remaining `scripts/`, the
+  Hermes hook under `integrations/` (the source for the chat adapter's grammar), and the
+  documents under `docs/` that describe the two-host deployment.
+
+**What it changes in the plan.** Earlier sections assumed one codebase evolving in place,
+with old and new workers side by side. With two repositories there are two systems:
+
+| Topic | Consequence |
+| --- | --- |
+| Running in parallel | The original keeps running on its hosts, unchanged, until cut-over. The new system has its own database, Temporal namespace and deployment |
+| Ownership of a project | A project is handled by exactly one system at a time, so the two never act on the same issue. Cut-over is per project: stop admitting work in the old system, let it drain, migrate the project's records, enable it in the new one |
+| Records | Section 13.5's migration reads from the original database and writes into the new one. The original is only read |
+| Hermes | Stays with the original system until the last project has moved. The new system never includes it |
+| Chat | A bot delivers to one consumer, so the new system needs its own bot for the period both run |
+| Accounts | A subscription account logged in on both systems counts against one limit. Capacity during the overlap has to be planned, or separate accounts used |
+| GitHub | The new system uses its own GitHub App; the original keeps its current login |
+| Fixes during the programme | A fix made in the original does not reach this repository by itself. Keep the original to critical fixes and port each one here |
+| Steps 1 and 2 | Simpler than planned: host coupling can be deleted here instead of being made configurable, because nothing in this repository has to keep the hosts working |
+
+**Target layout of this repository.**
+
+```text
+src/engineering_control/   platform code (imported, then restructured)
+web/console/               console and flow designer
+flows/                     built-in flows and prompt templates
+images/                    container images: control plane, sandbox, chat adapter
+deploy/chart/              Helm chart
+deploy/argocd/             Argo CD project and application
+docs/                      this study, decisions, runbooks
+tests/
+```
+
+## 15. Two additions to flow design (sixth iteration)
+
+### 15.1 Tasks in a list, placed by drag and drop
+
+The building blocks of a flow are called **tasks** in the designer. (Sections 11 and 12 call
+them modules; it is the same thing.) The requirement is that every available task is shown
+in a list and a flow is built by dragging tasks from it.
+
+- **The task list** is always visible beside the canvas, grouped as in the catalogue of
+  section 11.2 (triggers, workspace, agents, review, checks, GitHub, people, release,
+  control) and searchable. Each entry shows what the task needs and what it produces.
+- **Dragging a task onto the canvas** adds it. Dropping it **onto a connection** inserts it
+  between the two tasks that connection joins. Tasks on the canvas are moved and reordered
+  the same way.
+- **Connecting** is dragging from one task's output to another's input; incompatible
+  inputs do not accept the drop.
+- **Saved tasks.** A configured task — for example a reviewer with a particular prompt and
+  model — can be saved to the list under its own name and reused in other flows.
+- **Without a pointer.** Every drag has a keyboard equivalent (select a task, choose "add
+  after…"), as the UI kit's accessibility rules require.
+
+The canvas is `@gntik-ai/flow`; the list uses the kit's list and search components.
+
+### 15.2 Creating flows by talking to the supervisor
+
+The administrator can ask the supervisor, in chat, for a new flow. The supervisor proposes
+one; the administrator accepts; the flow exists.
+
+**Example.** "Create a flow that cleans up code." The supervisor answers with a proposal
+such as:
+
+```text
+Flow: Code clean-up
+  1. Trigger            on schedule, weekly, per project
+  2. Read-only snapshot of the default branch
+  3. Agent (auditor)    find dead code, duplication and lint debt; prompt drafted, shown below
+  4. Create work items  one per finding, kind "clean-up", risk R1
+  → each item is then delivered by the existing "Deliver issue" flow
+Validation: passes.  Dry-run on last week's snapshot of gntik-ui: 7 findings.
+```
+
+with a link that opens the same proposal as a graph in the designer.
+
+**How it works.**
+
+1. **Draft.** The supervisor composes the flow from the task list. It can only use tasks
+   that exist. If the request needs a task that does not exist, it says so and can file a
+   work item to have that task built.
+2. **Check.** The draft goes through the same validation as a hand-made flow (the
+   invariants of section 11.2) and a dry-run on a recorded item. A draft that fails
+   validation is not proposed.
+3. **Propose.** The proposal is sent to chat and to the decision inbox: the steps in order,
+   the prompts it wrote, the validation and dry-run results.
+4. **Refine.** The administrator can answer with changes ("run it monthly", "add a test
+   step before the work items"). Each change produces a new draft and repeats the check.
+5. **Accept.** On acceptance the platform publishes the flow as a new version, recorded as
+   approved by the administrator and drafted by the supervisor. From then on it appears in
+   the designer like any other flow and can be edited by hand.
+
+**How this fits the supervisor's limits.** Section 12.3 says the supervisor never publishes
+or edits a flow. That stays true in the sense that matters: nothing it drafts takes effect
+without the administrator's acceptance, and the engine's invariants apply to its drafts
+exactly as to anyone's. Section 12.3's "draft fixes" already allowed it to draft changes to
+existing flows; this extends drafting to new ones.
+
+Two details:
+
+- **Acceptance in chat is enough for flows that only read, analyse or create work items.**
+  A flow that contains merge or deploy tasks is accepted in the console, where the password
+  is asked again (section 12.2).
+- **Two roles, one supervisor.** Handling stalls and errors, and designing flows, are
+  different jobs with different permissions. They are separate agent roles behind the same
+  conversation: the operations role has the action list of section 12.3; the design role
+  can only read the task list and existing flows, and create, validate and simulate drafts.
+
+### 15.3 Effect on the plan
+
+| Addition | Engineer-weeks | Where |
+| --- | --- | --- |
+| Task list with drag and drop, saved tasks | Included in the designer estimate | Step 12 |
+| Flow creation through the supervisor: design role, draft and proposal handling, refinement in chat, graph preview | 3–4 | After steps 11 and 12 |
+
+Total: about **76–100 engineer-weeks**. The sequence of section 13.6 is otherwise
+unchanged; conversational flow creation comes last because it needs the supervisor, the
+chat channel, the task catalogue and the validator to exist.
 
 ## Appendix A. Documentation drift found during the audit
 

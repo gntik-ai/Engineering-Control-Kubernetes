@@ -1,9 +1,0 @@
-[Unit]
-Description=Watch for typed operator-approved GitHub backlog policy requests
-
-[Path]
-PathExists=/var/lib/engineering-control/github-policy-requests/activate.json
-Unit=engineering-github-policy-reconciler.service
-
-[Install]
-WantedBy=multi-user.target

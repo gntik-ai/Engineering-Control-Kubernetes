@@ -35,19 +35,6 @@ def test_dashboard_systemd_unit_verifies(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_caddy_site_is_independent_and_proxies_only_dashboard() -> None:
-    site = (ROOT / "caddy/ade.musematic.ai.caddy").read_text(encoding="utf-8")
-    assert site.startswith("ade.musematic.ai {")
-    assert "reverse_proxy 127.0.0.1:8750" in site
-    assert "flush_interval -1" in site
-    assert "encode " not in site
-    assert "@private_api path /v1 /v1/*" in site
-    assert "127.0.0.1:8740" not in site
-    assert "omniroute" not in site.lower()
-    assert "Strict-Transport-Security" in site
-    assert "Content-Security-Policy" in site
-
-
 def test_dashboard_assets_contain_no_remote_dependencies_or_mutation_routes() -> None:
     sources = [
         *(ROOT / "src/engineering_control/dashboard/templates").glob("*.html"),

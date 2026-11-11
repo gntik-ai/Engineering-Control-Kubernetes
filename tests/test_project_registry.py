@@ -19,7 +19,6 @@ import importlib
 import json
 import pkgutil
 import re
-import shlex
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,10 +215,6 @@ def _python_files() -> list[Path]:
 
 
 CATALOG_SITES: dict[str, dict[str, list[str]]] = {
-    # historical C-02 evidence collector: split pairs plus flowbench
-    "scripts/collect-c02-consumers.py": {
-        "<module>": ["{falcone, falcone-charts, musematic, musematic-deploy, musematic-flowbench}"],
-    },
     # root-owned; may not import the package (text parity below)
     "scripts/reconcile-backlog-github-policy.py": {
         # SAFE_REPOSITORIES, then every earlier set still accepted from in-flight campaigns
@@ -1354,35 +1349,6 @@ def test_root_owned_python_scripts_match_the_registry_as_text() -> None:
     assert len(pair_maps) == 2
     for raw in pair_maps:
         assert ast.literal_eval(raw) == expected_pairs
-
-
-def test_root_owned_shell_scripts_match_the_registry_as_text() -> None:
-    mirrors = (SCRIPTS / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
-    match = re.search(r"^repositories=\((.*)\)$", mirrors, re.MULTILINE)
-    assert match is not None and tuple(match.group(1).split()) == REPOSITORY_SLUGS
-
-    verify = (SCRIPTS / "verify-worker.sh").read_text(encoding="utf-8")
-    match = re.search(r"^for repository in ([a-z0-9 -]+); do$", verify, re.MULTILINE)
-    assert match is not None and tuple(match.group(1).split()) == REPOSITORY_SLUGS
-
-    worker = (SCRIPTS / "bootstrap-worker.sh").read_text(encoding="utf-8")
-    match = re.search(r"^for repository in ((?:[^;]|\\\n)+); do$", worker, re.MULTILINE)
-    assert match is not None
-    assert tuple(shlex.split(match.group(1).replace("\\\n", " "))) == (
-        *REPOSITORY_SLUGS,
-        *(f"{projects.ORGANIZATION}-{slug}" for slug in REPOSITORY_SLUGS),
-    )
-    # Manifests are installed per project; NEW-160: credentials, personas and flows only for
-    # projects with a runtime (gntik-ui, falcone-serverless and falcone-workflow are skipped
-    # right after their manifests).
-    match = re.search(r"^for project in ([a-z0-9 -]+); do$", worker, re.MULTILINE)
-    assert match is not None and tuple(match.group(1).split()) == PROJECTS
-    loop = worker[match.end() : worker.index("\ndone\n", match.end())]
-    assert loop.index("projects.d") < loop.index(
-        "if [[ ${project} == gntik-ui || ${project} == falcone-serverless"
-        " || ${project} == falcone-workflow ]]; then"
-    )
-    assert loop.index("continue") < loop.index("personas.d") < loop.index("flows.d")
 
 
 def test_policy_activation_request_repositories_are_byte_identical() -> None:

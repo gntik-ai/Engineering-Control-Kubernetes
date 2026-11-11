@@ -1,3 +1,21 @@
+# Engineering Control on Kubernetes
+
+This repository is where Engineering Control is rebuilt for Kubernetes. It was seeded from
+[`gntik-ai/engineering-control`](https://github.com/gntik-ai/engineering-control) with its
+full history; that repository is not changed by this work and keeps running the current
+two-host deployment until each project is cut over.
+
+- **Plan and design:** [`docs/design/kubernetes-architecture-study.md`](docs/design/kubernetes-architecture-study.md).
+  Start with the summary, then section 13.6 (consolidated plan) and sections 14–15.
+- **State of this repository:** the imported platform code, plus the gntik-ui console
+  (`web/console`). Host-only files (systemd units, Compose and Caddy files, bootstrap and
+  cut-over scripts, operational notes) have been removed from the working tree. Nothing has
+  been deployed from here yet.
+- **Still describing the old deployment:** everything below this section and most of
+  `docs/`. They are kept as reference and will be rewritten as each part is replaced.
+
+---
+
 # Engineering Control
 
 `engineering-control` is the external, durable control plane for autonomous engineering work on

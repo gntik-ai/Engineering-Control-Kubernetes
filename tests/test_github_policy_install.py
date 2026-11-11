@@ -123,13 +123,3 @@ def test_unknown_or_operator_modified_invalid_policy_is_never_replaced(
 
     assert target.read_text(encoding="utf-8") == existing
     assert not (tmp_path / "backups").exists()
-
-
-def test_bootstrap_sources_use_reconciler_only_on_controller() -> None:
-    controller = (ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
-    worker = (ROOT / "scripts/bootstrap-worker.sh").read_text(encoding="utf-8")
-
-    assert "reconcile-github-write-policy.py" in controller
-    assert "--backup-root /var/backups/engineering-control/policy-migrations" in controller
-    assert "reconcile-github-write-policy.py" not in worker
-    assert "config/policy/github-issue-write-validation.yaml" not in worker

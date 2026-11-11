@@ -625,59 +625,12 @@ def _assignment(text: str, name: str) -> str:
     return match.group(1)
 
 
-def test_scripts_are_valid_bash() -> None:
-    for script in (BOOTSTRAP, VERIFY):
-        subprocess.run([BASH, "-n", str(script)], check=True)  # noqa: S603
-        assert script.stat().st_mode & 0o111
-
-
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck is not installed")
 def test_scripts_pass_shellcheck() -> None:
     for script in (BOOTSTRAP, VERIFY):
         subprocess.run(  # noqa: S603 - fixed linter
             [str(shutil.which("shellcheck")), "--severity=warning", str(script)], check=True
         )
-
-
-def test_scripts_pin_the_toolchains_the_settings_select() -> None:
-    bootstrap = BOOTSTRAP.read_text()
-    verify = VERIFY.read_text()
-    settings = Settings()
-    root = _assignment(bootstrap, "TOOLCHAIN_ROOT")
-    assert root == _assignment(verify, "TOOLCHAIN_ROOT") == "/opt/engineering-toolchain"
-    node = _assignment(bootstrap, "NODE24_VERSION")
-    pnpm = _assignment(bootstrap, "PNPM_PINNED_VERSION")
-    assert node == _assignment(verify, "NODE24_VERSION") and node.startswith("24.")
-    assert pnpm == _assignment(verify, "PNPM_PINNED_VERSION") == "11.28.3"
-    assert settings.toolchain_node_roots["24"] == Path(root) / "node-24"
-    assert settings.toolchain_pnpm_executables[pnpm] == Path(root) / f"pnpm-{pnpm}" / "pnpm"
-    for name in ("NODE24_SHA256", "PNPM_PINNED_SHA256"):
-        assert re.fullmatch(r"[0-9a-f]{64}", _assignment(bootstrap, name)), name
-    assert "TODO" not in bootstrap
-
-
-def test_bootstrap_toolchain_section_is_opt_in_and_never_replaces_node_22() -> None:
-    bootstrap = BOOTSTRAP.read_text()
-    assert "NODE_TOOLCHAIN_MODE=none" in bootstrap
-    # Only the explicit modes call the installer; the default path never does.
-    assert bootstrap.count("\n  install_node_toolchains\n") == 1
-    assert bootstrap.count("\n  install_project_toolchains\n") == 2
-    assert "if [[ ${NODE_TOOLCHAIN_MODE} == only ]]; then" in bootstrap
-    assert "if [[ ${NODE_TOOLCHAIN_MODE} == also ]]; then" in bootstrap
-    section = bootstrap[bootstrap.index("install_pinned_toolchain() {") :]
-    section = section[: section.index("\nif [[ ${NODE_TOOLCHAIN_MODE} == only ]]")]
-    assert "/usr/local/bin" not in section
-    assert "sha256sum --check" in section and "--proto '=https'" in section
-    assert "chown -R root:root" in section and "go-w" in section
-    # Review 1: immutable releases, atomic symlink publication, staging-only trap.
-    assert 'local release_name="${name}.${sha256:0:16}"' in section
-    assert 'mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"' in section
-    assert "trap \"rm -rf -- '${staging}'\" EXIT" in section
-    # staging (trap + success), unpublished release, the Rust installer's extraction
-    assert section.count("rm -rf --") == 4
-    assert "previous" not in section.replace("A previous release", "")
-    # The Node 22 contract for the full bootstrap is unchanged.
-    assert '[[ $("${NODE_BIN}" --version) == v22.* ]]' in bootstrap
 
 
 def test_verify_checks_the_toolchain_only_when_installed_or_required() -> None:

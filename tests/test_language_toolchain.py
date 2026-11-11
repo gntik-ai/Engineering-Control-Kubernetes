@@ -9,7 +9,6 @@ not installed on the host.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -725,83 +724,6 @@ def _assignment(text: str, name: str) -> str:
     match = re.search(rf"^{name}=(\S+|\"[^\"]*\")$", text, re.MULTILINE)
     assert match is not None, name
     return match.group(1).strip('"')
-
-
-def test_scripts_pin_the_language_toolchains_the_settings_select() -> None:
-    bootstrap = BOOTSTRAP.read_text()
-    verify = VERIFY.read_text()
-    settings = Settings()
-    root = Path(_assignment(bootstrap, "TOOLCHAIN_ROOT"))
-    rust = _assignment(bootstrap, "RUST_PINNED_VERSION")
-    go_line = _assignment(bootstrap, "GO_PINNED_LINE")
-    go_version = _assignment(bootstrap, "GO_PINNED_VERSION")
-    assert rust == _assignment(verify, "RUST_PINNED_VERSION") == "1.99.1"
-    assert go_line == _assignment(verify, "GO_PINNED_LINE") == "1.26"
-    assert go_version == _assignment(verify, "GO_PINNED_VERSION")
-    assert go_version.startswith(go_line + ".")
-    assert _assignment(bootstrap, "RUST_PINNED_RUSTC") == _assignment(verify, "RUST_PINNED_RUSTC")
-    assert settings.toolchain_rust_roots[rust] == root / f"rust-{rust}"
-    assert settings.toolchain_go_roots[go_line] == root / f"go-{go_line}"
-    for name in ("RUST_PINNED_SHA256", "GO_PINNED_SHA256"):
-        assert re.fullmatch(r"[0-9a-f]{64}", _assignment(bootstrap, name)), name
-    for name in ("RUST_PINNED_URL", "GO_PINNED_URL"):
-        assert _assignment(bootstrap, name).startswith("https://"), name
-    # The installer adds exactly the components resolve_node_toolchain requires.
-    assert _assignment(bootstrap, "RUST_COMPONENTS") == (
-        "rustc,cargo,rust-std-x86_64-unknown-linux-gnu,rustfmt-preview,clippy-preview"
-    )
-
-
-def test_language_toolchains_are_opt_in_and_verified() -> None:
-    bootstrap = BOOTSTRAP.read_text()
-    assert "LANGUAGE_TOOLCHAINS=0" in bootstrap
-    assert bootstrap.count("\n  install_project_toolchains\n") == 2
-    assert bootstrap.count("\n    install_language_toolchains\n") == 1
-    assert "--project-toolchains-only) NODE_TOOLCHAIN_MODE=only LANGUAGE_TOOLCHAINS=1 ;;" in (
-        bootstrap
-    )
-    section = bootstrap[bootstrap.index("install_language_toolchains() {") :]
-    section = section[: section.index("\n}\n")]
-    assert "rustup" not in section and "/usr/local/go" not in section
-    for tool in (*RUST_TOOLS, "gofmt"):
-        assert tool in section, tool
-    verify = VERIFY.read_text()
-    assert "ENGINEERING_VERIFY_LANGUAGE_TOOLCHAINS:-0" in verify
-    assert "SKIP language toolchains" in verify and "PASS language toolchains" in verify
-
-
-def test_bootstrap_installs_falcone_serverless_without_runtime_material() -> None:
-    worker = BOOTSTRAP.read_text()
-    assert (
-        "if [[ ${project} == gntik-ui || ${project} == falcone-serverless"
-        " || ${project} == falcone-workflow ]]; then" in worker
-    )
-    result = subprocess.run(  # noqa: S603 - fixed shell, syntax check only
-        ["/bin/bash", "-n", str(BOOTSTRAP)], check=False
-    )
-    assert result.returncode == 0
-
-
-def test_shared_toolchain_caches_are_read_only_for_makers() -> None:
-    # Review 1: makers and the checker run as codex-runner / claude-runner and must read the
-    # crate and module caches scan-runner fills, including entries created later.
-    bootstrap = BOOTSTRAP.read_text()
-    section = bootstrap[bootstrap.index("grant_shared_toolchain_caches() {") :]
-    section = section[: section.index("\n}\n")]
-    assert "SHARED_TOOLCHAIN_CACHES=(go-mod cargo-home trivy)" in bootstrap
-    assert "u:codex-runner:--x,u:claude-runner:--x" in section  # ancestors: traverse only
-    assert "setfacl -R --modify u:codex-runner:rX,u:claude-runner:rX" in section
-    assert "d:u::rwx,d:u:codex-runner:rx,d:u:claude-runner:rx,d:g::---,d:m::rwx,d:o::---" in (
-        section
-    )
-    assert "rwx" not in section.replace("d:u::rwx", "").replace("d:m::rwx", "")
-    # The full bootstrap grants after the cache chmods; --project-toolchains-only too.
-    full = bootstrap[bootstrap.index('"${PLATFORM_ROOT}/cache/scan/worktree-git"') :]
-    assert "\ngrant_shared_toolchain_caches\n" in full
-    assert "\n    grant_shared_toolchain_caches\n" in bootstrap
-    verify = VERIFY.read_text()
-    assert "PASS shared toolchain caches" in verify
-    assert "default:user:codex-runner:r-x" in verify
 
 
 # -- final review: no platform dependency resolution under a pinned Rust/Go ---------------

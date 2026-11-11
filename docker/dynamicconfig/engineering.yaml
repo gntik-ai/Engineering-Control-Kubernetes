@@ -1,6 +1,0 @@
-system.enableActivityEagerExecution:
-  - value: true
-frontend.enableUpdateWorkflowExecution:
-  - value: true
-history.enableRequestIdRefLinks:
-  - value: true

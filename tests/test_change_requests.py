@@ -708,8 +708,6 @@ def test_the_hermes_publish_machinery_is_really_gone() -> None:
         "systemd/engineering-change-request-attestor.timer",
     ):
         assert not (ROOT / path).exists()
-    bootstrap = (ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
-    assert "change-request" not in bootstrap
     assert (
         "change-request"
         not in (ROOT / "src/engineering_control/adapters/github/client.py").read_text()

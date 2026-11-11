@@ -43,15 +43,3 @@ def test_every_runtime_worker_identity_projects_its_exact_task_queue(tmp_path: P
     controller = connections["worker-controller"]
     assert controller.status == "NOT_INSTALLED"
     assert controller.details == {"replacement_component": "engineering-api"}
-
-
-def test_controller_units_bind_identity_specific_heartbeat_tokens() -> None:
-    repository_root = Path(__file__).resolve().parents[1]
-    expectations = {"engineering-github-worker.service": "github-runner"}
-    for unit, identity in expectations.items():
-        source = (repository_root / "systemd" / unit).read_text(encoding="utf-8")
-        assert "ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence" in source
-        assert (
-            "ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE="
-            f"/etc/engineering-control/env/evidence-uploaders/{identity}.token"
-        ) in source

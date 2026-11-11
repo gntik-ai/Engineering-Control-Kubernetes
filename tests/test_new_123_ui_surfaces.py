@@ -131,18 +131,6 @@ def staging(tmp_path: Path, *, provisioned: bool = True) -> Staging:
     return handler
 
 
-def test_bootstrap_provisions_the_input_root_for_scan_with_runner_traverse() -> None:
-    script = (ROOT / "scripts" / "bootstrap-worker.sh").read_text()
-    assert (
-        "install -d -o scan-runner -g scan-runner -m 0700 "
-        '"${PLATFORM_ROOT}/worktrees/ui-plan-inputs"' in script
-    )
-    assert "setfacl --modify u:codex-runner:--x,u:claude-runner:--x" in script
-    unit = (ROOT / "systemd" / "engineering-worker@.service").read_text()
-    # Inside the scan unit's existing writable root; read-only (ProtectSystem) for the others.
-    assert " /srv/engineering/worktrees " in unit
-
-
 def test_stage_inputs_copies_hash_verified_files_into_a_model_readable_directory(
     tmp_path: Path,
 ) -> None:
