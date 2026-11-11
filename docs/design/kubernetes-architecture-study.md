@@ -2,6 +2,9 @@
 
 Status: proposal for discussion. Nothing in this document is implemented.
 
+Sections 1–10 are the first iteration. Section 11 is a second iteration that adds designable
+flows, a supervising agent and the options those two make necessary.
+
 This study answers two questions asked ahead of the Kubernetes migration:
 
 1. Does it still make sense to keep Hermes?
@@ -56,6 +59,12 @@ restructuring in this study adds about 24–31, for roughly 41–54 engineer-wee
 about six months for a team of three, allowing for coordination. The plan in section 8
 delivers isolation and scale first and migrates one workflow family at a time, so it can stop
 after any phase.
+
+**Second iteration (section 11).** Designable flows built from pre-built modules and a
+supervising agent are both feasible without giving up the safety rules, provided those rules
+are enforced by the engine rather than written into each flow, and the supervisor acts only
+through a closed list of typed actions. With the supporting options recommended there, the
+programme grows to about 67–90 engineer-weeks.
 
 ## 2. Scope and method
 
@@ -407,9 +416,10 @@ Mission definitions:
 
 Design rules that keep this honest:
 
-- **Typed stages in Python, not a general workflow language.** A mission definition is a
-  short module, validated at registration. The aim is to remove duplication, not to build a
-  configurable engine.
+- **Stages are typed modules in code; definitions are data.** In the first iteration the
+  definitions were to be fixed Python modules. Section 11 extends this so that people can
+  compose and edit definitions, on the condition that safety rules are enforced by the
+  engine and not by the definition.
 - **The definition version is part of the mission's input.** A running mission keeps the
   definition it started with. New behaviour is a new version, not a patch fork.
 - **Missions are short; long-lived things are thin.** A delivery mission lasts hours. The
@@ -618,7 +628,7 @@ Natural stopping points:
 | Provider logins cap parallelism regardless of architecture | Decide seats versus API keys before step 5; the seat broker works for either |
 | Rewriting the delivery path regresses safety rules that live in the 2,204-line loop | Extract rules into stages with the existing tests first; run old and new side by side per project; keep the deterministic gate code untouched |
 | Draining long-running loops takes weeks | Stop admitting new work to old loops per project; set a cut-off after which remaining items are re-queued |
-| The mission engine becomes a second framework | Typed stages only; no user-editable definitions; review each new stage against "could two missions use it" |
+| The mission engine becomes a second framework | Modules are typed code with engine-enforced invariants (section 11.2); review each new module against "could two flows use it" |
 | Removing Hermes leaves no command channel | Step 4 lands console commands, CLI credentials and the chat adapter together, before the gateway is stopped |
 | Renaming breaks deduplication and bindings | Machine-read identifiers are frozen (section 5.4) |
 | Test suite depends on host facilities | Split in step 1; retire host-model tests as their code is removed |
@@ -634,6 +644,293 @@ Natural stopping points:
 4. **Name.** Keep "Hermes" as the product name, or rename the human-facing text.
 5. **Scope.** Stop after step 6 (Kubernetes with today's workflows) or continue to the full
    restructuring.
+
+## 11. Extended options (second iteration)
+
+This part builds on sections 1–10. It evaluates two requested capabilities — designable
+flows and a supervising agent — and adds the further options that those two make necessary.
+It changes one rule of the first iteration, noted in 11.1.
+
+### 11.1 What changes from the first iteration
+
+Section 6.2 originally ruled out user-editable workflow definitions. The reason was safety:
+today every rule that keeps an agent from publishing, merging or deploying unchecked is
+written inside workflow code, so a freely edited workflow could simply leave a rule out.
+
+Designable flows are compatible with that concern if the rules move **out of the flow and
+into the engine**. A flow author arranges modules; the engine refuses to publish or run an
+arrangement that breaks an invariant. With that in place the first iteration's stages become
+the first entries of a module catalogue, and its mission definitions become the first
+built-in flows. Section 6.2 and the risk table have been amended accordingly.
+
+### 11.2 Option A — designable flows from pre-built modules
+
+#### What a flow is
+
+A flow is a versioned document: a graph of module instances, their parameters and the
+connections between their typed inputs and outputs. Modules are code, shipped with the
+platform; flows are data, created by people.
+
+#### Module catalogue
+
+Almost every module already exists as code in the current system. The work is to give each a
+typed interface and remove its assumptions about which workflow calls it.
+
+| Group | Modules | Built from |
+| --- | --- | --- |
+| Triggers | Work item of a given kind, GitHub event, schedule, manual start, call from another flow | Backlog import, scheduler, command bus |
+| Workspace | Read-only snapshot, writable workspace, toolchain preparation, dependency resolution | Worktree manager, toolchain and dependency steps |
+| Agents | **Claude CLI agent**, **Codex CLI agent**, generic agent (provider chosen at run time) | `adapters/claude`, `adapters/codex`, provider activity |
+| Agent presets | Spec architect, implementer, reviewer, auditor, finding verifier, triager, planner | Agent pack roles and skills |
+| Review | Reviewer (must be a different provider from the author), author–review loop with a correction budget | The five loop copies in W1 |
+| Deterministic checks | Secret, vulnerability and static-analysis scans; test commands; baseline comparison; change validation gate; risk classification; schema validation | `adapters/scanning`, `delivery.validate_changeset`, pre-existing-failure checks |
+| GitHub | Read issue, comment, label, create or update issue, open draft pull request, watch CI, merge, tag release | Typed GitHub broker operations |
+| People | Approval gate bound to a digest, question to the operator, notification | Approvals, notification outbox |
+| Release and verification | Deploy through the project's strategy, runtime observation, browser journey | Release adapters, observer, journey runner |
+| Control | Condition, bounded loop, fan-out with a concurrency limit, wait, sub-flow, create work item | Mission engine |
+| Records | Publish evidence, summarise a run | Evidence pipeline |
+
+Every agent module exposes the same parameters: provider and model, role and skills, prompt
+template, tool permissions (read-only or write within the workspace), output schema, and
+time and token budgets.
+
+#### Editable prompts
+
+Today prompts are assembled in Python — `activities/metadata.py` alone has about 46 prompt
+references, concatenating toolchain rules, maker rules and deployment-pin text — on top of
+the role and skill files in the agent pack. To make them editable:
+
+- Prompts become **versioned templates with declared variables**, stored with the flow.
+- Each template has two parts. The **contract** (output schema, tool boundaries, safety
+  rules, redaction) is fixed by the module and cannot be edited. The **instructions** are
+  editable.
+- The exact template version and its hash are recorded with every invocation, extending the
+  provenance record that exists today.
+- A changed prompt is a new flow version and goes through the same validation and
+  evaluation as any other change (11.4, option C).
+
+#### Invariants the engine enforces
+
+Checked when a flow is published and again at run time. A flow that violates one cannot be
+published.
+
+| Invariant | Enforcement |
+| --- | --- |
+| Nothing an agent wrote reaches GitHub, a merge or a deployment without passing the change validation gate | Graph check: every path from a write-capable agent to a publishing module passes through the gate |
+| Author and reviewer are different invocations from different providers | Graph and run-time check on the review module |
+| The risk floor can only rise | Risk classification is computed by the engine, not passed between modules |
+| High-risk work needs a human approval bound to the exact digest | Engine inserts the gate from the item's risk class; a flow cannot remove it |
+| Agents never hold GitHub, release or cluster credentials | Credentials attach to module types, not to flows; agent modules have none |
+| Loops and fan-outs are bounded | Maximum iterations and width are mandatory parameters with platform ceilings |
+| Mutating modules run in dry-run unless the target is enabled and approved | Kept from today's `_mutation_steps` rule |
+
+#### Lifecycle
+
+Draft → validate (types, invariants, permissions) → simulate (dry-run against recorded or
+synthetic data) → evaluate (option C) → publish as an immutable version → run. A run is
+pinned to the version it started with. Publishing a flow that contains merge or deploy
+modules needs an approver, like any other high-impact change.
+
+#### Three levels, built in order
+
+| Level | What the user can do | Added effort (engineer-weeks) |
+| --- | --- | --- |
+| 1. Configurable flows | Pick a built-in flow per project; switch optional stages on or off; edit prompts, models and budgets | 2–3 for prompt templates; the rest comes with the mission engine |
+| 2. Composable flows | Write a flow as a document from the module catalogue; validation, simulation, versioning; stored in Git | 6–8 |
+| 3. Visual designer | Draw and edit flows in the console | 5–7 |
+
+Level 3 is an editor for the level 2 format, not a separate system. The UI kit already
+ships what it needs: `@gntik-ai/flow` (a node-graph canvas) and `@gntik-ai/editor` (a code
+editor for prompts), both published at 0.11.0.
+
+**Recommendation:** build the mission engine as a flow interpreter from the start (about
+2–3 weeks more than the plain engine of step 8), deliver level 1 with it, then level 2.
+Treat level 3 as optional: it makes flows approachable but adds no capability.
+
+#### Costs and risks
+
+- **Testing surface.** Built-in flows can be tested exhaustively; arbitrary arrangements
+  cannot. The invariants bound the damage, and the evaluation lab (option C) bounds the
+  quality risk.
+- **Debuggability.** A failed run of a custom flow must be explainable without reading
+  engine code. This needs the run trace view (option F).
+- **Support.** Each flow someone designs is something the platform must keep running across
+  module upgrades. Modules therefore need version and compatibility rules.
+
+### 11.3 Option B — a supervising agent
+
+#### What handles stalls and errors today
+
+Handling is fixed in code: activity retries, a classifier that maps transient provider
+failures to "pause and wait for the operator", a watchdog alarm for stalled backlog loops,
+and eight operator commands (pause, pause after current, resume, nudge, retry, stop after
+current, cancel, skip). When none of that fits, a person investigates. The repository's
+`.go-status/` directory contains five scripts written to repair stuck runs by hand, and one
+finding about operations stuck in STARTED is still open. A supervisor that triages these
+cases has clear value.
+
+#### Design
+
+The supervisor is **not** a model polling every run. It has three parts:
+
+1. **Detectors (deterministic).** They open a *case* when a run makes no progress beyond its
+   expected duration, a module fails after retries, corrections repeat without converging, a
+   provider is limited or logged out, a run exceeds its budget, or an item is blocked longer
+   than a threshold.
+2. **Known-signature rules (deterministic).** A table of failure signatures with a fixed
+   response — for example "provider overloaded → retry on another seat after backoff". Cases
+   that match never reach a model.
+3. **The supervising agent.** Invoked once per unmatched case. It reads the run's status,
+   timings, error codes, the tail of the transcript, the evidence and similar past cases,
+   and returns a structured decision: a diagnosis, one action from a closed list, and its
+   reasoning.
+
+The agent's output is data. Deterministic code checks it against policy and executes it
+through the same typed command bus people use. This follows the lesson the project already
+drew from its Hermes period: instructions to a model are advice, not controls.
+
+#### What it may and may not do
+
+| May (through typed, policy-checked actions) | Never |
+| --- | --- |
+| Retry a module; retry on another provider or seat | Approve anything |
+| Nudge or resume a waiting run | Merge or deploy |
+| Return an item to the queue, or skip it with a reason | Lower a risk class or bypass a gate |
+| Pause a flow or a project | Edit flows, prompts or policies |
+| Extend a correction budget within a platform ceiling | Touch credentials or run commands in a workspace |
+| Escalate to a person with a summary; open an incident; file a platform bug | Act on the same case more than a set number of times |
+
+#### Autonomy levels
+
+| Level | Behaviour |
+| --- | --- |
+| 0. Advise | Diagnosis and a proposed action go to the operator, who accepts with one action |
+| 1. Act on reversible steps | Retries, nudges, re-queues and seat switches run automatically; everything else is advice |
+| 2. Act broadly | Also skips, pauses and budget extensions, within limits per project and per hour |
+
+The level is set per project and per risk class. Start at level 0 and record how often the
+operator accepts the proposal unchanged; promote a category of action only once that rate is
+high. Recurring agent decisions should be turned into signature rules, so the model handles
+a shrinking share of cases.
+
+#### Choosing the model
+
+- The supervisor's provider and model are settings, like any agent module: Claude or an
+  OpenAI model, with a fallback order.
+- It needs **its own credential**, separate from the seats that run work. Otherwise the
+  commonest failure — a limited or logged-out provider — also silences the supervisor.
+- If the case concerns one provider, prefer the other for the diagnosis.
+- If no model is reachable, the deterministic fallback applies: pause the affected run and
+  notify a person.
+- It runs headless and continuously, which is the natural case for API access rather than an
+  interactive subscription login. This adds weight to decision 2 in section 10.
+
+#### Safeguards
+
+- Every case, decision, rationale and executed action is recorded and visible in the
+  console.
+- Action budgets per run, per project and per hour, with a circuit breaker that escalates.
+- The plain liveness checks stay deterministic and independent, so a failed supervisor is
+  itself detected.
+- The supervisor reads; it has no workspace and no write tools.
+
+#### Effort
+
+| Part | Engineer-weeks |
+| --- | --- |
+| Detectors, case model, signature rules, action policy | 3–4 |
+| Supervising agent at level 0, with the decision inbox (option D) | 2–3 |
+| Levels 1 and 2, acceptance tracking, rule promotion | 2–3 |
+| **Total** | **7–10** |
+
+### 11.4 Further options
+
+Editable flows and an agent that acts on its own judgement both create needs that the first
+iteration did not have. These are the options I consider necessary, in order.
+
+**C — Evaluation lab (necessary for A).** Once prompts, models and flows can be edited,
+changes need evidence before they reach real issues. A set of past work items per project is
+replayed in dry-run sandboxes against a candidate flow version and scored: gate pass rate,
+correction rounds, time, cost, reviewer findings. It also supports comparing two models on
+the same items, which today exists only as a hash-based rotation between providers.
+Effort: 4–5 weeks.
+
+**D — Decision inbox (necessary for B at level 0).** One place, in the console and mirrored
+to chat, for everything waiting on a person: approvals, supervisor proposals, operator
+questions. The console currently has no write actions, so this is also where commands
+return. Effort: 2–3 weeks, partly counted in step 4.
+
+**E — Budgets and cost accounting (necessary for both).** Per run, flow and project limits
+on tokens, wall-clock time and correction rounds; cost per delivered item by flow version
+and model. Token usage is already recorded per invocation. A breached budget opens a
+supervisor case instead of failing silently. Effort: 2 weeks.
+
+**F — Run trace view (necessary for A).** A timeline of one run: modules, inputs and outputs
+by reference, agent transcripts, gate results, supervisor actions. It is what a flow author
+debugs with and what the supervisor reads. Effort: 2–3 weeks.
+
+**G — Model routing policy.** A catalogue of providers and models with per-module defaults,
+per-project overrides, a fallback order and the "reviewer differs from author" constraint.
+This is the general form of choosing a model for the supervisor and for each agent module,
+and it replaces the model names currently fixed in `config.py`. Effort: counted in step 9.
+
+**H — Event-driven triggers.** With a GitHub App the platform can receive events instead of
+polling, so a flow can start when an issue is labelled or a pull request is reviewed.
+Effort: 1–2 weeks on top of the GitHub App.
+
+Options I would defer:
+
+- **Project memory** — feeding recurring reviewer findings back into author instructions.
+  Valuable, but it should wait for the evaluation lab to measure whether it helps.
+- **A shared flow library across organisations.** Flows in Git already give reuse within one
+  organisation.
+
+### 11.5 Effect on the plan
+
+The options add to the 41–54 weeks of section 8.
+
+| Option | Engineer-weeks | Recommended |
+| --- | --- | --- |
+| A — engine built as a flow interpreter (added to step 8) | 2–3 | Yes |
+| A — prompt templates, level 1 | 2–3 | Yes |
+| A — composable flows, level 2 | 6–8 | Yes |
+| A — visual designer, level 3 | 5–7 | Later |
+| B — supervisor, levels 0 and 1 | 5–7 | Yes |
+| B — supervisor, level 2 | 2–3 | Later |
+| C — evaluation lab | 4–5 | Yes |
+| D — decision inbox | 2–3 | Yes |
+| E — budgets and cost | 2 | Yes |
+| F — run trace view | 2–3 | Yes |
+| H — event triggers | 1–2 | Yes |
+| **Recommended set** | **26–36** | |
+| **Everything** | **33–46** | |
+
+With the recommended set the programme is about **67–90 engineer-weeks**: nine to ten
+months for a team of three.
+
+Where they fit in the sequence of section 8:
+
+- **With step 4 (identity and console):** decision inbox.
+- **With step 8 (mission engine):** interpreter, prompt templates, run trace view, budgets.
+- **After step 8:** supervisor at level 0, then level 1 once acceptance is measured.
+- **After step 10 (all workflows on the engine):** composable flows, evaluation lab, event
+  triggers.
+- **Last, if wanted:** visual designer, supervisor level 2.
+
+The stopping points of section 8 still hold. The first new one worth naming: after step 8
+with the supervisor at level 0, issue resolution runs on the new engine with editable prompts
+and assisted triage — the point where day-to-day operation changes most.
+
+### 11.6 Additional decisions
+
+6. **How far to take flow design:** configurable (level 1), composable (level 2,
+   recommended) or visual (level 3).
+7. **Who may publish flows,** and whether flows containing merge or deploy modules need a
+   second approver (recommended).
+8. **Supervisor autonomy:** the starting level (recommended: advise only) and which projects
+   and risk classes may be promoted.
+9. **Supervisor model and credential:** which provider is primary, and whether it uses API
+   access.
 
 ## Appendix A. Documentation drift found during the audit
 
