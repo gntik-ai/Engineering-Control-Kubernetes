@@ -105,7 +105,7 @@ def reauthenticate(client, candidate_id):
 def assert_denied(client, token):
     client.cookies.clear()
     client.cookies.set(SESSION_COOKIE, token)
-    assert client.get("/overview", follow_redirects=False).status_code == 303
+    assert client.get("/console", follow_redirects=False).status_code == 303
     for path in ("/api/dashboard/activity/recent", "/api/dashboard/activity/stream"):
         assert client.get(path, follow_redirects=False).status_code == 401
 
@@ -119,12 +119,12 @@ def test_login_rotates_presented_cookie_and_preserves_sibling(repositories):
         assert login(client).status_code == 303
         new = client.cookies.get(SESSION_COOKIE)
         assert new != old and csrf(client) != old_csrf
-        assert client.get("/overview").status_code == sibling.get("/overview").status_code == 200
+        assert client.get("/console").status_code == sibling.get("/console").status_code == 200
         assert_denied(client, old)
         # A lost login/rotation response never grants access using its old cookie.
         # Fresh password login recovers without resetting the shared password.
         assert login(client).status_code == 303
-        assert client.get("/overview").status_code == 200
+        assert client.get("/console").status_code == 200
 
 
 def test_reauth_transfers_exact_candidate_and_rotates_before_execute(repositories):
@@ -165,7 +165,7 @@ def test_reauth_transfers_exact_candidate_and_rotates_before_execute(repositorie
         retried = client.post("/api/dashboard/actions/execute", json=body)
         assert retried.status_code == 202
         assert retried.json()["operation_id"] == queued.json()["operation_id"]
-        assert sibling.get("/overview").status_code == 200
+        assert sibling.get("/console").status_code == 200
         assert_denied(client, old)
 
 
@@ -190,7 +190,7 @@ def test_invalid_candidate_does_not_partially_rotate(repositories, state):
                 row.capability_status = "BLOCKED"
         assert reauthenticate(client, identifier).status_code == 400
         assert client.cookies.get(SESSION_COOKIE) == old
-        assert client.get("/overview").status_code == 200
+        assert client.get("/console").status_code == 200
         with operations.sessions() as session:
             assert session.scalar(select(func.count()).select_from(DashboardSessionRevocation)) == 0
             assert session.scalar(select(func.count()).select_from(ReauthenticationBinding)) == 0
@@ -357,18 +357,6 @@ def test_postgres_waiting_rotation_rechecks_authority(postgres_repositories, win
         )
 
 
-def test_browser_adopts_csrf_before_execute_and_clears_password():
-    source = Path(__file__).parents[1] / "src/engineering_control/dashboard/static/dashboard.js"
-    script = source.read_text()
-    start = script.index("async function confirmAction")
-    handoff = script.index("adoptSessionRotation(authorized)", start)
-    execute = script.index('fetch("/api/dashboard/actions/execute"', start)
-    assert handoff < execute
-    assert 'input[name="csrf_token"]' in script
-    assert re.search(r'finally\s*\{\s*byId\("action-password"\)\.value = "";', script)
-    # This is source contract evidence; real browser interaction remains separate.
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ["unchanged", "body", "risk", "source_head"])
 async def test_issue_rotation_preserves_exact_approval_snapshot(tmp_path, changed):
@@ -434,7 +422,7 @@ async def test_lost_reauth_response_requires_fresh_login_not_old_cookie(reposito
         await operations.rotate_reauthentication(prepared.candidate_id, auth, "d" * 64)
     with client_for(dashboard, operations) as client:
         assert login(client, presented=old).status_code == 303
-        assert client.get("/overview").status_code == 200
+        assert client.get("/console").status_code == 200
     with operations.sessions() as session:
         assert session.scalar(select(func.count()).select_from(OperationRequest)) == 0
 

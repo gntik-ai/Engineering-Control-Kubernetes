@@ -1,7 +1,7 @@
-import { Link, Page, StatusDot, Switch, Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsList, TabsPanel, TabsTab } from '@gntik-ai/ui';
+import { Badge, Link, Page, StatusDot, Switch, Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsList, TabsPanel, TabsTab } from '@gntik-ai/ui';
 import { apiUrl, useResource, type Cursored, type Execution, type Resource, type Workflow } from '../api';
 import { IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, Status, TableFrame, When, mono } from '../parts';
-import { setQuery, useLocation } from '../router';
+import { BASE, setQuery, useLocation } from '../router';
 import { TERMINAL } from '../status';
 
 const REFRESH_MS = 5_000;
@@ -70,7 +70,7 @@ function ExecutionsTable({ resource, activeOnly }: { resource: Resource<Cursored
                     <When value={item.ended_at ? null : item.last_heartbeat} />
                   </TableCell>
                   <TableCell align="right">
-                    <Link href={`/executions/${item.execution_id}`} className="text-[12px]">
+                    <Link href={`${BASE}/execution?id=${item.execution_id}`} className="text-[12px]">
                       Logs
                     </Link>
                   </TableCell>
@@ -117,7 +117,7 @@ function WorkflowsTable({ resource, activeOnly }: { resource: Resource<Cursored<
                   <TableCell className="max-w-xs">
                     <div className="font-medium">{item.workflow_type}</div>
                     <Link
-                      href={`/workflows/${encodeURIComponent(item.workflow_id)}`}
+                      href={`${BASE}/executions?workflow=${encodeURIComponent(item.workflow_id)}&all=1`}
                       className="block truncate font-mono text-[11px]"
                       title={item.workflow_id}
                     >
@@ -148,10 +148,12 @@ export function ExecutionsPage() {
   const { query } = useLocation();
   const project = query.get('project');
   const activeOnly = query.get('all') !== '1';
-  const tab = query.get('tab') === 'workflows' ? 'workflows' : 'agents';
+  const workflow = query.get('workflow');
+  // A workflow filter lists that workflow's agent executions.
+  const tab = !workflow && query.get('tab') === 'workflows' ? 'workflows' : 'agents';
 
   const executions = narrowed(
-    useResource<Cursored<Execution>>(apiUrl('executions', { project, limit: 100 }), REFRESH_MS),
+    useResource<Cursored<Execution>>(apiUrl('executions', { project, workflow_id: workflow, limit: 100 }), REFRESH_MS),
     activeOnly,
   );
   const workflows = narrowed(
@@ -180,6 +182,11 @@ export function ExecutionsPage() {
             checked={activeOnly}
             onCheckedChange={(checked) => setQuery({ all: checked ? null : '1' })}
           />
+          {workflow ? (
+            <Badge tone="info" onRemove={() => setQuery({ workflow: null })} removeLabel="Clear workflow filter">
+              <span className="font-mono">{workflow}</span>
+            </Badge>
+          ) : null}
         </div>
         <LoadError resource={shown} />
         <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'workflows' ? 'workflows' : null })}>

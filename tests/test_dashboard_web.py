@@ -8,7 +8,6 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
 
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
@@ -20,7 +19,6 @@ from engineering_control.db.models import (
     OperationRequest,
     Run,
 )
-from engineering_control.operations.models import AuditPlanCommand
 from engineering_control.operations.repository import OperationsRepository
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
@@ -56,72 +54,52 @@ def _authenticated_client(tmp_path: Path) -> tuple[TestClient, DashboardReposito
     return client, repository
 
 
-def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path) -> None:
+def test_only_the_console_and_sign_in_pages_remain(tmp_path: Path) -> None:
     client, repository = _authenticated_client(tmp_path)
     try:
-        for path, heading in (
-            ("/overview", "Overview"),
-            ("/backlog", "Backlog"),
-            ("/activity", "Logs"),
-            ("/workflows", "Workflows"),
-            ("/logs", "Logs"),
-            ("/audits", "Audits"),
-            ("/commands", "Commands"),
-            ("/findings", "Findings"),
-            ("/enhancements", "Enhancements"),
-            ("/connections", "Connections"),
-            ("/settings", "Settings"),
+        root = client.get("/", follow_redirects=False)
+        assert root.status_code == 303
+        assert root.headers["location"] == "/console"
+        # The server-rendered pages are gone; their data stays behind /api/dashboard.
+        for path in (
+            "/overview",
+            "/backlog",
+            "/activity",
+            "/workflows",
+            "/workflows/known-workflow",
+            "/executions/00000000-0000-0000-0000-000000000000",
+            "/logs",
+            "/audits",
+            "/commands",
+            "/findings",
+            "/enhancements",
+            "/connections",
+            "/settings",
+            "/static/dashboard.js",
+            "/static/dashboard.css",
         ):
             response = client.get(path)
-            assert response.status_code == 200
-            assert heading in response.text
-            assert "https://" not in response.text
-            assert "http://" not in response.text
-            assert "Cache-Control" in response.headers
+            assert response.status_code == 404
+            assert response.json() == {"detail": "not found"}
             assert response.headers["X-Robots-Tag"] == "noindex, nofollow"
-            assert "start workflow" not in response.text.lower()
-            assert "cancel workflow" not in response.text.lower()
-            assert "approve deployment" not in response.text.lower()
-        audit_page = client.get("/audits")
-        assert 'id="plan-all-audits"' in audit_page.text
-        assert 'id="start-all-audits"' in audit_page.text
-        assert 'pattern="[a-z][a-z0-9\\-]{0,119}"' in audit_page.text
-        rendered_pattern = re.search(r'pattern="([^"]+)"', audit_page.text)
-        assert rendered_pattern
-        browser_pattern = re.compile(rendered_pattern.group(1))
-        accepted_environments = [
-            "a",
-            "staging",
-            "prod-eu-1",
-            "a" + ("1" * 119),
-        ]
-        rejected_environments = ["", "Prod", "-x", "1staging", "prod_eu", "a" * 121]
-        for environment in accepted_environments:
-            assert browser_pattern.fullmatch(environment)
-            AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
-        for environment in rejected_environments:
-            assert browser_pattern.fullmatch(environment) is None
-            try:
-                AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
-            except ValidationError:
-                pass
-            else:
-                raise AssertionError(f"server accepted invalid environment: {environment!r}")
-        assert "Audit all projects unavailable" not in audit_page.text
-        stylesheet = client.get("/static/dashboard.css")
+        assert client.post("/settings/password", data={}).status_code == 404
+        html_routes = {
+            route.path
+            for route in client.app.routes
+            if "GET" in getattr(route, "methods", set())
+            and not route.path.startswith(("/api/", "/health/", "/internal/", "/console"))
+        }
+        assert html_routes >= {"/", "/login", "/robots.txt"}
+        assert html_routes <= {"/", "/login", "/robots.txt", "/docs", "/redoc", "/openapi.json"}
+        login_page = client.get("/login", follow_redirects=False)
+        assert login_page.status_code == 303
+        assert login_page.headers["location"] == "/console"
+        stylesheet = client.get("/login?asset=css")
         assert stylesheet.status_code == 200
-        assert ".status-present" in stylesheet.text
-        assert ".audit-summary-label { min-width: 0; overflow-wrap: anywhere; }" in stylesheet.text
-        status_selectors = re.findall(r"\.status-([A-Za-z0-9_-]+)", stylesheet.text)
-        assert status_selectors
-        assert all(value == value.lower() for value in status_selectors)
-        javascript = client.get("/static/dashboard.js")
-        assert javascript.status_code == 200
-        assert "status status-${String(label).toLowerCase()}" in javascript.text
-        assert (
-            'summary.append(node("span", "audit-summary-label", `${item.project}' in javascript.text
-        )
+        assert stylesheet.headers["content-type"].startswith("text/css")
         assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"
+        client.cookies.clear()
+        assert client.get("/overview", follow_redirects=False).headers["location"] == "/login"
     finally:
         client.__exit__(None, None, None)
         repository.engine.dispose()
@@ -203,7 +181,6 @@ def test_dashboard_workflow_detail_returns_projection_and_safe_unknown_404(
                     metadata_json={"status": "RUNNING"},
                 )
             )
-        assert client.get("/workflows/known-workflow").status_code == 200
         detail = client.get("/api/dashboard/workflows/known-workflow")
         assert detail.status_code == 200
         assert detail.json()["workflow_id"] == "known-workflow"
@@ -316,7 +293,6 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
     assert post_routes == {
         "/login",
         "/logout",
-        "/settings/password",
         "/api/dashboard/actions/candidates",
         "/api/dashboard/actions/reauthenticate",
         "/api/dashboard/actions/execute",
@@ -333,13 +309,3 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
     ) as client:
         login = client.get("/login")
         client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
-        javascript = client.get("/static/dashboard.js").text
-        stylesheet = client.get("/static/dashboard.css").text
-        assert "activity/stream?after_id=" in javascript
-        assert "requestAnimationFrame" in javascript
-        assert ".page-heading .muted" in stylesheet
-        assert ".command-group { display: grid; gap: .8rem; min-width: 0; }" in stylesheet
-        assert ".command-form .muted" in stylesheet
-        assert "overflow-wrap: anywhere" in stylesheet
-        assert "overflow-x: clip" in stylesheet
-        assert "min-width: 0; max-width: 100%" in stylesheet

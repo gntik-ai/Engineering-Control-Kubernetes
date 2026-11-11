@@ -67,6 +67,19 @@ export interface Workflow {
   blocker_code: string | null;
 }
 
+export interface LogChunk {
+  id: number | string;
+  sequence: number;
+  stream: string;
+  timestamp: string | null;
+  text: string;
+  is_truncated: boolean;
+}
+
+export interface ExecutionLogs extends Listing<LogChunk> {
+  last_sequence: number;
+}
+
 export interface Listing<T> {
   items: T[];
   refreshed_at?: string | null;
@@ -100,6 +113,22 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   }
   if (!response.ok) throw new Error(`The dashboard API answered ${response.status}.`);
   return (await response.json()) as T;
+}
+
+/** Ends the dashboard session (the server revokes it) and returns to the sign-in page. */
+export async function signOut(): Promise<void> {
+  const controller = new AbortController();
+  const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
+  const response = await fetch('/logout', {
+    method: 'POST',
+    credentials: 'same-origin',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf_token: session.csrf_token }).toString(),
+  });
+  // A followed redirect is opaque here; anything but an explicit error means signed out.
+  if (response.status >= 400) throw new Error(`Sign-out failed (${response.status}); the session is still active.`);
+  window.location.assign('/login');
 }
 
 export interface Resource<T> {

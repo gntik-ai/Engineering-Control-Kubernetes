@@ -121,14 +121,13 @@ async def test_authenticated_dashboard_observes_actual_loopback_api_and_loss(
                 assert lost.status_code == 200
                 assert lost.json()["admission"]["status"] == "UNKNOWN"
                 assert lost.json()["admission"]["observed_at"] is None
-                page = await client.get("/overview")
-                logout_csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
-                assert logout_csrf
+                session = await client.get("/api/dashboard/session")
+                logout_csrf = session.json()["csrf_token"]
                 assert (
                     await client.post(
                         "/logout",
                         data={
-                            "csrf_token": logout_csrf.group(1),
+                            "csrf_token": logout_csrf,
                         },
                         follow_redirects=False,
                     )

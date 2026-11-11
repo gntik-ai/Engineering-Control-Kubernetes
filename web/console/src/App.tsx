@@ -1,6 +1,8 @@
-import { Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
-import { FolderKanban, ListTodo, SquareActivity, LayoutDashboard } from '@gntik-ai/icons';
-import { useEffect, type ReactNode } from 'react';
+import { Alert, Button, Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
+import { FolderKanban, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
+import { useEffect, useState, type ReactNode } from 'react';
+import { signOut } from './api';
+import { ExecutionPage } from './pages/Execution';
 import { BacklogPage } from './pages/Backlog';
 import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
@@ -16,21 +18,34 @@ const NAV: NavGroup[] = [
       { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
     ],
   },
-  {
-    id: 'operations',
-    label: 'Operations',
-    // The server-rendered dashboard: approvals, commands, logs and settings stay there.
-    items: [{ label: 'Operations dashboard', href: '/overview', icon: LayoutDashboard }],
-  },
 ];
 
 const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/projects`]: () => <ProjectsPage />,
   [`${BASE}/backlog`]: () => <BacklogPage />,
   [`${BASE}/executions`]: () => <ExecutionsPage />,
+  [`${BASE}/execution`]: () => <ExecutionPage />,
 };
 
+function SignOut({ onError }: { onError: (message: string) => void }) {
+  const [pending, setPending] = useState(false);
+  const run = () => {
+    setPending(true);
+    signOut().catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      setPending(false);
+      onError(error instanceof Error ? error.message : 'Sign-out failed; the session is still active.');
+    });
+  };
+  return (
+    <Button variant="ghost" size="sm" icon={LogOut} loading={pending} onClick={run}>
+      Sign out
+    </Button>
+  );
+}
+
 export default function App() {
+  const [problem, setProblem] = useState<string | null>(null);
   const { path } = useLocation();
   const current = path.replace(/\/$/, '');
   const view = VIEWS[current];
@@ -45,14 +60,26 @@ export default function App() {
         sidebarLabel="Console"
         sidebarHeader={({ collapsed }) => <Logo size={26} wordmark={!collapsed} />}
         sidebar={({ collapsed, closeDrawer }) => (
-          <NavList groups={NAV} currentHref={current} collapsed={collapsed} label="Console" onNavigate={closeDrawer} />
+          <NavList
+            groups={NAV}
+            currentHref={current === `${BASE}/execution` ? `${BASE}/executions` : current}
+            collapsed={collapsed}
+            label="Console"
+            onNavigate={closeDrawer}
+          />
         )}
         topbar={
-          <div className="flex w-full items-center justify-end">
+          <div className="flex w-full items-center justify-end gap-2">
             <ThemeSwitcher size="sm" showLabels={false} />
+            <SignOut onError={setProblem} />
           </div>
         }
       >
+        {problem ? (
+          <div className="px-6 pt-4">
+            <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
+          </div>
+        ) : null}
         {view ? view() : null}
       </SidebarLayout>
     </div>

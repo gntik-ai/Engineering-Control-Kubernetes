@@ -33,7 +33,13 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
     client, _repository = _authenticated_client(tmp_path)
     try:
         index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
-        for path in ("/console", "/console/projects", "/console/backlog", "/console/executions"):
+        for path in (
+            "/console",
+            "/console/projects",
+            "/console/backlog",
+            "/console/executions",
+            "/console/execution",
+        ):
             response = client.get(path)
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("text/html")
@@ -68,9 +74,8 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
         # The relaxed style source stays on the console.
         assert (
             CONSOLE_INLINE_STYLE_HASH
-            not in client.get("/overview").headers["Content-Security-Policy"]
+            not in client.get("/api/dashboard/projects").headers["Content-Security-Policy"]
         )
-        assert 'href="/console"' in client.get("/overview").text
     finally:
         client.__exit__(None, None, None)
 
@@ -84,6 +89,24 @@ def test_console_bundle_still_adds_only_the_allowed_inline_style() -> None:
     variable = re.search(rf'([\w$]+)="{name}"', bundle)
     assert variable
     assert f"`{template.replace('NAME', variable.group(1))}`" in bundle
+
+
+def test_session_endpoint_gives_the_csrf_token_sign_out_needs(tmp_path: Path) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        session = client.get("/api/dashboard/session")
+        assert session.status_code == 200
+        assert set(session.json()) == {"csrf_token", "expires_at"}
+        rejected = client.post("/logout", data={"csrf_token": "x" * 32}, follow_redirects=False)
+        assert rejected.status_code == 403
+        signed_out = client.post(
+            "/logout", data={"csrf_token": session.json()["csrf_token"]}, follow_redirects=False
+        )
+        assert signed_out.status_code == 303
+        assert signed_out.headers["location"] == "/login"
+        assert client.get("/api/dashboard/session").status_code == 401
+    finally:
+        client.__exit__(None, None, None)
 
 
 def test_login_returns_to_the_console(tmp_path: Path) -> None:

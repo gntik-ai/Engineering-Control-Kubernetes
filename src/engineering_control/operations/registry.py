@@ -61,7 +61,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Provider usage",
         available=True,
         effect="read-only",
-        href="/overview",
+        href="/console/projects",
     ),
     _entry(
         "Diagnostics",
@@ -133,7 +133,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Locate issue",
         available=True,
         effect="read-only",
-        href="/backlog",
+        href="/console/backlog",
     ),
     _entry(
         "Issues",
@@ -141,7 +141,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Diagnose workflow",
         available=True,
         effect="read-only",
-        href="/workflows",
+        href="/console/executions",
     ),
     _entry(
         "Issues",
@@ -149,7 +149,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Tail workflow",
         available=True,
         effect="read-only",
-        href="/logs",
+        href="/console/executions",
     ),
     _entry(
         "Issues",
@@ -162,7 +162,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
             {"name": "surface", "type": "select", "values": ["source"]},
             {"name": "issue_number", "type": "integer", "min": 1119, "max": 1119},
         ],
-        href="/backlog",
+        href="/console/backlog",
     ),
     _entry(
         "Audits",
@@ -219,7 +219,6 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Campaigns",
         available=True,
         effect="read-only",
-        href="/audits",
     ),
     _entry(
         "Audits",
@@ -253,7 +252,6 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Findings",
         available=True,
         effect="read-only",
-        href="/findings",
     ),
     _entry(
         "Audits",
@@ -281,7 +279,6 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "List enhancements",
         available=True,
         effect="read-only",
-        href="/enhancements",
     ),
     _entry(
         "Enhancements",
@@ -339,7 +336,7 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Bootstrap status",
         available=True,
         effect="read-only",
-        href="/workflows",
+        href="/console/executions",
     ),
     _entry(
         "Evidence",

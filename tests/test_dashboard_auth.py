@@ -79,6 +79,12 @@ def _csrf(response_text: str) -> str:
     return match.group(1)
 
 
+def _session_csrf(client: TestClient) -> str:
+    response = client.get("/api/dashboard/session")
+    assert response.status_code == 200
+    return str(response.json()["csrf_token"])
+
+
 def _login(client: TestClient, password: str = PASSWORD) -> object:
     page = client.get("/login")
     return client.post(
@@ -86,7 +92,7 @@ def _login(client: TestClient, password: str = PASSWORD) -> object:
         data={
             "csrf_token": _csrf(page.text),
             "password": password,
-            "next_path": "/backlog",
+            "next_path": "/console/backlog",
         },
         follow_redirects=False,
     )
@@ -168,7 +174,7 @@ def test_uninitialized_dashboard_fails_closed(tmp_path: Path) -> None:
         response = _login(client)
         assert response.status_code == 401
         assert "Unable to sign in" in response.text
-        assert client.get("/backlog", follow_redirects=False).status_code == 303
+        assert client.get("/console", follow_redirects=False).status_code == 303
 
 
 def test_valid_invalid_login_csrf_cookie_and_tamper(tmp_path: Path) -> None:
@@ -184,11 +190,11 @@ def test_valid_invalid_login_csrf_cookie_and_tamper(tmp_path: Path) -> None:
         assert "Secure" in cookie
         assert "HttpOnly" in cookie
         assert "SameSite=strict" in cookie
-        assert client.get("/backlog").status_code == 200
+        assert client.get("/console").status_code == 200
         session_cookie = client.cookies.get("engineering_dashboard_session")
         assert session_cookie is not None
         client.cookies.set("engineering_dashboard_session", session_cookie + "x")
-        assert client.get("/backlog", follow_redirects=False).status_code == 303
+        assert client.get("/console", follow_redirects=False).status_code == 303
 
 
 def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Path) -> None:
@@ -233,8 +239,7 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
             follow_redirects=False,
         )
         assert response.status_code == 303
-        settings = client.get("/settings")
-        csrf = _csrf(settings.text)
+        csrf = _session_csrf(client)
 
         for suffix in (
             "",
@@ -351,8 +356,7 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
     # the opaque same-origin navigation revoked the previous test session.
     with _client(repository) as client:
         assert _login(client).status_code == 303
-        settings = client.get("/settings")
-        csrf = _csrf(settings.text)
+        csrf = _session_csrf(client)
         allowed_referer = client.post(
             "/logout",
             data={"csrf_token": csrf},
@@ -375,7 +379,7 @@ def test_opaque_origin_browser_login_requires_exact_fetch_metadata_and_csrf(
         form = {
             "csrf_token": login_csrf,
             "password": PASSWORD,
-            "next_path": "/overview",
+            "next_path": "/console",
         }
         accepted_metadata = {
             "Origin": "null",
@@ -415,7 +419,7 @@ def test_opaque_origin_browser_login_requires_exact_fetch_metadata_and_csrf(
             follow_redirects=False,
         )
         assert accepted.status_code == 303
-        assert accepted.headers["location"] == "/overview"
+        assert accepted.headers["location"] == "/console"
 
 
 def test_r3_candidate_authentication_precedes_query_and_body_validation(tmp_path: Path) -> None:
@@ -445,8 +449,7 @@ def test_r3_candidate_authentication_precedes_query_and_body_validation(tmp_path
             assert anonymous_post.json() == {"detail": "authentication required"}
 
         assert _login(client).status_code == 303
-        settings = client.get("/settings")
-        csrf = _csrf(settings.text)
+        csrf = _session_csrf(client)
         for suffix in malformed_targets:
             authenticated_get = client.get(r3_path + suffix)
             assert authenticated_get.status_code == 422
@@ -505,16 +508,16 @@ def test_logout_revokes_only_the_current_session_and_survives_app_restart(
         assert first_cookie is not None and second_cookie is not None
         session_data = SignedSessionManager(b"s" * 48).verify(first_cookie)
         assert session_data is not None
-        page = first.get("/backlog")
+        first_csrf = _session_csrf(first)
         assert (
             first.post(
                 "/logout",
-                data={"csrf_token": _csrf(page.text)},
+                data={"csrf_token": first_csrf},
                 follow_redirects=False,
             ).status_code
             == 303
         )
-        assert second.get("/backlog").status_code == 200
+        assert second.get("/console").status_code == 200
 
     with repository.sessions() as session:
         revocation = session.scalar(select(DashboardSessionRevocation))
@@ -528,10 +531,10 @@ def test_logout_revokes_only_the_current_session_and_survives_app_restart(
     reopened = DashboardRepository(str(repository.engine.url))
     with _client(reopened) as restarted:
         restarted.cookies.set("engineering_dashboard_session", first_cookie)
-        assert restarted.get("/backlog", follow_redirects=False).status_code == 303
+        assert restarted.get("/console", follow_redirects=False).status_code == 303
     with _client(reopened) as concurrent:
         concurrent.cookies.set("engineering_dashboard_session", second_cookie)
-        assert concurrent.get("/backlog").status_code == 200
+        assert concurrent.get("/console").status_code == 200
     reopened.engine.dispose()
 
 
@@ -601,20 +604,20 @@ def test_logout_failure_is_explicit_logged_and_leaves_session_active(
     monkeypatch.setattr(repository, "revoke_session", fail_revoke)
     with _client(repository) as client:
         assert _login(client).status_code == 303
-        page = client.get("/backlog")
+        session_csrf = _session_csrf(client)
         response = client.post(
             "/logout",
-            data={"csrf_token": _csrf(page.text)},
+            data={"csrf_token": session_csrf},
             follow_redirects=False,
         )
         assert response.status_code == 503
         assert "session remains active" in response.text
         assert "synthetic unavailable database" not in response.text
-        assert client.get("/backlog").status_code == 200
+        assert client.get("/console").status_code == 200
         monkeypatch.setattr(repository, "revoke_session", real_revoke)
         recovered = client.post(
             "/logout",
-            data={"csrf_token": _csrf(page.text)},
+            data={"csrf_token": session_csrf},
             follow_redirects=False,
         )
         assert recovered.status_code == 303
@@ -642,11 +645,11 @@ def test_session_validation_database_failure_is_logged_and_fails_closed(
             raise RuntimeError("synthetic validation database failure secret-digest-94ac")
 
         monkeypatch.setattr(repository, "session_authorized", fail_authorization)
-        response = client.get("/backlog", follow_redirects=False)
+        response = client.get("/console", follow_redirects=False)
         assert response.status_code == 303
         assert response.headers["location"].startswith("/login")
         client.cookies.set("engineering_dashboard_session", session_cookie)
-        repeated = client.get("/backlog", follow_redirects=False)
+        repeated = client.get("/console", follow_redirects=False)
         assert repeated.status_code == 303
         metrics = client.get("/internal/metrics", headers={"Host": "127.0.0.1:8750"})
         assert metrics.status_code == 200
@@ -954,51 +957,16 @@ def test_password_change_rotates_version_and_does_not_log_values(
     with _client(repository) as client:
         _login(client)
         old_cookie = client.cookies.get("engineering_dashboard_session")
-        settings_page = client.get("/settings")
-        changed = client.post(
-            "/settings/password",
-            data={
-                "csrf_token": _csrf(settings_page.text),
-                "current_password": PASSWORD,
-                "new_password": NEW_PASSWORD,
-                "confirmation": NEW_PASSWORD,
-            },
-        )
-        assert changed.status_code == 200
-        assert "Other sessions have been signed out" in changed.text
+        assert old_cookie is not None
+        # The console has no password form: rotation is `engineering-ctl dashboard
+        # reset-password` or the repository call it shares with the former page.
+        assert asyncio.run(repository.change_password(PASSWORD, NEW_PASSWORD)) is not None
         assert PASSWORD not in str(caplog)
         assert NEW_PASSWORD not in str(caplog)
-        assert old_cookie is not None
 
         with _client(repository) as stale:
             stale.cookies.set("engineering_dashboard_session", old_cookie)
-            assert stale.get("/backlog", follow_redirects=False).status_code == 303
+            assert stale.get("/console", follow_redirects=False).status_code == 303
         with _client(repository) as login_check:
             assert _login(login_check, PASSWORD).status_code == 401
             assert _login(login_check, NEW_PASSWORD).status_code == 303
-
-
-def test_password_change_requires_csrf_and_distinct_confirmation(tmp_path: Path) -> None:
-    repository = _repository(tmp_path)
-    with _client(repository) as client:
-        _login(client)
-        rejected = client.post(
-            "/settings/password",
-            data={
-                "current_password": PASSWORD,
-                "new_password": NEW_PASSWORD,
-                "confirmation": NEW_PASSWORD,
-            },
-        )
-        assert rejected.status_code == 403
-        page = client.get("/settings")
-        mismatch = client.post(
-            "/settings/password",
-            data={
-                "csrf_token": _csrf(page.text),
-                "current_password": PASSWORD,
-                "new_password": NEW_PASSWORD,
-                "confirmation": "something else long enough",
-            },
-        )
-        assert mismatch.status_code == 400

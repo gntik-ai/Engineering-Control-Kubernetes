@@ -5,6 +5,7 @@ import binascii
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -442,7 +443,7 @@ class DashboardObservabilityProjection:
                 return None
             item = self._execution(row)
             item.pop("updated_datetime", None)
-            item["workflow_url"] = f"/workflows/{row.workflow_id}"
+            item["workflow_url"] = f"/console/executions?workflow={quote(row.workflow_id, safe='')}"
             return item
 
     def execution_logs(

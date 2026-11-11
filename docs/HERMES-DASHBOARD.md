@@ -46,29 +46,29 @@ session validity and revocation remain checked against the shared application DB
 
 ## Architecture
 
-`engineering-dashboard` is a separate FastAPI process bound only to `127.0.0.1:8750`. It uses
-server-rendered Jinja2, local CSS and vanilla JavaScript. Caddy is the only public listener and
-proxies the `ade.musematic.ai` virtual host to that loopback address. The existing private API at
+`engineering-dashboard` is a separate FastAPI process bound only to `127.0.0.1:8750`. Its only
+pages are the server-rendered sign-in page and the gntik-ui console at `/console` (next section);
+the authenticated root redirects to `/console`. Caddy is the only public listener and proxies the
+`ade.musematic.ai` virtual host to that loopback address. The existing private API at
 `127.0.0.1:8740` is never proxied.
 
 The dashboard reads existing PostgreSQL solution loops, GitHub backlog campaigns, ChangeSets,
-Runs, campaigns, coverage cells and findings. It also exposes a small controlled-operation surface:
-immutable typed candidates, current-password reauthentication, one-use five-minute action
-bindings, and state-dependent workflow signals. The dashboard never accepts a command line,
-provider invocation, shell string, repository argument outside the catalog, production target, or
-arbitrary Engineering Control argument. All accepted operations use the same application command
-bus as Telegram and `engineering-ctl`. The authenticated navigation is:
+Runs, campaigns, coverage cells and findings through `/api/dashboard/*`.
 
-- **Overview** — current work, queue/blocker summaries and persisted service/provider health;
-- **Backlog** — issues and their current workflow/provider state;
-- **Workflows** — cursor-paginated workflow summaries and durable detail timelines;
-- **Audits** — campaigns, current cells and grouped root blockers;
-- **Logs** — redacted operational events and native-agent execution transcripts;
-- **Commands** — allowlisted typed forms with explicit disabled/runtime-blocked capabilities;
-- **Connections** — fixed read-only probes and redacted persisted health snapshots;
-- **Settings** — dashboard password change only.
+The former server-rendered pages (Overview, Backlog, Workflows, Audits, Logs, Commands,
+Connections, Settings) were removed in favour of the console. Consequences:
 
-Legacy `/activity` bookmarks redirect to `/logs`; the authenticated root redirects to `/overview`.
+- Commands, approvals and audits are run from Telegram or `engineering-ctl`; the browser has no
+  form for them. The typed controlled-operation endpoints (`/api/dashboard/actions/*`,
+  `/api/dashboard/r3-issues/candidate`: immutable candidates, current-password reauthentication,
+  one-use five-minute bindings) remain on the service but no page calls them. Sections below that
+  describe a browser flow for them describe those endpoints, not a page.
+- The dashboard password is rotated with `engineering-ctl dashboard reset-password`; the web
+  password form and `POST /settings/password` no longer exist.
+- Audits, findings, enhancements, connections and the operational event stream stay readable
+  through their `/api/dashboard/*` endpoints only. Agent transcripts are shown per execution in
+  the console.
+
 Migration `0010` adds only:
 
 - the singleton `dashboard_authentication` row, containing an Argon2id hash and password version;
@@ -190,14 +190,15 @@ Provider roles mean:
 
 ## gntik-ui console (`/console`)
 
-`/console` is a read-only single-page view built with the gntik-ui kit, served by the same
-dashboard service and session: **Projects** (`/console/projects`: every registered project, its
+`/console` is the dashboard's web interface, built with the gntik-ui kit and served by the same
+service and session: **Projects** (`/console/projects`: every registered project, its
 repositories, tracked backlog issues, active workflows and running agents), **Backlog**
 (`/console/backlog`: filter by project and status, search) and **Executions**
 (`/console/executions`: agent executions and workflows in progress, refreshed every five
-seconds). It reads `/api/dashboard/{projects,backlog,executions,workflows}` and performs no
-writes; approvals, commands, logs and settings stay on the pages above. Source, build and
-Content-Security-Policy constraints: `web/console/README.md`. The built bundle is committed under
+seconds; each execution opens its redacted transcript at `/console/execution?id=…`). It reads
+`/api/dashboard/{projects,backlog,executions,workflows,session}`; its only write is sign-out
+(`POST /logout` with the session's CSRF token). Source, build and Content-Security-Policy
+constraints: `web/console/README.md`. The built bundle is committed under
 `src/engineering_control/dashboard/console/` because the controller installs no Node toolchain.
 
 ## Authentication and password files

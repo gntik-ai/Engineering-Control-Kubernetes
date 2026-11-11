@@ -47,7 +47,6 @@ from engineering_control.dashboard.schemas import (
     ActionExecuteInput,
     ActionReauthenticationInput,
     ActivityEventInput,
-    PasswordChangeInput,
     R3CandidateCreateInput,
 )
 from engineering_control.dashboard.service import DashboardService
@@ -78,7 +77,7 @@ CONSOLE_INLINE_STYLE = (
 CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
-CONSOLE_VIEWS = frozenset({"", "projects", "backlog", "executions"})
+CONSOLE_VIEWS = frozenset({"", "projects", "backlog", "executions", "execution"})
 CONSOLE_ASSET_TYPES = {
     ".js": "text/javascript",
     ".css": "text/css",
@@ -292,26 +291,6 @@ def create_app(
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
 
-    def page_context(
-        request: Request,
-        authenticated: AuthenticatedSession,
-        *,
-        title: str,
-        active: str,
-        error: str | None = None,
-        notice: str | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "request": request,
-            "title": title,
-            "active": active,
-            "csrf_token": authenticated.data.csrf_token,
-            "error": error,
-            "notice": notice,
-            "projects": sorted(PROJECTS),
-            "statuses": NORMALIZED_STATUSES,
-        }
-
     @app.get("/health/live")
     async def health_live() -> dict[str, str]:
         return {"status": "ok"}
@@ -375,7 +354,7 @@ def create_app(
         if request.query_params.get("asset") == "icon":
             return Response(status_code=204)
         if await current_session(request) is not None:
-            return RedirectResponse("/overview", status_code=303)
+            return RedirectResponse("/console", status_code=303)
         csrf = request.cookies.get(LOGIN_CSRF_COOKIE, "")
         if not csrf or not sessions.verify_login_csrf(csrf):
             csrf = sessions.create_login_csrf()
@@ -444,7 +423,7 @@ def create_app(
                 "Sign-in is temporarily unavailable; try again.", status_code=503
             )
         login_limiter.success(address)
-        redirect = RedirectResponse(next_path or "/overview", status_code=303)
+        redirect = RedirectResponse(next_path, status_code=303)
         _set_cookie(
             redirect, SESSION_COOKIE, token, max_age=resolved.dashboard_session_hours * 3600
         )
@@ -499,230 +478,22 @@ def create_app(
         authenticated = await require_session(request)
         if isinstance(authenticated, Response):
             return authenticated
-        return RedirectResponse("/overview", status_code=303)
+        return RedirectResponse("/console", status_code=303)
 
-    @app.get("/overview", response_class=HTMLResponse)
-    async def overview_page(request: Request) -> Response:
-        authenticated = await require_session(request)
+    @app.get("/api/dashboard/session")
+    async def session_api(request: Request) -> Response:
+        """What the console needs to sign out: the session's CSRF token and its expiry."""
+        authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="overview.html",
-            context=page_context(request, authenticated, title="Overview", active="overview"),
+        return JSONResponse(
+            {
+                "csrf_token": authenticated.data.csrf_token,
+                "expires_at": datetime.fromtimestamp(
+                    authenticated.data.expires_at, UTC
+                ).isoformat(),
+            }
         )
-
-    @app.get("/backlog", response_class=HTMLResponse)
-    async def backlog_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="backlog.html",
-            context=page_context(request, authenticated, title="Backlog", active="backlog"),
-        )
-
-    @app.get("/activity")
-    async def activity_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return RedirectResponse("/logs", status_code=303)
-
-    @app.get("/logs", response_class=HTMLResponse)
-    async def logs_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="logs.html",
-            context=page_context(request, authenticated, title="Logs", active="logs"),
-        )
-
-    @app.get("/workflows", response_class=HTMLResponse)
-    async def workflows_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="workflows.html",
-            context=page_context(request, authenticated, title="Workflows", active="workflows"),
-        )
-
-    @app.get("/workflows/{workflow_id}", response_class=HTMLResponse)
-    async def workflow_page(workflow_id: str, request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        if not 1 <= len(workflow_id) <= 240:
-            raise HTTPException(status_code=404, detail="workflow not found")
-        return templates.TemplateResponse(
-            request=request,
-            name="workflow.html",
-            context={
-                **page_context(request, authenticated, title="Workflow detail", active="workflows"),
-                "workflow_id": workflow_id,
-            },
-        )
-
-    @app.get("/executions/{execution_id}", response_class=HTMLResponse)
-    async def execution_page(execution_id: UUID, request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="execution.html",
-            context={
-                **page_context(request, authenticated, title="Execution", active="logs"),
-                "execution_id": str(execution_id),
-            },
-        )
-
-    @app.get("/audits", response_class=HTMLResponse)
-    async def audits_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="audits.html",
-            context=page_context(request, authenticated, title="Audits", active="audits"),
-        )
-
-    @app.get("/commands", response_class=HTMLResponse)
-    async def commands_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="commands.html",
-            context=page_context(request, authenticated, title="Commands", active="commands"),
-        )
-
-    @app.get("/findings", response_class=HTMLResponse)
-    async def findings_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="findings.html",
-            context=page_context(request, authenticated, title="Findings", active="findings"),
-        )
-
-    @app.get("/enhancements", response_class=HTMLResponse)
-    async def enhancements_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="enhancements.html",
-            context=page_context(
-                request, authenticated, title="Enhancements", active="enhancements"
-            ),
-        )
-
-    @app.get("/connections", response_class=HTMLResponse)
-    async def connections_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="connections.html",
-            context=page_context(request, authenticated, title="Connections", active="connections"),
-        )
-
-    @app.get("/settings", response_class=HTMLResponse)
-    async def settings_page(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return templates.TemplateResponse(
-            request=request,
-            name="settings.html",
-            context=page_context(request, authenticated, title="Settings", active="settings"),
-        )
-
-    @app.post("/settings/password", response_class=HTMLResponse)
-    async def change_password(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        form = await _form(request)
-        if not _valid_csrf(authenticated, form.get("csrf_token")):
-            return PlainTextResponse("invalid request", status_code=403)
-        try:
-            values = PasswordChangeInput(
-                current_password=form.get("current_password", ""),
-                new_password=form.get("new_password", ""),
-                confirmation=form.get("confirmation", ""),
-            )
-            if values.new_password != values.confirmation:
-                raise ValueError("new password confirmation does not match")
-            version = await repo(request).change_password(
-                values.current_password, values.new_password
-            )
-        except ValueError as error:
-            return templates.TemplateResponse(
-                request=request,
-                name="settings.html",
-                context=page_context(
-                    request,
-                    authenticated,
-                    title="Settings",
-                    active="settings",
-                    error=str(error),
-                ),
-                status_code=400,
-            )
-        except Exception:  # noqa: BLE001 - form values must never enter error logging
-            version = None
-        if version is None:
-            return templates.TemplateResponse(
-                request=request,
-                name="settings.html",
-                context=page_context(
-                    request,
-                    authenticated,
-                    title="Settings",
-                    active="settings",
-                    error="Unable to change password.",
-                ),
-                status_code=400,
-            )
-        token = sessions.create(version)
-        updated = AuthenticatedSession(token=token, data=cast(Any, sessions.verify(token)))
-        response = templates.TemplateResponse(
-            request=request,
-            name="settings.html",
-            context=page_context(
-                request,
-                updated,
-                title="Settings",
-                active="settings",
-                notice="Password changed. Other sessions have been signed out.",
-            ),
-        )
-        _set_cookie(
-            response, SESSION_COOKIE, token, max_age=resolved.dashboard_session_hours * 3600
-        )
-        await _record_safely(
-            repo(request),
-            ActivityEventInput(
-                level="INFO",
-                event_type="dashboard.password_changed",
-                source="dashboard",
-                message="Dashboard password version changed",
-            ),
-        )
-        return response
 
     @app.get("/api/dashboard/backlog")
     async def backlog_api(
@@ -1191,20 +962,6 @@ def create_app(
         response.headers["X-Accel-Buffering"] = "no"
         return response
 
-    @app.get("/static/dashboard.css")
-    async def dashboard_css(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return FileResponse(STATIC_ROOT / "dashboard.css", media_type="text/css")
-
-    @app.get("/static/dashboard.js")
-    async def dashboard_js(request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return FileResponse(STATIC_ROOT / "dashboard.js", media_type="text/javascript")
-
     @app.get("/console/assets/{name}")
     async def console_asset(name: str, request: Request) -> Response:
         authenticated = await require_session(request)
@@ -1230,17 +987,9 @@ def create_app(
 
     @app.exception_handler(404)
     async def not_found(request: Request, _error: Exception) -> Response:
-        authenticated = await current_session(request)
-        if authenticated is None:
+        if await current_session(request) is None:
             return RedirectResponse("/login", status_code=303)
-        return templates.TemplateResponse(
-            request=request,
-            name="error.html",
-            context=page_context(
-                request, authenticated, title="Not found", active="", error="Page not found."
-            ),
-            status_code=404,
-        )
+        return JSONResponse({"detail": "not found"}, status_code=404)
 
     return app
 
@@ -1294,23 +1043,11 @@ def _valid_csrf(authenticated: AuthenticatedSession, supplied: str | None) -> bo
 
 
 def _safe_next(value: str | None) -> str:
-    if value in {
-        "/overview",
-        "/backlog",
-        "/workflows",
-        "/activity",
-        "/logs",
-        "/audits",
-        "/commands",
-        "/connections",
-        "/settings",
-        "/console",
-        "/console/projects",
-        "/console/backlog",
-        "/console/executions",
-    }:
-        return value
-    return "/overview"
+    if value is not None and value.startswith("/console/"):
+        view = value.removeprefix("/console/")
+        if view and view in CONSOLE_VIEWS:
+            return value
+    return "/console"
 
 
 def _client_address(request: Request) -> str:

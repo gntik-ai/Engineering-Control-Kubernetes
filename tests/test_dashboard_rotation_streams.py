@@ -223,18 +223,8 @@ async def test_shared_database_stream_revocation_matrix(tmp_path, cause, isolate
             )
             assert response.status_code == 303
         elif cause == "password_change":
-            response = await clients[0].post(
-                "/settings/password",
-                data={
-                    "csrf_token": session_data.csrf_token,
-                    "current_password": PASSWORD,
-                    "new_password": NEW_PASSWORD,
-                    "confirmation": NEW_PASSWORD,
-                },
-            )
-            assert response.status_code == 200 and response.cookies.get(
-                "engineering_dashboard_session"
-            )
+            # No web password form any more; the repository call it used rotates the version.
+            assert await repo.change_password(PASSWORD, NEW_PASSWORD) is not None
         elif cause == "password_reset":
             await asyncio.to_thread(repo.reset_password_sync, NEW_PASSWORD)
         elif cause == "revocation_store_unavailable":

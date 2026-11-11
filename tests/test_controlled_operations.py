@@ -953,10 +953,7 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
             follow_redirects=False,
         )
         assert logged_in.status_code == 303
-        commands = client.get("/commands")
-        match = re.search(r'name="csrf_token" value="([^"]+)"', commands.text)
-        assert match is not None
-        csrf = match.group(1)
+        csrf = client.get("/api/dashboard/session").json()["csrf_token"]
 
         assert (
             client.post(

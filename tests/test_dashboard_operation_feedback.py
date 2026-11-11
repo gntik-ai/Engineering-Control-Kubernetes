@@ -103,5 +103,3 @@ def test_missing_observer_has_no_installed_config_fallback(repositories):
         response = client.post("/api/dashboard/actions/execute", json=prepare(client))
         assert response.status_code == 202
         assert response.json()["dispatch_observation"]["status"] == "UNKNOWN"
-        page = client.get("/connections")
-        assert 'id="action-progress"' in page.text and 'aria-live="polite"' in page.text
