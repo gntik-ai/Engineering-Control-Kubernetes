@@ -74,8 +74,54 @@ async def test_admission_fixed_read_path_and_scope(
     ],
 )
 def test_non_loopback_or_invalid_target_rejected(host: str, port: int) -> None:
-    with pytest.raises(ValueError, match="loopback"):
+    with pytest.raises(ValueError, match="admission observation requires"):
         AdmissionReader(host, port)
+
+
+@pytest.mark.asyncio
+async def test_cluster_service_is_read_without_credentials() -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert str(request.url) == "http://engineering-control-api:8740/health/ready"
+        assert "authorization" not in request.headers and "cookie" not in request.headers
+        return httpx.Response(200, json=payload("normal", True))
+
+    # The listener address of a pod is every interface; the Service name decides the target.
+    reader = AdmissionReader(
+        "0.0.0.0",  # noqa: S104 - the listener address of a pod
+        8740,
+        service="engineering-control-api",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert (await reader.read())["status"] == "DISPATCHING"
+        assert len(requests) == 1
+    finally:
+        await reader.aclose()
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        "",
+        "api.other-namespace",
+        "api.other-namespace.svc.cluster.local",
+        "ade.musematic.ai",
+        "10.10.0.2",
+        "api:8740",
+        "api/health",
+        "api@remote.invalid",
+        "API",
+        "-api",
+        "api-",
+        "a" * 64,
+    ],
+)
+def test_cluster_service_must_be_one_label_of_the_own_namespace(service: str) -> None:
+    with pytest.raises(ValueError, match="plain service name"):
+        AdmissionReader("127.0.0.1", 8740, service=service)
 
 
 @pytest.mark.asyncio

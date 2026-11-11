@@ -10,6 +10,8 @@ data:
   # Listeners are on the pod interface; network policy decides who may reach them.
   ENGINEERING_NETWORK_BOUNDARY: cluster
   ENGINEERING_API_HOST: 0.0.0.0
+  # The console reads the admission state of the API through its Service.
+  ENGINEERING_API_SERVICE_NAME: engineering-control-api
   ENGINEERING_DASHBOARD_HOST: 0.0.0.0
   ENGINEERING_EVIDENCE_INGEST_HOST: 0.0.0.0
   ENGINEERING_API_TOKEN_FILE: /var/run/secrets/engineering-control/api.token

@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     network_boundary: Literal["loopback", "cluster"] = "loopback"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8740, ge=1024, le=65535)
+    # In a cluster, the Service through which other pods of the namespace reach the API.
+    api_service_name: str | None = Field(default=None, pattern=r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
     api_admission_mode: Literal["normal", "synthetic-only", "diagnostics-only"] = "normal"
     projection_reconciliation_enabled: bool = False
     projection_reconciliation_interval_seconds: int = Field(default=30, ge=5, le=300)
@@ -320,6 +322,8 @@ class Settings(BaseSettings):
         """Outside a cluster, no listener may be reachable from every interface."""
         if self.network_boundary == "cluster":
             return self
+        if self.api_service_name is not None:
+            raise ValueError("an API service name is only meaningful inside a cluster")
         every_interface = {"0.0.0.0", "::"}  # noqa: S104 - these values are explicitly rejected
         if self.api_host in every_interface:
             raise ValueError("the Engineering Control API cannot bind to every interface")

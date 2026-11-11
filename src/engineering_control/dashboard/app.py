@@ -153,9 +153,11 @@ def create_app(
         # Injected fixture repositories must never fall back to live networking.
         if resolved_admission is None and repository is None:
             try:
-                resolved_admission = AdmissionReader(resolved.api_host, resolved.api_port)
+                resolved_admission = AdmissionReader(
+                    resolved.api_host, resolved.api_port, service=resolved.api_service_name
+                )
             except ValueError:
-                LOGGER.warning("dashboard local API admission observation is unavailable")
+                LOGGER.warning("dashboard API admission observation is unavailable")
         app.state.dashboard_service = DashboardService(resolved_repository, resolved_admission)
         resolved_operations = operations_repository or OperationsRepository(
             resolved.database_url.get_secret_value(),

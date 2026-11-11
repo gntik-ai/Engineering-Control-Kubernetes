@@ -1,9 +1,10 @@
-"""Credential-free, bounded observation of the local API's admission state."""
+"""Credential-free, bounded observation of the private API's admission state."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -13,6 +14,8 @@ import httpx
 CACHE_SECONDS = 2.0
 REQUEST_SECONDS = 1.0
 MAX_BODY_BYTES = 4096
+# One DNS label: it resolves only through the pod's own namespace search path.
+SERVICE_NAME = re.compile(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?")
 
 
 def unknown_admission() -> dict[str, Any]:
@@ -29,19 +32,31 @@ def unknown_admission() -> dict[str, Any]:
 
 
 class AdmissionReader:
-    """No credentials, arbitrary URLs, redirects, proxy env or fixture fallback."""
+    """No credentials, arbitrary URLs, redirects, proxy env or fixture fallback.
+
+    The target is the loopback API or, in a cluster, the API Service of the
+    pod's own namespace, named by a validated setting.
+    """
 
     def __init__(
         self,
         host: str,
         port: int,
         *,
+        service: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if host not in {"127.0.0.1", "::1", "localhost"} or not 1024 <= port <= 65535:
+        if not 1024 <= port <= 65535:
+            raise ValueError("dashboard admission observation requires an unprivileged API port")
+        if service is not None:
+            if SERVICE_NAME.fullmatch(service) is None:
+                raise ValueError("dashboard admission observation requires a plain service name")
+            address = service
+        elif host in {"127.0.0.1", "::1", "localhost"}:
+            # Never resolve a hostname from DNS, environment or browser input.
+            address = "[::1]" if host == "::1" else "127.0.0.1"
+        else:
             raise ValueError("dashboard admission observation requires a loopback API")
-        # Never resolve a hostname from DNS, environment or browser input.
-        address = "[::1]" if host == "::1" else "127.0.0.1"
         self.url = f"http://{address}:{port}/health/ready"
         self.client = httpx.AsyncClient(
             transport=transport,

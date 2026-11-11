@@ -105,3 +105,14 @@ def test_listeners_are_loopback_only_unless_the_boundary_is_the_cluster() -> Non
     assert settings.api_host == settings.dashboard_host == every_interface
     with pytest.raises(ValueError):
         Settings(network_boundary="public")
+
+
+def test_api_service_name_is_a_single_label_and_only_for_a_cluster() -> None:
+    assert Settings().api_service_name is None
+    with pytest.raises(ValueError, match="only meaningful inside a cluster"):
+        Settings(api_service_name="engineering-control-api")
+    settings = Settings(network_boundary="cluster", api_service_name="engineering-control-api")
+    assert settings.api_service_name == "engineering-control-api"
+    for value in ("api.other-namespace", "ade.musematic.ai", "10.10.0.2", "api:8740", "API"):
+        with pytest.raises(ValueError):
+            Settings(network_boundary="cluster", api_service_name=value)
