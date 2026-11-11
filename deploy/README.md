@@ -35,6 +35,15 @@ CI builds the image for every commit, boots it, and pushes it tagged with the co
 Deploying is changing `newTag` in `base/kustomization.yaml` to that commit and synchronising
 the application.
 
+## Replacing a database
+
+The processes read the database address and password once, when the pod starts. If a
+PostgreSQL cluster is deleted and created again, its password changes: wait until the old
+cluster is gone before synchronising (otherwise the synchronisation fails with "is missing,
+it might have been deleted"), then restart the deployments so they read the new password.
+The console's first password stays the same: the Job applies the one already stored in the
+Secret `engineering-control-admin` to the new, empty database.
+
 ## The first password
 
 After the first synchronisation the initial dashboard password is in the Secret

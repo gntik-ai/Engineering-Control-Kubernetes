@@ -1555,6 +1555,13 @@ should be given the scoped account above, never the administrator's.
   fixed the nodes, and the pin was removed.
 - **There is a fourth node**, `aibot` (12 CPU, about 30 GiB), not seen in the first
   inspection.
+- **The second stage runs on the worker nodes.** After the node fix, both PostgreSQL
+  clusters, Temporal (one pod, four services), the API and the workflow worker start on
+  `aibot` and stay healthy. Moving the database meant creating it again, so its password
+  changed and the processes had to be restarted to read it. The first console password
+  did not change: the Job applied the stored one to the new database.
+- **The console could not read the API's admission state in a pod.** The reader accepted
+  only a loopback API. It now also accepts the API Service of its own namespace.
 - **The storage class named in another application's settings does not exist.** The default
   class is node-local storage; a volume lives on one node's disk.
 - **Images in the organisation's registry are pulled without credentials only when the
