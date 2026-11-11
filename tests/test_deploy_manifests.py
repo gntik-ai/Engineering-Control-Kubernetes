@@ -108,7 +108,12 @@ def test_no_secret_value_is_in_the_repository() -> None:
     documents = _documents()
     assert not [d for d in documents if d["kind"] == "Secret"]
     text = "\n".join(path.read_text() for path in BASE.glob("*.yaml"))
-    assert "BEGIN " not in text and "password:" not in text.replace("key: password", "")
+    # The only password fields are a reference to a Secret key and a placeholder that the
+    # Temporal pod replaces at start.
+    allowed = ("key: password", 'password: "__TEMPORAL_DB_PASSWORD__"')
+    for phrase in allowed:
+        text = text.replace(phrase, "")
+    assert "BEGIN " not in text and "password:" not in text
 
 
 def test_mounted_secrets_are_group_readable_only_and_listeners_need_no_public_route() -> None:
