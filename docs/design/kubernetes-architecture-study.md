@@ -5,6 +5,8 @@ Status: proposal for discussion. Nothing in this document is implemented.
 Sections 1–10 are the first iteration. Section 11 is a second iteration that adds designable
 flows, a supervising agent and the options those two make necessary.
 Section 12 records the decisions taken on section 11 and takes precedence where it differs.
+Section 13 records the final decisions, corrects section 12.4 and gives the consolidated
+plan; it takes precedence over everything before it.
 
 This study answers two questions asked ahead of the Kubernetes migration:
 
@@ -71,6 +73,13 @@ programme grows to about 67–90 engineer-weeks.
 single administrator publishes them without a second approver; the supervisor acts on its
 own for reversible actions and waits for the administrator before risky ones; and it runs
 on its own credentials. With these the programme is about 72–97 engineer-weeks.
+
+**Final decisions (section 13).** A first-party chat channel; subscriptions for every model,
+the supervisor included; deployment on an existing cluster through its Argo CD; the name
+Engineering Control; and the full restructuring with all 33 existing workflows imported as
+built-in flows. The consolidated plan is about 73–96 engineer-weeks, roughly eleven months
+for a team of three. Throughput will be set by the number of subscription accounts, not by
+the cluster.
 
 ## 2. Scope and method
 
@@ -642,6 +651,8 @@ Natural stopping points:
 
 ## 10. Decisions needed
 
+All five were decided; see section 13.
+
 1. **Chat channel.** Keep Telegram through a first-party adapter (recommended), or rely on
    the console and CLI only.
 2. **Provider credentials.** Subscription seats behind a broker, or API keys. Unchanged from
@@ -955,7 +966,7 @@ section takes precedence.
 | 8 | Supervisor autonomy | **As autonomous as possible**, stopping to wait for the administrator before risky actions |
 | 9 | Supervisor credential | **Its own credentials** (see 12.4 for how this was read) |
 
-Decisions 1–5 of section 10 remain open.
+Decisions 1–5 of section 10 were open at this point; they are taken in section 13.
 
 ### 12.1 Visual flow designer
 
@@ -1077,6 +1088,10 @@ authority:**
 
 ### 12.4 Supervisor credentials
 
+**Withdrawn.** The decision was corrected: every model, the supervisor included, runs on a
+subscription and no API key is used. See section 13.1. The text below is kept for the
+record only.
+
 The decision was "use credentials". It is read here as: **the supervisor has its own
 provider credentials** — an API key for the chosen provider, with a second provider
 configured as fallback — stored as a cluster secret and separate from the accounts that run
@@ -1119,6 +1134,212 @@ Sequence, adjusting section 11.5:
 The designer comes after step 10 because it needs every workflow family expressed as
 modules first; before that, built-in flows are configured through settings and prompt
 templates.
+
+## 13. Final decisions and consolidated plan (fourth iteration)
+
+All open decisions are now taken. This section records them, corrects section 12.4, and
+restates the plan in one place. It takes precedence over earlier sections where they differ.
+
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | Chat channel | **Yes**: a first-party chat adapter replaces the Hermes gateway |
+| 2 | How agents authenticate | **Subscriptions**, for every model |
+| 3 | Cluster | **An existing cluster**, deployed through its existing Argo CD if suitable |
+| 4 | Name | **Engineering Control** |
+| 5 | Scope | **Full restructuring**, with the existing workflows imported as flows |
+| 9 | Supervisor credential (corrects 12.4) | **Subscription**, not an API key |
+
+### 13.1 Subscriptions for every model
+
+No API keys anywhere: the working agents, the reviewer and the supervisor all run the
+provider's command-line client on a subscription login, as today. The rule that strips API
+keys from agent environments stays and now also covers the supervisor. Section 12.4 is
+withdrawn.
+
+**Accounts as the unit of capacity.** A subscription login is an *account*. The platform
+keeps a pool of accounts per provider and the scheduler admits work against it.
+
+| Aspect | Design |
+| --- | --- |
+| Storage | Each account's client home (its login tokens) is a persistent volume of its own. The client refreshes tokens in place, so the volume must be writable and must survive the pod |
+| Use | An account is leased to a sandbox for one agent invocation and released afterwards. Concurrent invocations per account is a setting, starting at the value that works today (two) |
+| Health | The existing status probes (`claude auth status`, `codex login status`) give each account a state: ready, limited (waiting with backoff), or login required |
+| Login | Interactive, as it is today over SSH. In the cluster it becomes an item in the decision inbox that opens a login session for that account. How each client's browser login can be driven from the console has to be verified per client |
+| Rate limits | Neither client exposes remaining quota. The scheduler learns from refusals: the account is set to limited until the reset time the client reports, or with backoff when it reports none |
+| Supervisor | A read-only pod running the same client with structured output. It should have **an account of its own** on at least one provider, so that a limited work account does not silence it, with the other provider as fallback. If neither answers, the deterministic fallback applies: pause the affected run and notify |
+
+**What this means for scale.** Parallelism is the number of accounts multiplied by the
+concurrent invocations each tolerates, not the size of the cluster. A running mission holds
+about one invocation at a time (author, then reviewer from the other provider), so N
+missions in parallel need about N invocation slots spread over both providers, plus the
+supervisor's. Adding capacity means adding accounts.
+
+**Two things to confirm outside the code:**
+
+- Whether the subscription plans permit this many automated, concurrent sessions, and what
+  their limits are. This is a question of plan terms, and it bounds the whole programme.
+- How many accounts per provider are to be bought. The design works with any number; the
+  achievable throughput follows from it.
+
+### 13.2 Chat channel
+
+A first-party adapter as described in section 5.3: a stateless service that receives
+messages by webhook, checks the sender against the administrator's identity, parses the
+fixed command grammar, submits typed commands, and delivers replies, notifications and
+supervisor requests. Telegram is the first transport because the allowlist, the command set
+and the operator's habits already exist; the transport is a separate layer so another can be
+added.
+
+With the supervisor of section 12.3, the chat channel carries three kinds of message:
+notifications, questions that wait for an answer (approvals and risky supervisor actions,
+answerable in chat), and the daily digest.
+
+### 13.3 An existing cluster and its Argo CD
+
+**Assumption.** The repository shows one cluster: the staging cluster that hosts falcone,
+musematic and llmwiki, with an Argo CD instance in the `argocd` namespace. This section
+assumes that is the cluster meant. If it is another, the isolation measures below can be
+relaxed.
+
+**What sharing the cluster gains:**
+
+- Observer and release identities become service accounts bound to the existing
+  least-privilege roles in `config/kubernetes/`. The kubeconfig files, and the open findings
+  about them, go away.
+- No second cluster to run.
+
+**What it requires**, because agent sandboxes execute project code next to the products
+they deliver to:
+
+| Measure | Purpose |
+| --- | --- |
+| Separate namespaces for the control plane and for sandboxes | Different privileges and quotas |
+| Default-deny network policy on sandboxes: no route to product namespaces, the cluster API or the control-plane database; outbound only to the evidence service, the provider endpoints and package registries | A compromised sandbox reaches nothing |
+| No service-account token mounted in sandboxes; restricted pod security | No cluster identity inside a sandbox |
+| Resource quotas, limits and a lower priority class for sandboxes | Product workloads are never starved; a maker run today needs up to 6–8 GB |
+| A dedicated node pool with taints, if the cluster can add one | Keeps untrusted code off the nodes that run products |
+| A sandboxed container runtime, if the cluster offers one | A second boundary below the pod |
+
+**Argo CD.** Using the existing instance is reasonable, with two conditions:
+
+- A dedicated Argo CD project for Engineering Control, restricted to its own namespaces and
+  its deployment repository.
+- The platform's own Argo CD account, which it uses to sync product applications, must not
+  be able to change the platform's application. Otherwise an agent-driven change could
+  alter the system that supervises it.
+
+**Facts about the cluster needed before step 3**, which the repository does not contain:
+
+- Kubernetes distribution and version; whether the network plug-in enforces network
+  policies.
+- Free capacity, and whether nodes can be added or a pool dedicated.
+- Storage classes for persistent volumes; what is available for object storage.
+- Ingress controller and certificate management.
+- Whether a sandboxed runtime class and user namespaces are available (the loopback shell
+  that today protects agent credentials relies on bubblewrap, which needs them).
+- The secret operator in use (the product manifests reference external-secrets).
+
+### 13.4 The name
+
+"Engineering Control" replaces "Hermes" wherever a person reads it; identifiers that code
+reads back stay as they are, for the reasons in section 5.4.
+
+| Renamed | Kept |
+| --- | --- |
+| Sign-in page, console, notifications and chat messages | Labels `hermes:risk-r1`, `hermes:change-request` |
+| Titles and bodies of new issues and pull requests the platform opens | The CI-baseline branch pattern and marker file |
+| Prompt text that names the platform | HTML markers in existing issue bodies |
+| Documentation, comments, unit descriptions | Namespace strings behind deterministic identifiers and approval bindings |
+| Environment variable names, with the old names accepted during the transition | Event types and sources already stored in the database |
+
+One detail: the backlog import skips the platform's own operational issues by title prefix.
+New titles need new prefixes added to that list, and the old prefixes must stay, or existing
+operational issues would be imported as work.
+
+The console already carries the new name; the sign-in page still shows the old one.
+
+### 13.5 Full restructuring, with existing workflows imported
+
+Every one of the 33 existing workflows has a destination. Those that represent work become
+**built-in flows**, visible and editable in the designer. Those that are plumbing become
+part of the engine, the scheduler or the platform's maintenance jobs.
+
+| Existing workflows | Destination |
+| --- | --- |
+| Existing-backlog loop, issue delivery, staging GitOps delivery, delivery reconciliation, final closure | Flow **Deliver issue** |
+| Preview deployment, staging deployment, runtime verification | Sub-flow **Release and verify**, using the project's release strategy |
+| Recovery | Flow **Recover deployment** |
+| GitHub backlog import | Producer **Import backlog** |
+| Audit campaign, finding verification | Flow **Audit code** |
+| Multi-project audit, autonomous backlog campaign | The scheduler (fan-out across projects is its job, not a flow's) |
+| Enhancement discovery, enhancement delivery | Flow **Discover enhancements** |
+| Issue solution loop, enhancement solution loop | Retired: their items go through **Deliver issue** |
+| Change request | Flow **Change request** |
+| UI migration plan, UI blueprint fan-out, UI gap consolidation | Flow **Plan UI migration** |
+| Backlog decomposition plan and fan-out | Flow **Decompose backlog** |
+| Issue amend observation, publication heads observation | Event triggers and engine internals |
+| Cleanup, quota refresh, connections refresh | Platform maintenance jobs, not editable |
+| LLMWiki staging bootstrap | An action of the llmwiki project plug-in |
+| Acceptance lifecycle, both observability acceptance workflows | A synthetic canary flow and test fixtures |
+
+**What "imported" has to mean:**
+
+- **Same behaviour first.** Each built-in flow starts as a faithful translation: the same
+  stages, gates, budgets and prompts. Prompts are extracted from the Python that assembles
+  them into templates word for word. Improvements come afterwards, as new versions.
+- **Proven on recorded work.** Old and new are run on the same past items and compared on
+  gate results, corrections and outcome. This is the evaluation lab of section 11.4, which
+  therefore moves earlier in the plan: it is the acceptance test for the import.
+- **Existing records carried over.** Backlog campaigns, issue records, change sets,
+  findings, enhancements and approvals are migrated into the work-item model so history and
+  open items are not lost. Approvals bound to digests stay valid because their bindings are
+  not recomputed.
+- **Project settings carried over.** The six project manifests become project records and
+  flow parameters.
+- **Running work drained.** Executions in flight finish on the old workers; nothing is
+  converted mid-run.
+
+### 13.6 Consolidated plan
+
+| Step | Scope | Engineer-weeks |
+| --- | --- | --- |
+| 1 | Continuous integration; image builds | 2 |
+| 2 | Containers; paths and hosts moved to configuration | 2–3 |
+| 3 | Control plane on the existing cluster through Argo CD: namespaces, policies, database, Temporal with TLS, secrets, object storage | 4–5 |
+| 4 | Access: one administrator, a credential per channel, GitHub App; console commands and decision inbox; chat adapter; rename to Engineering Control; **retire Hermes** | 5–6 |
+| 5 | Sandbox per mission: launcher, workspace, bundle handoff | 6–8 |
+| 6 | Isolation hardening; account pool with leasing, health and login from the inbox | 4–6 |
+| 7 | Work-item model and scheduler; migration of existing records | 5–7 |
+| 8 | Flow interpreter, module catalogue, prompt templates, budgets; **Deliver issue** imported; evaluation lab used as its acceptance test | 12–15 |
+| 9 | Projects, providers, models and roles as data; plug-in points | 3–4 |
+| 10 | Remaining flows imported: audit, enhancements, change request, UI planning, decomposition, recovery; legacy loops retired | 4–5 |
+| 11 | Supervisor: detectors, rules, agent on a subscription account, automatic and waiting actions | 7–10 |
+| 12 | Composable flows and the visual designer with run view; event triggers | 13–17 |
+| 13 | State: status from Temporal, outbox projector, references instead of payloads; remove reconciliation code | 3–4 |
+| 14 | Monitoring, runbooks, cut-over, old hosts retired | 3–4 |
+| | **Total** | **about 73–96** |
+
+About eleven months for a team of three, allowing for coordination. Steps 11 and 12 can run
+in parallel with 9–10 once step 8 is complete.
+
+Milestones:
+
+- **After step 6:** running on the cluster with isolated sandboxes and the account pool;
+  Hermes gone; workflows unchanged.
+- **After step 8:** issue resolution on the new engine, with editable prompts.
+- **After step 10:** every existing workflow imported; legacy code removed.
+- **After step 12:** flows designed visually; supervisor operating.
+
+### 13.7 What is still unknown
+
+No decisions remain open. Three facts do, and each can change the plan:
+
+1. **Subscription terms and the number of accounts** (13.1). This sets the throughput the
+   whole programme can reach.
+2. **The cluster's properties** (13.3), especially capacity, network policy enforcement and
+   whether a sandboxed runtime is available.
+3. **Driving the clients' login from the console** (13.1). If it cannot be done, logging an
+   account in remains a command-line task for the administrator.
 
 ## Appendix A. Documentation drift found during the audit
 
