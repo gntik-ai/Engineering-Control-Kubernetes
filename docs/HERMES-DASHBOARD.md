@@ -188,6 +188,18 @@ Provider roles mean:
 - **reviewer** — release or plan review;
 - **verifier** — finding or runtime verification.
 
+## gntik-ui console (`/console`)
+
+`/console` is a read-only single-page view built with the gntik-ui kit, served by the same
+dashboard service and session: **Projects** (`/console/projects`: every registered project, its
+repositories, tracked backlog issues, active workflows and running agents), **Backlog**
+(`/console/backlog`: filter by project and status, search) and **Executions**
+(`/console/executions`: agent executions and workflows in progress, refreshed every five
+seconds). It reads `/api/dashboard/{projects,backlog,executions,workflows}` and performs no
+writes; approvals, commands, logs and settings stay on the pages above. Source, build and
+Content-Security-Policy constraints: `web/console/README.md`. The built bundle is committed under
+`src/engineering_control/dashboard/console/` because the controller installs no Node toolchain.
+
 ## Authentication and password files
 
 There is one password and no username. Sessions are HMAC signed for 12 hours and use Secure,

@@ -157,6 +157,9 @@ class DashboardService:
     async def services(self) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.observability.services)
 
+    async def projects(self) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.observability.projects)
+
     async def root_blockers(
         self,
         *,

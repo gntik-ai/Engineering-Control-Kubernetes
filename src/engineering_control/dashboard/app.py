@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import grp
+import hashlib
 import hmac
 import ipaddress
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -60,6 +63,30 @@ from engineering_control.projects import PROJECT_SET
 PACKAGE_ROOT = Path(__file__).parent
 TEMPLATE_ROOT = PACKAGE_ROOT / "templates"
 STATIC_ROOT = PACKAGE_ROOT / "static"
+# The built gntik-ui console (web/console, `pnpm build`): index.html plus hashed assets.
+# Kept outside static/: that directory holds the hand-written, remote-free dashboard files.
+CONSOLE_ROOT = PACKAGE_ROOT / "console"
+CONSOLE_ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+# The one inline <style> the console's select popup (Base UI, under gntik-ui) adds to the
+# page: it hides the popup list's scrollbar. Only this exact text is allowed, and only on
+# /console; if a kit upgrade changes it, the browser blocks the new text (the scrollbar
+# shows) until the constant is updated. tests/test_dashboard_console.py checks the bundle.
+CONSOLE_INLINE_STYLE = (
+    ".base-ui-disable-scrollbar{scrollbar-width:none}"
+    ".base-ui-disable-scrollbar::-webkit-scrollbar{display:none}"
+)
+CONSOLE_INLINE_STYLE_HASH = (
+    "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
+)
+CONSOLE_VIEWS = frozenset({"", "projects", "backlog", "executions"})
+CONSOLE_ASSET_TYPES = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+}
 PROJECTS = PROJECT_SET
 LOGGER = logging.getLogger(__name__)
 
@@ -185,9 +212,12 @@ def create_app(
         response.headers["Permissions-Policy"] = (
             "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=()"
         )
+        style_sources = "'self'"
+        if request.url.path == "/console" or request.url.path.startswith("/console/"):
+            style_sources = f"'self' '{CONSOLE_INLINE_STYLE_HASH}'"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; "
-            "object-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; "
+            f"object-src 'none'; img-src 'self'; script-src 'self'; style-src {style_sources}; "
             "connect-src 'self'"
         )
         return response
@@ -880,6 +910,13 @@ def create_app(
             return authenticated
         return JSONResponse(await service(request).services())
 
+    @app.get("/api/dashboard/projects")
+    async def projects_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).projects())
+
     @app.get("/api/dashboard/root-blockers")
     async def root_blockers_api(
         request: Request,
@@ -1168,6 +1205,29 @@ def create_app(
             return authenticated
         return FileResponse(STATIC_ROOT / "dashboard.js", media_type="text/javascript")
 
+    @app.get("/console/assets/{name}")
+    async def console_asset(name: str, request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        media_type = CONSOLE_ASSET_TYPES.get(Path(name).suffix)
+        path = CONSOLE_ROOT / "assets" / name
+        if media_type is None or not CONSOLE_ASSET_NAME.fullmatch(name) or not path.is_file():
+            raise HTTPException(status_code=404, detail="asset not found")
+        return FileResponse(path, media_type=media_type)
+
+    @app.get("/console")
+    @app.get("/console/{view}")
+    async def console_page(request: Request, view: str = "") -> Response:
+        """The gntik-ui console: one client-routed page over the read-only dashboard API."""
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        index = CONSOLE_ROOT / "index.html"
+        if view not in CONSOLE_VIEWS or not index.is_file():
+            raise HTTPException(status_code=404, detail="page not found")
+        return FileResponse(index, media_type="text/html")
+
     @app.exception_handler(404)
     async def not_found(request: Request, _error: Exception) -> Response:
         authenticated = await current_session(request)
@@ -1244,6 +1304,10 @@ def _safe_next(value: str | None) -> str:
         "/commands",
         "/connections",
         "/settings",
+        "/console",
+        "/console/projects",
+        "/console/backlog",
+        "/console/executions",
     }:
         return value
     return "/overview"

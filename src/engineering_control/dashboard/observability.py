@@ -37,6 +37,7 @@ from engineering_control.operations.connection_status import (
     PROVIDER_FRESHNESS_SECONDS,
     provider_connection_status,
 )
+from engineering_control.projects import PROJECT_REPOSITORIES, PROJECTS, SELF_CONTAINED
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -480,6 +481,77 @@ class DashboardObservabilityProjection:
                 "source": "agent_log_chunks",
                 "observed_at": utc_iso(datetime.now(UTC)),
             }
+
+    def projects(self) -> dict[str, Any]:
+        """One row per registered project: its repositories and bounded activity counts.
+
+        Grouped counts only (no per-row projection), so the page can poll it.
+        """
+        summaries: dict[str, dict[str, Any]] = {
+            project: {
+                "project": project,
+                "source_repository": PROJECT_REPOSITORIES[project][0],
+                "deployment_repository": PROJECT_REPOSITORIES[project][1],
+                "self_contained": project in SELF_CONTAINED,
+                "backlog_issues": 0,
+                "workflows": 0,
+                "active_workflows": 0,
+                "running_executions": 0,
+                "last_activity_at": None,
+            }
+            for project in PROJECTS
+        }
+        with self.sessions() as session:
+            tracked_issues = (
+                select(
+                    GitHubBacklogCampaign.project.label("project"),
+                    BacklogIssueRecord.repository,
+                    BacklogIssueRecord.issue_number,
+                )
+                .join(
+                    GitHubBacklogCampaign,
+                    BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
+                )
+                .distinct()
+                .subquery()
+            )
+            issue_counts = select(tracked_issues.c.project, func.count()).group_by(
+                tracked_issues.c.project
+            )
+            for row in session.execute(issue_counts).all():
+                if row[0] in summaries:
+                    summaries[row[0]]["backlog_issues"] = row[1]
+            for project, status, run_type, count, latest in session.execute(
+                select(
+                    Run.project, Run.status, Run.run_type, func.count(), func.max(Run.updated_at)
+                ).group_by(Run.project, Run.status, Run.run_type)
+            ).all():
+                summary = summaries.get(project)
+                if summary is None:
+                    continue
+                summary["workflows"] += int(count)
+                if map_status(status, entity_type=run_type).normalized not in TERMINAL_STATUSES:
+                    summary["active_workflows"] += int(count)
+                latest_utc = current_utc(latest)
+                if latest_utc and (
+                    summary["last_activity_at"] is None or latest_utc > summary["last_activity_at"]
+                ):
+                    summary["last_activity_at"] = latest_utc
+            for project, status, count in session.execute(
+                select(AgentExecution.project, AgentExecution.status, func.count())
+                .where(AgentExecution.ended_at.is_(None))
+                .group_by(AgentExecution.project, AgentExecution.status)
+            ).all():
+                summary = summaries.get(project)
+                if summary is None:
+                    continue
+                normalized = map_status(status, entity_type="agent_execution").normalized
+                if normalized not in TERMINAL_STATUSES:
+                    summary["running_executions"] += int(count)
+        items = list(summaries.values())
+        for item in items:
+            item["last_activity_at"] = utc_iso(item["last_activity_at"])
+        return {"items": items, "refreshed_at": utc_iso(datetime.now(UTC))}
 
     def services(self) -> dict[str, Any]:
         with self.sessions() as session:

@@ -25,6 +25,7 @@
       <a href="/commands"{% if active in ("commands", "findings", "enhancements") %} aria-current="page"{% endif %}>Commands</a>
       <a href="/connections"{% if active == "connections" %} aria-current="page"{% endif %}>Connections</a>
       <a href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>Settings</a>
+      <a href="/console">Console</a>
       <form action="/logout" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button class="nav-button" type="submit">Logout</button>
