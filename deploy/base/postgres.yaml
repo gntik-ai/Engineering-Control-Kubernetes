@@ -9,22 +9,6 @@ metadata:
 spec:
   instances: 1
   imageName: ghcr.io/cloudnative-pg/postgresql:17
-  # On the cluster's Ubuntu 26.04 nodes (kernel 7.0) PostgreSQL cannot signal its own
-  # processes and never finishes starting ("could not signal for checkpoint: Permission
-  # denied"); the same error keeps two databases of another application down there. It
-  # starts normally on the Ubuntu 24.04 node, so the database is placed on that node until
-  # the nodes are fixed. That node is the control plane and is tainted; the toleration is
-  # the one another application's database already uses to run there. Remove this block
-  # once PostgreSQL starts on the worker nodes: a control-plane node should not carry
-  # workloads for long.
-  affinity:
-    nodeSelector:
-      kubernetes.io/hostname: mus-srv-0
-    tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Equal
-        value: "true"
-        effect: NoSchedule
   bootstrap:
     initdb:
       database: engineering_control

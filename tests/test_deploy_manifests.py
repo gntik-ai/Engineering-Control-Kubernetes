@@ -10,6 +10,11 @@ import yaml
 
 BASE = Path(__file__).parents[1] / "deploy" / "base"
 IMAGE = "engineering-control"  # the placeholder kustomization.yaml pins to a commit
+# Temporal's own images, pinned by digest, and the user they run as.
+THIRD_PARTY_IMAGES = {
+    "temporalio/server:1.31.2@sha256:b5ecdb8282bededae2a10c36e8d862e27d0bc2d247fc73c5416025997ab4a1da",
+    "temporalio/admin-tools:1.31.2@sha256:dbc5fcd6ee8f0f4d808bf765af9a87dea9d8a283abfdcfbd2fc148496ba66107",
+}
 BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
 
 
@@ -51,12 +56,15 @@ def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
     for name, spec in specs:
         pod = spec["securityContext"]
         assert pod["runAsNonRoot"] is True, name
-        assert pod["runAsUser"] == 10001 and pod["runAsGroup"] == 10001, name
+        images = {container["image"] for container in spec["containers"]}
+        third_party = images <= THIRD_PARTY_IMAGES
+        assert third_party or images == {IMAGE}, name  # never a mix, never anything else
+        user = 1000 if third_party else 10001
+        assert pod["runAsUser"] == user and pod["runAsGroup"] == user, name
         assert pod["seccompProfile"] == {"type": "RuntimeDefault"}, name
         assert not spec.get("hostNetwork") and not spec.get("hostPID"), name
         for container in spec["containers"] + spec.get("initContainers", []):
             security = container["securityContext"]
-            assert container["image"] == IMAGE, name
             assert security["allowPrivilegeEscalation"] is False, name
             assert security["readOnlyRootFilesystem"] is True, name
             assert security["capabilities"] == {"drop": ["ALL"]}, name

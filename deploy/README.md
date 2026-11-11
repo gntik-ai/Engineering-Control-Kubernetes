@@ -4,22 +4,24 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 
 | Path | What it is |
 | --- | --- |
-| `base/` | Kustomize manifests for stage 1: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, console, evidence ingest, notifier |
+| `base/` | Kustomize manifests for the control plane: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, Temporal, API, console, evidence ingest, notifier, workflow worker |
 | `registry/` | A one-template Helm chart that creates the image pull Secret from parameters held in Argo CD |
 | `argocd/` | The Argo CD project and applications, as applied |
 
-## What stage 1 contains
+## What is deployed
 
 | Wave | Resource | Purpose |
 | --- | --- | --- |
-| −2, −1 | Namespace, settings, service accounts, role, network policy | Everything the rest needs |
-| 0 | PostgreSQL cluster; Job `bootstrap-secrets` | The database; the Secret with service tokens and the session key, generated in the cluster |
-| 1 | Job `migrate-database` | `alembic upgrade head` |
-| 2 | Job `bootstrap-admin-password` | First dashboard password, stored in the Secret `engineering-control-admin` |
-| 3 | Console, evidence ingest (with its evidence volume), notifier | The long-running processes that need no Temporal |
+| −2, −1 | Namespace, settings, service accounts, role, network policies, Temporal configuration | Everything the rest needs |
+| 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
+| 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
+| 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
+| 3 | Console, evidence ingest (with its evidence volume), notifier; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
+| 4 | API, workflow worker | The command bus and the workflow engine's worker |
 
-Not in stage 1: the API, the scheduler and the workflow worker (they need Temporal), an
-Ingress (nothing is reachable from outside the cluster yet), and the sandboxes.
+Not deployed yet: the scheduler (it would start recurring workflows whose activities need
+role workers that do not exist yet), an Ingress (nothing is reachable from outside the
+cluster), TLS between the platform and Temporal, and the sandboxes.
 
 ## Rules the manifests keep
 
