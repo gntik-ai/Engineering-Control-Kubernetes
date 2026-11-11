@@ -1543,7 +1543,16 @@ should be given the scoped account above, never the administrator's.
 
 ### 16.3 Still unknown
 
-These need direct access to the cluster, which Argo CD does not give:
+These need direct access to the cluster, which Argo CD does not give. A cluster credential
+was provided, but the Kubernetes API (port 6443, client-certificate authentication) cannot be
+reached from the environment this work is done in, so the answers have to be collected by
+the administrator with the read-only commands in `docs/design/cluster-facts.sh`.
+
+One fact did come from the credential itself: its default namespace is a **production
+namespace of another product** on this same cluster. The cluster is therefore not
+staging-only, which makes the isolation measures of section 13.3 — a dedicated node for
+sandboxes above all — a requirement, not a preference.
+
 
 - Storage classes, and what is available for object storage.
 - The ingress controller and its class.
