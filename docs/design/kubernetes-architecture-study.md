@@ -12,6 +12,7 @@ Section 15 adds tasks placed by drag and drop and flows created by talking to th
 Section 16 records what a read-only inspection of the existing cluster showed.
 Section 17 records the product model the administrator asked for: projects, sections,
 backlog, queue and the supervisor as an agent.
+Section 18 is the current plan: every feature to build and the phases they are built in.
 
 File paths in sections 3–5 and the appendices refer to the code as imported from
 `gntik-ai/engineering-control`; some of the host-only files they cite are no longer in this
@@ -1725,6 +1726,156 @@ period in which flows can be assigned but not yet edited.
    environment — and with which test identity?
 3. **Order.** Build the product surface first on the existing workflows (recommended in
    17.8), or keep the order of section 13.6?
+
+## 18. Features to build and development phases
+
+This section replaces the step list of section 13.6 as the working plan. It lists every
+feature once, then orders them into phases so that the product the administrator uses comes
+first and the flow engine replaces what is behind it later (the order recommended in 17.8).
+
+### 18.1 Features
+
+Status: **done**, **in progress**, or blank for not started.
+
+**A. Platform foundation**
+
+| Id | Feature | Status |
+| --- | --- | --- |
+| A1 | Repository seeded from the original; continuous integration with lint, types, unit and replay tests | done |
+| A2 | Control-plane image | done |
+| A3 | Every control-plane process starts from configuration alone (environment and mounted secrets), proven by a boot test in CI | done for the control plane; the CLI and the role workers follow in phases 1 and 3 |
+| A4 | Helm chart; Argo CD project and application; namespaces and network policies | |
+| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | |
+| A6 | Object storage for evidence, transcripts and change bundles | |
+| A7 | Secrets delivered by the cluster's secret operator | |
+| A8 | Probes, metrics, alert rules, runbooks | |
+
+**B. Access**
+
+| Id | Feature |
+| --- | --- |
+| B1 | One administrator signing in with a password; the API takes the actor from the credential |
+| B2 | A separate credential for each channel and service |
+| B3 | GitHub App: installation per repository, short-lived tokens, all writes through the broker |
+| B4 | "Engineering Control" in everything a person reads |
+
+**C. Projects and sections**
+
+| Id | Feature |
+| --- | --- |
+| C1 | Create a project: name it and connect its repository |
+| C2 | GitHub sign-in to pick the repository from a list |
+| C3 | Six core sections per project, and custom sections |
+| C4 | Assign, change or remove the flow of a section |
+| C5 | The six existing projects migrated into project records |
+
+**D. Backlog and queue**
+
+| Id | Feature |
+| --- | --- |
+| D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals |
+| D2 | Import and keep in step with GitHub issues |
+| D3 | Route an item to a section, by the supervisor or by hand |
+| D4 | Run one item at a time |
+| D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder |
+| D6 | Scheduler with budgets per account, project, component and risk class |
+| D7 | Existing campaigns, issues, change sets, findings and approvals migrated |
+
+**E. Execution**
+
+| Id | Feature |
+| --- | --- |
+| E1 | One sandbox per run: private workspace, author and reviewer as separate containers |
+| E2 | Sandbox image with the agent clients, scanners and toolchains |
+| E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) |
+| E4 | Isolation: network policy, no cluster identity, quotas, a dedicated node |
+| E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox |
+| E6 | Evidence upload with a token valid for one run |
+
+**F. Flows**
+
+| Id | Feature |
+| --- | --- |
+| F1 | Flow interpreter and the catalogue of typed tasks |
+| F2 | Safety rules enforced by the engine on every flow |
+| F3 | Prompt templates: fixed contract, editable instructions, versions |
+| F4 | Existing workflows imported as built-in flows (13.5) |
+| F5 | New flows: Code clean, UI audit, UX audit |
+| F6 | Flow library: create, import into a project, versions, export |
+| F7 | Validation and dry-run simulation |
+| F8 | Visual designer: task list, drag and drop, inspector, prompt editor |
+| F9 | Run view on the canvas |
+| F10 | Evaluation lab: replay past items against a changed flow |
+| F11 | Triggers from GitHub events and schedules |
+| F12 | Budgets and cost per run, flow and project |
+
+**G. Supervisor**
+
+| Id | Feature |
+| --- | --- |
+| G1 | Agent definition — prompt, skills, tools, model — editable and versioned |
+| G2 | Tool service with policy checks on every call |
+| G3 | Planning role: build the backlog, route items, propose queues |
+| G4 | Operations role: detect stalls and errors; act automatically, wait, or never (12.3) |
+| G5 | Design role: draft flows on request (15.2) |
+| G6 | Its own subscription account, with the other provider as fallback |
+| G7 | Record of every decision; daily digest |
+
+**H. Console and chat**
+
+| Id | Feature |
+| --- | --- |
+| H1 | Pages for projects, sections, flows, backlog, queue and runs |
+| H2 | Supervisor panel on every page |
+| H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions |
+| H4 | Commands from the console, with the password asked again for approvals |
+| H5 | Chat channel (Telegram first) for commands, questions and notifications |
+| H6 | Supervisor settings page |
+
+**I. State and cut-over**
+
+| Id | Feature |
+| --- | --- |
+| I1 | Run status read from Temporal; explicit projector; references instead of payloads |
+| I2 | Reconciliation code and legacy loops removed |
+| I3 | Projects moved over one at a time; original hosts retired |
+
+### 18.2 Phases
+
+| Phase | Outcome for the administrator | Features | Engineer-weeks |
+| --- | --- | --- | --- |
+| 0. Foundation | Nothing visible. The new repository builds and tests itself | A1, A2 | done |
+| 1. In the cluster | The console is reachable on the cluster, signed in, on an empty database | A3, A4, A5, A6, A7, B1, B2, B4 | 7–9 |
+| 2. Projects and backlog | Create a project, connect its repository, see its six sections and its issues as a backlog. Nothing runs yet | B3, C1, C2, C3, C4, D1, D2, D3 (by hand), H1, H3, H4 | 7–9 |
+| 3. First work, isolated | Resolve an issue from the console: the existing delivery workflow runs behind the Issues section, in a sandbox, on a subscription account | E1–E6, D4, runs page of H1 | 13–17 |
+| 4. Supervisor and queues | Talk to the supervisor in the console and in chat; it builds the backlog with you, routes items, proposes queues; queues run | G1, G2, G3, G6, G7, H2, H5, H6, D5, D6 | 9–12 |
+| 5. All current work on the cluster | Code audit and Enhancement sections run the existing workflows; the supervisor handles stalls and errors; existing projects and records are migrated and the first project is cut over | G4, C5, D7, I3 (first project) | 9–12 |
+| 6. Flow engine | The same sections now run on the new engine; prompts can be edited; changes are tested on past items before use | F1, F2, F3, F4, F7, F10, F12 | 18–23 |
+| 7. Designer and new flows | Design flows by dragging tasks; ask the supervisor for a flow; Code clean, UI audit and UX audit exist | F5, F6, F8, F9, F11, G5 | 18–24 |
+| 8. Consolidation | Remaining projects moved; original hosts switched off; simpler state handling | I1, I2, I3, A8 | 6–8 |
+| | | **Total remaining** | **87–114** |
+
+For a team of three this is roughly twelve to fourteen months. The total agrees with section
+17.8 to within the rounding of two different groupings.
+
+Points at which the result is usable on its own:
+
+- **After phase 3:** issues are resolved on the cluster, in isolation, started from the
+  console. This is the first point at which the original system could be replaced for a
+  project that only needs issue resolution.
+- **After phase 5:** everything the original does today runs on the cluster, with the
+  supervisor and the queue added.
+- **After phase 7:** the full product described in sections 11–17.
+
+### 18.3 What each phase depends on from outside the code
+
+| Phase | Needed |
+| --- | --- |
+| 1 | Direct access to the cluster (section 16.3 lists what Argo CD cannot show); a rotated Argo CD credential scoped to a project for this platform |
+| 2 | A GitHub App created in the organisation |
+| 3 | A dedicated node for sandboxes; the subscription accounts, and confirmation that the plans allow this use |
+| 4 | A chat bot for the new system; a subscription account for the supervisor |
+| 5 | A decision on which project is cut over first |
 
 ## Appendix A. Documentation drift found during the audit
 
