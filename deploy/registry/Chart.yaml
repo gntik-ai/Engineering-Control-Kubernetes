@@ -1,0 +1,5 @@
+apiVersion: v2
+name: engineering-control-registry
+description: The credential the cluster uses to pull the Engineering Control image.
+type: application
+version: 0.1.0

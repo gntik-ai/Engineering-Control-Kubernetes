@@ -6,6 +6,9 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
 automountServiceAccountToken: false
+# The image is in a private registry. This Secret is created by deploy/registry.
+imagePullSecrets:
+  - name: engineering-control-registry
 ---
 # The bootstrap Jobs may read and write Secrets in this namespace, and nothing else.
 apiVersion: v1
@@ -15,6 +18,8 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
 automountServiceAccountToken: false
+imagePullSecrets:
+  - name: engineering-control-registry
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

@@ -15,9 +15,9 @@ spec:
       owner: engineering_control
       encoding: UTF8
       dataChecksums: true
+  # No storage class is named: the cluster's default is used.
   storage:
     size: 10Gi
-    storageClass: hcloud-volumes
   resources:
     requests:
       cpu: 100m

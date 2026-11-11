@@ -1,0 +1,4 @@
+# Set in the Argo CD application, never in this file: a GitHub user name and a token that
+# may read packages (classic token, scope read:packages). With no token nothing is created.
+username: ""
+token: ""

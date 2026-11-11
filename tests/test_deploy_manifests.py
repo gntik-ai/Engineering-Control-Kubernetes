@@ -76,6 +76,11 @@ def test_only_the_bootstrap_jobs_have_a_cluster_identity() -> None:
             assert spec["automountServiceAccountToken"] is False, name
     accounts = {d["metadata"]["name"]: d for d in _documents() if d["kind"] == "ServiceAccount"}
     assert all(account["automountServiceAccountToken"] is False for account in accounts.values())
+    # Both pull the private image with the Secret deploy/registry creates.
+    assert all(
+        account["imagePullSecrets"] == [{"name": "engineering-control-registry"}]
+        for account in accounts.values()
+    )
 
 
 def test_the_bootstrap_role_reaches_only_secrets_of_its_namespace() -> None:
@@ -130,3 +135,15 @@ def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it(
                     name = volume["persistentVolumeClaim"]["claimName"]
                     mounted[name] = min(mounted.get(name, 99), wave(document))
     assert claims == mounted
+
+
+def test_no_storage_class_is_named() -> None:
+    # The class taken from another application's settings did not exist on the cluster;
+    # the default class is the one known to work.
+    text = "\n".join(path.read_text() for path in BASE.glob("*.yaml"))
+    assert "storageClassName:" not in text and "storageClass:" not in text
+
+
+def test_the_registry_chart_holds_no_credential() -> None:
+    values = yaml.safe_load((BASE.parent / "registry" / "values.yaml").read_text())
+    assert values == {"username": "", "token": ""}

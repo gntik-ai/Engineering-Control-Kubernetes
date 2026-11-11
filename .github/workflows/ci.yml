@@ -40,7 +40,11 @@ jobs:
       - name: Mypy (strict)
         run: mypy
       - name: Deployment manifests render
-        run: kubectl kustomize deploy/base > /dev/null
+        run: |
+          kubectl kustomize deploy/base > /dev/null
+          test -z "$(helm template deploy/registry)"
+          helm template deploy/registry --set username=someone --set token=example \
+            | grep --quiet 'kubernetes.io/dockerconfigjson'
 
   test:
     name: Unit tests

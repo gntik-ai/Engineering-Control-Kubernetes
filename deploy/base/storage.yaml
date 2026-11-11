@@ -8,8 +8,8 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "3"
 spec:
+  # No storage class is named: the cluster's default is used.
   accessModes: ["ReadWriteOnce"]
-  storageClassName: hcloud-volumes
   resources:
     requests:
       storage: 10Gi

@@ -5,7 +5,8 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | Path | What it is |
 | --- | --- |
 | `base/` | Kustomize manifests for stage 1: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, console, evidence ingest, notifier |
-| `argocd/` | The Argo CD project and application, as applied |
+| `registry/` | A one-template Helm chart that creates the image pull Secret from parameters held in Argo CD |
+| `argocd/` | The Argo CD project and applications, as applied |
 
 ## What stage 1 contains
 
@@ -46,3 +47,11 @@ kubectl -n engineering-control get secret engineering-control-admin -o jsonpath=
 The repository is private. Argo CD reads it with a read-only deploy key: the private half is
 stored in Argo CD as a credential for this repository only, the public half is added under
 the repository's Settings → Deploy keys (without write access).
+
+## Pulling the image
+
+The image is in a private registry package. The application `engineering-control-registry`
+creates the pull Secret from two Helm parameters, `username` and `token`, that are set in
+Argo CD (application → Details → Parameters) and never stored in this repository. The token
+is a GitHub classic token with only the `read:packages` scope. Both service accounts name
+that Secret, so every pod uses it.
