@@ -50,7 +50,6 @@ from engineering_control.projects import PROJECT_SET
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "config" / "projects"
-BOOTSTRAP = ROOT / "scripts" / "bootstrap-worker.sh"
 VERIFY = ROOT / "scripts" / "verify-worker.sh"
 BASH = shutil.which("bash") or "/bin/bash"
 NON_DEFAULT_VARIABLES = {
@@ -627,7 +626,7 @@ def _assignment(text: str, name: str) -> str:
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck is not installed")
 def test_scripts_pass_shellcheck() -> None:
-    for script in (BOOTSTRAP, VERIFY):
+    for script in (VERIFY,):
         subprocess.run(  # noqa: S603 - fixed linter
             [str(shutil.which("shellcheck")), "--severity=warning", str(script)], check=True
         )

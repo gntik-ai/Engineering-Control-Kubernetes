@@ -372,6 +372,7 @@ def test_an_entry_swapped_for_a_symlink_after_listing_is_never_changed(
 ) -> None:
     tree = tmp_path / "worktree"
     tree.mkdir()
+    tree.chmod(0o770)  # already normalised, whatever umask the suite runs under
     victim = tree / "victim"
     victim.write_text("x")
     victim.chmod(0o600)
@@ -446,6 +447,7 @@ def test_entries_on_another_filesystem_are_neither_changed_nor_entered(
 ) -> None:
     tree = tmp_path / "worktree"
     (tree / "mnt").mkdir(parents=True)
+    tree.chmod(0o770)  # already normalised, whatever umask the suite runs under
     (tree / "mnt" / "inner").write_text("x")
     (tree / "mnt" / "inner").chmod(0o600)
     (tree / "mnt").chmod(0o700)

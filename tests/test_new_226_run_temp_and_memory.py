@@ -456,6 +456,9 @@ def test_a_put_back_entry_never_replaces_a_new_one_of_that_name(
         return walk(path, *args, **kwargs)
 
     monkeypatch.setattr(tmp_sweep, "_newest_change", recreate_during_the_final_walk)
+    # A migration test earlier in the same process may have run alembic's fileConfig, which
+    # disables every logger that already existed; the warning asserted below needs this one.
+    monkeypatch.setattr(tmp_sweep.LOGGER, "disabled", False)
     with tmp_sweep.running_step():
         time.sleep(0.05)
         result = tmp_sweep.sweep(root, idle_seconds=5400, protected=(), busy_idle_seconds=-60)

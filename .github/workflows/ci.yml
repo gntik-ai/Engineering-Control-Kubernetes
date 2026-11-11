@@ -55,6 +55,22 @@ jobs:
           cache-dependency-path: requirements.lock
       - name: Install constrained project and development dependencies
         run: python -m pip install --constraint requirements.lock --editable ".[dev]"
+      - name: Install test facilities
+        # bubblewrap: the agent-sandbox tests check the binary. shellcheck is on the runner.
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends bubblewrap
+      - name: Install the Temporal CLI (pinned, checksum verified)
+        # With `temporal` on PATH the workflow replay tests run instead of skipping.
+        env:
+          TEMPORAL_CLI_VERSION: "1.10.0"
+          TEMPORAL_CLI_SHA256: 521f461f3d108902763bb71e85cd0fd382dc9357b59604ae03da6ae734d16890
+        run: |
+          archive="temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --output "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/${archive}"
+          echo "${TEMPORAL_CLI_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${HOME}/.local/bin"
+          tar --extract --gzip --file "${RUNNER_TEMP}/${archive}" --directory "${HOME}/.local/bin" temporal
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
       - name: Fetch the Temporal test server once
         # The workflow tests start a local Temporal server, downloaded on first use. Doing
         # it here keeps parallel test workers from each downloading it.

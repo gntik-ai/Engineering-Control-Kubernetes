@@ -129,7 +129,8 @@ def test_finalize_requires_both_cross_provider_directions(
     assert value["status"] == "PASS"
     assert value["authentication_mode"] == "native-subscription-cli"
     assert value["paid_api_fallback"] is False
-    assert len(value["release_sha"]) == 40
+    # The release is the name of the directory the fixed source link points into.
+    assert value["release_sha"] == Path("/opt/engineering-control/source").resolve().parent.name
     assert set(value["directions"].values()) == {"PASS"}
     assert len(digest) == 64
     with pytest.raises(ValueError, match="not empty"):

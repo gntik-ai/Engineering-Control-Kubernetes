@@ -9,6 +9,7 @@ Section 13 records the final decisions, corrects section 12.4 and gives the cons
 plan; it takes precedence over everything before it.
 Section 14 records that the system is built in this repository and what that changes.
 Section 15 adds tasks placed by drag and drop and flows created by talking to the supervisor.
+Section 16 records what a read-only inspection of the existing cluster showed.
 
 File paths in sections 3–5 and the appendices refer to the code as imported from
 `gntik-ai/engineering-control`; some of the host-only files they cite are no longer in this
@@ -1485,6 +1486,67 @@ Two details:
 Total: about **76–100 engineer-weeks**. The sequence of section 13.6 is otherwise
 unchanged; conversational flow creation comes last because it needs the supervisor, the
 chat channel, the task catalogue and the validator to exist.
+
+## 16. The existing cluster, as observed
+
+Read-only inspection through the Argo CD API on 2026-11-11. Nothing was created or changed.
+It answers part of section 13.3; what Argo CD cannot show is listed at the end.
+
+### 16.1 Facts
+
+| Topic | Observation |
+| --- | --- |
+| Argo CD | v3.4.2 at `argocd.musematic.ai`. One cluster registered: the one it runs in |
+| Kubernetes | v1.36.1, k3s distribution, containerd 2.2.3 |
+| Nodes | Three. `github-actions` and `kind`: 12 CPU and about 30 GiB each. `mus-srv-0`: 4 CPU and about 7.6 GiB |
+| Already requested | `github-actions`: 8.5 of 12 CPU, 18.4 of 30.2 GiB. `kind`: 9.6 of 12 CPU, 19.3 of 30.2 GiB. `mus-srv-0`: 0.85 of 4 CPU, 1.1 of 7.6 GiB |
+| Free by requests | About 9 CPU and 29 GiB across the three nodes |
+| Operators present | cert-manager, external-secrets, CloudNativePG, Strimzi (Kafka), Prometheus operator |
+| Network policies | Used by both products (10 and 11 policies) |
+| Argo CD projects | Only `default`, which allows any repository, any destination and any cluster-scoped resource |
+| Argo CD applications | `falcone-staging` and `musematic-platform`, both with automated sync |
+| Argo CD accounts | Only the local `admin`. No single sign-on |
+| Health at inspection | Both applications were Degraded. falcone: several pods restarting (control-plane executor, documentdb, keycloak). musematic: five external secrets could not be read from their provider |
+
+### 16.2 What this means for the plan
+
+- **Capacity is the first constraint.** A maker run needs up to 6–8 GiB and several CPUs.
+  The free capacity fits the control plane and about three sandboxes at once, with nothing
+  left for the products to grow. Plan a **dedicated node for sandboxes**, joined to k3s with
+  a taint, before step 5. It also gives the isolation that section 13.3 asks for.
+- **Existing operators can be reused**, which shortens step 3:
+  - CloudNativePG for the platform's PostgreSQL and for Temporal's.
+  - cert-manager for certificates.
+  - external-secrets for secrets — once its provider works again; it was failing for
+    musematic at inspection, and the platform would depend on it.
+  - The Prometheus operator for monitoring (step 14).
+- **Network policy enforcement is likely available.** k3s ships a policy controller and both
+  products define policies. It still has to be confirmed that it is switched on, because
+  the sandbox isolation depends on it.
+- **Argo CD needs two additions before the platform is deployed through it:**
+  - A dedicated project limited to this repository, to the platform's namespaces, and to
+    the few cluster-scoped kinds the chart needs.
+  - A dedicated non-admin account for the platform's own use, limited to syncing the
+    product applications. The original code names its sync user `hermes-engineering`, but
+    no such account exists in Argo CD today.
+- **The node names** (`github-actions`, `kind`) suggest the two large nodes may also serve
+  other purposes. That should be confirmed before capacity is planned on them.
+- **The two Degraded applications** are outside this programme, but a platform that deploys
+  to and verifies these environments will report them as unhealthy from its first run.
+
+**Credentials.** The Argo CD administrator password was provided in conversation for this
+inspection. It is not stored in this repository. It should be rotated, and the platform
+should be given the scoped account above, never the administrator's.
+
+### 16.3 Still unknown
+
+These need direct access to the cluster, which Argo CD does not give:
+
+- Storage classes, and what is available for object storage.
+- The ingress controller and its class.
+- Whether a sandboxed runtime class exists and whether user namespaces are enabled.
+- Node labels and taints, and whether another node can be added.
+- Whether the network policy controller is enabled.
 
 ## Appendix A. Documentation drift found during the audit
 

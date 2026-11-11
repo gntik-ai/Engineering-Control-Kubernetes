@@ -84,6 +84,13 @@ SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
 PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects"
 
+# The CLI is reported from a fixed install path; the tests assert the report for this machine.
+_CLI_STATUS = (
+    "PRESENT"
+    if Path("/opt/engineering-control/venv/bin/engineering-ctl").is_file()
+    else "NOT_INSTALLED"
+)
+
 
 async def _rotate_candidate(repository, candidate_id, previous_binding):
     """Use the real rotating repository path with explicit synthetic session proof."""
@@ -1255,7 +1262,7 @@ def test_gateway_delivery_failure_is_never_projected_as_success(tmp_path: Path) 
         assert values[component].last_success_at.replace(tzinfo=UTC) == now - timedelta(seconds=2)
         assert values[component].last_failure_at.replace(tzinfo=UTC) == now - timedelta(seconds=1)
         assert values[component].details["last_event_type"] == ("telegram.response_delivery_failed")
-    assert values["engineering-cli"].status == "PRESENT"
+    assert values["engineering-cli"].status == _CLI_STATUS
 
     channel = repository._operator_snapshot("channel")
     assert channel["status"] == "DEGRADED"
