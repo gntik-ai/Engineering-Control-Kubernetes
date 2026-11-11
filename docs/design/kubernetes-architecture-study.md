@@ -1549,8 +1549,9 @@ should be given the scoped account above, never the administrator's.
   the signal, which points at the container security profile on those nodes. The same error
   is why two databases of the falcone staging application are down. On `mus-srv-0`
   (Ubuntu 24.04, kernel 6.8) PostgreSQL starts normally, so the platform's database is
-  pinned there for now. This is a node problem to fix on the cluster, not in this
-  repository.
+  pinned there for now. That node is the control plane and is tainted, so the database
+  tolerates the taint, as one of falcone's databases already does. This is a node problem
+  to fix on the cluster, not in this repository, and the pin should be removed when it is.
 - **There is a fourth node**, `aibot` (12 CPU, about 30 GiB), not seen in the first
   inspection.
 - **The storage class named in another application's settings does not exist.** The default
