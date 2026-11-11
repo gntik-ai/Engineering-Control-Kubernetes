@@ -4,9 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
-import os
 import re
-import stat
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,6 +23,7 @@ from engineering_control.retention_limits import (
     NOTIFICATION_OUTBOX_DELIVERED_STATUS,
     NOTIFICATION_OUTBOX_PENDING_STATUS,
 )
+from engineering_control.secret_files import read_mounted_token
 from engineering_control.security.redaction import SecretRedactor
 
 logger = structlog.get_logger()
@@ -70,34 +69,8 @@ class NotificationSink:
             raise ValueError("HMAC notification sink must be a credential-free loopback HTTP URL")
 
     def _token(self, path: Path) -> str:
-        before = path.lstat()
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("notification token path must be a non-symlink regular file")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError("notification token path must remain a regular file")
-            if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
-                raise RuntimeError("notification token file changed during protected read")
-            mode = stat.S_IMODE(metadata.st_mode)
-            if mode in {0o400, 0o600}:
-                if metadata.st_uid not in {0, os.geteuid()}:
-                    raise PermissionError("notification token owner is not trusted")
-            elif mode in {0o440, 0o640}:
-                if metadata.st_uid != 0 or metadata.st_gid != os.getegid():
-                    raise PermissionError("group-readable notification token custody is invalid")
-            else:
-                raise PermissionError("notification token file permissions are too broad")
-            raw = os.read(descriptor, 4097)
-        finally:
-            os.close(descriptor)
-        if len(raw) > 4096:
-            raise ValueError("notification token is too large")
-        token = raw.decode("utf-8").strip()
-        if self.settings.notification_auth_mode == "hmac-sha256-v2" and len(token) < 32:
-            raise ValueError("HMAC notification token must contain at least 32 characters")
-        return token
+        minimum = 32 if self.settings.notification_auth_mode == "hmac-sha256-v2" else 1
+        return read_mounted_token(path, label="notification token", minimum=minimum)
 
     def _request(
         self,

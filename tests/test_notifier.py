@@ -256,7 +256,9 @@ def test_hmac_v2_notification_is_signed_idempotent_and_redacted(tmp_path: Path) 
     assert hmac.compare_digest(request.headers["X-Webhook-Signature-V2"], expected)
 
 
-def test_hmac_sink_is_loopback_only_and_token_is_not_a_symlink(tmp_path: Path) -> None:
+def test_hmac_sink_is_loopback_only_and_token_link_may_not_leave_its_directory(
+    tmp_path: Path,
+) -> None:
     token_file = tmp_path / "notification.token"
     token_file.write_text("fixture-hmac-secret-0123456789abcdef", encoding="utf-8")
     token_file.chmod(0o600)
@@ -270,8 +272,9 @@ def test_hmac_sink_is_loopback_only_and_token_is_not_a_symlink(tmp_path: Path) -
             )
         )
 
-    link = tmp_path / "link.token"
-    link.symlink_to(token_file)
+    (tmp_path / "elsewhere").mkdir()
+    link = tmp_path / "elsewhere" / "link.token"
+    link.symlink_to(token_file)  # leaves its own directory
     service = NotificationService(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'symlink.sqlite'}",
@@ -291,7 +294,7 @@ def test_hmac_sink_is_loopback_only_and_token_is_not_a_symlink(tmp_path: Path) -
                 next_attempt_at=datetime.now(UTC),
             )
         )
-    with pytest.raises(ValueError, match="non-symlink"):
+    with pytest.raises(PermissionError, match="outside its own directory"):
         service.run_once()
 
 
@@ -559,13 +562,22 @@ def test_group_readable_token_must_be_root_owned(tmp_path: Path) -> None:
         service.sink._token(_new112a_token_file(tmp_path, 0o640))
 
 
-def test_token_symlinks_and_short_hmac_keys_are_refused(tmp_path: Path) -> None:
+def test_token_links_may_not_leave_their_directory_and_short_hmac_keys_are_refused(
+    tmp_path: Path,
+) -> None:
     service = NotificationService(_new112a_settings(tmp_path))
     target = _new112a_token_file(tmp_path)
-    link = tmp_path / "link.secret"
-    link.symlink_to(target)
-    with pytest.raises(ValueError, match="non-symlink"):
-        service.sink._token(link)
+    # A mounted Secret exposes each key as a link into the same volume: accepted.
+    inside = tmp_path / "link.secret"
+    inside.symlink_to(target.name)
+    assert service.sink._token(inside) == NEW112A_TOKEN
+    # A link that leaves its directory is refused.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    outside = elsewhere / "link.secret"
+    outside.symlink_to(target)
+    with pytest.raises(PermissionError, match="outside its own directory"):
+        service.sink._token(outside)
     with pytest.raises(ValueError, match="32 characters"):
         service.sink._token(_new112a_token_file(tmp_path, content="short"))
 

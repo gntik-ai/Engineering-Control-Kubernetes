@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from engineering_control.policy.github_write import GITHUB_WRITE_POLICY_PATH
+from engineering_control.secret_files import read_mounted_token
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     )
 
     environment: str = "development"
+    # How the listeners are kept private. "loopback": this machine's own interfaces, as on
+    # the original two hosts. "cluster": a Kubernetes pod, where a listener has to be on the
+    # pod interface to be reachable by its Service and probes, and who may reach it is
+    # decided by network policy, not by the bind address.
+    network_boundary: Literal["loopback", "cluster"] = "loopback"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8740, ge=1024, le=65535)
     api_admission_mode: Literal["normal", "synthetic-only", "diagnostics-only"] = "normal"
@@ -310,19 +315,19 @@ class Settings(BaseSettings):
             raise ValueError(f"{field_name} must remain the canonical queue {expected}")
         return value
 
-    @field_validator("api_host")
-    @classmethod
-    def private_api_only(cls, value: str) -> str:
-        if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
+    @model_validator(mode="after")
+    def private_listeners(self) -> Settings:
+        """Outside a cluster, no listener may be reachable from every interface."""
+        if self.network_boundary == "cluster":
+            return self
+        every_interface = {"0.0.0.0", "::"}  # noqa: S104 - these values are explicitly rejected
+        if self.api_host in every_interface:
             raise ValueError("the Engineering Control API cannot bind to every interface")
-        return value
-
-    @field_validator("dashboard_host")
-    @classmethod
-    def private_dashboard_only(cls, value: str) -> str:
-        if value not in {"127.0.0.1", "::1", "localhost"}:
+        if self.dashboard_host not in {"127.0.0.1", "::1", "localhost"}:
             raise ValueError("the dashboard must bind only to loopback")
-        return value
+        if self.evidence_ingest_host in every_interface:
+            raise ValueError("the evidence ingest service cannot bind to every interface")
+        return self
 
     @field_validator("dashboard_allowed_hosts")
     @classmethod
@@ -351,13 +356,6 @@ class Settings(BaseSettings):
         ):
             raise ValueError("dashboard allowed origin is invalid")
         return normalized
-
-    @field_validator("evidence_ingest_host")
-    @classmethod
-    def private_evidence_ingest_only(cls, value: str) -> str:
-        if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
-            raise ValueError("the evidence ingest service cannot bind to every interface")
-        return value
 
     @field_validator("toolchain_node_roots")
     @classmethod
@@ -438,18 +436,7 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _read_service_token(path: Path, label: str) -> str:
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"{label} token path must be a regular file")
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO):
-            raise PermissionError(
-                f"{label} token file may grant group read but not group write/execute "
-                "or other access"
-            )
-        token = path.read_text(encoding="utf-8").strip()
-        if len(token) < 32:
-            raise ValueError(f"{label} token must contain at least 32 characters")
-        return token
+        return read_mounted_token(path, label=f"{label} token")
 
 
 @lru_cache

@@ -10,6 +10,8 @@ plan; it takes precedence over everything before it.
 Section 14 records that the system is built in this repository and what that changes.
 Section 15 adds tasks placed by drag and drop and flows created by talking to the supervisor.
 Section 16 records what a read-only inspection of the existing cluster showed.
+Section 17 records the product model the administrator asked for: projects, sections,
+backlog, queue and the supervisor as an agent.
 
 File paths in sections 3–5 and the appendices refer to the code as imported from
 `gntik-ai/engineering-control`; some of the host-only files they cite are no longer in this
@@ -1547,6 +1549,182 @@ These need direct access to the cluster, which Argo CD does not give:
 - Whether a sandboxed runtime class exists and whether user namespaces are enabled.
 - Node labels and taints, and whether another node can be added.
 - Whether the network policy controller is enabled.
+
+## 17. Product model: projects, sections, backlog and the supervisor (seventh iteration)
+
+The administrator described what the web page must do. This section records those
+requirements and maps them onto the design. Where it differs from earlier sections, it takes
+precedence.
+
+### 17.1 Requirements as stated
+
+1. **Projects.** Create a project, name it, and connect it to a GitHub repository. A GitHub
+   sign-in may be offered to make the connection easier.
+2. **Flows per project.** Inside a project, add flows by creating new ones or importing
+   existing ones.
+3. **Sections.** Every project starts with six core sections, and custom sections with their
+   own names can be added:
+
+   | Section | Purpose |
+   | --- | --- |
+   | Code audit | Audit the codebase |
+   | UI audit | Audit the features and functionality of the web pages |
+   | UX audit | Audit how navigable the pages are |
+   | Code clean | Verify, reduce or clean up existing code |
+   | Enhancement | Handle enhancement requests |
+   | Issues | Resolve an issue |
+
+4. **One flow per section, optionally.** The administrator assigns a flow to a section. A
+   section may be left without one.
+5. **Backlog through the supervisor.** The administrator, working with the supervisor,
+   builds a backlog of issues and possible enhancements. The supervisor decides which
+   section each item belongs to.
+6. **One by one, or a queue.** The administrator can have issues resolved one at a time or
+   as a queue. The queue is built by the supervisor, or defined by hand by choosing the
+   items.
+7. **The supervisor is an agent** with its own prompt, skills and tools.
+
+### 17.2 Entities
+
+| Entity | Holds | Notes |
+| --- | --- | --- |
+| Project | Name, connected repository, default branch, application address for UI and UX audits, settings | Replaces the compiled-in project list (section 6.4). Created from the console |
+| Section | Project, name, kind (core or custom), a description of what belongs in it, the assigned flow or none | The six core sections are created with the project. The description is what the supervisor routes by |
+| Flow | Name, versions, scope (library or project) | Library flows are the built-in ones of section 13.5. Importing copies a library flow, or a flow from another project, into the project, where it can be edited |
+| Backlog item | Project, title, source, section, state, priority | The work item of section 6.1 with a section added. Sources: a GitHub issue, an audit finding, a request made in chat, a supervisor proposal |
+| Queue | Project, ordered items, mode, state | Mode is *one by one* (the next item starts when the previous one ends) or *continuous* (items run up to the allowed concurrency) |
+
+Item states: proposed → accepted → queued → running → done, failed or skipped. An item whose
+section has no flow stays accepted and is shown as "section not configured"; the supervisor
+says so instead of guessing another section.
+
+### 17.3 Sections and the flows behind them
+
+| Section | Starting flow | State |
+| --- | --- | --- |
+| Issues | Deliver issue | Imported from the existing workflows (13.5) |
+| Enhancement | Discover enhancements, then Deliver issue for approved ones | Imported |
+| Code audit | Audit code | Imported |
+| Code clean | Code clean-up (the example of 15.2) | To build, from existing tasks |
+| UI audit | New: drive the application through its pages, compare behaviour with what is expected, report findings as backlog items | To build. The journey runner, the per-project journey catalogue and the UI inventory exist and become its tasks |
+| UX audit | New: walk the navigation, check reachability, dead ends, consistency and accessibility, report findings | To build. Shares its tasks with the UI audit |
+
+The two audits need to know where the application runs, so a project has an application
+address and, where sign-in is needed, a test identity. Projects without a running application
+leave those two sections without a flow.
+
+### 17.4 Connecting a repository
+
+- The platform already needs a **GitHub App** for its own access (section 5.4). Connecting a
+  project is installing that App on the repository: the wizard sends the administrator to
+  GitHub to choose the repository and returns with the installation.
+- **GitHub sign-in is the same App's user authorisation.** It lets the wizard list the
+  repositories the administrator can reach, so the repository is picked from a list instead
+  of typed. It is a convenience on top of the installation, not a second mechanism.
+- The existing projects have a source repository and sometimes a separate deployment
+  repository. A project therefore has one repository and, optionally, a second one for
+  deployment.
+
+### 17.5 Backlog and queue
+
+**Building the backlog.** The administrator talks to the supervisor ("look at the open issues
+of this project", "what should we improve in the checkout pages?"). The supervisor gathers
+candidates from GitHub issues, audit findings and the conversation, proposes them as items
+with a section and a reason, and the administrator accepts, edits or rejects them. Items can
+also be added by hand.
+
+**Routing.** For each item the supervisor returns the section, a reason and its confidence.
+The platform checks the answer: the section must exist in the project. A low-confidence
+routing is shown for confirmation instead of applied.
+
+**Running.**
+
+| Mode | Who builds it | Behaviour |
+| --- | --- | --- |
+| One by one | The administrator names an item, or asks the supervisor for "the next one" | One item runs. The supervisor reports the outcome and waits for the next instruction |
+| Queue by the supervisor | The supervisor proposes an order with its reasons (dependencies, risk, priority); the administrator accepts or reorders | Items run in order, up to the allowed concurrency |
+| Queue by hand | The administrator selects items in the backlog and orders them by drag and drop | Same |
+
+A queue can be paused, reordered and extended while it runs. Approvals and the supervisor's
+waiting actions (section 12.3) apply to queued items as to any other.
+
+### 17.6 The supervisor as an agent
+
+The supervisor is defined like any agent, and the definition is editable and versioned:
+
+| Part | Content | Who can change it |
+| --- | --- | --- |
+| Prompt | Its role, priorities and manner; how cautious to be; what to ask before acting | The administrator, in the console |
+| Skills | Instruction packs for specific jobs: triaging an issue, routing to a section, ordering a queue, diagnosing a stalled run, drafting a flow | The administrator can edit them and add new ones |
+| Tools | The typed operations it may call | A fixed set provided by the platform; the administrator switches individual tools on or off and sets which need confirmation |
+| Model | Provider and model, on a subscription account of its own (13.1) | The administrator |
+
+Tools, grouped by what they can do:
+
+| Group | Tools | Confirmation |
+| --- | --- | --- |
+| Read | Projects, sections, flows, backlog, queues, runs, transcripts, evidence, GitHub issues and pull requests | None |
+| Plan | Propose backlog items, route an item to a section, propose or reorder a queue | Proposals are accepted by the administrator unless set to automatic |
+| Operate | Start an item or a queue, pause, resume, retry, re-queue, skip | By the action classes of section 12.3 |
+| Design | Draft, validate and simulate a flow (15.2) | Publishing is always the administrator's |
+| Ask | Put a question or a decision to the administrator, in chat and in the inbox | — |
+
+It keeps three roles — planning, operations, design — each with its own skills and tool
+subset, behind one conversation.
+
+**How the tools reach the agent.** The working agents run with no external tools at all, and
+that stays. The supervisor is different: it has no workspace and no credentials, and it is
+far more useful if it can look things up itself. Its tools are therefore served by the
+platform over the tool protocol both command-line clients support, and every call is checked
+against policy on the platform's side before it has any effect. The prompt and skills shape
+how the supervisor behaves; the tool checks decide what it can do.
+
+**Where the administrator talks to it.** A supervisor panel in the console, available on
+every page, and the chat channel of section 13.2. Both are transports to the same
+conversation.
+
+### 17.7 The web page
+
+| Page | Content |
+| --- | --- |
+| Projects | List, and a "new project" wizard: name, connect repository, sections created |
+| Project → Sections | The six core sections and custom ones; assign, change or remove the flow of each; add a custom section |
+| Project → Flows | The project's flows; create, import, open in the designer |
+| Project → Backlog | Items with section, source and state; accept, edit, route by hand; select items for a queue |
+| Project → Queue | Order by drag and drop, mode, start and pause, progress |
+| Project → Runs | What is running and what ran, with the run view on the canvas |
+| Supervisor | The conversation; and its settings: prompt, skills, tools, model, autonomy |
+| Inbox | Everything waiting on the administrator |
+
+### 17.8 Effect on the plan
+
+| Addition | Engineer-weeks |
+| --- | --- |
+| Project, section and queue entities; project wizard and repository connection | 3–4 |
+| Sections, backlog and queue pages; supervisor panel | 4–5 |
+| Supervisor planning role, editable agent definition, tool service | 3–4 |
+| Three new flows: Code clean, UI audit, UX audit | 4–6 |
+| **Total** | **14–19** |
+
+The programme becomes about **90–119 engineer-weeks**.
+
+**A change of order worth making.** These requirements describe the product the
+administrator will use every day, and most of it does not depend on the new flow engine.
+Projects, sections, the backlog, the queue and the supervisor's planning role can be built on
+top of the imported workflows as they are: "Issues" runs the existing delivery workflow,
+"Code audit" the existing audit, "Enhancement" the existing discovery. The interpreter and
+the designer then replace what is behind each section without changing what the
+administrator sees. That brings a usable product forward by several months, at the cost of a
+period in which flows can be assigned but not yet edited.
+
+### 17.9 Questions this raises
+
+1. **Repository connection.** Is installing a GitHub App on the organisation acceptable, with
+   sign-in as a convenience, as proposed in 17.4?
+2. **UI and UX audits.** Which address do they audit for each project — the staging
+   environment — and with which test identity?
+3. **Order.** Build the product surface first on the existing workflows (recommended in
+   17.8), or keep the order of section 13.6?
 
 ## Appendix A. Documentation drift found during the audit
 

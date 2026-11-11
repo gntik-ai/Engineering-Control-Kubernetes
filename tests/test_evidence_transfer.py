@@ -248,7 +248,7 @@ def test_publisher_uses_private_origin_and_restricted_token_file(tmp_path: Path)
     report.write_text('{"status":"PASS"}\n', encoding="utf-8")
     token_file = tmp_path / "evidence.token"
     token_file.write_text("t" * 48, encoding="utf-8")
-    os.chmod(token_file, 0o640)
+    os.chmod(token_file, 0o600)
 
     def receive(request: httpx.Request) -> httpx.Response:
         artifact_id = request.headers["X-Evidence-Artifact-Id"]
@@ -325,7 +325,7 @@ def test_scan_reports_pass_the_real_ingest_redaction_check(tmp_path: Path) -> No
     already.write_text("password: [REDACTED]\nCookie: [REDACTED]\n", encoding="utf-8")
     token_file = tmp_path / "evidence.token"
     token_file.write_text("e" * 48, encoding="utf-8")
-    os.chmod(token_file, 0o640)
+    os.chmod(token_file, 0o600)
     app = create_evidence_ingest_app(
         settings=Settings(evidence_root=tmp_path / "stored"),
         repository=repository,  # type: ignore[arg-type]

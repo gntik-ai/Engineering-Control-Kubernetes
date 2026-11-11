@@ -18,6 +18,8 @@ from typing import Any
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
+from engineering_control.secret_files import read_mounted_secret
+
 PASSWORD_MIN_LENGTH = 14
 PASSWORD_MAX_LENGTH = 128
 SESSION_COOKIE = "engineering_dashboard_session"
@@ -185,31 +187,12 @@ class LoginFailureLimiter:
             self._failures.pop(address, None)
 
 
-def read_session_key(path: Path, *, expected_group_id: int | None = None) -> bytes:
-    parent = path.parent
-    parent_metadata = parent.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(parent_metadata.st_mode)
-        or stat.S_IMODE(parent_metadata.st_mode) != 0o750
-        or parent_metadata.st_uid != 0
-        or (expected_group_id is not None and parent_metadata.st_gid != expected_group_id)
-    ):
-        raise PermissionError("dashboard session-key directory metadata is invalid")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def read_session_key(path: Path) -> bytes:
+    """The key that signs dashboard sessions: a mounted secret of 32 to 1024 bytes."""
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o640:
-            raise PermissionError("dashboard session-key metadata is invalid")
-        if metadata.st_uid != 0:
-            raise PermissionError("dashboard session key must be root-owned")
-        if expected_group_id is not None and metadata.st_gid != expected_group_id:
-            raise PermissionError("dashboard session key has the wrong service group")
-        key = os.read(descriptor, 4096)
-    finally:
-        os.close(descriptor)
-    if len(key) < 32 or len(key) > 1024:
-        raise PermissionError("dashboard session key has an invalid size")
-    return key
+        return read_mounted_secret(path, label="dashboard session key", minimum=32, maximum=1024)
+    except ValueError as error:
+        raise PermissionError(str(error)) from error
 
 
 @dataclass

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import grp
 import hashlib
 import hmac
 import ipaddress
@@ -102,8 +101,7 @@ def create_app(
     resolved = settings or get_settings()
     key = session_key
     if key is None:
-        group_id = grp.getgrnam("engineering-control").gr_gid
-        key = read_session_key(resolved.dashboard_session_key_file, expected_group_id=group_id)
+        key = read_session_key(resolved.dashboard_session_key_file)
     sessions = SignedSessionManager(
         key,
         lifetime_seconds=resolved.dashboard_session_hours * 3600,
