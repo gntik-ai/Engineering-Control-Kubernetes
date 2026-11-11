@@ -11,11 +11,11 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 
 | Wave | Resource | Purpose |
 | --- | --- | --- |
-| −2, −1 | Namespace, settings, service accounts, role, network policy, evidence volume | Everything the rest needs |
+| −2, −1 | Namespace, settings, service accounts, role, network policy | Everything the rest needs |
 | 0 | PostgreSQL cluster; Job `bootstrap-secrets` | The database; the Secret with service tokens and the session key, generated in the cluster |
 | 1 | Job `migrate-database` | `alembic upgrade head` |
 | 2 | Job `bootstrap-admin-password` | First dashboard password, stored in the Secret `engineering-control-admin` |
-| 3 | Console, evidence ingest, notifier | The long-running processes that need no Temporal |
+| 3 | Console, evidence ingest (with its evidence volume), notifier | The long-running processes that need no Temporal |
 
 Not in stage 1: the API, the scheduler and the workflow worker (they need Temporal), an
 Ingress (nothing is reachable from outside the cluster yet), and the sandboxes.

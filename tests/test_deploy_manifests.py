@@ -109,3 +109,24 @@ def test_mounted_secrets_are_group_readable_only_and_listeners_need_no_public_ro
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     for service in (d for d in _documents() if d["kind"] == "Service"):
         assert service["spec"].get("type", "ClusterIP") == "ClusterIP"
+
+
+def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it() -> None:
+    # The cluster's storage class binds a claim when its first pod is scheduled. Argo CD
+    # waits for each wave to be healthy, so a claim in an earlier wave would never bind.
+    def wave(document: dict[str, Any]) -> int:
+        return int(document["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"])
+
+    documents = _documents()
+    claims = {
+        d["metadata"]["name"]: wave(d) for d in documents if d["kind"] == "PersistentVolumeClaim"
+    }
+    assert claims
+    mounted: dict[str, int] = {}
+    for document in documents:
+        if document["kind"] in {"Deployment", "StatefulSet", "Job"}:
+            for volume in document["spec"]["template"]["spec"].get("volumes", []):
+                if "persistentVolumeClaim" in volume:
+                    name = volume["persistentVolumeClaim"]["claimName"]
+                    mounted[name] = min(mounted.get(name, 99), wave(document))
+    assert claims == mounted

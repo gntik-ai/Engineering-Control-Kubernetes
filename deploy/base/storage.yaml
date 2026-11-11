@@ -1,10 +1,12 @@
 # Evidence stays on a volume until object storage replaces it.
+# Same wave as the pod that mounts it: the storage class creates a volume only when a pod
+# first uses the claim, so an earlier wave would wait for a volume that cannot appear yet.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: engineering-control-evidence
   annotations:
-    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: hcloud-volumes
