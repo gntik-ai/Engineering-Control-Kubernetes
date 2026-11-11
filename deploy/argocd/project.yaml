@@ -1,0 +1,18 @@
+# The Argo CD project for Engineering Control. It limits the platform to its own repository
+# and its own namespace; the only cluster-scoped kind it may create is a Namespace.
+# Applied through the Argo CD API (the cluster API is not reachable from where this is built).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: engineering-control
+  namespace: argocd
+spec:
+  description: Engineering Control platform. Its own repository and its own namespaces only.
+  sourceRepos:
+    - git@github.com:gntik-ai/Engineering-Control-Kubernetes.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: engineering-control
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace

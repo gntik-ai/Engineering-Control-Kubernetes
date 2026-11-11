@@ -1,8 +1,8 @@
 name: CI
 
 # Every push runs lint, type checks, the unit suite, the console build and the control-plane
-# image build. Nothing here deploys or publishes: the image is pushed to the registry only
-# from main.
+# image build and boot test. An image that boots is pushed to the private registry, tagged
+# with its commit. Nothing here deploys: Argo CD does, from deploy/base.
 on:
   push:
   workflow_dispatch:
@@ -39,6 +39,8 @@ jobs:
         run: ruff format --check src tests
       - name: Mypy (strict)
         run: mypy
+      - name: Deployment manifests render
+        run: kubectl kustomize deploy/base > /dev/null
 
   test:
     name: Unit tests
@@ -155,15 +157,15 @@ jobs:
         # scheduler and workflow worker must all start from configuration alone.
         run: images/control/boot-test.sh engineering-control:ci
       - name: Log in to the registry
-        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push (main only)
-        if: github.ref == 'refs/heads/main'
+      - name: Push the image, tagged with its commit
+        # Only an image that passed the boot test is pushed. The package is private, like
+        # this repository; deploy/base/kustomization.yaml pins the commit to deploy.
         run: |
-          image=ghcr.io/gntik-ai/engineering-control
+          image=ghcr.io/gntik-ai/engineering-control-kubernetes
           docker tag engineering-control:ci "${image}:${GITHUB_SHA}"
           docker push "${image}:${GITHUB_SHA}"

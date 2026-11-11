@@ -143,6 +143,9 @@ class DashboardRepository:
     async def authentication_version(self) -> int | None:
         return await asyncio.to_thread(self._authentication_version)
 
+    def authentication_version_sync(self) -> int | None:
+        return self._authentication_version()
+
     def _authentication_version(self) -> int | None:
         with self.sessions() as session:
             row = session.get(DashboardAuthentication, 1)

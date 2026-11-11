@@ -1,0 +1,133 @@
+# Receives evidence, heartbeats and transcripts from workers. One replica: it writes a
+# ReadWriteOnce volume until object storage replaces it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineering-control-evidence-ingest
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: evidence-ingest
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: evidence-ingest
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: evidence-ingest
+    spec:
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: evidence-ingest
+          image: engineering-control
+          command: ["engineering-evidence-ingest"]
+          ports:
+            - name: http
+              containerPort: 8750
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: secrets
+              mountPath: /var/run/secrets/engineering-control
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/engineering-control
+            - name: tmp
+              mountPath: /tmp
+            - name: evidence
+              mountPath: /srv/engineering/evidence
+      volumes:
+        - name: secrets
+          secret:
+            secretName: engineering-control-secrets
+            defaultMode: 0440
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: engineering-control-evidence
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: engineering-control-evidence-ingest
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: evidence-ingest
+spec:
+  selector:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: evidence-ingest
+  ports:
+    - name: http
+      port: 8750
+      targetPort: http

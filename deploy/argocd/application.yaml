@@ -1,0 +1,16 @@
+# The Argo CD application for stage 1 (deploy/base). Synchronisation is manual until the
+# first deployment has been watched through; switch targetRevision to main after the merge.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: engineering-control
+  namespace: argocd
+spec:
+  project: engineering-control
+  source:
+    repoURL: git@github.com:gntik-ai/Engineering-Control-Kubernetes.git
+    targetRevision: claude/determined-cray-5v3lhn
+    path: deploy/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: engineering-control

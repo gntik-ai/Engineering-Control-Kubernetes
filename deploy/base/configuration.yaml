@@ -1,0 +1,18 @@
+# Non-secret settings shared by every control-plane process.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: engineering-control-settings
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  ENGINEERING_ENVIRONMENT: cluster
+  # Listeners are on the pod interface; network policy decides who may reach them.
+  ENGINEERING_NETWORK_BOUNDARY: cluster
+  ENGINEERING_API_HOST: 0.0.0.0
+  ENGINEERING_DASHBOARD_HOST: 0.0.0.0
+  ENGINEERING_EVIDENCE_INGEST_HOST: 0.0.0.0
+  ENGINEERING_API_TOKEN_FILE: /var/run/secrets/engineering-control/api.token
+  ENGINEERING_DASHBOARD_SESSION_KEY_FILE: /var/run/secrets/engineering-control/session.key
+  ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE: /var/run/secrets/engineering-control/evidence-ingest.token
+  ENGINEERING_EVIDENCE_INGEST_TOKEN_DIRECTORY: /var/run/secrets/engineering-control

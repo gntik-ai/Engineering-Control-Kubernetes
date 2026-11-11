@@ -1,0 +1,46 @@
+# The long-running processes have no cluster identity at all.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: engineering-control
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+automountServiceAccountToken: false
+---
+# The bootstrap Jobs may read and write Secrets in this namespace, and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: engineering-control-bootstrap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: engineering-control-bootstrap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["engineering-control-secrets", "engineering-control-admin"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: engineering-control-bootstrap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: engineering-control-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: engineering-control-bootstrap

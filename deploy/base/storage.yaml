@@ -1,0 +1,13 @@
+# Evidence stays on a volume until object storage replaces it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: engineering-control-evidence
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: hcloud-volumes
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,17 @@
+# The control-plane pods accept connections only from their own namespace. Outbound traffic
+# is not restricted yet; that comes with the sandbox namespace. The database pods are left
+# out on purpose: their operator, in another namespace, has to reach them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-plane-ingress
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {}

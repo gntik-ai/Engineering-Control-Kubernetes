@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: engineering-control
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  labels:
+    # The control plane needs no privileges. "baseline" is enforced and "restricted" is
+    # reported, so anything that would not pass the stricter level is visible.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

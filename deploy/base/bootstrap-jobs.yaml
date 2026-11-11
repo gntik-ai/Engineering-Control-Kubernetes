@@ -1,0 +1,174 @@
+# One-off steps, run on every sync in this order and safe to repeat:
+#   wave 0  create the service Secret (missing keys only)
+#   wave 1  migrate the database (after the database of wave 0 is healthy)
+#   wave 2  give the dashboard its first password (only if it has none)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-secrets
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control-bootstrap
+        app.kubernetes.io/component: bootstrap-secrets
+    spec:
+      restartPolicy: Never
+      serviceAccountName: engineering-control-bootstrap
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: engineering-control
+          command: ["python", "-m", "engineering_control.cluster_bootstrap", "secrets"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-database
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control-bootstrap
+        app.kubernetes.io/component: migrate-database
+    spec:
+      restartPolicy: Never
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: engineering-control
+          command: ["alembic", "upgrade", "head"]
+          workingDir: /app
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-admin-password
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control-bootstrap
+        app.kubernetes.io/component: bootstrap-admin-password
+    spec:
+      restartPolicy: Never
+      serviceAccountName: engineering-control-bootstrap
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: engineering-control
+          command: ["python", "-m", "engineering_control.cluster_bootstrap", "admin-password"]
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

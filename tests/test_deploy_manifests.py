@@ -1,0 +1,111 @@
+"""Rules every manifest under deploy/base has to keep, whatever is added later."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+BASE = Path(__file__).parents[1] / "deploy" / "base"
+IMAGE = "engineering-control"  # the placeholder kustomization.yaml pins to a commit
+BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
+
+
+def _documents() -> list[dict[str, Any]]:
+    kustomization = yaml.safe_load((BASE / "kustomization.yaml").read_text())
+    documents: list[dict[str, Any]] = []
+    for name in kustomization["resources"]:
+        documents.extend(d for d in yaml.safe_load_all((BASE / name).read_text()) if d)
+    return documents
+
+
+def _pod_specs() -> list[tuple[str, dict[str, Any]]]:
+    found = []
+    for document in _documents():
+        if document["kind"] in {"Deployment", "Job", "StatefulSet"}:
+            name = f"{document['kind']}/{document['metadata']['name']}"
+            found.append((name, document["spec"]["template"]["spec"]))
+    return found
+
+
+def test_every_file_in_the_directory_is_listed_and_nothing_else() -> None:
+    kustomization = yaml.safe_load((BASE / "kustomization.yaml").read_text())
+    on_disk = {path.name for path in BASE.glob("*.yaml")} - {"kustomization.yaml"}
+    assert set(kustomization["resources"]) == on_disk
+    assert kustomization["namespace"] == "engineering-control"
+
+
+def test_the_image_is_pinned_to_a_commit() -> None:
+    kustomization = yaml.safe_load((BASE / "kustomization.yaml").read_text())
+    (image,) = kustomization["images"]
+    assert image["name"] == IMAGE
+    assert image["newName"] == "ghcr.io/gntik-ai/engineering-control-kubernetes"
+    assert re.fullmatch(r"[0-9a-f]{40}", str(image["newTag"]))
+
+
+def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
+    specs = _pod_specs()
+    assert len(specs) >= 6
+    for name, spec in specs:
+        pod = spec["securityContext"]
+        assert pod["runAsNonRoot"] is True, name
+        assert pod["runAsUser"] == 10001 and pod["runAsGroup"] == 10001, name
+        assert pod["seccompProfile"] == {"type": "RuntimeDefault"}, name
+        assert not spec.get("hostNetwork") and not spec.get("hostPID"), name
+        for container in spec["containers"] + spec.get("initContainers", []):
+            security = container["securityContext"]
+            assert container["image"] == IMAGE, name
+            assert security["allowPrivilegeEscalation"] is False, name
+            assert security["readOnlyRootFilesystem"] is True, name
+            assert security["capabilities"] == {"drop": ["ALL"]}, name
+            assert "privileged" not in security, name
+            assert container["resources"]["requests"]["memory"], name
+            assert container["resources"]["limits"]["memory"], name
+        assert not any("hostPath" in volume for volume in spec.get("volumes", [])), name
+
+
+def test_only_the_bootstrap_jobs_have_a_cluster_identity() -> None:
+    for name, spec in _pod_specs():
+        if spec["serviceAccountName"] == BOOTSTRAP_ACCOUNT:
+            assert name in {"Job/bootstrap-secrets", "Job/bootstrap-admin-password"}
+            assert spec["automountServiceAccountToken"] is True
+        else:
+            assert spec["serviceAccountName"] == "engineering-control", name
+            assert spec["automountServiceAccountToken"] is False, name
+    accounts = {d["metadata"]["name"]: d for d in _documents() if d["kind"] == "ServiceAccount"}
+    assert all(account["automountServiceAccountToken"] is False for account in accounts.values())
+
+
+def test_the_bootstrap_role_reaches_only_secrets_of_its_namespace() -> None:
+    roles = [d for d in _documents() if d["kind"] in {"Role", "ClusterRole", "ClusterRoleBinding"}]
+    assert [role["kind"] for role in roles] == ["Role"]
+    for rule in roles[0]["rules"]:
+        assert rule["apiGroups"] == [""] and rule["resources"] == ["secrets"]
+        if set(rule["verbs"]) - {"create"}:
+            assert rule["resourceNames"] == [
+                "engineering-control-secrets",
+                "engineering-control-admin",
+            ]
+        assert not {"list", "watch", "delete", "*"} & set(rule["verbs"])
+
+
+def test_no_secret_value_is_in_the_repository() -> None:
+    documents = _documents()
+    assert not [d for d in documents if d["kind"] == "Secret"]
+    text = "\n".join(path.read_text() for path in BASE.glob("*.yaml"))
+    assert "BEGIN " not in text and "password:" not in text.replace("key: password", "")
+
+
+def test_mounted_secrets_are_group_readable_only_and_listeners_need_no_public_route() -> None:
+    for name, spec in _pod_specs():
+        for volume in spec.get("volumes", []):
+            if "secret" in volume:
+                assert volume["secret"]["defaultMode"] == 0o440, name
+    kinds = {d["kind"] for d in _documents()}
+    assert "Ingress" not in kinds  # nothing is exposed outside the cluster yet
+    policies = [d for d in _documents() if d["kind"] == "NetworkPolicy"]
+    assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
+    for service in (d for d in _documents() if d["kind"] == "Service"):
+        assert service["spec"].get("type", "ClusterIP") == "ClusterIP"

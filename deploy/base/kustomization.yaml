@@ -1,0 +1,25 @@
+# Stage 1 of the cluster deployment: database, bootstrap, migrations, console, evidence
+# ingest and notifier. The API, scheduler and workflow worker join when Temporal is deployed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: engineering-control
+resources:
+  - namespace.yaml
+  - configuration.yaml
+  - access.yaml
+  - network-policy.yaml
+  - postgres.yaml
+  - storage.yaml
+  - bootstrap-jobs.yaml
+  - console.yaml
+  - evidence-ingest.yaml
+  - notifier.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: engineering-control
+images:
+  # Built and pushed by CI for every commit, tagged with the commit it was built from.
+  # Deploying a new version is changing this one line.
+  - name: engineering-control
+    newName: ghcr.io/gntik-ai/engineering-control-kubernetes
+    newTag: 6c8f58f4cc839ccc9a104a8d049386c208db3c70
