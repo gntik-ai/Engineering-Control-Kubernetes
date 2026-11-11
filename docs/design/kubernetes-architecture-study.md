@@ -1541,6 +1541,23 @@ It answers part of section 13.3; what Argo CD cannot show is listed at the end.
 inspection. It is not stored in this repository. It should be rotated, and the platform
 should be given the scoped account above, never the administrator's.
 
+### 16.2a Found during the first deployment
+
+- **PostgreSQL does not start on the Ubuntu 26.04 nodes.** On `aibot`, `github-actions` and
+  `kind` (kernel 7.0) it logs `could not signal for checkpoint: Permission denied` and stays
+  in recovery. The message is the one the kernel returns when a security profile refuses
+  the signal, which points at the container security profile on those nodes. The same error
+  is why two databases of the falcone staging application are down. On `mus-srv-0`
+  (Ubuntu 24.04, kernel 6.8) PostgreSQL starts normally, so the platform's database is
+  pinned there for now. This is a node problem to fix on the cluster, not in this
+  repository.
+- **There is a fourth node**, `aibot` (12 CPU, about 30 GiB), not seen in the first
+  inspection.
+- **The storage class named in another application's settings does not exist.** The default
+  class is node-local storage; a volume lives on one node's disk.
+- **Images in the organisation's registry are pulled without credentials only when the
+  package is public.** This platform's image is private and needs a pull secret.
+
 ### 16.3 Still unknown
 
 These need direct access to the cluster, which Argo CD does not give. A cluster credential
