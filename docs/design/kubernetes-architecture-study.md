@@ -4,6 +4,7 @@ Status: proposal for discussion. Nothing in this document is implemented.
 
 Sections 1–10 are the first iteration. Section 11 is a second iteration that adds designable
 flows, a supervising agent and the options those two make necessary.
+Section 12 records the decisions taken on section 11 and takes precedence where it differs.
 
 This study answers two questions asked ahead of the Kubernetes migration:
 
@@ -65,6 +66,11 @@ supervising agent are both feasible without giving up the safety rules, provided
 are enforced by the engine rather than written into each flow, and the supervisor acts only
 through a closed list of typed actions. With the supporting options recommended there, the
 programme grows to about 67–90 engineer-weeks.
+
+**Decisions taken (section 12).** Flows are designed visually with the gntik-ui kit; the
+single administrator publishes them without a second approver; the supervisor acts on its
+own for reversible actions and waits for the administrator before risky ones; and it runs
+on its own credentials. With these the programme is about 72–97 engineer-weeks.
 
 ## 2. Scope and method
 
@@ -499,6 +505,7 @@ pack release.
   takes the actor from the verified token, never from a header (I1).
 - **Roles**: viewer, operator (start, pause, retry), approver (approvals, by risk class).
   Approvals are bound to the authenticated person and the digest they approved.
+  (Superseded by section 12.2: there is one administrator and no identity provider.)
 - **Services** (chat adapter, CLI, workers) each have their own credential with a fixed
   actor.
 - **The console regains commands** through the typed command bus, with re-authentication for
@@ -906,7 +913,8 @@ The options add to the 41–54 weeks of section 8.
 | **Everything** | **33–46** | |
 
 With the recommended set the programme is about **67–90 engineer-weeks**: nine to ten
-months for a team of three.
+months for a team of three. Section 12.5 revises this after the decisions: the visual
+designer and full supervisor autonomy are in scope.
 
 Where they fit in the sequence of section 8:
 
@@ -923,6 +931,8 @@ and assisted triage — the point where day-to-day operation changes most.
 
 ### 11.6 Additional decisions
 
+These four were decided; see section 12.
+
 6. **How far to take flow design:** configurable (level 1), composable (level 2,
    recommended) or visual (level 3).
 7. **Who may publish flows,** and whether flows containing merge or deploy modules need a
@@ -931,6 +941,184 @@ and assisted triage — the point where day-to-day operation changes most.
    and risk classes may be promoted.
 9. **Supervisor model and credential:** which provider is primary, and whether it uses API
    access.
+
+## 12. Decisions taken and their consequences (third iteration)
+
+The administrator decided the four questions of section 11.6. This section records each
+decision and what it changes in the design. Where it conflicts with sections 6 or 11, this
+section takes precedence.
+
+| # | Question | Decision |
+| --- | --- | --- |
+| 6 | How far to take flow design | **Visual designer**, built with the gntik-ui kit |
+| 7 | Who may publish flows | **The administrator.** The platform has one user; no second approver |
+| 8 | Supervisor autonomy | **As autonomous as possible**, stopping to wait for the administrator before risky actions |
+| 9 | Supervisor credential | **Its own credentials** (see 12.4 for how this was read) |
+
+Decisions 1–5 of section 10 remain open.
+
+### 12.1 Visual flow designer
+
+All three levels of section 11.2 are now in scope. The designer is the main way flows are
+created; the document format of level 2 stays underneath it as the stored form.
+
+**Screen layout**, using `SidebarLayout` and `InspectorLayout` from `@gntik-ai/ui`:
+
+| Area | Content | Kit component |
+| --- | --- | --- |
+| Left | Module palette, grouped as in the catalogue, searchable | `TreeList`, `SearchField` |
+| Centre | The flow graph: drag modules in, connect outputs to inputs | `@gntik-ai/flow` |
+| Right | Inspector for the selected module: parameters, provider and model, budgets, permissions | Forms generated from the module's schema |
+| Right, prompt tab | Prompt editor with the fixed contract shown read-only above the editable instructions, and the declared variables | `@gntik-ai/editor` |
+| Bottom | Validation results, simulation output, version history | `Tabs`, `DiffViewer` |
+
+**Behaviour:**
+
+- **Typed connections.** An output can only be dropped on an input of a compatible type.
+- **Live validation.** The invariants of section 11.2 are checked as the graph changes. A
+  violation is shown on the offending connection or module with the rule it breaks, and
+  blocks publishing. Gates the engine will insert (for example the approval for high-risk
+  items) are drawn as locked nodes so the author sees the flow that will really run.
+- **Simulation.** Runs the draft in dry-run against a recorded work item and shows the
+  result per module.
+- **Versions.** Every publish creates an immutable version with a diff against the previous
+  one. Running flows keep the version they started with.
+- **Built-in flows** (deliver item, audit, discover enhancements, plan) open in the designer
+  as editable copies; the originals stay available as a baseline.
+- **Run view.** The same canvas, read-only, shows a live or finished run with each module's
+  state. This is the run trace view of option F, so the two are built together.
+
+**Storage.** With one user editing in a browser, the database is the source of truth for
+flows and versions. Flows can be exported and imported as documents, which also gives a
+backup and a way to move a flow between environments. This replaces "stored in Git" in
+section 11.2.
+
+**To verify during the build.** The console runs under a strict Content-Security-Policy
+(no inline styles or scripts). The graph canvas must be checked against it, as the select
+popup had to be when the console was built.
+
+### 12.2 One administrator
+
+- **Identity.** No identity provider and no roles. The existing password sign-in stays, and
+  the administrator is the only human actor. This replaces the "People" and "Roles" items
+  of section 6.6.
+- **What still has to change.** Finding I1 stands: the API must take the actor from the
+  credential presented, not from a header. Each channel — console session, CLI, chat
+  adapter — gets its own credential mapped to "administrator via that channel", and each
+  service keeps its own.
+- **Publishing flows.** The administrator publishes directly. There is no second approver.
+- **A safeguard that costs one prompt.** Publishing a flow that contains merge or deploy
+  modules, and giving any approval, asks for the password again. This is the control the
+  removed dashboard had for commands. It protects against an unattended session, not
+  against the administrator.
+- **Unaffected.** The separation of author and reviewer is between agents and does not
+  depend on how many people use the platform.
+- **Kept open for later.** Actions are still recorded against an actor, so more users or
+  roles can be added without changing stored records.
+
+### 12.3 Supervisor: autonomous by default, waits before risky actions
+
+The levels of section 11.3 are replaced by one mode. Every action belongs to one of three
+classes. The administrator can move an action between the first two classes; the third is
+fixed.
+
+**Automatic.** The supervisor acts and reports afterwards. These are reversible and have no
+effect outside the platform.
+
+| Action | Limit |
+| --- | --- |
+| Retry a module that has no external effect | Bounded per run |
+| Retry on another provider or account | When the first is limited, overloaded or logged out |
+| Nudge or resume a waiting run | — |
+| Return an item to the queue | Bounded per item |
+| Extend a correction budget | Up to the platform ceiling |
+| Pause one run | — |
+| Skip an item, with a recorded reason | The item stays in the backlog and can be re-queued |
+| Pause one flow or one project | When failures repeat across its runs |
+| Open an incident; file a platform bug | — |
+
+**Waits for the administrator.** The supervisor prepares the action with its diagnosis and
+evidence, puts it in the decision inbox, notifies by chat, and holds the affected run in a
+paused state. Other runs continue. A waiting action is never taken on a timeout; reminders
+are sent instead.
+
+| Action | Why it is risky |
+| --- | --- |
+| Cancel a run that holds unpublished work | The work is discarded |
+| Retry a publish, merge, release or deploy module after a partial failure | External effects may already have happened |
+| Resolve a publication whose outcome is unknown | Needs a judgement about external state |
+| Any corrective action on an item at the highest risk class | Policy already requires a person there |
+| Close or abandon a work item | Changes what the backlog will deliver |
+| Go beyond a budget ceiling or an action limit | The limits exist to stop loops |
+| Pause every project | Stops the platform |
+| Any action when the diagnosis is uncertain | The agent reports its confidence; below a threshold it asks |
+
+**Never.** Approve, merge, deploy, lower a risk class, bypass a gate, publish or edit a flow
+or prompt, or touch credentials. Unchanged from section 11.3.
+
+**Two additions that widen what the supervisor can usefully do without widening its
+authority:**
+
+- **Draft fixes.** When the cause is a prompt or a flow — for example the same reviewer
+  objection across many runs — the supervisor may draft a changed version and place it in
+  the inbox. Only the administrator publishes it.
+- **Learned rules.** A decision the supervisor takes repeatedly with the same outcome is
+  proposed as a known-signature rule, so that case stops needing a model.
+
+**Controls that make full autonomy acceptable:**
+
+- Limits on automatic actions per run, per project and per hour. Reaching a limit turns the
+  next action into one that waits.
+- Every decision is recorded with its evidence and reasoning, and summarised to the
+  administrator in a daily digest.
+- Any automatic action can be reversed from the inbox, and any action can be moved to the
+  waiting class in settings.
+- Liveness checks stay deterministic and independent of the supervisor.
+
+### 12.4 Supervisor credentials
+
+The decision was "use credentials". It is read here as: **the supervisor has its own
+provider credentials** — an API key for the chosen provider, with a second provider
+configured as fallback — stored as a cluster secret and separate from the accounts that run
+work. Consequences:
+
+- The supervisor keeps working when a work account is rate-limited or logged out.
+- Its usage is metered and budgeted on its own (option E).
+- The rule that strips API keys from agent environments stays in force for work agents; the
+  supervisor is a separate service with a separate environment.
+
+This does not settle decision 2 of section 10 (how the agents that do the work
+authenticate), which still sets the achievable parallelism. If "use credentials" was meant
+to cover those agents as well, that decision is closed in favour of API keys and the seat
+broker of section 6.6 reduces to a per-key concurrency limit.
+
+### 12.5 Revised scope and effort
+
+| Item | Engineer-weeks | Change |
+| --- | --- | --- |
+| Sections 1–10 (migration and restructuring) | 40–53 | One week less: no identity provider or roles |
+| Flow interpreter, prompt templates, composable flows | 10–14 | Unchanged |
+| Visual designer, including the run view | 6–8 | Now in scope; absorbs option F |
+| Supervisor, single autonomous mode with action classes | 7–10 | Now in scope in full |
+| Evaluation lab | 4–5 | Unchanged |
+| Decision inbox | 2–3 | Unchanged; required by 12.3 |
+| Budgets and cost | 2 | Unchanged |
+| Event triggers | 1–2 | Unchanged |
+| **Total** | **72–97** | |
+
+About ten to eleven months for a team of three.
+
+Sequence, adjusting section 11.5:
+
+- **With step 4:** single-administrator credentials per channel, decision inbox.
+- **With step 8:** flow interpreter, prompt templates, budgets, run view on the canvas.
+- **After step 8:** supervisor with automatic and waiting actions.
+- **After step 10:** composable flows and the visual designer, evaluation lab, event
+  triggers.
+
+The designer comes after step 10 because it needs every workflow family expressed as
+modules first; before that, built-in flows are configured through settings and prompt
+templates.
 
 ## Appendix A. Documentation drift found during the audit
 
