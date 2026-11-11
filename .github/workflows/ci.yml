@@ -1,0 +1,159 @@
+name: CI
+
+# Every push runs lint, type checks, the unit suite, the console build and the control-plane
+# image build. Nothing here deploys or publishes: the image is pushed to the registry only
+# from main.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install constrained project and development dependencies
+        run: python -m pip install --constraint requirements.lock --editable ".[dev]"
+      - name: Ruff lint
+        run: ruff check src tests
+      - name: Ruff format
+        run: ruff format --check src tests
+      - name: Mypy (strict)
+        run: mypy
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install constrained project and development dependencies
+        run: python -m pip install --constraint requirements.lock --editable ".[dev]"
+      - name: Fetch the Temporal test server once
+        # The workflow tests start a local Temporal server, downloaded on first use. Doing
+        # it here keeps parallel test workers from each downloading it.
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from temporalio.testing import WorkflowEnvironment
+
+
+          async def main() -> None:
+              async with await WorkflowEnvironment.start_local():
+                  pass
+
+
+          asyncio.run(main())
+          PY
+      - name: Run the unit suite
+        # Tests that need a real PostgreSQL server skip here; the PostgreSQL acceptance
+        # workflow runs them.
+        run: python -m pytest -q -n auto -p no:cacheprovider
+
+  console:
+    name: Console build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/console/package-lock.json
+      - run: npm ci
+      - name: Typecheck and build
+        run: npm run build
+      - name: The committed bundle matches the source
+        # The Python package ships the built console; a source change without a rebuild
+        # would deploy a stale page.
+        working-directory: .
+        run: |
+          git status --short src/engineering_control/dashboard/console
+          git diff --exit-code -- src/engineering_control/dashboard/console
+          test -z "$(git status --porcelain -- src/engineering_control/dashboard/console)"
+
+  image:
+    name: Control-plane image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/control/Dockerfile
+          load: true
+          tags: engineering-control:ci
+          build-args: |
+            REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the image
+        run: |
+          docker run --rm engineering-control:ci python - <<'PY'
+          import os
+
+          import engineering_control
+          from engineering_control.dashboard.app import CONSOLE_ROOT, TEMPLATE_ROOT
+          from engineering_control.workflows.definitions import ALL_WORKFLOWS
+
+          assert os.geteuid() != 0, "the image must not run as root"
+          assert (CONSOLE_ROOT / "index.html").is_file(), "console bundle missing"
+          assert (TEMPLATE_ROOT / "login.html").is_file(), "sign-in template missing"
+          assert ALL_WORKFLOWS, "no workflows registered"
+          print("ok", engineering_control.__name__, len(ALL_WORKFLOWS), "workflows")
+          PY
+          docker run --rm engineering-control:ci alembic --help >/dev/null
+      - name: Log in to the registry
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push (main only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          image=ghcr.io/gntik-ai/engineering-control
+          docker tag engineering-control:ci "${image}:${GITHUB_SHA}"
+          docker push "${image}:${GITHUB_SHA}"

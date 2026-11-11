@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import pwd
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -51,7 +53,7 @@ class FakePublicationRunner:
             self.fetches.append(arguments)
             environment = kwargs.get("environment")
             assert isinstance(environment, dict)
-            assert environment["HOME"] == "/home/hermes"
+            assert environment["HOME"] == pwd.getpwuid(os.geteuid()).pw_dir
             assert environment["GIT_SSH_COMMAND"].startswith("ssh -o BatchMode=yes")
             url = arguments[-2]
             slug = url.rsplit("/", 2)[-2]
@@ -88,7 +90,7 @@ class FakePublicationRunner:
             self.pushed_refspecs.append(arguments[-1])
             environment = kwargs.get("environment")
             assert isinstance(environment, dict)
-            assert environment["HOME"] == "/home/hermes"
+            assert environment["HOME"] == pwd.getpwuid(os.geteuid()).pw_dir
             return CommandResult(0, "ok\n", "")
         if executable == "gh" and arguments[:2] == ["auth", "status"]:
             return CommandResult(0, "", "")

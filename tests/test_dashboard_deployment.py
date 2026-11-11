@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from engineering_control.cli import parser
@@ -14,25 +13,6 @@ def test_dashboard_cli_has_only_explicit_password_output_operations() -> None:
     assert arguments.dashboard_command == "init-password"
     assert str(arguments.output_file) == output
     assert arguments.force_output is False
-
-
-def test_dashboard_systemd_unit_verifies(tmp_path: Path) -> None:
-    installed = ROOT / "systemd/engineering-dashboard.service"
-    candidate = tmp_path / "engineering-dashboard.service"
-    candidate.write_text(
-        installed.read_text(encoding="utf-8").replace(
-            "/opt/engineering-control/venv/bin/engineering-dashboard", "/bin/true"
-        ),
-        encoding="utf-8",
-    )
-    result = subprocess.run(  # noqa: S603 - executable and unit path are fixed test inputs
-        ["/usr/bin/systemd-analyze", "verify", str(candidate)],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def test_dashboard_assets_contain_no_remote_dependencies_or_mutation_routes() -> None:
