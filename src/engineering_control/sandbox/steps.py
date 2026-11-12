@@ -95,8 +95,9 @@ def check_job(provider: str, generation: int) -> dict[str, Any]:
             '{"mcpServers":{}}',
             "--tools",
             "",
-            CHECK_PROMPT,
         ]
+        # On standard input: --tools takes every word after it as a tool's name.
+        question: dict[str, Any] = {"stdin": CHECK_PROMPT}
     elif provider == "chatgpt":
         argv = [
             "codex",
@@ -109,6 +110,7 @@ def check_job(provider: str, generation: int) -> dict[str, Any]:
             WORKSPACE,
             CHECK_PROMPT,
         ]
+        question = {}
     else:
         raise ValueError(f"no client for provider {provider}")
     return {
@@ -120,6 +122,7 @@ def check_job(provider: str, generation: int) -> dict[str, Any]:
                 "cwd": WORKSPACE,
                 "env": client_environment(provider),
                 "timeout": CHECK_SECONDS,
+                **question,
             }
         ],
     }

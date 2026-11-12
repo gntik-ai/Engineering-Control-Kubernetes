@@ -238,6 +238,8 @@ def test_the_check_job_names_where_the_sign_in_is_and_never_holds_it() -> None:
     (command,) = claude["commands"]
     assert command["argv"][0] == "claude" and "--print" in command["argv"]
     assert command["argv"][command["argv"].index("--tools") + 1] == "", "no tools at all"
+    # --tools takes every word after it, so the question goes in on standard input.
+    assert command["argv"][-2:] == ["--tools", ""] and command["stdin"] == steps.CHECK_PROMPT
     codex = steps.check_job("chatgpt", 3)
     assert codex["seed"] == [
         {"from": "/run/account/auth.json", "to": "/account-home/auth.json", "generation": 3}
@@ -281,6 +283,25 @@ def test_a_result_is_read_from_the_last_marker_and_garbage_is_no_result() -> Non
             "limited",
         ),
         (_command(exit_code=1, stderr="HTTP 429 Too Many Requests"), "limited", "limited"),
+        # What the clients really print for a sign-in that is not accepted (seen with
+        # Claude Code 2.1.322 and Codex 0.167.2).
+        (
+            _command(
+                exit_code=1,
+                stdout="Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+            ),
+            "sign_in_required",
+            "sign_in_required",
+        ),
+        (
+            _command(
+                exit_code=1,
+                stderr="ERROR: unexpected status 401 Unauthorized: Missing bearer or basic "
+                "authentication in header, url: https://api.openai.com/v1/responses",
+            ),
+            "sign_in_required",
+            "sign_in_required",
+        ),
         (_command(exit_code=1, stderr="segmentation fault"), "failed", None),
         (_command(exit_code=0, stdout="I cannot do that"), "failed", None),
         (_command(exit_code=-15, timed_out=True), "timed_out", None),
