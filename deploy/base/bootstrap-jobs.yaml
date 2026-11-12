@@ -28,6 +28,17 @@ spec:
         runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: bootstrap
           image: engineering-control
@@ -76,6 +87,17 @@ spec:
         runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: migrate
           image: engineering-control
@@ -138,6 +160,17 @@ spec:
         runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: bootstrap
           image: engineering-control

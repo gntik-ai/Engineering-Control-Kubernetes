@@ -15,6 +15,17 @@ spec:
       owner: engineering_control
       encoding: UTF8
       dataChecksums: true
+  # Never on the node reserved for sandboxes (see deploy/README.md).
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: engineering-control/sandbox
+                operator: DoesNotExist
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: ["aibot"]
   # No storage class is named: the cluster's default is used.
   storage:
     size: 10Gi

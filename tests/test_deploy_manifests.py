@@ -197,3 +197,30 @@ def test_no_storage_class_is_named() -> None:
 def test_the_registry_chart_holds_no_credential() -> None:
     values = yaml.safe_load((BASE.parent / "registry" / "values.yaml").read_text())
     assert values == {"username": "", "token": ""}
+
+
+def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:
+    """Sandboxes run code the platform does not control; they get a node to themselves."""
+    rule = {
+        "requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [
+                {
+                    "matchExpressions": [
+                        {"key": "engineering-control/sandbox", "operator": "DoesNotExist"},
+                        {"key": "kubernetes.io/hostname", "operator": "NotIn", "values": ["aibot"]},
+                    ]
+                }
+            ]
+        }
+    }
+    pods = _pod_specs()
+    assert len(pods) >= 11
+    for name, spec in pods:
+        assert spec.get("affinity", {}).get("nodeAffinity") == rule, name
+        assert "nodeSelector" not in spec and "tolerations" not in spec, name
+    clusters = [d for d in _documents() if d["kind"] == "Cluster"]
+    assert len(clusters) == 2
+    for cluster in clusters:
+        name = cluster["metadata"]["name"]
+        assert cluster["spec"]["affinity"]["nodeAffinity"] == rule, name
+        assert "tolerations" not in cluster["spec"]["affinity"], name

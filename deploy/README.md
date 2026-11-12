@@ -29,6 +29,22 @@ to the cluster so that the ingress controller can reach it; every other port and
 pod accepts connections from its own namespace only. The rule should be narrowed to the
 ingress controller once its namespace and labels are known (`docs/design/cluster-facts.sh`).
 
+## The sandbox node
+
+Runs execute code the platform does not control, so sandboxes get a node to themselves:
+`aibot`, chosen by the administrator. Every pod of the platform and both databases refuse
+that node, by its name and by the label `engineering-control/sandbox`; the name can be
+dropped from the rule once the node carries the label. The label and, when nothing else
+needs the node any more, the taint are set by the administrator:
+
+```bash
+kubectl label node aibot engineering-control/sandbox=true
+kubectl taint node aibot engineering-control/sandbox=true:NoSchedule
+```
+
+The taint keeps every other workload off the node. Pods already there keep running until
+they restart; one with data on the node's disk cannot come back afterwards, so move it first.
+
 ## Rules the manifests keep
 
 `tests/test_deploy_manifests.py` fails if a pod could run as root, write its root

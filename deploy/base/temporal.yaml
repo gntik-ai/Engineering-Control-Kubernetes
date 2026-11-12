@@ -20,6 +20,17 @@ spec:
       # Temporal keeps its visibility records in a second database.
       postInitSQL:
         - CREATE DATABASE temporal_visibility OWNER temporal ENCODING 'UTF8'
+  # Never on the node reserved for sandboxes (see deploy/README.md).
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: engineering-control/sandbox
+                operator: DoesNotExist
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: ["aibot"]
   # No storage class is named: the cluster's default is used.
   storage:
     size: 10Gi
@@ -150,6 +161,17 @@ spec:
         runAsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: schema
           image: temporalio/admin-tools:1.31.2@sha256:dbc5fcd6ee8f0f4d808bf765af9a87dea9d8a283abfdcfbd2fc148496ba66107
@@ -229,6 +251,17 @@ spec:
         runAsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: temporal
           image: temporalio/server:1.31.2@sha256:b5ecdb8282bededae2a10c36e8d862e27d0bc2d247fc73c5416025997ab4a1da
@@ -359,6 +392,17 @@ spec:
         runAsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
       containers:
         - name: namespace
           image: temporalio/admin-tools:1.31.2@sha256:dbc5fcd6ee8f0f4d808bf765af9a87dea9d8a283abfdcfbd2fc148496ba66107
