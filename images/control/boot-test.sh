@@ -144,6 +144,7 @@ expect "API answers an authenticated call" 200 \
   --header "Authorization: Bearer ${api_token}" http://127.0.0.1:8740/v1/readiness/core
 expect "dashboard is ready" 200 http://127.0.0.1:8750/health/ready
 expect "sign-in page is served" 200 http://127.0.0.1:8750/login
+expect "sign-in token is issued" 200 http://127.0.0.1:8750/login/challenge
 expect "console requires a session" 303 http://127.0.0.1:8750/console
 expect "evidence ingest is live" 200 http://127.0.0.1:8751/health/live
 

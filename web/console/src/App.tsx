@@ -3,6 +3,7 @@ import { FolderKanban, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons'
 import { useEffect, useState, type ReactNode } from 'react';
 import { signOut } from './api';
 import { ExecutionPage } from './pages/Execution';
+import { NotFoundPage } from './pages/NotFound';
 import { BacklogPage } from './pages/Backlog';
 import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
@@ -49,9 +50,11 @@ export default function App() {
   const { path } = useLocation();
   const current = path.replace(/\/$/, '');
   const view = VIEWS[current];
+  const home = current === BASE;
   useEffect(() => {
-    if (!view) navigate(`${BASE}/projects`, { replace: true });
-  }, [view]);
+    if (home) navigate(`${BASE}/projects`, { replace: true });
+  }, [home]);
+  if (!view && !home) return <NotFoundPage />;
   return (
     <div className="h-dvh">
       <SidebarLayout

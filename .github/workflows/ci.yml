@@ -143,12 +143,13 @@ jobs:
           import os
 
           import engineering_control
-          from engineering_control.dashboard.app import CONSOLE_ROOT, TEMPLATE_ROOT
+          from engineering_control.dashboard.app import CONSOLE_ROOT, sign_in_assets
           from engineering_control.workflows.definitions import ALL_WORKFLOWS
 
           assert os.geteuid() != 0, "the image must not run as root"
           assert (CONSOLE_ROOT / "index.html").is_file(), "console bundle missing"
-          assert (TEMPLATE_ROOT / "login.html").is_file(), "sign-in template missing"
+          assert (CONSOLE_ROOT / "login.html").is_file(), "sign-in page missing"
+          assert sign_in_assets(), "the sign-in page names no files"
           assert ALL_WORKFLOWS, "no workflows registered"
           print("ok", engineering_control.__name__, len(ALL_WORKFLOWS), "workflows")
           PY

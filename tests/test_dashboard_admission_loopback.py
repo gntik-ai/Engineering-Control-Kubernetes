@@ -97,8 +97,8 @@ async def test_authenticated_dashboard_observes_actual_loopback_api_and_loss(
             ) as client:
                 assert (await client.get("/api/dashboard/overview")).status_code == 401
                 assert not requests
-                login = await client.get("/login")
-                csrf = re.search(r'name="csrf_token" value="([^"]+)"', login.text)
+                login = await client.get("/login/challenge")
+                csrf = re.search(r'"csrf_token":\s*"([^"]+)"', login.text)
                 assert csrf
                 accepted = await client.post(
                     "/login",

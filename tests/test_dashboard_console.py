@@ -8,6 +8,7 @@ from engineering_control.dashboard.app import (
     CONSOLE_INLINE_STYLE,
     CONSOLE_INLINE_STYLE_HASH,
     CONSOLE_ROOT,
+    sign_in_assets,
 )
 from engineering_control.db.models import AgentExecution, Run
 from engineering_control.projects import PROJECTS
@@ -22,9 +23,85 @@ def test_console_requires_a_session(tmp_path: Path) -> None:
         page = client.get("/console/backlog", follow_redirects=False)
         assert page.status_code == 303
         assert page.headers["location"] == "/login?next=/console/backlog"
-        asset = client.get("/console/assets/theme-bootstrap.js", follow_redirects=False)
-        assert asset.status_code == 303
         assert client.get("/api/dashboard/projects").status_code == 401
+        # The console's own code is not given out; only what the sign-in page loads is.
+        index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
+        private = set(re.findall(r'"/console/assets/([^"]+)"', index)) - sign_in_assets()
+        assert private and all(name.startswith("index-") for name in private)
+        for name in private:
+            asset = client.get(f"/console/assets/{name}", follow_redirects=False)
+            assert asset.status_code == 303
+            assert asset.headers["location"].startswith("/login")
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_sign_in_page_is_the_built_page_and_loads_without_a_session(tmp_path: Path) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        client.cookies.clear()
+        built = (CONSOLE_ROOT / "login.html").read_text(encoding="utf-8")
+        page = client.get("/login?next=/console/backlog")
+        assert page.status_code == 200
+        assert page.headers["content-type"].startswith("text/html")
+        assert page.text == built
+        assert "<title>Sign in · Engineering Control</title>" in built
+        # Same strict policy as every other page: no inline script, no inline style.
+        policy = page.headers["Content-Security-Policy"]
+        assert "script-src 'self';" in policy and "style-src 'self';" in policy
+        assert not re.search(r"<script(?![^>]*\ssrc=)", built) and "<style" not in built
+        references = re.findall(r'(?:src|href)="([^"]+)"', built)
+        assert references and all(r.startswith("/console/assets/") for r in references)
+        assert {r.removeprefix("/console/assets/") for r in references} == sign_in_assets()
+        for reference in references:
+            asset = client.get(reference, follow_redirects=False)
+            assert asset.status_code == 200
+            assert asset.headers["X-Content-Type-Options"] == "nosniff"
+        # The stylesheet names the fonts, so they are given out too; nothing else is.
+        fonts = list((CONSOLE_ROOT / "assets").glob("*.woff2"))
+        assert fonts
+        assert client.get(f"/console/assets/{fonts[0].name}").status_code == 200
+        # Without a session, anything that does not exist answers like everything else.
+        for absent in ("/console/assets/absent.woff2", "/console/assets/absent.js"):
+            assert client.get(absent, follow_redirects=False).status_code == 303
+        # The token comes from its own endpoint, and only as a cookie the page cannot read.
+        challenge = client.get("/login/challenge")
+        assert challenge.status_code == 200
+        assert set(challenge.json()) == {"csrf_token"}
+        cookie = challenge.headers["set-cookie"].lower()
+        assert "httponly" in cookie and "secure" in cookie and "samesite=strict" in cookie
+        wrong = client.post(
+            "/login",
+            data={"csrf_token": challenge.json()["csrf_token"], "password": "not the password"},
+            follow_redirects=False,
+        )
+        assert wrong.status_code == 401
+        assert set(wrong.json()) == {"detail", "csrf_token"}
+        assert wrong.json()["csrf_token"] != challenge.json()["csrf_token"]
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_a_browser_asking_for_an_unknown_page_gets_the_console_not_found_page(
+    tmp_path: Path,
+) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
+        browser = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        for path in ("/console/unknown", "/overview", "/settings/password"):
+            page = client.get(path, headers=browser)
+            assert page.status_code == 404
+            assert page.text == index
+        # Scripts, the API and missing files keep the plain answer.
+        for path in ("/console/unknown", "/api/dashboard/unknown", "/console/assets/absent.js"):
+            assert client.get(path).json() == {"detail": "not found"}
+        assert client.get("/api/dashboard/unknown", headers=browser).json() == {
+            "detail": "not found"
+        }
+        assert client.get("/console/assets/absent.js", headers=browser).status_code == 404
+        assert client.get("/console/assets/absent.js", headers=browser).text != index
+        assert client.post("/overview", headers=browser).status_code in {404, 405}
     finally:
         client.__exit__(None, None, None)
 
@@ -81,7 +158,8 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
 
 
 def test_console_bundle_still_adds_only_the_allowed_inline_style() -> None:
-    scripts = list((CONSOLE_ROOT / "assets").glob("index-*.js"))
+    # The libraries are one file, shared by the console and the sign-in page.
+    scripts = list((CONSOLE_ROOT / "assets").glob("vendor-*.js"))
     assert len(scripts) == 1
     bundle = scripts[0].read_text(encoding="utf-8")
     name = "base-ui-disable-scrollbar"
@@ -113,8 +191,8 @@ def test_login_returns_to_the_console(tmp_path: Path) -> None:
     client, _repository = _authenticated_client(tmp_path)
     try:
         client.cookies.clear()
-        login = client.get("/login?next=/console/executions")
-        token = re.search(r'name="csrf_token" value="([^"]+)"', login.text)
+        login = client.get("/login/challenge")
+        token = re.search(r'"csrf_token":\s*"([^"]+)"', login.text)
         assert token
         response = client.post(
             "/login?next=/console/executions",

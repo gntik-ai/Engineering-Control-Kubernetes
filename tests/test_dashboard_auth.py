@@ -20,7 +20,7 @@ from starlette.responses import StreamingResponse
 from engineering_control.config import Settings
 from engineering_control.dashboard import app as dashboard_app_module
 from engineering_control.dashboard import repository as repository_module
-from engineering_control.dashboard.app import create_app
+from engineering_control.dashboard.app import create_app, sign_in_assets
 from engineering_control.dashboard.auth import (
     LoginFailureLimiter,
     PasswordService,
@@ -74,7 +74,7 @@ def _client(
 
 
 def _csrf(response_text: str) -> str:
-    match = re.search(r'name="csrf_token" value="([^"]+)"', response_text)
+    match = re.search(r'"csrf_token":\s*"([^"]+)"', response_text)
     assert match is not None
     return match.group(1)
 
@@ -86,7 +86,7 @@ def _session_csrf(client: TestClient) -> str:
 
 
 def _login(client: TestClient, password: str = PASSWORD) -> object:
-    page = client.get("/login")
+    page = client.get("/login/challenge")
     return client.post(
         "/login",
         data={
@@ -232,7 +232,7 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
             assert response.status_code == 401
             assert response.json() == {"detail": "authentication required"}
 
-        login = client.get("/login")
+        login = client.get("/login/challenge")
         response = client.post(
             "/login",
             data={"csrf_token": _csrf(login.text), "password": PASSWORD},
@@ -374,7 +374,7 @@ def test_opaque_origin_browser_login_requires_exact_fetch_metadata_and_csrf(
 ) -> None:
     repository = _repository(tmp_path)
     with _client(repository) as client:
-        login = client.get("/login")
+        login = client.get("/login/challenge")
         login_csrf = _csrf(login.text)
         form = {
             "csrf_token": login_csrf,
@@ -922,15 +922,20 @@ async def test_transcript_stream_route_rechecks_durable_session_revocation(
     await asyncio.wait_for(consumer, timeout=1)
 
 
-def test_login_csrf_survives_browser_asset_and_repeated_page_requests(tmp_path: Path) -> None:
+def test_login_csrf_survives_page_asset_and_repeated_challenge_requests(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     with _client(repository) as client:
-        first_page = client.get("/login")
+        first_page = client.get("/login/challenge")
         csrf = _csrf(first_page.text)
         assert client.cookies.get("engineering_dashboard_login_csrf") == csrf
 
-        assert client.get("/login?asset=icon").status_code == 204
-        second_page = client.get("/login")
+        # Loading the page and its files neither issues nor replaces the token.
+        page = client.get("/login")
+        assert page.status_code == 200 and "csrf" not in page.text.lower()
+        assert "set-cookie" not in page.headers
+        for name in sign_in_assets():
+            assert client.get(f"/console/assets/{name}").status_code == 200
+        second_page = client.get("/login/challenge")
         assert _csrf(second_page.text) == csrf
         assert client.cookies.get("engineering_dashboard_login_csrf") == csrf
 

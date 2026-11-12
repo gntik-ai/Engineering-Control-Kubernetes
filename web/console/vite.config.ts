@@ -37,6 +37,15 @@ export default defineConfig({
     assetsInlineLimit: 0,
     modulePreload: { polyfill: false },
     chunkSizeWarningLimit: 4000,
+    rollupOptions: {
+      // Two pages. The sign-in page is served before there is a session, so the server
+      // gives out exactly the files login.html names: its own entry, the stylesheet and
+      // the libraries. The console's own code (the index entry) needs a session.
+      input: { index: 'index.html', login: 'login.html' },
+      output: {
+        manualChunks: (id) => (id.includes('/node_modules/') ? 'vendor' : undefined),
+      },
+    },
   },
   server: {
     proxy: { '/api': 'http://127.0.0.1:8750', '/login': 'http://127.0.0.1:8750' },

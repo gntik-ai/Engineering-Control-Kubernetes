@@ -20,14 +20,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
-    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
     Response,
 )
-from jinja2 import StrictUndefined
-from starlette.templating import Jinja2Templates
 
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.admission import AdmissionReader
@@ -59,8 +56,6 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.projects import PROJECT_SET
 
 PACKAGE_ROOT = Path(__file__).parent
-TEMPLATE_ROOT = PACKAGE_ROOT / "templates"
-STATIC_ROOT = PACKAGE_ROOT / "static"
 # The built gntik-ui console (web/console, `pnpm build`): index.html plus hashed assets.
 # Kept outside static/: that directory holds the hand-written, remote-free dashboard files.
 CONSOLE_ROOT = PACKAGE_ROOT / "console"
@@ -77,6 +72,8 @@ CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
 CONSOLE_VIEWS = frozenset({"", "projects", "backlog", "executions", "execution"})
+CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
+CONSOLE_ASSET_REFERENCE = re.compile(r'(?:src|href)="/console/assets/([^"]+)"')
 CONSOLE_ASSET_TYPES = {
     ".js": "text/javascript",
     ".css": "text/css",
@@ -87,6 +84,18 @@ CONSOLE_ASSET_TYPES = {
 }
 PROJECTS = PROJECT_SET
 LOGGER = logging.getLogger(__name__)
+
+
+def sign_in_assets() -> frozenset[str]:
+    """The console files given out without a session: the ones the sign-in page names.
+
+    The sign-in page is built as its own entry (web/console/login.html), so this is its
+    script, the stylesheet and the libraries. The console's own code is not among them.
+    """
+    page = CONSOLE_ROOT / "login.html"
+    if not page.is_file():
+        return frozenset()
+    return frozenset(CONSOLE_ASSET_REFERENCE.findall(page.read_text(encoding="utf-8")))
 
 
 def create_app(
@@ -140,11 +149,10 @@ def create_app(
         LOGGER.info("%s; suppressed_failures=%d", message, suppressed)
 
     login_limiter = limiter or LoginFailureLimiter()
+    public_assets = sign_in_assets()
     trusted_proxies = tuple(
         ipaddress.ip_network(value) for value in resolved.dashboard_trusted_proxy_networks
     )
-    templates = Jinja2Templates(directory=TEMPLATE_ROOT)
-    templates.env.undefined = StrictUndefined
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -350,32 +358,27 @@ def create_app(
     async def robots() -> PlainTextResponse:
         return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
-    @app.get("/login", response_class=HTMLResponse)
+    @app.get("/login")
     async def login_page(request: Request) -> Response:
-        if request.query_params.get("asset") == "css":
-            return FileResponse(STATIC_ROOT / "dashboard.css", media_type="text/css")
-        if request.query_params.get("asset") == "icon":
-            return Response(status_code=204)
+        """The sign-in page of the gntik-ui console. It holds no token; see the challenge."""
         if await current_session(request) is not None:
             return RedirectResponse("/console", status_code=303)
+        page = CONSOLE_ROOT / "login.html"
+        if not page.is_file():
+            raise HTTPException(status_code=404, detail="page not found")
+        return FileResponse(page, media_type="text/html")
+
+    @app.get("/login/challenge")
+    async def login_challenge(request: Request) -> Response:
+        """The token a sign-in has to send back, also set as a cookie the page cannot read."""
         csrf = request.cookies.get(LOGIN_CSRF_COOKIE, "")
         if not csrf or not sessions.verify_login_csrf(csrf):
             csrf = sessions.create_login_csrf()
-        next_path = _safe_next(request.query_params.get("next"))
-        response = templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={
-                "title": "Sign in",
-                "csrf_token": csrf,
-                "error": None,
-                "next_path": next_path,
-            },
-        )
+        response = JSONResponse({"csrf_token": csrf})
         _set_cookie(response, LOGIN_CSRF_COOKIE, csrf, max_age=900)
         return response
 
-    @app.post("/login", response_class=HTMLResponse)
+    @app.post("/login")
     async def login(request: Request) -> Response:
         form = await _form(request)
         csrf = form.get("csrf_token", "")
@@ -397,15 +400,8 @@ def create_app(
             if csrf_valid and not blocked:
                 login_limiter.failure(address)
             fresh_csrf = sessions.create_login_csrf()
-            response = templates.TemplateResponse(
-                request=request,
-                name="login.html",
-                context={
-                    "title": "Sign in",
-                    "csrf_token": fresh_csrf,
-                    "error": "Unable to sign in.",
-                    "next_path": next_path,
-                },
+            response = JSONResponse(
+                {"detail": "Unable to sign in.", "csrf_token": fresh_csrf},
                 status_code=429 if blocked else 401,
             )
             _set_cookie(response, LOGIN_CSRF_COOKIE, fresh_csrf, max_age=900)
@@ -422,8 +418,8 @@ def create_app(
             await repo(request).confirm_login(version, previous)
         except Exception as error:  # noqa: BLE001 - never issue a cookie on uncertain rotation
             log_failure("session-validation", "dashboard login rotation failed", error)
-            return PlainTextResponse(
-                "Sign-in is temporarily unavailable; try again.", status_code=503
+            return JSONResponse(
+                {"detail": "Sign-in is temporarily unavailable; try again."}, status_code=503
             )
         login_limiter.success(address)
         redirect = RedirectResponse(next_path, status_code=303)
@@ -967,9 +963,11 @@ def create_app(
 
     @app.get("/console/assets/{name}")
     async def console_asset(name: str, request: Request) -> Response:
-        authenticated = await require_session(request)
-        if isinstance(authenticated, Response):
-            return authenticated
+        # The sign-in page's files and the fonts are public; the rest needs a session.
+        if name not in public_assets and Path(name).suffix not in CONSOLE_FONT_SUFFIXES:
+            authenticated = await require_session(request)
+            if isinstance(authenticated, Response):
+                return authenticated
         media_type = CONSOLE_ASSET_TYPES.get(Path(name).suffix)
         path = CONSOLE_ROOT / "assets" / name
         if media_type is None or not CONSOLE_ASSET_NAME.fullmatch(name) or not path.is_file():
@@ -992,6 +990,16 @@ def create_app(
     async def not_found(request: Request, _error: Exception) -> Response:
         if await current_session(request) is None:
             return RedirectResponse("/login", status_code=303)
+        index = CONSOLE_ROOT / "index.html"
+        path = request.url.path
+        if (
+            request.method == "GET"
+            and "text/html" in request.headers.get("accept", "")
+            and not path.startswith(("/api/", "/console/assets/"))
+            and index.is_file()
+        ):
+            # A browser asking for a page gets the console, which shows its not-found page.
+            return FileResponse(index, media_type="text/html", status_code=404)
         return JSONResponse({"detail": "not found"}, status_code=404)
 
     return app

@@ -69,8 +69,8 @@ def login(client, *, presented=None):
     # the existing session cookie can then accompany the credential submission.
     old = client.cookies.get(SESSION_COOKIE)
     client.cookies.clear()
-    page = client.get("/login")
-    match = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
+    page = client.get("/login/challenge")
+    match = re.search(r'"csrf_token":\s*"([^"]+)"', page.text)
     assert match
     if presented or old:
         client.cookies.set(SESSION_COOKIE, presented or old, domain="ade.musematic.ai", path="/")

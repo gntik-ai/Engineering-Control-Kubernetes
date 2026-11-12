@@ -1779,20 +1779,20 @@ Status: **done**, **in progress**, or blank for not started.
 | A1 | Repository seeded from the original; continuous integration with lint, types, unit and replay tests | done |
 | A2 | Control-plane image | done |
 | A3 | Every control-plane process starts from configuration alone (environment and mounted secrets), proven by a boot test in CI | done for the control plane; the CLI and the role workers follow in phases 1 and 3 |
-| A4 | Helm chart; Argo CD project and application; namespaces and network policies | |
-| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | |
+| A4 | Manifests (Kustomize); Argo CD project and application; namespace and network policies | done for the control plane; the sandbox namespace follows in phase 3 |
+| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | in progress: both run; TLS to Temporal is not set up |
 | A6 | Object storage for evidence, transcripts and change bundles | |
 | A7 | Secrets delivered by the cluster's secret operator | |
 | A8 | Probes, metrics, alert rules, runbooks | |
 
 **B. Access**
 
-| Id | Feature |
-| --- | --- |
-| B1 | One administrator signing in with a password; the API takes the actor from the credential |
-| B2 | A separate credential for each channel and service |
-| B3 | GitHub App: installation per repository, short-lived tokens, all writes through the broker |
-| B4 | "Engineering Control" in everything a person reads |
+| Id | Feature | Status |
+| --- | --- | --- |
+| B1 | One administrator signing in with a password; the API takes the actor from the credential | in progress: sign-in works at `https://ade.musematic.ai`; the API still takes the actor from the request |
+| B2 | A separate credential for each channel and service | |
+| B3 | GitHub App: installation per repository, short-lived tokens, all writes through the broker | |
+| B4 | "Engineering Control" in everything a person reads | in progress: every page of the console; not yet the messages and documents |
 
 **C. Projects and sections**
 
@@ -1858,9 +1858,12 @@ Status: **done**, **in progress**, or blank for not started.
 
 **H. Console and chat**
 
+Every page is built on gntik-ui, the sign-in and not-found pages included; the service
+renders no HTML of its own.
+
 | Id | Feature |
 | --- | --- |
-| H1 | Pages for projects, sections, flows, backlog, queue and runs |
+| H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, backlog and runs exist, read-only) |
 | H2 | Supervisor panel on every page |
 | H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions |
 | H4 | Commands from the console, with the password asked again for approvals |

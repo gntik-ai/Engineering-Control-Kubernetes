@@ -25,7 +25,7 @@ PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fix
 
 
 def _csrf(text: str) -> str:
-    match = re.search(r'name="csrf_token" value="([^"]+)"', text)
+    match = re.search(r'"csrf_token":\s*"([^"]+)"', text)
     assert match
     return match.group(1)
 
@@ -44,7 +44,7 @@ def _authenticated_client(tmp_path: Path) -> tuple[TestClient, DashboardReposito
         headers={"Origin": "https://ade.musematic.ai"},
     )
     client.__enter__()
-    login = client.get("/login")
+    login = client.get("/login/challenge")
     response = client.post(
         "/login",
         data={"csrf_token": _csrf(login.text), "password": PASSWORD},
@@ -77,6 +77,7 @@ def test_only_the_console_and_sign_in_pages_remain(tmp_path: Path) -> None:
             "/settings",
             "/static/dashboard.js",
             "/static/dashboard.css",
+            "/login/unknown",
         ):
             response = client.get(path)
             assert response.status_code == 404
@@ -89,14 +90,14 @@ def test_only_the_console_and_sign_in_pages_remain(tmp_path: Path) -> None:
             if "GET" in getattr(route, "methods", set())
             and not route.path.startswith(("/api/", "/health/", "/internal/", "/console"))
         }
-        assert html_routes >= {"/", "/login", "/robots.txt"}
-        assert html_routes <= {"/", "/login", "/robots.txt", "/docs", "/redoc", "/openapi.json"}
+        public = {"/", "/login", "/login/challenge", "/robots.txt"}
+        assert html_routes >= public
+        assert html_routes <= public | {"/docs", "/redoc", "/openapi.json"}
         login_page = client.get("/login", follow_redirects=False)
         assert login_page.status_code == 303
         assert login_page.headers["location"] == "/console"
-        stylesheet = client.get("/login?asset=css")
-        assert stylesheet.status_code == 200
-        assert stylesheet.headers["content-type"].startswith("text/css")
+        # The old page's stylesheet and icon are gone with the page.
+        assert client.get("/login?asset=css", follow_redirects=False).status_code == 303
         assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"
         client.cookies.clear()
         assert client.get("/overview", follow_redirects=False).headers["location"] == "/login"
@@ -127,8 +128,7 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         assert client.get("/api/dashboard/root-blockers").status_code == 401
         assert client.get("/api/dashboard/findings").status_code == 401
         assert client.get("/api/dashboard/enhancements").status_code == 401
-        page = client.get("/login")
-        assert 'autocomplete="current-password"' in page.text
+        page = client.get("/login/challenge")
         client.post("/login", data={"csrf_token": _csrf(page.text), "password": PASSWORD})
         backlog = client.get("/api/dashboard/backlog").json()
         audits = client.get("/api/dashboard/audits").json()
@@ -263,7 +263,7 @@ def test_dashboard_operation_export_requires_session_and_returns_bounded_attachm
         headers={"Origin": "https://ade.musematic.ai"},
     ) as client:
         assert client.get(path).status_code == 401
-        login = client.get("/login")
+        login = client.get("/login/challenge")
         client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
         operation = client.get(f"/api/dashboard/operations/{operation_id}")
         assert operation.json()["result_available"] is True
@@ -307,5 +307,5 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         base_url="https://ade.musematic.ai",
         headers={"Origin": "https://ade.musematic.ai"},
     ) as client:
-        login = client.get("/login")
+        login = client.get("/login/challenge")
         client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})

@@ -950,8 +950,8 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
     ) as client:
         endpoint = "/api/dashboard/actions/candidates"
         assert client.post(endpoint, json={}).status_code == 401
-        login = client.get("/login")
-        match = re.search(r'name="csrf_token" value="([^"]+)"', login.text)
+        login = client.get("/login/challenge")
+        match = re.search(r'"csrf_token":\s*"([^"]+)"', login.text)
         assert match is not None
         signed_login_csrf = match.group(1)
         logged_in = client.post(
