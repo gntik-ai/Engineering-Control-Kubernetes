@@ -24,9 +24,10 @@ Not deployed yet: the scheduler (it would start recurring workflows whose activi
 role workers that do not exist yet), TLS between the platform and Temporal, and the
 sandboxes.
 
-Only the console is reachable from outside. A network policy lets the ingress controller
-(pods labelled `app.kubernetes.io/name: ingress-nginx`, in any namespace) reach the console's
-port and nothing else; every other pod accepts connections from its own namespace only.
+Only the console is reachable from outside. A network policy opens the console's HTTP port
+to the cluster so that the ingress controller can reach it; every other port and every other
+pod accepts connections from its own namespace only. The rule should be narrowed to the
+ingress controller once its namespace and labels are known (`docs/design/cluster-facts.sh`).
 
 ## Rules the manifests keep
 

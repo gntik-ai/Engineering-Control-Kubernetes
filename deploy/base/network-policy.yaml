@@ -16,12 +16,16 @@ spec:
     - from:
         - podSelector: {}
 ---
-# The console is the one process with a route from outside. Besides its own namespace, it
-# accepts connections from the ingress controller, and only on its HTTP port.
+# The console is the one process with a route from outside. Its HTTP port accepts
+# connections from anywhere in the cluster, because the ingress controller's namespace and
+# labels are not known yet (it is not visible through Argo CD, and a rule on the usual
+# `ingress-nginx` label left the console unreachable). Narrow this to the controller once
+# `docs/design/cluster-facts.sh` has been run. What it opens is the sign-in page that is
+# public anyway; no other port and no other pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: console-from-ingress-controller
+  name: console-http
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
 spec:
@@ -31,12 +35,7 @@ spec:
       app.kubernetes.io/component: console
   policyTypes: ["Ingress"]
   ingress:
-    - from:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ingress-nginx
-      ports:
+    - ports:
         - protocol: TCP
           port: 8750
 ---

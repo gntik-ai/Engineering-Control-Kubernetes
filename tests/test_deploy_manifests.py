@@ -154,17 +154,16 @@ def test_only_the_console_has_a_route_from_outside_and_only_over_https() -> None
         assert last > 4
 
 
-def test_pods_accept_connections_only_from_the_namespace_and_the_ingress_controller() -> None:
+def test_only_the_console_port_accepts_connections_from_outside_the_namespace() -> None:
     policies = [d for d in _documents() if d["kind"] == "NetworkPolicy"]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]
-    outside = [p for p in policies if p["spec"]["ingress"] != same_namespace]
-    [policy] = outside
-    assert policy["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "console"
-    [rule] = policy["spec"]["ingress"]
-    assert rule["ports"] == [{"protocol": "TCP", "port": 8750}]
-    [peer] = rule["from"]
-    assert peer["podSelector"]["matchLabels"] == {"app.kubernetes.io/name": "ingress-nginx"}
+    [policy] = [p for p in policies if p["spec"]["ingress"] != same_namespace]
+    assert policy["spec"]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "engineering-control",
+        "app.kubernetes.io/component": "console",
+    }
+    assert policy["spec"]["ingress"] == [{"ports": [{"protocol": "TCP", "port": 8750}]}]
 
 
 def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it() -> None:
