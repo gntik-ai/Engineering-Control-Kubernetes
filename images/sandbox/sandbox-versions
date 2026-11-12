@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Print the version of every pinned tool in this image, one "name version" per line.
+# It is the image's default command, the build's smoke test compares it with the lock
+# files, and a run records it as evidence of what it ran with.
+set -euo pipefail
+
+version() { # <name> <command...>: the first dotted number the command prints
+  local name="$1" output
+  shift
+  output="$("$@" 2>/dev/null)" || { echo "${name}: '$*' failed" >&2; exit 1; }
+  if [[ "${output}" =~ ([0-9]+(\.[0-9]+)+) ]]; then
+    echo "${name} ${BASH_REMATCH[1]}"
+  else
+    echo "${name}: no version in the output of '$*': ${output}" >&2
+    exit 1
+  fi
+}
+
+version claude claude --version
+version codex codex --version
+version pnpm pnpm --version
+version gitleaks gitleaks version
+version trivy trivy --version
+version syft syft version
+version kubeconform kubeconform -v
+version semgrep semgrep --version
+version uv uv --version
+version node node --version
+version git git --version
+version python python3 --version

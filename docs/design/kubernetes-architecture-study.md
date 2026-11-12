@@ -1821,7 +1821,7 @@ Status: **done**, **in progress**, or blank for not started.
 | Id | Feature |
 | --- | --- |
 | E1 | One sandbox per run: private workspace, author and reviewer as separate containers |
-| E2 | Sandbox image with the agent clients, scanners and toolchains |
+| E2 | Sandbox image with the agent clients, scanners and toolchains (done: `images/sandbox`, built, smoke-tested and pushed by CI, everything pinned by digest or hash; Node.js, pnpm, Python and uv are in it, the Rust and Go toolchains and the browsers follow when a flow needs them) |
 | E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) |
 | E4 | Isolation: network policy, no cluster identity, quotas, a dedicated node |
 | E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox. Accounts are added and removed in the console, as many as the administrator wants. Each account has a provider type, so that providers beyond Claude and ChatGPT (the administrator named DeepSeek, GLM, Kimi and Qwen) can be added later; how each of those is signed in to has to be checked when it is added |

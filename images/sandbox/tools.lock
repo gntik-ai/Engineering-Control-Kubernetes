@@ -1,0 +1,11 @@
+# Tools installed into the sandbox image as single binaries.
+#
+# One line each: name, version, SHA-256 of the archive, URL of the archive. The archive
+# must hold exactly one file with the tool's name. install-tools.sh refuses an archive
+# whose checksum differs, so changing a version means changing its checksum here too.
+# Scanner versions are the ones the scan adapters were verified against.
+gitleaks    8.30.0  79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e  https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz
+trivy       0.74.0  2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a  https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
+syft        1.51.0  2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f  https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
+kubeconform 0.8.0   9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+uv          0.13.8  5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91  https://github.com/astral-sh/uv/releases/download/0.13.8/uv-x86_64-unknown-linux-gnu.tar.gz

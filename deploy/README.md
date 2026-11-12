@@ -40,20 +40,6 @@ connections from its own namespace only. The node addresses are listed in
 `base/network-policy.yaml` and, for the sign-in counter, in `base/configuration.yaml`; both
 change if a node is added or renumbered.
 
-## TLS to Temporal
-
-`base/certificates.yaml` asks the cluster's cert-manager for a certificate authority of the
-platform's own and for the certificate the Temporal server presents. The API, the workflow
-worker and the namespace Job mount the authority's certificate only, and refuse a server
-that cannot show a certificate signed by it. The server's key is mounted in the Temporal
-pod alone. cert-manager renews both; the server rereads its certificate every hour.
-Clients do not present a certificate: the network policy decides who may connect.
-
-Only the console is reachable from outside. A network policy opens the console's HTTP port
-to the cluster so that the ingress controller can reach it; every other port and every other
-pod accepts connections from its own namespace only. The rule should be narrowed to the
-ingress controller once its namespace and labels are known (`docs/design/cluster-facts.sh`).
-
 ## The sandbox node
 
 Runs execute code the platform does not control, so sandboxes get a node to themselves:
@@ -115,6 +101,31 @@ After the first synchronisation the initial dashboard password is in the Secret
 ```bash
 kubectl -n engineering-control get secret engineering-control-admin -o jsonpath='{.data.initial-password}' | base64 -d
 ```
+
+## The sandbox image
+
+A run works in `images/sandbox`: the two agent clients (Claude Code and Codex), git, a
+compiler, Node.js 22 with pnpm, Python with uv, and the scanners (gitleaks, trivy, semgrep,
+syft, kubeconform). CI builds it, runs `images/sandbox/smoke-test.sh` against it and pushes
+it to `ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox`, tagged with its commit.
+Nothing deploys it yet: runs arrive with the sandbox launcher.
+
+- **Pinned.** The base image by digest; the Node packages by the integrity hashes of
+  `node-tools/package-lock.json`; the Python packages by the hashes of `semgrep.lock`; the
+  single binaries by the checksums of `tools.lock`. To change a version, change it there:
+  `npm install --package-lock-only --ignore-scripts` in `node-tools/`,
+  `uv pip compile --generate-hashes --python-version 3.11 --python-platform
+  x86_64-unknown-linux-gnu` for semgrep, or a new version, checksum and URL in
+  `tools.lock`. The smoke test fails when the image and the lock files disagree.
+- **Empty of credentials.** No account is built in; a run's subscription sign-in is mounted
+  for that run. There is no kubectl, helm, argocd, gh or ssh, and no file with a set-user
+  bit. Publishing is the platform's, through the GitHub App.
+- **Run as it is tested.** User 10002, read-only root filesystem, no capabilities; the
+  workspace, the home directory and `/tmp` are volumes of the run.
+- **Not in it yet.** The Rust and Go toolchains that `falcone-serverless` needs, and the
+  browsers of the journey runner; they are added when a flow needs them.
+
+`docker run <image>` prints the version of every tool, which a run records as evidence.
 
 ## Repository access for Argo CD
 
