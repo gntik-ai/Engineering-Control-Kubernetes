@@ -140,16 +140,29 @@ def test_github_app_is_named_completely_or_not_at_all() -> None:
             Settings(**{**whole, field: value})
 
 
-def test_the_deployed_configuration_names_the_github_app(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_deployed_configuration_names_the_github_app_and_the_chat_administrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import yaml
 
     manifest = Path(__file__).parents[1] / "deploy" / "base" / "configuration.yaml"
     data = yaml.safe_load(manifest.read_text())["data"]
     for name, value in data.items():
-        if name.startswith(("ENGINEERING_GITHUB_APP_", "ENGINEERING_NETWORK_BOUNDARY")):
+        if name.startswith(
+            ("ENGINEERING_GITHUB_APP_", "ENGINEERING_TELEGRAM_", "ENGINEERING_NETWORK_BOUNDARY")
+        ):
             monkeypatch.setenv(name, value)
     settings = Settings()
+    assert settings.telegram_administrator_id and settings.telegram_administrator_id > 0
     assert settings.github_app_id and settings.github_app_installation_id
     assert settings.github_app_client_id
     # Identifiers only: nothing that looks like a key or a secret is in the manifest.
     assert not any("PRIVATE" in value or "secret" in name.lower() for name, value in data.items())
+
+
+def test_the_chat_administrator_is_one_positive_account_id() -> None:
+    assert Settings().telegram_administrator_id is None
+    assert Settings(telegram_administrator_id=685699815).telegram_administrator_id == 685699815
+    for value in (0, -5, "someone"):
+        with pytest.raises(ValueError):
+            Settings(telegram_administrator_id=value)
