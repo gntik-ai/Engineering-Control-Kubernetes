@@ -306,6 +306,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/sections/{key}/flow",
         "/api/dashboard/projects/{name}/backlog/sync",
         "/api/dashboard/projects/{name}/items",
+        "/api/dashboard/projects/{name}/items/bulk",
         "/api/dashboard/items/{item_id}/route",
         "/api/dashboard/items/{item_id}/state",
     }

@@ -61,6 +61,8 @@ class ProjectRenameInput(DashboardModel):
 
 class ProjectArchiveInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
+    # Removing a project needs the password again.
+    current_password: str = Field(min_length=1, max_length=128)
 
 
 class SectionGuideInput(DashboardModel):
@@ -107,6 +109,23 @@ class ItemRouteInput(DashboardModel):
 class ItemStateInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     state: str = Field(pattern=r"^(proposed|accepted|skipped|done)$")
+
+
+class ItemBulkInput(DashboardModel):
+    """One change to every item the filters match. It needs the password again."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    # The filters, as on the page: a section key or "none", a state, a search.
+    section: str | None = Field(default=None, max_length=40)
+    state: str | None = Field(default=None, pattern=r"^(proposed|accepted|skipped|done)$")
+    search: str | None = Field(default=None, max_length=200)
+    # How many items the administrator was shown.
+    expected: int = Field(ge=1, le=5000)
+    # Exactly one of the three.
+    route_to: str | None = Field(default=None, max_length=40)
+    clear_route: bool = False
+    state_to: str | None = Field(default=None, pattern=r"^(proposed|accepted|skipped|done)$")
 
 
 class BacklogSyncInput(DashboardModel):

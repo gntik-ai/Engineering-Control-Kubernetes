@@ -35,6 +35,7 @@ STATES: Final = ("proposed", "accepted", "skipped", "done")
 OPEN_STATES: Final = ("proposed", "accepted")
 TITLE_MAX = 300
 MAX_PAGE_SIZE = 200
+MAX_BULK = 5000
 
 
 def clean_title(value: str) -> str:
@@ -109,6 +110,31 @@ class BacklogItems:
         key, or ``none`` for the items not routed yet."""
         page = max(1, page)
         page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+        query = self._filtered(project=project, section=section, state=state, search=search)
+        with self.sessions() as session:
+            total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
+            rows = session.execute(
+                query.order_by(
+                    func.coalesce(BacklogItem.issue_updated_at, BacklogItem.updated_at).desc(),
+                    BacklogItem.created_at.desc(),
+                    BacklogItem.id,
+                )
+                .limit(page_size)
+                .offset((page - 1) * page_size)
+            ).all()
+            return {
+                "items": [serialize(item, record, found) for item, record, found in rows],
+                "total": int(total),
+                "page": page,
+                "page_size": page_size,
+                "pages": max(1, -(-int(total) // page_size)),
+            }
+
+    @staticmethod
+    def _filtered(
+        *, project: str | None, section: str | None, state: str | None, search: str | None
+    ) -> Any:
+        """Items with their project and section, narrowed the way the page's filters are."""
         query = (
             select(BacklogItem, ProjectRecord, ProjectSection)
             .join(ProjectRecord, BacklogItem.project_id == ProjectRecord.id)
@@ -130,24 +156,147 @@ class BacklogItems:
             if number.isdigit():
                 conditions.append(BacklogItem.issue_number == int(number))
             query = query.where(or_(*conditions))
+        return query
+
+    def bulk(
+        self,
+        project: str,
+        *,
+        section: str | None,
+        state: str | None,
+        search: str | None,
+        expected: int,
+        route_to: str | None = None,
+        clear_route: bool = False,
+        state_to: str | None = None,
+    ) -> dict[str, Any]:
+        """One change to every item of ``project`` the filters match.
+
+        ``expected`` is the number of items the administrator was shown. If the filters
+        match another number by now, nothing is changed: they decide again on what is there.
+        """
+        if (route_to is not None) + clear_route + (state_to is not None) != 1:
+            raise ProjectInvalid("Choose exactly one change: a section, no section, or a state")
+        if state_to is not None and state_to not in STATES:
+            raise ProjectInvalid("That is not a state an item can have")
         with self.sessions() as session:
-            total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
+            record = self._project(session, project)
+            target = self._section(session, record, route_to) if route_to else None
             rows = session.execute(
-                query.order_by(
-                    func.coalesce(BacklogItem.issue_updated_at, BacklogItem.updated_at).desc(),
-                    BacklogItem.created_at.desc(),
-                    BacklogItem.id,
+                self._filtered(project=project, section=section, state=state, search=search).limit(
+                    MAX_BULK + 1
                 )
-                .limit(page_size)
-                .offset((page - 1) * page_size)
             ).all()
-            return {
-                "items": [serialize(item, record, found) for item, record, found in rows],
-                "total": int(total),
-                "page": page,
-                "page_size": page_size,
-                "pages": max(1, -(-int(total) // page_size)),
-            }
+            if len(rows) > MAX_BULK:
+                raise ProjectConflict(
+                    f"More than {MAX_BULK} items match; narrow the filter and do it in parts"
+                )
+            if len(rows) != expected:
+                raise ProjectConflict(
+                    f"The filter now matches {len(rows)} items, not {expected}; look at the "
+                    "list again before changing them"
+                )
+            changed = unchanged = 0
+            for item, _record, _section in rows:
+                if state_to is not None:
+                    if state_to in OPEN_STATES and item.issue_state == "closed":
+                        unchanged += 1  # its issue is closed on GitHub
+                        continue
+                    if item.state == state_to:
+                        unchanged += 1
+                        continue
+                    item.state = state_to
+                else:
+                    wanted = target.id if target else None
+                    if item.section_id == wanted and item.routed_by == "administrator":
+                        unchanged += 1
+                        continue
+                    item.section_id = wanted
+                    item.routed_by = "administrator"
+                    item.routing_reason = None
+                changed += 1
+            session.commit()
+            return {"project": record.name, "changed": changed, "unchanged": unchanged}
+
+    def inbox(self) -> list[dict[str, Any]]:
+        """What waits for the administrator, most pressing kind first.
+
+        Each entry says what it is about, how many items it covers and where to act on it.
+        Kinds: a backlog that could not be read, a section with work and no flow, items
+        without a section, items not decided on.
+        """
+        entries: list[dict[str, Any]] = []
+        with self.sessions() as session:
+            active = ProjectRecord.archived_at.is_(None)
+            for name, display, error in session.execute(
+                select(ProjectRecord.name, ProjectRecord.display_name, BacklogSync.error)
+                .join(BacklogSync, BacklogSync.project_id == ProjectRecord.id)
+                .where(active, BacklogSync.error.is_not(None))
+                .order_by(ProjectRecord.name)
+            ):
+                entries.append(
+                    {
+                        "kind": "sync_failed",
+                        "project": name,
+                        "project_name": display,
+                        "section": None,
+                        "count": 1,
+                        "detail": error,
+                    }
+                )
+            for name, display, key, section_name, count in session.execute(
+                select(
+                    ProjectRecord.name,
+                    ProjectRecord.display_name,
+                    ProjectSection.key,
+                    ProjectSection.name,
+                    func.count(),
+                )
+                .join(BacklogItem, BacklogItem.section_id == ProjectSection.id)
+                .join(ProjectRecord, ProjectSection.project_id == ProjectRecord.id)
+                .where(
+                    active, ProjectSection.flow_key.is_(None), BacklogItem.state.in_(OPEN_STATES)
+                )
+                .group_by(
+                    ProjectRecord.name,
+                    ProjectRecord.display_name,
+                    ProjectSection.key,
+                    ProjectSection.name,
+                )
+                .order_by(func.count().desc(), ProjectRecord.name, ProjectSection.key)
+            ):
+                entries.append(
+                    {
+                        "kind": "section_without_flow",
+                        "project": name,
+                        "project_name": display,
+                        "section": {"key": key, "name": section_name},
+                        "count": int(count),
+                        "detail": None,
+                    }
+                )
+            for kind, condition in (
+                ("unrouted", BacklogItem.section_id.is_(None) & BacklogItem.state.in_(OPEN_STATES)),
+                ("undecided", BacklogItem.state == "proposed"),
+            ):
+                for name, display, count in session.execute(
+                    select(ProjectRecord.name, ProjectRecord.display_name, func.count())
+                    .join(BacklogItem, BacklogItem.project_id == ProjectRecord.id)
+                    .where(active, condition)
+                    .group_by(ProjectRecord.name, ProjectRecord.display_name)
+                    .order_by(func.count().desc(), ProjectRecord.name)
+                ):
+                    entries.append(
+                        {
+                            "kind": kind,
+                            "project": name,
+                            "project_name": display,
+                            "section": None,
+                            "count": int(count),
+                            "detail": None,
+                        }
+                    )
+        return entries
 
     def open_counts(self) -> dict[str, int]:
         """Project name -> items that are still to do."""

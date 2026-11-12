@@ -21,10 +21,11 @@ The console's views:
 
 | View | Path | Data |
 | --- | --- | --- |
+| Inbox: what waits for the administrator | `/console/inbox` | `GET /api/dashboard/inbox` |
 | Projects: list, create, rename, remove | `/console/projects` | `GET /api/dashboard/projects`; `POST /api/dashboard/projects`, `…/{name}/rename`, `…/{name}/archive` |
 | Project: its sections and the flow of each | `/console/project?name=…` | `GET /api/dashboard/projects/{name}`, `GET /api/dashboard/flows`, `GET …/projects/{name}/routing` (what the supervisor reads); `POST …/projects/{name}/sections`, `…/sections/{key}/update`, `…/remove`, `…/flow` |
 | Repository picker of "New project" | (dialog) | `GET /api/dashboard/github/repositories`: the repositories the GitHub App is installed on, and the project each belongs to |
-| Backlog: the work wanted, routed to sections | `/console/backlog?project=…` | `GET /api/dashboard/items`, `GET …/projects/{name}/backlog`; `POST …/projects/{name}/backlog/sync`, `…/projects/{name}/items`, `…/items/{id}/route`, `…/items/{id}/state` |
+| Backlog: the work wanted, routed to sections | `/console/backlog?project=…` | `GET /api/dashboard/items`, `GET …/projects/{name}/backlog`; `POST …/projects/{name}/backlog/sync`, `…/projects/{name}/items`, `…/items/{id}/route`, `…/items/{id}/state`, `…/projects/{name}/items/bulk` (every item the filters match; needs the password again) |
 | Executions (agents and workflows, refreshed every 5 s) | `/console/executions` | `GET /api/dashboard/executions`, `/workflows` |
 | Execution transcript | `/console/execution?id=…` | `GET /api/dashboard/executions/{id}` and `/logs` |
 

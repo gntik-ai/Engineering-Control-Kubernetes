@@ -1,8 +1,9 @@
 import { Alert, Button, Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
-import { FolderKanban, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
+import { FolderKanban, Inbox as InboxIcon, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
 import { useEffect, useState, type ReactNode } from 'react';
-import { signOut } from './api';
+import { apiUrl, signOut, useResource, type Inbox } from './api';
 import { ExecutionPage } from './pages/Execution';
+import { InboxPage } from './pages/Inbox';
 import { NotFoundPage } from './pages/NotFound';
 import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
@@ -10,11 +11,18 @@ import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
 import { BASE, navigate, useLocation } from './router';
 
-const NAV: NavGroup[] = [
+/** The navigation; the inbox shows how many things are waiting. */
+const navigation = (waiting: number): NavGroup[] => [
   {
     id: 'console',
     label: 'Engineering',
     items: [
+      {
+        label: 'Inbox',
+        href: `${BASE}/inbox`,
+        icon: InboxIcon,
+        badge: waiting > 0 ? waiting.toLocaleString('en') : undefined,
+      },
       { label: 'Projects', href: `${BASE}/projects`, icon: FolderKanban },
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
       { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
@@ -23,6 +31,7 @@ const NAV: NavGroup[] = [
 ];
 
 const VIEWS: Record<string, () => ReactNode> = {
+  [`${BASE}/inbox`]: () => <InboxPage />,
   [`${BASE}/projects`]: () => <ProjectsPage />,
   [`${BASE}/project`]: () => <ProjectPage />,
   [`${BASE}/backlog`]: () => <BacklogPage />,
@@ -52,6 +61,10 @@ export default function App() {
   const { path } = useLocation();
   const current = path.replace(/\/$/, '');
   const view = VIEWS[current];
+  const inbox = useResource<Inbox>(apiUrl('inbox'), 60_000);
+  // What waits changes with what was just done on a page: count again on every move.
+  const { reload: recount } = inbox;
+  useEffect(() => recount(), [current, recount]);
   const home = current === BASE;
   useEffect(() => {
     if (home) navigate(`${BASE}/projects`, { replace: true });
@@ -66,7 +79,7 @@ export default function App() {
         sidebarHeader={({ collapsed }) => <Logo size={26} wordmark={!collapsed} />}
         sidebar={({ collapsed, closeDrawer }) => (
           <NavList
-            groups={NAV}
+            groups={navigation(inbox.data?.total ?? 0)}
             currentHref={
               current === `${BASE}/execution`
                 ? `${BASE}/executions`

@@ -11,9 +11,10 @@ from fastapi.testclient import TestClient
 from engineering_control.dashboard.backlog_items import route_by_labels
 from engineering_control.db.models import ProjectSection
 from engineering_control.github_app import GitHubAppError
-from tests.test_github_app import GitHub, _app, _console, _repository
+from tests.test_github_app import PASSWORD, GitHub, _app, _console, _repository
 
 FALCONE = "gntik-ai/falcone"
+NOT_IT = "not it"  # a wrong answer to "confirm with your password"
 
 
 def _issue(number: int, title: str, *labels: str, **extra: Any) -> dict[str, Any]:
@@ -292,3 +293,117 @@ def test_label_routing_rules() -> None:
     assert chosen is None and reason and "more than one section" in reason
     # Two labels of the same section are still one section.
     assert route_by_labels(sections, ["bug", "defect"])[0] is sections[0]
+
+
+def test_the_inbox_lists_what_waits_and_where(tmp_path: Path, github: GitHub) -> None:
+    client = _console(tmp_path, _app(tmp_path, github))
+    try:
+        assert client.get("/api/dashboard/inbox").json() == {"items": [], "total": 0}
+        _post(client, "projects/falcone/backlog/sync")
+        _post(client, "projects/musematic/backlog/sync")  # the app cannot see that repository
+        items = _by_number(client, project="falcone")
+        _post(
+            client, f"items/{items[4]['id']}/route", section="ux-audit"
+        )  # a section without a flow
+        _post(client, f"items/{items[1]['id']}/state", state="accepted")
+
+        inbox = client.get("/api/dashboard/inbox").json()
+        entries = inbox["items"]
+        assert inbox["total"] == len(entries) == 5
+        kinds = [
+            (e["kind"], e["project"], (e["section"] or {}).get("key"), e["count"]) for e in entries
+        ]
+        assert kinds == [
+            # What stops work comes first, then what waits for a decision.
+            ("sync_failed", "musematic", None, 1),
+            ("section_without_flow", "falcone", "code-clean", 1),
+            ("section_without_flow", "falcone", "ux-audit", 1),
+            ("unrouted", "falcone", None, 1),
+            ("undecided", "falcone", None, 4),
+        ]
+        assert entries[0]["detail"] == "The GitHub App cannot see the repository gntik-ai/musematic"
+        assert (
+            entries[1]["section"]["name"] == "Code clean"
+            and entries[1]["project_name"] == "falcone"
+        )
+        # Giving the section a flow, and deciding, empties those entries.
+        _post(client, "projects/falcone/sections/ux-audit/flow", flow="change-request")
+        left = [e["kind"] for e in client.get("/api/dashboard/inbox").json()["items"]]
+        assert left.count("section_without_flow") == 1
+        client.cookies.clear()
+        assert client.get("/api/dashboard/inbox").status_code == 401
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_one_change_to_every_item_a_filter_matches(tmp_path: Path, github: GitHub) -> None:
+    client = _console(tmp_path, _app(tmp_path, github))
+    try:
+        _post(client, "projects/falcone/backlog/sync")
+
+        def bulk(**body: Any) -> Any:
+            return _post(client, "projects/falcone/items/bulk", current_password=PASSWORD, **body)
+
+        # Route the two unrouted items to one section.
+        routed = bulk(section="none", expected=2, route_to="code-audit")
+        assert routed.status_code == 200
+        assert routed.json() == {"project": "falcone", "changed": 2, "unchanged": 0}
+        items = _by_number(client, project="falcone")
+        assert {items[3]["section"]["key"], items[4]["section"]["key"]} == {"code-audit"}
+        assert items[3]["routed_by"] == items[4]["routed_by"] == "administrator"
+        assert items[1]["section"]["key"] == "issues"  # outside the filter: untouched
+
+        # Accept everything that is proposed; doing it twice changes nothing more.
+        accepted = bulk(state="proposed", expected=5, state_to="accepted")
+        assert accepted.json()["changed"] == 5
+        assert all(i["state"] == "accepted" for i in _items(client, project="falcone"))
+        again = bulk(state="accepted", expected=5, state_to="accepted")
+        assert again.json() == {"project": "falcone", "changed": 0, "unchanged": 5}
+        # Hand a section's items back: no section, by the administrator's decision.
+        cleared = bulk(section="code-audit", expected=2, clear_route=True)
+        assert cleared.json()["changed"] == 2
+        assert _by_number(client, section="none").keys() == {3, 4}
+        # An item whose issue is closed on GitHub is not reopened by a bulk change.
+        github.issues[FALCONE] = [i for i in github.issues[FALCONE] if i["number"] != 2]
+        _post(client, "projects/falcone/backlog/sync")
+        reopened = bulk(search="csv", expected=1, state_to="proposed")
+        assert reopened.json() == {"project": "falcone", "changed": 0, "unchanged": 1}
+
+        # The number shown must still be the number matched.
+        stale = bulk(section="none", expected=7, route_to="issues")
+        assert stale.status_code == 409 and "now matches 2 items, not 7" in stale.json()["detail"]
+        for body in (
+            {"expected": 2, "section": "none"},  # no change named
+            {"expected": 2, "section": "none", "route_to": "issues", "state_to": "done"},  # two
+            {"expected": 2, "section": "none", "route_to": "absent"},
+            {"expected": 0, "state_to": "done"},
+            {"expected": 2, "section": "none", "state_to": "running"},
+        ):
+            assert bulk(**body).status_code == 422, body
+        assert (
+            _post(
+                client,
+                "projects/absent/items/bulk",
+                current_password=PASSWORD,
+                expected=1,
+                state_to="done",
+            ).status_code
+            == 404
+        )
+        # It needs the password again, and the right one.
+        without = _post(
+            client, "projects/falcone/items/bulk", section="none", expected=2, state_to="skipped"
+        )
+        assert without.status_code == 422
+        wrong = _post(
+            client,
+            "projects/falcone/items/bulk",
+            current_password=NOT_IT,
+            section="none",
+            expected=2,
+            state_to="skipped",
+        )
+        assert wrong.status_code == 403
+        assert all(i["state"] == "accepted" for i in _items(client, section="none"))
+    finally:
+        client.__exit__(None, None, None)

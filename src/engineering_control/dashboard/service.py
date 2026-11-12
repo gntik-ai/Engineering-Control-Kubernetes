@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
@@ -233,6 +233,13 @@ class DashboardService:
 
     async def set_item_state(self, item_id: UUID, state: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.backlog.set_state, item_id, state)
+
+    async def inbox(self) -> dict[str, object]:
+        entries = await asyncio.to_thread(self.repository.backlog.inbox)
+        return {"items": entries, "total": len(entries)}
+
+    async def bulk_items(self, project: str, **options: Any) -> dict[str, object]:
+        return await asyncio.to_thread(lambda: self.repository.backlog.bulk(project, **options))
 
     async def backlog_status(self, project: str) -> dict[str, object] | None:
         return await asyncio.to_thread(self.repository.backlog.sync_status, project)

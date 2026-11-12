@@ -19,6 +19,7 @@ import {
   FieldDescription,
   FieldLabel,
   Input,
+  PasswordInput,
   SimpleSelect,
   Skeleton,
 } from '@gntik-ai/ui';
@@ -275,16 +276,19 @@ export function RemoveProjectDialog({
   onOpenChange,
   onSaved,
 }: DialogProps & { project: ProjectSummary }) {
+  const [password, setPassword] = useState('');
   const { pending, problem, submit, reset } = useSubmit(
-    () => postJson<ProjectSummary>(`projects/${project.project}/archive`),
+    () => postJson<ProjectSummary>(`projects/${project.project}/archive`, { current_password: password }),
     () => {
       onSaved();
       onOpenChange(false);
     },
   );
   useEffect(() => {
-    if (open) reset();
-    // Only when it opens: the last error is cleared.
+    if (!open) return;
+    setPassword('');
+    reset();
+    // Only when it opens: the password field and the last error are cleared.
   }, [open]);
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
@@ -298,9 +302,19 @@ export function RemoveProjectDialog({
           </AlertDialogDescription>
         </AlertDialogHeader>
         {problem ? <Alert tone="destructive" title={problem} /> : null}
+        <Field>
+          <FieldLabel>Your password, to confirm</FieldLabel>
+          <PasswordInput
+            name="current_password"
+            autoComplete="current-password"
+            maxLength={128}
+            value={password}
+            onValueChange={setPassword}
+          />
+        </Field>
         <AlertDialogFooter>
           <AlertDialogCancel>Keep it</AlertDialogCancel>
-          <Button variant="destructive" loading={pending} onClick={() => void submit()}>
+          <Button variant="destructive" loading={pending} disabled={!password} onClick={() => void submit()}>
             Remove project
           </Button>
         </AlertDialogFooter>

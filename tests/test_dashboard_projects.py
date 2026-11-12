@@ -16,7 +16,7 @@ from engineering_control.dashboard.project_records import (
     clean_repository,
 )
 from engineering_control.projects import PROJECTS
-from tests.test_dashboard_web import _authenticated_client
+from tests.test_dashboard_web import PASSWORD, _authenticated_client
 
 
 def _csrf(client: TestClient) -> str:
@@ -91,7 +91,8 @@ def test_create_rename_and_remove_a_project(tmp_path: Path) -> None:
         assert falcone.json()["display_name"] == "Falcone platform"
 
         removed = client.post(
-            "/api/dashboard/projects/docs/archive", json={"csrf_token": _csrf(client)}
+            "/api/dashboard/projects/docs/archive",
+            json={"csrf_token": _csrf(client), "current_password": PASSWORD},
         )
         assert removed.status_code == 200
         assert _names(client) == list(PROJECTS)
@@ -106,7 +107,8 @@ def test_create_rename_and_remove_a_project(tmp_path: Path) -> None:
         )
         assert gone.status_code == 404
         gone = client.post(
-            "/api/dashboard/projects/docs/archive", json={"csrf_token": _csrf(client)}
+            "/api/dashboard/projects/docs/archive",
+            json={"csrf_token": _csrf(client), "current_password": PASSWORD},
         )
         assert gone.status_code == 404
         events = client.get("/api/dashboard/activity/recent").json()["items"]
@@ -148,11 +150,13 @@ def test_what_cannot_be_a_project_is_refused(tmp_path: Path) -> None:
         assert "already connected to the project falcone" in connected.json()["detail"]
         # The registry's projects are used by the workflows and cannot be removed.
         kept = client.post(
-            "/api/dashboard/projects/falcone/archive", json={"csrf_token": _csrf(client)}
+            "/api/dashboard/projects/falcone/archive",
+            json={"csrf_token": _csrf(client), "current_password": PASSWORD},
         )
         assert kept.status_code == 409 and "cannot be removed" in kept.json()["detail"]
         missing = client.post(
-            "/api/dashboard/projects/absent/archive", json={"csrf_token": _csrf(client)}
+            "/api/dashboard/projects/absent/archive",
+            json={"csrf_token": _csrf(client), "current_password": PASSWORD},
         )
         assert missing.status_code == 404
         assert _names(client) == list(PROJECTS)
@@ -194,3 +198,25 @@ def test_cleaning_rules() -> None:
         with pytest.raises(ProjectInvalid):
             clean_name(bad)
     assert issubclass(ProjectConflict, ValueError) and issubclass(ProjectInvalid, ValueError)
+
+
+def test_removing_a_project_needs_the_password_again(tmp_path: Path) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        assert _create(client).status_code == 201
+        path = "/api/dashboard/projects/docs/archive"
+        missing = client.post(path, json={"csrf_token": _csrf(client)})
+        assert missing.status_code == 422
+        wrong = client.post(path, json={"csrf_token": _csrf(client), "current_password": "nope"})
+        assert wrong.status_code == 403
+        assert wrong.json() == {"detail": "That password was not accepted."}
+        assert "docs" in _names(client)  # nothing was removed
+        # Wrong passwords are counted like failed sign-ins: after five, even the right one waits.
+        for _ in range(4):
+            client.post(path, json={"csrf_token": _csrf(client), "current_password": "nope"})
+        blocked = client.post(
+            path, json={"csrf_token": _csrf(client), "current_password": PASSWORD}
+        )
+        assert blocked.status_code == 429 and "docs" in _names(client)
+    finally:
+        client.__exit__(None, None, None)

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from engineering_control.dashboard.project_sections import CORE_SECTIONS, section_key
 from engineering_control.flow_library import FLOWS
-from tests.test_dashboard_web import _authenticated_client
+from tests.test_dashboard_web import PASSWORD, _authenticated_client
 
 CORE_KEYS = [section.key for section in CORE_SECTIONS]
 
@@ -259,7 +259,7 @@ def test_there_is_a_limit_and_a_removed_project_has_no_sections(tmp_path: Path) 
             assert added.status_code == 201
         too_many = _post(client, "docs/sections", name="One more", description="Work.")
         assert too_many.status_code == 409 and "20 sections" in too_many.json()["detail"]
-        assert _post(client, "docs/archive").status_code == 200
+        assert _post(client, "docs/archive", current_password=PASSWORD).status_code == 200
         assert client.get("/api/dashboard/projects/docs").status_code == 404
         assert _post(client, "docs/sections", name="Late", description="x").status_code == 404
         assert _post(client, "docs/sections/issues/flow", flow=None).status_code == 404

@@ -16,6 +16,7 @@ import {
   MoreMenu,
   Page,
   Pagination,
+  PasswordInput,
   SimpleSelect,
   StatusTag,
   Table,
@@ -27,7 +28,7 @@ import {
   TableRow,
   type StatusDefinition,
 } from '@gntik-ai/ui';
-import { Check, CircleSlash, Plus, RefreshCw, RotateCcw, Search } from '@gntik-ai/icons';
+import { Check, CircleSlash, ListChecks, Plus, RefreshCw, Route, RotateCcw, Search } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -136,6 +137,134 @@ function AddItemDialog({
             </Button>
             <Button type="submit" loading={pending} disabled={!title.trim()}>
               Add item
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+type BulkChange = { kind: 'route' } | { kind: 'state'; state: 'accepted' | 'skipped' };
+
+/**
+ * One change to every item the page's filters match. It says how many, and asks for the
+ * password again: a change to hundreds of items is not made by a slip of the hand.
+ */
+function BulkDialog({
+  project,
+  sections,
+  filters,
+  total,
+  change,
+  onOpenChange,
+  onDone,
+}: {
+  project: string;
+  sections: Section[];
+  filters: { section: string | null; state: string | null; search: string };
+  total: number;
+  change: BulkChange | null;
+  onOpenChange: (open: boolean) => void;
+  onDone: (notice: string) => void;
+}) {
+  // Empty until the administrator chooses: "no section" is a choice too, never a default.
+  const [target, setTarget] = useState('');
+  const [password, setPassword] = useState('');
+  const [pending, setPending] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  useEffect(() => {
+    if (!change) return;
+    setTarget('');
+    setPassword('');
+    setProblem(null);
+    // Only when it opens: nothing is carried over from the last change.
+  }, [change]);
+  const items = `${total.toLocaleString('en')} ${total === 1 ? 'item' : 'items'}`;
+  const what =
+    change?.kind === 'state'
+      ? change.state === 'accepted'
+        ? `Accept ${items}`
+        : `Skip ${items}`
+      : `Route ${items}`;
+  const ready = password !== '' && (change?.kind !== 'route' || target !== '');
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!change || !ready || pending) return;
+    setPending(true);
+    setProblem(null);
+    try {
+      const result = await postJson<{ changed: number; unchanged: number }>(`projects/${project}/items/bulk`, {
+        current_password: password,
+        section: filters.section,
+        state: filters.state,
+        search: filters.search || null,
+        expected: total,
+        ...(change.kind === 'state'
+          ? { state_to: change.state }
+          : target === NO_SECTION
+            ? { clear_route: true }
+            : { route_to: target }),
+      });
+      onDone(
+        `${result.changed.toLocaleString('en')} changed${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} left as they were` : ''}.`,
+      );
+      onOpenChange(false);
+    } catch (error) {
+      setProblem(message(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <Dialog open={change !== null} onOpenChange={onOpenChange}>
+      <DialogContent size="md">
+        <form onSubmit={submit} noValidate>
+          <DialogHeader>
+            <DialogTitle>{what}</DialogTitle>
+            <DialogDescription>
+              This changes every item of {project} that the filters on the page match now: {items}. Items outside
+              the filters are not touched.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            {change?.kind === 'route' ? (
+              <Field>
+                <FieldLabel>Section</FieldLabel>
+                <SimpleSelect
+                  aria-label="Section"
+                  className="w-full"
+                  placeholder="Choose where they go"
+                  items={[
+                    ...sections.map((item) => ({ value: item.key, label: item.name })),
+                    { value: NO_SECTION, label: 'No section' },
+                  ]}
+                  value={target || null}
+                  onValueChange={(next) => setTarget(next ?? '')}
+                />
+                <FieldDescription>
+                  They become your choice: a later reading of GitHub will not move them by their labels.
+                </FieldDescription>
+              </Field>
+            ) : null}
+            <Field>
+              <FieldLabel>Your password, to confirm</FieldLabel>
+              <PasswordInput
+                name="current_password"
+                autoComplete="current-password"
+                maxLength={128}
+                value={password}
+                onValueChange={setPassword}
+              />
+            </Field>
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" loading={pending} disabled={!ready}>
+              {what}
             </Button>
           </DialogFooter>
         </form>
@@ -297,6 +426,7 @@ export function BacklogPage() {
   const page = Math.max(1, Number(query.get('page')) || 1);
   const [draft, setDraft] = useState(search);
   const [adding, setAdding] = useState(false);
+  const [bulk, setBulk] = useState<BulkChange | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   // Typing filters after a short pause; any filter change returns to the first page.
@@ -335,6 +465,26 @@ export function BacklogPage() {
                 setProblem(failure);
                 backlog.reload();
               }}
+            />
+          ) : null}
+          {sections && total ? (
+            <MoreMenu
+              label={`Change all ${total.toLocaleString('en')} listed`}
+              size="sm"
+              align="end"
+              items={[
+                { label: `Route all ${total.toLocaleString('en')}…`, icon: Route, onSelect: () => setBulk({ kind: 'route' }) },
+                {
+                  label: `Accept all ${total.toLocaleString('en')}…`,
+                  icon: ListChecks,
+                  onSelect: () => setBulk({ kind: 'state', state: 'accepted' }),
+                },
+                {
+                  label: `Skip all ${total.toLocaleString('en')}…`,
+                  icon: CircleSlash,
+                  onSelect: () => setBulk({ kind: 'state', state: 'skipped' }),
+                },
+              ]}
             />
           ) : null}
           <Button icon={Plus} size="sm" disabled={!sections} onClick={() => setAdding(true)}>
@@ -378,7 +528,7 @@ export function BacklogPage() {
             Choose a project to read its issues from GitHub, add an item or route items to a section.
           </p>
         )}
-        {notice ? <Alert tone="success" title="Read from GitHub" description={notice} onDismiss={() => setNotice(null)} /> : null}
+        {notice ? <Alert tone="success" title="Done" description={notice} onDismiss={() => setNotice(null)} /> : null}
         {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
         <LoadError resource={backlog} />
         <TableFrame>
@@ -423,7 +573,22 @@ export function BacklogPage() {
         ) : null}
       </div>
       {project && sections ? (
-        <AddItemDialog project={project} sections={sections} open={adding} onOpenChange={setAdding} onSaved={backlog.reload} />
+        <>
+          <AddItemDialog project={project} sections={sections} open={adding} onOpenChange={setAdding} onSaved={backlog.reload} />
+          <BulkDialog
+            project={project}
+            sections={sections}
+            filters={{ section, state, search }}
+            total={total ?? 0}
+            change={bulk}
+            onOpenChange={(open) => !open && setBulk(null)}
+            onDone={(result) => {
+              setNotice(result);
+              setProblem(null);
+              backlog.reload();
+            }}
+          />
+        </>
       ) : null}
     </Page>
   );

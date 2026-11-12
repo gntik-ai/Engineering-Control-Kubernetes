@@ -1865,8 +1865,8 @@ renders no HTML of its own.
 | --- | --- |
 | H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, backlog and runs exist, read-only) |
 | H2 | Supervisor panel on every page |
-| H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions |
-| H4 | Commands from the console, with the password asked again for approvals |
+| H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions (started: the inbox lists what waits in the data that exists, each entry leading to where it is acted on: a backlog that could not be read, a section with work and no flow, items without a section, items not decided on. Approvals, supervisor actions, sign-ins and questions join it when they exist) |
+| H4 | Commands from the console, with the password asked again for approvals (started: one change to every item a filter matches, and removing a project, are confirmed with the password; a wrong one is counted like a failed sign-in. Approvals of runs come with phase 3) |
 | H5 | Chat channel (Telegram first) for commands, questions and notifications |
 | H6 | Supervisor settings page |
 

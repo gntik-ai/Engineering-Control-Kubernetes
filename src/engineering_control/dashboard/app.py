@@ -57,6 +57,7 @@ from engineering_control.dashboard.schemas import (
     ActionReauthenticationInput,
     ActivityEventInput,
     BacklogSyncInput,
+    ItemBulkInput,
     ItemCreateInput,
     ItemRouteInput,
     ItemStateInput,
@@ -98,7 +99,9 @@ CONSOLE_INLINE_STYLE = (
 CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
-CONSOLE_VIEWS = frozenset({"", "projects", "project", "backlog", "executions", "execution"})
+CONSOLE_VIEWS = frozenset(
+    {"", "inbox", "projects", "project", "backlog", "executions", "execution"}
+)
 CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
 CONSOLE_ASSET_REFERENCE = re.compile(r'(?:src|href)="/console/assets/([^"]+)"')
 CONSOLE_ASSET_TYPES = {
@@ -785,6 +788,7 @@ def create_app(
         event: str,
         subject: str | None = None,
         status_code: int = 200,
+        password: bool = False,
     ) -> Response:
         """One shape for every change to a project: session, body, CSRF, change, record."""
         authenticated = await require_session(request, api=True)
@@ -796,6 +800,27 @@ def create_app(
             return JSONResponse({"detail": "invalid request"}, status_code=422)
         if not _valid_csrf(authenticated, body.csrf_token):
             return JSONResponse({"detail": "invalid request"}, status_code=403)
+        if password:
+            # A change that removes something or touches many things at once is confirmed
+            # with the password, counted against the same limit as a sign-in.
+            address = f"reauth:{_client_address(request, trusted_proxies)}"
+            if login_limiter.blocked(address):
+                return JSONResponse(
+                    {"detail": "Too many wrong passwords. Wait 15 minutes, then try again."},
+                    status_code=429,
+                )
+            try:
+                version = await repo(request).verify_password(body.current_password)
+            except Exception as error:  # noqa: BLE001 - never reflect the password or the cause
+                log_failure("session-validation", "dashboard password confirmation failed", error)
+                return JSONResponse(
+                    {"detail": "The password could not be checked; try again."}, status_code=503
+                )
+            if version != authenticated.data.password_version:
+                login_limiter.failure(address)
+                # 403, not 401: the session is good; it is this change that is refused.
+                return JSONResponse({"detail": "That password was not accepted."}, status_code=403)
+            login_limiter.success(address)
         try:
             changed = await change(body)
         except ProjectInvalid as error:
@@ -1002,6 +1027,34 @@ def create_app(
             )
         )
 
+    @app.get("/api/dashboard/inbox")
+    async def inbox_api(request: Request) -> Response:
+        """What waits for the administrator, and where to act on each thing."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).inbox())
+
+    @app.post("/api/dashboard/projects/{name}/items/bulk")
+    async def bulk_items_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ItemBulkInput,
+            lambda body: service(request).bulk_items(
+                name,
+                section=body.section,
+                state=body.state,
+                search=body.search,
+                expected=body.expected,
+                route_to=body.route_to,
+                clear_route=body.clear_route,
+                state_to=body.state_to,
+            ),
+            event="dashboard.items_changed_together",
+            subject=name,
+            password=True,
+        )
+
     @app.get("/api/dashboard/projects/{name}/backlog")
     async def backlog_status_api(name: str, request: Request) -> Response:
         """Whether the project's backlog can be brought in step with GitHub, and when it was."""
@@ -1068,6 +1121,7 @@ def create_app(
             ProjectArchiveInput,
             lambda _body: service(request).archive_project(name),
             event="dashboard.project_removed",
+            password=True,
         )
 
     @app.get("/api/dashboard/root-blockers")

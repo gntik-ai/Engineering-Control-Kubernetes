@@ -85,6 +85,21 @@ export interface SyncResult {
   complete: boolean;
 }
 
+/** One thing waiting for the administrator, and how many items it covers. */
+export interface InboxEntry {
+  kind: 'sync_failed' | 'section_without_flow' | 'unrouted' | 'undecided';
+  project: string;
+  project_name: string;
+  section: { key: string; name: string } | null;
+  count: number;
+  detail: string | null;
+}
+
+export interface Inbox {
+  items: InboxEntry[];
+  total: number;
+}
+
 /** A repository the GitHub App is installed on. */
 export interface GitHubRepository {
   full_name: string;
