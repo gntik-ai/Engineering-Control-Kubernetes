@@ -81,48 +81,21 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             )
         )
 
-    # 0026: every project has the six core sections; the registry's keep their three flows.
-    def sections_by_project() -> dict[str, list[tuple[str, str, str | None]]]:
-        with engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    "SELECT p.name, s.key, s.kind, s.flow_key FROM project_sections s "
-                    "JOIN projects p ON p.id = s.project_id ORDER BY p.name, s.position"
-                )
-            ).all()
-        found: dict[str, list[tuple[str, str, str | None]]] = {}
-        for name, key, kind, flow in rows:
-            found.setdefault(name, []).append((key, kind, flow))
-        return found
-
-    by_project = sections_by_project()
-    assert set(by_project) == set(PROJECTS)  # the console's project was added after 0026 ran
-    assert by_project["falcone"] == [
-        ("code-audit", "core", "audit-code"),
-        ("ui-audit", "core", None),
-        ("ux-audit", "core", None),
-        ("code-clean", "core", None),
-        ("enhancement", "core", "discover-enhancements"),
-        ("issues", "core", "deliver-issue"),
-    ]
-    # Run 0026 again with the console's project present: it gets the same six, without a flow.
-    command.downgrade(config, parent)
-    assert "project_sections" not in inspect(engine).get_table_names()
-    command.upgrade(config, head)
-    by_project = sections_by_project()
-    assert set(by_project) == {*PROJECTS, "made-here"}
-    assert [key for key, _kind, _flow in by_project["made-here"]] == [
-        key for key, _kind, _flow in by_project["falcone"]
-    ]
-    assert [flow for _key, _kind, flow in by_project["made-here"]] == [None] * 6
+    # 0026: the table of sections, with the routing guide. The console fills it when it
+    # starts (tests/test_dashboard_sections.py), so a migrated database has none yet.
+    columns = {column["name"] for column in inspect(engine).get_columns("project_sections")}
+    assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
     # A section the administrator added must not be lost by a downgrade.
     with engine.begin() as connection:
         connection.execute(
             text(
-                "INSERT INTO project_sections (id, project_id, key, name, description, kind, "
-                "position, created_at, updated_at) SELECT '00000000000000000000000000000002', "
-                "id, 'release-notes', 'Release notes', '', 'custom', 6, CURRENT_TIMESTAMP, "
-                "CURRENT_TIMESTAMP FROM projects WHERE name = 'made-here'"
+                "INSERT INTO project_sections (id, project_id, key, name, description, "
+                "use_when, avoid_when, labels, examples, kind, position, created_at, "
+                "updated_at) SELECT '00000000000000000000000000000002', id, 'release-notes', "
+                "'Release notes', 'What changed.', '', '', '[]', '[]', 'custom', 6, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM projects WHERE name = 'made-here'"
             )
         )
     with pytest.raises(RuntimeError, match="refuses to drop sections the administrator added"):

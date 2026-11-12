@@ -32,8 +32,9 @@ import {
   SimpleSelect,
   Skeleton,
   Textarea,
+  TokenInput,
 } from '@gntik-ai/ui';
-import { ArrowLeft, FolderKanban, Pencil, Plus, Trash2 } from '@gntik-ai/icons';
+import { ArrowLeft, Bot, FolderKanban, Pencil, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -71,17 +72,35 @@ function SectionDialog({
 }) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [useWhen, setUseWhen] = useState('');
+  const [avoidWhen, setAvoidWhen] = useState('');
+  const [labels, setLabels] = useState<string[]>([]);
+  const [examples, setExamples] = useState('');
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
     if (!open) return;
     setName(section?.name ?? '');
     setDescription(section?.description ?? '');
+    setUseWhen(section?.use_when ?? '');
+    setAvoidWhen(section?.avoid_when ?? '');
+    setLabels(section?.labels ?? []);
+    setExamples((section?.examples ?? []).join('\n'));
     setProblem(null);
     // Only when it opens: the form starts from the section as it is.
   }, [open]);
   const core = section?.kind === 'core';
-  const ready = name.trim() !== '';
+  const ready = name.trim() !== '' && description.trim() !== '';
+  const guide = () => ({
+    description,
+    use_when: useWhen,
+    avoid_when: avoidWhen,
+    labels,
+    examples: examples
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  });
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!ready || pending) return;
@@ -91,10 +110,10 @@ function SectionDialog({
       if (section) {
         await postJson(`projects/${project}/sections/${section.key}/update`, {
           ...(core ? {} : { name }),
-          description,
+          ...guide(),
         });
       } else {
-        await postJson(`projects/${project}/sections`, { name, description });
+        await postJson(`projects/${project}/sections`, { name, ...guide() });
       }
       onSaved();
       onOpenChange(false);
@@ -111,7 +130,8 @@ function SectionDialog({
           <DialogHeader>
             <DialogTitle>{section ? `Edit ${section.name}` : 'Add a section'}</DialogTitle>
             <DialogDescription>
-              A section is one kind of work on the project. Its description says what belongs in it.
+              A section is one kind of work on the project. These texts are its routing guide: what the supervisor
+              reads to decide whether a piece of work belongs here.
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
@@ -130,16 +150,48 @@ function SectionDialog({
               {core ? <FieldDescription>A core section keeps its name.</FieldDescription> : null}
             </Field>
             <Field>
-              <FieldLabel>What belongs in it</FieldLabel>
+              <FieldLabel required>What belongs in it</FieldLabel>
               <Textarea
                 name="description"
                 value={description}
                 onValueChange={setDescription}
                 maxLength={500}
-                rows={4}
+                rows={2}
                 autoFocus={core}
               />
-              <FieldDescription>Work is routed to a section by this text.</FieldDescription>
+              <FieldDescription>One or two sentences. A section cannot be without it.</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Use it when</FieldLabel>
+              <Textarea name="use_when" value={useWhen} onValueChange={setUseWhen} maxLength={600} rows={3} />
+              <FieldDescription>The situations that should send work here.</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Do not use it when</FieldLabel>
+              <Textarea name="avoid_when" value={avoidWhen} onValueChange={setAvoidWhen} maxLength={600} rows={3} />
+              <FieldDescription>
+                The near misses, each with the section to use instead, for example "Something is broken (use
+                Issues)".
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Examples</FieldLabel>
+              <Textarea name="examples" value={examples} onValueChange={setExamples} rows={3} />
+              <FieldDescription>Requests that belong here, one per line, six at most.</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Labels</FieldLabel>
+              <TokenInput
+                aria-label="Labels"
+                value={labels}
+                onValueChange={(next) => setLabels(next.map((label) => label.toLowerCase()))}
+                maxItems={12}
+                placeholder="Type a label and press Enter"
+              />
+              <FieldDescription>
+                An item carrying one of these, such as a GitHub issue label, goes to this section without a
+                judgement. A label belongs to one section only.
+              </FieldDescription>
             </Field>
           </DialogBody>
           <DialogFooter>
@@ -247,14 +299,23 @@ function SectionCard({
                 {custom ? 'Yours' : 'Core'}
               </Badge>
             </div>
-            <CardDescription className="mt-1">{section.description || 'No description yet.'}</CardDescription>
+            <CardDescription className="mt-1">{section.description}</CardDescription>
+            {section.labels.length ? (
+              <div className="mt-2 flex flex-wrap gap-1" aria-label={`Labels of ${section.name}`}>
+                {section.labels.map((label) => (
+                  <Badge key={label} tone="neutral" size="sm">
+                    {label}
+                  </Badge>
+                ))}
+              </div>
+            ) : null}
           </div>
           <MoreMenu
             label={`Actions for ${section.name}`}
             size="sm"
             align="end"
             items={[
-              { label: custom ? 'Edit' : 'Edit description', icon: Pencil, onSelect: onEdit },
+              { label: custom ? 'Edit' : 'Edit guide', icon: Pencil, onSelect: onEdit },
               ...(custom ? [{ label: 'Remove', icon: Trash2, destructive: true, onSelect: onRemove }] : []),
             ]}
           />
@@ -279,12 +340,25 @@ function SectionCard({
   );
 }
 
+/** The text the supervisor is given for this project, exactly as assembled from the sections. */
+function SupervisorBrief({ project }: { project: string }) {
+  const brief = useResource<{ brief: string }>(apiUrl(`projects/${project}/routing`));
+  if (brief.error) return <LoadError resource={brief} />;
+  if (!brief.data) return <Skeleton className="h-64 w-full" />;
+  return (
+    <pre className="max-h-[60vh] overflow-auto rounded-md border border-border bg-secondary/40 p-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap">
+      {brief.data.brief}
+    </pre>
+  );
+}
+
 function Detail({ name }: { name: string }) {
   const detail = useResource<ProjectDetail>(apiUrl(`projects/${name}`));
   const flows = useResource<Listing<Flow>>(apiUrl('flows'));
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Section | null>(null);
   const [removing, setRemoving] = useState<Section | null>(null);
+  const [reading, setReading] = useState(false);
   const project = detail.data?.project;
   const sections = detail.data?.sections;
   return (
@@ -311,6 +385,9 @@ function Detail({ name }: { name: string }) {
       actions={
         <div className="flex items-center gap-2">
           <RefreshButton resource={detail} />
+          <Button variant="secondary" icon={Bot} size="sm" disabled={!sections} onClick={() => setReading(true)}>
+            What the supervisor reads
+          </Button>
           <Button icon={Plus} size="sm" disabled={!sections} onClick={() => setAdding(true)}>
             Add section
           </Button>
@@ -355,6 +432,25 @@ function Detail({ name }: { name: string }) {
         onOpenChange={(open) => !open && setEditing(null)}
         onSaved={detail.reload}
       />
+      <Dialog open={reading} onOpenChange={setReading}>
+        <DialogContent size="lg">
+          <DialogHeader>
+            <DialogTitle>What the supervisor reads</DialogTitle>
+            <DialogDescription>
+              Assembled from the sections of this project as they are now. This is how the supervisor decides which
+              section, and so which flow, a piece of work goes to. Edit a section's guide to change it.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <SupervisorBrief project={name} />
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" onClick={() => setReading(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <RemoveSectionDialog
         project={name}
         section={removing}

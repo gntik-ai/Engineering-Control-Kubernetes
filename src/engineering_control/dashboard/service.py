@@ -6,6 +6,7 @@ from typing import cast
 from uuid import UUID
 
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
+from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 
 
@@ -179,21 +180,20 @@ class DashboardService:
                 return {"project": item, "sections": sections}
         return None
 
-    async def add_section(
-        self, project: str, *, name: str, description: str | None
-    ) -> dict[str, object]:
+    async def add_section(self, project: str, *, name: str, guide: Guide) -> dict[str, object]:
         return await asyncio.to_thread(
-            lambda: self.repository.sections.add(project, name=name, description=description)
+            lambda: self.repository.sections.add(project, name=name, guide=guide)
         )
 
     async def update_section(
-        self, project: str, key: str, *, name: str | None, description: str | None
+        self, project: str, key: str, *, name: str | None, guide: Guide
     ) -> dict[str, object]:
         return await asyncio.to_thread(
-            lambda: self.repository.sections.update(
-                project, key, name=name, description=description
-            )
+            lambda: self.repository.sections.update(project, key, name=name, guide=guide)
         )
+
+    async def routing_brief(self, project: str) -> str:
+        return await asyncio.to_thread(self.repository.sections.brief, project)
 
     async def remove_section(self, project: str, key: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.sections.remove, project, key)

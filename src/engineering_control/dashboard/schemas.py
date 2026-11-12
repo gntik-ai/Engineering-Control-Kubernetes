@@ -63,16 +63,23 @@ class ProjectArchiveInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
-class SectionCreateInput(DashboardModel):
+class SectionGuideInput(DashboardModel):
+    """The routing guide of a section. A field left out is left as it is."""
+
     csrf_token: str = Field(min_length=20, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    use_when: str | None = Field(default=None, max_length=2000)
+    avoid_when: str | None = Field(default=None, max_length=2000)
+    labels: list[str] | None = Field(default=None, max_length=50)
+    examples: list[str] | None = Field(default=None, max_length=50)
+
+
+class SectionCreateInput(SectionGuideInput):
     name: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
 
 
-class SectionUpdateInput(DashboardModel):
-    csrf_token: str = Field(min_length=20, max_length=200)
+class SectionUpdateInput(SectionGuideInput):
     name: str | None = Field(default=None, min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
 
 
 class SectionRemoveInput(DashboardModel):

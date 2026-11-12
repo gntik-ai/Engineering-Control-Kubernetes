@@ -445,9 +445,12 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
 class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
     """One kind of work on a project (migration 0026).
 
-    Every project has the six core sections; the administrator adds custom ones. The
-    description says what belongs in the section, which is what work is routed by. A
-    section runs the flow assigned to it, or nothing while it has none.
+    Every project has the six core sections; the administrator adds custom ones. A section
+    runs the flow assigned to it, or nothing while it has none.
+
+    Five fields are its routing guide, written for whoever decides where work goes (the
+    supervisor): what belongs in it, when to use it, when not to and where to send the
+    work instead, example requests, and the labels that send an item here on their own.
     """
 
     __tablename__ = "project_sections"
@@ -457,6 +460,10 @@ class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
     key: Mapped[str] = mapped_column(String(40))
     name: Mapped[str] = mapped_column(String(80))
     description: Mapped[str] = mapped_column(String(500), default="")
+    use_when: Mapped[str] = mapped_column(String(600), default="")
+    avoid_when: Mapped[str] = mapped_column(String(600), default="")
+    labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    examples: Mapped[list[str]] = mapped_column(JSON, default=list)
     kind: Mapped[str] = mapped_column(String(8))
     position: Mapped[int] = mapped_column(Integer)
     flow_key: Mapped[str | None] = mapped_column(String(80))

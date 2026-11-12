@@ -25,11 +25,20 @@ export interface Flow {
   summary: string;
 }
 
-/** One kind of work on a project. `flow` is null while none is assigned. */
+/**
+ * One kind of work on a project. `flow` is null while none is assigned. The description,
+ * the two "when" texts, the examples and the labels are its routing guide: what the
+ * supervisor reads to decide whether a piece of work belongs here.
+ */
 export interface Section {
   key: string;
   name: string;
   description: string;
+  use_when: string;
+  avoid_when: string;
+  /** An item carrying one of these (a GitHub label) belongs here without a judgement. */
+  labels: string[];
+  examples: string[];
   kind: 'core' | 'custom';
   flow: Flow | null;
 }

@@ -46,6 +46,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     clean_repository,
 )
+from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
     ActionCandidateInput,
@@ -58,6 +59,7 @@ from engineering_control.dashboard.schemas import (
     R3CandidateCreateInput,
     SectionCreateInput,
     SectionFlowInput,
+    SectionGuideInput,
     SectionRemoveInput,
     SectionUpdateInput,
 )
@@ -864,14 +866,33 @@ def create_app(
             return JSONResponse({"detail": "not found"}, status_code=404)
         return JSONResponse(found)
 
+    @app.get("/api/dashboard/projects/{name}/routing")
+    async def project_routing_api(name: str, request: Request) -> Response:
+        """What the supervisor is given to decide which section a piece of work belongs to."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            brief = await service(request).routing_brief(name)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return JSONResponse({"project": name, "brief": brief})
+
+    def guide(body: SectionGuideInput) -> Guide:
+        return Guide(
+            description=body.description,
+            use_when=body.use_when,
+            avoid_when=body.avoid_when,
+            labels=body.labels,
+            examples=body.examples,
+        )
+
     @app.post("/api/dashboard/projects/{name}/sections", status_code=201)
     async def add_section_api(name: str, request: Request) -> Response:
         return await project_change(
             request,
             SectionCreateInput,
-            lambda body: service(request).add_section(
-                name, name=body.name, description=body.description
-            ),
+            lambda body: service(request).add_section(name, name=body.name, guide=guide(body)),
             event="dashboard.section_added",
             subject=name,
             status_code=201,
@@ -883,7 +904,7 @@ def create_app(
             request,
             SectionUpdateInput,
             lambda body: service(request).update_section(
-                name, key, name=body.name, description=body.description
+                name, key, name=body.name, guide=guide(body)
             ),
             event="dashboard.section_changed",
             subject=f"{name}/{key}",

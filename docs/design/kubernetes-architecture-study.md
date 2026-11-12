@@ -1800,7 +1800,7 @@ Status: **done**, **in progress**, or blank for not started.
 | --- | --- |
 | C1 | Create a project: name it and connect its repository (done: projects are records; create, rename and remove in the console; the repository is chosen from the ones the GitHub App is installed on, and its default branch is taken from GitHub) |
 | C2 | GitHub sign-in to pick the repository from a list |
-| C3 | Six core sections per project, and custom sections (done: every project has the six; the administrator adds, describes, renames and removes its own, up to twenty) |
+| C3 | Six core sections per project, and custom sections (done: every project has the six; the administrator adds, renames and removes its own, up to twenty. Each section has a routing guide for the supervisor: a description, which is required, when to use it, when not to and which section to use instead, examples, and labels. A label belongs to one section of a project and will route an imported item carrying it without a judgement. The console shows the text assembled from the guides, exactly as the supervisor will read it) |
 | C4 | Assign, change or remove the flow of a section (done as a record: a section holds one of the seven built-in flows or none; nothing starts from the assignment until runs are connected in phase 3) |
 | C5 | The six existing projects migrated into project records (done: copied in by migration 0025; the workflows still read the registry in code) |
 
@@ -1850,7 +1850,7 @@ Status: **done**, **in progress**, or blank for not started.
 | --- | --- |
 | G1 | Agent definition — prompt, skills, tools, model — editable and versioned |
 | G2 | Tool service with policy checks on every call |
-| G3 | Planning role: build the backlog, route items, propose queues |
+| G3 | Planning role: build the backlog, route items, propose queues. It routes by section, never by flow, from the routing brief of the project (C3): one section per item, never the nearest when none fits, never another section when the fitting one has no flow |
 | G4 | Operations role: detect stalls and errors; act automatically, wait, or never (12.3) |
 | G5 | Design role: draft flows on request (15.2) |
 | G6 | Its own subscription account, with the other provider as fallback |
