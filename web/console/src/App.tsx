@@ -9,6 +9,7 @@ import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
 import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
+import { usePageTitle } from './parts';
 import { BASE, navigate, useLocation } from './router';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -39,6 +40,16 @@ const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/execution`]: () => <ExecutionPage />,
 };
 
+/** What the browser tab says for each view. */
+const TITLES: Record<string, string> = {
+  [`${BASE}/inbox`]: 'Inbox',
+  [`${BASE}/projects`]: 'Projects',
+  [`${BASE}/project`]: 'Project',
+  [`${BASE}/backlog`]: 'Backlog',
+  [`${BASE}/executions`]: 'Executions',
+  [`${BASE}/execution`]: 'Execution',
+};
+
 function SignOut({ onError }: { onError: (message: string) => void }) {
   const [pending, setPending] = useState(false);
   const run = () => {
@@ -66,6 +77,7 @@ export default function App() {
   const { reload: recount } = inbox;
   useEffect(() => recount(), [current, recount]);
   const home = current === BASE;
+  usePageTitle(home ? undefined : (TITLES[current] ?? 'Not found'));
   useEffect(() => {
     if (home) navigate(`${BASE}/projects`, { replace: true });
   }, [home]);

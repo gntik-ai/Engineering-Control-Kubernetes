@@ -156,6 +156,7 @@ function SectionDialog({
                 value={description}
                 onValueChange={setDescription}
                 maxLength={500}
+                showCount
                 rows={2}
                 autoFocus={core}
               />
@@ -163,12 +164,19 @@ function SectionDialog({
             </Field>
             <Field>
               <FieldLabel>Use it when</FieldLabel>
-              <Textarea name="use_when" value={useWhen} onValueChange={setUseWhen} maxLength={600} rows={3} />
+              <Textarea name="use_when" value={useWhen} onValueChange={setUseWhen} maxLength={600} showCount rows={3} />
               <FieldDescription>The situations that should send work here.</FieldDescription>
             </Field>
             <Field>
               <FieldLabel>Do not use it when</FieldLabel>
-              <Textarea name="avoid_when" value={avoidWhen} onValueChange={setAvoidWhen} maxLength={600} rows={3} />
+              <Textarea
+                name="avoid_when"
+                value={avoidWhen}
+                onValueChange={setAvoidWhen}
+                maxLength={600}
+                showCount
+                rows={3}
+              />
               <FieldDescription>
                 The near misses, each with the section to use instead, for example "Something is broken (use
                 Issues)".

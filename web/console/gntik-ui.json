@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "framework": "vite",
+  "packageManager": "npm",
+  "css": "src/index.css",
+  "brand": "gntik",
+  "aliases": {
+    "components": "src/components",
+    "blocks": "src/components/blocks",
+    "templates": "src/components/templates"
+  }
+}

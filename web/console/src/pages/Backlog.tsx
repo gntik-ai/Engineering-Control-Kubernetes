@@ -13,6 +13,7 @@ import {
   FieldDescription,
   FieldLabel,
   Input,
+  SearchField,
   MoreMenu,
   Page,
   Pagination,
@@ -28,7 +29,7 @@ import {
   TableRow,
   type StatusDefinition,
 } from '@gntik-ai/ui';
-import { Check, CircleSlash, ListChecks, Plus, RefreshCw, Route, RotateCcw, Search } from '@gntik-ai/icons';
+import { Check, CircleSlash, ListChecks, Plus, RefreshCw, Route, RotateCcw } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -429,12 +430,11 @@ export function BacklogPage() {
   const [bulk, setBulk] = useState<BulkChange | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
-  // Typing filters after a short pause; any filter change returns to the first page.
-  useEffect(() => {
-    if (draft === search) return;
-    const timer = window.setTimeout(() => setQuery({ search: draft.trim(), page: null }), 350);
-    return () => window.clearTimeout(timer);
-  }, [draft, search]);
+  // Typing filters after a short pause, Enter at once; any filter change returns to the
+  // first page.
+  const find = (text: string) => {
+    if (text.trim() !== search) setQuery({ search: text.trim(), page: null });
+  };
 
   const backlog = useResource<Paged<WorkItem>>(
     apiUrl('items', { project, section, state, search, page, page_size: PAGE_SIZE }),
@@ -512,15 +512,16 @@ export function BacklogPage() {
             value={state}
             onChange={(value) => setQuery({ state: value, page: null })}
           />
-          <Input
-            type="search"
+          <SearchField
             size="sm"
             className="w-64"
             aria-label="Search by title or issue number"
             placeholder="Search title or number"
-            leadingIcon={Search}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onValueChange={setDraft}
+            onSearch={find}
+            debounceMs={350}
+            pending={backlog.loading && draft.trim() !== '' && draft.trim() === search}
           />
         </div>
         {project ? null : (

@@ -9,12 +9,18 @@ import {
   TableCell,
   TableRow,
   Timestamp,
+  useDocumentTitle,
   type SimpleSelectItem,
 } from '@gntik-ai/ui';
 import { Inbox, RefreshCw } from '@gntik-ai/icons';
 import type { ReactNode } from 'react';
 import { apiUrl, useResource, type Listing, type ProjectSummary, type Resource } from './api';
 import { STATUSES } from './status';
+
+/** Names the page in the browser tab while it is shown. */
+export function usePageTitle(page: string | undefined) {
+  useDocumentTitle(page ? `${page} · Engineering Control` : undefined);
+}
 
 export const mono = 'font-mono text-[12px] whitespace-nowrap text-muted-foreground';
 

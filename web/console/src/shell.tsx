@@ -1,6 +1,6 @@
 import { StrictMode, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { LinkProvider, ThemeProvider, TooltipProvider, gntikPreset } from '@gntik-ai/ui';
+import { KitProvider, gntikPreset } from '@gntik-ai/ui';
 import { RouterLink } from './router';
 import './index.css';
 
@@ -8,11 +8,9 @@ import './index.css';
 export function mount(page: ReactNode) {
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
-      <ThemeProvider brand={{ ...gntikPreset, name: 'Engineering Control' }}>
-        <LinkProvider component={RouterLink}>
-          <TooltipProvider>{page}</TooltipProvider>
-        </LinkProvider>
-      </ThemeProvider>
+      <KitProvider theme={{ brand: { ...gntikPreset, name: 'Engineering Control' } }} link={RouterLink}>
+        {page}
+      </KitProvider>
     </StrictMode>,
   );
 }

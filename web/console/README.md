@@ -1,60 +1,57 @@
-# Engineering Control console
+# Console
 
-Every page the dashboard service shows is built here on
-[gntik-ui](https://github.com/gntik-ai/gntik-ui) (`@gntik-ai/ui`, React 19, Tailwind 4); the
-service renders no HTML of its own. There are two entries:
-
-| Entry | Served at | What it is |
-| --- | --- | --- |
-| `login.html` → `src/login.tsx` | `/login` | The sign-in page (`AuthLayout`, `PasswordInput`) |
-| `index.html` → `src/main.tsx` | `/console/…`, and any unknown address | The console and its not-found page (`StatusLayout`) |
-
-The sign-in page loads before there is a session, so the service gives out without one
-exactly the files `login.html` names (its entry, the stylesheet, the libraries in
-`vendor-*.js`) and the fonts. The console's own code (`index-*.js`) needs a session.
-
-Signing in: the page asks `GET /login/challenge` for a token (also set as a cookie the page
-cannot read) and posts it with the password to `POST /login`. A correct password is answered
-with a redirect, a wrong one with `401` and a new token, too many attempts with `429`.
-
-The console's views:
-
-| View | Path | Data |
-| --- | --- | --- |
-| Inbox: what waits for the administrator | `/console/inbox` | `GET /api/dashboard/inbox` |
-| Projects: list, create, rename, remove | `/console/projects` | `GET /api/dashboard/projects`; `POST /api/dashboard/projects`, `…/{name}/rename`, `…/{name}/archive` |
-| Project: its sections and the flow of each | `/console/project?name=…` | `GET /api/dashboard/projects/{name}`, `GET /api/dashboard/flows`, `GET …/projects/{name}/routing` (what the supervisor reads); `POST …/projects/{name}/sections`, `…/sections/{key}/update`, `…/remove`, `…/flow` |
-| Repository picker of "New project" | (dialog) | `GET /api/dashboard/github/repositories`: the repositories the GitHub App is installed on, and the project each belongs to |
-| Backlog: the work wanted, routed to sections | `/console/backlog?project=…` | `GET /api/dashboard/items`, `GET …/projects/{name}/backlog`; `POST …/projects/{name}/backlog/sync`, `…/projects/{name}/items`, `…/items/{id}/route`, `…/items/{id}/state`, `…/projects/{name}/items/bulk` (every item the filters match; needs the password again) |
-| Executions (agents and workflows, refreshed every 5 s) | `/console/executions` | `GET /api/dashboard/executions`, `/workflows` |
-| Execution transcript | `/console/execution?id=…` | `GET /api/dashboard/executions/{id}` and `/logs` |
-
-It uses the dashboard's session cookie. The only changes it makes are to projects (each sent with the session's CSRF token) and sign-out. It is the only web
-interface: commands, approvals and audits are run from Telegram or `engineering-ctl`, and the
-password is rotated with `engineering-ctl dashboard reset-password`.
-
-## Build
-
-The controller installs the Python package only (no Node), so the built bundle is committed in
-`src/engineering_control/dashboard/console/`. After changing anything here:
+The Engineering Control console: React on the gntik-ui design system, built by Vite into
+`src/engineering_control/dashboard/console/`, which the dashboard service serves. The built
+bundle is committed; CI fails when it does not match the source.
 
 ```bash
-cd web/console
 npm ci
-npm run build      # typechecks, then writes ../../src/engineering_control/dashboard/console
+npm run build
 ```
 
-Commit the regenerated directory with the source change. `tests/test_dashboard_console.py`
-serves the bundle through the real application and checks every referenced asset.
+## gntik-ui
 
-## Constraints from the dashboard's Content-Security-Policy
+| Package | Version | Used for |
+| --- | --- | --- |
+| `@gntik-ai/ui` | 0.13.0 | every component and layout |
+| `@gntik-ai/tokens` | 0.4.0 | colours, type and the page baseline (`base.css`); the version `ui` requires |
+| `@gntik-ai/icons` | 0.5.0 | icons |
 
-`script-src 'self'; style-src 'self'; img-src 'self'`: no inline script (the theme script is
-emitted as a file), no `data:` assets (`assetsInlineLimit: 0`), fonts bundled from
-`@fontsource`. The one inline style the kit's select popup adds is allowed by hash on
-`/console` only (`CONSOLE_INLINE_STYLE` in `dashboard/app.py`); the sign-in page gets the
-strict policy with no exception.
+`gntik-ui.json` is the configuration of the kit's command line (`npx @gntik-ai/cli`), which
+adds components and copies blocks or page templates into `src/components/`.
 
-## Develop
+Rules the console keeps:
 
-`npm run dev` proxies `/api` and `/login` to a dashboard on `127.0.0.1:8750`; sign in there first.
+- **One root.** `KitProvider` in `src/shell.tsx` supplies the theme, links, tooltips, toasts
+  and announcements to both pages (console and sign-in).
+- **Kit components before own code.** Search is `SearchField`, counters are `showCount`,
+  the browser tab is named with `useDocumentTitle`. Before writing a part, look for it with
+  `npx @gntik-ai/cli search <words>`.
+- **Blocks are copied in, not imported.** `@gntik-ai/blocks` is published as one file that
+  imports the code editor, the flow canvas and the charts. Importing a single block from the
+  package adds the editor's workers (about 9 MB of files) and a quarter more script to the
+  build, measured at 0.13.0. `npx @gntik-ai/cli add <block>` copies only that block's source,
+  which depends on `@gntik-ai/ui` alone.
+- **Strict content security policy.** Scripts, styles, fonts and images come from the
+  console's own address; the theme script is a file, never inline. The fonts are the Latin
+  files named in `src/index.css`, which is what the sign-in page is allowed to load.
+
+## Upgrading gntik-ui
+
+1. `npm view @gntik-ai/ui version`, and the `@gntik-ai/tokens` version that release depends
+   on (`npm view @gntik-ai/ui dependencies`); install both exactly, with the icons.
+2. Read the release notes in `packages/ui/CHANGELOG.md` of the gntik-ui repository, and run
+   the kit's own migration check: `npx @gntik-ai/cli upgrade --from <old version>` (it needs
+   `@gntik-ai/codemods` installed; a dry run unless `--apply`).
+3. `npm run build`, then look at every page in a browser, dialogs included.
+
+From 0.11.0 to 0.13.0 no migration applied. Taken from those releases: `KitProvider`,
+`SearchField`, character counters, document titles and the page baseline.
+
+Blocks worth copying in when their page is next worked on: `error-panel` (load errors with
+a retry), `confirm-destructive` (removal dialogs), `page-header` (breadcrumbs on the project
+and execution pages) and `data-table` (the backlog, with row selection). The shell blocks
+(`app-sidebar`, `app-topbar`) are made for products with workspaces and user accounts; the
+console has one administrator and uses the layout they are built on directly. Not needed
+yet: `@gntik-ai/charts` (usage and budgets), `@gntik-ai/flow` and `@gntik-ai/editor` (the
+flow designer), `@gntik-ai/chat` (talking to the supervisor in the console).
