@@ -75,6 +75,9 @@ spec:
             - name: secrets
               mountPath: /var/run/secrets/engineering-control
               readOnly: true
+            - name: temporal-ca
+              mountPath: /var/run/secrets/engineering-control-temporal
+              readOnly: true
             - name: state
               mountPath: /var/lib/engineering-control
             - name: tmp
@@ -84,6 +87,14 @@ spec:
           secret:
             secretName: engineering-control-secrets
             defaultMode: 0440
+        # The certificate authority only; the key of the server certificate is not mounted.
+        - name: temporal-ca
+          secret:
+            secretName: engineering-control-temporal-tls
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
         - name: state
           emptyDir: {}
         - name: tmp

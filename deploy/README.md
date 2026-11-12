@@ -13,6 +13,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | Wave | Resource | Purpose |
 | --- | --- | --- |
 | −2, −1 | Namespace, settings, service accounts, role, network policies, Temporal configuration | Everything the rest needs |
+| −1, 0 | Certificate authority and Temporal's certificate | TLS between the platform and Temporal |
 | 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
 | 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
 | 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
@@ -21,8 +22,16 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
 Not deployed yet: the scheduler (it would start recurring workflows whose activities need
-role workers that do not exist yet), TLS between the platform and Temporal, and the
-sandboxes.
+role workers that do not exist yet) and the sandboxes.
+
+## TLS to Temporal
+
+`base/certificates.yaml` asks the cluster's cert-manager for a certificate authority of the
+platform's own and for the certificate the Temporal server presents. The API, the workflow
+worker and the namespace Job mount the authority's certificate only, and refuse a server
+that cannot show a certificate signed by it. The server's key is mounted in the Temporal
+pod alone. cert-manager renews both; the server rereads its certificate every hour.
+Clients do not present a certificate: the network policy decides who may connect.
 
 Only the console is reachable from outside. A network policy opens the console's HTTP port
 to the cluster so that the ingress controller can reach it; every other port and every other

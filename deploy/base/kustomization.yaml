@@ -9,6 +9,7 @@ resources:
   - configuration.yaml
   - access.yaml
   - network-policy.yaml
+  - certificates.yaml
   - postgres.yaml
   - storage.yaml
   - bootstrap-jobs.yaml
@@ -27,4 +28,4 @@ images:
   # Deploying a new version is changing this one line.
   - name: engineering-control
     newName: ghcr.io/gntik-ai/engineering-control-kubernetes
-    newTag: a161c69b212445741acc0bbe763ff3f696815406
+    newTag: 87891208b8128d6e42f488a0c1deb490a4f50f75

@@ -1,0 +1,70 @@
+# TLS between the platform and Temporal, issued inside the namespace by the cluster's
+# cert-manager. A certificate authority of the platform's own signs the certificate the
+# Temporal server presents; every client is given the authority's certificate (never a
+# key) and refuses a server that cannot show a certificate signed by it.
+#
+# Clients do not present a certificate yet: who may connect is decided by the network
+# policy (the namespace only).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: engineering-control-selfsigned
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  selfSigned: {}
+---
+# The platform's certificate authority. Ten years; cert-manager renews it a year ahead.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: engineering-control-ca
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  isCA: true
+  commonName: Engineering Control internal authority
+  secretName: engineering-control-ca
+  duration: 87600h
+  renewBefore: 8760h
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: engineering-control-selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: engineering-control-ca
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  ca:
+    secretName: engineering-control-ca
+---
+# What the Temporal server presents. One year, renewed a month ahead; the server rereads
+# the files every hour, so a renewal needs no restart.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: engineering-control-temporal-tls
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  secretName: engineering-control-temporal-tls
+  commonName: engineering-control-temporal
+  dnsNames:
+    - engineering-control-temporal
+    - engineering-control-temporal.engineering-control
+    - engineering-control-temporal.engineering-control.svc
+    - engineering-control-temporal.engineering-control.svc.cluster.local
+  duration: 8760h
+  renewBefore: 720h
+  usages:
+    - server auth
+    # Temporal's own services call its frontend, and present this certificate when they do.
+    - client auth
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: engineering-control-ca

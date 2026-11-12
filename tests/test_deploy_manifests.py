@@ -137,7 +137,9 @@ def test_only_the_console_has_a_route_from_outside_and_only_over_https() -> None
     [tls] = ingress["spec"]["tls"]
     assert tls["hosts"] == [host]
     assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/ssl-redirect"] == "true"
-    [certificate] = [d for d in documents if d["kind"] == "Certificate"]
+    [certificate] = [
+        d for d in documents if d["kind"] == "Certificate" and "ClusterIssuer" in str(d["spec"])
+    ]
     assert certificate["spec"]["dnsNames"] == [host]
     assert certificate["spec"]["secretName"] == tls["secretName"]
     # The console refuses any other host name and any other origin for a change.
@@ -224,3 +226,58 @@ def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:
         name = cluster["metadata"]["name"]
         assert cluster["spec"]["affinity"]["nodeAffinity"] == rule, name
         assert "tolerations" not in cluster["spec"]["affinity"], name
+
+
+def test_temporal_is_reached_over_tls_and_only_the_server_holds_its_key() -> None:
+    documents = _documents()
+    settings = next(
+        d
+        for d in documents
+        if d["kind"] == "ConfigMap" and "data" in d and ("ENGINEERING_TEMPORAL_TARGET" in d["data"])
+    )["data"]
+    name = settings["ENGINEERING_TEMPORAL_TLS_SERVER_NAME"]
+    assert settings["ENGINEERING_TEMPORAL_TARGET"] == f"{name}:7233"
+    authority_file = settings["ENGINEERING_TEMPORAL_TLS_CA_FILE"]
+
+    certificates = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Certificate"}
+    server = certificates["engineering-control-temporal-tls"]["spec"]
+    assert name in server["dnsNames"] and "server auth" in server["usages"]
+    assert server["issuerRef"]["kind"] == "Issuer"  # the platform's own authority, not a public one
+    authority = certificates["engineering-control-ca"]["spec"]
+    assert authority["isCA"] is True
+    issuers = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "Issuer"}
+    assert issuers[server["issuerRef"]["name"]] == {"ca": {"secretName": authority["secretName"]}}
+
+    # The server is configured with the certificate, and rereads it without a restart.
+    config = yaml.safe_load(
+        next(
+            d for d in documents if d["metadata"]["name"] == "engineering-control-temporal-config"
+        )["data"]["docker.yaml"]
+    )
+    tls = config["global"]["tls"]
+    assert tls["frontend"]["server"]["certFile"].endswith("/tls.crt")
+    assert tls["frontend"]["server"]["keyFile"].endswith("/tls.key")
+    assert tls["frontend"]["client"]["serverName"] == name
+    assert tls["refreshInterval"]
+
+    holders = {}
+    for pod, spec in _pod_specs():
+        for volume in spec.get("volumes", []):
+            if volume.get("secret", {}).get("secretName") == server["secretName"]:
+                holders[pod] = volume["secret"].get("items")
+    only_authority = [{"key": "ca.crt", "path": "ca.crt"}]
+    assert holders == {
+        "Deployment/engineering-control-temporal": None,  # the whole secret: it is the server
+        "Job/temporal-namespace": only_authority,
+        "Deployment/engineering-control-api": only_authority,
+        "Deployment/engineering-control-workflow-worker": only_authority,
+    }
+    # The clients find the authority where the settings say it is.
+    for pod in (
+        "Deployment/engineering-control-api",
+        "Deployment/engineering-control-workflow-worker",
+    ):
+        spec = dict(_pod_specs())[pod]
+        mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
+        assert f"{mounts['temporal-ca']['mountPath']}/ca.crt" == authority_file
+        assert mounts["temporal-ca"]["readOnly"] is True

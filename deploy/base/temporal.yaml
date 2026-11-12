@@ -83,6 +83,20 @@ data:
       membership:
         maxJoinDuration: 30s
         broadcastAddress: "__POD_IP__"
+      # The frontend presents the certificate of deploy/base/certificates.yaml. Temporal's
+      # own services reach the frontend by the pod address, so they are told which name
+      # the certificate carries and which authority signed it.
+      tls:
+        refreshInterval: 1h
+        frontend:
+          server:
+            certFile: /etc/temporal/tls/tls.crt
+            keyFile: /etc/temporal/tls/tls.key
+            requireClientAuth: false
+          client:
+            serverName: engineering-control-temporal
+            rootCaFiles:
+              - /etc/temporal/tls/ca.crt
       pprof:
         port: 0
     services:
@@ -249,6 +263,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       # Never on the node reserved for sandboxes (see deploy/README.md).
@@ -338,12 +353,19 @@ spec:
             - name: config-src
               mountPath: /etc/temporal/config-src
               readOnly: true
+            - name: tls
+              mountPath: /etc/temporal/tls
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config-src
           configMap:
             name: engineering-control-temporal-config
+        - name: tls
+          secret:
+            secretName: engineering-control-temporal-tls
+            defaultMode: 0440
         - name: tmp
           emptyDir: {}
 ---
@@ -390,6 +412,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       # Never on the node reserved for sandboxes (see deploy/README.md).
@@ -412,19 +435,25 @@ spec:
             - /bin/sh
             - -ec
             - |
+              # Every call verifies the server against the platform's certificate authority.
+              tls="--tls-ca-path /etc/temporal/tls/ca.crt --tls-server-name ${FRONTEND%%:*}"
               attempt=0
-              until temporal operator cluster health --address "${FRONTEND}" >/dev/null 2>&1; do
+              until temporal operator cluster health --address "${FRONTEND}" ${tls} >/dev/null 2>&1; do
                 attempt=$((attempt + 1))
-                if [ "${attempt}" -ge 60 ]; then echo "Temporal did not answer" >&2; exit 1; fi
+                if [ "${attempt}" -ge 60 ]; then
+                  echo "Temporal did not answer" >&2
+                  temporal operator cluster health --address "${FRONTEND}" ${tls} >&2 || true
+                  exit 1
+                fi
                 sleep 5
               done
-              if temporal operator namespace describe --address "${FRONTEND}" \
+              if temporal operator namespace describe --address "${FRONTEND}" ${tls} \
                   --namespace "${PLATFORM_NAMESPACE}" >/dev/null 2>&1; then
                 echo "namespace ${PLATFORM_NAMESPACE} already exists"
               else
-                temporal operator namespace create --address "${FRONTEND}" \
+                temporal operator namespace create --address "${FRONTEND}" ${tls} \
                   --namespace "${PLATFORM_NAMESPACE}" --retention 30d
-                temporal operator namespace describe --address "${FRONTEND}" \
+                temporal operator namespace describe --address "${FRONTEND}" ${tls} \
                   --namespace "${PLATFORM_NAMESPACE}" >/dev/null
                 echo "namespace ${PLATFORM_NAMESPACE} created"
               fi
@@ -449,6 +478,17 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: temporal-ca
+              mountPath: /etc/temporal/tls
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        # The certificate authority only; the key of the server certificate is not mounted.
+        - name: temporal-ca
+          secret:
+            secretName: engineering-control-temporal-tls
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
