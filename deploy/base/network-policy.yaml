@@ -16,12 +16,13 @@ spec:
     - from:
         - podSelector: {}
 ---
-# The console is the one process with a route from outside. Its HTTP port accepts
-# connections from anywhere in the cluster, because the ingress controller's namespace and
-# labels are not known yet (it is not visible through Argo CD, and a rule on the usual
-# `ingress-nginx` label left the console unreachable). Narrow this to the controller once
-# `docs/design/cluster-facts.sh` has been run. What it opens is the sign-in page that is
-# public anyway; no other port and no other pod.
+# The console is the one process with a route from outside. The ingress controller runs on
+# a node's own network (mus-srv-0), so the console sees its connections arrive from a node
+# address, which a rule that selects pods can never match. Its HTTP port therefore accepts
+# the cluster's nodes and nothing else: each node's address and the address its traffic to
+# pods on other nodes carries (the first address of its pod range). No pod outside the
+# namespace can reach the console. If a node is added or renumbered, this list and
+# ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS change with it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -35,7 +36,20 @@ spec:
       app.kubernetes.io/component: console
   policyTypes: ["Ingress"]
   ingress:
-    - ports:
+    - from:
+        # mus-srv-0, where the ingress controller runs
+        - ipBlock: {cidr: 10.0.1.1/32}
+        - ipBlock: {cidr: 10.42.0.0/32}
+        # kind
+        - ipBlock: {cidr: 100.64.0.7/32}
+        - ipBlock: {cidr: 10.42.3.0/32}
+        # github-actions
+        - ipBlock: {cidr: 100.64.0.6/32}
+        - ipBlock: {cidr: 10.42.5.0/32}
+        # aibot
+        - ipBlock: {cidr: 100.64.0.5/32}
+        - ipBlock: {cidr: 10.42.17.0/32}
+      ports:
         - protocol: TCP
           port: 8750
 ---

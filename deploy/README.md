@@ -33,6 +33,22 @@ that cannot show a certificate signed by it. The server's key is mounted in the 
 pod alone. cert-manager renews both; the server rereads its certificate every hour.
 Clients do not present a certificate: the network policy decides who may connect.
 
+Only the console is reachable from outside. The ingress controller runs on a node's own
+network, so a network policy lets the cluster's nodes, by address, reach the console's HTTP
+port; no pod outside the namespace can. Every other port and every other pod accepts
+connections from its own namespace only. The node addresses are listed in
+`base/network-policy.yaml` and, for the sign-in counter, in `base/configuration.yaml`; both
+change if a node is added or renumbered.
+
+## TLS to Temporal
+
+`base/certificates.yaml` asks the cluster's cert-manager for a certificate authority of the
+platform's own and for the certificate the Temporal server presents. The API, the workflow
+worker and the namespace Job mount the authority's certificate only, and refuse a server
+that cannot show a certificate signed by it. The server's key is mounted in the Temporal
+pod alone. cert-manager renews both; the server rereads its certificate every hour.
+Clients do not present a certificate: the network policy decides who may connect.
+
 Only the console is reachable from outside. A network policy opens the console's HTTP port
 to the cluster so that the ingress controller can reach it; every other port and every other
 pod accepts connections from its own namespace only. The rule should be narrowed to the

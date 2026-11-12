@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -156,8 +157,9 @@ def test_only_the_console_has_a_route_from_outside_and_only_over_https() -> None
         assert last > 4
 
 
-def test_only_the_console_port_accepts_connections_from_outside_the_namespace() -> None:
-    policies = [d for d in _documents() if d["kind"] == "NetworkPolicy"]
+def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
+    documents = _documents()
+    policies = [d for d in documents if d["kind"] == "NetworkPolicy"]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]
     [policy] = [p for p in policies if p["spec"]["ingress"] != same_namespace]
@@ -165,7 +167,21 @@ def test_only_the_console_port_accepts_connections_from_outside_the_namespace() 
         "app.kubernetes.io/name": "engineering-control",
         "app.kubernetes.io/component": "console",
     }
-    assert policy["spec"]["ingress"] == [{"ports": [{"protocol": "TCP", "port": 8750}]}]
+    [rule] = policy["spec"]["ingress"]
+    assert rule["ports"] == [{"protocol": "TCP", "port": 8750}]
+    # Single addresses only: no range that could hold a pod, no selector, no exception.
+    assert rule["from"] and all(set(peer) == {"ipBlock"} for peer in rule["from"])
+    addresses = [peer["ipBlock"]["cidr"] for peer in rule["from"]]
+    assert all(set(peer["ipBlock"]) == {"cidr"} for peer in rule["from"])
+    assert all(cidr.endswith("/32") for cidr in addresses) and len(set(addresses)) == len(addresses)
+    # The same addresses, and only they, may name the client a sign-in is counted against.
+    settings = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+    )
+    trusted = json.loads(settings["ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS"])
+    assert sorted(trusted) == sorted(addresses)
 
 
 def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it() -> None:
