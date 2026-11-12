@@ -113,6 +113,10 @@ def _tail(command: dict[str, Any], limit: int = 400) -> str:
     return " ".join(said.split())[-limit:]
 
 
+def _short(text: str, limit: int = 240) -> str:
+    return " ".join(text.split())[-limit:]
+
+
 def _last_line(command: dict[str, Any]) -> str:
     lines = str(command.get("stdout") or "").strip().splitlines()
     return lines[-1].strip() if lines else ""
@@ -281,7 +285,12 @@ class DeliverIssue:
                 account_reason="The stored sign-in could not be read. Sign the account in again.",
             )
             if agent.get("name") == "setup"
-            else steps.account_problem(agent, datetime.now(UTC))
+            # Only what the client itself reported: the rest of an agent's output is the
+            # repository's own text and says nothing about the account.
+            else steps.account_problem(
+                {"stdout": deliver.agent_errors(item.provider or "", commands)},
+                datetime.now(UTC),
+            )
         )
         if problem is None:
             return None
@@ -316,21 +325,40 @@ class DeliverIssue:
         provider = item.provider or ""
         answer = deliver.agent_answer(provider, commands)
         agent = next((c for c in commands if c.get("name") == "agent"), commands[0])
+        commit = next((c for c in commands if c.get("name") == "commit"), None)
+        head = _last_line(commit) if commit and commit.get("exit_code") == 0 else ""
+        changed = len(head) == 40 and head != item.run_data.get("base_sha")
         if answer is None:
-            return _failed("no_answer", f"The implementer gave no answer: {_tail(agent)}")
+            # The agent ended without its closing answer: it ran out of time, or the
+            # provider cut its last message off. Work it did is not thrown away for that:
+            # it is committed, and the reviewer and the tests judge it as it is.
+            why = (
+                "it ran out of time"
+                if agent.get("timed_out")
+                else _short(deliver.agent_errors(provider, commands)) or "it ended early"
+            )
+            if not changed:
+                return _failed(
+                    "no_answer", f"The implementer changed nothing and gave no answer: {why}"
+                )
+            answer = {
+                "decision": "COMPLETE",
+                "summary": f"The implementer ended without its closing answer ({why}). What "
+                "it changed is committed and is reviewed as it stands.",
+                "tests": [],
+                "blocked_reason": "",
+            }
         if answer.get("decision") != "COMPLETE":
             reason = str(answer.get("blocked_reason") or answer.get("summary") or "no reason given")
             return Result(
                 Verdict(False, "blocked", f"The implementer could not resolve the issue: {reason}"),
                 output=answer,
             )
-        commit = next((c for c in commands if c.get("name") == "commit"), None)
-        head = _last_line(commit) if commit and commit.get("exit_code") == 0 else ""
         if len(head) != 40:
             return _failed(
                 "commit_failed", f"The change could not be committed: {_tail(commit or agent)}"
             )
-        if head == item.run_data.get("base_sha"):
+        if not changed:
             return Result(
                 Verdict(False, "no_change", "The implementer says it is done but changed nothing."),
                 output=answer,
@@ -381,7 +409,21 @@ class DeliverIssue:
         answer = deliver.agent_answer(item.provider or "", commands)
         agent = next((c for c in commands if c.get("name") == "agent"), commands[0])
         if answer is None:
-            return _failed("no_answer", f"The reviewer gave no answer: {_tail(agent)}")
+            why = (
+                "it ran out of time"
+                if agent.get("timed_out")
+                else _short(deliver.agent_errors(item.provider or "", commands)) or "it ended early"
+            )
+            asked = int(item.input.get("asked_again") or 0)
+            if asked >= 1:
+                return _failed("no_answer", f"The reviewer gave no answer twice: {why}")
+            # A review without a verdict is no review: ask once more.
+            return Result(
+                Verdict(
+                    True, "no_answer", f"The reviewer gave no answer ({why}). It is asked again."
+                ),
+                follow=(Follow("review", item.provider, {**item.input, "asked_again": asked + 1}),),
+            )
         decision = answer.get("decision")
         summary = str(answer.get("summary") or "")[:500]
         if decision == "PASS":

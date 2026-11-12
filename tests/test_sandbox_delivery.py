@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -794,3 +795,139 @@ def test_the_console_starts_a_delivery_and_decides_with_the_password(world: Any)
         assert decided.status_code == 200 and decided.json()["state"] == "running"
         assert "Run #11 Signing in fails" in client.get("/api/dashboard/activity/recent").text
     repository.engine.dispose()
+
+
+# What Codex 0.167.2 really printed when its closing answer ran away (run 59c44470).
+CUT_OFF = "\n".join(
+    [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "aggregated_output": "GET /callback -> 401 Unauthorized; rate limit reached; "
+                    "please run /login",
+                },
+            }
+        ),
+        json.dumps(
+            {"type": "error", "message": "Incomplete response returned, reason: max_output_tokens"}
+        ),
+        json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "Incomplete response returned, reason: max_output_tokens"},
+            }
+        ),
+    ]
+)
+
+
+@pytest.mark.asyncio
+async def test_work_is_kept_when_the_implementer_ends_without_its_closing_answer(
+    world: Any,
+) -> None:
+    codex = world.account("ChatGPT one", "chatgpt")
+    world.account("Claude one", "claude")
+    run = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
+    await world.step("prepare", _prepared())
+    await world.launcher.tick()
+    commands = world.job()["commands"]
+    assert [(c["name"], c.get("allow_failure", False)) for c in commands] == [
+        ("agent", True),
+        ("answer", True),
+        ("commit", False),
+    ], "the commit happens whatever became of the agent"
+    world.fake.finish(
+        _log(
+            [
+                _ran("agent", CUT_OFF, exit_code=1),
+                _ran("answer", exit_code=1, stderr="No such file"),
+                _ran("commit", f"{HEAD}\n"),
+            ]
+        )
+    )
+    await world.launcher.tick()
+    step = world.run(run["id"])["steps"][1]
+    assert (step["state"], step["outcome"]) == ("succeeded", "implemented")
+    assert "without its closing answer" in step["detail"] and "max_output_tokens" in step["detail"]
+    # What the repository's own output said about tokens and limits is not about the account.
+    assert world.accounts.get(codex)["state"] == "unchecked"
+    await world.launcher.tick()
+    prompt = world.job()["commands"][0]["stdin"]
+    assert "ended without its closing answer" in prompt, "the reviewer is told"
+    world.fake.finish(_reviewed())
+    await world.launcher.tick()
+    assert world.run(run["id"])["steps"][-1]["name"] == "verify"
+
+    # Nothing changed and no answer: there is nothing to go on with.
+    world.runs.request_cancel(UUID(run["id"]))
+    await world.launcher.tick()
+    empty = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
+    await world.step("prepare", _prepared())
+    await world.step(
+        "implement",
+        _log(
+            [
+                _ran("agent", CUT_OFF, exit_code=1),
+                _ran("answer", exit_code=1),
+                _ran("commit", f"{BASE}\n"),
+            ]
+        ),
+    )
+    ended = world.run(empty["id"])
+    assert (ended["state"], ended["outcome"]) == ("failed", "no_answer")
+    assert "changed nothing" in ended["detail"] and "max_output_tokens" in ended["detail"]
+    await world.github.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_without_a_verdict_is_asked_once_more(world: Any) -> None:
+    world.account("ChatGPT one", "chatgpt")
+    world.account("Claude one", "claude")
+    run = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
+    await world.step("prepare", _prepared())
+    await world.step("implement", _implemented())
+    silent = _log([_ran("agent", "not an event\n", exit_code=1, stderr="crashed"), _ran("restore")])
+    await world.step("review", silent)
+    steps_now = world.run(run["id"])["steps"]
+    assert steps_now[-2]["outcome"] == "no_answer" and "asked again" in steps_now[-2]["detail"]
+    assert (steps_now[-1]["name"], steps_now[-1]["provider"]) == ("review", "claude")
+    await world.step("review", silent)
+    ended = world.run(run["id"])
+    assert (ended["state"], ended["outcome"]) == ("failed", "no_answer")
+    assert "twice" in ended["detail"]
+    await world.github.aclose()
+
+
+def test_only_the_clients_own_errors_say_something_about_the_account() -> None:
+    assert deliver.agent_errors("chatgpt", [_ran("agent", CUT_OFF, exit_code=1)]) == (
+        "Incomplete response returned, reason: max_output_tokens\n"
+        "Incomplete response returned, reason: max_output_tokens"
+    )
+    refused = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "api_error_status": 401,
+            "result": "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+        }
+    )
+    noise = json.dumps(
+        {"type": "assistant", "message": {"content": "the test prints 429 rate limit"}}
+    )
+    said = deliver.agent_errors("claude", [_ran("agent", f"{noise}\n{refused}\n", exit_code=1)])
+    assert said.startswith("401 Failed to authenticate") and "429" not in said
+    verdict = steps.account_problem({"stdout": said}, datetime.now(UTC))
+    assert verdict is not None and verdict.account_state == "sign_in_required"
+    assert (
+        steps.account_problem(
+            {"stdout": deliver.agent_errors("claude", [_ran("agent", noise)])}, datetime.now(UTC)
+        )
+        is None
+    )
+    # A client that printed no events at all: the end of what it did print.
+    assert "usage limit" in deliver.agent_errors(
+        "chatgpt", [_ran("agent", stderr="You've hit your usage limit.", exit_code=1)]
+    )
+    assert deliver.agent_errors("chatgpt", [_ran("commit")]) == ""

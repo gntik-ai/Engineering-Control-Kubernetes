@@ -309,6 +309,9 @@ def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) 
                 "stdin": prompt,
                 "timeout": 3000,
                 "echo": 1_500_000,
+                # An agent that ends badly does not end the step: what it changed is still
+                # committed and what it answered, if anything, is still read.
+                "allow_failure": True,
             }
         ]
         files: list[dict[str, str]] = []
@@ -336,8 +339,14 @@ def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) 
                 "stdin": prompt,
                 "timeout": 3000,
                 "echo": 1_500_000,
+                "allow_failure": True,
             },
-            {"name": "answer", "argv": ["cat", "/tmp/answer.json"], "timeout": 30},  # noqa: S108
+            {
+                "name": "answer",
+                "argv": ["cat", "/tmp/answer.json"],  # noqa: S108
+                "timeout": 30,
+                "allow_failure": True,
+            },
         ]
         files = [{"path": "/tmp/answer-schema.json", "content": schema_text}]  # noqa: S108
     return {**account_setup(provider, generation), "files": files, "commands": commands}
@@ -548,6 +557,38 @@ def agent_answer(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any
             return _object(str(event.get("result") or ""))
         return None
     return _object(str((by_name.get("answer") or {}).get("stdout") or "").strip())
+
+
+def agent_errors(provider: str, commands: list[dict[str, Any]]) -> str:
+    """What the client itself reported as an error, and nothing else it printed.
+
+    An agent's output holds whatever it read and ran: test output, source code, the text
+    of an issue. Words like "unauthorized" or "rate limit" in there say nothing about the
+    account. Only the client's own error events do, or, when it printed no events at all,
+    the end of its error output.
+    """
+    agent = next((c for c in commands if c.get("name") == "agent"), None)
+    if agent is None:
+        return ""
+    found: list[str] = []
+    seen_events = False
+    for line in str(agent.get("stdout") or "").splitlines():
+        event = _object(line) if line.startswith("{") else None
+        if event is None:
+            continue
+        seen_events = True
+        kind = event.get("type")
+        if provider == "claude":
+            if kind == "result" and event.get("is_error"):
+                found.append(f"{event.get('api_error_status') or ''} {event.get('result') or ''}")
+        elif kind == "error":
+            found.append(str(event.get("message") or ""))
+        elif kind == "turn.failed":
+            found.append(str((event.get("error") or {}).get("message") or ""))
+    if not seen_events:
+        found.append(str(agent.get("stderr") or "")[-1500:])
+        found.append(str(agent.get("stdout") or "")[-1500:])
+    return "\n".join(part for part in found if part.strip())[-4000:]
 
 
 def protected_paths(paths: list[str]) -> list[str]:
