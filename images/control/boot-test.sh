@@ -54,7 +54,11 @@ docker run --detach --name boot-postgres --publish 127.0.0.1:55432:5432 \
 temporal server start-dev --ip 127.0.0.1 --port 7233 --namespace engineering-control \
   --headless --log-level warn >"${work}/temporal.log" 2>&1 &
 temporal_pid=$!
-wait_for "PostgreSQL" 60 docker exec boot-postgres pg_isready --username postgres
+# Over TCP, not the socket: while the image initialises a new database it runs a temporary
+# server that answers on the socket only and is then shut down. A check on the socket can
+# find that one, and the next command then meets a server that is going away.
+wait_for "PostgreSQL" 90 docker exec boot-postgres \
+  pg_isready --host 127.0.0.1 --port 5432 --username postgres
 docker exec boot-postgres psql --username postgres --quiet \
   --command "CREATE ROLE engineering_control LOGIN PASSWORD 'boot_only'" \
   --command "CREATE DATABASE engineering_control OWNER engineering_control ENCODING 'UTF8' TEMPLATE template0"
