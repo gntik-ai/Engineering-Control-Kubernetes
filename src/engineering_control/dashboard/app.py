@@ -140,6 +140,9 @@ def create_app(
         LOGGER.info("%s; suppressed_failures=%d", message, suppressed)
 
     login_limiter = limiter or LoginFailureLimiter()
+    trusted_proxies = tuple(
+        ipaddress.ip_network(value) for value in resolved.dashboard_trusted_proxy_networks
+    )
     templates = Jinja2Templates(directory=TEMPLATE_ROOT)
     templates.env.undefined = StrictUndefined
 
@@ -179,7 +182,7 @@ def create_app(
             resolved_operations.engine.dispose()
 
     app = FastAPI(
-        title="Hermes Engineering Operations Dashboard",
+        title="Engineering Control Console",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -378,7 +381,7 @@ def create_app(
         csrf = form.get("csrf_token", "")
         csrf_cookie = request.cookies.get(LOGIN_CSRF_COOKIE, "")
         next_path = _safe_next(form.get("next_path"))
-        address = _client_address(request)
+        address = _client_address(request, trusted_proxies)
         csrf_valid = (
             bool(csrf)
             and bool(csrf_cookie)
@@ -816,7 +819,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        address = _client_address(request)
+        address = _client_address(request, trusted_proxies)
         if login_limiter.blocked(f"reauth:{address}"):
             return JSONResponse({"detail": "unable to authorize action"}, status_code=429)
         try:
@@ -1050,19 +1053,28 @@ def _safe_next(value: str | None) -> str:
     return "/console"
 
 
-def _client_address(request: Request) -> str:
+def _client_address(
+    request: Request,
+    trusted_proxies: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (),
+) -> str:
+    """The address sign-in attempts are counted against.
+
+    The forwarded address is believed only when the connection comes from a proxy: the
+    loopback interface, or a network named in the settings. The entry used is the last
+    one, the one the nearest proxy wrote; earlier entries are whatever the client sent.
+    """
     direct = request.client.host if request.client else "unknown"
     try:
         direct_ip = ipaddress.ip_address(direct)
     except ValueError:
         return direct
-    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    if direct_ip.is_loopback and forwarded:
-        try:
-            return str(ipaddress.ip_address(forwarded))
-        except ValueError:
-            return direct
-    return direct
+    if not direct_ip.is_loopback and not any(direct_ip in network for network in trusted_proxies):
+        return direct
+    forwarded = request.headers.get("x-forwarded-for", "").rsplit(",", 1)[-1].strip()
+    try:
+        return str(ipaddress.ip_address(forwarded))
+    except ValueError:
+        return direct
 
 
 def _request_host(value: str | None) -> str:

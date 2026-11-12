@@ -14,6 +14,9 @@ data:
   ENGINEERING_API_SERVICE_NAME: engineering-control-api
   ENGINEERING_DASHBOARD_HOST: 0.0.0.0
   ENGINEERING_EVIDENCE_INGEST_HOST: 0.0.0.0
+  # The ingress controller connects from the pod network; only such connections may say
+  # which client address a sign-in attempt is counted against.
+  ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS: '["10.42.0.0/16"]'
   ENGINEERING_API_TOKEN_FILE: /var/run/secrets/engineering-control/api.token
   ENGINEERING_DASHBOARD_SESSION_KEY_FILE: /var/run/secrets/engineering-control/session.key
   ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE: /var/run/secrets/engineering-control/evidence-ingest.token

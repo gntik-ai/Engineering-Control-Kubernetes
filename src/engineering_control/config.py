@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from functools import lru_cache
@@ -284,6 +285,9 @@ class Settings(BaseSettings):
         "http://127.0.0.1:8750",
         "http://localhost:8750",
     )
+    # In a cluster, the networks the ingress controller connects from. Only connections
+    # from them (and from loopback) may say which client address they forward.
+    dashboard_trusted_proxy_networks: tuple[str, ...] = ()
     dashboard_session_key_file: Path = Path("/etc/engineering-control/dashboard/session.key")
     dashboard_session_hours: int = Field(default=12, ge=1, le=24)
     dashboard_event_retention_days: int = Field(default=30, ge=1, le=365)
@@ -324,6 +328,8 @@ class Settings(BaseSettings):
             return self
         if self.api_service_name is not None:
             raise ValueError("an API service name is only meaningful inside a cluster")
+        if self.dashboard_trusted_proxy_networks:
+            raise ValueError("trusted proxy networks are only meaningful inside a cluster")
         every_interface = {"0.0.0.0", "::"}  # noqa: S104 - these values are explicitly rejected
         if self.api_host in every_interface:
             raise ValueError("the Engineering Control API cannot bind to every interface")
@@ -342,6 +348,17 @@ class Settings(BaseSettings):
         if any("/" in item or "@" in item or len(item) > 253 for item in normalized):
             raise ValueError("dashboard allowed host is invalid")
         return normalized
+
+    @field_validator("dashboard_trusted_proxy_networks")
+    @classmethod
+    def bounded_proxy_networks(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 8:
+            raise ValueError("at most 8 trusted proxy networks may be named")
+        for item in value:
+            network = ipaddress.ip_network(item)  # raises ValueError for anything else
+            if network.prefixlen == 0:
+                raise ValueError("a trusted proxy network cannot be every address")
+        return value
 
     @field_validator("dashboard_allowed_origins")
     @classmethod

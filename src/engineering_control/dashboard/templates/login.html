@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  <title>{{ title }} · Hermes Engineering</title>
+  <title>{{ title }} · Engineering Control</title>
   <link rel="icon" href="/login?asset=icon">
   <link rel="stylesheet" href="/login?asset=css">
 </head>
 <body class="login-page">
   <main class="login-card">
-    <p class="eyebrow">Hermes</p>
-    <h1>Engineering Operations</h1>
-    <p class="muted">Enter the dashboard password. There is no username.</p>
+    <p class="eyebrow">Console</p>
+    <h1>Engineering Control</h1>
+    <p class="muted">Enter the administrator password. There is no username.</p>
     {% if error %}<p class="alert error" role="alert">{{ error }}</p>{% endif %}
     <form action="/login" method="post" autocomplete="on">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
