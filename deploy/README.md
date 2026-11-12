@@ -22,7 +22,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
 Not deployed yet: the scheduler (it would start recurring workflows whose activities need
-role workers that do not exist yet) and the sandboxes.
+role workers that do not exist yet) and the launcher that starts sandboxes.
 
 ## TLS to Temporal
 
@@ -101,6 +101,30 @@ After the first synchronisation the initial dashboard password is in the Secret
 ```bash
 kubectl -n engineering-control get secret engineering-control-admin -o jsonpath='{.data.initial-password}' | base64 -d
 ```
+
+## The sandbox namespace and the accounts
+
+`deploy/sandboxes` is a second Argo CD application (`deploy/argocd/sandboxes-application.yaml`)
+for the namespace `engineering-control-sandboxes`. The cluster refuses any pod there that is
+not unprivileged in every respect (pod security level "restricted"), and a network policy
+denies all traffic in and out until a rule allows it. Nothing runs there by manifest: the
+platform starts one sandbox per run.
+
+A subscription account is a record in the database and a Secret in that namespace, named
+`account-<id>`. The administrator signs an account in on their own computer with the
+provider's client and pastes the result in the console (Accounts → Sign in):
+
+| Subscription | Client | What is pasted | How a sandbox uses it |
+| --- | --- | --- | --- |
+| Claude | Claude Code | the token `claude setup-token` prints | as `CLAUDE_CODE_OAUTH_TOKEN` |
+| ChatGPT | Codex | the content of `~/.codex/auth.json` after `codex login` | as the sign-in file of the account's Codex home, which Codex renews in place |
+
+Anything that looks like an API key is refused. The console's pod has an identity of its
+own for this one purpose (`engineering-control-console`, a token valid for an hour, mounted
+explicitly). In the sandbox namespace it may create, replace and delete Secrets; it cannot
+read one back or list them, and in its own namespace it may do nothing. What was pasted
+goes from the browser to the console to the cluster and is not written to the database or
+to the activity record.
 
 ## The sandbox image
 

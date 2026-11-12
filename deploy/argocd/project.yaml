@@ -13,6 +13,9 @@ spec:
   destinations:
     - server: https://kubernetes.default.svc
       namespace: engineering-control
+    # Where the sandboxes run (deploy/sandboxes).
+    - server: https://kubernetes.default.svc
+      namespace: engineering-control-sandboxes
   clusterResourceWhitelist:
     - group: ""
       kind: Namespace

@@ -10,6 +10,20 @@ automountServiceAccountToken: false
 imagePullSecrets:
   - name: engineering-control-registry
 ---
+# The console stores the sign-ins of subscription accounts in the sandbox namespace. Its
+# identity is not mounted by default: the console's pod asks for a short-lived token
+# explicitly. What it may do with it is in deploy/sandboxes/access.yaml: write and delete
+# Secrets there, never read one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: engineering-control-console
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+automountServiceAccountToken: false
+imagePullSecrets:
+  - name: engineering-control-registry
+---
 # The bootstrap Jobs may read and write Secrets in this namespace, and nothing else.
 apiVersion: v1
 kind: ServiceAccount

@@ -29,12 +29,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0027 (the backlog) follows 0026 (sections of a project) and 0025 (projects as
-    # records), which follow
+    # 0028 (subscription accounts) follows 0027 (the backlog), 0026 (sections of a
+    # project) and 0025 (projects as records), which follow
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0027", "0026")
+    assert (head, parent) == ("0028", "0027")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -88,6 +88,24 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0028: subscription accounts. An account that is not removed still has its sign-in
+    # stored in the cluster, so a downgrade must not drop its record.
+    assert "provider_accounts" in inspect(engine).get_table_names()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO provider_accounts (id, name, provider, state, paused, "
+                "max_concurrent, credential_generation, created_at, updated_at) VALUES "
+                "('00000000000000000000000000000005', 'Claude one', 'claude', 'signed_out', "
+                "FALSE, 2, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="refuses to drop accounts that are not removed"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE provider_accounts SET archived_at = CURRENT_TIMESTAMP"))
+    command.downgrade(config, parent)
+    assert "provider_accounts" not in inspect(engine).get_table_names()
     # 0027: the backlog. An item the administrator wrote must not be lost by a downgrade;
     # one that only mirrors a GitHub issue can be imported again.
     assert {"backlog_items", "backlog_syncs"} <= set(inspect(engine).get_table_names())
@@ -106,10 +124,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
                 {"id": item_id, "source": source, "routed_by": routed_by},
             )
     with pytest.raises(RuntimeError, match="refuses to drop backlog items the administrator"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0026")
     with engine.begin() as connection:
         connection.execute(text("DELETE FROM backlog_items WHERE source = 'manual'"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0026")
     assert "backlog_items" not in inspect(engine).get_table_names()
     assert "backlog_syncs" not in inspect(engine).get_table_names()
     # A section the administrator added must not be lost by a downgrade.

@@ -87,9 +87,12 @@ export interface SyncResult {
 
 /** One thing waiting for the administrator, and how many items it covers. */
 export interface InboxEntry {
-  kind: 'sync_failed' | 'section_without_flow' | 'unrouted' | 'undecided';
-  project: string;
-  project_name: string;
+  kind: 'account_sign_in' | 'sync_failed' | 'section_without_flow' | 'unrouted' | 'undecided';
+  /** Null for an entry that is about an account, not a project. */
+  project: string | null;
+  project_name: string | null;
+  account?: string;
+  account_id?: string;
   section: { key: string; name: string } | null;
   count: number;
   detail: string | null;
@@ -98,6 +101,41 @@ export interface InboxEntry {
 export interface Inbox {
   items: InboxEntry[];
   total: number;
+}
+
+/** A subscription sign-in the agents work with. */
+export interface Account {
+  id: string;
+  name: string;
+  provider: string;
+  provider_name: string;
+  client: string | null;
+  state: 'signed_out' | 'unchecked' | 'ready' | 'limited' | 'sign_in_required';
+  state_reason: string | null;
+  paused: boolean;
+  max_concurrent: number;
+  identity: string | null;
+  signed_in_at: string | null;
+  checked_at: string | null;
+  last_used_at: string | null;
+  limited_until: string | null;
+}
+
+/** A kind of subscription, and how the administrator signs one in. */
+export interface ProviderType {
+  key: string;
+  name: string;
+  client: string | null;
+  credential: 'token' | 'auth_file' | null;
+  available: boolean;
+  steps: string[];
+  note: string;
+}
+
+export interface Accounts extends Listing<Account> {
+  providers: ProviderType[];
+  /** False when this installation has nowhere to store a sign-in. */
+  sign_in_available: boolean;
 }
 
 /** A repository the GitHub App is installed on. */
@@ -229,6 +267,9 @@ export class ApiError extends Error {
 }
 
 /** A change: the session's CSRF token is fetched and sent with the body. */
+/** Sent on the window after every change the administrator made. */
+export const CHANGED = 'engineering-control:changed';
+
 export async function postJson<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
   const controller = new AbortController();
   const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
@@ -247,6 +288,8 @@ export async function postJson<T>(path: string, body: Record<string, unknown> = 
     const detail = typeof payload?.detail === 'string' ? payload.detail : `The request was refused (${response.status}).`;
     throw new ApiError(detail, response.status);
   }
+  // Something changed: whatever counts things (the inbox in the navigation) counts again.
+  window.dispatchEvent(new Event(CHANGED));
   return payload as T;
 }
 

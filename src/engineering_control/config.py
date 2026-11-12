@@ -210,6 +210,17 @@ class Settings(BaseSettings):
     # The one Telegram account the chat channel answers: the administrator's numeric user
     # id. The bot's token is a mounted secret, never a setting.
     telegram_administrator_id: int | None = Field(default=None, ge=1)
+    # The namespace the sandboxes run in. Without it the platform acts on no cluster:
+    # accounts can be listed but not signed in, and nothing can be run.
+    sandbox_namespace: str | None = Field(
+        default=None, pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    )
+    # The cluster's own API, and the identity and certificate authority the kubelet mounts.
+    cluster_api_server: str = Field(
+        default="https://kubernetes.default.svc", pattern=r"^https://[A-Za-z0-9.-]+(:\d{1,5})?$"
+    )
+    cluster_token_file: Path = Path("/var/run/secrets/engineering-control-cluster/token")
+    cluster_ca_file: Path = Path("/var/run/secrets/engineering-control-cluster/ca.crt")
     llmwiki_staging_bootstrap_enabled: bool = False
     application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH

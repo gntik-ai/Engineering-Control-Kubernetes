@@ -19,6 +19,9 @@ THIRD_PARTY_IMAGES = {
     "temporalio/admin-tools:1.31.2@sha256:dbc5fcd6ee8f0f4d808bf765af9a87dea9d8a283abfdcfbd2fc148496ba66107",
 }
 BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
+CONSOLE_ACCOUNT = "engineering-control-console"
+SANDBOXES = BASE.parent / "sandboxes"
+SANDBOX_NAMESPACE = "engineering-control-sandboxes"
 
 
 def _documents() -> list[dict[str, Any]]:
@@ -77,21 +80,100 @@ def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
         assert not any("hostPath" in volume for volume in spec.get("volumes", [])), name
 
 
-def test_only_the_bootstrap_jobs_have_a_cluster_identity() -> None:
+def test_only_the_bootstrap_jobs_and_the_console_have_a_cluster_identity() -> None:
     for name, spec in _pod_specs():
+        tokens = [
+            source
+            for volume in spec.get("volumes", [])
+            for source in volume.get("projected", {}).get("sources", [])
+            if "serviceAccountToken" in source
+        ]
         if spec["serviceAccountName"] == BOOTSTRAP_ACCOUNT:
             assert name in {"Job/bootstrap-secrets", "Job/bootstrap-admin-password"}
             assert spec["automountServiceAccountToken"] is True
+        elif spec["serviceAccountName"] == CONSOLE_ACCOUNT:
+            # The console asks for its token explicitly: short-lived, in a volume of its
+            # own, readable by its group only.
+            assert name == "Deployment/engineering-control-console"
+            assert spec["automountServiceAccountToken"] is False
+            assert tokens == [{"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}]
+            volume = next(v for v in spec["volumes"] if "projected" in v)
+            assert volume["projected"]["defaultMode"] == 0o440
         else:
             assert spec["serviceAccountName"] == "engineering-control", name
             assert spec["automountServiceAccountToken"] is False, name
+            assert tokens == [], name
     accounts = {d["metadata"]["name"]: d for d in _documents() if d["kind"] == "ServiceAccount"}
+    assert set(accounts) == {"engineering-control", BOOTSTRAP_ACCOUNT, CONSOLE_ACCOUNT}
     assert all(account["automountServiceAccountToken"] is False for account in accounts.values())
-    # Both pull the private image with the Secret deploy/registry creates.
+    # All pull the private image with the Secret deploy/registry creates.
     assert all(
         account["imagePullSecrets"] == [{"name": "engineering-control-registry"}]
         for account in accounts.values()
     )
+    # In its own namespace the console's identity may do nothing: no role is bound to it.
+    for binding in (d for d in _documents() if d["kind"] == "RoleBinding"):
+        assert CONSOLE_ACCOUNT not in {subject["name"] for subject in binding["subjects"]}
+
+
+def _sandbox_documents() -> list[dict[str, Any]]:
+    kustomization = yaml.safe_load((SANDBOXES / "kustomization.yaml").read_text())
+    assert "namespace" not in kustomization, "every object names its namespace itself"
+    assert {path.name for path in SANDBOXES.glob("*.yaml")} == {
+        "kustomization.yaml",
+        *kustomization["resources"],
+    }
+    documents: list[dict[str, Any]] = []
+    for name in kustomization["resources"]:
+        documents.extend(d for d in yaml.safe_load_all((SANDBOXES / name).read_text()) if d)
+    return documents
+
+
+def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None:
+    documents = _sandbox_documents()
+    namespace = next(d for d in documents if d["kind"] == "Namespace")
+    assert namespace["metadata"]["name"] == SANDBOX_NAMESPACE
+    assert namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
+    for document in documents:
+        if document["kind"] != "Namespace":
+            assert document["metadata"]["namespace"] == SANDBOX_NAMESPACE, document["kind"]
+    policies = [d for d in documents if d["kind"] == "NetworkPolicy"]
+    deny = next(p for p in policies if p["metadata"]["name"] == "deny-everything")
+    assert deny["spec"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    settings = next(
+        d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
+    )
+    assert settings["data"]["ENGINEERING_SANDBOX_NAMESPACE"] == SANDBOX_NAMESPACE
+    Settings(sandbox_namespace=SANDBOX_NAMESPACE)
+    # Argo CD may deploy to the two namespaces of the platform and to no other.
+    project = yaml.safe_load((BASE.parent / "argocd" / "project.yaml").read_text())
+    assert [d["namespace"] for d in project["spec"]["destinations"]] == [
+        "engineering-control",
+        SANDBOX_NAMESPACE,
+    ]
+    application = yaml.safe_load(
+        (BASE.parent / "argocd" / "sandboxes-application.yaml").read_text()
+    )
+    assert application["spec"]["source"]["path"] == "deploy/sandboxes"
+    assert application["spec"]["destination"]["namespace"] == SANDBOX_NAMESPACE
+    assert application["spec"]["project"] == "engineering-control"
+
+
+def test_the_console_may_write_and_delete_sign_ins_and_never_read_one() -> None:
+    documents = _sandbox_documents()
+    roles = [d for d in documents if d["kind"] in {"Role", "ClusterRole"}]
+    assert [role["kind"] for role in roles] == ["Role"]
+    assert roles[0]["rules"] == [
+        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "update", "delete"]}
+    ]
+    bindings = [d for d in documents if d["kind"] in {"RoleBinding", "ClusterRoleBinding"}]
+    assert [binding["kind"] for binding in bindings] == ["RoleBinding"]
+    assert bindings[0]["roleRef"]["name"] == roles[0]["metadata"]["name"]
+    assert bindings[0]["subjects"] == [
+        {"kind": "ServiceAccount", "name": CONSOLE_ACCOUNT, "namespace": "engineering-control"}
+    ]
+    # Nothing runs here by manifest: sandboxes are started by the platform, one per run.
+    assert not [d for d in documents if d["kind"] in {"Deployment", "Job", "StatefulSet", "Pod"}]
 
 
 def test_the_bootstrap_role_reaches_only_secrets_of_its_namespace() -> None:

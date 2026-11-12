@@ -33,6 +33,9 @@ data:
   # The chat channel answers this Telegram account only. The bot's token is in the Secret
   # engineering-control-telegram, created by the administrator.
   ENGINEERING_TELEGRAM_ADMINISTRATOR_ID: "685699815"
+  # Where the sandboxes run and the sign-ins of subscription accounts are stored
+  # (deploy/sandboxes). Only the console has an identity that may write there.
+  ENGINEERING_SANDBOX_NAMESPACE: engineering-control-sandboxes
   ENGINEERING_TEMPORAL_TARGET: engineering-control-temporal:7233
   ENGINEERING_TEMPORAL_NAMESPACE: engineering-control
   # Temporal is reached over TLS: the server must show a certificate for this name, signed

@@ -1,7 +1,8 @@
 import { Alert, Button, Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
-import { FolderKanban, Inbox as InboxIcon, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
+import { FolderKanban, Inbox as InboxIcon, KeyRound, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
 import { useEffect, useState, type ReactNode } from 'react';
-import { apiUrl, signOut, useResource, type Inbox } from './api';
+import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
+import { AccountsPage } from './pages/Accounts';
 import { ExecutionPage } from './pages/Execution';
 import { InboxPage } from './pages/Inbox';
 import { NotFoundPage } from './pages/NotFound';
@@ -26,6 +27,7 @@ const navigation = (waiting: number): NavGroup[] => [
       },
       { label: 'Projects', href: `${BASE}/projects`, icon: FolderKanban },
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
+      { label: 'Accounts', href: `${BASE}/accounts`, icon: KeyRound },
       { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
     ],
   },
@@ -36,6 +38,7 @@ const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/projects`]: () => <ProjectsPage />,
   [`${BASE}/project`]: () => <ProjectPage />,
   [`${BASE}/backlog`]: () => <BacklogPage />,
+  [`${BASE}/accounts`]: () => <AccountsPage />,
   [`${BASE}/executions`]: () => <ExecutionsPage />,
   [`${BASE}/execution`]: () => <ExecutionPage />,
 };
@@ -46,6 +49,7 @@ const TITLES: Record<string, string> = {
   [`${BASE}/projects`]: 'Projects',
   [`${BASE}/project`]: 'Project',
   [`${BASE}/backlog`]: 'Backlog',
+  [`${BASE}/accounts`]: 'Accounts',
   [`${BASE}/executions`]: 'Executions',
   [`${BASE}/execution`]: 'Execution',
 };
@@ -76,6 +80,10 @@ export default function App() {
   // What waits changes with what was just done on a page: count again on every move.
   const { reload: recount } = inbox;
   useEffect(() => recount(), [current, recount]);
+  useEffect(() => {
+    window.addEventListener(CHANGED, recount);
+    return () => window.removeEventListener(CHANGED, recount);
+  }, [recount]);
   const home = current === BASE;
   usePageTitle(home ? undefined : (TITLES[current] ?? 'Not found'));
   useEffect(() => {

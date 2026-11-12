@@ -5,7 +5,14 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
+from engineering_control.cluster import Cluster
+from engineering_control.dashboard.accounts import (
+    check_credential,
+    provider_catalogue,
+    secret_name,
+)
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
+from engineering_control.dashboard.project_records import ProjectInvalid
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.github_app import GitHubApp, GitHubAppError
@@ -235,8 +242,55 @@ class DashboardService:
         return await asyncio.to_thread(self.repository.backlog.set_state, item_id, state)
 
     async def inbox(self) -> dict[str, object]:
-        entries = await asyncio.to_thread(self.repository.backlog.inbox)
+        # An account nobody can work with stops everything, so it comes first.
+        entries = await asyncio.to_thread(
+            lambda: self.repository.accounts.inbox() + self.repository.backlog.inbox()
+        )
         return {"items": entries, "total": len(entries)}
+
+    async def accounts(self) -> dict[str, object]:
+        listing = await asyncio.to_thread(self.repository.accounts.listing)
+        return {**listing, "providers": provider_catalogue()}
+
+    async def create_account(self, *, name: str, provider: str) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.accounts.create(name=name, provider=provider)
+        )
+
+    async def update_account(self, account_id: UUID, **changes: Any) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.accounts.update(account_id, **changes)
+        )
+
+    async def sign_in_account(
+        self, account_id: UUID, pasted: str, cluster: Cluster | None
+    ) -> dict[str, object]:
+        """Check what was pasted, hand it to the cluster, then record that it is there."""
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        credential = check_credential(str(account["provider"]), pasted)
+        if cluster is None:
+            raise ProjectInvalid(
+                "This installation has no sandbox namespace, so a sign-in cannot be stored"
+            )
+        await cluster.put_secret(
+            secret_name(account_id),
+            credential.data,
+            {
+                "app.kubernetes.io/part-of": "engineering-control",
+                "engineering-control/account": str(account_id),
+                "engineering-control/provider": str(account["provider"]),
+            },
+        )
+        return await asyncio.to_thread(
+            self.repository.accounts.signed_in, account_id, credential.identity
+        )
+
+    async def remove_account(self, account_id: UUID, cluster: Cluster | None) -> dict[str, object]:
+        """The sign-in leaves the cluster first; the record is removed only when it is gone."""
+        await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if cluster is not None:
+            await cluster.delete_secret(secret_name(account_id))
+        return await asyncio.to_thread(self.repository.accounts.archive, account_id)
 
     async def bulk_items(self, project: str, **options: Any) -> dict[str, object]:
         return await asyncio.to_thread(lambda: self.repository.backlog.bulk(project, **options))

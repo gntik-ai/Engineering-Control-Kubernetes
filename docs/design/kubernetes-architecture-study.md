@@ -1779,7 +1779,7 @@ Status: **done**, **in progress**, or blank for not started.
 | A1 | Repository seeded from the original; continuous integration with lint, types, unit and replay tests | done |
 | A2 | Control-plane image | done |
 | A3 | Every control-plane process starts from configuration alone (environment and mounted secrets), proven by a boot test in CI | done for the control plane; the CLI and the role workers follow in phases 1 and 3 |
-| A4 | Manifests (Kustomize); Argo CD project and application; namespace and network policies | done for the control plane; the sandbox namespace follows in phase 3 |
+| A4 | Manifests (Kustomize); Argo CD project and application; namespace and network policies | done: the control plane, and the sandbox namespace as a second application (pod security "restricted", all traffic denied until a rule allows it) |
 | A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | in progress: both run; the server presents a certificate issued in the cluster and every client verifies it; clients do not present one yet |
 | A6 | Object storage for evidence, transcripts and change bundles | set aside: the administrator keeps evidence on a volume |
 | A7 | Secrets delivered by the cluster's secret operator | set aside for now by the administrator |
@@ -1824,7 +1824,7 @@ Status: **done**, **in progress**, or blank for not started.
 | E2 | Sandbox image with the agent clients, scanners and toolchains (done: `images/sandbox`, built, smoke-tested and pushed by CI, everything pinned by digest or hash; Node.js, pnpm, Python and uv are in it, the Rust and Go toolchains and the browsers follow when a flow needs them) |
 | E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) |
 | E4 | Isolation: network policy, no cluster identity, quotas, a dedicated node |
-| E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox. Accounts are added and removed in the console, as many as the administrator wants. Each account has a provider type, so that providers beyond Claude and ChatGPT (the administrator named DeepSeek, GLM, Kimi and Qwen) can be added later; how each of those is signed in to has to be checked when it is added |
+| E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox (done so far: accounts are records, added, signed in, paused and removed in the console; the sign-in is made with the provider's client on the administrator's computer and stored as a Secret of the sandbox namespace, API keys refused; leasing and health follow with the launcher). Accounts are added and removed in the console, as many as the administrator wants. Each account has a provider type, so that providers beyond Claude and ChatGPT (the administrator named DeepSeek, GLM, Kimi and Qwen) can be added later; how each of those is signed in to has to be checked when it is added |
 | E6 | Evidence upload with a token valid for one run |
 
 **F. Flows**

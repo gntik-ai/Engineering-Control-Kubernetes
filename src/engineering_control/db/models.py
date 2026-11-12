@@ -510,6 +510,40 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class ProviderAccount(UUIDPrimaryKey, Timestamps, Base):
+    """One subscription sign-in the agents work with (migration 0028).
+
+    The record holds no credential: that is a Secret of the sandbox namespace, named after
+    the account, written when the administrator signs the account in and replaced when they
+    do so again (``credential_generation`` counts how often). ``state`` is what the platform
+    last learned: nothing stored yet, stored and not tried, working, refused for now
+    (``limited_until``), or the provider wants a new sign-in.
+    """
+
+    __tablename__ = "provider_accounts"
+    name: Mapped[str] = mapped_column(String(60), index=True)
+    provider: Mapped[str] = mapped_column(String(16), index=True)
+    state: Mapped[str] = mapped_column(String(20))
+    state_reason: Mapped[str | None] = mapped_column(String(300))
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_concurrent: Mapped[int] = mapped_column(Integer, default=2)
+    credential_generation: Mapped[int] = mapped_column(Integer, default=0)
+    # What the sign-in says about itself and is safe to show: an address, a plan.
+    identity: Mapped[str | None] = mapped_column(String(200))
+    signed_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    limited_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('signed_out', 'unchecked', 'ready', 'limited', 'sign_in_required')",
+            name="state",
+        ),
+        CheckConstraint("max_concurrent BETWEEN 1 AND 8", name="max_concurrent"),
+    )
+
+
 class BacklogSync(Base):
     """When a project's backlog was last brought in step with GitHub, and how it went."""
 

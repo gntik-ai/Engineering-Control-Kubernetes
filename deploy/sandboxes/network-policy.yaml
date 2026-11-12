@@ -1,0 +1,13 @@
+# Nothing in this namespace is reachable and nothing in it reaches anything, until a rule
+# says otherwise. The rules that let a run reach its provider and the package registries
+# arrive with the launcher.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-everything
+  namespace: engineering-control-sandboxes
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

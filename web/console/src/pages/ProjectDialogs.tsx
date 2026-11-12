@@ -38,7 +38,7 @@ const suggestName = (display: string) =>
     .slice(0, 32)
     .replace(/-+$/, '');
 
-function useSubmit(action: () => Promise<unknown>, done: () => void) {
+export function useSubmit(action: () => Promise<unknown>, done: () => void) {
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const submit = async () => {
@@ -57,7 +57,7 @@ function useSubmit(action: () => Promise<unknown>, done: () => void) {
   return { pending, problem, submit, reset: () => setProblem(null) };
 }
 
-interface DialogProps {
+export interface DialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Called after the change was saved, before the dialog closes. */

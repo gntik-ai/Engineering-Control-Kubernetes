@@ -28,6 +28,7 @@ from fastapi.responses import (
     Response,
 )
 
+from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.admission import AdmissionReader
 from engineering_control.dashboard.auth import (
@@ -52,6 +53,10 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.project_sections import SECTION_KEY, Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
+    AccountCreateInput,
+    AccountRemoveInput,
+    AccountSignInInput,
+    AccountUpdateInput,
     ActionCandidateInput,
     ActionExecuteInput,
     ActionReauthenticationInput,
@@ -100,7 +105,7 @@ CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
 CONSOLE_VIEWS = frozenset(
-    {"", "inbox", "projects", "project", "backlog", "executions", "execution"}
+    {"", "inbox", "projects", "project", "backlog", "accounts", "executions", "execution"}
 )
 CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
 CONSOLE_ASSET_REFERENCE = re.compile(r'(?:src|href)="/console/assets/([^"]+)"')
@@ -137,6 +142,7 @@ def create_app(
     operations_repository: OperationsRepository | None = None,
     admission_reader: AdmissionReader | None = None,
     github_app: GitHubApp | None = None,
+    cluster: Cluster | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     key = session_key
@@ -243,6 +249,11 @@ def create_app(
         if resolved_github is None and repository is None:
             resolved_github = GitHubApp.from_settings(resolved)
         app.state.github_app = resolved_github
+        resolved_cluster = cluster
+        # A fixture repository never reaches a cluster by itself either.
+        if resolved_cluster is None and repository is None:
+            resolved_cluster = Cluster.from_settings(resolved)
+        app.state.cluster = resolved_cluster
         keeper: asyncio.Task[None] | None = None
         # Keep every project's backlog in step with GitHub, unless a fixture supplied the
         # app (a test drives the import itself) or the interval is zero.
@@ -261,6 +272,8 @@ def create_app(
                 await keeper
         if github_app is None and resolved_github is not None:
             await resolved_github.aclose()
+        if cluster is None and resolved_cluster is not None:
+            await resolved_cluster.aclose()
         if admission_reader is None and resolved_admission is not None:
             await resolved_admission.aclose()
         if repository is None:
@@ -789,8 +802,10 @@ def create_app(
         subject: str | None = None,
         status_code: int = 200,
         password: bool = False,
+        entity: str = "project",
     ) -> Response:
-        """One shape for every change to a project: session, body, CSRF, change, record."""
+        """One shape for every change the administrator makes: session, body, CSRF, change,
+        record. ``entity`` names what was changed, a project unless said otherwise."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
@@ -829,10 +844,10 @@ def create_app(
             return JSONResponse({"detail": str(error)}, status_code=409)
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
-        except GitHubAppError as error:
+        except (GitHubAppError, ClusterError) as error:
             return JSONResponse({"detail": str(error)}, status_code=502)
-        # What changed: a project by its name, or a section as project/section.
-        label = subject or str(changed["project"])
+        # What changed: a project by its name, a section as project/section, an account.
+        label = subject or str(changed[entity])
         action = event.rsplit(".", 1)[-1].replace("_", " ")
         await _record_safely(
             repo(request),
@@ -841,15 +856,18 @@ def create_app(
                 event_type=event,
                 source="dashboard",
                 project="platform",
-                entity_type="project",
+                entity_type=entity,
                 entity_id=label[:240],
-                message=f"Project {label}: {action}",
+                message=f"{entity.capitalize()} {label}: {action}",
             ),
         )
         return JSONResponse(changed, status_code=status_code)
 
     def github(request: Request) -> GitHubApp | None:
         return cast(GitHubApp | None, request.app.state.github_app)
+
+    def cluster_of(request: Request) -> Cluster | None:
+        return cast(Cluster | None, request.app.state.cluster)
 
     @app.get("/api/dashboard/github/repositories")
     async def github_repositories_api(request: Request) -> Response:
@@ -1034,6 +1052,62 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse(await service(request).inbox())
+
+    @app.get("/api/dashboard/accounts")
+    async def accounts_api(request: Request) -> Response:
+        """The subscription accounts, the provider types, and whether a sign-in can be
+        stored here at all."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        listing = await service(request).accounts()
+        return JSONResponse({**listing, "sign_in_available": cluster_of(request) is not None})
+
+    @app.post("/api/dashboard/accounts")
+    async def create_account_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            AccountCreateInput,
+            lambda body: service(request).create_account(name=body.name, provider=body.provider),
+            event="dashboard.account_added",
+            status_code=201,
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/update")
+    async def update_account_api(account_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            AccountUpdateInput,
+            lambda body: service(request).update_account(
+                account_id, name=body.name, max_concurrent=body.max_concurrent, paused=body.paused
+            ),
+            event="dashboard.account_changed",
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/sign-in")
+    async def sign_in_account_api(account_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            AccountSignInInput,
+            lambda body: service(request).sign_in_account(
+                account_id, body.credential, cluster_of(request)
+            ),
+            event="dashboard.account_signed_in",
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/remove")
+    async def remove_account_api(account_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            AccountRemoveInput,
+            lambda _body: service(request).remove_account(account_id, cluster_of(request)),
+            event="dashboard.account_removed",
+            password=True,
+            entity="account",
+        )
 
     @app.post("/api/dashboard/projects/{name}/items/bulk")
     async def bulk_items_api(name: str, request: Request) -> Response:

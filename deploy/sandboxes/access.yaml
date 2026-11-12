@@ -1,0 +1,26 @@
+# The console stores the sign-in of a subscription account as a Secret of this namespace
+# and deletes it when the account is removed. It can write and delete; it cannot read a
+# Secret back or list them, here or anywhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: account-sign-ins
+  namespace: engineering-control-sandboxes
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: account-sign-ins
+  namespace: engineering-control-sandboxes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: account-sign-ins
+subjects:
+  - kind: ServiceAccount
+    name: engineering-control-console
+    namespace: engineering-control

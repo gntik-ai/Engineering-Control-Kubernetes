@@ -1,0 +1,13 @@
+# The namespace the sandboxes run in, apart from the control plane: different privileges,
+# different network rules. Deployed by its own Argo CD application. Every object names its
+# namespace itself, so that the one reference to the control plane's namespace (the console's
+# identity) is not rewritten.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - network-policy.yaml
+  - access.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: engineering-control

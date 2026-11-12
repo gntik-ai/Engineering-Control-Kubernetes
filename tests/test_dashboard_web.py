@@ -291,6 +291,10 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
     )
     post_routes = {route.path for route in app.routes if "POST" in getattr(route, "methods", set())}
     assert post_routes == {
+        "/api/dashboard/accounts",
+        "/api/dashboard/accounts/{account_id}/update",
+        "/api/dashboard/accounts/{account_id}/sign-in",
+        "/api/dashboard/accounts/{account_id}/remove",
         "/login",
         "/logout",
         "/api/dashboard/actions/candidates",

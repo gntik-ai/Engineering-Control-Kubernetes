@@ -1,5 +1,5 @@
 import { Badge, Button, Card, CardBody, EmptyState, Page, Skeleton } from '@gntik-ai/ui';
-import { CircleAlert, CircleCheck, GitBranch, ListChecks, Route } from '@gntik-ai/icons';
+import { CircleAlert, CircleCheck, GitBranch, KeyRound, ListChecks, Route } from '@gntik-ai/icons';
 import type { ComponentType } from 'react';
 import { apiUrl, useResource, type Inbox, type InboxEntry } from '../api';
 import { LoadError, RefreshButton } from '../parts';
@@ -19,8 +19,18 @@ interface Shown {
 
 /** What an entry says, and where the administrator acts on it. */
 function shown(entry: InboxEntry): Shown {
-  const project = encodeURIComponent(entry.project);
+  const project = encodeURIComponent(entry.project ?? '');
   switch (entry.kind) {
+    case 'account_sign_in':
+      return {
+        icon: KeyRound,
+        tone: 'warning',
+        label: 'Sign-in needed',
+        title: `The account ${entry.account ?? ''} is not signed in`,
+        detail: entry.detail ?? 'No sandbox can work with it until its subscription is signed in.',
+        action: 'Open the accounts',
+        href: `${BASE}/accounts`,
+      };
     case 'sync_failed':
       return {
         icon: CircleAlert,
@@ -101,7 +111,10 @@ export function InboxPage() {
         <LoadError resource={inbox} />
         {entries
           ? entries.map((entry) => (
-              <Entry key={`${entry.kind}/${entry.project}/${entry.section?.key ?? ''}`} entry={entry} />
+              <Entry
+                key={`${entry.kind}/${entry.project ?? entry.account_id}/${entry.section?.key ?? ''}`}
+                entry={entry}
+              />
             ))
           : !inbox.error && Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-20 w-full" />)}
         {entries?.length === 0 ? (

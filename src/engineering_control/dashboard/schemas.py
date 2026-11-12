@@ -143,3 +143,31 @@ class ActionExecuteInput(DashboardModel):
     candidate_id: UUID
     reauthentication_token: str = Field(min_length=32, max_length=200)
     confirmation_phrase: str | None = Field(default=None, max_length=120)
+
+
+class AccountCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    provider: str = Field(pattern=r"^[a-z]{2,16}$")
+
+
+class AccountUpdateInput(DashboardModel):
+    """A field left out is left as it is."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    max_concurrent: int | None = Field(default=None, ge=1, le=8)
+    paused: bool | None = None
+
+
+class AccountSignInInput(DashboardModel):
+    """What the provider's client produced when the administrator signed in."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    credential: str = Field(min_length=1, max_length=70000)
+
+
+class AccountRemoveInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    # Removing an account needs the password again.
+    current_password: str = Field(min_length=1, max_length=128)

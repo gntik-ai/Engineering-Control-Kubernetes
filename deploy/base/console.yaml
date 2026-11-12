@@ -20,7 +20,7 @@ spec:
         app.kubernetes.io/name: engineering-control
         app.kubernetes.io/component: console
     spec:
-      serviceAccountName: engineering-control
+      serviceAccountName: engineering-control-console
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -106,6 +106,9 @@ spec:
             - name: github-app
               mountPath: /var/run/secrets/engineering-control-github-app
               readOnly: true
+            - name: cluster
+              mountPath: /var/run/secrets/engineering-control-cluster
+              readOnly: true
             - name: state
               mountPath: /var/lib/engineering-control
             - name: tmp
@@ -126,6 +129,21 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        # The console's identity towards the cluster, for one purpose: storing the sign-in
+        # of a subscription account in the sandbox namespace. A token valid for an hour,
+        # renewed by the kubelet, readable by the console's group only.
+        - name: cluster
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
         - name: state
           emptyDir: {}
         - name: tmp
