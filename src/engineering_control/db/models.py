@@ -423,6 +423,25 @@ class ProjectSnapshot(UUIDPrimaryKey, Timestamps, Base):
     snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
+    """A project the administrator sees and manages (migration 0025).
+
+    ``origin`` says where it comes from: ``registry`` for the projects the workflows know
+    by name (``engineering_control.projects``), ``console`` for one created in the console.
+    Removing a project archives it; its name stays taken so old records keep their meaning.
+    """
+
+    __tablename__ = "projects"
+    name: Mapped[str] = mapped_column(String(32), unique=True)
+    display_name: Mapped[str] = mapped_column(String(80))
+    source_repository: Mapped[str] = mapped_column(String(140))
+    deployment_repository: Mapped[str] = mapped_column(String(140))
+    default_branch: Mapped[str] = mapped_column(String(100), default="main")
+    origin: Mapped[str] = mapped_column(String(16))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
+
+
 class SolutionLoop(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "solution_loops"
     workflow_id: Mapped[str] = mapped_column(String(240), unique=True, index=True)

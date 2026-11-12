@@ -1,0 +1,220 @@
+"""Projects as records the administrator creates, renames and removes.
+
+The projects the workflows know by name (``engineering_control.projects``) are records
+too, with origin ``registry``; they can be given another display name but not removed,
+because code refers to them. A project created in the console has origin ``console``.
+Nothing runs for a console project yet: it is a name and a connected repository.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
+
+from engineering_control.db.models import ProjectRecord
+from engineering_control.projects import DEFAULT_BRANCH, PROJECT_REPOSITORIES, PROJECTS
+
+# The name is an identifier: it appears in addresses, filters and records.
+NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+# owner/repository as GitHub allows them.
+REPOSITORY = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$")
+# Words the platform uses for itself or in addresses.
+RESERVED_NAMES = frozenset({"platform", "all", "new", "console", "api", "login", "logout"})
+DISPLAY_NAME_MAX = 80
+
+
+class ProjectInvalid(ValueError):
+    """What was asked for cannot be a project (answered with 422)."""
+
+
+class ProjectConflict(ValueError):
+    """It could be a project, but something existing stands in the way (409)."""
+
+
+class ProjectNotFound(LookupError):
+    """No active project has that name (404)."""
+
+
+def clean_display_name(value: str | None, *, fallback: str) -> str:
+    text = unicodedata.normalize("NFC", value or "").strip()
+    if not text:
+        return fallback
+    if len(text) > DISPLAY_NAME_MAX:
+        raise ProjectInvalid(f"The name is longer than {DISPLAY_NAME_MAX} characters")
+    if any(unicodedata.category(character).startswith("C") for character in text):
+        raise ProjectInvalid("The name holds a control character")
+    return text
+
+
+def clean_name(value: str) -> str:
+    if not NAME.fullmatch(value) or "--" in value:
+        raise ProjectInvalid(
+            "The identifier must be 1 to 32 lower-case letters, digits and single hyphens, "
+            "starting and ending with a letter or digit"
+        )
+    if value in RESERVED_NAMES:
+        raise ProjectInvalid(f"The identifier {value} is reserved")
+    return value
+
+
+def clean_repository(value: str) -> str:
+    text = value.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
+    if not REPOSITORY.fullmatch(text) or text.endswith((".", "/")) or ".." in text:
+        raise ProjectInvalid("The repository must be written as owner/name")
+    return text
+
+
+class ProjectRecords:
+    def __init__(self, sessions: sessionmaker[Session]) -> None:
+        self.sessions = sessions
+
+    def sync_registry(self) -> list[str]:
+        """Give every project of the registry its record. Returns the names added."""
+        added: list[str] = []
+        with self.sessions() as session:
+            existing = set(session.scalars(select(ProjectRecord.name)))
+            for name in PROJECTS:
+                if name in existing:
+                    continue
+                source, deployment = PROJECT_REPOSITORIES[name]
+                session.add(
+                    ProjectRecord(
+                        name=name,
+                        display_name=name,
+                        source_repository=source,
+                        deployment_repository=deployment,
+                        default_branch=DEFAULT_BRANCH.get(name, "main"),
+                        origin="registry",
+                    )
+                )
+                added.append(name)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Another process added the same rows at the same moment.
+                session.rollback()
+                return []
+        return added
+
+    def active(self) -> list[ProjectRecord]:
+        """Registry projects in registry order, then the console's by age."""
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(select(ProjectRecord).where(ProjectRecord.archived_at.is_(None)))
+            )
+        order: dict[str, int] = {name: index for index, name in enumerate(PROJECTS)}
+        return sorted(
+            rows,
+            key=lambda row: (
+                0 if row.origin == "registry" else 1,
+                order.get(row.name, len(order)),
+                row.created_at,
+                row.name,
+            ),
+        )
+
+    def exists(self, name: str) -> bool:
+        if not NAME.fullmatch(name):
+            return False
+        with self.sessions() as session:
+            return (
+                session.scalar(
+                    select(ProjectRecord.id).where(
+                        ProjectRecord.name == name, ProjectRecord.archived_at.is_(None)
+                    )
+                )
+                is not None
+            )
+
+    def create(self, *, name: str, display_name: str | None, repository: str) -> dict[str, Any]:
+        name = clean_name(name)
+        repository = clean_repository(repository)
+        display = clean_display_name(display_name, fallback=name)
+        with self.sessions() as session:
+            taken = session.scalar(select(ProjectRecord).where(ProjectRecord.name == name))
+            if taken is not None:
+                raise ProjectConflict(
+                    f"The identifier {name} belonged to a removed project and stays reserved"
+                    if taken.archived_at is not None
+                    else f"A project with the identifier {name} already exists"
+                )
+            connected = session.scalar(
+                select(ProjectRecord).where(
+                    ProjectRecord.archived_at.is_(None),
+                    (func.lower(ProjectRecord.source_repository) == repository.lower())
+                    | (func.lower(ProjectRecord.deployment_repository) == repository.lower()),
+                )
+            )
+            if connected is not None:
+                raise ProjectConflict(
+                    f"The repository {repository} is already connected to the project "
+                    f"{connected.name}"
+                )
+            record = ProjectRecord(
+                name=name,
+                display_name=display,
+                source_repository=repository,
+                deployment_repository=repository,
+                default_branch="main",
+                origin="console",
+            )
+            session.add(record)
+            try:
+                session.commit()
+            except IntegrityError as error:
+                session.rollback()
+                raise ProjectConflict(
+                    f"A project with the identifier {name} already exists"
+                ) from error
+            return serialize(record)
+
+    def rename(self, name: str, display_name: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            record = self._active(session, name)
+            record.display_name = clean_display_name(display_name, fallback=record.name)
+            session.commit()
+            return serialize(record)
+
+    def archive(self, name: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            record = self._active(session, name)
+            if record.origin != "console":
+                raise ProjectConflict(
+                    f"The project {name} is one the workflows run for; it cannot be removed"
+                )
+            record.archived_at = datetime.now(UTC)
+            session.commit()
+            return serialize(record)
+
+    @staticmethod
+    def _active(session: Session, name: str) -> ProjectRecord:
+        record = (
+            session.scalar(
+                select(ProjectRecord).where(
+                    ProjectRecord.name == name, ProjectRecord.archived_at.is_(None)
+                )
+            )
+            if NAME.fullmatch(name)
+            else None
+        )
+        if record is None:
+            raise ProjectNotFound(name)
+        return record
+
+
+def serialize(record: ProjectRecord) -> dict[str, Any]:
+    return {
+        "project": record.name,
+        "display_name": record.display_name,
+        "source_repository": record.source_repository,
+        "deployment_repository": record.deployment_repository,
+        "self_contained": record.source_repository == record.deployment_repository,
+        "default_branch": record.default_branch,
+        "origin": record.origin,
+    }

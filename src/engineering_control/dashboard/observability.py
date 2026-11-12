@@ -11,6 +11,8 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.project_records import ProjectRecords
+from engineering_control.dashboard.project_records import serialize as serialize_project
 from engineering_control.dashboard.status_mapping import (
     TERMINAL_STATUSES,
     expected_next_step,
@@ -38,7 +40,6 @@ from engineering_control.operations.connection_status import (
     PROVIDER_FRESHNESS_SECONDS,
     provider_connection_status,
 )
-from engineering_control.projects import PROJECT_REPOSITORIES, PROJECTS, SELF_CONTAINED
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -484,23 +485,20 @@ class DashboardObservabilityProjection:
             }
 
     def projects(self) -> dict[str, Any]:
-        """One row per registered project: its repositories and bounded activity counts.
+        """One row per project record: its repositories and bounded activity counts.
 
         Grouped counts only (no per-row projection), so the page can poll it.
         """
         summaries: dict[str, dict[str, Any]] = {
-            project: {
-                "project": project,
-                "source_repository": PROJECT_REPOSITORIES[project][0],
-                "deployment_repository": PROJECT_REPOSITORIES[project][1],
-                "self_contained": project in SELF_CONTAINED,
+            record.name: {
+                **serialize_project(record),
                 "backlog_issues": 0,
                 "workflows": 0,
                 "active_workflows": 0,
                 "running_executions": 0,
                 "last_activity_at": None,
             }
-            for project in PROJECTS
+            for record in ProjectRecords(self.sessions).active()
         }
         with self.sessions() as session:
             tracked_issues = (

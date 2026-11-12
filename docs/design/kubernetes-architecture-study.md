@@ -1780,9 +1780,9 @@ Status: **done**, **in progress**, or blank for not started.
 | A2 | Control-plane image | done |
 | A3 | Every control-plane process starts from configuration alone (environment and mounted secrets), proven by a boot test in CI | done for the control plane; the CLI and the role workers follow in phases 1 and 3 |
 | A4 | Manifests (Kustomize); Argo CD project and application; namespace and network policies | done for the control plane; the sandbox namespace follows in phase 3 |
-| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | in progress: both run; TLS to Temporal is not set up |
-| A6 | Object storage for evidence, transcripts and change bundles | |
-| A7 | Secrets delivered by the cluster's secret operator | |
+| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | in progress: both run; the server presents a certificate issued in the cluster and every client verifies it; clients do not present one yet |
+| A6 | Object storage for evidence, transcripts and change bundles | set aside: the administrator keeps evidence on a volume |
+| A7 | Secrets delivered by the cluster's secret operator | set aside for now by the administrator |
 | A8 | Probes, metrics, alert rules, runbooks | |
 
 **B. Access**
@@ -1798,11 +1798,11 @@ Status: **done**, **in progress**, or blank for not started.
 
 | Id | Feature |
 | --- | --- |
-| C1 | Create a project: name it and connect its repository |
+| C1 | Create a project: name it and connect its repository (done: projects are records; create, rename and remove in the console; the repository is typed in until C2) |
 | C2 | GitHub sign-in to pick the repository from a list |
 | C3 | Six core sections per project, and custom sections |
 | C4 | Assign, change or remove the flow of a section |
-| C5 | The six existing projects migrated into project records |
+| C5 | The six existing projects migrated into project records (done: copied in by migration 0025; the workflows still read the registry in code) |
 
 **D. Backlog and queue**
 
@@ -1824,7 +1824,7 @@ Status: **done**, **in progress**, or blank for not started.
 | E2 | Sandbox image with the agent clients, scanners and toolchains |
 | E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) |
 | E4 | Isolation: network policy, no cluster identity, quotas, a dedicated node |
-| E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox |
+| E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox. Accounts are added and removed in the console, as many as the administrator wants. Each account has a provider type, so that providers beyond Claude and ChatGPT (the administrator named DeepSeek, GLM, Kimi and Qwen) can be added later; how each of those is signed in to has to be checked when it is added |
 | E6 | Evidence upload with a token valid for one run |
 
 **F. Flows**

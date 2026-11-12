@@ -73,7 +73,10 @@ export function FilterSelect({
 
 export function ProjectFilter({ value, onChange }: { value: string | null; onChange: (value: string | null) => void }) {
   const projects = useProjects();
-  const items = (projects.data?.items ?? []).map(({ project }) => ({ value: project, label: project }));
+  const items = (projects.data?.items ?? []).map(({ project, display_name }) => ({
+    value: project,
+    label: display_name,
+  }));
   // A project named in the URL stays selectable before (or without) the list.
   if (value && !items.some((item) => item.value === value)) items.push({ value, label: value });
   return <FilterSelect label="Project" allLabel="All projects" items={items} value={value} onChange={onChange} />;

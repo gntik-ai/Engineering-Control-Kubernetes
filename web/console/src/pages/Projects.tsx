@@ -1,8 +1,24 @@
-import { Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Link, Page, Skeleton, StatusDot } from '@gntik-ai/ui';
-import { FolderKanban } from '@gntik-ai/icons';
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+  Link,
+  MoreMenu,
+  Page,
+  Skeleton,
+  StatusDot,
+} from '@gntik-ai/ui';
+import { FolderKanban, Pencil, Plus, Trash2 } from '@gntik-ai/icons';
+import { useState } from 'react';
 import type { ProjectSummary } from '../api';
 import { LoadError, RefreshButton, When, useProjects } from '../parts';
 import { BASE } from '../router';
+import { NewProjectDialog, RemoveProjectDialog, RenameProjectDialog } from './ProjectDialogs';
 
 const filtered = (view: string, project: string) => `${BASE}/${view}?project=${encodeURIComponent(project)}`;
 
@@ -15,14 +31,39 @@ function Metric({ label, value, href }: { label: string; value: number; href: st
   );
 }
 
-function ProjectCard({ item }: { item: ProjectSummary }) {
+function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () => void }) {
   const busy = item.running_executions > 0;
+  const [dialog, setDialog] = useState<'rename' | 'remove' | null>(null);
+  const removable = item.origin === 'console';
   return (
     <Card>
       <CardHeader>
-        <CardTitle as="h2" className="font-mono">
-          {item.project}
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <CardTitle as="h2" className="truncate">
+              {item.display_name}
+            </CardTitle>
+            <div className="mt-0.5 flex items-center gap-2">
+              <span className="font-mono text-[12px] text-muted-foreground">{item.project}</span>
+              {removable ? null : (
+                <Badge tone="neutral" size="sm">
+                  Built in
+                </Badge>
+              )}
+            </div>
+          </div>
+          <MoreMenu
+            label={`Actions for ${item.display_name}`}
+            size="sm"
+            align="end"
+            items={[
+              { label: 'Rename', icon: Pencil, onSelect: () => setDialog('rename') },
+              ...(removable
+                ? [{ label: 'Remove', icon: Trash2, destructive: true, onSelect: () => setDialog('remove') }]
+                : []),
+            ]}
+          />
+        </div>
         <CardDescription>
           {item.self_contained
             ? item.source_repository
@@ -42,6 +83,20 @@ function ProjectCard({ item }: { item: ProjectSummary }) {
           </span>
         </div>
       </CardBody>
+      <RenameProjectDialog
+        project={item}
+        open={dialog === 'rename'}
+        onOpenChange={(open) => setDialog(open ? 'rename' : null)}
+        onSaved={onChanged}
+      />
+      {removable ? (
+        <RemoveProjectDialog
+          project={item}
+          open={dialog === 'remove'}
+          onOpenChange={(open) => setDialog(open ? 'remove' : null)}
+          onSaved={onChanged}
+        />
+      ) : null}
     </Card>
   );
 }
@@ -49,21 +104,30 @@ function ProjectCard({ item }: { item: ProjectSummary }) {
 export function ProjectsPage() {
   const projects = useProjects(15_000);
   const items = projects.data?.items;
+  const [creating, setCreating] = useState(false);
   return (
     <Page
       title="Projects"
-      description="Every project Engineering Control delivers for, with its repositories and current activity."
-      actions={<RefreshButton resource={projects} />}
+      description="Every project Engineering Control works on, with its repository and current activity."
+      actions={
+        <div className="flex items-center gap-2">
+          <RefreshButton resource={projects} />
+          <Button icon={Plus} size="sm" onClick={() => setCreating(true)}>
+            New project
+          </Button>
+        </div>
+      }
     >
       <div className="grid gap-4">
         <LoadError resource={projects} />
-        {items?.length === 0 ? <EmptyState icon={FolderKanban} title="No projects are registered" /> : null}
+        {items?.length === 0 ? <EmptyState icon={FolderKanban} title="No projects yet" /> : null}
         <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
           {items
-            ? items.map((item) => <ProjectCard key={item.project} item={item} />)
+            ? items.map((item) => <ProjectCard key={item.project} item={item} onChanged={projects.reload} />)
             : !projects.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-44 w-full" />)}
         </div>
       </div>
+      <NewProjectDialog open={creating} onOpenChange={setCreating} onSaved={projects.reload} />
     </Page>
   );
 }

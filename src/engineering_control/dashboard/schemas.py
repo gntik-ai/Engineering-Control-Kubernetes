@@ -47,6 +47,22 @@ class R3CandidateCreateInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class ProjectCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=32)
+    display_name: str | None = Field(default=None, max_length=200)
+    repository: str = Field(min_length=3, max_length=200)
+
+
+class ProjectRenameInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    display_name: str = Field(min_length=1, max_length=200)
+
+
+class ProjectArchiveInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+
+
 class ActionReauthenticationInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     candidate_id: UUID

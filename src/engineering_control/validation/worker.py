@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from temporalio.client import Client
 from temporalio.worker import Worker
 
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
+from engineering_control.temporal_connection import connect as connect_temporal
 from engineering_control.validation.lifecycle import AcceptanceActivities
 from engineering_control.workflows.supervision import run_worker_until_signal
 
@@ -22,10 +22,7 @@ async def serve() -> None:
     if root == temporary_root or not root.is_relative_to(temporary_root):
         raise ValueError("acceptance root must be a child of the configured temporary root")
     activities = AcceptanceActivities(root)
-    client = await Client.connect(
-        settings.temporal_target,
-        namespace=settings.temporal_namespace,
-    )
+    client = await connect_temporal(settings)
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="acceptance-activity")
     worker = Worker(
         client,

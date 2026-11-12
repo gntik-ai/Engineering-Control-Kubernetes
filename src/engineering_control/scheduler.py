@@ -21,6 +21,7 @@ from engineering_control.logging import configure_logging
 from engineering_control.operations.connection_status import (
     PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS,
 )
+from engineering_control.temporal_connection import connect as connect_temporal
 from engineering_control.workflows.inputs import (
     CleanupInput,
     ConnectionsRefreshInput,
@@ -90,9 +91,7 @@ async def configure() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     async with asyncio.timeout(CONFIGURE_TIMEOUT_SECONDS):
-        client = await Client.connect(
-            settings.temporal_target, namespace=settings.temporal_namespace
-        )
+        client = await connect_temporal(settings)
         for schedule_id, desired in schedules(
             settings.temporal_task_queue,
             cleanup_execution_enabled=settings.cleanup_execution_enabled,

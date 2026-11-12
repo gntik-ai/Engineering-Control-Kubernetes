@@ -11,7 +11,6 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
-from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.api.admission import MaintenanceAdmission
@@ -127,6 +126,7 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 from engineering_control.projects import PROJECT_ALTERNATION, PROJECT_SET, REPOSITORY_SLUG_SET
+from engineering_control.temporal_connection import connect as connect_temporal
 
 # NEW-123 review 2: how long a claimed but not yet started fan-out counts as starting.
 UI_FANOUT_START_GRACE = timedelta(minutes=5)
@@ -171,9 +171,7 @@ def create_app(
             maximum_transcript_bytes=resolved.dashboard_transcript_max_bytes,
         )
         if service is None:
-            client = await Client.connect(
-                resolved.temporal_target, namespace=resolved.temporal_namespace
-            )
+            client = await connect_temporal(resolved)
             app.state.control_service = TemporalControlService(
                 client, resolved.temporal_task_queue, resolved_repository
             )

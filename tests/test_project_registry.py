@@ -1429,6 +1429,9 @@ _FREE_FORM_FIELDS: dict[str, str] = {
     "activities.scan:WorktreeAllocationRequest.deployment_repository": (
         "checked against the manifest"
     ),
+    "dashboard.schemas:ProjectCreateInput.repository": (
+        "the repository of a project created in the console; checked by ProjectRecords"
+    ),
     "engineering.backlog:GitHubIssueSnapshot.repository": _SNAPSHOT,
     "engineering.backlog:GitHubPullRequestSnapshot.repository": _SNAPSHOT,
     "engineering.backlog:GitHubRepositoryBacklogSnapshot.repository": _SNAPSHOT,

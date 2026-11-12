@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import ACTIVE_OPERATION_STATUSES, OperationRequest
+from engineering_control.projects import PROJECTS
 
 
 def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
@@ -28,10 +29,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # NEW-245: 0024 (stored cleanup lists) follows NEW-234 PR6's 0023 (one active request
-    # per decomposition lineage), 0022 (backlog decompositions), 0021 (MERGED and gap
-    # consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0024", "0023")
+    # 0025 (projects as records) follows NEW-245's 0024 (stored cleanup lists), NEW-234
+    # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
+    # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
+    assert (head, parent) == ("0025", "0024")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -59,9 +60,35 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         index["name"] for index in inspect(engine).get_indexes("change_requests")
     }
     assert "cleanup_run_items" in inspect(engine).get_table_names()
+    # 0025: the registry's projects are copied in, once, as records.
+    with engine.connect() as connection:
+        copied = connection.execute(
+            text("SELECT name, source_repository, origin FROM projects ORDER BY created_at, name")
+        ).all()
+    assert {row[0] for row in copied} == set(PROJECTS)
+    assert all(row[2] == "registry" for row in copied)
+    assert ("falcone", "gntik-ai/falcone", "registry") in [tuple(row) for row in copied]
+    # A project created in the console must not be lost by a downgrade.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, display_name, source_repository, "
+                "deployment_repository, default_branch, origin, created_at, updated_at) "
+                "VALUES ('00000000000000000000000000000001', 'made-here', 'Made here', "
+                "'gntik-ai/made-here', 'gntik-ai/made-here', 'main', 'console', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="refuses to drop projects created in the console"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM projects WHERE origin = 'console'"))
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "projects" not in inspect(engine).get_table_names()
+    assert "cleanup_run_items" in inspect(engine).get_table_names()
+    command.downgrade(config, "0023")
     assert "cleanup_run_items" not in inspect(engine).get_table_names()
     command.downgrade(config, "0022")
     assert "uq_change_requests_active_decomposition_lineage" not in {

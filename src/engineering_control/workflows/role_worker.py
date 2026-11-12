@@ -5,7 +5,6 @@ import faulthandler
 import logging
 from pathlib import Path
 
-from temporalio.client import Client
 from temporalio.worker import Worker
 
 from engineering_control.activities.core import ControlActivities
@@ -19,6 +18,7 @@ from engineering_control.config import Settings, get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.observability.heartbeat import WorkerHeartbeatPublisher
 from engineering_control.systemd_notify import notify, watchdog_interval_seconds
+from engineering_control.temporal_connection import connect as connect_temporal
 from engineering_control.workflows import tmp_sweep
 from engineering_control.workflows.supervision import run_worker_until_signal
 from engineering_control.workflows.worker_registry import (
@@ -99,7 +99,7 @@ async def serve() -> None:
             LOGGER.exception("stale run temporary directories not removed")
     if not tmp_sweep.is_private_tmp():
         LOGGER.warning("private /tmp sweep disabled: /tmp is not a systemd PrivateTmp")
-    client = await Client.connect(settings.temporal_target, namespace=settings.temporal_namespace)
+    client = await connect_temporal(settings)
     activities = ControlActivities(settings, spec.kind)
     worker = Worker(
         client,

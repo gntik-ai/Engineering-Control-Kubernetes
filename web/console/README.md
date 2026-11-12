@@ -21,12 +21,12 @@ The console's views:
 
 | View | Path | Data |
 | --- | --- | --- |
-| Projects | `/console/projects` | `GET /api/dashboard/projects` |
+| Projects: list, create, rename, remove | `/console/projects` | `GET /api/dashboard/projects`; `POST /api/dashboard/projects`, `…/{name}/rename`, `…/{name}/archive` |
 | Backlog (project, status, search) | `/console/backlog?project=…` | `GET /api/dashboard/backlog` |
 | Executions (agents and workflows, refreshed every 5 s) | `/console/executions` | `GET /api/dashboard/executions`, `/workflows` |
 | Execution transcript | `/console/execution?id=…` | `GET /api/dashboard/executions/{id}` and `/logs` |
 
-It uses the dashboard's session cookie and is read-only apart from sign-out. It is the only web
+It uses the dashboard's session cookie. The only changes it makes are to projects (each sent with the session's CSRF token) and sign-out. It is the only web
 interface: commands, approvals and audits are run from Telegram or `engineering-ctl`, and the
 password is rotated with `engineering-ctl dashboard reset-password`.
 

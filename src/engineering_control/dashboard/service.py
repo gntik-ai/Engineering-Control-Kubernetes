@@ -160,6 +160,27 @@ class DashboardService:
     async def projects(self) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.observability.projects)
 
+    async def project_exists(self, name: str) -> bool:
+        return await asyncio.to_thread(self.repository.projects.exists, name)
+
+    async def sync_registry_projects(self) -> list[str]:
+        return await asyncio.to_thread(self.repository.projects.sync_registry)
+
+    async def create_project(
+        self, *, name: str, display_name: str | None, repository: str
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.projects.create(
+                name=name, display_name=display_name, repository=repository
+            )
+        )
+
+    async def rename_project(self, name: str, display_name: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.projects.rename, name, display_name)
+
+    async def archive_project(self, name: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.projects.archive, name)
+
     async def root_blockers(
         self,
         *,

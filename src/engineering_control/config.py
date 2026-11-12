@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     api_token_file: Path = Path("/etc/engineering-control/env/api.token")
     temporal_target: str = "127.0.0.1:7233"
     temporal_namespace: str = "engineering-control"
+    # TLS to Temporal: the file holding the certificate authority the server's certificate
+    # chains to, and the name that certificate was issued for. Without the file the
+    # connection is plain text, which is only right for a server on the loopback interface.
+    temporal_tls_ca_file: Path | None = None
+    temporal_tls_server_name: str | None = Field(
+        default=None, pattern=r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+    )
     temporal_task_queue: str = CONTROL_TASK_QUEUE
     codex_task_queue: str = ROLE_WORKER_REGISTRY["codex"].task_queue
     claude_task_queue: str = ROLE_WORKER_REGISTRY["claude"].task_queue
@@ -328,6 +335,14 @@ class Settings(BaseSettings):
         if value != expected:
             raise ValueError(f"{field_name} must remain the canonical queue {expected}")
         return value
+
+    @model_validator(mode="after")
+    def temporal_tls(self) -> Settings:
+        if self.temporal_tls_server_name is not None and self.temporal_tls_ca_file is None:
+            raise ValueError("a Temporal server name needs the certificate authority file")
+        if self.temporal_tls_ca_file is not None and not self.temporal_tls_ca_file.is_absolute():
+            raise ValueError("the Temporal certificate authority file must be an absolute path")
+        return self
 
     @model_validator(mode="after")
     def whole_github_app(self) -> Settings:

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
-from temporalio.client import Client
 from temporalio.worker import Worker
 
 from engineering_control.activities.core import ControlActivities
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
+from engineering_control.temporal_connection import connect as connect_temporal
 from engineering_control.workflows.definitions import ALL_WORKFLOWS
 from engineering_control.workflows.supervision import run_worker_until_signal
 from engineering_control.workflows.worker_registry import worker_deployment_kwargs
@@ -16,7 +16,7 @@ from engineering_control.workflows.worker_registry import worker_deployment_kwar
 async def serve() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
-    client = await Client.connect(settings.temporal_target, namespace=settings.temporal_namespace)
+    client = await connect_temporal(settings)
     activities = ControlActivities(settings)
     worker = Worker(
         client,

@@ -37,12 +37,23 @@ from engineering_control.dashboard.auth import (
 )
 from engineering_control.dashboard.dependencies import AuthenticatedSession
 from engineering_control.dashboard.events import sse_events, transcript_sse
+from engineering_control.dashboard.project_records import (
+    NAME as PROJECT_NAME,
+)
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectNotFound,
+)
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
     ActionCandidateInput,
     ActionExecuteInput,
     ActionReauthenticationInput,
     ActivityEventInput,
+    ProjectArchiveInput,
+    ProjectCreateInput,
+    ProjectRenameInput,
     R3CandidateCreateInput,
 )
 from engineering_control.dashboard.service import DashboardService
@@ -170,6 +181,12 @@ def create_app(
             except ValueError:
                 LOGGER.warning("dashboard API admission observation is unavailable")
         app.state.dashboard_service = DashboardService(resolved_repository, resolved_admission)
+        try:
+            # The projects the workflows know by name are records too; a release that adds
+            # one to the registry gets its record here.
+            await app.state.dashboard_service.sync_registry_projects()
+        except Exception as error:  # noqa: BLE001 - the console must start without it
+            log_failure("project-registry", "dashboard project registry sync failed", error)
         resolved_operations = operations_repository or OperationsRepository(
             resolved.database_url.get_secret_value(),
             export_retention_days=resolved.dashboard_operation_export_retention_days,
@@ -240,6 +257,20 @@ def create_app(
 
     def operations(request: Request) -> OperationsRepository:
         return cast(OperationsRepository, request.app.state.operations_repository)
+
+    async def check_filters(
+        request: Request, project: str | None, status: str | None, provider: str | None = None
+    ) -> None:
+        """A project filter names a project of the registry or an active record."""
+        if (
+            project is not None
+            and project not in PROJECTS
+            and not (
+                PROJECT_NAME.fullmatch(project) and await service(request).project_exists(project)
+            )
+        ):
+            raise HTTPException(status_code=422, detail="invalid project filter")
+        _validate_observability_filters(None, status, provider)
 
     def session_authorization(authenticated: AuthenticatedSession) -> SessionAuthorization:
         return SessionAuthorization(
@@ -506,7 +537,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_filters(project, status)
+        await check_filters(request, project, status)
         result = await service(request).backlog(
             project=project,
             status=status,
@@ -541,7 +572,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_observability_filters(project, status, provider)
+        await check_filters(request, project, status, provider)
         try:
             value = await service(request).workflows(
                 project=project,
@@ -594,7 +625,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_observability_filters(project, status, provider)
+        await check_filters(request, project, status, provider)
         try:
             value = await service(request).executions(
                 project=project,
@@ -687,6 +718,72 @@ def create_app(
             return authenticated
         return JSONResponse(await service(request).projects())
 
+    async def project_change(
+        request: Request, model: type[Any], change: Any, *, event: str, status_code: int = 200
+    ) -> Response:
+        """One shape for every change to a project: session, body, CSRF, change, record."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            body = model.model_validate(await _json(request))
+        except ValueError:
+            return JSONResponse({"detail": "invalid request"}, status_code=422)
+        if not _valid_csrf(authenticated, body.csrf_token):
+            return JSONResponse({"detail": "invalid request"}, status_code=403)
+        try:
+            project = await change(body)
+        except ProjectInvalid as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+        except ProjectConflict as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "project not found"}, status_code=404)
+        action = event.rsplit(".", 1)[-1].replace("_", " ")
+        await _record_safely(
+            repo(request),
+            ActivityEventInput(
+                level="INFO",
+                event_type=event,
+                source="dashboard",
+                project="platform",
+                entity_type="project",
+                entity_id=str(project["project"]),
+                message=f"Project {project['project']}: {action}",
+            ),
+        )
+        return JSONResponse(project, status_code=status_code)
+
+    @app.post("/api/dashboard/projects", status_code=201)
+    async def create_project_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            ProjectCreateInput,
+            lambda body: service(request).create_project(
+                name=body.name, display_name=body.display_name, repository=body.repository
+            ),
+            event="dashboard.project_created",
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/rename")
+    async def rename_project_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProjectRenameInput,
+            lambda body: service(request).rename_project(name, body.display_name),
+            event="dashboard.project_renamed",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/archive")
+    async def archive_project_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProjectArchiveInput,
+            lambda _body: service(request).archive_project(name),
+            event="dashboard.project_removed",
+        )
+
     @app.get("/api/dashboard/root-blockers")
     async def root_blockers_api(
         request: Request,
@@ -698,7 +795,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_filters(project, None)
+        await check_filters(request, project, None)
         try:
             value = await service(request).root_blockers(
                 project=project,
@@ -717,7 +814,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_filters(project, status)
+        await check_filters(request, project, status)
         return JSONResponse(await service(request).audits(project=project, status=status))
 
     @app.get("/api/dashboard/commands")
@@ -776,7 +873,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_filters(project, None)
+        await check_filters(request, project, None)
         return JSONResponse(await service(request).findings(project=project, limit=limit))
 
     @app.get("/api/dashboard/enhancements")
@@ -788,7 +885,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        _validate_filters(project, None)
+        await check_filters(request, project, None)
         return JSONResponse(await service(request).enhancements(project=project, limit=limit))
 
     @app.post("/api/dashboard/actions/candidates")

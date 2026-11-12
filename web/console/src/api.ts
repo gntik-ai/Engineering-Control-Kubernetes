@@ -3,6 +3,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 /** Rows of the read-only dashboard API (src/engineering_control/dashboard). */
 export interface ProjectSummary {
   project: string;
+  /** What the administrator calls it; the name above is the identifier and never changes. */
+  display_name: string;
+  /** "registry": the workflows run for it and it cannot be removed. "console": made here. */
+  origin: 'registry' | 'console';
+  default_branch: string;
   source_repository: string;
   deployment_repository: string;
   self_contained: boolean;
@@ -113,6 +118,38 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   }
   if (!response.ok) throw new Error(`The dashboard API answered ${response.status}.`);
   return (await response.json()) as T;
+}
+
+/** A refusal of the API, with the reason it gave. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+/** A change: the session's CSRF token is fetched and sent with the body. */
+export async function postJson<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+  const controller = new AbortController();
+  const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
+  const response = await fetch(apiUrl(path), {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ ...body, csrf_token: session.csrf_token }),
+  });
+  const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+  if (response.status === 401) {
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
+    throw new DOMException('Signed out', 'AbortError');
+  }
+  if (!response.ok) {
+    const detail = typeof payload?.detail === 'string' ? payload.detail : `The request was refused (${response.status}).`;
+    throw new ApiError(detail, response.status);
+  }
+  return payload as T;
 }
 
 /** Ends the dashboard session (the server revokes it) and returns to the sign-in page. */
