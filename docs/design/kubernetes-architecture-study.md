@@ -1791,14 +1791,14 @@ Status: **done**, **in progress**, or blank for not started.
 | --- | --- | --- |
 | B1 | One administrator signing in with a password; the API takes the actor from the credential | in progress: sign-in works at `https://ade.musematic.ai`; the API still takes the actor from the request |
 | B2 | A separate credential for each channel and service | |
-| B3 | GitHub App: installation per repository, short-lived tokens, all writes through the broker | |
+| B3 | GitHub App: installation per repository, short-lived tokens, all writes through the broker | in progress: the app exists and is installed; the console reads the installation's repositories with a token limited to metadata; nothing writes through it yet |
 | B4 | "Engineering Control" in everything a person reads | in progress: every page of the console; not yet the messages and documents |
 
 **C. Projects and sections**
 
 | Id | Feature |
 | --- | --- |
-| C1 | Create a project: name it and connect its repository (done: projects are records; create, rename and remove in the console; the repository is typed in until C2) |
+| C1 | Create a project: name it and connect its repository (done: projects are records; create, rename and remove in the console; the repository is chosen from the ones the GitHub App is installed on, and its default branch is taken from GitHub) |
 | C2 | GitHub sign-in to pick the repository from a list |
 | C3 | Six core sections per project, and custom sections |
 | C4 | Assign, change or remove the flow of a section |

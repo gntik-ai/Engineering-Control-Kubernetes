@@ -167,13 +167,24 @@ class DashboardService:
         return await asyncio.to_thread(self.repository.projects.sync_registry)
 
     async def create_project(
-        self, *, name: str, display_name: str | None, repository: str
+        self,
+        *,
+        name: str,
+        display_name: str | None,
+        repository: str,
+        default_branch: str = "main",
     ) -> dict[str, object]:
         return await asyncio.to_thread(
             lambda: self.repository.projects.create(
-                name=name, display_name=display_name, repository=repository
+                name=name,
+                display_name=display_name,
+                repository=repository,
+                default_branch=default_branch,
             )
         )
+
+    async def connected_repositories(self) -> dict[str, str]:
+        return await asyncio.to_thread(self.repository.projects.connected_repositories)
 
     async def rename_project(self, name: str, display_name: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.projects.rename, name, display_name)

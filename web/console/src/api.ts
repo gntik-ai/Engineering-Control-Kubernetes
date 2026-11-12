@@ -18,6 +18,22 @@ export interface ProjectSummary {
   last_activity_at: string | null;
 }
 
+/** A repository the GitHub App is installed on. */
+export interface GitHubRepository {
+  full_name: string;
+  private: boolean;
+  archived: boolean;
+  default_branch: string;
+  /** The project it is already connected to, if any. */
+  project: string | null;
+}
+
+/** `configured` is false while the platform has no GitHub App to ask. */
+export interface GitHubRepositories {
+  configured: boolean;
+  items: GitHubRepository[];
+}
+
 export interface BacklogItem {
   project: string;
   repository?: string | null;

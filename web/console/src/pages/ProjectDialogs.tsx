@@ -19,9 +19,11 @@ import {
   FieldDescription,
   FieldLabel,
   Input,
+  SimpleSelect,
+  Skeleton,
 } from '@gntik-ai/ui';
 import { useEffect, useState, type FormEvent } from 'react';
-import { postJson, type ProjectSummary } from '../api';
+import { apiUrl, postJson, useResource, type GitHubRepositories, type ProjectSummary } from '../api';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -59,6 +61,69 @@ interface DialogProps {
   onOpenChange: (open: boolean) => void;
   /** Called after the change was saved, before the dialog closes. */
   onSaved: () => void;
+}
+
+/**
+ * The repository of a new project. With the GitHub App configured it is chosen from the
+ * repositories the app is installed on and no project uses yet; without it, or while GitHub
+ * cannot be reached, it is typed.
+ */
+function RepositoryField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const repositories = useResource<GitHubRepositories>(apiUrl('github/repositories'));
+  const typed = (description: string) => (
+    <Field>
+      <FieldLabel>GitHub repository</FieldLabel>
+      <Input
+        name="repository"
+        value={value}
+        onValueChange={onChange}
+        maxLength={200}
+        inputClassName="font-mono"
+        placeholder="gntik-ai/documentation"
+      />
+      <FieldDescription>{description}</FieldDescription>
+    </Field>
+  );
+  if (repositories.error) {
+    return (
+      <>
+        <Alert
+          tone="warning"
+          title="GitHub could not be asked for the repositories"
+          description="Type the repository instead. It is checked against GitHub when the project is created."
+        />
+        {typed('Written as owner/name.')}
+      </>
+    );
+  }
+  if (!repositories.data) return <Skeleton className="h-16 w-full" />;
+  if (!repositories.data.configured) return typed('Written as owner/name. A repository belongs to one project.');
+  const free = repositories.data.items.filter((item) => !item.project && !item.archived);
+  if (free.length === 0) {
+    return (
+      <Alert
+        tone="info"
+        title="No repository is free"
+        description="Every repository the GitHub App is installed on already belongs to a project. Install the app on another repository in GitHub, then open this dialog again."
+      />
+    );
+  }
+  return (
+    <Field>
+      <FieldLabel>GitHub repository</FieldLabel>
+      <SimpleSelect
+        aria-label="GitHub repository"
+        className="w-full"
+        placeholder="Choose a repository"
+        items={free.map((item) => ({ value: item.full_name, label: item.full_name }))}
+        value={value || null}
+        onValueChange={(next) => onChange(next ?? '')}
+      />
+      <FieldDescription>
+        The repositories the GitHub App is installed on that no project uses yet ({free.length}).
+      </FieldDescription>
+    </Field>
+  );
 }
 
 export function NewProjectDialog({ open, onOpenChange, onSaved }: DialogProps) {
@@ -131,18 +196,7 @@ export function NewProjectDialog({ open, onOpenChange, onSaved }: DialogProps) {
                 later.
               </FieldDescription>
             </Field>
-            <Field>
-              <FieldLabel>GitHub repository</FieldLabel>
-              <Input
-                name="repository"
-                value={repository}
-                onValueChange={setRepository}
-                maxLength={200}
-                inputClassName="font-mono"
-                placeholder="gntik-ai/documentation"
-              />
-              <FieldDescription>Written as owner/name. A repository belongs to one project.</FieldDescription>
-            </Field>
+            <RepositoryField value={repository} onChange={setRepository} />
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>

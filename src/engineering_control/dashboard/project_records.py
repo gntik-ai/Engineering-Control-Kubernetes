@@ -119,6 +119,14 @@ class ProjectRecords:
             ),
         )
 
+    def connected_repositories(self) -> dict[str, str]:
+        """Lower-cased repository -> the active project it is connected to."""
+        connected: dict[str, str] = {}
+        for record in self.active():
+            connected[record.source_repository.lower()] = record.name
+            connected[record.deployment_repository.lower()] = record.name
+        return connected
+
     def exists(self, name: str) -> bool:
         if not NAME.fullmatch(name):
             return False
@@ -132,7 +140,14 @@ class ProjectRecords:
                 is not None
             )
 
-    def create(self, *, name: str, display_name: str | None, repository: str) -> dict[str, Any]:
+    def create(
+        self,
+        *,
+        name: str,
+        display_name: str | None,
+        repository: str,
+        default_branch: str = "main",
+    ) -> dict[str, Any]:
         name = clean_name(name)
         repository = clean_repository(repository)
         display = clean_display_name(display_name, fallback=name)
@@ -161,7 +176,7 @@ class ProjectRecords:
                 display_name=display,
                 source_repository=repository,
                 deployment_repository=repository,
-                default_branch="main",
+                default_branch=default_branch[:100] or "main",
                 origin="console",
             )
             session.add(record)

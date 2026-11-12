@@ -44,6 +44,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    clean_repository,
 )
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
@@ -60,6 +61,7 @@ from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
 from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
+from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.registry import COMMAND_REGISTRY
@@ -117,6 +119,7 @@ def create_app(
     limiter: LoginFailureLimiter | None = None,
     operations_repository: OperationsRepository | None = None,
     admission_reader: AdmissionReader | None = None,
+    github_app: GitHubApp | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     key = session_key
@@ -198,7 +201,14 @@ def create_app(
             projection_reconciliation_max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
         )
         app.state.operations_repository = resolved_operations
+        resolved_github = github_app
+        # As above: a fixture repository never reaches out to GitHub by itself.
+        if resolved_github is None and repository is None:
+            resolved_github = GitHubApp.from_settings(resolved)
+        app.state.github_app = resolved_github
         yield
+        if github_app is None and resolved_github is not None:
+            await resolved_github.aclose()
         if admission_reader is None and resolved_admission is not None:
             await resolved_admission.aclose()
         if repository is None:
@@ -739,6 +749,8 @@ def create_app(
             return JSONResponse({"detail": str(error)}, status_code=409)
         except ProjectNotFound:
             return JSONResponse({"detail": "project not found"}, status_code=404)
+        except GitHubAppError as error:
+            return JSONResponse({"detail": str(error)}, status_code=502)
         action = event.rsplit(".", 1)[-1].replace("_", " ")
         await _record_safely(
             repo(request),
@@ -754,14 +766,59 @@ def create_app(
         )
         return JSONResponse(project, status_code=status_code)
 
+    def github(request: Request) -> GitHubApp | None:
+        return cast(GitHubApp | None, request.app.state.github_app)
+
+    @app.get("/api/dashboard/github/repositories")
+    async def github_repositories_api(request: Request) -> Response:
+        """The repositories the GitHub App is installed on, and the project each belongs to."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        installed = github(request)
+        if installed is None:
+            return JSONResponse({"configured": False, "items": []})
+        try:
+            repositories = await installed.repositories()
+        except GitHubAppError as error:
+            return JSONResponse({"detail": str(error)}, status_code=502)
+        connected = await service(request).connected_repositories()
+        return JSONResponse(
+            {
+                "configured": True,
+                "items": [
+                    {**item.as_dict(), "project": connected.get(item.full_name.lower())}
+                    for item in repositories
+                ],
+            }
+        )
+
     @app.post("/api/dashboard/projects", status_code=201)
     async def create_project_api(request: Request) -> Response:
+        async def create(body: ProjectCreateInput) -> dict[str, object]:
+            repository = clean_repository(body.repository)
+            default_branch = "main"
+            installed = github(request)
+            if installed is not None:
+                # With the app configured, a project is connected only to a repository the
+                # app can work on, under the name and default branch GitHub gives it.
+                found = await installed.repository(repository)
+                if found is None:
+                    raise ProjectInvalid(f"The GitHub App is not installed on {repository}")
+                if found.archived:
+                    raise ProjectInvalid(f"The repository {found.full_name} is archived on GitHub")
+                repository, default_branch = found.full_name, found.default_branch
+            return await service(request).create_project(
+                name=body.name,
+                display_name=body.display_name,
+                repository=repository,
+                default_branch=default_branch,
+            )
+
         return await project_change(
             request,
             ProjectCreateInput,
-            lambda body: service(request).create_project(
-                name=body.name, display_name=body.display_name, repository=body.repository
-            ),
+            create,
             event="dashboard.project_created",
             status_code=201,
         )
