@@ -116,3 +116,40 @@ def test_api_service_name_is_a_single_label_and_only_for_a_cluster() -> None:
     for value in ("api.other-namespace", "ade.musematic.ai", "10.10.0.2", "api:8740", "API"):
         with pytest.raises(ValueError):
             Settings(network_boundary="cluster", api_service_name=value)
+
+
+def test_github_app_is_named_completely_or_not_at_all() -> None:
+    assert Settings().github_app_id is None
+    whole = {
+        "github_app_id": 5724836,
+        "github_app_client_id": "Iv23ctEXJNig6ZErLZsS",
+        "github_app_installation_id": 181163547,
+    }
+    settings = Settings(**whole)
+    assert settings.github_app_installation_id == 181163547
+    for missing in whole:
+        with pytest.raises(ValueError, match="app id, client id and installation id together"):
+            Settings(**{key: value for key, value in whole.items() if key != missing})
+    for field, value in (
+        ("github_app_id", 0),
+        ("github_app_installation_id", -1),
+        ("github_app_client_id", "ghp_notaclientid"),
+        ("github_app_client_id", "Iv1"),
+    ):
+        with pytest.raises(ValueError):
+            Settings(**{**whole, field: value})
+
+
+def test_the_deployed_configuration_names_the_github_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yaml
+
+    manifest = Path(__file__).parents[1] / "deploy" / "base" / "configuration.yaml"
+    data = yaml.safe_load(manifest.read_text())["data"]
+    for name, value in data.items():
+        if name.startswith(("ENGINEERING_GITHUB_APP_", "ENGINEERING_NETWORK_BOUNDARY")):
+            monkeypatch.setenv(name, value)
+    settings = Settings()
+    assert settings.github_app_id and settings.github_app_installation_id
+    assert settings.github_app_client_id
+    # Identifiers only: nothing that looks like a key or a secret is in the manifest.
+    assert not any("PRIVATE" in value or "secret" in name.lower() for name, value in data.items())

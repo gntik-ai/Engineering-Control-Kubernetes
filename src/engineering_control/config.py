@@ -191,6 +191,11 @@ class Settings(BaseSettings):
     github_executable: Path = Path("/usr/bin/gh")
     github_authenticated_home: Path | None = None
     github_writes_enabled: bool = False
+    # The GitHub App the platform acts through. These three identify it and are not
+    # secret; its private key and client secret are mounted secrets, never settings.
+    github_app_id: int | None = Field(default=None, ge=1)
+    github_app_client_id: str | None = Field(default=None, pattern=r"^Iv[0-9A-Za-z]{10,40}$")
+    github_app_installation_id: int | None = Field(default=None, ge=1)
     llmwiki_staging_bootstrap_enabled: bool = False
     application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH
@@ -320,6 +325,16 @@ class Settings(BaseSettings):
         if value != expected:
             raise ValueError(f"{field_name} must remain the canonical queue {expected}")
         return value
+
+    @model_validator(mode="after")
+    def whole_github_app(self) -> Settings:
+        """The app is named completely or not at all."""
+        named = (self.github_app_id, self.github_app_client_id, self.github_app_installation_id)
+        if any(value is not None for value in named) and None in named:
+            raise ValueError(
+                "the GitHub App needs its app id, client id and installation id together"
+            )
+        return self
 
     @model_validator(mode="after")
     def private_listeners(self) -> Settings:

@@ -21,5 +21,11 @@ data:
   ENGINEERING_DASHBOARD_SESSION_KEY_FILE: /var/run/secrets/engineering-control/session.key
   ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE: /var/run/secrets/engineering-control/evidence-ingest.token
   ENGINEERING_EVIDENCE_INGEST_TOKEN_DIRECTORY: /var/run/secrets/engineering-control
+  # The GitHub App "Engineering Control" of the organisation, installed on the repositories
+  # the platform works on. Identifiers only; the private key and the client secret are in
+  # the Secret engineering-control-github-app, created by the administrator.
+  ENGINEERING_GITHUB_APP_ID: "5724836"
+  ENGINEERING_GITHUB_APP_CLIENT_ID: Iv23ctEXJNig6ZErLZsS
+  ENGINEERING_GITHUB_APP_INSTALLATION_ID: "181163547"
   ENGINEERING_TEMPORAL_TARGET: engineering-control-temporal:7233
   ENGINEERING_TEMPORAL_NAMESPACE: engineering-control
