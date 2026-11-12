@@ -53,6 +53,18 @@ def test_a_group_readable_secret_must_be_roots(tmp_path: Path) -> None:
             read_mounted_secret(path, label="API token")
 
 
+def test_a_projected_token_may_be_this_users_and_readable_by_its_group(tmp_path: Path) -> None:
+    # What the kubelet makes of a projected service-account token in a pod with a user and
+    # an fsGroup: the pod's user owns it, the pod's group may read it.
+    path = _secret_volume(tmp_path / "volume", "token", b"t" * 48, 0o640)
+    assert read_mounted_secret(path, label="cluster token", own_group_readable=True) == b"t" * 48
+    # Still nobody else, and never writable by the group.
+    for mode in (0o644, 0o660):
+        os.chmod(os.path.realpath(path), mode)
+        with pytest.raises(PermissionError, match="too broad"):
+            read_mounted_secret(path, label="cluster token", own_group_readable=True)
+
+
 def test_relative_paths_directories_and_sizes_are_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="absolute"):
         read_mounted_secret(Path("api.token"), label="API token")

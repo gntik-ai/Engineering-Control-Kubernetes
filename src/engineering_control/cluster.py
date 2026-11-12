@@ -23,10 +23,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import structlog
 
 from engineering_control.config import Settings
 from engineering_control.secret_files import read_mounted_secret
 
+LOG = structlog.get_logger(__name__)
 REQUEST_SECONDS = 10.0
 # A DNS label, as Kubernetes wants for a namespace and for the names used here.
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
@@ -85,9 +87,16 @@ class Cluster:
     def _headers(self) -> dict[str, str]:
         try:
             token = read_mounted_secret(
-                self._token_file, label="cluster token", minimum=20, maximum=MAX_TOKEN_BYTES
+                self._token_file,
+                label="cluster token",
+                minimum=20,
+                maximum=MAX_TOKEN_BYTES,
+                # The kubelet gives a projected token to the pod's own user and group.
+                own_group_readable=True,
             )
         except (OSError, ValueError) as error:
+            # The reason names a rule about the file (owner, mode, size), never its content.
+            LOG.warning("cluster_identity_unreadable", reason=str(error)[:200])
             raise ClusterError("The platform's cluster identity could not be read") from error
         return {
             "Authorization": f"Bearer {token.decode('ascii', errors='strict').strip()}",

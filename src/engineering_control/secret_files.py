@@ -24,11 +24,24 @@ import stat
 from pathlib import Path
 
 
-def read_mounted_secret(path: Path, *, label: str, minimum: int = 1, maximum: int = 4096) -> bytes:
+def read_mounted_secret(
+    path: Path,
+    *,
+    label: str,
+    minimum: int = 1,
+    maximum: int = 4096,
+    own_group_readable: bool = False,
+) -> bytes:
     """Return the bytes of the secret at ``path``, or raise without revealing them.
 
     ``PermissionError`` for custody problems (location, owner, mode), ``ValueError`` for a
     file that is not a secret of the expected size.
+
+    ``own_group_readable`` is for one kind of file only: the service-account token the
+    kubelet projects into a pod. The kubelet gives that file to the pod's own user and,
+    when the pod has an fsGroup, makes it readable by that group; it cannot be asked for
+    anything else. Such a file is accepted when it belongs to this process's user and to
+    one of its groups.
     """
     if not path.is_absolute():
         raise ValueError(f"{label} path must be absolute")
@@ -49,7 +62,9 @@ def read_mounted_secret(path: Path, *, label: str, minimum: int = 1, maximum: in
         if metadata.st_mode & stat.S_IRGRP:
             # Readable through a group: only as root's file shared with a group of this
             # service, which is how a mounted Secret with an fsGroup arrives.
-            if metadata.st_uid != 0 or metadata.st_gid not in {os.getegid(), *os.getgroups()}:
+            owners = {0, os.geteuid()} if own_group_readable else {0}
+            groups = {os.getegid(), *os.getgroups()}
+            if metadata.st_uid not in owners or metadata.st_gid not in groups:
                 raise PermissionError(
                     f"group-readable {label} must belong to root and to a group of this service"
                 )
