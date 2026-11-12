@@ -41,8 +41,13 @@ IDENTITY: Final = {
     "GIT_COMMITTER_EMAIL": "engineering-control@users.noreply.github.com",
 }
 # Tool caches live on the run's volume, so that what one step installed the next one finds.
+# That includes the package manager itself: pnpm downloads the version a repository pins,
+# and the step that tests without network must find that download, not fail for lack of it
+# (the first real run's implementer worked around exactly that by changing the repository).
 TOOLS: Final = {
     "XDG_CACHE_HOME": CACHE,
+    "XDG_DATA_HOME": f"{CACHE}/data",
+    "PNPM_HOME": f"{CACHE}/pnpm-home",
     "npm_config_cache": f"{CACHE}/npm",
     "npm_config_store_dir": f"{CACHE}/pnpm-store",
     "UV_CACHE_DIR": f"{CACHE}/uv",

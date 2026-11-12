@@ -318,6 +318,10 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
         "baseline 2",
     ]
     assert job["commands"][1]["argv"] == ["pnpm", "install", "--frozen-lockfile"]
+    # What a step installs, the package manager's own pinned version included, is kept on
+    # the run's volume for the steps that follow, which may have no network.
+    for name in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "PNPM_HOME", "npm_config_store_dir"):
+        assert job["commands"][1]["env"][name].startswith("/workspace/.cache"), name
     assert job["commands"][2]["allow_failure"] is True
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "internet"
     workspace = pods.workspace_claim(UUID(run["id"]))
