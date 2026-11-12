@@ -28,4 +28,4 @@ images:
   # Deploying a new version is changing this one line.
   - name: engineering-control
     newName: ghcr.io/gntik-ai/engineering-control-kubernetes
-    newTag: c559286be05cac4afb5cbcb86260e8181e2d1a0b
+    newTag: f48bdeeee2ff51795bf1e30ae7f7a26f18db4804
