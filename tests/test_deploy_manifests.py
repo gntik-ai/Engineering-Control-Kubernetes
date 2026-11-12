@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from engineering_control.config import Settings
+
 BASE = Path(__file__).parents[1] / "deploy" / "base"
 IMAGE = "engineering-control"  # the placeholder kustomization.yaml pins to a commit
 # Temporal's own images, pinned by digest, and the user they run as.
@@ -116,17 +118,53 @@ def test_no_secret_value_is_in_the_repository() -> None:
     assert "BEGIN " not in text and "password:" not in text
 
 
-def test_mounted_secrets_are_group_readable_only_and_listeners_need_no_public_route() -> None:
+def test_mounted_secrets_are_group_readable_only() -> None:
     for name, spec in _pod_specs():
         for volume in spec.get("volumes", []):
             if "secret" in volume:
                 assert volume["secret"]["defaultMode"] == 0o440, name
-    kinds = {d["kind"] for d in _documents()}
-    assert "Ingress" not in kinds  # nothing is exposed outside the cluster yet
+
+
+def test_only_the_console_has_a_route_from_outside_and_only_over_https() -> None:
+    documents = _documents()
+    for service in (d for d in documents if d["kind"] == "Service"):
+        assert service["spec"].get("type", "ClusterIP") == "ClusterIP"
+    [ingress] = [d for d in documents if d["kind"] == "Ingress"]
+    [rule] = ingress["spec"]["rules"]
+    host = rule["host"]
+    backends = [path["backend"]["service"] for path in rule["http"]["paths"]]
+    assert backends == [{"name": "engineering-control-console", "port": {"name": "http"}}]
+    [tls] = ingress["spec"]["tls"]
+    assert tls["hosts"] == [host]
+    assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/ssl-redirect"] == "true"
+    [certificate] = [d for d in documents if d["kind"] == "Certificate"]
+    assert certificate["spec"]["dnsNames"] == [host]
+    assert certificate["spec"]["secretName"] == tls["secretName"]
+    # The console refuses any other host name and any other origin for a change.
+    settings = Settings()
+    assert host in settings.dashboard_allowed_hosts
+    assert f"https://{host}" in settings.dashboard_allowed_origins
+    # A certificate that cannot be issued must not hold back the rest of the platform.
+    last = max(
+        int(d["metadata"].get("annotations", {}).get("argocd.argoproj.io/sync-wave", "0"))
+        for d in documents
+    )
+    for document in (ingress, certificate):
+        assert int(document["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"]) == last
+        assert last > 4
+
+
+def test_pods_accept_connections_only_from_the_namespace_and_the_ingress_controller() -> None:
     policies = [d for d in _documents() if d["kind"] == "NetworkPolicy"]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
-    for service in (d for d in _documents() if d["kind"] == "Service"):
-        assert service["spec"].get("type", "ClusterIP") == "ClusterIP"
+    same_namespace = [{"from": [{"podSelector": {}}]}]
+    outside = [p for p in policies if p["spec"]["ingress"] != same_namespace]
+    [policy] = outside
+    assert policy["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "console"
+    [rule] = policy["spec"]["ingress"]
+    assert rule["ports"] == [{"protocol": "TCP", "port": 8750}]
+    [peer] = rule["from"]
+    assert peer["podSelector"]["matchLabels"] == {"app.kubernetes.io/name": "ingress-nginx"}
 
 
 def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it() -> None:

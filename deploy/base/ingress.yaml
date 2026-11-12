@@ -1,0 +1,47 @@
+# The only route from outside the cluster: the console, over HTTPS. The API, the evidence
+# ingest, the notifier and Temporal have no route.
+#
+# Both resources are in the last wave so that a certificate that cannot be issued (for
+# example, a DNS record that does not point at this cluster) never blocks the platform.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: engineering-control-console-tls
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  secretName: engineering-control-console-tls
+  dnsNames:
+    - ade.musematic.ai
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: engineering-control-console
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # The console keeps event streams open; they must not be buffered or cut short.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ade.musematic.ai
+      secretName: engineering-control-console-tls
+  rules:
+    - host: ade.musematic.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: engineering-control-console
+                port:
+                  name: http

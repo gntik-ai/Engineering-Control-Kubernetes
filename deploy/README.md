@@ -18,10 +18,15 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
 | 3 | Console, evidence ingest (with its evidence volume), notifier; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
 | 4 | API, workflow worker | The command bus and the workflow engine's worker |
+| 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
 Not deployed yet: the scheduler (it would start recurring workflows whose activities need
-role workers that do not exist yet), an Ingress (nothing is reachable from outside the
-cluster), TLS between the platform and Temporal, and the sandboxes.
+role workers that do not exist yet), TLS between the platform and Temporal, and the
+sandboxes.
+
+Only the console is reachable from outside. A network policy lets the ingress controller
+(pods labelled `app.kubernetes.io/name: ingress-nginx`, in any namespace) reach the console's
+port and nothing else; every other pod accepts connections from its own namespace only.
 
 ## Rules the manifests keep
 

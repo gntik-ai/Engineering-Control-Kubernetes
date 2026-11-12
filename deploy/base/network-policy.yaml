@@ -16,6 +16,30 @@ spec:
     - from:
         - podSelector: {}
 ---
+# The console is the one process with a route from outside. Besides its own namespace, it
+# accepts connections from the ingress controller, and only on its HTTP port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: console-from-ingress-controller
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: console
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8750
+---
 # Temporal accepts connections only from this namespace.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

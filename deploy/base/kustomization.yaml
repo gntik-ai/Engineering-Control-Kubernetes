@@ -1,5 +1,6 @@
 # The control plane: databases, bootstrap, migrations, Temporal, API, console, evidence
-# ingest, notifier and workflow worker. The scheduler and the role workers are not here yet.
+# ingest, notifier, workflow worker and the console's public route. The scheduler and the
+# role workers are not here yet.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: engineering-control
@@ -17,6 +18,7 @@ resources:
   - notifier.yaml
   - api.yaml
   - workflow-worker.yaml
+  - ingress.yaml
 labels:
   - pairs:
       app.kubernetes.io/part-of: engineering-control
