@@ -103,6 +103,9 @@ spec:
             - name: secrets
               mountPath: /var/run/secrets/engineering-control
               readOnly: true
+            - name: github-app
+              mountPath: /var/run/secrets/engineering-control-github-app
+              readOnly: true
             - name: state
               mountPath: /var/lib/engineering-control
             - name: tmp
@@ -112,6 +115,17 @@ spec:
           secret:
             secretName: engineering-control-secrets
             defaultMode: 0440
+        # The GitHub App's private key, from the Secret the administrator creates. Only the
+        # key: the app's client secret is not mounted. Without the Secret the console still
+        # starts and asks for the repository of a new project to be typed.
+        - name: github-app
+          secret:
+            secretName: engineering-control-github-app
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
         - name: state
           emptyDir: {}
         - name: tmp

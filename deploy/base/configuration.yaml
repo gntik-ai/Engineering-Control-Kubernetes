@@ -29,6 +29,7 @@ data:
   ENGINEERING_GITHUB_APP_ID: "5724836"
   ENGINEERING_GITHUB_APP_CLIENT_ID: Iv23ctEXJNig6ZErLZsS
   ENGINEERING_GITHUB_APP_INSTALLATION_ID: "181163547"
+  ENGINEERING_GITHUB_APP_PRIVATE_KEY_FILE: /var/run/secrets/engineering-control-github-app/private-key.pem
   # The chat channel answers this Telegram account only. The bot's token is in the Secret
   # engineering-control-telegram, created by the administrator.
   ENGINEERING_TELEGRAM_ADMINISTRATOR_ID: "685699815"

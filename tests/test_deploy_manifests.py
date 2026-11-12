@@ -297,3 +297,27 @@ def test_temporal_is_reached_over_tls_and_only_the_server_holds_its_key() -> Non
         mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
         assert f"{mounts['temporal-ca']['mountPath']}/ca.crt" == authority_file
         assert mounts["temporal-ca"]["readOnly"] is True
+
+
+def test_only_the_console_holds_the_github_app_key_and_never_its_client_secret() -> None:
+    documents = _documents()
+    settings = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+    )
+    key_file = settings["ENGINEERING_GITHUB_APP_PRIVATE_KEY_FILE"]
+    holders = {}
+    for pod, spec in _pod_specs():
+        for volume in spec.get("volumes", []):
+            if volume.get("secret", {}).get("secretName") == "engineering-control-github-app":
+                holders[pod] = volume
+    assert set(holders) == {"Deployment/engineering-control-console"}
+    volume = holders["Deployment/engineering-control-console"]
+    assert volume["secret"]["items"] == [{"key": "private-key.pem", "path": "private-key.pem"}]
+    # The administrator creates this Secret; a cluster without it must still start.
+    assert volume["secret"]["optional"] is True
+    spec = dict(_pod_specs())["Deployment/engineering-control-console"]
+    mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
+    assert f"{mounts[volume['name']]['mountPath']}/private-key.pem" == key_file
+    assert mounts[volume["name"]]["readOnly"] is True

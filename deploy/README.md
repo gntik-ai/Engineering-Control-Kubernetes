@@ -70,6 +70,20 @@ kubectl taint node aibot engineering-control/sandbox=true:NoSchedule
 The taint keeps every other workload off the node. Pods already there keep running until
 they restart; one with data on the node's disk cannot come back afterwards, so move it first.
 
+## The GitHub App
+
+The platform acts on GitHub through the organisation's GitHub App "Engineering Control". Its
+app id, client id and installation id are settings in `base/configuration.yaml`. Its private
+key and client secret are in the Secret `engineering-control-github-app`, which the
+administrator creates and which is not in this repository:
+
+```bash
+kubectl -n engineering-control create secret generic engineering-control-github-app --from-file=private-key.pem=/path/to/key.pem --from-literal=client-secret='...'
+```
+
+Only the console mounts it, and only the private key. With it the console lists the
+repositories the app is installed on, using a token limited to reading metadata.
+
 ## Rules the manifests keep
 
 `tests/test_deploy_manifests.py` fails if a pod could run as root, write its root
