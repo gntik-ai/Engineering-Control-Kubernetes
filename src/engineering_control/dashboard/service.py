@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from typing import cast
 from uuid import UUID
 
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
@@ -164,7 +165,41 @@ class DashboardService:
         return await asyncio.to_thread(self.repository.projects.exists, name)
 
     async def sync_registry_projects(self) -> list[str]:
-        return await asyncio.to_thread(self.repository.projects.sync_registry)
+        added = await asyncio.to_thread(self.repository.projects.sync_registry)
+        # Every project has its core sections, whenever it was created.
+        await asyncio.to_thread(self.repository.sections.sync_core)
+        return added
+
+    async def project(self, name: str) -> dict[str, object] | None:
+        """One project with its counts and its sections; None when there is none."""
+        listing = await asyncio.to_thread(self.repository.observability.projects)
+        for item in cast(list[dict[str, object]], listing["items"]):
+            if item["project"] == name:
+                sections = await asyncio.to_thread(self.repository.sections.of_project, name)
+                return {"project": item, "sections": sections}
+        return None
+
+    async def add_section(
+        self, project: str, *, name: str, description: str | None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.sections.add(project, name=name, description=description)
+        )
+
+    async def update_section(
+        self, project: str, key: str, *, name: str | None, description: str | None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.sections.update(
+                project, key, name=name, description=description
+            )
+        )
+
+    async def remove_section(self, project: str, key: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.sections.remove, project, key)
+
+    async def assign_flow(self, project: str, key: str, flow: str | None) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.sections.assign, project, key, flow)
 
     async def create_project(
         self,

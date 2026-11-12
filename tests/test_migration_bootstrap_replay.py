@@ -29,10 +29,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0025 (projects as records) follows NEW-245's 0024 (stored cleanup lists), NEW-234
+    # 0026 (sections of a project) follows 0025 (projects as records), which follows
+    # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0025", "0024")
+    assert (head, parent) == ("0026", "0025")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -79,13 +80,66 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
                 "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
-    with pytest.raises(RuntimeError, match="refuses to drop projects created in the console"):
+
+    # 0026: every project has the six core sections; the registry's keep their three flows.
+    def sections_by_project() -> dict[str, list[tuple[str, str, str | None]]]:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT p.name, s.key, s.kind, s.flow_key FROM project_sections s "
+                    "JOIN projects p ON p.id = s.project_id ORDER BY p.name, s.position"
+                )
+            ).all()
+        found: dict[str, list[tuple[str, str, str | None]]] = {}
+        for name, key, kind, flow in rows:
+            found.setdefault(name, []).append((key, kind, flow))
+        return found
+
+    by_project = sections_by_project()
+    assert set(by_project) == set(PROJECTS)  # the console's project was added after 0026 ran
+    assert by_project["falcone"] == [
+        ("code-audit", "core", "audit-code"),
+        ("ui-audit", "core", None),
+        ("ux-audit", "core", None),
+        ("code-clean", "core", None),
+        ("enhancement", "core", "discover-enhancements"),
+        ("issues", "core", "deliver-issue"),
+    ]
+    # Run 0026 again with the console's project present: it gets the same six, without a flow.
+    command.downgrade(config, parent)
+    assert "project_sections" not in inspect(engine).get_table_names()
+    command.upgrade(config, head)
+    by_project = sections_by_project()
+    assert set(by_project) == {*PROJECTS, "made-here"}
+    assert [key for key, _kind, _flow in by_project["made-here"]] == [
+        key for key, _kind, _flow in by_project["falcone"]
+    ]
+    assert [flow for _key, _kind, flow in by_project["made-here"]] == [None] * 6
+    # A section the administrator added must not be lost by a downgrade.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO project_sections (id, project_id, key, name, description, kind, "
+                "position, created_at, updated_at) SELECT '00000000000000000000000000000002', "
+                "id, 'release-notes', 'Release notes', '', 'custom', 6, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP FROM projects WHERE name = 'made-here'"
+            )
+        )
+    with pytest.raises(RuntimeError, match="refuses to drop sections the administrator added"):
         command.downgrade(config, parent)
     with engine.begin() as connection:
-        connection.execute(text("DELETE FROM projects WHERE origin = 'console'"))
+        connection.execute(text("DELETE FROM project_sections WHERE kind = 'custom'"))
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "project_sections" not in inspect(engine).get_table_names()
+    with pytest.raises(RuntimeError, match="refuses to drop projects created in the console"):
+        command.downgrade(config, "0024")
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM projects WHERE origin = 'console'"))
+    command.downgrade(config, "0024")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0024"
     assert "projects" not in inspect(engine).get_table_names()
     assert "cleanup_run_items" in inspect(engine).get_table_names()
     command.downgrade(config, "0023")

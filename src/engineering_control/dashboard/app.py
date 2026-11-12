@@ -56,11 +56,16 @@ from engineering_control.dashboard.schemas import (
     ProjectCreateInput,
     ProjectRenameInput,
     R3CandidateCreateInput,
+    SectionCreateInput,
+    SectionFlowInput,
+    SectionRemoveInput,
+    SectionUpdateInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
 from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
+from engineering_control.flow_library import flow_catalogue
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.operations.models import parse_command
@@ -84,7 +89,7 @@ CONSOLE_INLINE_STYLE = (
 CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
-CONSOLE_VIEWS = frozenset({"", "projects", "backlog", "executions", "execution"})
+CONSOLE_VIEWS = frozenset({"", "projects", "project", "backlog", "executions", "execution"})
 CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
 CONSOLE_ASSET_REFERENCE = re.compile(r'(?:src|href)="/console/assets/([^"]+)"')
 CONSOLE_ASSET_TYPES = {
@@ -729,7 +734,13 @@ def create_app(
         return JSONResponse(await service(request).projects())
 
     async def project_change(
-        request: Request, model: type[Any], change: Any, *, event: str, status_code: int = 200
+        request: Request,
+        model: type[Any],
+        change: Any,
+        *,
+        event: str,
+        subject: str | None = None,
+        status_code: int = 200,
     ) -> Response:
         """One shape for every change to a project: session, body, CSRF, change, record."""
         authenticated = await require_session(request, api=True)
@@ -742,15 +753,17 @@ def create_app(
         if not _valid_csrf(authenticated, body.csrf_token):
             return JSONResponse({"detail": "invalid request"}, status_code=403)
         try:
-            project = await change(body)
+            changed = await change(body)
         except ProjectInvalid as error:
             return JSONResponse({"detail": str(error)}, status_code=422)
         except ProjectConflict as error:
             return JSONResponse({"detail": str(error)}, status_code=409)
         except ProjectNotFound:
-            return JSONResponse({"detail": "project not found"}, status_code=404)
+            return JSONResponse({"detail": "not found"}, status_code=404)
         except GitHubAppError as error:
             return JSONResponse({"detail": str(error)}, status_code=502)
+        # What changed: a project by its name, or a section as project/section.
+        label = subject or str(changed["project"])
         action = event.rsplit(".", 1)[-1].replace("_", " ")
         await _record_safely(
             repo(request),
@@ -760,11 +773,11 @@ def create_app(
                 source="dashboard",
                 project="platform",
                 entity_type="project",
-                entity_id=str(project["project"]),
-                message=f"Project {project['project']}: {action}",
+                entity_id=label[:240],
+                message=f"Project {label}: {action}",
             ),
         )
-        return JSONResponse(project, status_code=status_code)
+        return JSONResponse(changed, status_code=status_code)
 
     def github(request: Request) -> GitHubApp | None:
         return cast(GitHubApp | None, request.app.state.github_app)
@@ -830,6 +843,70 @@ def create_app(
             ProjectRenameInput,
             lambda body: service(request).rename_project(name, body.display_name),
             event="dashboard.project_renamed",
+        )
+
+    @app.get("/api/dashboard/flows")
+    async def flows_api(request: Request) -> Response:
+        """The flows a section can be assigned."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse({"items": flow_catalogue()})
+
+    @app.get("/api/dashboard/projects/{name}")
+    async def project_api(name: str, request: Request) -> Response:
+        """One project: what the list shows for it, and its sections."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        found = await service(request).project(name) if PROJECT_NAME.fullmatch(name) else None
+        if found is None:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return JSONResponse(found)
+
+    @app.post("/api/dashboard/projects/{name}/sections", status_code=201)
+    async def add_section_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionCreateInput,
+            lambda body: service(request).add_section(
+                name, name=body.name, description=body.description
+            ),
+            event="dashboard.section_added",
+            subject=name,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/sections/{key}/update")
+    async def update_section_api(name: str, key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionUpdateInput,
+            lambda body: service(request).update_section(
+                name, key, name=body.name, description=body.description
+            ),
+            event="dashboard.section_changed",
+            subject=f"{name}/{key}",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/sections/{key}/remove")
+    async def remove_section_api(name: str, key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionRemoveInput,
+            lambda _body: service(request).remove_section(name, key),
+            event="dashboard.section_removed",
+            subject=f"{name}/{key}",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/sections/{key}/flow")
+    async def assign_flow_api(name: str, key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionFlowInput,
+            lambda body: service(request).assign_flow(name, key, body.flow),
+            event="dashboard.section_flow_assigned",
+            subject=f"{name}/{key}",
         )
 
     @app.post("/api/dashboard/projects/{name}/archive")

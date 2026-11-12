@@ -1800,8 +1800,8 @@ Status: **done**, **in progress**, or blank for not started.
 | --- | --- |
 | C1 | Create a project: name it and connect its repository (done: projects are records; create, rename and remove in the console; the repository is chosen from the ones the GitHub App is installed on, and its default branch is taken from GitHub) |
 | C2 | GitHub sign-in to pick the repository from a list |
-| C3 | Six core sections per project, and custom sections |
-| C4 | Assign, change or remove the flow of a section |
+| C3 | Six core sections per project, and custom sections (done: every project has the six; the administrator adds, describes, renames and removes its own, up to twenty) |
+| C4 | Assign, change or remove the flow of a section (done as a record: a section holds one of the seven built-in flows or none; nothing starts from the assignment until runs are connected in phase 3) |
 | C5 | The six existing projects migrated into project records (done: copied in by migration 0025; the workflows still read the registry in code) |
 
 **D. Backlog and queue**

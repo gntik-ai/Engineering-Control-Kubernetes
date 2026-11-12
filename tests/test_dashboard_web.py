@@ -300,6 +300,10 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects",
         "/api/dashboard/projects/{name}/rename",
         "/api/dashboard/projects/{name}/archive",
+        "/api/dashboard/projects/{name}/sections",
+        "/api/dashboard/projects/{name}/sections/{key}/update",
+        "/api/dashboard/projects/{name}/sections/{key}/remove",
+        "/api/dashboard/projects/{name}/sections/{key}/flow",
     }
     paths = {route.path for route in app.routes}
     assert not any("journal" in path or "shell" in path or "terminal" in path for path in paths)

@@ -13,6 +13,7 @@ from engineering_control.coverage_outcome import coverage_outcome, normalized_co
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.project_records import ProjectRecords
+from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.schemas import ActivityEventInput
 from engineering_control.dashboard.session_store import (
     SessionAuthorization,
@@ -121,6 +122,7 @@ class DashboardRepository:
         self.redactor = SecretRedactor()
         self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
         self.projects = ProjectRecords(self.sessions)
+        self.sections = SectionRecords(self.sessions)
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)

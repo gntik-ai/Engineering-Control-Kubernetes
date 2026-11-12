@@ -18,6 +18,27 @@ export interface ProjectSummary {
   last_activity_at: string | null;
 }
 
+/** A flow of the library: what a section can be assigned. */
+export interface Flow {
+  key: string;
+  name: string;
+  summary: string;
+}
+
+/** One kind of work on a project. `flow` is null while none is assigned. */
+export interface Section {
+  key: string;
+  name: string;
+  description: string;
+  kind: 'core' | 'custom';
+  flow: Flow | null;
+}
+
+export interface ProjectDetail {
+  project: ProjectSummary;
+  sections: Section[];
+}
+
 /** A repository the GitHub App is installed on. */
 export interface GitHubRepository {
   full_name: string;

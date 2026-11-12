@@ -442,6 +442,30 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 
+class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
+    """One kind of work on a project (migration 0026).
+
+    Every project has the six core sections; the administrator adds custom ones. The
+    description says what belongs in the section, which is what work is routed by. A
+    section runs the flow assigned to it, or nothing while it has none.
+    """
+
+    __tablename__ = "project_sections"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(40))
+    name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    kind: Mapped[str] = mapped_column(String(8))
+    position: Mapped[int] = mapped_column(Integer)
+    flow_key: Mapped[str | None] = mapped_column(String(80))
+    __table_args__ = (
+        UniqueConstraint("project_id", "key", name="uq_project_sections_project_key"),
+        CheckConstraint("kind IN ('core', 'custom')", name="kind"),
+    )
+
+
 class SolutionLoop(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "solution_loops"
     workflow_id: Mapped[str] = mapped_column(String(240), unique=True, index=True)

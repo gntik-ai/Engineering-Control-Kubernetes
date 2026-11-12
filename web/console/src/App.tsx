@@ -4,6 +4,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { signOut } from './api';
 import { ExecutionPage } from './pages/Execution';
 import { NotFoundPage } from './pages/NotFound';
+import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
 import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
@@ -23,6 +24,7 @@ const NAV: NavGroup[] = [
 
 const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/projects`]: () => <ProjectsPage />,
+  [`${BASE}/project`]: () => <ProjectPage />,
   [`${BASE}/backlog`]: () => <BacklogPage />,
   [`${BASE}/executions`]: () => <ExecutionsPage />,
   [`${BASE}/execution`]: () => <ExecutionPage />,
@@ -65,7 +67,13 @@ export default function App() {
         sidebar={({ collapsed, closeDrawer }) => (
           <NavList
             groups={NAV}
-            currentHref={current === `${BASE}/execution` ? `${BASE}/executions` : current}
+            currentHref={
+              current === `${BASE}/execution`
+                ? `${BASE}/executions`
+                : current === `${BASE}/project`
+                  ? `${BASE}/projects`
+                  : current
+            }
             collapsed={collapsed}
             label="Console"
             onNavigate={closeDrawer}

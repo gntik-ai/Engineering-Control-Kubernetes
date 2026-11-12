@@ -63,6 +63,28 @@ class ProjectArchiveInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class SectionCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class SectionUpdateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class SectionRemoveInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+
+
+class SectionFlowInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    # None leaves the section without a flow.
+    flow: str | None = Field(default=None, max_length=80)
+
+
 class ActionReauthenticationInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     candidate_id: UUID

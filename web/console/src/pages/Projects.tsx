@@ -41,7 +41,9 @@ function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () 
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <CardTitle as="h2" className="truncate">
-              {item.display_name}
+              <Link href={`${BASE}/project?name=${encodeURIComponent(item.project)}`} className="text-foreground">
+                {item.display_name}
+              </Link>
             </CardTitle>
             <div className="mt-0.5 flex items-center gap-2">
               <span className="font-mono text-[12px] text-muted-foreground">{item.project}</span>

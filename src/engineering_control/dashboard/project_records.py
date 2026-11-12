@@ -181,6 +181,11 @@ class ProjectRecords:
             )
             session.add(record)
             try:
+                session.flush()
+                # A project is born with its six core sections.
+                from engineering_control.dashboard.project_sections import ensure_core_sections
+
+                ensure_core_sections(session, record)
                 session.commit()
             except IntegrityError as error:
                 session.rollback()
