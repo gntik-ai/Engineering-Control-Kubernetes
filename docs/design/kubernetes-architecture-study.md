@@ -1808,9 +1808,9 @@ Status: **done**, **in progress**, or blank for not started.
 
 | Id | Feature |
 | --- | --- |
-| D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals |
-| D2 | Import and keep in step with GitHub issues |
-| D3 | Route an item to a section, by the supervisor or by hand |
+| D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals (done for GitHub issues and for items the administrator writes; findings, chat and supervisor proposals come with phases 4 and 5) |
+| D2 | Import and keep in step with GitHub issues (done: the open issues of a project's repository are read through the GitHub App on demand and every fifteen minutes; an issue closed on GitHub closes its item, a reopened one is proposed again) |
+| D3 | Route an item to a section, by the supervisor or by hand (done by label and by hand: an issue carrying a label of exactly one section goes there; the administrator's choice is never changed by an import. The supervisor's routing comes in phase 4) |
 | D4 | Run one item at a time |
 | D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder |
 | D6 | Scheduler with budgets per account, project, component and risk class |

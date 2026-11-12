@@ -82,7 +82,9 @@ kubectl -n engineering-control create secret generic engineering-control-github-
 ```
 
 Only the console mounts it, and only the private key. With it the console lists the
-repositories the app is installed on, using a token limited to reading metadata.
+repositories the app is installed on and reads their open issues for the backlog, using a
+token limited to reading metadata and issues. It reads the issues of every project every
+fifteen minutes (`ENGINEERING_BACKLOG_SYNC_MINUTES`; zero leaves it to the Sync button).
 
 ## Rules the manifests keep
 

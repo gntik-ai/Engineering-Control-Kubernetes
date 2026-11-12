@@ -65,7 +65,8 @@ def _present() -> bool:
     if _TABLE not in set(inspector.get_table_names()):
         return False
     columns = {str(item["name"]) for item in inspector.get_columns(_TABLE)}
-    if columns != _COLUMNS:
+    # A later revision may add columns, which a fresh install then has from the start.
+    if not _COLUMNS <= columns:
         raise RuntimeError("revision 0025 found a partial bootstrap schema")
     return True
 

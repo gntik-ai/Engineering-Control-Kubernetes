@@ -48,6 +48,43 @@ export interface ProjectDetail {
   sections: Section[];
 }
 
+/** One piece of work wanted on a project: an issue of its repository, or written by hand. */
+export interface WorkItem {
+  id: string;
+  project: string;
+  project_name: string;
+  /** The section it is routed to; null while it is not routed. */
+  section: { key: string; name: string } | null;
+  title: string;
+  source: 'github' | 'manual';
+  state: 'proposed' | 'accepted' | 'skipped' | 'done';
+  /** Who chose the section: a label of the issue, or the administrator. */
+  routed_by: 'label' | 'administrator' | null;
+  routing_reason: string | null;
+  repository: string | null;
+  issue_number: number | null;
+  issue_url: string | null;
+  issue_state: 'open' | 'closed' | null;
+  labels: string[];
+  updated_at: string | null;
+}
+
+/** Whether a project's backlog can be read from GitHub, and how the last reading went. */
+export interface BacklogStatus {
+  github: boolean;
+  last_sync: { synced_at: string; open_issues: number; error: string | null } | null;
+}
+
+export interface SyncResult {
+  imported: number;
+  updated: number;
+  closed: number;
+  reopened: number;
+  routed: number;
+  open_issues: number;
+  complete: boolean;
+}
+
 /** A repository the GitHub App is installed on. */
 export interface GitHubRepository {
   full_name: string;

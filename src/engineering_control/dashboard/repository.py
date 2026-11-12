@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.coverage_outcome import coverage_outcome, normalized_coverage_status
 from engineering_control.dashboard.auth import PasswordService
+from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
@@ -123,6 +124,7 @@ class DashboardRepository:
         self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
         self.projects = ProjectRecords(self.sessions)
         self.sections = SectionRecords(self.sessions)
+        self.backlog = BacklogItems(self.sessions)
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)

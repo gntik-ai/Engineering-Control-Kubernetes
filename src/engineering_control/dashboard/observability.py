@@ -11,6 +11,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_records import serialize as serialize_project
 from engineering_control.dashboard.status_mapping import (
@@ -500,6 +501,11 @@ class DashboardObservabilityProjection:
             }
             for record in ProjectRecords(self.sessions).active()
         }
+        # The backlog of the console: items still to do. The older issue records of the
+        # workflows are added below.
+        for name, count in BacklogItems(self.sessions).open_counts().items():
+            if name in summaries:
+                summaries[name]["backlog_issues"] += count
         with self.sessions() as session:
             tracked_issues = (
                 select(
@@ -519,7 +525,7 @@ class DashboardObservabilityProjection:
             )
             for row in session.execute(issue_counts).all():
                 if row[0] in summaries:
-                    summaries[row[0]]["backlog_issues"] = row[1]
+                    summaries[row[0]]["backlog_issues"] += row[1]
             for project, status, run_type, count, latest in session.execute(
                 select(
                     Run.project, Run.status, Run.run_type, func.count(), func.max(Run.updated_at)

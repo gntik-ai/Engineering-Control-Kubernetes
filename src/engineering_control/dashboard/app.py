@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import ipaddress
@@ -35,6 +37,7 @@ from engineering_control.dashboard.auth import (
     SignedSessionManager,
     read_session_key,
 )
+from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.dependencies import AuthenticatedSession
 from engineering_control.dashboard.events import sse_events, transcript_sse
 from engineering_control.dashboard.project_records import (
@@ -46,13 +49,17 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     clean_repository,
 )
-from engineering_control.dashboard.project_sections import Guide
+from engineering_control.dashboard.project_sections import SECTION_KEY, Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
     ActionCandidateInput,
     ActionExecuteInput,
     ActionReauthenticationInput,
     ActivityEventInput,
+    BacklogSyncInput,
+    ItemCreateInput,
+    ItemRouteInput,
+    ItemStateInput,
     ProjectArchiveInput,
     ProjectCreateInput,
     ProjectRenameInput,
@@ -175,6 +182,26 @@ def create_app(
         ipaddress.ip_network(value) for value in resolved.dashboard_trusted_proxy_networks
     )
 
+    async def keep_backlogs_in_step(
+        backlog_service: DashboardService, installed: GitHubApp, *, interval_seconds: int
+    ) -> None:
+        """Every interval, import each project's open issues. One project failing (its
+        repository gone, GitHub not answering) never stops the others or the console."""
+        await asyncio.sleep(min(60, interval_seconds))
+        while True:
+            try:
+                names = await backlog_service.active_project_names()
+            except Exception as error:  # noqa: BLE001 - try again at the next interval
+                log_failure("backlog-sync", "dashboard backlog sync could not list projects", error)
+                names = []
+            for name in names:
+                try:
+                    await backlog_service.sync_backlog(name, installed)
+                    log_recovery("backlog-sync", "dashboard backlog sync recovered")
+                except Exception as error:  # noqa: BLE001 - recorded on the project; go on
+                    log_failure("backlog-sync", "dashboard backlog sync failed", error)
+            await asyncio.sleep(interval_seconds)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -213,7 +240,22 @@ def create_app(
         if resolved_github is None and repository is None:
             resolved_github = GitHubApp.from_settings(resolved)
         app.state.github_app = resolved_github
+        keeper: asyncio.Task[None] | None = None
+        # Keep every project's backlog in step with GitHub, unless a fixture supplied the
+        # app (a test drives the import itself) or the interval is zero.
+        if github_app is None and resolved_github is not None and resolved.backlog_sync_minutes:
+            keeper = asyncio.create_task(
+                keep_backlogs_in_step(
+                    app.state.dashboard_service,
+                    resolved_github,
+                    interval_seconds=resolved.backlog_sync_minutes * 60,
+                )
+            )
         yield
+        if keeper is not None:
+            keeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keeper
         if github_app is None and resolved_github is not None:
             await resolved_github.aclose()
         if admission_reader is None and resolved_admission is not None:
@@ -928,6 +970,95 @@ def create_app(
             lambda body: service(request).assign_flow(name, key, body.flow),
             event="dashboard.section_flow_assigned",
             subject=f"{name}/{key}",
+        )
+
+    @app.get("/api/dashboard/items")
+    async def items_api(
+        request: Request,
+        project: str | None = None,
+        section: str | None = Query(default=None, max_length=40),
+        state: str | None = Query(default=None, max_length=16),
+        search: str | None = Query(default=None, max_length=200),
+        page: int = Query(default=1, ge=1, le=10_000),
+        page_size: int = Query(default=50, ge=1, le=200),
+    ) -> Response:
+        """The backlog: the work wanted, with the section each item is routed to."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        await check_filters(request, project, None)
+        if state is not None and state not in BACKLOG_STATES:
+            raise HTTPException(status_code=422, detail="invalid state filter")
+        if section is not None and section != "none" and not SECTION_KEY.fullmatch(section):
+            raise HTTPException(status_code=422, detail="invalid section filter")
+        return JSONResponse(
+            await service(request).items(
+                project=project,
+                section=section,
+                state=state,
+                search=search,
+                page=page,
+                page_size=page_size,
+            )
+        )
+
+    @app.get("/api/dashboard/projects/{name}/backlog")
+    async def backlog_status_api(name: str, request: Request) -> Response:
+        """Whether the project's backlog can be brought in step with GitHub, and when it was."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            status = await service(request).backlog_status(name)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return JSONResponse({"github": github(request) is not None, "last_sync": status})
+
+    @app.post("/api/dashboard/projects/{name}/backlog/sync")
+    async def backlog_sync_api(name: str, request: Request) -> Response:
+        async def sync(_body: BacklogSyncInput) -> dict[str, object]:
+            installed = github(request)
+            if installed is None:
+                raise ProjectConflict("The GitHub App is not configured, so issues cannot be read")
+            return await service(request).sync_backlog(name, installed)
+
+        return await project_change(
+            request,
+            BacklogSyncInput,
+            sync,
+            event="dashboard.backlog_synced",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/items", status_code=201)
+    async def add_item_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ItemCreateInput,
+            lambda body: service(request).add_item(name, title=body.title, section=body.section),
+            event="dashboard.item_added",
+            subject=name,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/items/{item_id}/route")
+    async def route_item_api(item_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ItemRouteInput,
+            lambda body: service(request).route_item(item_id, body.section),
+            event="dashboard.item_routed",
+            subject=str(item_id),
+        )
+
+    @app.post("/api/dashboard/items/{item_id}/state")
+    async def item_state_api(item_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ItemStateInput,
+            lambda body: service(request).set_item_state(item_id, body.state),
+            event="dashboard.item_state_changed",
+            subject=str(item_id),
         )
 
     @app.post("/api/dashboard/projects/{name}/archive")

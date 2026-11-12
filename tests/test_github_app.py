@@ -49,6 +49,9 @@ class GitHub:
         self.requests: list[httpx.Request] = []
         self.token_requests = 0
         self.fail_with: int | None = None
+        # full name -> what GET /repos/{full name}/issues returns (issues and pull requests)
+        self.issues: dict[str, list[dict[str, Any]]] = {}
+        self.issues_disabled: set[str] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -70,15 +73,27 @@ class GitHub:
                 padding.PKCS1v15(),
                 hashes.SHA256(),
             )
-            # The console asks for nothing beyond reading metadata.
-            assert json.loads(request.content) == {"permissions": {"metadata": "read"}}
+            # The console asks for nothing beyond reading metadata and issues.
+            assert json.loads(request.content) == {
+                "permissions": {"metadata": "read", "issues": "read"}
+            }
             self.token_requests += 1
             expires = datetime.now(UTC) + timedelta(hours=1)
             return httpx.Response(
                 201, json={"token": "installation-token", "expires_at": expires.isoformat()}
             )
-        assert request.url.path == "/installation/repositories" and request.method == "GET"
-        assert bearer == "installation-token"
+        assert bearer == "installation-token" and request.method == "GET"
+        if request.url.path.startswith("/repos/"):
+            full_name = request.url.path.removeprefix("/repos/").removesuffix("/issues")
+            assert request.url.path.endswith("/issues") and request.url.params["state"] == "open"
+            if full_name in self.issues_disabled:
+                return httpx.Response(410, json={"message": "Issues are disabled"})
+            if full_name not in self.issues:
+                return httpx.Response(404, json={"message": "Not Found"})
+            page = int(request.url.params["page"])
+            size = int(request.url.params["per_page"])
+            return httpx.Response(200, json=self.issues[full_name][(page - 1) * size : page * size])
+        assert request.url.path == "/installation/repositories"
         page = int(request.url.params["page"])
         size = int(request.url.params["per_page"])
         chunk = self.repositories[(page - 1) * size : page * size]

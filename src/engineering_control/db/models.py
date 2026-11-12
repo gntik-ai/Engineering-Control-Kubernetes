@@ -473,6 +473,55 @@ class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
+    """One piece of work wanted on a project (migration 0027).
+
+    It comes from a GitHub issue of the project's repository or is written by the
+    administrator. It is routed to one section of the project, or to none yet; the
+    section's flow is what will run for it. ``routed_by`` says who decided: a label of the
+    issue, or the administrator, whose choice a later import never changes.
+    """
+
+    __tablename__ = "backlog_items"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    section_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("project_sections.id", ondelete="SET NULL"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(300))
+    source: Mapped[str] = mapped_column(String(16))
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    routed_by: Mapped[str | None] = mapped_column(String(16))
+    routing_reason: Mapped[str | None] = mapped_column(String(300))
+    # For an item that came from GitHub: where it is, and how it looked at the last import.
+    repository: Mapped[str | None] = mapped_column(String(140))
+    issue_number: Mapped[int | None] = mapped_column(Integer)
+    issue_url: Mapped[str | None] = mapped_column(String(300))
+    issue_state: Mapped[str | None] = mapped_column(String(16))
+    issue_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    issue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "repository", "issue_number", name="uq_backlog_items_project_issue"
+        ),
+        CheckConstraint("source IN ('github', 'manual')", name="source"),
+        CheckConstraint("state IN ('proposed', 'accepted', 'skipped', 'done')", name="state"),
+    )
+
+
+class BacklogSync(Base):
+    """When a project's backlog was last brought in step with GitHub, and how it went."""
+
+    __tablename__ = "backlog_syncs"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    open_issues: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(String(300))
+
+
 class SolutionLoop(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "solution_loops"
     workflow_id: Mapped[str] = mapped_column(String(240), unique=True, index=True)

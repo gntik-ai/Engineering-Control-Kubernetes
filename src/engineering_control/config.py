@@ -204,6 +204,9 @@ class Settings(BaseSettings):
     github_app_client_id: str | None = Field(default=None, pattern=r"^Iv[0-9A-Za-z]{10,40}$")
     github_app_installation_id: int | None = Field(default=None, ge=1)
     github_app_private_key_file: Path | None = None
+    # How often the console brings every project's backlog in step with GitHub by itself.
+    # Zero leaves it to the administrator's "Sync" button.
+    backlog_sync_minutes: int = Field(default=15, ge=0, le=1440)
     # The one Telegram account the chat channel answers: the administrator's numeric user
     # id. The bot's token is a mounted secret, never a setting.
     telegram_administrator_id: int | None = Field(default=None, ge=1)

@@ -2,8 +2,9 @@
 
 The app is identified by its id and one installation (both settings) and proves itself
 with a private key (a mounted secret). From the key it signs a token valid for minutes,
-exchanges it for an installation token limited to reading repository metadata, and lists
-the repositories of the installation. Nothing here writes to GitHub.
+exchanges it for an installation token limited to reading repository metadata and issues,
+and lists the repositories of the installation and the open issues of one of them.
+Nothing here writes to GitHub.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +31,8 @@ API_VERSION = "2022-11-28"
 REQUEST_SECONDS = 10.0
 PAGE_SIZE = 100
 MAX_REPOSITORIES = 2000
+MAX_ISSUES = 2000
+REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$")
 # GitHub accepts an app token for at most ten minutes; ask for less and allow clock drift.
 APP_TOKEN_SECONDS = 540
 CLOCK_DRIFT_SECONDS = 60
@@ -55,6 +59,15 @@ class Repository:
             "archived": self.archived,
             "default_branch": self.default_branch,
         }
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str
+    url: str
+    labels: tuple[str, ...]
+    updated_at: datetime | None
 
 
 def load_private_key(path: Path) -> rsa.RSAPrivateKey:
@@ -159,7 +172,79 @@ class GitHubApp:
                     return candidate
         return None
 
-    async def _request(self, method: str, url: str, *, token: str, **options: Any) -> Any:
+    async def open_issues(self, full_name: str) -> tuple[list[Issue], bool]:
+        """The open issues of a repository, oldest first, and whether that is all of them.
+
+        Pull requests are left out: GitHub lists them among the issues. A repository with
+        issues switched off has none.
+        """
+        if not REPOSITORY_NAME.fullmatch(full_name) or ".." in full_name:
+            raise GitHubAppError("That is not the name of a repository")
+        token = await self._installation_token()
+        issues: list[Issue] = []
+        page = 1
+        while True:
+            body = await self._request(
+                "GET",
+                f"/repos/{full_name}/issues",
+                token=token,
+                params={
+                    "state": "open",
+                    "sort": "created",
+                    "direction": "asc",
+                    "per_page": PAGE_SIZE,
+                    "page": page,
+                },
+                not_found=f"The GitHub App cannot see the repository {full_name}",
+                gone=[],
+            )
+            if not isinstance(body, list):
+                raise GitHubAppError("GitHub gave no list of issues")
+            for item in body:
+                if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                number, title = item.get("number"), item.get("title")
+                if not isinstance(number, int) or not isinstance(title, str):
+                    continue
+                updated = item.get("updated_at")
+                try:
+                    updated_at = (
+                        datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                        if isinstance(updated, str)
+                        else None
+                    )
+                except ValueError:
+                    updated_at = None
+                labels = tuple(
+                    label["name"]
+                    for label in item.get("labels") or []
+                    if isinstance(label, dict) and isinstance(label.get("name"), str)
+                )
+                issues.append(
+                    Issue(
+                        number=number,
+                        title=title,
+                        url=str(item.get("html_url") or ""),
+                        labels=labels,
+                        updated_at=updated_at,
+                    )
+                )
+            if len(body) < PAGE_SIZE:
+                return issues, True
+            if len(issues) >= MAX_ISSUES:
+                return issues, False
+            page += 1
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        token: str,
+        not_found: str = "GitHub does not know this installation of the app",
+        gone: Any = None,
+        **options: Any,
+    ) -> Any:
         try:
             response = await self.client.request(
                 method, url, headers={"Authorization": f"Bearer {token}"}, **options
@@ -169,7 +254,9 @@ class GitHubApp:
         if response.status_code in {401, 403}:
             raise GitHubAppError("GitHub refused the app's credentials")
         if response.status_code == 404:
-            raise GitHubAppError("GitHub does not know this installation of the app")
+            raise GitHubAppError(not_found)
+        if response.status_code == 410 and gone is not None:
+            return gone
         if response.status_code >= 400:
             raise GitHubAppError(f"GitHub answered {response.status_code}")
         try:
@@ -186,8 +273,8 @@ class GitHubApp:
             "POST",
             f"/app/installations/{self.installation_id}/access_tokens",
             token=app_token(self.app_id, self._key),
-            # Listing repositories needs nothing more than their metadata.
-            json={"permissions": {"metadata": "read"}},
+            # Read only: the list of repositories and their issues, nothing else.
+            json={"permissions": {"metadata": "read", "issues": "read"}},
         )
         token = body.get("token") if isinstance(body, dict) else None
         expires = body.get("expires_at") if isinstance(body, dict) else None

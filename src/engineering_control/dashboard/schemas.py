@@ -92,6 +92,27 @@ class SectionFlowInput(DashboardModel):
     flow: str | None = Field(default=None, max_length=80)
 
 
+class ItemCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    title: str = Field(min_length=1, max_length=1000)
+    # The key of a section of the project; None leaves the item unrouted.
+    section: str | None = Field(default=None, max_length=40)
+
+
+class ItemRouteInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    section: str | None = Field(default=None, max_length=40)
+
+
+class ItemStateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    state: str = Field(pattern=r"^(proposed|accepted|skipped|done)$")
+
+
+class BacklogSyncInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+
+
 class ActionReauthenticationInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     candidate_id: UUID

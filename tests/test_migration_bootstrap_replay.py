@@ -29,11 +29,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0026 (sections of a project) follows 0025 (projects as records), which follows
+    # 0027 (the backlog) follows 0026 (sections of a project) and 0025 (projects as
+    # records), which follow
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0026", "0025")
+    assert (head, parent) == ("0027", "0026")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -87,6 +88,30 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0027: the backlog. An item the administrator wrote must not be lost by a downgrade;
+    # one that only mirrors a GitHub issue can be imported again.
+    assert {"backlog_items", "backlog_syncs"} <= set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        for item_id, source, routed_by in (
+            ("00000000000000000000000000000003", "github", None),
+            ("00000000000000000000000000000004", "manual", "administrator"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO backlog_items (id, project_id, title, source, state, routed_by, "
+                    "issue_labels, created_at, updated_at) SELECT :id, id, 'An item', :source, "
+                    "'proposed', :routed_by, '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP "
+                    "FROM projects WHERE name = 'made-here'"
+                ),
+                {"id": item_id, "source": source, "routed_by": routed_by},
+            )
+    with pytest.raises(RuntimeError, match="refuses to drop backlog items the administrator"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM backlog_items WHERE source = 'manual'"))
+    command.downgrade(config, parent)
+    assert "backlog_items" not in inspect(engine).get_table_names()
+    assert "backlog_syncs" not in inspect(engine).get_table_names()
     # A section the administrator added must not be lost by a downgrade.
     with engine.begin() as connection:
         connection.execute(
@@ -99,12 +124,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             )
         )
     with pytest.raises(RuntimeError, match="refuses to drop sections the administrator added"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0025")
     with engine.begin() as connection:
         connection.execute(text("DELETE FROM project_sections WHERE kind = 'custom'"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0025")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0025"
     assert "project_sections" not in inspect(engine).get_table_names()
     with pytest.raises(RuntimeError, match="refuses to drop projects created in the console"):
         command.downgrade(config, "0024")

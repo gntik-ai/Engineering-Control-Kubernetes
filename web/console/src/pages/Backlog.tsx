@@ -1,20 +1,304 @@
-import { Input, Page, Pagination, Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from '@gntik-ai/ui';
-import { Search } from '@gntik-ai/icons';
-import { useEffect, useState } from 'react';
-import { apiUrl, useResource, type BacklogItem, type Paged } from '../api';
-import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, Status, TableFrame, When, mono } from '../parts';
+import {
+  Alert,
+  Badge,
+  Button,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Field,
+  FieldDescription,
+  FieldLabel,
+  Input,
+  MoreMenu,
+  Page,
+  Pagination,
+  SimpleSelect,
+  StatusTag,
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  type StatusDefinition,
+} from '@gntik-ai/ui';
+import { Check, CircleSlash, Plus, RefreshCw, RotateCcw, Search } from '@gntik-ai/icons';
+import { useEffect, useState, type FormEvent } from 'react';
+import {
+  apiUrl,
+  postJson,
+  useResource,
+  type BacklogStatus,
+  type Paged,
+  type ProjectDetail,
+  type Section,
+  type SyncResult,
+  type WorkItem,
+} from '../api';
+import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { setQuery, useLocation } from '../router';
-import { STATUS_ITEMS } from '../status';
 
 const PAGE_SIZE = 50;
+const UNROUTED = 'none';
+const NO_SECTION = '__none__';
+
+const STATES: Record<string, StatusDefinition> = {
+  proposed: { label: 'Proposed', tone: 'neutral' },
+  accepted: { label: 'Accepted', tone: 'info' },
+  skipped: { label: 'Skipped', tone: 'neutral' },
+  done: { label: 'Done', tone: 'success' },
+};
+const STATE_ITEMS = Object.entries(STATES).map(([value, { label }]) => ({ value, label }));
+
+function message(error: unknown): string | null {
+  if (error instanceof DOMException && error.name === 'AbortError') return null;
+  return error instanceof Error ? error.message : 'The request failed.';
+}
+
+function AddItemDialog({
+  project,
+  sections,
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  project: string;
+  sections: Section[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const [title, setTitle] = useState('');
+  const [section, setSection] = useState(NO_SECTION);
+  const [pending, setPending] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    setTitle('');
+    setSection(NO_SECTION);
+    setProblem(null);
+    // Only when it opens: the form starts empty.
+  }, [open]);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!title.trim() || pending) return;
+    setPending(true);
+    setProblem(null);
+    try {
+      await postJson(`projects/${project}/items`, { title, section: section === NO_SECTION ? null : section });
+      onSaved();
+      onOpenChange(false);
+    } catch (error) {
+      setProblem(message(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="md">
+        <form onSubmit={submit} noValidate>
+          <DialogHeader>
+            <DialogTitle>Add an item</DialogTitle>
+            <DialogDescription>
+              Something you want done on this project that is not an issue on GitHub. It is added as accepted.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            <Field>
+              <FieldLabel>What should be done</FieldLabel>
+              <Input name="title" value={title} onValueChange={setTitle} maxLength={300} autoFocus />
+            </Field>
+            <Field>
+              <FieldLabel>Section</FieldLabel>
+              <SimpleSelect
+                aria-label="Section"
+                className="w-full"
+                items={[
+                  { value: NO_SECTION, label: 'Not routed yet' },
+                  ...sections.map((item) => ({ value: item.key, label: item.name })),
+                ]}
+                value={section}
+                onValueChange={(next) => setSection(next ?? NO_SECTION)}
+              />
+              <FieldDescription>The section's flow is what will run for it. You can route it later.</FieldDescription>
+            </Field>
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" loading={pending} disabled={!title.trim()}>
+              Add item
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Reads a project's open issues from GitHub now, and says what that changed. */
+function SyncButton({ project, onSynced }: { project: string; onSynced: (result: string | null, problem: string | null) => void }) {
+  const status = useResource<BacklogStatus>(apiUrl(`projects/${project}/backlog`));
+  const [pending, setPending] = useState(false);
+  const sync = async () => {
+    setPending(true);
+    try {
+      const result = await postJson<SyncResult>(`projects/${project}/backlog/sync`);
+      const parts = [
+        `${result.open_issues} open ${result.open_issues === 1 ? 'issue' : 'issues'} on GitHub`,
+        `${result.imported} new`,
+        `${result.closed} closed`,
+        `${result.routed} routed by a label`,
+      ];
+      onSynced(`${parts.join(', ')}.${result.complete ? '' : ' GitHub has more open issues than were read.'}`, null);
+      status.reload();
+    } catch (error) {
+      onSynced(null, message(error));
+      status.reload();
+    } finally {
+      setPending(false);
+    }
+  };
+  const last = status.data?.last_sync;
+  return (
+    <div className="flex items-center gap-2">
+      {last ? (
+        <span className="text-[12px] text-muted-foreground">
+          Read from GitHub <When value={last.synced_at} />
+        </span>
+      ) : null}
+      <Button
+        variant="secondary"
+        size="sm"
+        icon={RefreshCw}
+        loading={pending}
+        disabled={status.data ? !status.data.github : true}
+        onClick={() => void sync()}
+      >
+        Sync with GitHub
+      </Button>
+    </div>
+  );
+}
+
+function ItemRow({
+  item,
+  sections,
+  showProject,
+  onChanged,
+  onProblem,
+}: {
+  item: WorkItem;
+  sections: Section[] | null;
+  showProject: boolean;
+  onChanged: () => void;
+  onProblem: (problem: string | null) => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const change = async (path: string, body: Record<string, unknown>) => {
+    setPending(true);
+    onProblem(null);
+    try {
+      await postJson(`items/${item.id}/${path}`, body);
+      onChanged();
+    } catch (error) {
+      onProblem(message(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  const closed = item.issue_state === 'closed';
+  const actions = [
+    item.state !== 'accepted' && !closed
+      ? { label: 'Accept', icon: Check, onSelect: () => void change('state', { state: 'accepted' }) }
+      : null,
+    item.state !== 'skipped'
+      ? { label: 'Skip', icon: CircleSlash, onSelect: () => void change('state', { state: 'skipped' }) }
+      : null,
+    item.state !== 'proposed' && !closed
+      ? { label: 'Back to proposed', icon: RotateCcw, onSelect: () => void change('state', { state: 'proposed' }) }
+      : null,
+    item.state !== 'done' ? { label: 'Mark done', icon: Check, onSelect: () => void change('state', { state: 'done' }) } : null,
+  ].filter((action) => action !== null);
+  return (
+    <TableRow>
+      <TableCell className="max-w-xl">
+        <div className="flex items-baseline gap-2">
+          {item.issue_number ? <IssueRef number={item.issue_number} url={item.issue_url} /> : null}
+          <span className="truncate font-medium" title={item.title}>
+            {item.title}
+          </span>
+        </div>
+        {item.labels.length ? (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {item.labels.map((label) => (
+              <Badge key={label} tone="neutral" size="sm">
+                {label}
+              </Badge>
+            ))}
+          </div>
+        ) : null}
+      </TableCell>
+      {showProject ? <TableCell className={mono}>{item.project}</TableCell> : null}
+      <TableCell>
+        {sections ? (
+          <SimpleSelect
+            aria-label={`Section of ${item.title}`}
+            size="sm"
+            className="w-44"
+            disabled={pending}
+            items={[
+              { value: NO_SECTION, label: 'Not routed' },
+              ...sections.map((section) => ({ value: section.key, label: section.name })),
+            ]}
+            value={item.section?.key ?? NO_SECTION}
+            onValueChange={(next) => {
+              const section = !next || next === NO_SECTION ? null : next;
+              if (section !== (item.section?.key ?? null)) void change('route', { section });
+            }}
+          />
+        ) : (
+          <span className="text-[13px]">{item.section?.name ?? <span className="text-muted-foreground">Not routed</span>}</span>
+        )}
+        <div className="mt-1 text-[12px] text-muted-foreground">
+          {item.routed_by === 'administrator'
+            ? 'Chosen by you'
+            : (item.routing_reason ?? (item.section ? '' : 'No label of a section'))}
+        </div>
+      </TableCell>
+      <TableCell>
+        <StatusTag status={item.state} statuses={STATES} size="sm" />
+        {closed ? <div className="mt-1 text-[12px] text-muted-foreground">Closed on GitHub</div> : null}
+      </TableCell>
+      <TableCell>
+        <When value={item.updated_at} />
+      </TableCell>
+      <TableCell className="text-right">
+        <MoreMenu label={`Actions for ${item.title}`} size="sm" align="end" items={actions} />
+      </TableCell>
+    </TableRow>
+  );
+}
 
 export function BacklogPage() {
   const { query } = useLocation();
   const project = query.get('project');
-  const status = query.get('status');
+  const section = query.get('section');
+  const state = query.get('state');
   const search = query.get('search') ?? '';
   const page = Math.max(1, Number(query.get('page')) || 1);
   const [draft, setDraft] = useState(search);
+  const [adding, setAdding] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
   // Typing filters after a short pause; any filter change returns to the first page.
   useEffect(() => {
     if (draft === search) return;
@@ -22,10 +306,13 @@ export function BacklogPage() {
     return () => window.clearTimeout(timer);
   }, [draft, search]);
 
-  const backlog = useResource<Paged<BacklogItem>>(
-    apiUrl('backlog', { project, status, search, page, page_size: PAGE_SIZE }),
+  const backlog = useResource<Paged<WorkItem>>(
+    apiUrl('items', { project, section, state, search, page, page_size: PAGE_SIZE }),
     30_000,
   );
+  // The sections of the chosen project: what an item can be routed to.
+  const detail = useResource<ProjectDetail>(project ? apiUrl(`projects/${project}`) : apiUrl('flows'));
+  const sections = project && detail.data && 'sections' in detail.data ? detail.data.sections : null;
   const total = backlog.data?.total;
 
   return (
@@ -33,20 +320,47 @@ export function BacklogPage() {
       title="Backlog"
       description={
         total === undefined
-          ? 'Issues imported from GitHub and their delivery state.'
-          : `${total.toLocaleString('en')} ${total === 1 ? 'issue' : 'issues'}${project ? ` in ${project}` : ' across all projects'}.`
+          ? 'The work wanted on each project, and the section each item is routed to.'
+          : `${total.toLocaleString('en')} ${total === 1 ? 'item' : 'items'}${project ? ` in ${project}` : ' across all projects'}.`
       }
-      actions={<RefreshButton resource={backlog} />}
+      actions={
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <RefreshButton resource={backlog} />
+          {project ? (
+            <SyncButton
+              key={project}
+              project={project}
+              onSynced={(result, failure) => {
+                setNotice(result);
+                setProblem(failure);
+                backlog.reload();
+              }}
+            />
+          ) : null}
+          <Button icon={Plus} size="sm" disabled={!sections} onClick={() => setAdding(true)}>
+            Add item
+          </Button>
+        </div>
+      }
     >
       <div className="grid gap-4">
         <div className="flex flex-wrap items-center gap-2">
-          <ProjectFilter value={project} onChange={(value) => setQuery({ project: value, page: null })} />
+          <ProjectFilter value={project} onChange={(value) => setQuery({ project: value, section: null, page: null })} />
+          {sections ? (
+            <FilterSelect
+              label="Section"
+              allLabel="All sections"
+              items={[{ value: UNROUTED, label: 'Not routed' }, ...sections.map((item) => ({ value: item.key, label: item.name }))]}
+              value={section}
+              onChange={(value) => setQuery({ section: value, page: null })}
+            />
+          ) : null}
           <FilterSelect
-            label="Status"
-            allLabel="All statuses"
-            items={STATUS_ITEMS}
-            value={status}
-            onChange={(value) => setQuery({ status: value, page: null })}
+            label="State"
+            allLabel="All states"
+            items={STATE_ITEMS}
+            value={state}
+            onChange={(value) => setQuery({ state: value, page: null })}
           />
           <Input
             type="search"
@@ -59,49 +373,41 @@ export function BacklogPage() {
             onChange={(event) => setDraft(event.target.value)}
           />
         </div>
+        {project ? null : (
+          <p className="text-[13px] text-muted-foreground">
+            Choose a project to read its issues from GitHub, add an item or route items to a section.
+          </p>
+        )}
+        {notice ? <Alert tone="success" title="Read from GitHub" description={notice} onDismiss={() => setNotice(null)} /> : null}
+        {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
         <LoadError resource={backlog} />
         <TableFrame>
           <Table density="compact" containerLabel="Backlog">
-            <TableCaption srOnly>Backlog issues</TableCaption>
+            <TableCaption srOnly>Backlog items</TableCaption>
             <TableHeader>
               <TableRow>
-                <TableHead>Issue</TableHead>
-                <TableHead>Title</TableHead>
-                <TableHead>Project</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Phase</TableHead>
-                <TableHead>Risk</TableHead>
-                <TableHead>Last activity</TableHead>
+                <TableHead>Item</TableHead>
+                {project ? null : <TableHead>Project</TableHead>}
+                <TableHead>Section</TableHead>
+                <TableHead>State</TableHead>
+                <TableHead>Last change</TableHead>
+                <TableHead>
+                  <span className="sr-only">Actions</span>
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              <Rows resource={backlog} columns={7} empty="No issues match these filters">
+              <Rows resource={backlog} columns={project ? 5 : 6} empty="No items match these filters">
                 {(items) =>
-                  items.map((item, index) => (
-                    <TableRow key={`${item.project}/${item.issue_number ?? item.workflow_id ?? index}`}>
-                      <TableCell>
-                        <IssueRef number={item.issue_number} url={item.issue_url} />
-                      </TableCell>
-                      <TableCell className="max-w-md">
-                        <div className="truncate font-medium" title={item.title}>
-                          {item.title}
-                        </div>
-                        {item.blocker ? (
-                          <div className="truncate text-[12px] text-destructive-text" title={item.blocker}>
-                            {item.blocker}
-                          </div>
-                        ) : null}
-                      </TableCell>
-                      <TableCell className={mono}>{item.project}</TableCell>
-                      <TableCell>
-                        <Status value={item.normalized_status} />
-                      </TableCell>
-                      <TableCell className={mono}>{item.current_phase ?? '—'}</TableCell>
-                      <TableCell className={mono}>{item.risk ?? '—'}</TableCell>
-                      <TableCell>
-                        <When value={item.last_activity_at} />
-                      </TableCell>
-                    </TableRow>
+                  items.map((item) => (
+                    <ItemRow
+                      key={item.id}
+                      item={item}
+                      sections={sections}
+                      showProject={!project}
+                      onChanged={backlog.reload}
+                      onProblem={setProblem}
+                    />
                   ))
                 }
               </Rows>
@@ -116,6 +422,9 @@ export function BacklogPage() {
           />
         ) : null}
       </div>
+      {project && sections ? (
+        <AddItemDialog project={project} sections={sections} open={adding} onOpenChange={setAdding} onSaved={backlog.reload} />
+      ) : null}
     </Page>
   );
 }

@@ -8,6 +8,7 @@ from uuid import UUID
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.github_app import GitHubApp, GitHubAppError
 
 
 class DashboardService:
@@ -200,6 +201,58 @@ class DashboardService:
 
     async def assign_flow(self, project: str, key: str, flow: str | None) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.sections.assign, project, key, flow)
+
+    async def items(
+        self,
+        *,
+        project: str | None,
+        section: str | None,
+        state: str | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.backlog.listing(
+                project=project,
+                section=section,
+                state=state,
+                search=search,
+                page=page,
+                page_size=page_size,
+            )
+        )
+
+    async def add_item(self, project: str, *, title: str, section: str | None) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.backlog.add(project, title=title, section=section)
+        )
+
+    async def route_item(self, item_id: UUID, section: str | None) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.backlog.route, item_id, section)
+
+    async def set_item_state(self, item_id: UUID, state: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.backlog.set_state, item_id, state)
+
+    async def backlog_status(self, project: str) -> dict[str, object] | None:
+        return await asyncio.to_thread(self.repository.backlog.sync_status, project)
+
+    async def sync_backlog(self, project: str, github: GitHubApp) -> dict[str, object]:
+        """Read the open issues of the project's repository and bring its items in step."""
+        repository = await asyncio.to_thread(self.repository.backlog.repository, project)
+        try:
+            issues, complete = await github.open_issues(repository)
+        except GitHubAppError as error:
+            await asyncio.to_thread(self.repository.backlog.record_failure, project, str(error))
+            raise
+        return await asyncio.to_thread(
+            lambda: self.repository.backlog.apply_import(project, issues, complete=complete)
+        )
+
+    async def active_project_names(self) -> list[str]:
+        return await asyncio.to_thread(
+            lambda: [record.name for record in self.repository.projects.active()]
+        )
 
     async def create_project(
         self,
