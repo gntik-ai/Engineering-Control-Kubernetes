@@ -19,6 +19,7 @@ from typing import Any, Final
 from engineering_control.sandbox.pods import ACCOUNT, ACCOUNT_HOME, WORKSPACE
 
 MARKER: Final = "::sandbox-result::"
+ARTIFACT: Final = "::sandbox-artifact::"
 CHECK_PROMPT: Final = "Reply with the single word ready and nothing else."
 CHECK_SECONDS: Final = 180
 
@@ -139,6 +140,19 @@ def parse_result(log: str) -> list[dict[str, Any]] | None:
     if not isinstance(commands, list) or not all(isinstance(item, dict) for item in commands):
         return None
     return commands
+
+
+def parse_artifact(log: str, name: str) -> dict[str, Any] | None:
+    """A JSON file the runner handed back whole, or None when it handed none back."""
+    marker = f"{ARTIFACT}{name}::"
+    position = log.rfind(marker)
+    if position < 0:
+        return None
+    try:
+        document = json.loads(log[position + len(marker) :].split("\n", 1)[0])
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
 
 
 def _limited_until(text: str, now: datetime) -> datetime:

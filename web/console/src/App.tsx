@@ -1,5 +1,5 @@
 import { Alert, Button, Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
-import { FolderKanban, Inbox as InboxIcon, KeyRound, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
+import { Bot, FolderKanban, Inbox as InboxIcon, KeyRound, ListTodo, LogOut, SquareActivity } from '@gntik-ai/icons';
 import { useEffect, useState, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { AccountsPage } from './pages/Accounts';
@@ -10,6 +10,7 @@ import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
 import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
+import { RunPage, RunsPage } from './pages/Runs';
 import { usePageTitle } from './parts';
 import { BASE, navigate, useLocation } from './router';
 
@@ -27,6 +28,7 @@ const navigation = (waiting: number): NavGroup[] => [
       },
       { label: 'Projects', href: `${BASE}/projects`, icon: FolderKanban },
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
+      { label: 'Runs', href: `${BASE}/runs`, icon: Bot },
       { label: 'Accounts', href: `${BASE}/accounts`, icon: KeyRound },
       { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
     ],
@@ -39,6 +41,8 @@ const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/project`]: () => <ProjectPage />,
   [`${BASE}/backlog`]: () => <BacklogPage />,
   [`${BASE}/accounts`]: () => <AccountsPage />,
+  [`${BASE}/runs`]: () => <RunsPage />,
+  [`${BASE}/run`]: () => <RunPage />,
   [`${BASE}/executions`]: () => <ExecutionsPage />,
   [`${BASE}/execution`]: () => <ExecutionPage />,
 };
@@ -50,6 +54,8 @@ const TITLES: Record<string, string> = {
   [`${BASE}/project`]: 'Project',
   [`${BASE}/backlog`]: 'Backlog',
   [`${BASE}/accounts`]: 'Accounts',
+  [`${BASE}/runs`]: 'Runs',
+  [`${BASE}/run`]: 'Run',
   [`${BASE}/executions`]: 'Executions',
   [`${BASE}/execution`]: 'Execution',
 };
@@ -105,7 +111,9 @@ export default function App() {
                 ? `${BASE}/executions`
                 : current === `${BASE}/project`
                   ? `${BASE}/projects`
-                  : current
+                  : current === `${BASE}/run`
+                    ? `${BASE}/runs`
+                    : current
             }
             collapsed={collapsed}
             label="Console"

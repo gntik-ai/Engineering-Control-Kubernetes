@@ -1,5 +1,5 @@
 import { Badge, Button, Card, CardBody, EmptyState, Page, Skeleton } from '@gntik-ai/ui';
-import { CircleAlert, CircleCheck, GitBranch, KeyRound, ListChecks, Route } from '@gntik-ai/icons';
+import { Bot, CircleAlert, CircleCheck, GitBranch, KeyRound, ListChecks, Route } from '@gntik-ai/icons';
 import type { ComponentType } from 'react';
 import { apiUrl, useResource, type Inbox, type InboxEntry } from '../api';
 import { LoadError, RefreshButton } from '../parts';
@@ -21,6 +21,16 @@ interface Shown {
 function shown(entry: InboxEntry): Shown {
   const project = encodeURIComponent(entry.project ?? '');
   switch (entry.kind) {
+    case 'run_waiting':
+      return {
+        icon: Bot,
+        tone: entry.outcome === 'publish_failed' ? 'destructive' : 'warning',
+        label: entry.outcome === 'publish_failed' ? 'Could not publish' : 'Your decision',
+        title: `A change is ready: ${entry.run ?? ''}`,
+        detail: entry.detail ?? 'Publish it as a pull request, or discard it.',
+        action: 'Open the run',
+        href: `${BASE}/run?id=${entry.run_id}`,
+      };
     case 'account_sign_in':
       return {
         icon: KeyRound,
@@ -112,7 +122,7 @@ export function InboxPage() {
         {entries
           ? entries.map((entry) => (
               <Entry
-                key={`${entry.kind}/${entry.project ?? entry.account_id}/${entry.section?.key ?? ''}`}
+                key={`${entry.kind}/${entry.run_id ?? entry.project ?? entry.account_id}/${entry.section?.key ?? ''}`}
                 entry={entry}
               />
             ))

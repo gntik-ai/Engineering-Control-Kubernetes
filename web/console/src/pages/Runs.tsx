@@ -1,0 +1,429 @@
+import {
+  Alert,
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+  Field,
+  FieldLabel,
+  Link,
+  Page,
+  PasswordInput,
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@gntik-ai/ui';
+import { ArrowLeft, Bot, CircleSlash, GitBranch, Trash2 } from '@gntik-ai/icons';
+import { useEffect, useState } from 'react';
+import { apiUrl, postJson, useResource, type Listing, type Run, type RunStep } from '../api';
+import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
+import { BASE, RouterLink, useLocation } from '../router';
+import { useSubmit } from './ProjectDialogs';
+
+type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
+
+const RUN_STATES: Record<Run['state'], { label: string; tone: Tone }> = {
+  queued: { label: 'Queued', tone: 'neutral' },
+  running: { label: 'Running', tone: 'info' },
+  waiting: { label: 'Waits for you', tone: 'warning' },
+  succeeded: { label: 'Done', tone: 'success' },
+  failed: { label: 'Failed', tone: 'destructive' },
+  cancelled: { label: 'Stopped', tone: 'neutral' },
+};
+
+const STEP_STATES: Record<RunStep['state'], { label: string; tone: Tone }> = {
+  pending: { label: 'Waiting', tone: 'neutral' },
+  running: { label: 'Running', tone: 'info' },
+  succeeded: { label: 'Done', tone: 'success' },
+  failed: { label: 'Failed', tone: 'destructive' },
+  cancelled: { label: 'Stopped', tone: 'neutral' },
+  skipped: { label: 'Not run', tone: 'neutral' },
+};
+
+const STEP_NAMES: Record<string, string> = {
+  check: 'Ask the account',
+  prepare: 'Check out and install',
+  implement: 'Implement',
+  review: 'Review',
+  verify: 'Test and scan',
+  bundle: 'Collect the change',
+};
+
+const KINDS: Record<Run['kind'], string> = {
+  account_check: 'Trying an account',
+  deliver_issue: 'Delivering an issue',
+};
+
+const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
+
+export function RunState({ run }: { run: Pick<Run, 'state'> }) {
+  const shown = RUN_STATES[run.state];
+  return (
+    <Badge tone={shown.tone} size="sm">
+      {shown.label}
+    </Badge>
+  );
+}
+
+const active = (run: Pick<Run, 'state'> | null | undefined) =>
+  run?.state === 'queued' || run?.state === 'running';
+
+export function RunsPage() {
+  const [busy, setBusy] = useState(false);
+  const runs = useResource<Listing<Run>>(apiUrl('runs'), busy ? 5_000 : 30_000);
+  const any = runs.data?.items.some(active) ?? false;
+  useEffect(() => setBusy(any), [any]);
+  return (
+    <Page
+      title="Runs"
+      description="Work done in sandboxes: every run with what it is doing or how it ended."
+      actions={<RefreshButton resource={runs} />}
+    >
+      <div className="grid gap-4">
+        <LoadError resource={runs} />
+        {runs.data?.items.length === 0 ? (
+          <EmptyState
+            icon={Bot}
+            title="Nothing has run yet"
+            description="Try an account on the Accounts page, or deliver an issue from the backlog."
+          />
+        ) : (
+          <TableFrame>
+            <Table>
+              <TableCaption className="sr-only">Runs</TableCaption>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Run</TableHead>
+                  <TableHead>Project</TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead>What happened</TableHead>
+                  <TableHead>Started</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                <Rows resource={runs} columns={5} empty="Nothing has run yet">
+                  {(items) =>
+                    items.map((run) => (
+                      <TableRow key={run.id}>
+                        <TableCell className="max-w-md">
+                          <Link href={`${BASE}/run?id=${run.id}`} className="font-medium">
+                            {run.title}
+                          </Link>
+                          <div className="text-[12px] text-muted-foreground">{KINDS[run.kind] ?? run.kind}</div>
+                        </TableCell>
+                        <TableCell className={mono}>{run.project ?? '—'}</TableCell>
+                        <TableCell>
+                          <RunState run={run} />
+                        </TableCell>
+                        <TableCell className="max-w-md text-[13px] text-muted-foreground">{run.detail ?? '—'}</TableCell>
+                        <TableCell>
+                          <When value={run.started_at ?? run.created_at} />
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  }
+                </Rows>
+              </TableBody>
+            </Table>
+          </TableFrame>
+        )}
+      </div>
+    </Page>
+  );
+}
+
+function DecideDialog({
+  run,
+  decision,
+  onOpenChange,
+  onDone,
+}: {
+  run: Run;
+  decision: 'publish' | 'discard' | null;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const [password, setPassword] = useState('');
+  const { pending, problem, submit, reset } = useSubmit(
+    () => postJson<Run>(`runs/${run.id}/decide`, { decision, current_password: password }),
+    () => {
+      onDone();
+      onOpenChange(false);
+    },
+  );
+  useEffect(() => {
+    if (!decision) return;
+    setPassword('');
+    reset();
+    // Only when it opens: the password field and the last error are cleared.
+  }, [decision]);
+  const publish = decision === 'publish';
+  return (
+    <AlertDialog open={decision !== null} onOpenChange={onOpenChange}>
+      <AlertDialogContent>
+        <AlertDialogHeader tone={publish ? undefined : 'destructive'}>
+          <AlertDialogTitle>{publish ? 'Publish this change?' : 'Discard this change?'}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {publish
+              ? `A new branch with one commit is created on ${run.data.repository ?? 'the repository'} and a pull request is opened for it. Nothing is merged: that stays yours, on GitHub.`
+              : 'The change is thrown away and nothing reaches GitHub. The issue stays in the backlog and can be delivered again.'}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {problem ? <Alert tone="destructive" title={problem} /> : null}
+        <Field>
+          <FieldLabel>Your password, to confirm</FieldLabel>
+          <PasswordInput
+            name="current_password"
+            autoComplete="current-password"
+            maxLength={128}
+            value={password}
+            onValueChange={setPassword}
+          />
+        </Field>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Not now</AlertDialogCancel>
+          <Button
+            variant={publish ? 'primary' : 'destructive'}
+            loading={pending}
+            disabled={!password}
+            onClick={() => void submit()}
+          >
+            {publish ? 'Publish as pull request' : 'Discard the change'}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function Step({ step }: { step: RunStep }) {
+  // The output of the step that is running, or that failed, is what one came to see.
+  const [open, setOpen] = useState(step.state === 'running' || step.state === 'failed');
+  const shown = STEP_STATES[step.state];
+  return (
+    <Card>
+      <CardBody className="grid gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={mono}>{step.position}</span>
+          <span className="font-medium">{STEP_NAMES[step.name] ?? step.name}</span>
+          <Badge tone={shown.tone} size="sm">
+            {shown.label}
+          </Badge>
+          {step.provider ? (
+            <Badge tone="neutral" size="sm">
+              {step.provider
+                .split(',')
+                .map((name) => PROVIDERS[name] ?? name)
+                .join(' or ')}
+            </Badge>
+          ) : null}
+          <span className="ml-auto text-[12px] text-muted-foreground">
+            {step.started_at ? <When value={step.started_at} /> : null}
+          </span>
+        </div>
+        {step.detail ? <p className="text-[13px] text-muted-foreground">{step.detail}</p> : null}
+        {step.log ? (
+          <div>
+            <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(!open)}>
+              {open ? 'Hide what it printed' : 'Show what it printed'}
+            </Button>
+            {open ? (
+              <pre
+                tabIndex={0}
+                aria-label={`Output of step ${step.position}`}
+                className="mt-2 max-h-96 overflow-auto rounded-md border border-border bg-background p-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-words"
+              >
+                {step.log.replace(/\n?::sandbox-(result|artifact)::\S*/g, '').trimEnd()}
+              </pre>
+            ) : null}
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+const FILE_STATUS: Record<string, { label: string; tone: Tone }> = {
+  A: { label: 'Added', tone: 'success' },
+  M: { label: 'Changed', tone: 'info' },
+  D: { label: 'Deleted', tone: 'destructive' },
+  T: { label: 'Changed', tone: 'info' },
+};
+
+function Change({ change }: { change: NonNullable<Run['data']['change']> }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>The change</CardTitle>
+      </CardHeader>
+      <CardBody className="grid gap-3">
+        <p className="text-[13px] text-muted-foreground">{change.summary}</p>
+        <ul className="grid gap-1">
+          {change.files.map((file) => (
+            <li key={file.path} className="flex items-center gap-2">
+              <Badge tone={FILE_STATUS[file.status]?.tone ?? 'neutral'} size="sm">
+                {FILE_STATUS[file.status]?.label ?? file.status}
+              </Badge>
+              <span className="font-mono text-[12px]">{file.path}</span>
+            </li>
+          ))}
+        </ul>
+        <pre
+          tabIndex={0}
+          aria-label="The change as a diff"
+          className="max-h-[32rem] overflow-auto rounded-md border border-border bg-background p-3 font-mono text-[12px] leading-relaxed"
+        >
+          {change.diff}
+        </pre>
+        {change.diff_complete ? null : (
+          <p className="text-[12px] text-muted-foreground">
+            The diff is longer than is shown here. The pull request shows all of it.
+          </p>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function RunDetail({ id }: { id: string }) {
+  const [busy, setBusy] = useState(true);
+  const resource = useResource<Run>(apiUrl(`runs/${id}`), busy ? 4_000 : 20_000);
+  const run = resource.data;
+  const running = active(run);
+  useEffect(() => setBusy(running), [running]);
+  const [decision, setDecision] = useState<'publish' | 'discard' | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const stop = () => {
+    postJson<Run>(`runs/${id}/cancel`)
+      .then(resource.reload)
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setProblem(error instanceof Error ? error.message : 'The request failed.');
+      });
+  };
+  const pull = run?.data.pull_request;
+  return (
+    <Page
+      title={run ? run.title : 'Run'}
+      description={
+        run
+          ? [KINDS[run.kind] ?? run.kind, run.project_name, run.data.repository].filter(Boolean).join(' · ')
+          : undefined
+      }
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="ghost" size="sm" icon={ArrowLeft} render={<RouterLink href={`${BASE}/runs`} />}>
+            All runs
+          </Button>
+          <RefreshButton resource={resource} />
+          {running && !run?.cancel_requested ? (
+            <Button variant="secondary" size="sm" icon={CircleSlash} onClick={stop}>
+              Stop
+            </Button>
+          ) : null}
+          {run?.state === 'waiting' ? (
+            <>
+              <Button variant="secondary" size="sm" icon={Trash2} onClick={() => setDecision('discard')}>
+                Discard
+              </Button>
+              <Button size="sm" icon={GitBranch} onClick={() => setDecision('publish')}>
+                Publish as pull request
+              </Button>
+            </>
+          ) : null}
+        </div>
+      }
+    >
+      <div className="grid gap-4">
+        <LoadError resource={resource} />
+        {problem ? (
+          <Alert tone="destructive" title="Could not stop the run" description={problem} onDismiss={() => setProblem(null)} />
+        ) : null}
+        {run ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <RunState run={run} />
+              {run.cancel_requested && running ? (
+                <Badge tone="warning" size="sm">
+                  Stopping
+                </Badge>
+              ) : null}
+              <span className="text-[13px] text-muted-foreground">{run.detail}</span>
+            </div>
+            {pull ? (
+              <Alert
+                tone="success"
+                title={`Pull request #${pull.number} is open`}
+                description={
+                  <Link href={pull.url} target="_blank" rel="noreferrer">
+                    {pull.url}
+                  </Link>
+                }
+              />
+            ) : null}
+            {run.data.issue?.url ? (
+              <p className="text-[13px]">
+                Issue{' '}
+                <Link href={run.data.issue.url} target="_blank" rel="noreferrer">
+                  #{run.data.issue.number} {run.data.issue.title}
+                </Link>
+                {run.data.branch ? (
+                  <>
+                    {' '}
+                    · branch <span className="font-mono text-[12px]">{run.data.branch}</span>
+                  </>
+                ) : null}
+              </p>
+            ) : null}
+            {run.data.toolchain?.note ? <Alert tone="warning" title={run.data.toolchain.note} /> : null}
+            {run.data.change ? <Change change={run.data.change} /> : null}
+            <div className="grid gap-2">
+              {(run.steps ?? []).map((step) => (
+                <Step key={step.id} step={step} />
+              ))}
+            </div>
+            <DecideDialog
+              run={run}
+              decision={decision}
+              onOpenChange={(open) => (open ? null : setDecision(null))}
+              onDone={resource.reload}
+            />
+          </>
+        ) : null}
+      </div>
+    </Page>
+  );
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function RunPage() {
+  const id = useLocation().query.get('id') ?? '';
+  if (!UUID.test(id)) {
+    return (
+      <Page title="Run">
+        <EmptyState
+          icon={Bot}
+          title="No run is named in the address"
+          description="Open a run from the list of runs."
+          primaryAction={<Button render={<RouterLink href={`${BASE}/runs`} />}>All runs</Button>}
+        />
+      </Page>
+    );
+  }
+  return <RunDetail key={id} id={id} />;
+}

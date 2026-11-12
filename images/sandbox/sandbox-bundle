@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Describe the change a run made, so that the platform can publish it without a checkout.
+
+Usage: sandbox-bundle <repository directory> <base commit> <output file>
+
+Writes one JSON document: the base and head commits, every file the change adds, modifies
+or deletes with its mode and (base64) content at the head, the numbers of the diff and the
+beginning of its text. Renames are a deletion and an addition. A change that holds a
+submodule, or more content than the platform publishes in one go, is refused.
+"""
+
+import base64
+import json
+import subprocess
+import sys
+
+MAX_CONTENT = 2 * 1024 * 1024
+MAX_FILES = 300
+DIFF_TEXT = 200 * 1024
+
+
+def git(repository, *arguments, text=True):
+    result = subprocess.run(  # noqa: S603 - fixed commands on the run's own checkout
+        ["git", "-C", repository, "-c", "core.hooksPath=/dev/null", *arguments],
+        capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"sandbox-bundle: git {arguments[0]} failed: {result.stderr.decode(errors='replace')[:300]}")
+    return result.stdout.decode("utf-8", errors="replace") if text else result.stdout
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit("usage: sandbox-bundle <repository directory> <base commit> <output file>")
+    repository, base, output = sys.argv[1:]
+    head = git(repository, "rev-parse", "HEAD").strip()
+    names = git(repository, "diff", "--no-renames", "--name-status", "-z", base, head, text=False)
+    parts = [part.decode("utf-8", errors="surrogateescape") for part in names.split(b"\0") if part]
+    if len(parts) % 2:
+        sys.exit("sandbox-bundle: the list of changed files could not be read")
+    changes = list(zip(parts[0::2], parts[1::2]))
+    if not changes:
+        sys.exit("sandbox-bundle: the change is empty")
+    if len(changes) > MAX_FILES:
+        sys.exit(f"sandbox-bundle: the change touches {len(changes)} files; at most {MAX_FILES} are published at once")
+    files, total = [], 0
+    for status, path in changes:
+        if status == "D":
+            files.append({"path": path, "status": "D", "mode": "100644", "content": None})
+            continue
+        entry = git(repository, "ls-tree", head, "--", path).split()
+        if len(entry) < 3 or entry[0] not in ("100644", "100755", "120000"):
+            sys.exit(f"sandbox-bundle: {path} is not a file a change can hold")
+        content = git(repository, "cat-file", "blob", entry[2], text=False)
+        total += len(content)
+        if total > MAX_CONTENT:
+            sys.exit("sandbox-bundle: the change holds more content than is published at once (2 MB)")
+        files.append({"path": path, "status": status[0], "mode": entry[0],
+                      "content": base64.b64encode(content).decode("ascii")})
+    numbers = git(repository, "diff", "--no-renames", "--shortstat", base, head).strip()
+    text = git(repository, "diff", "--no-renames", base, head)
+    document = {
+        "base": base,
+        "head": head,
+        "files": files,
+        "summary": numbers,
+        "diff": text[:DIFF_TEXT],
+        "diff_complete": len(text) <= DIFF_TEXT,
+    }
+    with open(output, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+    print(f"{len(files)} files: {numbers}")
+
+
+if __name__ == "__main__":
+    main()

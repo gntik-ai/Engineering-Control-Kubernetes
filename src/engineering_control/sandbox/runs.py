@@ -21,7 +21,14 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     ProjectNotFound,
 )
-from engineering_control.db.models import ProviderAccount, SandboxRun, SandboxStep
+from engineering_control.db.models import (
+    BacklogItem,
+    ProjectRecord,
+    ProjectSection,
+    ProviderAccount,
+    SandboxRun,
+    SandboxStep,
+)
 
 ACTIVE: Final = ("queued", "running", "waiting")
 FINISHED: Final = ("succeeded", "failed", "cancelled")
@@ -47,6 +54,7 @@ class StepWork:
     pod_name: str | None
     attempt: int
     started_at: datetime | None
+    input: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -83,8 +91,22 @@ def _step_row(step: SandboxStep, *, with_log: bool) -> dict[str, Any]:
     }
     if with_log:
         row["log"] = step.log or ""
-        row["output"] = step.output
+        row["input"] = step.input
+        row["output"] = _shown(step.output)
     return row
+
+
+def _shown(output: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A step's output as the console may have it: the files of a change by name, never
+    their content."""
+    if not output or not isinstance(output.get("files"), list):
+        return output
+    files = [
+        {"path": file.get("path"), "status": file.get("status")}
+        for file in output["files"]
+        if isinstance(file, dict)
+    ]
+    return {**{key: value for key, value in output.items() if key != "diff"}, "files": files}
 
 
 def _run_row(run: SandboxRun) -> dict[str, Any]:
@@ -97,12 +119,23 @@ def _run_row(run: SandboxRun) -> dict[str, Any]:
         "detail": run.detail,
         "cancel_requested": run.cancel_requested,
         "account_id": str(run.account_id) if run.account_id else None,
-        "data": run.data or {},
+        "item_id": str(run.item_id) if run.item_id else None,
+        "project": (run.data or {}).get("project"),
+        "project_name": (run.data or {}).get("project_name"),
+        "data": _shown_data(run.data or {}),
         "created_at": _when(run.created_at),
         "started_at": _when(run.started_at),
         "finished_at": _when(run.finished_at),
         "run": run.title,
     }
+
+
+def _shown_data(data: dict[str, Any]) -> dict[str, Any]:
+    """A run's data as the console may have it: the issue without its whole text."""
+    issue = data.get("issue")
+    if isinstance(issue, dict) and "body" in issue:
+        data = {**data, "issue": {key: value for key, value in issue.items() if key != "body"}}
+    return data
 
 
 class Runs:
@@ -157,6 +190,112 @@ class Runs:
             )
             session.flush()
             return _run_row(run)
+
+    def start_delivery(self, item_id: UUID, *, toolchain: dict[str, Any]) -> dict[str, Any]:
+        """Deliver a backlog item: a run that implements its issue, has it reviewed and
+        tested, and then waits for the administrator before anything reaches GitHub."""
+        with self.sessions.begin() as session:
+            found = session.execute(
+                select(BacklogItem, ProjectRecord, ProjectSection)
+                .join(ProjectRecord, BacklogItem.project_id == ProjectRecord.id)
+                .outerjoin(ProjectSection, BacklogItem.section_id == ProjectSection.id)
+                .where(BacklogItem.id == item_id, ProjectRecord.archived_at.is_(None))
+                .with_for_update(of=BacklogItem)
+            ).first()
+            if found is None:
+                raise ProjectNotFound(str(item_id))
+            item, project, section = found
+            if item.issue_number is None or not item.repository:
+                raise ProjectInvalid(
+                    "Only an item that is an issue of the repository can be delivered for now"
+                )
+            if item.state not in ("proposed", "accepted"):
+                raise ProjectInvalid("The item is not open any more")
+            if section is None:
+                raise ProjectInvalid("Route the item to a section first")
+            if section.flow_key != "deliver-issue":
+                raise ProjectInvalid(
+                    f"The section {section.name} has no flow that delivers issues. Assign "
+                    "Deliver issue to it on the project's page."
+                )
+            busy = session.scalar(
+                select(func.count())
+                .select_from(SandboxRun)
+                .where(SandboxRun.item_id == item.id, SandboxRun.state.in_(ACTIVE))
+            )
+            if busy:
+                raise ProjectConflict("A run for this item is already under way")
+            run = SandboxRun(
+                kind="deliver_issue",
+                state="queued",
+                title=f"#{item.issue_number} {item.title}"[:300],
+                project_id=project.id,
+                item_id=item.id,
+                cancel_requested=False,
+                data={},
+            )
+            session.add(run)
+            session.flush()
+            run.data = {
+                "project": project.name,
+                "project_name": project.display_name,
+                "repository": item.repository,
+                "base_branch": project.default_branch or "main",
+                "branch": f"engineering-control/issue-{item.issue_number}-{run.id.hex[:8]}",
+                "issue": {
+                    "number": item.issue_number,
+                    "title": item.title,
+                    "url": item.issue_url,
+                },
+                "toolchain": toolchain,
+            }
+            session.add(
+                SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
+            )
+            # Starting work on an item is deciding that it is wanted.
+            if item.state == "proposed":
+                item.state = "accepted"
+            session.flush()
+            return _run_row(run)
+
+    def for_items(self, item_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """The latest run of each of the items, by item."""
+        if not item_ids:
+            return {}
+        wanted = [UUID(item_id) for item_id in item_ids]
+        with self.sessions() as session:
+            runs = session.scalars(
+                select(SandboxRun)
+                .where(SandboxRun.item_id.in_(wanted))
+                .order_by(SandboxRun.created_at)
+            ).all()
+            return {
+                str(run.item_id): {"id": str(run.id), "state": run.state, "outcome": run.outcome}
+                for run in runs
+            }
+
+    def inbox(self) -> list[dict[str, Any]]:
+        """Runs that wait for the administrator."""
+        with self.sessions() as session:
+            waiting = session.scalars(
+                select(SandboxRun)
+                .where(SandboxRun.state == "waiting")
+                .order_by(SandboxRun.created_at)
+            ).all()
+            return [
+                {
+                    "kind": "run_waiting",
+                    "project": (run.data or {}).get("project"),
+                    "project_name": (run.data or {}).get("project_name"),
+                    "section": None,
+                    "count": 1,
+                    "detail": run.detail,
+                    "run_id": str(run.id),
+                    "run": run.title,
+                    "outcome": run.outcome,
+                }
+                for run in waiting
+            ]
 
     def accounts_being_tried(self) -> set[str]:
         with self.sessions() as session:
@@ -267,6 +406,7 @@ class Runs:
                         pod_name=step.pod_name,
                         attempt=step.attempt,
                         started_at=step.started_at,
+                        input=dict(step.input or {}),
                     )
                 )
         return found
@@ -283,6 +423,8 @@ class Runs:
             step = session.get(SandboxStep, step_id)
             if step is None or step.provider is None:
                 return None
+            # A step may name the providers it accepts, most wanted first.
+            wanted = [name for name in step.provider.split(",") if name]
             using = (
                 select(SandboxStep.account_id, func.count().label("running"))
                 .where(SandboxStep.state == "running", SandboxStep.account_id.is_not(None))
@@ -294,7 +436,7 @@ class Runs:
                 .outerjoin(using, using.c.account_id == ProviderAccount.id)
                 .where(
                     ProviderAccount.archived_at.is_(None),
-                    ProviderAccount.provider == step.provider,
+                    ProviderAccount.provider.in_(wanted),
                     ProviderAccount.credential_generation > 0,
                 )
                 .order_by(ProviderAccount.last_used_at.is_not(None), ProviderAccount.last_used_at)
@@ -302,7 +444,10 @@ class Runs:
             )
             if step.account_id is not None:
                 query = query.where(ProviderAccount.id == step.account_id)
-            for account, running in session.execute(query):
+            candidates = sorted(
+                session.execute(query).all(), key=lambda row: wanted.index(row[0].provider)
+            )
+            for account, running in candidates:
                 if step.account_id is None:
                     limited = (
                         account.state == "limited"
@@ -316,6 +461,7 @@ class Runs:
                 if running >= account.max_concurrent:
                     continue
                 step.account_id = account.id
+                step.provider = account.provider
                 account.last_used_at = now
                 session.flush()
                 return Lease(account.id, account.provider, account.credential_generation)
@@ -395,6 +541,72 @@ class Runs:
             ):
                 step.state = "cancelled" if state == "cancelled" else "skipped"
                 step.finished_at = run.finished_at
+
+    def add_step(
+        self, run_id: UUID, *, name: str, provider: str | None, given: dict[str, Any] | None
+    ) -> None:
+        """Append the step that follows; a run's steps are decided as it goes."""
+        with self.sessions.begin() as session:
+            last = session.scalar(
+                select(func.max(SandboxStep.position)).where(SandboxStep.run_id == run_id)
+            )
+            session.add(
+                SandboxStep(
+                    run_id=run_id,
+                    position=(last or 0) + 1,
+                    name=name,
+                    state="pending",
+                    provider=provider,
+                    input=given,
+                    attempt=0,
+                )
+            )
+
+    def merge_data(self, run_id: UUID, updates: dict[str, Any]) -> None:
+        with self.sessions.begin() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is not None and updates:
+                run.data = {**(run.data or {}), **updates}
+
+    def run_waiting(self, run_id: UUID, *, outcome: str, detail: str) -> None:
+        """The run can go no further by itself: it waits for the administrator."""
+        with self.sessions.begin() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is not None and run.state not in FINISHED:
+                run.state = "waiting"
+                run.outcome = outcome[:40]
+                run.detail = detail[:600]
+
+    def decide(self, run_id: UUID, decision: str) -> dict[str, Any]:
+        """The administrator's answer to a run that waits: publish its change, or discard it."""
+        if decision not in ("publish", "discard"):
+            raise ProjectInvalid("That is not a decision a run can take")
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(SandboxRun).where(SandboxRun.id == run_id).with_for_update()
+            )
+            if run is None:
+                raise ProjectNotFound(str(run_id))
+            if run.state != "waiting":
+                raise ProjectConflict("The run is not waiting for a decision")
+            run.data = {**(run.data or {}), "decision": decision}
+            run.state = "running"
+            run.detail = (
+                "Publishing the change." if decision == "publish" else "Discarding the change."
+            )
+            session.flush()
+            return _run_row(run)
+
+    def step_output(self, run_id: UUID, name: str) -> dict[str, Any] | None:
+        """What the run's latest step of that name produced, whole."""
+        with self.sessions() as session:
+            step = session.scalar(
+                select(SandboxStep)
+                .where(SandboxStep.run_id == run_id, SandboxStep.name == name)
+                .order_by(SandboxStep.position.desc())
+                .limit(1)
+            )
+            return dict(step.output) if step is not None and step.output else None
 
     def account_learned(
         self,

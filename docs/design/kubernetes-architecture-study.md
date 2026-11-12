@@ -1811,7 +1811,7 @@ Status: **done**, **in progress**, or blank for not started.
 | D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals (done for GitHub issues and for items the administrator writes; findings, chat and supervisor proposals come with phases 4 and 5) |
 | D2 | Import and keep in step with GitHub issues (done: the open issues of a project's repository are read through the GitHub App on demand and every fifteen minutes; an issue closed on GitHub closes its item, a reopened one is proposed again) |
 | D3 | Route an item to a section, by the supervisor or by hand (done by label and by hand: an issue carrying a label of exactly one section goes there; the administrator's choice is never changed by an import. The supervisor's routing comes in phase 4) |
-| D4 | Run one item at a time |
+| D4 | Run one item at a time (done: Deliver on a backlog item whose section runs "Deliver issue" starts a run; one run per item at a time) |
 | D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder |
 | D6 | Scheduler with budgets per account, project, component and risk class |
 | D7 | Existing campaigns, issues, change sets, findings and approvals migrated |
@@ -1822,10 +1822,10 @@ Status: **done**, **in progress**, or blank for not started.
 | --- | --- |
 | E1 | One sandbox per run: private workspace, author and reviewer as separate containers (in progress: a run is a sequence of steps, each step a pod of its own started by the launcher, so author and reviewer are separate pods that share only the run's workspace; the first kind of run tries an account) |
 | E2 | Sandbox image with the agent clients, scanners and toolchains (done: `images/sandbox`, built, smoke-tested and pushed by CI, everything pinned by digest or hash; Node.js, pnpm, Python and uv are in it, the Rust and Go toolchains and the browsers follow when a flow needs them) |
-| E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) |
+| E3 | Change bundle handed to the GitHub broker (replaces SSH between hosts) (done: the last step describes the change file by file; after the administrator's approval the launcher publishes it through the GitHub App as one commit on a new branch and a pull request, with a token for that repository revoked afterwards) |
 | E4 | Isolation: network policy, no cluster identity, quotas, a dedicated node (done except quotas: pod security "restricted" enforced by the namespace, no token, the reserved node, all traffic denied except name resolution and HTTPS to public addresses for steps that need it; an egress proxy that allows named hosts only would be narrower still) |
 | E5 | Pool of subscription accounts: leasing, health, sign-in from the inbox (done so far: accounts are records, added, signed in, paused and removed in the console; the sign-in is made with the provider's client on the administrator's computer and stored as a Secret of the sandbox namespace, API keys refused; an account is leased to a step while it runs, within its limit of sandboxes; trying an account sets it ready, limited or in need of a sign-in). Accounts are added and removed in the console, as many as the administrator wants. Each account has a provider type, so that providers beyond Claude and ChatGPT (the administrator named DeepSeek, GLM, Kimi and Qwen) can be added later; how each of those is signed in to has to be checked when it is added |
-| E6 | Evidence upload with a token valid for one run |
+| E6 | Evidence upload with a token valid for one run (not built: a step's output and the collected change come back through the sandbox's own output, read by the launcher, so no sandbox needs a way into the control plane; evidence files beyond that follow when a flow produces them) |
 
 **F. Flows**
 
@@ -1863,7 +1863,7 @@ renders no HTML of its own.
 
 | Id | Feature |
 | --- | --- |
-| H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, backlog and runs exist, read-only) |
+| H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, sections, backlog, accounts and runs exist; a run's page shows its steps, what each printed, the change and the decision; the queue follows in phase 4) |
 | H2 | Supervisor panel on every page |
 | H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions (started: the inbox lists what waits in the data that exists, each entry leading to where it is acted on: a backlog that could not be read, a section with work and no flow, items without a section, items not decided on. Approvals, supervisor actions, sign-ins and questions join it when they exist) |
 | H4 | Commands from the console, with the password asked again for approvals (started: one change to every item a filter matches, and removing a project, are confirmed with the password; a wrong one is counted like a failed sign-in. Approvals of runs come with phase 3) |

@@ -1,16 +1,22 @@
-"""The platform's GitHub App: which repositories it may work on.
+"""The platform's GitHub App: which repositories it may work on, and how a change reaches one.
 
 The app is identified by its id and one installation (both settings) and proves itself
-with a private key (a mounted secret). From the key it signs a token valid for minutes,
-exchanges it for an installation token limited to reading repository metadata and issues,
-and lists the repositories of the installation and the open issues of one of them.
-Nothing here writes to GitHub.
+with a private key (a mounted secret). From the key it signs a token valid for minutes and
+exchanges it for an installation token.
+
+For reading (the repositories of the installation, the open issues of one, one issue) the
+token is limited to repository metadata and issues. For a run it issues a token for one
+repository and one purpose: reading its contents to check it out, or, when the
+administrator has approved a change, writing one new branch and opening a pull request.
+Such a token is revoked when the purpose is served. Nothing is ever merged from here, and
+no existing branch is moved.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 import time
@@ -39,6 +45,11 @@ CLOCK_DRIFT_SECONDS = 60
 # An installation token lives an hour; stop using one five minutes before it ends.
 TOKEN_MARGIN_SECONDS = 300
 LIST_CACHE_SECONDS = 60.0
+MAX_ISSUE_BODY = 60_000
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$")
+# A regular file, an executable, a symbolic link. Never a submodule or a directory.
+FILE_MODES = frozenset({"100644", "100755", "120000"})
 
 
 class GitHubAppError(RuntimeError):
@@ -68,6 +79,33 @@ class Issue:
     url: str
     labels: tuple[str, ...]
     updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class IssueText:
+    """One issue as the agents are to read it."""
+
+    number: int
+    title: str
+    body: str
+    url: str
+    state: str
+    labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ChangedFile:
+    """One file of a change. ``content`` is None for a file the change deletes."""
+
+    path: str
+    mode: str
+    content: bytes | None
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    url: str
 
 
 def load_private_key(path: Path) -> rsa.RSAPrivateKey:
@@ -235,6 +273,160 @@ class GitHubApp:
                 return issues, False
             page += 1
 
+    # --- one repository: its issue, a token for it, a change published to it -------------
+
+    async def issue(self, full_name: str, number: int) -> IssueText:
+        if not REPOSITORY_NAME.fullmatch(full_name) or number < 1:
+            raise GitHubAppError("That is not an issue of a repository")
+        body = await self._request(
+            "GET",
+            f"/repos/{full_name}/issues/{number}",
+            token=await self._installation_token(),
+            not_found="GitHub does not know this issue",
+        )
+        if not isinstance(body, dict) or "pull_request" in body:
+            raise GitHubAppError("GitHub does not know this issue")
+        return IssueText(
+            number=number,
+            title=str(body.get("title") or "")[:300],
+            body=str(body.get("body") or "")[:MAX_ISSUE_BODY],
+            url=str(body.get("html_url") or ""),
+            state=str(body.get("state") or ""),
+            labels=tuple(
+                str(label.get("name"))
+                for label in body.get("labels") or []
+                if isinstance(label, dict) and label.get("name")
+            ),
+        )
+
+    async def repository_token(self, full_name: str, permissions: dict[str, str]) -> str:
+        """A token for one repository and the named permissions only, valid for an hour.
+        It is not kept: the caller uses it and revokes it."""
+        if not REPOSITORY_NAME.fullmatch(full_name):
+            raise GitHubAppError("That is not a repository")
+        if self._key is None:
+            self._key = await asyncio.to_thread(load_private_key, self.private_key_file)
+        try:
+            body = await self._request(
+                "POST",
+                f"/app/installations/{self.installation_id}/access_tokens",
+                token=app_token(self.app_id, self._key),
+                json={"repositories": [full_name.split("/", 1)[1]], "permissions": permissions},
+            )
+        except GitHubAppError as error:
+            if "422" in str(error):
+                wanted = ", ".join(f"{name}: {level}" for name, level in permissions.items())
+                raise GitHubAppError(
+                    f"The GitHub App is not allowed what this needs on {full_name} ({wanted}). "
+                    "Grant it in the app's settings and accept the change for the organisation."
+                ) from error
+            raise
+        token = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(token, str) or not token:
+            raise GitHubAppError("GitHub gave no token for the repository")
+        return token
+
+    async def revoke(self, token: str) -> None:
+        """End a token before its hour is over. A token that is already gone is fine."""
+        with contextlib.suppress(GitHubAppError):
+            await self._request("DELETE", "/installation/token", token=token, empty=True)
+
+    async def branch_head(self, full_name: str, branch: str, *, token: str) -> str:
+        body = await self._request(
+            "GET",
+            f"/repos/{full_name}/git/ref/heads/{branch}",
+            token=token,
+            not_found=f"{full_name} has no branch {branch}",
+        )
+        sha = (body.get("object") or {}).get("sha") if isinstance(body, dict) else None
+        if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
+            raise GitHubAppError(f"{full_name} has no branch {branch}")
+        return sha
+
+    async def publish(
+        self,
+        full_name: str,
+        *,
+        base_branch: str,
+        base_sha: str,
+        branch: str,
+        message: str,
+        title: str,
+        body: str,
+        files: list[ChangedFile],
+    ) -> PullRequest:
+        """Put a change on a new branch as one commit on top of ``base_sha`` and open a
+        pull request for it. Nothing is merged, and no existing branch is moved.
+
+        The commit is made through GitHub's API from the files' contents, so nothing a
+        sandbox produced is ever executed or pushed from here.
+        """
+        if not files or not COMMIT.fullmatch(base_sha) or not BRANCH.fullmatch(branch):
+            raise GitHubAppError("There is no change to publish")
+        token = await self.repository_token(
+            full_name, {"contents": "write", "pull_requests": "write"}
+        )
+        repository = f"/repos/{full_name}"
+        missing = f"{full_name} no longer has what the change was made on"
+        try:
+            base = await self._request(
+                "GET", f"{repository}/git/commits/{base_sha}", token=token, not_found=missing
+            )
+            entries: list[dict[str, Any]] = []
+            for file in files:
+                if file.mode not in FILE_MODES:
+                    raise GitHubAppError(f"{file.path} is not a file a change can hold")
+                sha: str | None = None
+                if file.content is not None:
+                    blob = await self._request(
+                        "POST",
+                        f"{repository}/git/blobs",
+                        token=token,
+                        not_found=missing,
+                        json={
+                            "content": base64.b64encode(file.content).decode("ascii"),
+                            "encoding": "base64",
+                        },
+                    )
+                    sha = blob["sha"]
+                entries.append({"path": file.path, "mode": file.mode, "type": "blob", "sha": sha})
+            tree = await self._request(
+                "POST",
+                f"{repository}/git/trees",
+                token=token,
+                not_found=missing,
+                json={"base_tree": base["tree"]["sha"], "tree": entries},
+            )
+            commit = await self._request(
+                "POST",
+                f"{repository}/git/commits",
+                token=token,
+                not_found=missing,
+                json={"message": message, "tree": tree["sha"], "parents": [base_sha]},
+            )
+            await self._request(
+                "POST",
+                f"{repository}/git/refs",
+                token=token,
+                not_found=missing,
+                json={"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
+            )
+            pull = await self._request(
+                "POST",
+                f"{repository}/pulls",
+                token=token,
+                not_found=missing,
+                json={"title": title[:250], "head": branch, "base": base_branch, "body": body},
+            )
+        except (KeyError, TypeError) as error:
+            raise GitHubAppError("GitHub answered with something unexpected") from error
+        finally:
+            await self.revoke(token)
+        number, url = pull.get("number"), pull.get("html_url")
+        if not isinstance(number, int) or not isinstance(url, str):
+            raise GitHubAppError("GitHub did not say where the pull request is")
+        return PullRequest(number=number, url=url)
+
     async def _request(
         self,
         method: str,
@@ -243,6 +435,7 @@ class GitHubApp:
         token: str,
         not_found: str = "GitHub does not know this installation of the app",
         gone: Any = None,
+        empty: bool = False,
         **options: Any,
     ) -> Any:
         try:
@@ -259,6 +452,8 @@ class GitHubApp:
             return gone
         if response.status_code >= 400:
             raise GitHubAppError(f"GitHub answered {response.status_code}")
+        if empty:
+            return None
         try:
             return response.json()
         except ValueError as error:

@@ -71,6 +71,7 @@ from engineering_control.dashboard.schemas import (
     ProjectCreateInput,
     ProjectRenameInput,
     R3CandidateCreateInput,
+    RunDecisionInput,
     SectionCreateInput,
     SectionFlowInput,
     SectionGuideInput,
@@ -106,7 +107,18 @@ CONSOLE_INLINE_STYLE_HASH = (
     "sha256-" + base64.b64encode(hashlib.sha256(CONSOLE_INLINE_STYLE.encode()).digest()).decode()
 )
 CONSOLE_VIEWS = frozenset(
-    {"", "inbox", "projects", "project", "backlog", "accounts", "executions", "execution"}
+    {
+        "",
+        "inbox",
+        "projects",
+        "project",
+        "backlog",
+        "accounts",
+        "runs",
+        "run",
+        "executions",
+        "execution",
+    }
 )
 CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
 CONSOLE_ASSET_REFERENCE = re.compile(r'(?:src|href)="/console/assets/([^"]+)"')
@@ -1128,6 +1140,31 @@ def create_app(
             return JSONResponse(await service(request).run(run_id))
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/items/{item_id}/deliver")
+    async def deliver_item_api(item_id: UUID, request: Request) -> Response:
+        """Start a run that delivers the item's issue."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).deliver_item(item_id),
+            event="dashboard.run_started",
+            status_code=201,
+            entity="run",
+        )
+
+    @app.post("/api/dashboard/runs/{run_id}/decide")
+    async def decide_run_api(run_id: UUID, request: Request) -> Response:
+        """Publish the change of a run that waits, or discard it. Nothing reaches GitHub
+        without this, and it asks for the password."""
+        return await project_change(
+            request,
+            RunDecisionInput,
+            lambda body: service(request).decide_run(run_id, body.decision),
+            event="dashboard.run_decided",
+            password=True,
+            entity="run",
+        )
 
     @app.post("/api/dashboard/runs/{run_id}/cancel")
     async def cancel_run_api(run_id: UUID, request: Request) -> Response:

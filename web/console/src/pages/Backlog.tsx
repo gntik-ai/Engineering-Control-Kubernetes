@@ -13,6 +13,7 @@ import {
   FieldDescription,
   FieldLabel,
   Input,
+  Link,
   SearchField,
   MoreMenu,
   Page,
@@ -29,7 +30,7 @@ import {
   TableRow,
   type StatusDefinition,
 } from '@gntik-ai/ui';
-import { Check, CircleSlash, ListChecks, Plus, RefreshCw, Route, RotateCcw } from '@gntik-ai/icons';
+import { Bot, Check, CircleSlash, ListChecks, Plus, RefreshCw, Route, RotateCcw } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -38,12 +39,14 @@ import {
   type BacklogStatus,
   type Paged,
   type ProjectDetail,
+  type Run,
   type Section,
   type SyncResult,
   type WorkItem,
 } from '../api';
 import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
-import { setQuery, useLocation } from '../router';
+import { BASE, navigate, setQuery, useLocation } from '../router';
+import { RunState } from './Runs';
 
 const PAGE_SIZE = 50;
 const UNROUTED = 'none';
@@ -346,7 +349,26 @@ function ItemRow({
     }
   };
   const closed = item.issue_state === 'closed';
+  const runActive = item.run ? ['queued', 'running', 'waiting'].includes(item.run.state) : false;
+  const deliverable =
+    item.issue_number !== null &&
+    !closed &&
+    item.section?.flow === 'deliver-issue' &&
+    (item.state === 'proposed' || item.state === 'accepted') &&
+    !runActive;
+  const deliver = async () => {
+    setPending(true);
+    try {
+      const run = await postJson<Run>(`items/${item.id}/deliver`);
+      navigate(`${BASE}/run?id=${run.id}`);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      onProblem(error instanceof Error ? error.message : 'The request failed.');
+      setPending(false);
+    }
+  };
   const actions = [
+    deliverable ? { label: 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
     item.state !== 'accepted' && !closed
       ? { label: 'Accept', icon: Check, onSelect: () => void change('state', { state: 'accepted' }) }
       : null,
@@ -407,6 +429,12 @@ function ItemRow({
       <TableCell>
         <StatusTag status={item.state} statuses={STATES} size="sm" />
         {closed ? <div className="mt-1 text-[12px] text-muted-foreground">Closed on GitHub</div> : null}
+        {item.run ? (
+          <div className="mt-1 flex items-center gap-1.5 text-[12px]">
+            <Link href={`${BASE}/run?id=${item.run.id}`}>Run</Link>
+            <RunState run={item.run} />
+          </div>
+        ) : null}
       </TableCell>
       <TableCell>
         <When value={item.updated_at} />

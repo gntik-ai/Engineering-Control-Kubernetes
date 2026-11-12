@@ -16,6 +16,7 @@ from engineering_control.dashboard.project_records import ProjectConflict, Proje
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.sandbox.deliver import toolchain_for
 
 
 class DashboardService:
@@ -219,8 +220,8 @@ class DashboardService:
         page: int,
         page_size: int,
     ) -> dict[str, object]:
-        return await asyncio.to_thread(
-            lambda: self.repository.backlog.listing(
+        def read() -> dict[str, Any]:
+            listing = self.repository.backlog.listing(
                 project=project,
                 section=section,
                 state=state,
@@ -228,7 +229,24 @@ class DashboardService:
                 page=page,
                 page_size=page_size,
             )
-        )
+            # Each item with its latest run, so the backlog shows what is being worked on.
+            runs = self.repository.runs.for_items([item["id"] for item in listing["items"]])
+            for item in listing["items"]:
+                item["run"] = runs.get(item["id"])
+            return listing
+
+        return await asyncio.to_thread(read)
+
+    async def deliver_item(self, item_id: UUID) -> dict[str, object]:
+        def start() -> dict[str, Any]:
+            project = self.repository.backlog.project_of(item_id)
+            toolchain = toolchain_for(project).as_dict() if project else {}
+            return self.repository.runs.start_delivery(item_id, toolchain=toolchain)
+
+        return await asyncio.to_thread(start)
+
+    async def decide_run(self, run_id: UUID, decision: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.decide, run_id, decision)
 
     async def add_item(self, project: str, *, title: str, section: str | None) -> dict[str, object]:
         return await asyncio.to_thread(
@@ -244,7 +262,11 @@ class DashboardService:
     async def inbox(self) -> dict[str, object]:
         # An account nobody can work with stops everything, so it comes first.
         entries = await asyncio.to_thread(
-            lambda: self.repository.accounts.inbox() + self.repository.backlog.inbox()
+            lambda: (
+                self.repository.runs.inbox()
+                + self.repository.accounts.inbox()
+                + self.repository.backlog.inbox()
+            )
         )
         return {"items": entries, "total": len(entries)}
 

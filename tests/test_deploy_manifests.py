@@ -441,7 +441,9 @@ def test_temporal_is_reached_over_tls_and_only_the_server_holds_its_key() -> Non
         assert mounts["temporal-ca"]["readOnly"] is True
 
 
-def test_only_the_console_holds_the_github_app_key_and_never_its_client_secret() -> None:
+def test_only_the_console_and_the_launcher_hold_the_github_app_key_never_its_client_secret() -> (
+    None
+):
     documents = _documents()
     settings = next(
         d["data"]
@@ -454,12 +456,16 @@ def test_only_the_console_holds_the_github_app_key_and_never_its_client_secret()
         for volume in spec.get("volumes", []):
             if volume.get("secret", {}).get("secretName") == "engineering-control-github-app":
                 holders[pod] = volume
-    assert set(holders) == {"Deployment/engineering-control-console"}
-    volume = holders["Deployment/engineering-control-console"]
-    assert volume["secret"]["items"] == [{"key": "private-key.pem", "path": "private-key.pem"}]
-    # The administrator creates this Secret; a cluster without it must still start.
-    assert volume["secret"]["optional"] is True
-    spec = dict(_pod_specs())["Deployment/engineering-control-console"]
-    mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
-    assert f"{mounts[volume['name']]['mountPath']}/private-key.pem" == key_file
-    assert mounts[volume["name"]]["readOnly"] is True
+    # The console reads repositories and issues; the launcher checks out and publishes.
+    assert set(holders) == {
+        "Deployment/engineering-control-console",
+        "Deployment/engineering-control-launcher",
+    }
+    for pod, volume in holders.items():
+        assert volume["secret"]["items"] == [{"key": "private-key.pem", "path": "private-key.pem"}]
+        # The administrator creates this Secret; a cluster without it must still start.
+        assert volume["secret"]["optional"] is True
+        spec = dict(_pod_specs())[pod]
+        mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
+        assert f"{mounts[volume['name']]['mountPath']}/private-key.pem" == key_file
+        assert mounts[volume["name"]]["readOnly"] is True

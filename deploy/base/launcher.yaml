@@ -1,6 +1,8 @@
 # Starts and watches the sandboxes: one pod per step of a run, in the sandbox namespace.
 # It has no listener. Its identity may act in the sandbox namespace only, on pods and
-# volumes (deploy/sandboxes/access.yaml); it cannot read a Secret anywhere.
+# volumes (deploy/sandboxes/access.yaml); it cannot read a Secret anywhere. It also holds
+# the GitHub App's key, because checking a repository out and publishing an approved change
+# are its work.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -87,6 +89,9 @@ spec:
             - name: cluster
               mountPath: /var/run/secrets/engineering-control-cluster
               readOnly: true
+            - name: github-app
+              mountPath: /var/run/secrets/engineering-control-github-app
+              readOnly: true
             - name: state
               mountPath: /var/lib/engineering-control
             - name: tmp
@@ -110,6 +115,16 @@ spec:
                   items:
                     - key: ca.crt
                       path: ca.crt
+        # The GitHub App's private key. The launcher issues a token for one repository when
+        # a run checks it out, and publishes a change the administrator approved.
+        - name: github-app
+          secret:
+            secretName: engineering-control-github-app
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
         - name: state
           emptyDir: {}
         - name: tmp

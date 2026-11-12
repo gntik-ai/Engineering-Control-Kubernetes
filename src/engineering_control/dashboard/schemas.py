@@ -173,6 +173,14 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class RunDecisionInput(DashboardModel):
+    """What to do with the change of a run that waits. It needs the password again."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    decision: str = Field(pattern=r"^(publish|discard)$")
+
+
 class AccountRemoveInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     # Removing an account needs the password again.

@@ -29,12 +29,13 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0029 (runs in sandboxes) follows 0028 (subscription accounts), 0027 (the backlog),
+    # 0030 (what a step was given) follows 0029 (runs in sandboxes), 0028 (subscription
+    # accounts), 0027 (the backlog),
     # 0026 (sections of a project) and 0025 (projects as records), which follow
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0029", "0028")
+    assert (head, parent) == ("0030", "0029")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -88,6 +89,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0030: one nullable column, added and dropped without touching a row.
+    assert "input" in {c["name"] for c in inspect(engine).get_columns("sandbox_steps")}
+    command.downgrade(config, parent)
+    assert "input" not in {c["name"] for c in inspect(engine).get_columns("sandbox_steps")}
     # 0029: runs in sandboxes. A run that is not finished has a sandbox in the cluster, so
     # a downgrade must not drop its record; finished runs are history and may go.
     assert {"sandbox_runs", "sandbox_steps"} <= set(inspect(engine).get_table_names())
@@ -105,10 +110,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
                 {"id": run_id, "state": state},
             )
     with pytest.raises(RuntimeError, match="refuses to drop runs that are not finished"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0028")
     with engine.begin() as connection:
         connection.execute(text("UPDATE sandbox_runs SET state = 'cancelled'"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0028")
     assert "sandbox_runs" not in inspect(engine).get_table_names()
     assert "sandbox_steps" not in inspect(engine).get_table_names()
     # 0028: subscription accounts. An account that is not removed still has its sign-in

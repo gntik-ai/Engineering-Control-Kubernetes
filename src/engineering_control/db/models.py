@@ -603,6 +603,8 @@ class SandboxStep(UUIDPrimaryKey, Timestamps, Base):
     exit_code: Mapped[int | None] = mapped_column(Integer)
     outcome: Mapped[str | None] = mapped_column(String(40))
     detail: Mapped[str | None] = mapped_column(String(600))
+    # What the step was given (a round, the findings to act on) and what it produced.
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     log: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

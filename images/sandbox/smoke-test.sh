@@ -104,6 +104,16 @@ sandbox bash -euc '
   git add main.c
   git -c user.name=smoke -c user.email=smoke@example.invalid commit --quiet --message smoke
   [[ "$(git rev-list --count HEAD)" == 1 ]]
+  # A second commit, described the way the platform publishes a change.
+  base="$(git rev-parse HEAD)"
+  printf "int main(void) { return 1; }\n" >main.c
+  printf "new\n" >added.txt
+  git add main.c added.txt
+  git -c user.name=smoke -c user.email=smoke@example.invalid commit --quiet --message change
+  sandbox-bundle /workspace "${base}" /tmp/bundle.json >/dev/null
+  [[ "$(jq --compact-output "[.files[] | [.status, .path, .mode]]" /tmp/bundle.json)" \
+    == "[[\"A\",\"added.txt\",\"100644\"],[\"M\",\"main.c\",\"100644\"]]" ]]
+  [[ "$(jq --raw-output ".files[0].content" /tmp/bundle.json | base64 --decode)" == new ]]
   printf "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: smoke\n" >object.yaml
   rg --quiet ConfigMap object.yaml
   jq --null-input --exit-status "true" >/dev/null

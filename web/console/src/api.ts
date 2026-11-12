@@ -54,7 +54,7 @@ export interface WorkItem {
   project: string;
   project_name: string;
   /** The section it is routed to; null while it is not routed. */
-  section: { key: string; name: string } | null;
+  section: { key: string; name: string; flow?: string | null } | null;
   title: string;
   source: 'github' | 'manual';
   state: 'proposed' | 'accepted' | 'skipped' | 'done';
@@ -67,6 +67,8 @@ export interface WorkItem {
   issue_state: 'open' | 'closed' | null;
   labels: string[];
   updated_at: string | null;
+  /** The item's latest run, when it has one. */
+  run?: { id: string; state: Run['state']; outcome: string | null } | null;
 }
 
 /** Whether a project's backlog can be read from GitHub, and how the last reading went. */
@@ -87,12 +89,15 @@ export interface SyncResult {
 
 /** One thing waiting for the administrator, and how many items it covers. */
 export interface InboxEntry {
-  kind: 'account_sign_in' | 'sync_failed' | 'section_without_flow' | 'unrouted' | 'undecided';
+  kind: 'run_waiting' | 'account_sign_in' | 'sync_failed' | 'section_without_flow' | 'unrouted' | 'undecided';
   /** Null for an entry that is about an account, not a project. */
   project: string | null;
   project_name: string | null;
   account?: string;
   account_id?: string;
+  run_id?: string;
+  run?: string;
+  outcome?: string | null;
   section: { key: string; name: string } | null;
   count: number;
   detail: string | null;
@@ -101,6 +106,52 @@ export interface InboxEntry {
 export interface Inbox {
   items: InboxEntry[];
   total: number;
+}
+
+/** One step of a run: one sandbox. */
+export interface RunStep {
+  id: string;
+  position: number;
+  name: string;
+  state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+  provider: string | null;
+  attempt: number;
+  exit_code: number | null;
+  outcome: string | null;
+  detail: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  log?: string;
+}
+
+/** Work done in sandboxes: trying an account, or delivering an issue. */
+export interface Run {
+  id: string;
+  kind: 'account_check' | 'deliver_issue';
+  state: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
+  title: string;
+  outcome: string | null;
+  detail: string | null;
+  cancel_requested: boolean;
+  project: string | null;
+  project_name: string | null;
+  data: {
+    repository?: string;
+    branch?: string;
+    issue?: { number: number; title: string; url: string | null };
+    toolchain?: { note?: string | null };
+    change?: {
+      summary: string;
+      files: { path: string; status: string }[];
+      diff: string;
+      diff_complete: boolean;
+    };
+    pull_request?: { number: number; url: string };
+  };
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  steps?: RunStep[];
 }
 
 /** A subscription sign-in the agents work with. */

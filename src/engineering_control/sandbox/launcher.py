@@ -24,12 +24,20 @@ from sqlalchemy.orm import sessionmaker
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
+from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import pods, steps
+from engineering_control.sandbox.flows import AccountCheck, DeliverIssue, Flow, Follow
 from engineering_control.sandbox.runs import Lease, Runs, StepWork
 
 LOG = structlog.get_logger(__name__)
 PASS_SECONDS: Final = 3.0
+WORKSPACE_GIBIBYTES: Final = 10
+# How much of a running step's output is shown, and how far back the result is looked for.
+# A long line reaches the cluster's log in pieces, each counted as a line.
+SHOWN_LINES: Final = 600
+RESULT_LINES: Final = 20_000
+SHOWN_CHARACTERS: Final = 300_000
 # How long a pod may wait for its node or its image before the step is given up.
 START_SECONDS: Final = 600
 # Reasons a container cannot start that waiting does not cure.
@@ -68,10 +76,20 @@ def pod_progress(pod: dict[str, Any]) -> tuple[str, str | None]:
 
 
 class Launcher:
-    def __init__(self, runs: Runs, cluster: Cluster, sandboxes: pods.Sandboxes) -> None:
+    def __init__(
+        self,
+        runs: Runs,
+        cluster: Cluster,
+        sandboxes: pods.Sandboxes,
+        github: GitHubApp | None = None,
+    ) -> None:
         self.runs = runs
         self.cluster = cluster
         self.sandboxes = sandboxes
+        self.flows: dict[str, Flow] = {
+            "account_check": AccountCheck(),
+            "deliver_issue": DeliverIssue(runs, github),
+        }
 
     async def tick(self) -> int:
         """One pass over every unfinished run. Returns how many it looked at. A run whose
@@ -80,29 +98,39 @@ class Launcher:
         for item in work:
             try:
                 await self._advance(item)
-            except ClusterError as error:
-                LOG.warning("launcher_cluster_error", run=str(item.run_id), error=str(error))
+            except (ClusterError, GitHubAppError) as error:
+                # Something outside refused or did not answer: say so and try again.
+                LOG.warning("launcher_outside_error", run=str(item.run_id), error=str(error))
                 await asyncio.to_thread(self.runs.step_waiting, item.step_id, str(error))
             except Exception as error:  # noqa: BLE001 - one run must not stop the loop
                 LOG.error("launcher_step_error", run=str(item.run_id), error=repr(error)[:300])
         return len(work)
 
     async def _advance(self, item: StepWork) -> None:
-        if item.cancel_requested:
+        flow = self.flows.get(item.run_kind)
+        if flow is None:
+            await self._finish(
+                item, state="failed", outcome="unknown", detail=f"No flow for {item.run_kind}."
+            )
+        elif item.cancel_requested:
             await self._cancel(item)
         elif item.state == "done":
-            await self._finish(item, state="succeeded", outcome="done", detail=None)
+            end = await flow.done(item)
+            if end.data:
+                await asyncio.to_thread(self.runs.merge_data, item.run_id, end.data)
+            if end.wait is not None:
+                outcome, detail = end.wait
+                await asyncio.to_thread(
+                    lambda: self.runs.run_waiting(item.run_id, outcome=outcome, detail=detail)
+                )
+            else:
+                await self._finish(item, state=end.state, outcome=end.outcome, detail=end.detail)
         elif item.state == "pending":
             await self._start(item)
         else:
             await self._watch(item)
 
     # --- starting ------------------------------------------------------------------------
-
-    def _job(self, item: StepWork, lease: Lease | None) -> dict[str, Any]:
-        if item.run_kind == "account_check" and lease is not None:
-            return steps.check_job(lease.provider, lease.generation)
-        raise ValueError(f"no job for step {item.name} of a {item.run_kind} run")
 
     async def _start(self, item: StepWork) -> None:
         lease: Lease | None = None
@@ -127,18 +155,32 @@ class Launcher:
                         labels={"engineering-control/account": str(lease.account_id)},
                     )
                 )
+        plan = await self.flows[item.run_kind].plan(item, lease)
+        workspace = None
+        if plan.workspace:
+            # The run's own volume, made with its first step and kept until the run ends.
+            workspace = pods.workspace_claim(item.run_id)
+            await self.cluster.create_claim(
+                pods.claim(
+                    workspace,
+                    namespace=self.sandboxes.namespace,
+                    gibibytes=WORKSPACE_GIBIBYTES,
+                    labels={"engineering-control/run": str(item.run_id)},
+                )
+            )
         manifest = pods.step_pod(
             self.sandboxes,
             run_id=item.run_id,
             step=item.name,
             position=item.position,
             attempt=item.attempt + 1,
-            job=self._job(item, lease),
-            egress="internet",
+            job=plan.job,
+            egress=plan.egress,
             account=account,
-            cpu="1",
-            memory="2Gi",
-            deadline_seconds=steps.CHECK_SECONDS + 120,
+            workspace=workspace,
+            cpu=plan.cpu,
+            memory=plan.memory,
+            deadline_seconds=plan.deadline_seconds,
         )
         await self.cluster.create_pod(manifest)
         await asyncio.to_thread(self.runs.step_started, item.step_id, manifest["metadata"]["name"])
@@ -165,20 +207,19 @@ class Launcher:
             elif said:
                 await asyncio.to_thread(self.runs.step_waiting, item.step_id, said)
             return
-        log = await self.cluster.pod_log(item.pod_name)
         if progress == "running":
+            log = await self.cluster.pod_log(item.pod_name, tail_lines=SHOWN_LINES)
             await asyncio.to_thread(self.runs.step_log, item.step_id, log)
             return
+        log = await self.cluster.pod_log(item.pod_name, tail_lines=RESULT_LINES)
         await self._conclude(item, log, said)
         await self.cluster.delete_pod(item.pod_name)
+        await self.flows[item.run_kind].ended(item)
 
     async def _conclude(self, item: StepWork, log: str, said: str | None) -> None:
         commands = steps.parse_result(log)
-        now = datetime.now(UTC)
-        if item.run_kind == "account_check":
-            verdict = steps.interpret_check(commands, now)
-        else:
-            verdict = steps.Verdict(False, "unknown", f"No reading for a {item.run_kind} run.")
+        result = await self.flows[item.run_kind].conclude(item, commands, log)
+        verdict = result.verdict
         if commands is None and said:
             verdict = steps.Verdict(False, "failed", said)
         last = commands[-1] if commands else {}
@@ -189,7 +230,8 @@ class Launcher:
                 outcome=verdict.outcome,
                 detail=verdict.detail,
                 exit_code=last.get("exit_code") if isinstance(last.get("exit_code"), int) else None,
-                log=log,
+                output=result.output,
+                log=log[-SHOWN_CHARACTERS:],
             )
         )
         if verdict.account_state and item.account_id is not None:
@@ -201,9 +243,26 @@ class Launcher:
                     limited_until=verdict.limited_until,
                 )
             )
+        if result.data:
+            await asyncio.to_thread(self.runs.merge_data, item.run_id, result.data)
         if not verdict.succeeded:
             await self._finish(item, state="failed", outcome=verdict.outcome, detail=verdict.detail)
+        elif result.wait is not None:
+            outcome, detail = result.wait
+            await asyncio.to_thread(
+                lambda: self.runs.run_waiting(item.run_id, outcome=outcome, detail=detail)
+            )
+            # What the run made is in the database now; its volume is no longer needed.
+            await self._release_workspace(item)
+        else:
+            for follow in result.follow:
+                await asyncio.to_thread(self._add, item, follow)
         LOG.info("sandbox_finished", run=str(item.run_id), step=item.name, outcome=verdict.outcome)
+
+    def _add(self, item: StepWork, follow: Follow) -> None:
+        self.runs.add_step(
+            item.run_id, name=follow.name, provider=follow.provider, given=follow.given
+        )
 
     async def _fail_step(self, item: StepWork, outcome: str, detail: str) -> None:
         await asyncio.to_thread(
@@ -216,6 +275,7 @@ class Launcher:
     async def _cancel(self, item: StepWork) -> None:
         if item.state == "running" and item.pod_name is not None:
             await self.cluster.delete_pod(item.pod_name, grace_seconds=0)
+            await self.flows[item.run_kind].ended(item)
         await self._finish(
             item, state="cancelled", outcome="cancelled", detail="Stopped by the administrator."
         )
@@ -226,6 +286,16 @@ class Launcher:
         await asyncio.to_thread(
             lambda: self.runs.run_finished(item.run_id, state=state, outcome=outcome, detail=detail)
         )
+        await self._release_workspace(item)
+
+    async def _release_workspace(self, item: StepWork) -> None:
+        """A run that has ended, or waits with its change collected, keeps nothing in the
+        cluster. One that never had a volume has none to delete, which is fine; one whose
+        volume cannot be deleted right now is not held up by it."""
+        try:
+            await self.cluster.delete_claim(pods.workspace_claim(item.run_id))
+        except ClusterError as error:
+            LOG.warning("workspace_not_released", run=str(item.run_id), error=str(error))
 
 
 def _aware(value: datetime) -> datetime:
@@ -257,7 +327,10 @@ async def serve(settings: Settings | None = None) -> None:
         max_overflow=2,
         connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
     )
-    launcher = Launcher(Runs(sessionmaker(engine, expire_on_commit=False)), cluster, sandboxes)
+    github = GitHubApp.from_settings(resolved)
+    launcher = Launcher(
+        Runs(sessionmaker(engine, expire_on_commit=False)), cluster, sandboxes, github
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for name in (signal.SIGTERM, signal.SIGINT):
@@ -273,6 +346,8 @@ async def serve(settings: Settings | None = None) -> None:
                 await asyncio.wait_for(stop.wait(), timeout=PASS_SECONDS)
     finally:
         await cluster.aclose()
+        if github is not None:
+            await github.aclose()
         engine.dispose()
 
 

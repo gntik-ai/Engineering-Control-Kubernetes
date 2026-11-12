@@ -77,7 +77,9 @@ def serialize(
         "id": str(item.id),
         "project": project.name,
         "project_name": project.display_name,
-        "section": {"key": section.key, "name": section.name} if section else None,
+        "section": {"key": section.key, "name": section.name, "flow": section.flow_key}
+        if section
+        else None,
         "title": item.title,
         "source": item.source,
         "state": item.state,
@@ -217,6 +219,15 @@ class BacklogItems:
                 changed += 1
             session.commit()
             return {"project": record.name, "changed": changed, "unchanged": unchanged}
+
+    def project_of(self, item_id: UUID) -> str | None:
+        """The name of the project an item belongs to."""
+        with self.sessions() as session:
+            return session.scalar(
+                select(ProjectRecord.name)
+                .join(BacklogItem, BacklogItem.project_id == ProjectRecord.id)
+                .where(BacklogItem.id == item_id)
+            )
 
     def inbox(self) -> list[dict[str, Any]]:
         """What waits for the administrator, most pressing kind first.

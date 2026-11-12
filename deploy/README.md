@@ -165,6 +165,35 @@ The sandbox image a run uses is pinned in `base/kustomization.yaml` by a patch, 
 commit as the control plane's image; `deploy/registry` puts the pull Secret into both
 namespaces.
 
+## Delivering an issue
+
+Backlog → an issue whose section runs the flow "Deliver issue" → Deliver. The run works on
+a checkout in a volume of its own (`run-<id>`, deleted when the run ends or waits):
+
+| Step | Sandbox | What happens |
+| --- | --- | --- |
+| Check out and install | network, no account | The repository at its default branch, cloned with a token for that repository's contents only, read-only, revoked when the step ends and never written into the checkout. The project's install commands; its test commands once, to know what already fails |
+| Implement | network, one account | An agent of one subscription (ChatGPT first, Claude when no ChatGPT account is free) changes the code. The platform commits |
+| Review | network, an account of the other subscription | Passes the change, asks for changes (back to Implement, three rounds at most) or stops the run |
+| Test and scan | no network, no account | The project's test commands; a command that passed before the change and fails after it sends the work back. A scan for secrets in the change; a finding ends the run |
+| Collect the change | no network, no account | The change file by file, with its diff, handed back to the platform |
+
+Then the run waits (Inbox, and the run's page): the administrator reads the change and,
+with the password, publishes it or discards it. Publishing is done by the launcher through
+GitHub's API with a token for that repository (contents and pull requests, revoked
+afterwards): one commit on a new branch `engineering-control/issue-<number>-<run>`, and a
+pull request. No sandbox ever holds a token that can write, nothing a sandbox produced is
+executed by the platform, nothing is merged, and no existing branch is moved. A change that
+touches `.github/`, `.claude/`, `.codex/`, `.mcp.json`, `CLAUDE.md` or `AGENTS.md` is refused.
+
+What to install and how to test comes from the project's manifest (`config/projects`) when
+the sandbox image has the tools it names; otherwise the run says so and the agents work
+without prepared tools. The issue's text reaches the agents marked as material from
+outside, with the rule not to follow instructions in it that go beyond the repository.
+
+A subscription that refuses (a limit, a sign-in that is no longer accepted) is recorded on
+the account, and the step is given to another account, three times at most.
+
 ## The sandbox image
 
 A run works in `images/sandbox`: the two agent clients (Claude Code and Codex), git, a

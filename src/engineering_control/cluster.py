@@ -32,7 +32,7 @@ REQUEST_SECONDS = 10.0
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 MAX_TOKEN_BYTES = 8192
 MAX_SECRET_BYTES = 256 * 1024
-MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_LOG_BYTES = 48 * 1024 * 1024
 
 
 class ClusterError(RuntimeError):
@@ -184,14 +184,17 @@ class Cluster:
     async def delete_pod(self, name: str, *, grace_seconds: int = 5) -> None:
         await self._delete("pods", "the sandbox", name, grace_seconds)
 
-    async def pod_log(self, name: str, *, limit_bytes: int = MAX_LOG_BYTES) -> str:
-        """What the pod's container printed, at most ``limit_bytes`` from its start.
+    async def pod_log(self, name: str, *, tail_lines: int, limit_bytes: int = MAX_LOG_BYTES) -> str:
+        """The end of what the pod's container printed: its last ``tail_lines`` lines, at
+        most ``limit_bytes`` of them.
 
         A pod that has not started yet has no log: that is an empty text, not an error.
         """
         _valid(name)
         response = await self._request(
-            "GET", f"{self._path('pods', name)}/log", params={"limitBytes": str(limit_bytes)}
+            "GET",
+            f"{self._path('pods', name)}/log",
+            params={"tailLines": str(tail_lines), "limitBytes": str(limit_bytes)},
         )
         if response.status_code in (400, 404):
             return ""
