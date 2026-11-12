@@ -16,3 +16,7 @@ spec:
   clusterResourceWhitelist:
     - group: ""
       kind: Namespace
+  # Show what else lives in the namespace (objects created by operators) without warning
+  # about it; this is how such objects can be inspected when only Argo CD is reachable.
+  orphanedResources:
+    warn: false
