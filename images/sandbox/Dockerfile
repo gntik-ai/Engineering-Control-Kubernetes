@@ -55,7 +55,7 @@ RUN python3 -m venv /opt/sandbox/semgrep \
     && for name in claude codex pnpm; do \
          ln --symbolic "/opt/sandbox/node/node_modules/.bin/${name}" "/usr/local/bin/${name}"; \
        done
-COPY sandbox-versions /usr/local/bin/sandbox-versions
+COPY sandbox-versions sandbox-step /usr/local/bin/
 # The image is pinned, so the clients must not look for newer versions of themselves, and
 # the scanner must not report to its maker.
 ENV HOME=/home/agent \

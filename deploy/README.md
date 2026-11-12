@@ -22,7 +22,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
 Not deployed yet: the scheduler (it would start recurring workflows whose activities need
-role workers that do not exist yet) and the launcher that starts sandboxes.
+role workers that do not exist yet).
 
 ## TLS to Temporal
 
@@ -126,6 +126,45 @@ read one back or list them, and in its own namespace it may do nothing. What was
 goes from the browser to the console to the cluster and is not written to the database or
 to the activity record.
 
+## Runs and the launcher
+
+A run is work done in sandboxes: a sequence of steps, each step one pod of the sandbox
+image in the sandbox namespace. The launcher (`engineering-control-launcher`, one replica)
+is the only part of the platform that starts pods. Every few seconds it looks at each run
+that is not finished and does what its current step needs next: lease an account and start
+the pod, look at how the pod is doing, or read its result. Everything it knows is in the
+database and in the cluster, so restarting it loses nothing.
+
+What a sandbox is (`src/engineering_control/sandbox/pods.py`):
+
+- user 10002, read-only root filesystem, no capabilities, no privilege escalation, the
+  default seccomp profile: what the namespace's "restricted" level demands, and the cluster
+  refuses anything less;
+- no identity towards the cluster (no token is mounted) and no list of its services;
+- only on the node labelled `engineering-control/sandbox=true`, whose taint it alone
+  tolerates;
+- an hour's deadline at most per step, a memory and a processor limit;
+- mounted into it: an empty home and `/tmp`, the run's workspace, and for a step that works
+  with a subscription the Secret of the one account leased to it. A ChatGPT account also
+  gets a small volume of its own, where Codex keeps the sign-in it renews;
+- the network: a step labelled `engineering-control/egress: internet` may resolve names and
+  open HTTPS connections to public addresses. It cannot reach a pod, a service or a node of
+  this cluster, nor any private network. A step without the label reaches nothing.
+
+The launcher's identity (`engineering-control-launcher`) may, in the sandbox namespace
+only, create, read and delete pods, read what they printed, and create and delete volume
+claims. It cannot read a Secret: a sandbox gets its account's sign-in because the pod names
+the Secret, not because the launcher has seen it.
+
+An account is leased to a step for as long as the step runs; the number of running steps
+per account never exceeds the account's "sandboxes at once". The first kind of run is
+trying an account (Accounts → Try it): one sandbox asks the account's client a trivial
+question, and the account becomes ready, limited until a time, or in need of a new sign-in.
+
+The sandbox image a run uses is pinned in `base/kustomization.yaml` by a patch, to the same
+commit as the control plane's image; `deploy/registry` puts the pull Secret into both
+namespaces.
+
 ## The sandbox image
 
 A run works in `images/sandbox`: the two agent clients (Claude Code and Codex), git, a
@@ -149,7 +188,9 @@ Nothing deploys it yet: runs arrive with the sandbox launcher.
 - **Not in it yet.** The Rust and Go toolchains that `falcone-serverless` needs, and the
   browsers of the journey runner; they are added when a flow needs them.
 
-`docker run <image>` prints the version of every tool, which a run records as evidence.
+`docker run <image>` prints the version of every tool. `sandbox-step` is what a step runs: it
+carries out the job the launcher wrote into `SANDBOX_JOB` (commands, in order) and ends
+with one line the launcher reads the result from.
 
 ## Repository access for Argo CD
 

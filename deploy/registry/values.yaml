@@ -2,3 +2,5 @@
 # may read packages (classic token, scope read:packages). With no token nothing is created.
 username: ""
 token: ""
+# The namespace of the sandboxes, which pull the sandbox image with the same Secret.
+sandboxNamespace: engineering-control-sandboxes

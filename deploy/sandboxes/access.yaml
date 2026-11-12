@@ -24,3 +24,45 @@ subjects:
   - kind: ServiceAccount
     name: engineering-control-console
     namespace: engineering-control
+---
+# What a sandbox runs as: an account with no rights and no token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox
+  namespace: engineering-control-sandboxes
+automountServiceAccountToken: false
+---
+# The launcher starts one pod per step, reads how it is doing and what it printed, and
+# deletes it; it creates and deletes the volumes runs and accounts work on. It cannot read
+# a Secret: a sandbox gets its account's sign-in because the pod names it, not because the
+# launcher has seen it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: launcher
+  namespace: engineering-control-sandboxes
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: launcher
+  namespace: engineering-control-sandboxes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: launcher
+subjects:
+  - kind: ServiceAccount
+    name: engineering-control-launcher
+    namespace: engineering-control

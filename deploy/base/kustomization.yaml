@@ -1,6 +1,6 @@
 # The control plane: databases, bootstrap, migrations, Temporal, API, console, evidence
-# ingest, notifier, workflow worker and the console's public route. The scheduler and the
-# role workers are not here yet.
+# ingest, notifier, workflow worker, launcher and the console's public route. The scheduler
+# and the role workers are not here yet.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: engineering-control
@@ -15,6 +15,7 @@ resources:
   - bootstrap-jobs.yaml
   - temporal.yaml
   - console.yaml
+  - launcher.yaml
   - evidence-ingest.yaml
   - notifier.yaml
   - api.yaml
@@ -29,3 +30,13 @@ images:
   - name: engineering-control
     newName: ghcr.io/gntik-ai/engineering-control-kubernetes
     newTag: f48bdeeee2ff51795bf1e30ae7f7a26f18db4804
+# The image the sandboxes run is a setting of the launcher, not a container of a manifest,
+# so it is pinned here by a patch: always to the same commit as the image above.
+patches:
+  - target:
+      kind: Deployment
+      name: engineering-control-launcher
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/3/value
+        value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:f48bdeeee2ff51795bf1e30ae7f7a26f18db4804

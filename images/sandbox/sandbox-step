@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Run one step of a run inside its sandbox.
+
+The step is described by the JSON in SANDBOX_JOB, written by the platform:
+
+    {
+      "env_files": {"NAME": "/path"},           a variable whose value is a file's content
+      "seed": [{"from": "/a", "to": "/b", "generation": 3}],
+                                                copy a file once per generation
+      "commands": [{"name": "...", "argv": [...], "cwd": "/workspace", "env": {...},
+                    "stdin": "...", "timeout": 600, "allow_failure": false}]
+    }
+
+Each command's output goes to this process's output as it is produced, so it can be read
+while the step runs. The last line printed is the result: a marker followed by base64 JSON
+with, for every command that ran, its exit code, how long it took and the end of what it
+printed. Commands run in order and stop at the first that fails, unless it allows failure.
+
+Exit code 0 when the job was carried out, whatever its commands returned; 2 when the job
+itself could not be read.
+"""
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+MARKER = "::sandbox-result::"
+STDOUT_TAIL = 512 * 1024
+STDERR_TAIL = 64 * 1024
+
+
+def fail(message):
+    print(f"sandbox-step: {message}", file=sys.stderr, flush=True)
+    sys.exit(2)
+
+
+def tail(chunks, limit):
+    text = b"".join(chunks)
+    return text[-limit:].decode("utf-8", errors="replace")
+
+
+def pump(stream, sink, chunks, limit):
+    """Copy a command's stream to ours as it arrives and keep its end."""
+    kept = 0
+    for line in iter(stream.readline, b""):
+        sink.buffer.write(line)
+        sink.buffer.flush()
+        chunks.append(line)
+        kept += len(line)
+        while kept > 2 * limit and len(chunks) > 1:
+            kept -= len(chunks.pop(0))
+    stream.close()
+
+
+def seed(entries):
+    for entry in entries:
+        source, target = entry["from"], entry["to"]
+        marker = f"{target}.generation"
+        wanted = str(entry["generation"])
+        try:
+            with open(marker, encoding="ascii") as handle:
+                if handle.read().strip() == wanted and os.path.exists(target):
+                    continue
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        staged = f"{target}.new"
+        shutil.copyfile(source, staged)
+        os.chmod(staged, 0o600)
+        os.replace(staged, target)
+        with open(marker, "w", encoding="ascii") as handle:
+            handle.write(wanted)
+
+
+def run(command, environment):
+    started = time.monotonic()
+    out, err = [], []
+    try:
+        process = subprocess.Popen(  # noqa: S603 - the platform wrote the command
+            command["argv"],
+            cwd=command.get("cwd") or None,
+            env={**environment, **command.get("env", {})},
+            stdin=subprocess.PIPE if "stdin" in command else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return {"name": command["name"], "exit_code": 127, "timed_out": False, "seconds": 0.0,
+                "stdout": "", "stderr": f"could not start: {error}"}
+    readers = [
+        threading.Thread(target=pump, args=(process.stdout, sys.stdout, out, STDOUT_TAIL)),
+        threading.Thread(target=pump, args=(process.stderr, sys.stderr, err, STDERR_TAIL)),
+    ]
+    for reader in readers:
+        reader.start()
+    if "stdin" in command:
+        try:
+            process.stdin.write(command["stdin"].encode())
+            process.stdin.close()
+        except OSError:
+            pass
+    timed_out = False
+    try:
+        process.wait(timeout=command.get("timeout", 600))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, 15)
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, 9)
+            except OSError:
+                pass
+            process.wait()
+    for reader in readers:
+        reader.join(timeout=10)
+    return {
+        "name": command["name"],
+        "exit_code": process.returncode,
+        "timed_out": timed_out,
+        "seconds": round(time.monotonic() - started, 1),
+        "stdout": tail(out, STDOUT_TAIL),
+        "stderr": tail(err, STDERR_TAIL),
+    }
+
+
+def main():
+    try:
+        job = json.loads(os.environ["SANDBOX_JOB"])
+        commands = job["commands"]
+        if not isinstance(commands, list) or not all(isinstance(c.get("argv"), list) for c in commands):
+            raise ValueError("commands")
+    except (KeyError, ValueError, TypeError, AttributeError):
+        fail("SANDBOX_JOB is not a job")
+    environment = {key: value for key, value in os.environ.items() if key != "SANDBOX_JOB"}
+    try:
+        for name, path in job.get("env_files", {}).items():
+            with open(path, encoding="utf-8") as handle:
+                environment[name] = handle.read().strip()
+        seed(job.get("seed", []))
+    except (OSError, KeyError) as error:
+        results = [{"name": "setup", "exit_code": 126, "timed_out": False, "seconds": 0.0,
+                    "stdout": "", "stderr": f"the step could not be set up: {error}"}]
+    else:
+        results = []
+        for command in commands:
+            print(f"--- {command['name']}", flush=True)
+            result = run(command, environment)
+            results.append(result)
+            if (result["exit_code"] != 0 or result["timed_out"]) and not command.get("allow_failure"):
+                break
+    encoded = base64.b64encode(json.dumps({"commands": results}).encode()).decode("ascii")
+    sys.stderr.flush()
+    print(f"\n{MARKER}{encoded}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

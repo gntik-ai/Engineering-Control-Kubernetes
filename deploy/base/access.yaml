@@ -24,6 +24,18 @@ automountServiceAccountToken: false
 imagePullSecrets:
   - name: engineering-control-registry
 ---
+# The launcher starts the sandboxes. Like the console's, its identity is mounted explicitly
+# and may act only in the sandbox namespace: on pods, what they print, and volumes.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: engineering-control-launcher
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+automountServiceAccountToken: false
+imagePullSecrets:
+  - name: engineering-control-registry
+---
 # The bootstrap Jobs may read and write Secrets in this namespace, and nothing else.
 apiVersion: v1
 kind: ServiceAccount

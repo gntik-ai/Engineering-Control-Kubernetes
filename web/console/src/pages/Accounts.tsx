@@ -34,7 +34,7 @@ import {
   TableRow,
   Textarea,
 } from '@gntik-ai/ui';
-import { KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
+import { FlaskConical, KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import { apiUrl, postJson, useResource, type Account, type Accounts, type ProviderType } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
@@ -48,7 +48,7 @@ function state(account: Account): { label: string; tone: Tone; detail: string | 
     case 'signed_out':
       return { label: 'Sign-in needed', tone: 'warning', detail: 'Nothing is stored for this account yet.' };
     case 'unchecked':
-      return { label: 'Signed in', tone: 'info', detail: 'Not used yet: the first run shows whether it works.' };
+      return { label: 'Signed in', tone: 'info', detail: 'Not tried yet. Try it to see whether the sign-in works.' };
     case 'ready':
       return { label: 'Ready', tone: 'success', detail: null };
     case 'limited':
@@ -369,14 +369,16 @@ function AccountRow({
   const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | null>(null);
   const shown = state(account);
   const signedIn = account.state !== 'signed_out';
-  const pause = () => {
-    postJson<Account>(`accounts/${account.id}/update`, { paused: !account.paused })
+  const change = (path: string, body: Record<string, unknown> = {}) => () => {
+    postJson<unknown>(`accounts/${account.id}/${path}`, body)
       .then(onChanged)
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') return;
         onProblem(error instanceof Error ? error.message : 'The request failed.');
       });
   };
+  const pause = change('update', { paused: !account.paused });
+  const tryIt = change('try');
   return (
     <TableRow>
       <TableCell>
@@ -399,8 +401,18 @@ function AccountRow({
               Paused
             </Badge>
           ) : null}
+          {account.being_tried ? (
+            <Badge tone="info" size="sm">
+              Being tried
+            </Badge>
+          ) : null}
         </div>
         {shown.detail ? <div className="mt-1 text-[12px] text-muted-foreground">{shown.detail}</div> : null}
+        {account.checked_at ? (
+          <div className="mt-1 text-[12px] text-muted-foreground">
+            Tried <When value={account.checked_at} />
+          </div>
+        ) : null}
       </TableCell>
       <TableCell className={mono}>{account.max_concurrent}</TableCell>
       <TableCell>
@@ -418,6 +430,9 @@ function AccountRow({
             size="sm"
             align="end"
             items={[
+              ...(signedIn && !account.being_tried
+                ? [{ label: 'Try it', icon: FlaskConical, onSelect: tryIt }]
+                : []),
               ...(signedIn && canSignIn
                 ? [{ label: 'Sign in again', icon: LogIn, onSelect: () => setDialog('sign-in') }]
                 : []),
@@ -454,7 +469,11 @@ function AccountRow({
 }
 
 export function AccountsPage() {
-  const accounts = useResource<Accounts>(apiUrl('accounts'), 30_000);
+  // While an account is being tried the page looks again every few seconds.
+  const [busy, setBusy] = useState(false);
+  const accounts = useResource<Accounts>(apiUrl('accounts'), busy ? 4_000 : 30_000);
+  const trying = accounts.data?.items.some((item) => item.being_tried) ?? false;
+  useEffect(() => setBusy(trying), [trying]);
   const [adding, setAdding] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const providers = accounts.data?.providers ?? [];

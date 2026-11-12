@@ -20,6 +20,7 @@ THIRD_PARTY_IMAGES = {
 }
 BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
 CONSOLE_ACCOUNT = "engineering-control-console"
+LAUNCHER_ACCOUNT = "engineering-control-launcher"
 SANDBOXES = BASE.parent / "sandboxes"
 SANDBOX_NAMESPACE = "engineering-control-sandboxes"
 
@@ -54,6 +55,21 @@ def test_the_image_is_pinned_to_a_commit() -> None:
     assert image["name"] == IMAGE
     assert image["newName"] == "ghcr.io/gntik-ai/engineering-control-kubernetes"
     assert re.fullmatch(r"[0-9a-f]{40}", str(image["newTag"]))
+    # The sandbox image is a setting of the launcher. The patch that pins it names that
+    # setting by its position, and always the commit of the image above.
+    (patch,) = kustomization["patches"]
+    assert patch["target"] == {"kind": "Deployment", "name": "engineering-control-launcher"}
+    (operation,) = yaml.safe_load(patch["patch"])
+    launcher = next(spec for name, spec in _pod_specs() if name.endswith("-launcher"))
+    position = int(
+        operation["path"].removeprefix("/spec/template/spec/containers/0/env/").split("/")[0]
+    )
+    assert operation["path"].endswith(f"/env/{position}/value") and operation["op"] == "replace"
+    assert launcher["containers"][0]["env"][position]["name"] == "ENGINEERING_SANDBOX_IMAGE"
+    assert operation["value"] == (
+        f"ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:{image['newTag']}"
+    )
+    Settings(sandbox_image=operation["value"])
 
 
 def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
@@ -80,7 +96,7 @@ def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
         assert not any("hostPath" in volume for volume in spec.get("volumes", [])), name
 
 
-def test_only_the_bootstrap_jobs_and_the_console_have_a_cluster_identity() -> None:
+def test_only_the_bootstrap_jobs_the_console_and_the_launcher_have_a_cluster_identity() -> None:
     for name, spec in _pod_specs():
         tokens = [
             source
@@ -91,10 +107,10 @@ def test_only_the_bootstrap_jobs_and_the_console_have_a_cluster_identity() -> No
         if spec["serviceAccountName"] == BOOTSTRAP_ACCOUNT:
             assert name in {"Job/bootstrap-secrets", "Job/bootstrap-admin-password"}
             assert spec["automountServiceAccountToken"] is True
-        elif spec["serviceAccountName"] == CONSOLE_ACCOUNT:
-            # The console asks for its token explicitly: short-lived, in a volume of its
-            # own, readable by its group only.
-            assert name == "Deployment/engineering-control-console"
+        elif spec["serviceAccountName"] in (CONSOLE_ACCOUNT, LAUNCHER_ACCOUNT):
+            # Each asks for its token explicitly: short-lived, in a volume of its own,
+            # readable by its group only.
+            assert name == f"Deployment/{spec['serviceAccountName']}"
             assert spec["automountServiceAccountToken"] is False
             assert tokens == [{"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}]
             volume = next(v for v in spec["volumes"] if "projected" in v)
@@ -104,16 +120,22 @@ def test_only_the_bootstrap_jobs_and_the_console_have_a_cluster_identity() -> No
             assert spec["automountServiceAccountToken"] is False, name
             assert tokens == [], name
     accounts = {d["metadata"]["name"]: d for d in _documents() if d["kind"] == "ServiceAccount"}
-    assert set(accounts) == {"engineering-control", BOOTSTRAP_ACCOUNT, CONSOLE_ACCOUNT}
+    assert set(accounts) == {
+        "engineering-control",
+        BOOTSTRAP_ACCOUNT,
+        CONSOLE_ACCOUNT,
+        LAUNCHER_ACCOUNT,
+    }
     assert all(account["automountServiceAccountToken"] is False for account in accounts.values())
     # All pull the private image with the Secret deploy/registry creates.
     assert all(
         account["imagePullSecrets"] == [{"name": "engineering-control-registry"}]
         for account in accounts.values()
     )
-    # In its own namespace the console's identity may do nothing: no role is bound to it.
+    # In their own namespace these identities may do nothing: no role is bound to them.
     for binding in (d for d in _documents() if d["kind"] == "RoleBinding"):
-        assert CONSOLE_ACCOUNT not in {subject["name"] for subject in binding["subjects"]}
+        bound = {subject["name"] for subject in binding["subjects"]}
+        assert not bound & {CONSOLE_ACCOUNT, LAUNCHER_ACCOUNT}
 
 
 def _sandbox_documents() -> list[dict[str, Any]]:
@@ -137,9 +159,23 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
     for document in documents:
         if document["kind"] != "Namespace":
             assert document["metadata"]["namespace"] == SANDBOX_NAMESPACE, document["kind"]
-    policies = [d for d in documents if d["kind"] == "NetworkPolicy"]
-    deny = next(p for p in policies if p["metadata"]["name"] == "deny-everything")
-    assert deny["spec"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    policies = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "NetworkPolicy"}
+    assert set(policies) == {"deny-everything", "egress-internet"}
+    assert policies["deny-everything"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    # A step that may reach out reaches name resolution and public HTTPS, and nothing of
+    # the cluster, its nodes or any private network. Nothing is ever let in.
+    internet = policies["egress-internet"]
+    assert internet["podSelector"] == {"matchLabels": {"engineering-control/egress": "internet"}}
+    assert internet["policyTypes"] == ["Egress"]
+    names, public = internet["egress"]
+    assert {port["port"] for port in names["ports"]} == {53}
+    assert names["to"][0]["podSelector"] == {"matchLabels": {"k8s-app": "kube-dns"}}
+    assert public["ports"] == [{"protocol": "TCP", "port": 443}]
+    (block,) = public["to"]
+    assert block["ipBlock"]["cidr"] == "0.0.0.0/0"
+    for private in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"):
+        assert private in block["ipBlock"]["except"], private
+    assert not any("ingress" in spec for spec in policies.values())
     settings = next(
         d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
     )
@@ -159,19 +195,43 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
     assert application["spec"]["project"] == "engineering-control"
 
 
-def test_the_console_may_write_and_delete_sign_ins_and_never_read_one() -> None:
+def test_the_console_writes_sign_ins_the_launcher_runs_pods_and_neither_reads_a_secret() -> None:
     documents = _sandbox_documents()
-    roles = [d for d in documents if d["kind"] in {"Role", "ClusterRole"}]
-    assert [role["kind"] for role in roles] == ["Role"]
-    assert roles[0]["rules"] == [
-        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "update", "delete"]}
-    ]
-    bindings = [d for d in documents if d["kind"] in {"RoleBinding", "ClusterRoleBinding"}]
-    assert [binding["kind"] for binding in bindings] == ["RoleBinding"]
-    assert bindings[0]["roleRef"]["name"] == roles[0]["metadata"]["name"]
-    assert bindings[0]["subjects"] == [
-        {"kind": "ServiceAccount", "name": CONSOLE_ACCOUNT, "namespace": "engineering-control"}
-    ]
+    assert not [d for d in documents if d["kind"] in {"ClusterRole", "ClusterRoleBinding"}]
+    roles = {d["metadata"]["name"]: d["rules"] for d in documents if d["kind"] == "Role"}
+    assert roles == {
+        "account-sign-ins": [
+            {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "update", "delete"]}
+        ],
+        "launcher": [
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "get", "delete"]},
+            {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+            {
+                "apiGroups": [""],
+                "resources": ["persistentvolumeclaims"],
+                "verbs": ["create", "delete"],
+            },
+        ],
+    }
+    for rules in roles.values():
+        for rule in rules:
+            if "secrets" in rule["resources"]:
+                assert not {"get", "list", "watch"} & set(rule["verbs"])
+            assert "*" not in rule["verbs"] and "*" not in rule["resources"]
+            assert "pods/exec" not in rule["resources"]
+    bound = {d["roleRef"]["name"]: d["subjects"] for d in documents if d["kind"] == "RoleBinding"}
+    assert bound == {
+        "account-sign-ins": [
+            {"kind": "ServiceAccount", "name": CONSOLE_ACCOUNT, "namespace": "engineering-control"}
+        ],
+        "launcher": [
+            {"kind": "ServiceAccount", "name": LAUNCHER_ACCOUNT, "namespace": "engineering-control"}
+        ],
+    }
+    # What a sandbox runs as has no token and no role.
+    (account,) = [d for d in documents if d["kind"] == "ServiceAccount"]
+    assert account["metadata"]["name"] == "sandbox"
+    assert account["automountServiceAccountToken"] is False
     # Nothing runs here by manifest: sandboxes are started by the platform, one per run.
     assert not [d for d in documents if d["kind"] in {"Deployment", "Job", "StatefulSet", "Pod"}]
 
@@ -296,7 +356,7 @@ def test_no_storage_class_is_named() -> None:
 
 def test_the_registry_chart_holds_no_credential() -> None:
     values = yaml.safe_load((BASE.parent / "registry" / "values.yaml").read_text())
-    assert values == {"username": "", "token": ""}
+    assert values == {"username": "", "token": "", "sandboxNamespace": SANDBOX_NAMESPACE}
 
 
 def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:

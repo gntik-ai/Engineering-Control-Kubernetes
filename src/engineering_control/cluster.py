@@ -8,6 +8,10 @@ authority.
 
 Nothing here reads a Secret back: what is stored for a subscription account is written once
 and afterwards only mounted into the sandbox that uses it.
+
+The launcher uses the rest: it starts one pod per step of a run, reads how the pod is
+doing and what it printed, and deletes it; it creates and deletes the volume a run works
+in. Each process has only the verbs its role in the sandbox namespace grants.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ REQUEST_SECONDS = 10.0
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 MAX_TOKEN_BYTES = 8192
 MAX_SECRET_BYTES = 256 * 1024
+MAX_LOG_BYTES = 8 * 1024 * 1024
 
 
 class ClusterError(RuntimeError):
@@ -89,12 +94,22 @@ class Cluster:
             "Accept": "application/json",
         }
 
-    async def _send(self, method: str, path: str, body: dict[str, Any] | None = None) -> int:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
         try:
-            response = await self._client.request(method, path, json=body, headers=self._headers())
+            return await self._client.request(
+                method, path, json=body, params=params, headers=self._headers()
+            )
         except httpx.HTTPError as error:
             raise ClusterError("The cluster did not answer") from error
-        return response.status_code
+
+    async def _send(self, method: str, path: str, body: dict[str, Any] | None = None) -> int:
+        return (await self._request(method, path, body)).status_code
 
     def _secrets(self, name: str | None = None) -> str:
         path = f"/api/v1/namespaces/{self.namespace}/secrets"
@@ -129,8 +144,84 @@ class Cluster:
         if status not in (200, 202, 404):
             raise ClusterError(_refusal("delete the sign-in", status))
 
+    # --- pods and volumes of the sandboxes -----------------------------------------------
 
-def _refusal(action: str, status: int) -> str:
+    def _path(self, kind: str, name: str | None = None) -> str:
+        path = f"/api/v1/namespaces/{self.namespace}/{kind}"
+        return path if name is None else f"{path}/{name}"
+
+    async def _create(self, kind: str, what: str, manifest: dict[str, Any]) -> None:
+        response = await self._request("POST", self._path(kind), manifest)
+        # 409: it is already there, which is what a repeated attempt wants.
+        if response.status_code not in (200, 201, 202, 409):
+            raise ClusterError(_refusal(f"create {what}", response.status_code, response))
+
+    async def _read(self, kind: str, what: str, name: str) -> dict[str, Any] | None:
+        _valid(name)
+        response = await self._request("GET", self._path(kind, name))
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise ClusterError(_refusal(f"read {what}", response.status_code, response))
+        document = response.json()
+        return document if isinstance(document, dict) else None
+
+    async def _delete(self, kind: str, what: str, name: str, grace_seconds: int) -> None:
+        _valid(name)
+        response = await self._request(
+            "DELETE", self._path(kind, name), params={"gracePeriodSeconds": str(grace_seconds)}
+        )
+        if response.status_code not in (200, 202, 404):
+            raise ClusterError(_refusal(f"delete {what}", response.status_code, response))
+
+    async def create_pod(self, manifest: dict[str, Any]) -> None:
+        await self._create("pods", "the sandbox", manifest)
+
+    async def pod(self, name: str) -> dict[str, Any] | None:
+        """The pod as the cluster describes it, or None when there is no such pod."""
+        return await self._read("pods", "the sandbox", name)
+
+    async def delete_pod(self, name: str, *, grace_seconds: int = 5) -> None:
+        await self._delete("pods", "the sandbox", name, grace_seconds)
+
+    async def pod_log(self, name: str, *, limit_bytes: int = MAX_LOG_BYTES) -> str:
+        """What the pod's container printed, at most ``limit_bytes`` from its start.
+
+        A pod that has not started yet has no log: that is an empty text, not an error.
+        """
+        _valid(name)
+        response = await self._request(
+            "GET", f"{self._path('pods', name)}/log", params={"limitBytes": str(limit_bytes)}
+        )
+        if response.status_code in (400, 404):
+            return ""
+        if response.status_code != 200:
+            raise ClusterError(_refusal("read the sandbox's output", response.status_code))
+        return response.text
+
+    async def create_claim(self, manifest: dict[str, Any]) -> None:
+        await self._create("persistentvolumeclaims", "the volume", manifest)
+
+    async def delete_claim(self, name: str) -> None:
+        await self._delete("persistentvolumeclaims", "the volume", name, 0)
+
+
+def _valid(name: str) -> None:
+    if not NAME.fullmatch(name):
+        raise ValueError("not a valid name")
+
+
+def _refusal(action: str, status: int, response: httpx.Response | None = None) -> str:
+    """What failed. For pods and volumes the cluster's own reason is added: it names a
+    field or a rule, never a value the platform put in."""
+    reason = ""
+    if response is not None:
+        try:
+            message = response.json().get("message")
+        except (ValueError, AttributeError):
+            message = None
+        if isinstance(message, str) and message:
+            reason = f": {' '.join(message.split())[:300]}"
     if status in (401, 403):
-        return f"The cluster did not allow the platform to {action} (status {status})"
-    return f"The cluster could not {action} (status {status})"
+        return f"The cluster did not allow the platform to {action} (status {status}){reason}"
+    return f"The cluster could not {action} (status {status}){reason}"

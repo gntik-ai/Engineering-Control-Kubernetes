@@ -66,6 +66,7 @@ from engineering_control.dashboard.schemas import (
     ItemCreateInput,
     ItemRouteInput,
     ItemStateInput,
+    PlainChangeInput,
     ProjectArchiveInput,
     ProjectCreateInput,
     ProjectRenameInput,
@@ -1096,6 +1097,46 @@ def create_app(
             ),
             event="dashboard.account_signed_in",
             entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/try")
+    async def try_account_api(account_id: UUID, request: Request) -> Response:
+        """Start a run that asks the account's client one trivial question."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).try_account(account_id),
+            event="dashboard.run_started",
+            status_code=201,
+            entity="run",
+        )
+
+    @app.get("/api/dashboard/runs")
+    async def runs_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).runs())
+
+    @app.get("/api/dashboard/runs/{run_id}")
+    async def run_api(run_id: UUID, request: Request) -> Response:
+        """One run with its steps and what each printed."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).run(run_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/runs/{run_id}/cancel")
+    async def cancel_run_api(run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).cancel_run(run_id),
+            event="dashboard.run_stopped",
+            entity="run",
         )
 
     @app.post("/api/dashboard/accounts/{account_id}/remove")

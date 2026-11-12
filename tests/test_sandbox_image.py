@@ -165,7 +165,7 @@ def test_the_image_does_not_update_itself_or_report_home() -> None:
 
 
 def test_scripts_are_executable() -> None:
-    for name in ("install-tools.sh", "smoke-test.sh", "sandbox-versions"):
+    for name in ("install-tools.sh", "smoke-test.sh", "sandbox-versions", "sandbox-step"):
         assert (SANDBOX / name).stat().st_mode & 0o111, name
 
 

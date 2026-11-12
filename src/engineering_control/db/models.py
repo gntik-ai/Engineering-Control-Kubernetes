@@ -544,6 +544,78 @@ class ProviderAccount(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class SandboxRun(UUIDPrimaryKey, Timestamps, Base):
+    """One piece of work done in sandboxes (migration 0029).
+
+    A run is a sequence of steps, each one pod. ``kind`` says what the run is for: trying
+    an account, or delivering a backlog item. ``data`` holds what the kind needs and may
+    be shown (a repository, an issue number), never a credential.
+    """
+
+    __tablename__ = "sandbox_runs"
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    item_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("backlog_items.id", ondelete="SET NULL"), index=True
+    )
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("provider_accounts.id", ondelete="SET NULL"), index=True
+    )
+    outcome: Mapped[str | None] = mapped_column(String(40))
+    detail: Mapped[str | None] = mapped_column(String(600))
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'running', 'waiting', 'succeeded', 'failed', 'cancelled')",
+            name="state",
+        ),
+    )
+
+
+class SandboxStep(UUIDPrimaryKey, Timestamps, Base):
+    """One step of a run: one pod in the sandbox namespace (migration 0029).
+
+    A step that works with a subscription names its ``provider``; the account leased to it
+    is ``account_id`` for as long as the step is running, which is what the limit of
+    sandboxes per account counts.
+    """
+
+    __tablename__ = "sandbox_steps"
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("sandbox_runs.id", ondelete="CASCADE"), index=True
+    )
+    position: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(40))
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    provider: Mapped[str | None] = mapped_column(String(16))
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("provider_accounts.id", ondelete="SET NULL"), index=True
+    )
+    pod_name: Mapped[str | None] = mapped_column(String(80))
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    outcome: Mapped[str | None] = mapped_column(String(40))
+    detail: Mapped[str | None] = mapped_column(String(600))
+    output: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    log: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("run_id", "position", name="uq_sandbox_steps_run_position"),
+        CheckConstraint(
+            "state IN ('pending', 'running', 'succeeded', 'failed', 'cancelled', 'skipped')",
+            name="state",
+        ),
+    )
+
+
 class BacklogSync(Base):
     """When a project's backlog was last brought in step with GitHub, and how it went."""
 

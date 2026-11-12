@@ -50,6 +50,7 @@ from engineering_control.operations.issue_delivery_approval import (
 )
 from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
+from engineering_control.sandbox.runs import Runs
 from engineering_control.security.redaction import SecretRedactor
 
 _EVENT_METADATA_KEYS = frozenset(
@@ -127,6 +128,7 @@ class DashboardRepository:
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.accounts = Accounts(self.sessions)
+        self.runs = Runs(self.sessions)
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)

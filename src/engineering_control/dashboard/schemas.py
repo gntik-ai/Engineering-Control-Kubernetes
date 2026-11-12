@@ -167,6 +167,12 @@ class AccountSignInInput(DashboardModel):
     credential: str = Field(min_length=1, max_length=70000)
 
 
+class PlainChangeInput(DashboardModel):
+    """A change that needs nothing but the session's token."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+
+
 class AccountRemoveInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     # Removing an account needs the password again.

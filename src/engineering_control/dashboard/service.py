@@ -12,7 +12,7 @@ from engineering_control.dashboard.accounts import (
     secret_name,
 )
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
-from engineering_control.dashboard.project_records import ProjectInvalid
+from engineering_control.dashboard.project_records import ProjectConflict, ProjectInvalid
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.github_app import GitHubApp, GitHubAppError
@@ -249,8 +249,26 @@ class DashboardService:
         return {"items": entries, "total": len(entries)}
 
     async def accounts(self) -> dict[str, object]:
-        listing = await asyncio.to_thread(self.repository.accounts.listing)
-        return {**listing, "providers": provider_catalogue()}
+        def read() -> dict[str, Any]:
+            listing = self.repository.accounts.listing()
+            tried = self.repository.runs.accounts_being_tried()
+            for item in listing["items"]:
+                item["being_tried"] = item["id"] in tried
+            return listing
+
+        return {**await asyncio.to_thread(read), "providers": provider_catalogue()}
+
+    async def try_account(self, account_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.start_account_check, account_id)
+
+    async def runs(self) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.listing)
+
+    async def run(self, run_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.get, run_id)
+
+    async def cancel_run(self, run_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.request_cancel, run_id)
 
     async def create_account(self, *, name: str, provider: str) -> dict[str, object]:
         return await asyncio.to_thread(
@@ -287,7 +305,11 @@ class DashboardService:
 
     async def remove_account(self, account_id: UUID, cluster: Cluster | None) -> dict[str, object]:
         """The sign-in leaves the cluster first; the record is removed only when it is gone."""
-        await asyncio.to_thread(self.repository.accounts.get, account_id)
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if await asyncio.to_thread(self.repository.runs.account_in_use, account_id):
+            raise ProjectConflict(
+                f"{account['name']} is in use by a run. Stop the run or wait for it to end."
+            )
         if cluster is not None:
             await cluster.delete_secret(secret_name(account_id))
         return await asyncio.to_thread(self.repository.accounts.archive, account_id)

@@ -1,6 +1,5 @@
 # Nothing in this namespace is reachable and nothing in it reaches anything, until a rule
-# says otherwise. The rules that let a run reach its provider and the package registries
-# arrive with the launcher.
+# says otherwise.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -11,3 +10,47 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+---
+# A step that has to reach its provider, GitHub or a package registry carries the label
+# engineering-control/egress: internet. It may then resolve names and open HTTPS
+# connections to public addresses, and to nothing else: not to a pod or a service of this
+# cluster, not to a node, not to any private network. A network policy cannot name hosts,
+# so "public addresses" is as narrow as it gets here; an egress proxy that allows named
+# hosts only is the next step up.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-internet
+  namespace: engineering-control-sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      engineering-control/egress: internet
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

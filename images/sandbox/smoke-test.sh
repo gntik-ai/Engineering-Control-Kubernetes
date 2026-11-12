@@ -109,4 +109,14 @@ sandbox bash -euc '
   jq --null-input --exit-status "true" >/dev/null
 ' || fail "git, the compiler, Node.js or Python do not work in the workspace"
 
+# A step: the runner carries out a job and ends with a result the platform can read.
+job='{"commands":[{"name":"one","argv":["bash","-c","echo step-ran"]},{"name":"two","argv":["false"]},{"name":"never","argv":["true"]}]}'
+step_log="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --network none --user "${uid}:${uid}" --tmpfs "/tmp:exec,uid=${uid},gid=${uid}" \
+  --env "SANDBOX_JOB=${job}" "${image}" sandbox-step)"
+grep --quiet '^step-ran$' <<<"${step_log}" || fail "the step runner did not run its command"
+result="$(sed -n 's/^::sandbox-result:://p' <<<"${step_log}" | tail -n 1 | base64 --decode)"
+[[ "$(jq --compact-output '[.commands[] | [.name, .exit_code]]' <<<"${result}")" \
+  == '[["one",0],["two",1]]' ]] || fail "the step runner's result is not what ran: ${result}"
+
 echo "sandbox image ok"

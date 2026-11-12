@@ -215,6 +215,14 @@ class Settings(BaseSettings):
     sandbox_namespace: str | None = Field(
         default=None, pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
     )
+    # The image a sandbox runs, pinned to a commit, and the Secret it is pulled with.
+    sandbox_image: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9./-]{2,200}(:[A-Za-z0-9._-]{1,128}|@sha256:[0-9a-f]{64})$",
+    )
+    sandbox_pull_secret: str = Field(
+        default="engineering-control-registry", pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    )
     # The cluster's own API, and the identity and certificate authority the kubelet mounts.
     cluster_api_server: str = Field(
         default="https://kubernetes.default.svc", pattern=r"^https://[A-Za-z0-9.-]+(:\d{1,5})?$"

@@ -42,11 +42,15 @@ jobs:
         run: mypy
       - name: Deployment manifests render
         run: |
-          kubectl kustomize deploy/base > /dev/null
+          kubectl kustomize deploy/base > /tmp/base.yaml
+          # The patch that pins the sandbox image must have reached the launcher.
+          grep --quiet 'value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:' /tmp/base.yaml
           kubectl kustomize deploy/sandboxes > /dev/null
           test -z "$(helm template deploy/registry)"
           helm template deploy/registry --set username=someone --set token=example \
-            | grep --quiet 'kubernetes.io/dockerconfigjson'
+            > /tmp/registry.yaml
+          test "$(grep --count 'kubernetes.io/dockerconfigjson' /tmp/registry.yaml)" = 2
+          grep --quiet 'namespace: engineering-control-sandboxes' /tmp/registry.yaml
 
   test:
     name: Unit tests
@@ -146,6 +150,7 @@ jobs:
 
           import engineering_control
           from engineering_control.dashboard.app import CONSOLE_ROOT, sign_in_assets
+          from engineering_control.sandbox.launcher import run as launcher
           from engineering_control.workflows.definitions import ALL_WORKFLOWS
 
           assert os.geteuid() != 0, "the image must not run as root"
@@ -153,6 +158,7 @@ jobs:
           assert (CONSOLE_ROOT / "login.html").is_file(), "sign-in page missing"
           assert sign_in_assets(), "the sign-in page names no files"
           assert ALL_WORKFLOWS, "no workflows registered"
+          assert callable(launcher), "the launcher is missing"
           print("ok", engineering_control.__name__, len(ALL_WORKFLOWS), "workflows")
           PY
           docker run --rm engineering-control:ci alembic --help >/dev/null

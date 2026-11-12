@@ -119,6 +119,8 @@ export interface Account {
   checked_at: string | null;
   last_used_at: string | null;
   limited_until: string | null;
+  /** A sandbox is asking the account's client a question right now. */
+  being_tried: boolean;
 }
 
 /** A kind of subscription, and how the administrator signs one in. */
