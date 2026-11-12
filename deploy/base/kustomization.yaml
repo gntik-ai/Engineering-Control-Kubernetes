@@ -29,7 +29,7 @@ images:
   # Deploying a new version is changing this one line.
   - name: engineering-control
     newName: ghcr.io/gntik-ai/engineering-control-kubernetes
-    newTag: f48bdeeee2ff51795bf1e30ae7f7a26f18db4804
+    newTag: 89cd1a4724451c35ef94658836e257316874ec9c
 # The image the sandboxes run is a setting of the launcher, not a container of a manifest,
 # so it is pinned here by a patch: always to the same commit as the image above.
 patches:
@@ -39,4 +39,4 @@ patches:
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/env/3/value
-        value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:f48bdeeee2ff51795bf1e30ae7f7a26f18db4804
+        value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:89cd1a4724451c35ef94658836e257316874ec9c
