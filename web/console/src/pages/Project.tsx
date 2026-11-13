@@ -34,7 +34,7 @@ import {
   Textarea,
   TokenInput,
 } from '@gntik-ai/ui';
-import { ArrowLeft, Bot, FolderKanban, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
+import { ArrowLeft, Bot, FolderKanban, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -420,7 +420,7 @@ function SectionRunDialog({
               <Textarea name="scope" value={scope} onValueChange={setScope} maxLength={2000} showCount rows={4} autoFocus />
               <FieldDescription>
                 {audit
-                  ? 'For example: "The session handling in src/auth" or "Everything that checks permissions". Leave it empty to audit the whole repository, starting with what carries the most risk.'
+                  ? 'For example: "The session handling in src/auth" or "Everything that checks permissions". Leave it empty to audit the whole repository: it is split into up to six areas, the riskiest first, and each is audited and verified in turn, which takes longer.'
                   : 'For example: "The reports pages" or "What an operator does every day". Leave it empty to look at the whole product.'}
               </FieldDescription>
             </Field>
@@ -459,6 +459,20 @@ function Detail({ name }: { name: string }) {
   const [removing, setRemoving] = useState<Section | null>(null);
   const [reading, setReading] = useState(false);
   const [moving, setMoving] = useState(false);
+  const [pausing, setPausing] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const pause = async (on: boolean) => {
+    setPausing(true);
+    setProblem(null);
+    try {
+      await postJson(`projects/${name}/${on ? 'pause' : 'resume'}`);
+      detail.reload();
+    } catch (error) {
+      setProblem(message(error));
+    } finally {
+      setPausing(false);
+    }
+  };
   const project = detail.data?.project;
   const sections = detail.data?.sections;
   const work = detail.data?.work;
@@ -486,6 +500,11 @@ function Detail({ name }: { name: string }) {
       actions={
         <div className="flex items-center gap-2">
           <RefreshButton resource={detail} />
+          {work && !work.paused ? (
+            <Button variant="ghost" size="sm" icon={Pause} loading={pausing} onClick={() => void pause(true)}>
+              Pause the project
+            </Button>
+          ) : null}
           <Button variant="secondary" icon={Bot} size="sm" disabled={!sections} onClick={() => setReading(true)}>
             What the supervisor reads
           </Button>
@@ -498,6 +517,19 @@ function Detail({ name }: { name: string }) {
       <div className="grid gap-4">
         <LoadError resource={detail} />
         <LoadError resource={flows} />
+        {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
+        {work?.paused ? (
+          <Alert
+            tone="warning"
+            title={`This project is paused${work.paused.by === 'supervisor' ? ' by the supervisor' : ''}`}
+            description={`${work.paused.reason ? `${work.paused.reason} ` : ''}Nothing new starts on it: no item, no audit, no queue. What is running runs to its end.`}
+            actions={
+              <Button size="sm" variant="secondary" loading={pausing} onClick={() => void pause(false)}>
+                Resume the project
+              </Button>
+            }
+          />
+        ) : null}
         {work && !work.here ? (
           <Alert
             tone="warning"

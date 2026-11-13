@@ -65,6 +65,7 @@ def test_create_rename_and_remove_a_project(tmp_path: Path) -> None:
             "self_contained": True,
             "default_branch": "main",
             "origin": "console",
+            "paused": None,
         }
         assert _names(client) == [*PROJECTS, "docs"]
         listed = client.get("/api/dashboard/projects").json()["items"][-1]

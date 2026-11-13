@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Final
 from uuid import UUID
 
@@ -35,7 +36,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import BacklogItems, clean_title
-from engineering_control.dashboard.project_records import ProjectInvalid, ProjectNotFound
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectNotFound,
+    paused,
+)
 from engineering_control.db.base import Base
 from engineering_control.db.models import BacklogItem, ProjectRecord
 from engineering_control.sandbox import audit, discover
@@ -102,6 +108,19 @@ WAITING_ENHANCEMENTS: Final = frozenset(
     {"CANDIDATE_ENHANCEMENT", "EVIDENCE_VALIDATED", "PRODUCT_REVIEWED"}
 )
 _ISSUE_URL: Final = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/issues/(\d+)")
+
+
+# Where the export script is: beside the process (the image), or in the repository.
+SCRIPT: Final = "export_original_records.py"
+_SCRIPT_ROOTS: Final = (Path("scripts"), Path(__file__).parents[3] / "scripts")
+
+
+def export_script() -> str:
+    """The script that writes a project's records on the original system's host."""
+    for root in _SCRIPT_ROOTS:
+        with contextlib.suppress(OSError):
+            return (root / SCRIPT).read_text(encoding="utf-8")
+    raise ProjectNotFound(SCRIPT)
 
 
 def _rows(document: dict[str, Any], table: str) -> list[dict[str, Any]]:
@@ -275,6 +294,16 @@ class Plan:
                 self.under_way += 1
             self._mark((str(record["repository"]), int(record["issue_number"])), {}, original)
         self.archive = {table: len(_rows(document, table)) for table in ARCHIVE}
+        # Work the original still had under way when the file was written.
+        self.in_flight = [
+            {
+                "run": " ".join(str(run.get("run_type") or "run").split())[:80],
+                "workflow": " ".join(str(run.get("workflow_id") or "").split())[:200],
+                "status": " ".join(str(run.get("status") or "").split())[:60],
+            }
+            for run in document.get("in_flight") or []
+            if isinstance(run, dict)
+        ][:200]
 
     def _mark(
         self, issue: tuple[str, int], facts: dict[str, Any], original: dict[str, Any]
@@ -295,6 +324,8 @@ class Plan:
             "issues_known": len(self.marks),
             "issues_under_way": self.under_way,
             "records": self.archive,
+            "in_flight": self.in_flight[:20],
+            "in_flight_count": len(self.in_flight),
         }
 
 
@@ -340,6 +371,7 @@ class BringOver:
                 if at
                 else None,
                 "brought_over": record.brought_over,
+                "paused": paused(record),
             }
 
     def preview(self, project: str, document: Any) -> dict[str, Any]:
@@ -373,10 +405,19 @@ class BringOver:
             if (str(item.repository), int(item.issue_number or 0)) in plan.marks
         }
 
-    def apply(self, project: str, document: Any) -> dict[str, Any]:
+    def apply(
+        self, project: str, document: Any, *, even_if_running: bool = False
+    ) -> dict[str, Any]:
         """Keep the records, make what is open into work here, and mark the project as
-        cut over. Returns what was done."""
+        cut over. Returns what was done. Nothing is brought over in the middle of a run of
+        the original, unless the administrator says that it may be."""
         plan = Plan(check(document, project))
+        if plan.in_flight and not even_if_running:
+            raise ProjectConflict(
+                f"The original system still had {len(plan.in_flight)} run(s) under way for "
+                "this project when the file was written. Let them end and export again, or "
+                "say that the work may be moved while they run."
+            )
         kept = self._keep(document)
         proposed = accepted = 0
         for finding in plan.findings:

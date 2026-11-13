@@ -83,6 +83,16 @@ function shown(entry: InboxEntry): Shown {
         action: 'Open the queue',
         href: `${BASE}/queue?id=${entry.queue_id}`,
       };
+    case 'project_paused':
+      return {
+        icon: CircleAlert,
+        tone: 'warning',
+        label: 'Paused',
+        title: `The supervisor paused ${entry.project_name}`,
+        detail: `${entry.detail ?? 'Its runs kept failing.'} Nothing starts on the project until you resume it.`,
+        action: 'Open the project',
+        href: `${BASE}/project?name=${project}`,
+      };
     case 'incident':
       return {
         icon: CircleAlert,

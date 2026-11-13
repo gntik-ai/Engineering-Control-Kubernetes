@@ -108,26 +108,57 @@ class _Producer:
 
 
 class AuditCode(_Producer):
-    """Check out, audit, verify twice; confirmed findings become proposed items."""
+    """Check out, audit, verify twice; confirmed findings become proposed items. Without
+    a scope: plan the areas of the repository first, then audit and verify each in turn."""
+
+    @staticmethod
+    def _whole(data: dict[str, Any]) -> bool:
+        scope = data.get("scope") or {}
+        return (
+            not str(scope.get("title") or "").strip() and not str(scope.get("text") or "").strip()
+        )
+
+    @staticmethod
+    def _area_of(item: StepWork) -> int | None:
+        """The area a step belongs to, in a whole-repository audit."""
+        area = item.input.get("area")
+        return int(area) if isinstance(area, int) else None
+
+    def _after_area(self, item: StepWork) -> tuple[Follow, ...]:
+        """What follows once an area has been audited and verified: the next area."""
+        area = self._area_of(item)
+        planned = item.run_data.get("areas") or []
+        if area is None or area + 1 >= len(planned):
+            return ()
+        return (Follow("audit", FIRST, {"area": area + 1}),)
 
     async def plan(self, item: StepWork, lease: Lease | None) -> Plan:
         data = item.run_data
         if item.name == "prepare":
             return await self._prepare(item, "audit")
+        if item.name == "plan":
+            prompt = audit.planner_prompt(repository=data["repository"], base_sha=data["base_sha"])
+            return self._reader(lease, prompt, audit.PLAN_SCHEMA)
+        area = self._area_of(item)
+        planned = data.get("areas") or []
         if item.name == "audit":
             prompt = audit.auditor_prompt(
                 repository=data["repository"],
                 base_sha=data["base_sha"],
                 scope=data.get("scope") or {},
+                area=(planned[area], area, len(planned))
+                if area is not None and area < len(planned)
+                else None,
             )
             return self._reader(lease, prompt, audit.AUDIT_SCHEMA)
         if item.name == "verify":
             found = await asyncio.to_thread(self.runs.step_outputs, item.run_id, "audit")
+            mine = [output for output in found if output.get("area") == area]
             toolchain = deliver.Toolchain.from_dict(data.get("toolchain"))
             prompt = audit.verifier_prompt(
                 repository=data["repository"],
                 base_sha=data["base_sha"],
-                findings=(found[-1] if found else {}).get("candidates") or [],
+                findings=(mine[-1] if mine else {}).get("candidates") or [],
                 known=await self._known(item),
                 ordinal=int(item.input.get("round") or 1),
                 tests=[command.text for command in toolchain.tests],
@@ -144,24 +175,53 @@ class AuditCode(_Producer):
             base_sha, failure = Checkouts.read(commands)
             if failure is not None or base_sha is None:
                 return failure or _failed("checkout_failed", "The checkout gave no commit.")
+            first = "plan" if self._whole(item.run_data) else "audit"
             return Result(
                 Verdict(True, "prepared", "Checked out and installed."),
                 output={"base_sha": base_sha},
-                follow=(Follow("audit", FIRST, None),),
+                follow=(Follow(first, FIRST, None),),
                 data={"base_sha": base_sha},
             )
+        if item.name == "plan":
+            answer, instead = self._answer(item, commands, who="The planner", retry=FIRST)
+            if answer is None:
+                return instead or _failed("no_answer", "The planner gave no answer.")
+            planned = audit.areas(answer)
+            summary = " ".join(str(answer.get("summary") or "").split())[:500]
+            output = {
+                "summary": str(answer.get("summary") or "")[:20_000],
+                "areas": planned,
+                "left_out": [str(entry)[:300] for entry in (answer.get("left_out") or [])[:60]],
+            }
+            if not planned:
+                # Nothing to split: the repository is audited as one scope after all.
+                return Result(
+                    Verdict(True, "one_area", f"No areas were named: {summary}"),
+                    output=output,
+                    follow=(Follow("audit", FIRST, None),),
+                )
+            return Result(
+                Verdict(True, "planned", f"{len(planned)} area(s): {summary}"),
+                output=output,
+                follow=(Follow("audit", FIRST, {"area": 0}),),
+                data={"areas": planned},
+            )
+        area = self._area_of(item)
         if item.name == "audit":
             answer, instead = self._answer(item, commands, who="The auditor", retry=FIRST)
             if answer is None:
                 return instead or _failed("no_answer", "The auditor gave no answer.")
             summary = " ".join(str(answer.get("summary") or "").split())[:500]
-            if answer.get("decision") == "BLOCKED":
+            blocked = answer.get("decision") == "BLOCKED"
+            if blocked and area is None:
                 return Result(
                     Verdict(False, "blocked", f"The auditor could not audit the scope: {summary}"),
                     output=answer,
                 )
-            candidates = audit.candidates(answer)
-            output = {
+            candidates = [] if blocked else audit.candidates(answer)
+            audited: dict[str, Any] = {
+                "area": area,
+                "blocked": blocked,
                 "summary": str(answer.get("summary") or "")[:20_000],
                 "covered": [str(entry)[:300] for entry in (answer.get("covered") or [])[:60]],
                 "not_covered": [
@@ -172,12 +232,26 @@ class AuditCode(_Producer):
                 ],
                 "candidates": candidates,
             }
+            if blocked:
+                # One area that could not be audited does not end an audit of the whole.
+                return Result(
+                    Verdict(True, "area_blocked", f"This area could not be audited: {summary}"),
+                    output=audited,
+                    follow=self._after_area(item),
+                )
             if not candidates:
-                return Result(Verdict(True, "no_findings", summary), output=output)
+                return Result(
+                    Verdict(True, "no_findings", summary),
+                    output=audited,
+                    follow=self._after_area(item),
+                )
+            given: dict[str, Any] = {"round": 1}
+            if area is not None:
+                given["area"] = area
             return Result(
                 Verdict(True, "candidates", f"{len(candidates)} candidate finding(s): {summary}"),
-                output=output,
-                follow=(Follow("verify", _other(item.provider or ""), {"round": 1}),),
+                output=audited,
+                follow=(Follow("verify", _other(item.provider or ""), given),),
                 data={"auditor": item.provider},
             )
         if item.name == "verify":
@@ -186,14 +260,16 @@ class AuditCode(_Producer):
                 return instead or _failed("no_answer", "The verifier gave no answer.")
             ordinal = int(item.input.get("round") or 1)
             summary = " ".join(str(answer.get("summary") or "").split())[:500]
-            follow = (
-                (Follow("verify", item.provider, {"round": ordinal + 1}),)
-                if ordinal < len(audit.ROUNDS)
-                else ()
-            )
+            if ordinal < len(audit.ROUNDS):
+                again: dict[str, Any] = {"round": ordinal + 1}
+                if area is not None:
+                    again["area"] = area
+                follow: tuple[Follow, ...] = (Follow("verify", item.provider, again),)
+            else:
+                follow = self._after_area(item)
             return Result(
                 Verdict(True, "verified", f"Round {ordinal}: {summary}"),
-                output={"round": ordinal, **answer},
+                output={"round": ordinal, "area": area, **answer},
                 follow=follow,
             )
         return _failed("unknown", f"An audit has no step {item.name}.")
@@ -203,68 +279,116 @@ class AuditCode(_Producer):
         audits = await asyncio.to_thread(self.runs.step_outputs, item.run_id, "audit")
         if not audits:
             return End("failed", "unfinished", "The run ended without an audit.")
-        audited = audits[-1]
-        candidates = audited.get("candidates") or []
+        plans = await asyncio.to_thread(self.runs.step_outputs, item.run_id, "plan")
+        planned = data.get("areas") or []
         rounds = await asyncio.to_thread(self.runs.step_outputs, item.run_id, "verify")
-        by_round = {int(answer.get("round") or 0): answer for answer in rounds}
-        answers = [by_round[ordinal] for ordinal in audit.ROUNDS if ordinal in by_round]
+        # The latest audit of each area: a step given again to another account answers
+        # once more for the same area.
+        by_area: dict[int | None, dict[str, Any]] = {}
+        for output in audits:
+            by_area[output.get("area")] = output
         findings: list[dict[str, Any]] = []
+        areas: list[dict[str, Any]] = []
         counts = {"CONFIRMED": 0, "REJECTED": 0, "FLAKY": 0, "BLOCKED": 0, "DUPLICATE": 0}
-        for number, finding in enumerate(candidates, start=1):
-            tried = audit.attempts(answers, number)
-            verdict = audit.disposition(tried)
-            entry: dict[str, Any] = {
-                "number": number,
-                "title": finding["title"],
-                "severity": finding["severity"],
-                "lens": finding["lens"],
-                "disposition": verdict,
-                "notes": [
-                    f"Round {index}: " + " ".join(str(t.get("note") or "").split())[:600]
-                    for index, t in enumerate(tried, start=1)
-                ],
-                "duplicate_of": next(
-                    (str(t["duplicate_of"])[:300] for t in tried if t.get("duplicate_of")), None
-                ),
-                "item_id": None,
+        number = 0
+        total = 0
+        for area, audited in sorted(by_area.items(), key=lambda entry: entry[0] or 0):
+            by_round = {
+                int(answer.get("round") or 0): answer
+                for answer in rounds
+                if answer.get("area") == area
             }
-            if verdict == "CONFIRMED":
-                made = await asyncio.to_thread(
-                    functools.partial(
-                        self.backlog.produce,
-                        data["project"],
-                        title=finding["title"],
-                        section=data.get("section"),
-                        description=audit.description(finding, tried, data["base_sha"]),
-                        facts={
-                            "kind": "finding",
-                            "severity": finding["severity"],
-                            "lens": finding["lens"],
-                            "confidence": finding["confidence"],
-                            "component": finding["affected_component"],
-                            "files": finding["files"][:20],
-                            "commit": data["base_sha"],
-                        },
-                        proposed_by="audit",
-                        origin_ref=f"run:{item.run_id}:finding:{number}",
-                        reason=f"Found and verified by the audit of {data['base_sha'][:12]}.",
-                        run_id=item.run_id,
+            answers = [by_round[ordinal] for ordinal in audit.ROUNDS if ordinal in by_round]
+            name = planned[area]["name"] if area is not None and area < len(planned) else None
+            confirmed = 0
+            for local, finding in enumerate(audited.get("candidates") or [], start=1):
+                number += 1
+                total += 1
+                tried = audit.attempts(answers, local)
+                verdict = audit.disposition(tried)
+                entry: dict[str, Any] = {
+                    "number": number,
+                    "title": finding["title"],
+                    "severity": finding["severity"],
+                    "lens": finding["lens"],
+                    "area": name,
+                    "disposition": verdict,
+                    "notes": [
+                        f"Round {index}: " + " ".join(str(t.get("note") or "").split())[:600]
+                        for index, t in enumerate(tried, start=1)
+                    ],
+                    "duplicate_of": next(
+                        (str(t["duplicate_of"])[:300] for t in tried if t.get("duplicate_of")),
+                        None,
+                    ),
+                    "item_id": None,
+                }
+                if verdict == "CONFIRMED":
+                    made = await asyncio.to_thread(
+                        functools.partial(
+                            self.backlog.produce,
+                            data["project"],
+                            title=finding["title"],
+                            section=data.get("section"),
+                            description=audit.description(finding, tried, data["base_sha"]),
+                            facts={
+                                "kind": "finding",
+                                "severity": finding["severity"],
+                                "lens": finding["lens"],
+                                "confidence": finding["confidence"],
+                                "component": finding["affected_component"],
+                                "files": finding["files"][:20],
+                                "commit": data["base_sha"],
+                            },
+                            proposed_by="audit",
+                            origin_ref=f"run:{item.run_id}:finding:{number}",
+                            reason=f"Found and verified by the audit of {data['base_sha'][:12]}.",
+                            run_id=item.run_id,
+                        )
                     )
+                    if made is None:
+                        # The backlog already has it, from this run or under the same title.
+                        verdict = entry["disposition"] = "DUPLICATE"
+                    else:
+                        entry["item_id"] = made["id"]
+                        confirmed += 1
+                counts[verdict] += 1
+                findings.append(entry)
+            if area is not None:
+                areas.append(
+                    {
+                        "name": name,
+                        "paths": (planned[area]["paths"] if area < len(planned) else [])[:12],
+                        "summary": " ".join(str(audited.get("summary") or "").split())[:600],
+                        "blocked": bool(audited.get("blocked")),
+                        "candidates": len(audited.get("candidates") or []),
+                        "confirmed": confirmed,
+                    }
                 )
-                if made is None:
-                    # The backlog already has it, from this run or under the same title.
-                    verdict = entry["disposition"] = "DUPLICATE"
-                else:
-                    entry["item_id"] = made["id"]
-            counts[verdict] += 1
-            findings.append(entry)
+
+        def gathered(key: str, limit: int) -> list[str]:
+            seen: list[str] = []
+            for output in by_area.values():
+                for value in output.get(key) or []:
+                    if value not in seen:
+                        seen.append(value)
+            return seen[:limit]
+
+        planned_areas = [str(entry.get("name")) for entry in planned]
+        missed = [name for name in planned_areas if name not in {a["name"] for a in areas}]
+        plan = plans[-1] if plans else {}
         result = {
-            "summary": audited.get("summary"),
-            "covered": audited.get("covered") or [],
-            "not_covered": audited.get("not_covered") or [],
-            "open_questions": audited.get("open_questions") or [],
+            "summary": plan.get("summary") if planned else next(iter(by_area.values()))["summary"],
+            "covered": gathered("covered", 80),
+            "not_covered": (
+                gathered("not_covered", 60)
+                + [str(entry) for entry in plan.get("left_out") or []]
+                + [f"The area {name}: not reached" for name in missed]
+            )[:100],
+            "open_questions": gathered("open_questions", 40),
             "findings": findings,
             "counts": counts,
+            "areas": areas,
         }
         said = _counted(
             counts,
@@ -279,14 +403,18 @@ class AuditCode(_Producer):
         await self._close_request(
             item.run_id, {"audit_run": str(item.run_id), "confirmed": counts["CONFIRMED"]}
         )
-        if not candidates:
+        over = f" in {len(areas)} area(s)" if areas else ""
+        if not total:
             return End(
-                "succeeded", "no_findings", "The audit found nothing.", data={"result": result}
+                "succeeded",
+                "no_findings",
+                f"The audit found nothing{over}.",
+                data={"result": result},
             )
         return End(
             "succeeded",
             "findings" if counts["CONFIRMED"] else "nothing_confirmed",
-            f"{len(candidates)} candidate finding(s): {said}.",
+            f"{total} candidate finding(s){over}: {said}.",
             data={"result": result},
         )
 

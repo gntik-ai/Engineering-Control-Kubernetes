@@ -20,6 +20,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    paused_refusal,
 )
 from engineering_control.db.models import (
     BacklogItem,
@@ -31,7 +32,7 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
-from engineering_control.flow_library import AUDIT, FLOWS, run_for_item
+from engineering_control.flow_library import AUDIT, FLOWS, WORK_KINDS, run_for_item
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -201,7 +202,9 @@ class Runs:
             session.flush()
             return _run_row(run)
 
-    def start_item(self, item_id: UUID, *, toolchain: dict[str, Any]) -> dict[str, Any]:
+    def start_item(
+        self, item_id: UUID, *, toolchain: dict[str, Any], max_rounds: int | None = None
+    ) -> dict[str, Any]:
         """Start work on a backlog item: the run its section's flow says.
 
         Most items are delivered: a run implements what the item asks for, has it reviewed
@@ -220,6 +223,8 @@ class Runs:
             if found is None:
                 raise ProjectNotFound(str(item_id))
             item, project, section = found
+            if refusal := paused_refusal(project):
+                raise ProjectConflict(refusal)
             if item.state not in ("proposed", "accepted"):
                 raise ProjectInvalid("The item is not open any more")
             if section is None:
@@ -284,6 +289,9 @@ class Runs:
                         **({} if numbered else {"body": item.description or ""}),
                     },
                 }
+                if max_rounds is not None:
+                    # More rounds of correction than usual, granted for this run.
+                    run.data = {**run.data, "max_rounds": int(max_rounds)}
             session.add(
                 SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
             )
@@ -311,6 +319,8 @@ class Runs:
             )
             if record is None:
                 raise ProjectNotFound(project)
+            if refusal := paused_refusal(record):
+                raise ProjectConflict(refusal)
             found = session.scalar(
                 select(ProjectSection).where(
                     ProjectSection.project_id == record.id, ProjectSection.key == section
@@ -773,6 +783,25 @@ class Runs:
                     SandboxRun.project_id == run.project_id, SandboxRun.item_id.is_(None)
                 )
             return int(session.scalar(query) or 0)
+
+    def failures(self, project: str) -> int:
+        """How many runs of work on the project failed within a day."""
+        since = datetime.now(UTC) - timedelta(hours=24)
+        with self.sessions() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(SandboxRun)
+                    .join(ProjectRecord, SandboxRun.project_id == ProjectRecord.id)
+                    .where(
+                        ProjectRecord.name == project,
+                        SandboxRun.kind.in_(WORK_KINDS),
+                        SandboxRun.state == "failed",
+                        SandboxRun.finished_at > since,
+                    )
+                )
+                or 0
+            )
 
     def item_of(self, run_id: UUID) -> UUID | None:
         """The backlog item the run works on, when it works on one."""

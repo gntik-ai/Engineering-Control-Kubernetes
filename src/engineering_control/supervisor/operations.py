@@ -64,7 +64,10 @@ again. Skip the item with skip_item when the item is not workable as it is writt
 otherwise leave it and say what would have to change.
    - A cause in the project (its tests fail before any change, its repository cannot be \
 checked out, its tools are missing): do not try again; say what the administrator has to \
-fix. When a queue will only repeat the failure, pause it with pause_queue.
+fix. When a queue will only repeat the failure, pause it with pause_queue; when several \
+runs of the project failed for it, pause the project with pause_project.
+   - A delivery whose rounds of correction ran out while each round came closer: grant \
+it more rounds with extend_correction.
    - A run that waits and will never get what it waits for: stop it with cancel_run.
    - When you are not sure, say so in the confidence you give; the tool then asks the \
 administrator instead of acting.

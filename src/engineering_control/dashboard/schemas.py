@@ -119,6 +119,13 @@ class SectionRunInput(DashboardModel):
     scope: str = Field(default="", max_length=2000)
 
 
+class ProjectPauseInput(DashboardModel):
+    """Start no further work on a project, with an optional word on why."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    reason: str = Field(default="", max_length=300)
+
+
 class RecordsInput(DashboardModel):
     """A file of one project's records from the original system, to look at."""
 
@@ -131,6 +138,8 @@ class RecordsApplyInput(RecordsInput):
     the password again."""
 
     current_password: str = Field(min_length=1, max_length=128)
+    # Bring it over although the original system still had runs under way for the project.
+    even_if_running: bool = False
 
 
 class ItemRouteInput(DashboardModel):

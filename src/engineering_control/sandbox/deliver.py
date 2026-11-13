@@ -31,6 +31,8 @@ RUN_DIR: Final = f"{WORKSPACE}/.run"
 CACHE: Final = f"{WORKSPACE}/.cache"
 BUNDLE: Final = f"{RUN_DIR}/bundle.json"
 MAX_ROUNDS: Final = 3
+# The most rounds of correction a run can be granted: the platform's ceiling.
+ROUNDS_CEILING: Final = 5
 PROVIDERS: Final = ("chatgpt", "claude")
 # Files an agent may not change: continuous integration and the agents' own configuration.
 PROTECTED: Final = (".github/", ".claude/", ".codex/", ".mcp.json", "CLAUDE.md", "AGENTS.md")
@@ -467,6 +469,16 @@ def _rules(toolchain: Toolchain) -> str:
     ]
     rules += list(toolchain.rules)
     return "\n".join(f"{number}. {rule}" for number, rule in enumerate(rules, start=1))
+
+
+def rounds_of(data: dict[str, Any]) -> int:
+    """How many rounds of correction a run has: the usual number, or the larger one it
+    was granted, never past the ceiling."""
+    try:
+        granted = int(data.get("max_rounds") or MAX_ROUNDS)
+    except (TypeError, ValueError):
+        granted = MAX_ROUNDS
+    return max(MAX_ROUNDS, min(granted, ROUNDS_CEILING))
 
 
 def subject(issue: dict[str, Any], repository: str) -> str:

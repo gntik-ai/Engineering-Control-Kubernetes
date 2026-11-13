@@ -192,14 +192,28 @@ class DashboardService:
                 return {"project": item, "sections": sections, "work": work}
         return None
 
+    async def pause_project(self, project: str, reason: str) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.projects.pause(project, reason=reason, by="administrator")
+        )
+
+    async def resume_project(self, project: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.projects.resume, project)
+
     async def work_status(self, project: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.bring_over.status, project)
 
     async def preview_records(self, project: str, records: dict[str, Any]) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.bring_over.preview, project, records)
 
-    async def bring_over(self, project: str, records: dict[str, Any]) -> dict[str, object]:
-        return await asyncio.to_thread(self.repository.bring_over.apply, project, records)
+    async def bring_over(
+        self, project: str, records: dict[str, Any], *, even_if_running: bool = False
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.bring_over.apply(
+                project, records, even_if_running=even_if_running
+            )
+        )
 
     async def cut_over(self, project: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.bring_over.cut_over, project)

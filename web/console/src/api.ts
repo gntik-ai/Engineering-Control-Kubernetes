@@ -53,6 +53,8 @@ export interface WorkStatus {
   /** False while the original system is still the one that works on the project. */
   here: boolean;
   cut_over_at: string | null;
+  /** Set while no work may start on the project. */
+  paused?: { at: string; reason: string | null; by: 'administrator' | 'supervisor' | null } | null;
   brought_over: {
     items_proposed: number;
     items_accepted: number;
@@ -73,6 +75,9 @@ export interface RecordsPreview {
   issues_under_way: number;
   records: Record<string, number>;
   exported_at: string | null;
+  /** Runs the original system still had under way for the project when the file was written. */
+  in_flight: { run: string; workflow: string; status: string }[];
+  in_flight_count: number;
 }
 
 export interface ProjectDetail {
@@ -157,6 +162,7 @@ export interface InboxEntry {
     | 'queue_proposed'
     | 'queue_paused'
     | 'incident'
+    | 'project_paused'
     | 'sync_failed'
     | 'section_without_flow'
     | 'unrouted'
@@ -370,6 +376,8 @@ export interface ProducedEntry {
   lens?: string;
   risk?: string;
   persona?: string;
+  /** In an audit of a whole repository: the area the finding was made in. */
+  area?: string | null;
   disposition: string;
   notes: string[];
   duplicate_of: string | null;
@@ -386,6 +394,8 @@ export interface RunResult {
   findings?: ProducedEntry[];
   proposals?: ProducedEntry[];
   counts?: Record<string, number>;
+  /** The areas a whole-repository audit was split into, and what came of each. */
+  areas?: { name: string; paths: string[]; summary: string; blocked: boolean; candidates: number; confirmed: number }[];
 }
 
 /** Work done in sandboxes: trying an account, delivering an item, auditing, looking for enhancements. */

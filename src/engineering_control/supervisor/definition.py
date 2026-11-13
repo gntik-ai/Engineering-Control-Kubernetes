@@ -352,6 +352,36 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         modes=MODES,
     ),
     Tool(
+        "extend_correction",
+        "operate",
+        "Try a delivery again with more rounds of correction",
+        "For a delivery that failed because its rounds of correction ran out (the reviewer "
+        "still asked for changes, or the tests still failed, in the last round): start "
+        "the item again with five rounds instead of three, the platform's ceiling. Use it "
+        "when the rounds were converging; it waits for the administrator when you are "
+        "not sure or the work already ran several times within a day.",
+        _schema(
+            {"run": _RUN, "reason": _REASON, "confidence": _CONFIDENCE},
+            ("run", "reason", "confidence"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
+        "pause_project",
+        "operate",
+        "Pause a project",
+        "Start no further work on a project until the administrator resumes it; what "
+        "runs, runs to its end. For a cause in the project itself that makes every run "
+        "fail (its repository cannot be checked out, its tests fail before any change). "
+        "It is done at once only when several runs of the project failed within a day "
+        "and you are sure; otherwise it waits for the administrator.",
+        _schema(
+            {"project": _PROJECT, "reason": _REASON, "confidence": _CONFIDENCE},
+            ("project", "reason", "confidence"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
         "cancel_run",
         "operate",
         "Stop a run",
@@ -529,7 +559,11 @@ DEFAULT_SKILLS: Final[tuple[dict[str, Any], ...]] = (
             "4. Skip an item (skip_item) only when it cannot be worked on as written, and "
             "say in the reason what would have to change.\n"
             "5. When the cause is in the project, pause the queue that would repeat the "
-            "failure and tell the administrator what to fix; do not skip the items.\n"
+            "failure, or the project itself when several of its runs failed for it "
+            "(pause_project), and tell the administrator what to fix; do not skip the "
+            "items.\n"
+            "5a. When a delivery ran out of rounds while each round was getting closer, "
+            "grant it more (extend_correction) instead of trying the same again.\n"
             "6. Give your confidence honestly. A wrong automatic action costs more than a "
             "question."
         ),

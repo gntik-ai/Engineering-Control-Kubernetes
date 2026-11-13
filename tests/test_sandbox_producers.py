@@ -342,10 +342,12 @@ async def test_an_item_of_a_section_that_audits_asks_for_an_audit(site: Any) -> 
 
 @pytest.mark.asyncio
 async def test_an_auditor_that_cannot_audit_or_does_not_answer_ends_the_run(site: Any) -> None:
-    run = site.runs.start_for_section("falcone-workflow", "code-audit", scope="", toolchain={})
+    run = site.runs.start_for_section(
+        "falcone-workflow", "code-audit", scope="The API", toolchain={}
+    )
     await site.step("prepare", _log([_ran("checkout", f"{BASE}\n")]))
     await site.launcher.tick()
-    assert "Scope: the whole repository." in _prompt(site)
+    assert "<scope>\nThe API\n</scope>" in _prompt(site)
     site.fake.finish(_log([_ran("agent", '{"type":"turn"}\n'), _ran("answer", "")]))
     await site.launcher.tick()
     # An audit without an answer is asked for once more, then given up.
@@ -354,13 +356,149 @@ async def test_an_auditor_that_cannot_audit_or_does_not_answer_ends_the_run(site
     assert (ended["state"], ended["outcome"]) == ("failed", "no_answer")
     assert "gave no answer twice" in ended["detail"]
 
-    blocked = site.runs.start_for_section("falcone-workflow", "code-audit", scope="", toolchain={})
+    blocked = site.runs.start_for_section(
+        "falcone-workflow", "code-audit", scope="The API", toolchain={}
+    )
     await site.step("prepare", _log([_ran("checkout", f"{BASE}\n")]))
     answer = {**AUDITED, "decision": "BLOCKED", "findings": [], "summary": "The checkout is empty."}
     await site.step("audit", _codex(answer))
     ended = site.run(blocked["id"])
     assert (ended["state"], ended["outcome"]) == ("failed", "blocked")
     assert "The checkout is empty." in ended["detail"]
+    await site.github.aclose()
+
+
+@pytest.mark.asyncio
+async def test_an_audit_without_a_scope_plans_areas_and_audits_each_in_turn(site: Any) -> None:
+    run = site.runs.start_for_section("falcone-workflow", "code-audit", scope="", toolchain={})
+    assert run["title"] == "Audit: the whole repository"
+    await site.step("prepare", _checked_out())
+
+    # First a plan: the areas of the repository, the riskiest first.
+    await site.launcher.tick()
+    pod = site.fake.only_pod()
+    assert pod["metadata"]["labels"]["engineering-control/step"] == "plan"
+    assert json.loads(site.job()["files"][0]["content"]) == audit.PLAN_SCHEMA
+    prompt = _prompt(site)
+    assert f"You plan an audit of {REPOSITORY}" in prompt and "at most 6 areas" in prompt
+    planned = {
+        "summary": "Three areas; the fixtures were left out.",
+        "areas": [
+            {
+                "name": "Sessions",
+                "paths": ["src/session.ts", "src/auth/"],
+                "why": "Sign-in.",
+                "lenses": ["security", "made-up"],
+            },
+            {
+                "name": "Billing",
+                "paths": ["src/billing/"],
+                "why": "Money.",
+                "lenses": ["correctness"],
+            },
+            {
+                "name": "Reports",
+                "paths": ["src/reports/"],
+                "why": "Reads data of others.",
+                "lenses": [],
+            },
+            # An area without paths is no area.
+            {"name": "Everything else", "paths": [], "why": "", "lenses": []},
+        ],
+        "left_out": ["test/fixtures/"],
+    }
+    site.fake.finish(_codex(planned))
+    await site.launcher.tick()
+    assert [area["name"] for area in site.run(run["id"])["data"]["areas"]] == [
+        "Sessions",
+        "Billing",
+        "Reports",
+    ]
+
+    # Area 1: a candidate, verified twice.
+    await site.launcher.tick()
+    prompt = _prompt(site)
+    assert "Scope: area 1 of 3 of a whole-repository audit, Sessions." in prompt
+    assert "- src/auth/" in prompt and "Lenses to apply first: security." in prompt
+    site.fake.finish(_codex({**AUDITED, "findings": AUDITED["findings"][:1]}))
+    await site.launcher.tick()
+    for ordinal in (1, 2):
+        await site.launcher.tick()
+        assert site.fake.only_pod()["metadata"]["labels"]["engineering-control/step"] == "verify"
+        assert f"Independent reproduction ordinal: {ordinal}." in _prompt(site)
+        assert "Finding 1: Expired sessions are accepted" in _prompt(site)
+        site.fake.finish(_by_claude(_round((1, True, True, True, True, None))))
+        await site.launcher.tick()
+
+    # Area 2 cannot be audited: that is said, and the audit goes on.
+    await site.launcher.tick()
+    assert "Scope: area 2 of 3 of a whole-repository audit, Billing." in _prompt(site)
+    site.fake.finish(
+        _codex(
+            {**AUDITED, "decision": "BLOCKED", "findings": [], "summary": "The package is empty."}
+        )
+    )
+    await site.launcher.tick()
+
+    # Area 3: its own candidate, numbered within the area, not reproduced.
+    await site.launcher.tick()
+    assert "Scope: area 3 of 3 of a whole-repository audit, Reports." in _prompt(site)
+    site.fake.finish(
+        _codex({**AUDITED, "findings": [_finding("Reports leak another tenant's rows")]})
+    )
+    await site.launcher.tick()
+    for _ordinal in (1, 2):
+        await site.launcher.tick()
+        prompt = _prompt(site)
+        assert "Finding 1: Reports leak another tenant's rows" in prompt
+        assert "Expired sessions are accepted" not in prompt.split("<backlog>")[0]
+        site.fake.finish(_by_claude(_round((1, False, True, True, True, None))))
+        await site.launcher.tick()
+
+    await site.launcher.tick()
+    ended = site.run(run["id"])
+    assert (ended["state"], ended["outcome"]) == ("succeeded", "findings")
+    assert ended["detail"] == "2 candidate finding(s) in 3 area(s): 1 confirmed, 1 not reproduced."
+    result = ended["data"]["result"]
+    assert [(f["number"], f["area"], f["disposition"]) for f in result["findings"]] == [
+        (1, "Sessions", "CONFIRMED"),
+        (2, "Reports", "REJECTED"),
+    ]
+    assert [
+        (a["name"], a["blocked"], a["candidates"], a["confirmed"]) for a in result["areas"]
+    ] == [
+        ("Sessions", False, 1, 1),
+        ("Billing", True, 0, 0),
+        ("Reports", False, 1, 0),
+    ]
+    assert result["summary"] == "Three areas; the fixtures were left out."
+    assert "test/fixtures/" in result["not_covered"]
+    found = [
+        item
+        for item in site.backlog.listing(project="falcone-workflow")["items"]
+        if item["proposed_by"] == "audit"
+    ]
+    assert [item["title"] for item in found] == ["Expired sessions are accepted"]
+    await site.github.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_plan_that_names_no_area_audits_the_repository_as_one_scope(site: Any) -> None:
+    run = site.runs.start_for_section("falcone-workflow", "code-audit", scope="", toolchain={})
+    await site.step("prepare", _checked_out())
+    await site.step(
+        "plan", _codex({"summary": "It is one small package.", "areas": [], "left_out": []})
+    )
+    await site.launcher.tick()
+    assert "Scope: the whole repository." in _prompt(site)
+    site.fake.finish(_codex({**AUDITED, "decision": "PASS", "findings": [], "summary": "Clean."}))
+    await site.launcher.tick()
+    await site.launcher.tick()
+    ended = site.run(run["id"])
+    assert (ended["outcome"], ended["detail"]) == ("no_findings", "The audit found nothing.")
+    assert ended["data"]["result"]["areas"] == []
+    assert audit.areas({"areas": [{"name": "", "paths": ["a/"]}] * 9})[0]["name"] == "a/"
+    assert len(audit.areas({"areas": [{"name": "x", "paths": ["a/"]}] * 9})) == audit.MAX_AREAS
     await site.github.aclose()
 
 

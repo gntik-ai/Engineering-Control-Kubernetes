@@ -62,6 +62,7 @@ const STEP_NAMES: Record<string, string> = {
   verify: 'Test and scan',
   bundle: 'Collect the change',
   audit: 'Audit',
+  plan: 'Plan the areas',
   discover: 'Look for enhancements',
 };
 // In a run that produces items, these steps mean something else than in a delivery.
@@ -362,6 +363,7 @@ function Produced({ run, result }: { run: Run; result: RunResult }) {
                       Risk {entry.risk}
                     </Badge>
                   ) : null}
+                  {entry.area ? <span className="text-[12px] text-muted-foreground">in {entry.area}</span> : null}
                   {entry.item_id && run.project ? (
                     <Link href={`${BASE}/backlog?project=${run.project}&item=${entry.item_id}`}>Open the item</Link>
                   ) : null}
@@ -382,6 +384,29 @@ function Produced({ run, result }: { run: Run; result: RunResult }) {
         ) : (
           <p className="text-[13px]">{audit ? 'The audit reported no finding.' : 'The search proposed nothing.'}</p>
         )}
+        {result.areas?.length ? (
+          <div>
+            <p className="text-[12px] font-medium text-muted-foreground">Areas, the riskiest first</p>
+            <ul className="mt-1 grid gap-2">
+              {result.areas.map((area) => (
+                <li key={area.name} className="text-[13px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{area.name}</span>
+                    <Badge tone={area.blocked ? 'warning' : area.confirmed ? 'success' : 'neutral'} size="sm">
+                      {area.blocked
+                        ? 'Could not be audited'
+                        : area.candidates
+                          ? `${area.confirmed} of ${area.candidates} confirmed`
+                          : 'Nothing found'}
+                    </Badge>
+                    <span className="font-mono text-[12px] text-muted-foreground">{area.paths.join(' ')}</span>
+                  </div>
+                  {area.summary ? <p className="text-[12px] text-muted-foreground">{area.summary}</p> : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         <Names title="Looked at" values={result.covered} />
         <Names title="Not looked at" values={result.not_covered} />
         <Names title="Questions for you" values={result.open_questions} />

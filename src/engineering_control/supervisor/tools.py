@@ -37,9 +37,9 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import ProjectRecord, SupervisorAction
-from engineering_control.flow_library import WORK_KINDS, run_for_item
+from engineering_control.flow_library import DELIVER, WORK_KINDS, run_for_item
 from engineering_control.github_app import GitHubApp, GitHubAppError
-from engineering_control.sandbox.deliver import toolchain_for
+from engineering_control.sandbox.deliver import ROUNDS_CEILING, rounds_of, toolchain_for
 from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import Runs
 from engineering_control.supervisor.conversation import Conversation
@@ -52,6 +52,10 @@ TRIES_A_DAY: Final = 3
 WILL_REPEAT: Final = frozenset(
     {"blocked", "rejected", "protected_files", "secret_found", "no_change", "changes_requested"}
 )
+# The outcomes of a delivery whose rounds of correction ran out, and how many runs of a
+# project have to fail within a day before the supervisor may pause it by itself.
+OUT_OF_ROUNDS: Final = frozenset({"changes_requested", "tests_failed"})
+FAILURES_TO_PAUSE: Final = 3
 # Changes carried out without asking, per turn and per hour. Past either, the next waits.
 AUTOMATIC_PER_TURN: Final = 40
 AUTOMATIC_PER_HOUR: Final = 200
@@ -482,9 +486,23 @@ class Toolbox:
         """Everything that waits for the administrator, most pressing first."""
         queued = self.queues.inbox() if self.queues is not None else []
         trouble = self.operations.inbox() if self.operations is not None else []
+        # A project the supervisor paused waits for the administrator to resume it.
+        stopped = [
+            {
+                "kind": "project_paused",
+                "project": record.name,
+                "project_name": record.display_name,
+                "section": None,
+                "count": 1,
+                "detail": record.pause_reason,
+            }
+            for record in self.projects.active()
+            if record.paused_at is not None and record.paused_by == "supervisor"
+        ]
         return (
             self.runs.inbox()
             + self.accounts.inbox()
+            + stopped
             + trouble
             + self.pending()
             + queued
@@ -627,6 +645,47 @@ class Toolbox:
             return Intent(
                 f"Try “{_words(run['title'], 160)}” again.", project=run["project"], confirm=confirm
             )
+        if name == "extend_correction":
+            run = self.runs.get(_uuid(arguments.get("run"), "a run"))
+            if run["kind"] != DELIVER or not run["item_id"]:
+                raise ProjectInvalid("Only the delivery of an item has rounds of correction")
+            if run["state"] != "failed" or run["outcome"] not in OUT_OF_ROUNDS:
+                raise ProjectConflict("The run did not fail for lack of rounds of correction")
+            had = rounds_of(run["data"])
+            if had >= ROUNDS_CEILING:
+                raise ProjectConflict(
+                    f"The run already had {had} rounds, the most the platform allows"
+                )
+            self._room(run["project"])
+            tries = self.runs.tries(UUID(run["id"]))
+            confirm = self._unsure(arguments)
+            if confirm is None and tries >= TRIES_A_DAY:
+                confirm = f"This work already ran {tries} times within a day."
+            return Intent(
+                f"Try “{_words(run['title'], 140)}” again with {ROUNDS_CEILING} rounds of "
+                f"correction instead of {had}.",
+                project=run["project"],
+                confirm=confirm,
+            )
+        if name == "pause_project":
+            project = str(arguments.get("project") or "")
+            record = next((r for r in self.projects.active() if r.name == project), None)
+            if record is None:
+                raise ProjectNotFound(project)
+            if record.paused_at is not None:
+                raise ProjectConflict("The project is paused already")
+            failed = self.runs.failures(project)
+            confirm = self._unsure(arguments)
+            if confirm is None and failed < FAILURES_TO_PAUSE:
+                confirm = (
+                    f"Only {failed} run(s) of the project failed within a day; pausing it "
+                    "for that is yours to decide."
+                )
+            return Intent(
+                f"Pause the project {record.display_name}: {_words(arguments.get('reason'), 240)}",
+                project=project,
+                confirm=confirm,
+            )
         if name == "cancel_run":
             run = self.runs.get(_uuid(arguments.get("run"), "a run"))
             if run["kind"] not in WORK_KINDS:
@@ -762,6 +821,21 @@ class Toolbox:
                     toolchain=toolchain,
                 )
             return {"run": run["id"], "state": run["state"]}
+        if name == "extend_correction":
+            failed = self.runs.get(UUID(str(arguments["run"])))
+            run = self.runs.start_item(
+                UUID(failed["item_id"]),
+                toolchain=toolchain_for(str(failed["project"])).as_dict(),
+                max_rounds=ROUNDS_CEILING,
+            )
+            return {"run": run["id"], "state": run["state"], "rounds": ROUNDS_CEILING}
+        if name == "pause_project":
+            paused = self.projects.pause(
+                str(arguments["project"]),
+                reason=_words(arguments.get("reason"), 300),
+                by="supervisor",
+            )
+            return {"project": paused["project"], "paused": True}
         if name == "cancel_run":
             run_to_stop = UUID(str(arguments["run"]))
             if self.runs.get(run_to_stop)["state"] == "waiting":

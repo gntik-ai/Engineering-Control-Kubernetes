@@ -437,7 +437,7 @@ class DeliverIssue:
         output: dict[str, Any],
     ) -> Result:
         round_number = int(item.input.get("round") or 1)
-        if round_number >= deliver.MAX_ROUNDS:
+        if round_number >= deliver.rounds_of(item.run_data):
             return Result(
                 Verdict(False, outcome, f"{detail} That was round {round_number}, the last one."),
                 output=output,

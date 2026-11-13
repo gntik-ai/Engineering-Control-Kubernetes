@@ -39,6 +39,8 @@ from engineering_control.dashboard.auth import (
     read_session_key,
 )
 from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
+from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
+from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
 from engineering_control.dashboard.events import sse_events, transcript_sse
 from engineering_control.dashboard.project_records import (
@@ -71,6 +73,7 @@ from engineering_control.dashboard.schemas import (
     PlainChangeInput,
     ProjectArchiveInput,
     ProjectCreateInput,
+    ProjectPauseInput,
     ProjectRenameInput,
     QueueCreateInput,
     QueueItemsInput,
@@ -1526,6 +1529,44 @@ def create_app(
             subject=str(item_id),
         )
 
+    @app.post("/api/dashboard/projects/{name}/pause")
+    async def pause_project_api(name: str, request: Request) -> Response:
+        """Start no further work on the project. What runs, runs to its end."""
+        return await project_change(
+            request,
+            ProjectPauseInput,
+            lambda body: service(request).pause_project(name, body.reason),
+            event="dashboard.project_paused",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/resume")
+    async def resume_project_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).resume_project(name),
+            event="dashboard.project_resumed",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/original-records-script")
+    async def records_script_api(request: Request) -> Response:
+        """The script that exports a project's records on the original system's host, to
+        save and run there. It only reads."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            text = export_script()
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return Response(
+            text,
+            media_type="text/x-python; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{EXPORT_SCRIPT}"'},
+        )
+
     @app.get("/api/dashboard/projects/{name}/bring-over")
     async def bring_over_status_api(name: str, request: Request) -> Response:
         """Whether the project's work is on this platform, and what was brought along
@@ -1558,7 +1599,9 @@ def create_app(
         return await project_change(
             request,
             RecordsApplyInput,
-            lambda body: service(request).bring_over(name, body.records),
+            lambda body: service(request).bring_over(
+                name, body.records, even_if_running=body.even_if_running
+            ),
             event="dashboard.project_cut_over",
             subject=name,
             password=True,

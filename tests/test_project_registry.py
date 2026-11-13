@@ -966,6 +966,8 @@ CLI_SITES: dict[str, str] = {
     "issue-touch-refresh:repository": "REPOSITORY_SLUGS",
     "r3-approve:project": "PROJECTS",
     "r3-candidate:project": "PROJECTS",
+    "records bring-over:project": "PROJECTS",
+    "records preview:project": "PROJECTS",
     "backlog-decompose:project": "(falcone-serverless, falcone-workflow)",
     "backlog-decompositions:project": "(falcone-serverless, falcone-workflow)",
     "ui-blueprints:project": "(falcone)",

@@ -1,6 +1,7 @@
 import {
   Alert,
   Button,
+  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -11,10 +12,11 @@ import {
   Field,
   FieldDescription,
   FieldLabel,
+  Link,
   PasswordInput,
 } from '@gntik-ai/ui';
 import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
-import { postJson, type RecordsPreview } from '../api';
+import { apiUrl, postJson, type RecordsPreview } from '../api';
 
 const count = (value: number, one: string, many: string) => `${value.toLocaleString('en')} ${value === 1 ? one : many}`;
 
@@ -83,6 +85,7 @@ export function BringOverDialog({
   const [fileName, setFileName] = useState<string | null>(null);
   const [preview, setPreview] = useState<RecordsPreview | null>(null);
   const [password, setPassword] = useState('');
+  const [anyway, setAnyway] = useState(false);
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
@@ -91,6 +94,7 @@ export function BringOverDialog({
     setFileName(null);
     setPreview(null);
     setPassword('');
+    setAnyway(false);
     setProblem(null);
     // Only when it opens: the dialog starts empty.
   }, [open]);
@@ -125,7 +129,11 @@ export function BringOverDialog({
     setProblem(null);
     try {
       if (records) {
-        await postJson(`projects/${project}/bring-over`, { records, current_password: password });
+        await postJson(`projects/${project}/bring-over`, {
+          records,
+          current_password: password,
+          even_if_running: anyway,
+        });
       } else {
         await postJson(`projects/${project}/cut-over`, { current_password: password });
       }
@@ -160,15 +168,40 @@ export function BringOverDialog({
                 onChange={(event) => void choose(event)}
               />
               <FieldDescription>
-                The file that <span className="font-mono text-[12px]">scripts/export_original_records.py</span> writes
-                on the original system's host. It only reads there. Without a file nothing is brought over and the
-                project is only marked as moved.
+                The file that{' '}
+                <Link href={apiUrl('original-records-script')} download>
+                  export_original_records.py
+                </Link>{' '}
+                writes on the original system's host. It only reads there. Without a file nothing is brought over and
+                the project is only marked as moved.
               </FieldDescription>
             </Field>
             {fileName && pending && !preview ? (
               <p className="text-[13px] text-muted-foreground">Reading {fileName}…</p>
             ) : null}
             {preview ? <Preview preview={preview} /> : null}
+            {preview?.in_flight_count ? (
+              <Alert
+                tone="warning"
+                title={`The original system still had ${count(preview.in_flight_count, 'run', 'runs')} under way for this project`}
+                description={
+                  <>
+                    <span className="block">
+                      {preview.in_flight
+                        .slice(0, 5)
+                        .map((run) => `${run.run} (${run.status})`)
+                        .join(', ')}
+                      {preview.in_flight_count > 5 ? ' and more' : ''}. Let them end there and export again, so that
+                      nothing is moved in the middle of a run.
+                    </span>
+                    <label className="mt-2 flex items-center gap-2">
+                      <Checkbox checked={anyway} onCheckedChange={(checked) => setAnyway(checked === true)} />
+                      <span>Move the work anyway: those runs are stuck or can be ignored</span>
+                    </label>
+                  </>
+                }
+              />
+            ) : null}
             <Field>
               <FieldLabel>Your password, to confirm</FieldLabel>
               <PasswordInput
@@ -184,7 +217,11 @@ export function BringOverDialog({
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" loading={pending} disabled={!password || (fileName !== null && !preview)}>
+            <Button
+              type="submit"
+              loading={pending}
+              disabled={!password || (fileName !== null && !preview) || Boolean(preview?.in_flight_count && !anyway)}
+            >
               {preview ? 'Bring over and move the work here' : 'Move the work here without records'}
             </Button>
           </DialogFooter>

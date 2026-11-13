@@ -561,3 +561,193 @@ def test_the_console_lists_incidents_and_saves_how_the_supervisor_operates(site:
         assert client.get("/api/dashboard/supervisor/incidents").json()["items"] == []
         everything = client.get("/api/dashboard/supervisor/incidents?everything=true").json()
         assert [entry["state"] for entry in everything["items"]] == ["dismissed"]
+
+
+# --- pausing a project, and more rounds of correction ------------------------------------
+
+
+def test_a_paused_project_starts_nothing_until_it_is_resumed(site: Any) -> None:
+    from engineering_control.dashboard.project_records import ProjectConflict
+
+    projects = site.toolbox.projects
+    made = site.queues.create("falcone-workflow", name="Fixes", item_ids=[site.item_id])
+    site.queues.start(UUID(made["id"]))
+    paused = projects.pause(
+        "falcone-workflow", reason="  The repository   is being moved. ", by="administrator"
+    )
+    assert paused["paused"]["reason"] == "The repository is being moved."
+    assert paused["paused"]["by"] == "administrator"
+    with pytest.raises(ProjectConflict, match="paused already"):
+        projects.pause("falcone-workflow", reason="", by="administrator")
+    with pytest.raises(ProjectConflict, match="was paused by you: The repository is being moved"):
+        site.runs.start_item(site.item_id, toolchain={})
+    with pytest.raises(ProjectConflict, match="was paused by you"):
+        site.runs.start_for_section("falcone-workflow", "issues", scope="", toolchain={})
+    # A queue of the project waits: its item is neither started nor skipped.
+    assert site.queues.advance() == 0
+    assert site.queues.get(UUID(made["id"]))["entries"][0]["state"] == "waiting"
+    assert "was paused by you" in (site.queues.budgets.may_start("falcone-workflow") or "")
+    # The administrator's own pause is not something that waits for them.
+    assert [e for e in site.toolbox.inbox_entries() if e["kind"] == "project_paused"] == []
+    assert projects.resume("falcone-workflow")["paused"] is None
+    with pytest.raises(ProjectConflict, match="not paused"):
+        projects.resume("falcone-workflow")
+    assert site.queues.advance() == 1
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_pauses_a_project_by_itself_only_when_its_runs_keep_failing(
+    site: Any,
+) -> None:
+    turn, token = await site.running_turn("The project keeps failing.")
+    arguments = {
+        "project": "falcone-workflow",
+        "reason": "Its repository cannot be checked out.",
+        "confidence": "high",
+    }
+    _failed_run(site, outcome="checkout_failed")
+    said, error = site.call(turn, token, "pause_project", **arguments)
+    assert not error and "Not done" in said and "Only 1 run(s) of the project failed" in said
+    _failed_run(site, outcome="checkout_failed")
+    _failed_run(site, outcome="checkout_failed")
+    said, _ = site.call(turn, token, "pause_project", **{**arguments, "confidence": "medium"})
+    assert "Not done" in said and "confidence: medium" in said
+    said, error = site.call(turn, token, "pause_project", **arguments)
+    assert not error and said.startswith("Done: Pause the project Falcone workflow")
+    said, error = site.call(turn, token, "pause_project", **arguments)
+    assert error and "paused already" in said
+    # Nothing starts, the supervisor's own retries included, and it is the
+    # administrator's to resume: the inbox says so, and there is no tool for it.
+    said, error = site.call(
+        turn, token, "retry_run", run=_last_run(site), reason="Again.", confidence="high"
+    )
+    assert error and "was paused by the supervisor: Its repository cannot be checked out" in said
+    (entry,) = [e for e in site.toolbox.inbox_entries() if e["kind"] == "project_paused"]
+    assert entry["project"] == "falcone-workflow"
+    assert entry["detail"] == "Its repository cannot be checked out."
+    assert "resume_project" not in TOOLS
+
+
+def _last_run(site: Any) -> str:
+    return str(site.runs.for_items([str(site.item_id)])[str(site.item_id)]["id"])
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_out_of_rounds_can_be_given_more_up_to_the_ceiling(site: Any) -> None:
+    from engineering_control.sandbox import deliver
+
+    assert deliver.rounds_of({}) == 3 and deliver.rounds_of({"max_rounds": 5}) == 5
+    # Never fewer than usual, never past the ceiling, whatever the data says.
+    assert deliver.rounds_of({"max_rounds": 9}) == 5 and deliver.rounds_of({"max_rounds": 1}) == 3
+    assert deliver.rounds_of({"max_rounds": "many"}) == 3
+
+    turn, token = await site.running_turn("It ran out of rounds.")
+    other = _failed_run(site, outcome="not_started")
+    said, error = site.call(
+        turn, token, "extend_correction", run=other, reason="More rounds.", confidence="high"
+    )
+    assert error and "did not fail for lack of rounds" in said
+    out = _failed_run(site, outcome="changes_requested", detail="That was round 3, the last one.")
+    said, _ = site.call(
+        turn, token, "extend_correction", run=out, reason="Each round fixed more.", confidence="low"
+    )
+    assert "Not done" in said
+    said, error = site.call(
+        turn,
+        token,
+        "extend_correction",
+        run=out,
+        reason="Each round fixed more.",
+        confidence="high",
+    )
+    assert not error and "with 5 rounds of correction instead of 3" in said
+    granted = site.runs.get(UUID(_last_run(site)))
+    assert granted["id"] != out and granted["data"]["max_rounds"] == 5
+    # A run that already had the most there is cannot be given more.
+    _fail(site, granted["id"], outcome="tests_failed", detail="That was round 5, the last one.")
+    said, error = site.call(
+        turn, token, "extend_correction", run=granted["id"], reason="Again.", confidence="high"
+    )
+    assert error and "already had 5 rounds, the most the platform allows" in said
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_more_rounds_goes_back_to_the_implementer_past_the_third(
+    site: Any,
+) -> None:
+    from engineering_control.sandbox.flows import DeliverIssue
+    from engineering_control.sandbox.runs import StepWork
+
+    def review(round_number: int, max_rounds: int | None) -> Any:
+        data: dict[str, Any] = {"maker": "chatgpt"}
+        if max_rounds is not None:
+            data["max_rounds"] = max_rounds
+        item = StepWork(
+            run_id=UUID(int=1),
+            run_kind="deliver_issue",
+            run_data=data,
+            cancel_requested=False,
+            step_id=UUID(int=2),
+            name="review",
+            position=3,
+            state="running",
+            provider="claude",
+            account_id=None,
+            pod_name=None,
+            attempt=1,
+            started_at=None,
+            input={"round": round_number},
+        )
+        return DeliverIssue(site.runs, None)._rework(item, "changes_requested", "Asked.", {}, {})
+
+    assert review(3, None).verdict.succeeded is False, "three rounds, as always"
+    more = review(3, 5)
+    assert more.verdict.succeeded and more.follow[0].given == {"round": 4}
+    assert review(5, 5).verdict.succeeded is False
+    assert "round 5, the last one" in review(5, 5).verdict.detail
+
+
+def test_the_console_pauses_and_resumes_a_project(site: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    from engineering_control.config import Settings
+    from engineering_control.dashboard.app import create_app
+    from engineering_control.dashboard.repository import DashboardRepository
+
+    password = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
+    repository = DashboardRepository(str(site.sessions.kw["bind"].url))
+    repository.initialize_password_sync(password)
+    client = TestClient(
+        create_app(
+            settings=Settings(database_url=str(repository.engine.url)),
+            repository=repository,
+            session_key=b"g" * 48,
+        ),
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    )
+    with client:
+        token = client.get("/login/challenge").json()["csrf_token"]
+        client.post("/login", data={"csrf_token": token, "password": password})
+
+        def post(path: str, **fields: Any) -> httpx.Response:
+            csrf = client.get("/api/dashboard/session").json()["csrf_token"]
+            return client.post(f"/api/dashboard{path}", json={"csrf_token": csrf, **fields})
+
+        assert (
+            client.get("/api/dashboard/projects/falcone-workflow").json()["work"]["paused"] is None
+        )
+        paused = post("/projects/falcone-workflow/pause", reason="Release week.")
+        assert paused.status_code == 200 and paused.json()["paused"]["by"] == "administrator"
+        work = client.get("/api/dashboard/projects/falcone-workflow").json()["work"]
+        assert work["paused"]["reason"] == "Release week."
+        refused = post(f"/items/{site.item_id}/deliver")
+        assert (
+            refused.status_code == 409
+            and "was paused by you: Release week." in refused.json()["detail"]
+        )
+        assert post("/projects/falcone-workflow/pause").status_code == 409
+        assert post("/projects/falcone-workflow/resume").status_code == 200
+        assert post("/projects/falcone-workflow/resume").status_code == 409
+        assert post(f"/items/{site.item_id}/deliver").status_code == 201
+        assert post("/projects/nobody/pause").status_code == 404

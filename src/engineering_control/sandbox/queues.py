@@ -28,6 +28,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    paused_refusal,
 )
 from engineering_control.db.models import (
     BacklogItem,
@@ -217,6 +218,9 @@ class Budgets:
 
     def refusal(self, session: Session, project_id: UUID) -> str | None:
         """Why no further run of work may start for the project right now, or None."""
+        project = session.get(ProjectRecord, project_id)
+        if project is not None and (paused := paused_refusal(project)):
+            return paused
         since = datetime.now(UTC) - DAY
         budgets = session.scalars(
             select(Budget).where(

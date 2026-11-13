@@ -523,6 +523,22 @@ def parser() -> argparse.ArgumentParser:
         password = dashboard_commands.add_parser(name)
         password.add_argument("--output-file", type=Path, required=True)
         password.add_argument("--force-output", action="store_true")
+    records = commands.add_parser(
+        "records", help="bring a project's records over from the original system"
+    )
+    records_commands = records.add_subparsers(dest="records_command", required=True)
+    records_commands.add_parser(
+        "script", help="print the export script, to run on the original's host"
+    )
+    for name in ("preview", "bring-over"):
+        moving = records_commands.add_parser(name)
+        # The projects the original system knows: only they have records there.
+        moving.add_argument("project", choices=PROJECTS)
+        moving.add_argument(
+            "--file", type=Path, help="the exported file; standard input when left out"
+        )
+        if name == "bring-over":
+            moving.add_argument("--even-if-running", action="store_true")
     return root
 
 
@@ -1163,6 +1179,13 @@ def main() -> None:
             raise SystemExit(1) from error
         print(json.dumps(result, indent=2, sort_keys=True))
         return
+    if arguments.command == "records":
+        try:
+            _records_command(arguments)
+        except Exception as error:
+            print(f"engineering-ctl: {error}", file=sys.stderr)
+            raise SystemExit(1) from error
+        return
     if arguments.command == "dashboard":
         try:
             _dashboard_password_command(arguments)
@@ -1342,6 +1365,36 @@ def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
         write_text_no_follow(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
         result["outputs"] = [str(path)]
     return result
+
+
+def _records_command(arguments: argparse.Namespace) -> None:
+    """Bring a project's records over from the original system, from a terminal that can
+    reach the platform's database: the same as the project's page does, for an
+    administrator who has the cluster at hand."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from engineering_control.dashboard.backlog_items import BacklogItems
+    from engineering_control.dashboard.bring_over import BringOver, export_script
+
+    if arguments.records_command == "script":
+        sys.stdout.write(export_script())
+        return
+    text = arguments.file.read_text(encoding="utf-8") if arguments.file else sys.stdin.read()
+    document = json.loads(text)
+    engine = create_engine(_dashboard_database_url())
+    try:
+        sessions = sessionmaker(engine, expire_on_commit=False)
+        moving = BringOver(sessions, BacklogItems(sessions))
+        if arguments.records_command == "preview":
+            result = moving.preview(arguments.project, document)
+        else:
+            result = moving.apply(
+                arguments.project, document, even_if_running=bool(arguments.even_if_running)
+            )
+    finally:
+        engine.dispose()
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def _dashboard_password_command(arguments: argparse.Namespace) -> None:

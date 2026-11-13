@@ -32,6 +32,9 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY schemas ./schemas
 COPY config ./config
+# The script the console hands out for exporting a project's records from the original
+# system. It runs there, not here.
+COPY scripts/export_original_records.py ./scripts/export_original_records.py
 ENV PATH=/opt/venv/bin:${PATH} \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

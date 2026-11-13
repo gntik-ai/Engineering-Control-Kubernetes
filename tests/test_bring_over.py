@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,8 +16,12 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.dashboard.bring_over import FORMAT, BringOver, Plan
-from engineering_control.dashboard.project_records import ProjectInvalid, ProjectRecords
+from engineering_control.dashboard.bring_over import FORMAT, BringOver, Plan, export_script
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectRecords,
+)
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
@@ -315,6 +320,7 @@ def test_a_preview_says_what_would_come_and_stores_nothing(site: Any) -> None:
         "here": False,
         "cut_over_at": None,
         "brought_over": None,
+        "paused": None,
     }
     shown = site.bring.preview("falcone-workflow", _document())
     assert shown["findings"] == {"CONFIRMED": 3, "REJECTED": 1}
@@ -490,6 +496,117 @@ def test_the_export_script_reads_only_and_writes_what_the_import_takes(
     assert ran.returncode == 0 and "Nothing was found." in ran.stdout
 
 
+def test_nothing_is_moved_in_the_middle_of_a_run_of_the_original_unless_told(site: Any) -> None:
+    running = {
+        **_document(),
+        "in_flight": [
+            {
+                "workflow_id": "issue-delivery-falcone-workflow-71",
+                "run_type": "IssueDeliveryWorkflow",
+                "status": "RUNNING",
+                "started_at": NOW,
+            },
+            "not a run",
+        ],
+    }
+    shown = site.bring.preview("falcone-workflow", running)
+    assert shown["in_flight_count"] == 1
+    assert shown["in_flight"] == [
+        {
+            "run": "IssueDeliveryWorkflow",
+            "workflow": "issue-delivery-falcone-workflow-71",
+            "status": "RUNNING",
+        }
+    ]
+    with pytest.raises(ProjectConflict, match="still had 1 run"):
+        site.bring.apply("falcone-workflow", running)
+    assert site.count(Finding) == 0 and site.bring.status("falcone-workflow")["here"] is False
+    done = site.bring.apply("falcone-workflow", running, even_if_running=True)
+    assert done["items_proposed"] == 2 and site.bring.status("falcone-workflow")["here"] is True
+
+
+def test_the_export_says_what_the_original_still_has_under_way(site: Any, tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from engineering_control.db.models import Run
+
+    now = datetime.now(UTC)
+    with site.sessions.begin() as session:
+        for workflow, started, finished in (
+            ("under-way", now - timedelta(hours=2), None),
+            ("ended", now - timedelta(hours=3), now - timedelta(hours=1)),
+            # A run that never ended, from long ago, is not what holds a move up.
+            ("forgotten", now - timedelta(days=60), None),
+        ):
+            session.add(
+                Run(
+                    workflow_id=workflow,
+                    run_type="IssueDeliveryWorkflow",
+                    status="RUNNING" if finished is None else "COMPLETED",
+                    project="falcone-workflow",
+                    started_at=started,
+                    finished_at=finished,
+                )
+            )
+    output = tmp_path / "records.json"
+    script = Path(__file__).resolve().parents[1] / "scripts" / "export_original_records.py"
+    ran = subprocess.run(  # noqa: S603 - the repository's own script
+        [
+            sys.executable,
+            str(script),
+            "--project",
+            "falcone-workflow",
+            "--output",
+            str(output),
+            "--database-url",
+            str(site.sessions.kw["bind"].url),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert "still has 1 run(s) under way" in ran.stdout and "under-way (RUNNING)" in ran.stdout
+    exported = json.loads(output.read_text())
+    assert [run["workflow_id"] for run in exported["in_flight"]] == ["under-way"]
+    assert Plan(exported).summary()["in_flight_count"] == 1
+
+
+def test_the_command_line_does_what_the_page_does(site: Any, tmp_path: Path) -> None:
+    """For an administrator with the cluster at hand: the script, a preview and the move,
+    from a terminal that reaches the platform's database."""
+    database = str(site.sessions.kw["bind"].url)
+    exported = tmp_path / "records.json"
+    exported.write_text(json.dumps(_document()))
+
+    def ctl(*arguments: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - the package's own command
+            [sys.executable, "-c", "from engineering_control.cli import main; main()", *arguments],
+            env={**os.environ, "ENGINEERING_DATABASE_URL": database},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    script = ctl("records", "script")
+    assert script.returncode == 0 and "SET TRANSACTION READ ONLY" in script.stdout
+    assert script.stdout == export_script()
+    shown = ctl("records", "preview", "falcone-workflow", "--file", str(exported))
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout)["findings_to_propose"] == 1
+    assert site.bring.status("falcone-workflow")["here"] is False
+    # The file can come on standard input, as through kubectl exec -i.
+    done = ctl("records", "bring-over", "falcone-workflow", stdin=exported.read_text())
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["items_proposed"] == 2
+    assert site.bring.status("falcone-workflow")["here"] is True
+    wrong = ctl("records", "bring-over", "musematic", "--file", str(exported))
+    assert wrong.returncode == 1 and "not of musematic" in wrong.stderr
+    # Only the projects the original knows have records there.
+    assert ctl("records", "preview", "made-here", "--file", str(exported)).returncode == 2
+
+
 def test_the_console_previews_brings_over_and_shows_where_the_work_is(site: Any) -> None:
     from fastapi.testclient import TestClient
 
@@ -538,6 +655,26 @@ def test_the_console_previews_brings_over_and_shows_where_the_work_is(site: Any)
         )
         assert done.status_code == 200, done.text
         assert done.json()["items_proposed"] == 2
+        # The script is handed out to be run on the original's host.
+        script = client.get("/api/dashboard/original-records-script")
+        assert script.status_code == 200 and script.text == export_script()
+        assert 'filename="export_original_records.py"' in script.headers["content-disposition"]
+        # A file written while the original still ran something is held back unless told.
+        busy = {
+            **document,
+            "in_flight": [{"workflow_id": "w", "run_type": "X", "status": "RUNNING"}],
+        }
+        held = post(
+            "/projects/falcone-workflow/bring-over", records=busy, current_password=password
+        )
+        assert held.status_code == 409 and "still had 1 run" in held.json()["detail"]
+        moved = post(
+            "/projects/falcone-workflow/bring-over",
+            records=busy,
+            current_password=password,
+            even_if_running=True,
+        )
+        assert moved.status_code == 200 and moved.json()["items_proposed"] == 0
         status = client.get("/api/dashboard/projects/falcone-workflow/bring-over").json()
         assert status["here"] is True and status["brought_over"]["issues_marked"] == 2
         assert client.get("/api/dashboard/projects/nobody/bring-over").status_code == 404

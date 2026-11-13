@@ -443,6 +443,11 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     # was brought along from there (migration 0034). Not set: the original still works on it.
     cut_over_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     brought_over: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # Set while no work may start on the project (migration 0035): since when, why, and
+    # whether the administrator or the supervisor said so. What runs, runs to its end.
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pause_reason: Mapped[str | None] = mapped_column(String(300))
+    paused_by: Mapped[str | None] = mapped_column(String(16))
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 

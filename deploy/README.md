@@ -262,6 +262,8 @@ platform checks:
 | Stop a run | The run has made no change yet | The run has implemented something, or its change waits to be published: that work would be discarded |
 | Skip an item, with the reason recorded on it | The supervisor is sure | It is not sure |
 | Return a failed item to its queue | Once per item | After that |
+| Try a delivery again with more rounds of correction | The run failed because its three rounds ran out, the supervisor is sure the rounds were converging, and the run had not had the ceiling of five yet | It is not sure; the work already ran three times within a day |
+| Pause a project | Three or more runs of the project failed within a day and the supervisor is sure the cause is in the project | Fewer failures, or it is not sure |
 | Start or resume a queue, start an item, an audit or a search | Never by default | Always, unless the definition says otherwise |
 
 It closes each incident with its diagnosis and its confidence (Supervisor → Trouble). An
@@ -271,9 +273,14 @@ the inbox. Liveness stays the launcher's: a sandbox that does not start in ten m
 runs past its limit is ended whatever the supervisor does. Switching "The supervisor looks
 at trouble by itself" off leaves incidents in the inbox and uses no subscription.
 
-Not built: pausing a whole project, and extending a correction budget, of the study's
-section 12.3. The first needs a notion of a paused project; the second has no budget to
-extend yet, since the delivery flow's three rounds are fixed.
+A paused project starts nothing: no item, no audit, no search, and its queues wait
+without skipping anything; what runs, runs to its end. The administrator pauses and
+resumes a project on its page. The supervisor can pause one and never resume it: a
+project it paused is in the inbox until the administrator resumes it.
+
+Not built, of the study's section 12.3: learned rules and drafted fixes to prompts and
+flows, which need the editable flows of the later phases, and filing a bug against the
+platform itself.
 
 ## The chat channel
 
@@ -389,9 +396,14 @@ negative control. The platform decides by the original's rule: reproduced both t
 both controls is confirmed; neither time, rejected; once, to retest; an environment that
 could not check it, not judged. Confirmed findings become proposed items of the section,
 with severity, lens, component and files; what the backlog already holds is recognised as
-known. The run says what the auditor looked at and what it left out. The original audited
-one coverage cell per agent with one finding at most; here one auditor covers the scope it
-is given, so a narrow scope finds more than "the whole repository".
+known. The run says what the auditor looked at and what it left out.
+
+Started without a scope, an audit covers the repository as the original's campaigns
+covered their cells: a first step plans at most six areas, each small enough to read
+thoroughly, the riskiest first, and names what it leaves out; then each area is audited
+and verified in turn, in the same run and the same checkout. An area that cannot be
+audited is said so and the next one goes on. Such a run takes as many times longer as it
+has areas; a scope in a few words is the quick way to look at one thing.
 
 **Discover enhancements** (`sandbox/discover.py`) is the original's enhancement discovery.
 One subscription proposes at most five enhancements with the original's fields (persona,
@@ -408,22 +420,43 @@ one has ended.
 The projects the original system works on are marked as such on their page until their
 work is moved here. Moving is two things, both on the administrator's side:
 
-1. On the original system's host, stop it from working on the project, then export the
-   project's records. The script only reads (a read-only transaction of SELECTs) and writes
-   one file readable by its owner alone:
+1. On the original system's host, export the project's records. The original starts
+   work on a project only when it is told to (it has no schedule per project), so
+   stopping it for the project means starting nothing more for it there. The script only
+   reads (a read-only transaction of SELECTs) and writes one file readable by its owner
+   alone. It also says which runs the original still has under way for the project:
 
    ```bash
    sudo /opt/engineering-control/venv/bin/python export_original_records.py \
      --project falcone-workflow --output falcone-workflow.records.json
    ```
 
-   The script is `scripts/export_original_records.py` of this repository; it needs only
-   the original's Python environment. It finds the database's address in the environment
-   variable `ENGINEERING_DATABASE_URL`, in `/etc/engineering-control/env/*.env`, or takes
-   it as `--database-url`; it never prints it.
+   The script is `scripts/export_original_records.py` of this repository, and the "Move
+   work here" dialog hands it out; it needs only the original's Python environment. It
+   finds the database's address in the environment variable `ENGINEERING_DATABASE_URL`,
+   in `/etc/engineering-control/env/*.env`, or takes it as `--database-url`; it never
+   prints it.
 
 2. On the project's page: Move work here, choose the file, read what it would bring over,
-   confirm with the password.
+   confirm with the password. A file written while the original still had runs under way
+   is held back, so that nothing is moved in the middle of a run, unless the
+   administrator says those runs are stuck or can be ignored.
+
+From a terminal that has `kubectl` for the cluster, as the original's controller host has,
+the same is three commands and no browser:
+
+```bash
+kubectl -n engineering-control exec deploy/engineering-control-api -- \
+  engineering-ctl records script > export_original_records.py
+sudo /opt/engineering-control/venv/bin/python export_original_records.py \
+  --project falcone-workflow --output falcone-workflow.records.json
+sudo cat falcone-workflow.records.json | kubectl -n engineering-control exec -i \
+  deploy/engineering-control-api -- engineering-ctl records bring-over falcone-workflow
+```
+
+`engineering-ctl records preview <project>` says what a file would bring over without
+storing anything; `--even-if-running` moves the work although the original still ran
+something.
 
 What is brought over (`dashboard/bring_over.py`):
 

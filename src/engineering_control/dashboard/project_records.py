@@ -201,6 +201,27 @@ class ProjectRecords:
             session.commit()
             return serialize(record)
 
+    def pause(self, name: str, *, reason: str, by: str) -> dict[str, Any]:
+        """Start no further work on the project. What runs, runs to its end."""
+        with self.sessions() as session:
+            record = self._active(session, name)
+            if record.paused_at is not None:
+                raise ProjectConflict(f"The project {name} is paused already")
+            record.paused_at = datetime.now(UTC)
+            record.pause_reason = " ".join(reason.split())[:300] or None
+            record.paused_by = by[:16]
+            session.commit()
+            return serialize(record)
+
+    def resume(self, name: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            record = self._active(session, name)
+            if record.paused_at is None:
+                raise ProjectConflict(f"The project {name} is not paused")
+            record.paused_at = record.pause_reason = record.paused_by = None
+            session.commit()
+            return serialize(record)
+
     def archive(self, name: str) -> dict[str, Any]:
         with self.sessions() as session:
             record = self._active(session, name)
@@ -237,4 +258,22 @@ def serialize(record: ProjectRecord) -> dict[str, Any]:
         "self_contained": record.source_repository == record.deployment_repository,
         "default_branch": record.default_branch,
         "origin": record.origin,
+        "paused": paused(record),
     }
+
+
+def paused(record: ProjectRecord) -> dict[str, Any] | None:
+    """Since when and why no work starts on the project, or None when it is not paused."""
+    if record.paused_at is None:
+        return None
+    at = record.paused_at if record.paused_at.tzinfo else record.paused_at.replace(tzinfo=UTC)
+    return {"at": at.isoformat(), "reason": record.pause_reason, "by": record.paused_by}
+
+
+def paused_refusal(record: ProjectRecord) -> str | None:
+    """Why nothing may start on the project, in words, when it is paused."""
+    if record.paused_at is None:
+        return None
+    who = "the supervisor" if record.paused_by == "supervisor" else "you"
+    why = f": {record.pause_reason}" if record.pause_reason else ""
+    return f"The project {record.display_name} was paused by {who}{why}. Resume it on its page."

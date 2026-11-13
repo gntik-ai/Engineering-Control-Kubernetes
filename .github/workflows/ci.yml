@@ -165,6 +165,9 @@ jobs:
           print("ok", engineering_control.__name__, len(ALL_WORKFLOWS), "workflows")
           PY
           docker run --rm engineering-control:ci alembic --help >/dev/null
+          # The export script for the original system's records is handed out by the
+          # console and by the command line: it has to be in the image.
+          docker run --rm engineering-control:ci engineering-ctl records script | grep -q "SET TRANSACTION READ ONLY"
       - name: Install the Temporal CLI (pinned, checksum verified)
         run: .github/scripts/install-temporal-cli.sh
       - name: Boot the image as a cluster would

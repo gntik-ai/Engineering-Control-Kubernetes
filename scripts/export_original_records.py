@@ -163,6 +163,19 @@ def main() -> None:
         for record in sorted(records, key=lambda row: str(row.get("updated_at") or "")):
             latest[(str(record.get("repository")), int(record.get("issue_number") or 0))] = record
         tables["backlog_issue_records"] = list(latest.values())
+        # Work the original still has under way for the project: nothing is brought over
+        # in the middle of a run, so the import says so and waits unless told otherwise.
+        since = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=14)).isoformat()
+        in_flight = [
+            {key: row.get(key) for key in ("workflow_id", "run_type", "status", "started_at")}
+            for row in rows(
+                "runs",
+                "project = :project AND finished_at IS NULL AND started_at IS NOT NULL "
+                "AND CAST(started_at AS VARCHAR(40)) > :since",
+                project=project,
+                since=since,
+            )
+        ]
         revision = None
         if "alembic_version" in present:
             revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -173,6 +186,7 @@ def main() -> None:
         "project": project,
         "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "schema_revision": revision,
+        "in_flight": in_flight,
         "tables": tables,
     }
     with open(arguments.output, "w", encoding="utf-8") as output:
@@ -184,6 +198,14 @@ def main() -> None:
         print(f"  {name}: {len(found)}")
     if not any(tables.values()):
         print("Nothing was found. Is the project's name written as the original has it?")
+    if in_flight:
+        print(
+            f"The original system still has {len(in_flight)} run(s) under way for this project, "
+            "started within the last 14 days:"
+        )
+        for run in in_flight[:20]:
+            print(f"  {run['run_type']} {run['workflow_id']} ({run['status']})")
+        print("Let them end and export again, or bring the file over knowing that they run.")
 
 
 if __name__ == "__main__":
