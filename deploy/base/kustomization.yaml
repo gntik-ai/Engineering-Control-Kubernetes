@@ -1,5 +1,5 @@
 # The control plane: databases, bootstrap, migrations, Temporal, API, console, evidence
-# ingest, notifier, workflow worker, launcher and the console's public route. The scheduler
+# ingest, notifier, workflow worker, launcher, the sandboxes' proxy and the console's public route. The scheduler
 # and the role workers are not here yet.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -16,6 +16,7 @@ resources:
   - temporal.yaml
   - console.yaml
   - launcher.yaml
+  - egress.yaml
   - evidence-ingest.yaml
   - notifier.yaml
   - api.yaml

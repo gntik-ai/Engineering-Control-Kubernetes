@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import ipaddress
 import signal
+import socket
 from datetime import UTC, datetime
 from typing import Any, Final
 
@@ -33,6 +36,7 @@ from engineering_control.sandbox.runs import Lease, Runs, StepWork
 LOG = structlog.get_logger(__name__)
 PASS_SECONDS: Final = 3.0
 WORKSPACE_GIBIBYTES: Final = 10
+PROXY_LOOKUP_SECONDS: Final = 60.0
 # How much of a running step's output is shown, and how far back the result is looked for.
 # A long line reaches the cluster's log in pieces, each counted as a line.
 SHOWN_LINES: Final = 600
@@ -90,6 +94,7 @@ class Launcher:
         self.sandboxes = sandboxes
         self.parallel_steps = parallel_steps
         self._running = 0
+        self._proxy: tuple[str, float] | None = None
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
             "deliver_issue": DeliverIssue(runs, github),
@@ -105,7 +110,7 @@ class Launcher:
         for item in work:
             try:
                 await self._advance(item)
-            except (ClusterError, GitHubAppError) as error:
+            except (ClusterError, GitHubAppError, OSError) as error:
                 # Something outside refused or did not answer: say so and try again.
                 LOG.warning("launcher_outside_error", run=str(item.run_id), error=str(error))
                 await asyncio.to_thread(self.runs.step_waiting, item.step_id, str(error))
@@ -138,6 +143,27 @@ class Launcher:
             await self._watch(item)
 
     # --- starting ------------------------------------------------------------------------
+
+    async def _sandboxes(self) -> pods.Sandboxes:
+        """The sandboxes' settings with the proxy as an address. A sandbox has no name
+        server, so the launcher looks the proxy's name up for it; the address of a service
+        stays the same for as long as the service exists."""
+        configured = self.sandboxes.proxy
+        if configured is None:
+            return self.sandboxes
+        now = asyncio.get_running_loop().time()
+        if self._proxy is None or now - self._proxy[1] > PROXY_LOOKUP_SECONDS:
+            host, _, port = configured.removeprefix("http://").rpartition(":")
+            try:
+                ipaddress.ip_address(host)
+                address = host
+            except ValueError:
+                found = await asyncio.get_running_loop().getaddrinfo(
+                    host, int(port), family=socket.AF_INET, type=socket.SOCK_STREAM
+                )
+                address = str(found[0][4][0])
+            self._proxy = (f"http://{address}:{port}", now)
+        return dataclasses.replace(self.sandboxes, proxy=self._proxy[0])
 
     async def _start(self, item: StepWork) -> None:
         if self._running >= self.parallel_steps:
@@ -183,7 +209,7 @@ class Launcher:
                 )
             )
         manifest = pods.step_pod(
-            self.sandboxes,
+            await self._sandboxes(),
             run_id=item.run_id,
             step=item.name,
             position=item.position,
@@ -324,6 +350,7 @@ def sandboxes_from(settings: Settings) -> pods.Sandboxes:
         namespace=settings.sandbox_namespace,
         image=settings.sandbox_image,
         pull_secret=settings.sandbox_pull_secret,
+        proxy=settings.sandbox_egress_proxy,
     )
 
 

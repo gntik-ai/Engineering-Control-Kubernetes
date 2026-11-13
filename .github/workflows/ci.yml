@@ -150,6 +150,7 @@ jobs:
 
           import engineering_control
           from engineering_control.dashboard.app import CONSOLE_ROOT, sign_in_assets
+          from engineering_control.sandbox.egress import run as egress
           from engineering_control.sandbox.launcher import run as launcher
           from engineering_control.workflows.definitions import ALL_WORKFLOWS
 

@@ -38,6 +38,9 @@ class Sandboxes:
     image: str
     pull_secret: str
     service_account: str = "sandbox"
+    # The proxy a step that may reach out goes through, as http://address:port. A sandbox
+    # has no name server, so this is an address, not a name.
+    proxy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,16 @@ def claim(name: str, *, namespace: str, gibibytes: int, labels: dict[str, str]) 
             "resources": {"requests": {"storage": f"{gibibytes}Gi"}},
         },
     }
+
+
+def _way_out(sandboxes: Sandboxes, egress: Egress) -> list[dict[str, str]]:
+    """A step that may reach out is told where the proxy is; that is its only way out."""
+    if egress != "internet" or sandboxes.proxy is None:
+        return []
+    return [
+        {"name": name, "value": sandboxes.proxy}
+        for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+    ]
 
 
 def step_pod(
@@ -167,7 +180,8 @@ def step_pod(
                         {
                             "name": "SANDBOX_JOB",
                             "value": json.dumps(job, separators=(",", ":"), sort_keys=True),
-                        }
+                        },
+                        *_way_out(sandboxes, egress),
                     ],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,

@@ -17,7 +17,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
 | 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
 | 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
-| 3 | Console, evidence ingest (with its evidence volume), notifier; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
+| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
 | 4 | API, workflow worker | The command bus and the workflow engine's worker |
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
@@ -147,9 +147,9 @@ What a sandbox is (`src/engineering_control/sandbox/pods.py`):
 - mounted into it: an empty home and `/tmp`, the run's workspace, and for a step that works
   with a subscription the Secret of the one account leased to it. A ChatGPT account also
   gets a small volume of its own, where Codex keeps the sign-in it renews;
-- the network: a step labelled `engineering-control/egress: internet` may resolve names and
-  open HTTPS connections to public addresses. It cannot reach a pod, a service or a node of
-  this cluster, nor any private network. A step without the label reaches nothing.
+- the network: a step labelled `engineering-control/egress: internet` may open connections
+  to the platform's proxy and to nothing else (see "The sandboxes' way out" below). A step
+  without the label reaches nothing.
 
 The launcher's identity (`engineering-control-launcher`) may, in the sandbox namespace
 only, create, read and delete pods, read what they printed, and create and delete volume
@@ -169,6 +169,33 @@ question, and the account becomes ready, limited until a time, or in need of a n
 The sandbox image a run uses is pinned in `base/kustomization.yaml` by a patch, to the same
 commit as the control plane's image; `deploy/registry` puts the pull Secret into both
 namespaces.
+
+## The sandboxes' way out
+
+A sandbox has no name server and no route to any address but one: the proxy
+`engineering-control-egress` in the control plane's namespace (`base/egress.yaml`,
+`src/engineering_control/sandbox/egress.py`). The launcher looks the proxy's service up and
+sets `HTTPS_PROXY` in every step that may reach out; the clients, git and the package
+managers all honour it.
+
+The proxy does one thing: asked for `CONNECT host:443`, it opens a tunnel when the host is
+on its list and the name resolves to a public address, and refuses otherwise. Plain HTTP,
+any other port, an address instead of a name, a host that is not listed, and a listed name
+that points into the cluster or a private network are all refused. It does not read what
+goes through a tunnel: that is TLS between the sandbox and the host, and the proxy holds no
+key and no sign-in. Network policy backs it on both sides: only sandboxes with the label
+reach the proxy, and the proxy itself reaches name resolution and public HTTPS only.
+
+The list is the setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` (a JSON list; a leading `*.`
+names every host under a domain). Its default, in `src/engineering_control/config.py`,
+holds the two subscriptions' hosts (`api.anthropic.com`; `chatgpt.com`, `auth.openai.com`,
+`api.openai.com`), GitHub's hosts for checking out, and the npm, PyPI, crates.io and Go
+module registries. When a project needs another host, the proxy's log says which:
+
+    kubectl -n engineering-control logs deploy/engineering-control-egress | grep egress_refused
+
+Add the host by setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` in `base/configuration.yaml` to
+the whole list, and release.
 
 ## Delivering an issue
 

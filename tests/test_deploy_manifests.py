@@ -21,6 +21,11 @@ THIRD_PARTY_IMAGES = {
 BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
 CONSOLE_ACCOUNT = "engineering-control-console"
 LAUNCHER_ACCOUNT = "engineering-control-launcher"
+EGRESS_LABELS = {
+    "app.kubernetes.io/name": "engineering-control",
+    "app.kubernetes.io/component": "egress",
+}
+PRIVATE_NETWORKS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
 SANDBOXES = BASE.parent / "sandboxes"
 SANDBOX_NAMESPACE = "engineering-control-sandboxes"
 
@@ -162,19 +167,23 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
     policies = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "NetworkPolicy"}
     assert set(policies) == {"deny-everything", "egress-internet"}
     assert policies["deny-everything"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
-    # A step that may reach out reaches name resolution and public HTTPS, and nothing of
-    # the cluster, its nodes or any private network. Nothing is ever let in.
+    # A step that may reach out reaches the platform's proxy and nothing else: no name
+    # server, no public address, nothing of the cluster. Nothing is ever let in.
     internet = policies["egress-internet"]
     assert internet["podSelector"] == {"matchLabels": {"engineering-control/egress": "internet"}}
     assert internet["policyTypes"] == ["Egress"]
-    names, public = internet["egress"]
-    assert {port["port"] for port in names["ports"]} == {53}
-    assert names["to"][0]["podSelector"] == {"matchLabels": {"k8s-app": "kube-dns"}}
-    assert public["ports"] == [{"protocol": "TCP", "port": 443}]
-    (block,) = public["to"]
-    assert block["ipBlock"]["cidr"] == "0.0.0.0/0"
-    for private in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"):
-        assert private in block["ipBlock"]["except"], private
+    (way_out,) = internet["egress"]
+    assert way_out == {
+        "to": [
+            {
+                "namespaceSelector": {
+                    "matchLabels": {"kubernetes.io/metadata.name": "engineering-control"}
+                },
+                "podSelector": {"matchLabels": EGRESS_LABELS},
+            }
+        ],
+        "ports": [{"protocol": "TCP", "port": 8888}],
+    }
     assert not any("ingress" in spec for spec in policies.values())
     settings = next(
         d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
@@ -311,9 +320,80 @@ def test_only_the_console_has_a_route_from_outside_and_only_over_https() -> None
         assert last > 4
 
 
+def test_sandboxes_reach_the_proxy_and_the_proxy_reaches_public_https_only() -> None:
+    documents = _documents()
+    [policy] = [
+        d["spec"]
+        for d in documents
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "egress-proxy"
+    ]
+    assert policy["podSelector"] == {"matchLabels": EGRESS_LABELS}
+    assert policy["policyTypes"] == ["Ingress", "Egress"]
+    # In: sandboxes whose step may reach out, on the proxy's port, from no other namespace.
+    assert policy["ingress"] == [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": SANDBOX_NAMESPACE}
+                    },
+                    "podSelector": {"matchLabels": {"engineering-control/egress": "internet"}},
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 8888}],
+        }
+    ]
+    # Out: name resolution and HTTPS to public addresses.
+    names, public = policy["egress"]
+    assert {port["port"] for port in names["ports"]} == {53}
+    assert names["to"][0]["podSelector"] == {"matchLabels": {"k8s-app": "kube-dns"}}
+    assert public["ports"] == [{"protocol": "TCP", "port": 443}]
+    (block,) = public["to"]
+    assert block["ipBlock"]["cidr"] == "0.0.0.0/0"
+    for private in PRIVATE_NETWORKS:
+        assert private in block["ipBlock"]["except"], private
+    # The proxy itself: the platform's image, no identity, no secret, no volume but /tmp,
+    # never on the sandboxes' node; its service is what the launcher hands to sandboxes.
+    [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-egress")]
+    assert name == "Deployment/engineering-control-egress"
+    assert spec["serviceAccountName"] == "engineering-control"
+    assert spec["volumes"] == [{"name": "tmp", "emptyDir": {}}]
+    [container] = spec["containers"]
+    assert container["command"] == ["engineering-egress"]
+    assert "env" not in container
+    assert container["ports"] == [{"name": "proxy", "containerPort": 8888}]
+    deployment = next(
+        d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == name[11:]
+    )
+    assert deployment["spec"]["template"]["metadata"]["labels"] == EGRESS_LABELS
+    service = next(
+        d
+        for d in documents
+        if d["kind"] == "Service" and d["metadata"]["name"] == "engineering-control-egress"
+    )
+    assert service["spec"]["selector"] == EGRESS_LABELS
+    assert service["spec"]["ports"] == [{"name": "proxy", "port": 8888, "targetPort": "proxy"}]
+    data = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+    )
+    assert data["ENGINEERING_SANDBOX_EGRESS_PROXY"] == "http://engineering-control-egress:8888"
+    settings = Settings(
+        network_boundary="cluster",
+        sandbox_egress_host=data["ENGINEERING_SANDBOX_EGRESS_HOST"],
+        sandbox_egress_proxy=data["ENGINEERING_SANDBOX_EGRESS_PROXY"],
+    )
+    assert settings.sandbox_egress_port == 8888
+
+
 def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     documents = _documents()
-    policies = [d for d in documents if d["kind"] == "NetworkPolicy"]
+    policies = [
+        d
+        for d in documents
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] != "egress-proxy"
+    ]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]
     [policy] = [p for p in policies if p["spec"]["ingress"] != same_namespace]

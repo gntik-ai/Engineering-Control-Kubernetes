@@ -12,11 +12,10 @@ spec:
     - Egress
 ---
 # A step that has to reach its provider, GitHub or a package registry carries the label
-# engineering-control/egress: internet. It may then resolve names and open HTTPS
-# connections to public addresses, and to nothing else: not to a pod or a service of this
-# cluster, not to a node, not to any private network. A network policy cannot name hosts,
-# so "public addresses" is as narrow as it gets here; an egress proxy that allows named
-# hosts only is the next step up.
+# engineering-control/egress: internet. It may then open connections to the platform's
+# proxy (deploy/base/egress.yaml) and to nothing else: no name server, no pod or service of
+# this cluster, no node, no private network, and no public address either. The proxy opens
+# tunnels to the hosts on its list only, so "the internet" for a sandbox is that list.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -32,25 +31,11 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: kube-system
+              kubernetes.io/metadata.name: engineering-control
           podSelector:
             matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 100.64.0.0/10
-              - 169.254.0.0/16
-              - 127.0.0.0/8
+              app.kubernetes.io/name: engineering-control
+              app.kubernetes.io/component: egress
       ports:
         - protocol: TCP
-          port: 443
+          port: 8888

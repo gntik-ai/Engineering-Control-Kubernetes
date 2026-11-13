@@ -220,6 +220,34 @@ class Settings(BaseSettings):
         default=None,
         pattern=r"^[a-z0-9][a-z0-9./-]{2,200}(:[A-Za-z0-9._-]{1,128}|@sha256:[0-9a-f]{64})$",
     )
+    # The way out for sandboxes: the proxy's listener, where sandboxes find it, and the
+    # hosts it opens tunnels to. A leading "*." names every host under a domain.
+    sandbox_egress_host: str = "127.0.0.1"
+    sandbox_egress_port: int = Field(default=8888, ge=1024, le=65535)
+    sandbox_egress_proxy: str | None = Field(
+        default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
+    )
+    sandbox_egress_hosts: tuple[str, ...] = (
+        # The subscriptions' clients.
+        "api.anthropic.com",
+        "chatgpt.com",
+        "api.openai.com",
+        "auth.openai.com",
+        # Checking a repository out, and what its dependencies are fetched from.
+        "github.com",
+        "codeload.github.com",
+        "objects.githubusercontent.com",
+        "raw.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "registry.npmjs.org",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "crates.io",
+        "static.crates.io",
+        "index.crates.io",
+        "proxy.golang.org",
+        "sum.golang.org",
+    )
     # How many steps may run in sandboxes at the same time, over all runs.
     sandbox_parallel_steps: int = Field(default=4, ge=1, le=32)
     sandbox_pull_secret: str = Field(
@@ -395,6 +423,8 @@ class Settings(BaseSettings):
             raise ValueError("the dashboard must bind only to loopback")
         if self.evidence_ingest_host in every_interface:
             raise ValueError("the evidence ingest service cannot bind to every interface")
+        if self.sandbox_egress_host in every_interface:
+            raise ValueError("the sandboxes' proxy cannot bind to every interface")
         return self
 
     @field_validator("dashboard_allowed_hosts")
@@ -406,6 +436,19 @@ class Settings(BaseSettings):
         if any("/" in item or "@" in item or len(item) > 253 for item in normalized):
             raise ValueError("dashboard allowed host is invalid")
         return normalized
+
+    @field_validator("sandbox_egress_hosts")
+    @classmethod
+    def named_egress_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        hosts = tuple(dict.fromkeys(item.strip().lower() for item in value if item.strip()))
+        if len(hosts) > 100:
+            raise ValueError("at most 100 hosts may be named for the sandboxes' way out")
+        for host in hosts:
+            if not re.fullmatch(r"(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", host):
+                raise ValueError(f"not a host name or a *.domain: {host}")
+            if host.startswith("*.") and host.count(".") < 2:
+                raise ValueError(f"too wide: {host} would name a whole top-level domain")
+        return hosts
 
     @field_validator("dashboard_trusted_proxy_networks")
     @classmethod

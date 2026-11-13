@@ -78,7 +78,8 @@ def account_setup(provider: str, generation: int) -> dict[str, Any]:
 def client_environment(provider: str) -> dict[str, str]:
     if provider == "chatgpt":
         return {"CODEX_HOME": ACCOUNT_HOME}
-    return {}
+    # Claude Code reaches its provider and nothing else: no update check, no telemetry.
+    return {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
 
 
 def check_job(provider: str, generation: int) -> dict[str, Any]:
