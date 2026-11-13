@@ -312,7 +312,8 @@ _TASKS: Final = (
         "Audit the running application",
         "An agent opens the project's application in a browser, goes through it, and "
         "reports candidate findings, each with the steps in the browser that show it. It "
-        "reaches that one host and nothing else, and changes nothing in the repository.",
+        "reaches the application's own hosts and nothing else, and changes nothing in the "
+        "repository.",
         "sandbox",
         account=True,
         application=True,

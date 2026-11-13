@@ -639,7 +639,7 @@ class PlanAreas:
 
 def _browsing(ctx: Context, plan: Plan) -> Plan:
     """A step that looks at the project's application: it is told where it runs, may
-    reach that one host, and finds the test identity when one is stored."""
+    reach its hosts, and finds the test identity when one is stored."""
     application = ctx.data.get("application") or {}
     url = str(application.get("url") or "")
     if not url:

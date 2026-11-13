@@ -76,8 +76,8 @@ export function ApplicationCard({
       <CardBody className="grid gap-4">
         <p className="text-[13px] text-muted-foreground">
           Where the project’s application runs, for the flows that look at it in a browser (UI audit, UX audit). A step
-          of such a flow may reach that one host and nothing else beyond what every sandbox reaches. The address is
-          https and a public host: a sandbox cannot reach into the cluster or a private network.
+          of such a flow may reach the application’s hosts and nothing else beyond what every sandbox reaches. The
+          address is https and a public host: a sandbox cannot reach into the cluster or a private network.
           {application ? (
             <>
               {' '}
