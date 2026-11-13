@@ -13,6 +13,7 @@ from engineering_control.coverage_outcome import coverage_outcome, normalized_co
 from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.backlog_items import BacklogItems
+from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
@@ -132,6 +133,7 @@ class DashboardRepository:
         self.projects = ProjectRecords(self.sessions)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
+        self.bring_over = BringOver(self.sessions, self.backlog)
         self.accounts = Accounts(self.sessions)
         self.runs = Runs(self.sessions)
         self.budgets = Budgets(self.sessions)

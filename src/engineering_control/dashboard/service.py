@@ -188,8 +188,21 @@ class DashboardService:
         for item in cast(list[dict[str, object]], listing["items"]):
             if item["project"] == name:
                 sections = await asyncio.to_thread(self.repository.sections.of_project, name)
-                return {"project": item, "sections": sections}
+                work = await asyncio.to_thread(self.repository.bring_over.status, name)
+                return {"project": item, "sections": sections, "work": work}
         return None
+
+    async def work_status(self, project: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.bring_over.status, project)
+
+    async def preview_records(self, project: str, records: dict[str, Any]) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.bring_over.preview, project, records)
+
+    async def bring_over(self, project: str, records: dict[str, Any]) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.bring_over.apply, project, records)
+
+    async def cut_over(self, project: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.bring_over.cut_over, project)
 
     async def add_section(self, project: str, *, name: str, guide: Guide) -> dict[str, object]:
         return await asyncio.to_thread(

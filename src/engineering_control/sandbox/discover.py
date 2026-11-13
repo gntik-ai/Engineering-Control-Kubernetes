@@ -280,28 +280,38 @@ def verdict(review: dict[str, Any] | None) -> str:
     return str(decision) if decision in ("APPROVE", "REQUEST_CHANGES", "BLOCKED") else "BLOCKED"
 
 
+def sections(proposal: dict[str, Any]) -> list[str]:
+    """What a proposal says, in the sections the original gave an enhancement's issue."""
+
+    def bullets(values: Any, mark: str = "-") -> str:
+        listed = [str(value) for value in values or [] if str(value).strip()]
+        return "\n".join(f"{mark} {value}" for value in listed) or "None."
+
+    def text(key: str) -> str:
+        return str(proposal.get(key) or "Not given.")
+
+    return [
+        "## Observed problem\n" + text("observed_problem"),
+        "## Current behaviour\n" + text("current_behavior"),
+        "## Proposed outcome\n" + text("proposed_outcome"),
+        "## User value\n" + text("user_value"),
+        "## Success metric\n" + text("success_metric"),
+        "## Evidence\n" + bullets(proposal.get("evidence")),
+        "## Dependencies\n" + bullets(proposal.get("dependencies")),
+        "## Security and data implications\n" + text("security_data_implications"),
+        "## Acceptance criteria\n" + bullets(proposal.get("acceptance_criteria"), "- [ ]"),
+        "## Rollout strategy\n" + text("rollout_strategy"),
+        "## Kill switch\n" + str(proposal.get("kill_switch") or "None."),
+    ]
+
+
 def description(proposal: dict[str, Any], review: dict[str, Any], base_sha: str) -> str:
-    """An approved proposal as the text of a backlog item, in the sections the original
-    gave an enhancement's issue."""
-
-    def bullets(values: list[str], mark: str = "-") -> str:
-        return "\n".join(f"{mark} {value}" for value in values) or "None."
-
+    """An approved proposal as the text of a backlog item."""
     return "\n\n".join(
         [
             f"**Persona:** {proposal['persona']} · **Risk:** {proposal['risk']} · "
             f"**Proposed at commit:** {base_sha[:12]}",
-            "## Observed problem\n" + proposal["observed_problem"],
-            "## Current behaviour\n" + proposal["current_behavior"],
-            "## Proposed outcome\n" + proposal["proposed_outcome"],
-            "## User value\n" + proposal["user_value"],
-            "## Success metric\n" + proposal["success_metric"],
-            "## Evidence\n" + bullets(proposal["evidence"]),
-            "## Dependencies\n" + bullets(proposal["dependencies"]),
-            "## Security and data implications\n" + proposal["security_data_implications"],
-            "## Acceptance criteria\n" + bullets(proposal["acceptance_criteria"], "- [ ]"),
-            "## Rollout strategy\n" + proposal["rollout_strategy"],
-            "## Kill switch\n" + (proposal["kill_switch"] or "None."),
+            *sections(proposal),
             "## Review\nReviewed as a product specification by an agent of the other "
             "subscription, which approved it: " + _line(review.get("summary"), 3_000),
         ]

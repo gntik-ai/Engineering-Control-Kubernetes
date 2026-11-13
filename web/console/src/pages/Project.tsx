@@ -48,6 +48,7 @@ import {
 } from '../api';
 import { LoadError, RefreshButton } from '../parts';
 import { BASE, RouterLink, navigate, useLocation } from '../router';
+import { BringOverDialog } from './BringOverDialog';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 const NO_FLOW = '__none__';
@@ -457,8 +458,10 @@ function Detail({ name }: { name: string }) {
   const [editing, setEditing] = useState<Section | null>(null);
   const [removing, setRemoving] = useState<Section | null>(null);
   const [reading, setReading] = useState(false);
+  const [moving, setMoving] = useState(false);
   const project = detail.data?.project;
   const sections = detail.data?.sections;
+  const work = detail.data?.work;
   return (
     <Page
       title={project ? project.display_name : 'Project'}
@@ -495,11 +498,30 @@ function Detail({ name }: { name: string }) {
       <div className="grid gap-4">
         <LoadError resource={detail} />
         <LoadError resource={flows} />
-        <Alert
-          tone="info"
-          title="Assigning a flow records your choice"
-          description="Nothing is started from this page yet. Work begins to run for a section when runs are connected to it."
-        />
+        {work && !work.here ? (
+          <Alert
+            tone="warning"
+            title="The original system may still be working on this project"
+            description="Its records are not here yet, and two systems on the same issue open two pull requests. Stop it there for this project, then move the work here."
+            actions={
+              <Button size="sm" variant="secondary" onClick={() => setMoving(true)}>
+                Move work here…
+              </Button>
+            }
+          />
+        ) : null}
+        {work?.cut_over_at ? (
+          <p className="text-[13px] text-muted-foreground">
+            This project's work moved here on{' '}
+            {new Date(work.cut_over_at).toLocaleDateString('en-GB', { dateStyle: 'long' })}.
+            {work.brought_over
+              ? ` Brought over from the original system: ${work.brought_over.items_proposed} proposed and ${work.brought_over.items_accepted} accepted items, ${work.brought_over.issues_marked} issues marked with what it had done.`
+              : ' Nothing was brought over from the original system.'}{' '}
+            <button type="button" className="underline" onClick={() => setMoving(true)}>
+              Bring over another file
+            </button>
+          </p>
+        ) : null}
         <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
           {sections
             ? sections.map((section) => (
@@ -549,6 +571,7 @@ function Detail({ name }: { name: string }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <BringOverDialog project={name} open={moving} onOpenChange={setMoving} onDone={detail.reload} />
       <RemoveSectionDialog
         project={name}
         section={removing}

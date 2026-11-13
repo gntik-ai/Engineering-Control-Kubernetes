@@ -1802,7 +1802,7 @@ Status: **done**, **in progress**, or blank for not started.
 | C2 | GitHub sign-in to pick the repository from a list |
 | C3 | Six core sections per project, and custom sections (done: every project has the six; the administrator adds, renames and removes its own, up to twenty. Each section has a routing guide for the supervisor: a description, which is required, when to use it, when not to and which section to use instead, examples, and labels. A label belongs to one section of a project and will route an imported item carrying it without a judgement. The console shows the text assembled from the guides, exactly as the supervisor will read it) |
 | C4 | Assign, change or remove the flow of a section (done as a record: a section holds one of the seven built-in flows or none; nothing starts from the assignment until runs are connected in phase 3) |
-| C5 | The six existing projects migrated into project records (done: copied in by migration 0025; the workflows still read the registry in code) |
+| C5 | The six existing projects migrated into project records (done: copied in by migration 0025. The flows that run on the cluster read the project's record; only the original's workflows, which do not run here, still read the registry in code. A project's page says whether its work is still the original's, and moves it) |
 
 **D. Backlog and queue**
 
@@ -1811,10 +1811,10 @@ Status: **done**, **in progress**, or blank for not started.
 | D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals (done for GitHub issues and for items the administrator writes; the supervisor proposes items, from the console's panel or from chat, which appear in the backlog as proposed by it with its reason; audit findings come with phase 5) |
 | D2 | Import and keep in step with GitHub issues (done: the open issues of a project's repository are read through the GitHub App on demand and every fifteen minutes; an issue closed on GitHub closes its item, a reopened one is proposed again) |
 | D3 | Route an item to a section, by the supervisor or by hand (done by label and by hand: an issue carrying a label of exactly one section goes there; the administrator's choice is never changed by an import. The supervisor routes from the project's routing brief: a section it is sure of is applied with its reason, anything less is shown for confirmation, and a section the administrator chose is changed only with their confirmation; a label still decides at the next import) |
-| D4 | Run one item at a time (done: Deliver on a backlog item whose section runs "Deliver issue" starts a run; one run per item at a time) |
+| D4 | Run one item at a time (done: starting a backlog item starts the run its section's flow says, one run per item at a time. An item need not be an issue on GitHub: one with its own text is delivered the same way) |
 | D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder (done: items are selected in the backlog and queued; the queue's page orders them by drag and drop or with arrows; the supervisor proposes a queue as a draft with its reasons; a queue is started, paused, resumed, extended and discarded; the launcher runs its items in order, one to four at once, skips an item that cannot start and pauses after two failures in a row) |
 | D6 | Scheduler with budgets per account, project, component and risk class (done for the platform, each project and each account: runs at the same time and within a day, steps within a day for an account; they hold back a queue's next item and work the supervisor starts. Budgets per component and per risk class follow when items carry those, with the flows of phases 5 and 6) |
-| D7 | Existing campaigns, issues, change sets, findings and approvals migrated |
+| D7 | Existing campaigns, issues, change sets, findings and approvals migrated (built: a read-only export script for the original's host writes one project's records; the project's page shows what the file would bring over and, with the password, keeps the records as they are in the same tables, turns open findings and enhancements into backlog items, and marks the issues the original knew with what it had done about them) |
 
 **E. Execution**
 
@@ -1851,7 +1851,7 @@ Status: **done**, **in progress**, or blank for not started.
 | G1 | Agent definition — prompt, skills, tools, model — editable and versioned (done: instructions, skills, the tools with how each is confirmed, the providers, an account of its own and the model are edited on the Supervisor page; every save is a new version and needs the password; an older version is loaded and saved again) |
 | G2 | Tool service with policy checks on every call (done: `engineering-control-tools` speaks the tool protocol of both clients; it is reached only from the sandbox of a turn, with a token valid while that sandbox runs; every call is checked against the definition and the platform's rules, then applied, held for the administrator or refused, and recorded) |
 | G3 | Planning role: build the backlog, route items, propose queues. It routes by section, never by flow, from the routing brief of the project (C3): one section per item, never the nearest when none fits, never another section when the fitting one has no flow (done: tools to read projects, the routing brief, backlog, queues, runs, accounts and the inbox; to propose items, route an item and propose or reorder a queue; skills for building the backlog, routing and ordering a queue. The platform refuses a section that is not of the item's project and holds back a routing the supervisor is not sure of) |
-| G4 | Operations role: detect stalls and errors; act automatically, wait, or never (12.3) |
+| G4 | Operations role: detect stalls and errors; act automatically, wait, or never (12.3) (built: the platform notices failed runs, runs that make no progress and queues that paused themselves, without a model, and asks the supervisor in a turn of its own; trying again, stopping a run, skipping an item and returning it to its queue are automatic within limits and wait for the administrator when the supervisor is not sure, when work would be discarded or past a limit; every incident is closed with a diagnosis. Not built: pausing a whole project, extending a correction budget, learned rules and drafted fixes) |
 | G5 | Design role: draft flows on request (15.2) |
 | G6 | Its own subscription account, with the other provider as fallback (done: the definition names the providers in order and, optionally, one account the supervisor takes first; that account can be kept for the supervisor alone, so no run of work is given it. A turn refused by the subscription is given to the next account) |
 | G7 | Record of every decision; daily digest (done: every call to a tool is recorded with its arguments, its reason and what became of it, shown on the Supervisor page; the chat channel sends a digest of the last day once a day and on request) |
@@ -1876,7 +1876,7 @@ renders no HTML of its own.
 | --- | --- |
 | I1 | Run status read from Temporal; explicit projector; references instead of payloads |
 | I2 | Reconciliation code and legacy loops removed |
-| I3 | Projects moved over one at a time; original hosts retired |
+| I3 | Projects moved over one at a time; original hosts retired (built for one project at a time: a project is marked as moved when its records are brought over, or without records. Stopping the original for the project, and retiring its hosts, are done on those hosts) |
 
 ### 18.2 Phases
 

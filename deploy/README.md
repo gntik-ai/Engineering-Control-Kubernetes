@@ -236,8 +236,38 @@ recorded with its arguments, its reason and what became of it (Supervisor → Re
 
 The supervisor reads projects, sections with their routing brief, the backlog, queues,
 runs, accounts and the inbox; proposes backlog items and queues; routes items to sections;
-and starts work on an item or a queue when asked. It never publishes, approves or touches a sign-in: there is no tool
-for those.
+and starts work on an item, a queue, an audit or a search for enhancements when asked. It
+never publishes, approves or touches a sign-in: there is no tool for those.
+
+### Trouble with the work
+
+The platform notices trouble by itself, without a model (`supervisor/operations.py`, on
+the launcher's passes): a run of work that failed, a run whose next step has waited more
+than 20 minutes for an account or a sandbox, a queue that paused itself after two
+failures. Each is an incident, once. For the open incidents the platform asks the
+supervisor in a turn of its own, up to five at a time, not while a turn is under way or a
+message of the administrator waits, and not more often within an hour than the definition
+allows (six by default). The supervisor reads what happened and acts through tools the
+platform checks:
+
+| Tool | At once | Waits for the administrator |
+| --- | --- | --- |
+| Try a failed run again | The cause passes by itself and the supervisor is sure | It is not sure; the work already ran three times within a day; the run failed for a reason trying again does not remove (the implementer could not do it, the reviewer stopped it, protected files, a credential) |
+| Stop a run | The run has made no change yet | The run has implemented something, or its change waits to be published: that work would be discarded |
+| Skip an item, with the reason recorded on it | The supervisor is sure | It is not sure |
+| Return a failed item to its queue | Once per item | After that |
+| Start or resume a queue, start an item, an audit or a search | Never by default | Always, unless the definition says otherwise |
+
+It closes each incident with its diagnosis and its confidence (Supervisor → Trouble). An
+incident whose action waits is closed when the administrator has decided. A turn that ends
+without an answer is tried once more; after that the incident is the administrator's, in
+the inbox. Liveness stays the launcher's: a sandbox that does not start in ten minutes or
+runs past its limit is ended whatever the supervisor does. Switching "The supervisor looks
+at trouble by itself" off leaves incidents in the inbox and uses no subscription.
+
+Not built: pausing a whole project, and extending a correction budget, of the study's
+section 12.3. The first needs a notion of a paused project; the second has no budget to
+extend yet, since the delivery flow's three rounds are fixed.
 
 ## The chat channel
 
@@ -320,6 +350,89 @@ outside, with the rule not to follow instructions in it that go beyond the repos
 
 A subscription that refuses (a limit, a sign-in that is no longer accepted) is recorded on
 the account, and the step is given to another account, three times at most.
+
+## Items that are not issues
+
+A backlog item need not be an issue on GitHub. One written in the console, proposed by the
+supervisor, found by an audit or proposed by a search for enhancements carries its own
+text (Backlog → the item's title). It is delivered like an issue: the agents are given its
+title and text, the branch is `engineering-control/item-<id>-<run>`, the pull request says
+what was asked for instead of naming an issue, and the item is done once the pull request
+is open, since nothing on GitHub would ever close it. Nothing is written to GitHub's
+issues: the GitHub App needs no permission for that.
+
+What starting an item runs is decided by its section's flow:
+
+| Flow of the section | Starting an item | What the section runs by itself |
+| --- | --- | --- |
+| Deliver issue | Delivers it | Nothing |
+| Audit code | Delivers a finding; any other item is a request, and an audit of what it names runs | An audit (Project → Start an audit) |
+| Discover enhancements | Delivers it | A search for enhancements (Project → Look for enhancements) |
+| The other flows of the library | Cannot run on this platform yet | Nothing |
+
+## Auditing code and looking for enhancements
+
+Both read a checkout and change nothing in it; whatever an agent changes is thrown away.
+Neither reaches GitHub beyond the read-only clone.
+
+**Audit code** (`sandbox/audit.py`) is the original's audit campaign and finding
+verification as one run. One subscription (ChatGPT first) audits the scope it is given and
+reports at most eight candidate findings, each with a minimal reproduction. The other
+subscription then verifies every candidate twice, independently, with a positive and a
+negative control. The platform decides by the original's rule: reproduced both times with
+both controls is confirmed; neither time, rejected; once, to retest; an environment that
+could not check it, not judged. Confirmed findings become proposed items of the section,
+with severity, lens, component and files; what the backlog already holds is recognised as
+known. The run says what the auditor looked at and what it left out. The original audited
+one coverage cell per agent with one finding at most; here one auditor covers the scope it
+is given, so a narrow scope finds more than "the whole repository".
+
+**Discover enhancements** (`sandbox/discover.py`) is the original's enhancement discovery.
+One subscription proposes at most five enhancements with the original's fields (persona,
+problem, outcome, value, success metric, acceptance criteria, risk, rollout, kill switch)
+and, as evidence, places in the repository. The other reviews each one as a product
+specification. Only an approval lets a proposal through, as a proposed item of the
+section. It waits for the administrator; an accepted one is delivered like any item.
+
+Both count against the budgets of queues like deliveries, and the chat channel says when
+one has ended.
+
+## Moving a project's work here
+
+The projects the original system works on are marked as such on their page until their
+work is moved here. Moving is two things, both on the administrator's side:
+
+1. On the original system's host, stop it from working on the project, then export the
+   project's records. The script only reads (a read-only transaction of SELECTs) and writes
+   one file readable by its owner alone:
+
+   ```bash
+   sudo /opt/engineering-control/venv/bin/python export_original_records.py \
+     --project falcone-workflow --output falcone-workflow.records.json
+   ```
+
+   The script is `scripts/export_original_records.py` of this repository; it needs only
+   the original's Python environment. It finds the database's address in the environment
+   variable `ENGINEERING_DATABASE_URL`, in `/etc/engineering-control/env/*.env`, or takes
+   it as `--database-url`; it never prints it.
+
+2. On the project's page: Move work here, choose the file, read what it would bring over,
+   confirm with the password.
+
+What is brought over (`dashboard/bring_over.py`):
+
+- The records as they are, into the tables of the same names this platform has from the
+  original: campaigns, coverage cells, findings and their verifications, published issues,
+  change sets, approvals, enhancements, backlog campaigns and the latest record of each
+  issue. Nothing is recomputed, so an approval stays bound to the digest it was given for.
+- Open work, as backlog items: a finding that was confirmed and neither published nor
+  delivered becomes a proposed item in Code audit; an enhancement that waited for approval
+  a proposed item in Enhancement, an approved one an accepted item.
+- Marks on the issues the original knew: what it had done about each, and the pull request
+  it had open, shown on the item so that the same work is not started twice.
+
+The same file can be applied again; nothing is doubled. A project with nothing worth
+keeping can be moved without a file. The original system is not touched by any of this.
 
 ## The sandbox image
 

@@ -443,7 +443,7 @@ function ItemRow({
             {item.title}
           </button>
         </div>
-        {item.labels.length || item.proposed_by || item.facts?.kind ? (
+        {item.labels.length || item.proposed_by || item.facts?.kind || item.facts?.original?.pull_request ? (
           <div className="mt-1 flex flex-wrap gap-1">
             <ItemBadges item={item} />
             {item.labels.map((label) => (

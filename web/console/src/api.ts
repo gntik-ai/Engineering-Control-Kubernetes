@@ -47,9 +47,38 @@ export interface Section {
   flow: Flow | null;
 }
 
+/** Where a project's work is done, and what was brought over from the original system. */
+export interface WorkStatus {
+  origin: 'registry' | 'console';
+  /** False while the original system is still the one that works on the project. */
+  here: boolean;
+  cut_over_at: string | null;
+  brought_over: {
+    items_proposed: number;
+    items_accepted: number;
+    issues_marked: number;
+    records_kept: Record<string, number>;
+  } | null;
+}
+
+/** What a file of the original system's records would bring over. */
+export interface RecordsPreview {
+  findings: Record<string, number>;
+  findings_to_propose: number;
+  enhancements: Record<string, number>;
+  enhancements_to_propose: number;
+  enhancements_to_accept: number;
+  issues_known: number;
+  issues_in_backlog: number;
+  issues_under_way: number;
+  records: Record<string, number>;
+  exported_at: string | null;
+}
+
 export interface ProjectDetail {
   project: ProjectSummary;
   sections: Section[];
+  work?: WorkStatus;
 }
 
 export interface ItemFacts {
@@ -60,6 +89,10 @@ export interface ItemFacts {
   risk?: string;
   persona?: string;
   pull_request?: { number: number; url: string };
+  /** What the original system had done about the item, when it was brought over. */
+  original?: { pull_request?: string; delivery?: string; closure?: string; [key: string]: unknown };
+  /** Why the supervisor set the item aside. */
+  skipped_reason?: string;
   [key: string]: unknown;
 }
 

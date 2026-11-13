@@ -60,6 +60,11 @@ export function ItemBadges({ item }: { item: WorkItem }) {
           Risk {facts.risk}
         </Badge>
       ) : null}
+      {facts.original?.pull_request ? (
+        <Badge tone="warning" size="sm">
+          The original system has a pull request open
+        </Badge>
+      ) : null}
     </>
   );
 }
@@ -154,8 +159,8 @@ export function ItemDialog({
                     rows={14}
                   />
                   <FieldDescription>
-                    This is what the agents are given when the item is worked on. Say what is wanted and how to tell that
-                    it is done.
+                    This is what the agents are given when the item is worked on. Say what is wanted and how to tell
+                    that it is done.
                   </FieldDescription>
                 </Field>
               </>
@@ -169,6 +174,12 @@ export function ItemDialog({
                     </Link>
                   ) : null}
                 </div>
+                {shown.facts?.skipped_reason ? (
+                  <p className="text-[13px]">
+                    <span className="text-muted-foreground">Set aside by the supervisor:</span>{' '}
+                    {shown.facts.skipped_reason}
+                  </p>
+                ) : null}
                 {shown.routing_reason ? (
                   <p className="text-[13px] text-muted-foreground">{shown.routing_reason}</p>
                 ) : null}
@@ -186,11 +197,18 @@ export function ItemDialog({
                   </p>
                 )}
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-[13px]">
-                  {shown.source_run_id ? <Link href={`${BASE}/run?id=${shown.source_run_id}`}>The run that produced it</Link> : null}
+                  {shown.source_run_id ? (
+                    <Link href={`${BASE}/run?id=${shown.source_run_id}`}>The run that produced it</Link>
+                  ) : null}
                   {shown.run ? <Link href={`${BASE}/run?id=${shown.run.id}`}>Its latest run</Link> : null}
                   {pull ? (
                     <Link href={pull.url} target="_blank" rel="noreferrer">
                       Pull request #{pull.number}
+                    </Link>
+                  ) : null}
+                  {shown.facts?.original?.pull_request ? (
+                    <Link href={shown.facts.original.pull_request} target="_blank" rel="noreferrer">
+                      The original system's pull request
                     </Link>
                   ) : null}
                 </div>

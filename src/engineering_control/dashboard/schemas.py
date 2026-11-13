@@ -119,6 +119,20 @@ class SectionRunInput(DashboardModel):
     scope: str = Field(default="", max_length=2000)
 
 
+class RecordsInput(DashboardModel):
+    """A file of one project's records from the original system, to look at."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    records: dict[str, Any]
+
+
+class RecordsApplyInput(RecordsInput):
+    """The same file, to bring over. It changes the backlog and the project, so it needs
+    the password again."""
+
+    current_password: str = Field(min_length=1, max_length=128)
+
+
 class ItemRouteInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     section: str | None = Field(default=None, max_length=40)

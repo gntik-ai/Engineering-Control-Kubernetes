@@ -219,7 +219,10 @@ class AuditCode(_Producer):
                 "severity": finding["severity"],
                 "lens": finding["lens"],
                 "disposition": verdict,
-                "notes": [" ".join(str(t.get("note") or "").split())[:600] for t in tried],
+                "notes": [
+                    f"Round {index}: " + " ".join(str(t.get("note") or "").split())[:600]
+                    for index, t in enumerate(tried, start=1)
+                ],
                 "duplicate_of": next(
                     (str(t["duplicate_of"])[:300] for t in tried if t.get("duplicate_of")), None
                 ),

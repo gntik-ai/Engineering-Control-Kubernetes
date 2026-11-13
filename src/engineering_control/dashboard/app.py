@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
@@ -76,6 +76,8 @@ from engineering_control.dashboard.schemas import (
     QueueItemsInput,
     QueueUpdateInput,
     R3CandidateCreateInput,
+    RecordsApplyInput,
+    RecordsInput,
     RunDecisionInput,
     SectionCreateInput,
     SectionFlowInput,
@@ -828,6 +830,7 @@ def create_app(
         status_code: int = 200,
         password: bool = False,
         entity: str = "project",
+        max_bytes: int = 32_768,
     ) -> Response:
         """One shape for every change the administrator makes: session, body, CSRF, change,
         record. ``entity`` names what was changed, a project unless said otherwise."""
@@ -835,7 +838,7 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         try:
-            body = model.model_validate(await _json(request))
+            body = model.model_validate(await _json(request, max_bytes))
         except ValueError:
             return JSONResponse({"detail": "invalid request"}, status_code=422)
         if not _valid_csrf(authenticated, body.csrf_token):
@@ -1523,6 +1526,57 @@ def create_app(
             subject=str(item_id),
         )
 
+    @app.get("/api/dashboard/projects/{name}/bring-over")
+    async def bring_over_status_api(name: str, request: Request) -> Response:
+        """Whether the project's work is on this platform, and what was brought along
+        from the original system."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).work_status(name))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/bring-over/preview")
+    async def bring_over_preview_api(name: str, request: Request) -> Response:
+        """What a file of the original system's records would bring over. Nothing is
+        stored."""
+        return await project_change(
+            request,
+            RecordsInput,
+            lambda body: service(request).preview_records(name, body.records),
+            event="dashboard.records_previewed",
+            subject=name,
+            max_bytes=RECORDS_BYTES,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bring-over")
+    async def bring_over_api(name: str, request: Request) -> Response:
+        """Keep the original system's records of the project, make what is open into
+        work here, and mark the project as cut over. It asks for the password."""
+        return await project_change(
+            request,
+            RecordsApplyInput,
+            lambda body: service(request).bring_over(name, body.records),
+            event="dashboard.project_cut_over",
+            subject=name,
+            password=True,
+            max_bytes=RECORDS_BYTES,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/cut-over")
+    async def cut_over_api(name: str, request: Request) -> Response:
+        """Mark the project's work as this platform's without bringing records over."""
+        return await project_change(
+            request,
+            ProjectArchiveInput,
+            lambda _body: service(request).cut_over(name),
+            event="dashboard.project_cut_over",
+            subject=name,
+            password=True,
+        )
+
     @app.post("/api/dashboard/projects/{name}/archive")
     async def archive_project_api(name: str, request: Request) -> Response:
         return await project_change(
@@ -1867,12 +1921,19 @@ async def _form(request: Request) -> dict[str, str]:
     return {key: items[0] for key, items in values.items()}
 
 
-async def _json(request: Request) -> dict[str, Any]:
+# A file of one project's records from the original system, as the console sends it.
+RECORDS_BYTES: Final = 64 * 1024 * 1024
+
+
+async def _json(request: Request, limit: int = 32_768) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type != "application/json":
         raise HTTPException(status_code=415, detail="unsupported JSON encoding")
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=413, detail="request is too large")
     body = await request.body()
-    if len(body) > 32_768:
+    if len(body) > limit:
         raise HTTPException(status_code=413, detail="request is too large")
     try:
         value = json.loads(body)

@@ -328,32 +328,40 @@ def disposition(tried: list[dict[str, Any]], rounds: int = len(ROUNDS)) -> str:
     return "FLAKY"
 
 
-def description(finding: dict[str, Any], tried: list[dict[str, Any]], base_sha: str) -> str:
-    """A confirmed finding as the text of a backlog item: what an implementer needs."""
+def sections(finding: dict[str, Any]) -> list[str]:
+    """What a finding says, as the sections of a backlog item's text."""
     steps = "\n".join(
-        f"{index}. {step}" for index, step in enumerate(finding["minimal_reproduction"], start=1)
+        f"{index}. {step}"
+        for index, step in enumerate(finding.get("minimal_reproduction") or [], start=1)
     )
     parts = [
-        f"**Severity:** {finding['severity']} · **Lens:** {finding['lens']} · "
-        f"**Component:** {finding['affected_component'] or 'not named'} · "
-        f"**Found at commit:** {base_sha[:12]}",
-        "## Expected behaviour\n" + finding["expected_behavior"],
-        "## Actual behaviour\n" + finding["actual_behavior"],
+        "## Expected behaviour\n" + str(finding.get("expected_behavior") or "Not given."),
+        "## Actual behaviour\n" + str(finding.get("actual_behavior") or "Not given."),
         "## Minimal reproduction\n" + (steps or "Not given."),
     ]
-    if finding["files"]:
+    if finding.get("files"):
         parts.append("## Files\n" + "\n".join(f"- `{file}`" for file in finding["files"]))
-    if finding["security_impact"]:
-        parts.append("## Security impact\n" + finding["security_impact"])
-    if finding["data_impact"]:
-        parts.append("## Data impact\n" + finding["data_impact"])
-    parts.append("## Recommended action\n" + finding["recommended_action"])
+    if finding.get("security_impact"):
+        parts.append("## Security impact\n" + str(finding["security_impact"]))
+    if finding.get("data_impact"):
+        parts.append("## Data impact\n" + str(finding["data_impact"]))
+    parts.append("## Recommended action\n" + str(finding.get("recommended_action") or "Not given."))
+    return parts
+
+
+def description(finding: dict[str, Any], tried: list[dict[str, Any]], base_sha: str) -> str:
+    """A confirmed finding as the text of a backlog item: what an implementer needs."""
     seen = "\n".join(
         f"- Round {index}: {_line(entry.get('note'), 1_500)}"
         for index, entry in enumerate(tried, start=1)
     )
-    parts.append(
-        "## Verification\nReproduced twice, independently, by an agent of the other "
-        "subscription, each time with a positive and a negative control.\n" + seen
+    return "\n\n".join(
+        [
+            f"**Severity:** {finding['severity']} · **Lens:** {finding['lens']} · "
+            f"**Component:** {finding['affected_component'] or 'not named'} · "
+            f"**Found at commit:** {base_sha[:12]}",
+            *sections(finding),
+            "## Verification\nReproduced twice, independently, by an agent of the other "
+            "subscription, each time with a positive and a negative control.\n" + seen,
+        ]
     )
-    return "\n\n".join(parts)
