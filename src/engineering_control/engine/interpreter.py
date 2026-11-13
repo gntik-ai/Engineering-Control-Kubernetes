@@ -122,6 +122,8 @@ class Engine:
         if ctx.prompt_used is not None:
             # Which wording the agent was given: traceable to a version of the flow.
             noted["prompt"] = ctx.prompt_used
+        if ctx.model_used is not None:
+            noted["model"] = ctx.model_used
         if noted:
             await asyncio.to_thread(self.runs.note_step, item.step_id, noted)
         return plan

@@ -19,6 +19,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.agent_models import problem as model_problem
 from engineering_control.dashboard.project_records import ProjectInvalid, ProjectNotFound
 from engineering_control.db.models import ProviderAccount, SupervisorDefinition
 
@@ -28,87 +29,6 @@ MAX_PROMPT: Final = 20_000
 MAX_SKILLS: Final = 20
 MAX_SKILL_BODY: Final = 8_000
 SKILL_KEY: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+){0,5}$")
-MODEL_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,59}$")
-
-# The models and the reasoning levels the administrator chooses among, by provider. They
-# are what the clients pinned in the sandbox image take (images/sandbox/node-tools): for
-# Claude the names its client resolves to the latest model of a family, for ChatGPT the
-# catalogue built into the Codex client, with the levels each model has. Another name can
-# always be written; the client then says whether it knows it.
-_LEVELS: Final = ("low", "medium", "high", "xhigh", "max")
-EFFORTS: Final[dict[str, tuple[str, ...]]] = {
-    "claude": _LEVELS,
-    "chatgpt": (*_LEVELS, "ultra"),
-}
-MODELS: Final[dict[str, tuple[dict[str, Any], ...]]] = {
-    "claude": (
-        {"name": "fable", "title": "Fable", "summary": "The latest Fable model."},
-        {"name": "opus", "title": "Opus", "summary": "The latest Opus model."},
-        {"name": "sonnet", "title": "Sonnet", "summary": "The latest Sonnet model."},
-        {"name": "haiku", "title": "Haiku", "summary": "The latest Haiku model: the fastest."},
-    ),
-    "chatgpt": (
-        {
-            "name": "gpt-6-astra",
-            "title": "GPT-6-Astra",
-            "summary": "Frontier intelligence for the most demanding work.",
-        },
-        {
-            "name": "gpt-6.1-sol",
-            "title": "GPT-6.1-Sol",
-            "summary": "Latest workhorse model for coding and everyday work.",
-        },
-        {"name": "gpt-6.1-terra", "title": "GPT-6.1 Terra", "summary": "A balanced model."},
-        {
-            "name": "gpt-6-sol",
-            "title": "GPT-6-Sol",
-            "summary": "Previous generation workhorse model.",
-        },
-        {
-            "name": "gpt-6-luna",
-            "title": "GPT-6-Luna",
-            "summary": "Fast and affordable model for easier tasks.",
-            "efforts": _LEVELS,
-        },
-        {
-            "name": "gpt-5.6-sol",
-            "title": "GPT-5.6-Sol",
-            "summary": "Older generation workhorse model.",
-        },
-        {
-            "name": "gpt-5.6-terra",
-            "title": "GPT-5.6-Terra",
-            "summary": "Older balanced model for straightforward work.",
-        },
-        {
-            "name": "gpt-5.6-luna",
-            "title": "GPT-5.6-Luna",
-            "summary": "Older fast and efficient model.",
-            "efforts": _LEVELS,
-        },
-        {
-            "name": "gpt-5.5",
-            "title": "GPT-5.5",
-            "summary": "Legacy coding model.",
-            "efforts": ("low", "medium", "high", "xhigh"),
-        },
-    ),
-}
-
-
-def choices() -> dict[str, Any]:
-    """What the console offers for each provider: its models and its reasoning levels."""
-    return {
-        provider: {
-            "models": [
-                {**model, "efforts": list(model.get("efforts") or EFFORTS[provider])}
-                for model in MODELS[provider]
-            ],
-            "efforts": list(EFFORTS[provider]),
-        }
-        for provider in PROVIDERS
-    }
-
 
 _OBJECT: Final[dict[str, Any]] = {"type": "object", "additionalProperties": False}
 
@@ -878,11 +798,10 @@ def clean_models(models: Any) -> dict[str, str]:
         raise ProjectInvalid("The models are given by provider")
     cleaned: dict[str, str] = {}
     for provider, name in models.items():
-        if provider not in PROVIDERS:
-            raise ProjectInvalid(f"There is no provider {provider}")
+        wrong = model_problem(str(provider), name, None)
+        if wrong is not None:
+            raise ProjectInvalid(wrong)
         text = str(name or "").strip()
-        if text and not MODEL_NAME.fullmatch(text):
-            raise ProjectInvalid(f"{text} is not a model's name")
         if text:
             cleaned[provider] = text
     return cleaned
@@ -897,19 +816,12 @@ def clean_efforts(efforts: Any, models: dict[str, str]) -> dict[str, str]:
         raise ProjectInvalid("The reasoning levels are given by provider")
     cleaned: dict[str, str] = {}
     for provider, level in efforts.items():
-        if provider not in PROVIDERS:
-            raise ProjectInvalid(f"There is no provider {provider}")
+        wrong = model_problem(str(provider), models.get(provider), level)
+        if wrong is not None:
+            raise ProjectInvalid(wrong)
         text = str(level or "").strip()
-        if not text:
-            continue
-        if text not in EFFORTS[provider]:
-            raise ProjectInvalid(f"{text} is not a reasoning level of {provider}")
-        known = next(
-            (model for model in MODELS[provider] if model["name"] == models.get(provider)), None
-        )
-        if known is not None and text not in (known.get("efforts") or EFFORTS[provider]):
-            raise ProjectInvalid(f"{known['title']} has no reasoning level {text}")
-        cleaned[provider] = text
+        if text:
+            cleaned[provider] = text
     return cleaned
 
 

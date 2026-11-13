@@ -562,6 +562,19 @@ task makes no difference to a run, and two flows that differ only in their drawi
 the same hash. A task as it is set, with the wording of its prompt, can be kept in the
 list under a name and dragged into other flows.
 
+Every task an agent works in (implementing, reviewing, planning the areas of an audit,
+auditing, verifying, the two that look at the running application, looking for
+enhancements and reviewing them) has two things set in the panel beside which
+subscriptions it may use: the model the agent works with, and how hard it reasons, for
+each subscription the task may come to run on. The list is the one the supervisor
+chooses from (`agent_models.py`); nothing chosen leaves both to the subscription's
+client. A task that judges another's work does not choose its subscription: it runs on
+the other one than the task it judges, so that no agent judges its own work, and the
+panel says which that is. Giving the judged task one subscription only fixes the
+judging task to the other. The choice is part of what the flow says, so it is saved as
+a draft, tried and put in force like any other change, and a run's step records the
+model it was started with.
+
 A run's page draws the run on the version of the flow it follows: each task with its
 state, who worked in it and how often, and the connections the run went along.
 

@@ -10,6 +10,7 @@ from uuid import UUID
 
 import pytest
 
+from engineering_control.agent_models import flags
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -121,6 +122,21 @@ def test_every_task_of_the_catalogue_says_what_it_is() -> None:
 # --- the rules that hold for every flow ---------------------------------------------------
 
 
+def test_every_task_an_agent_works_in_takes_a_model_and_a_reasoning_level() -> None:
+    agents = [task for task in TASKS.values() if task.account]
+    assert len(agents) == 9
+    for task in agents:
+        param = next((p for p in task.params if p.name == "models"), None)
+        assert param is not None and param.kind == "models" and param.default == {}, task.key
+        # Who works in it is said too: named subscriptions, or the other than a task's.
+        assert {"providers", "other_than"} & {p.name for p in task.params}, task.key
+    assert not [t.key for t in TASKS.values() if not t.account and "models" in t.defaults()]
+    # Nothing chosen says nothing to the client, on either subscription.
+    assert flags("claude", None, None) == [] and flags("chatgpt", None, None) == []
+    assert flags("claude", "sonnet", None) == ["--model", "sonnet"]
+    assert flags("chatgpt", None, "high") == ["-c", 'model_reasoning_effort="high"']
+
+
 def test_a_change_cannot_be_published_past_the_review_the_tests_or_the_administrator() -> None:
     # Straight from the implementer to the pull request.
     raw = _raw("deliver-issue")
@@ -169,6 +185,26 @@ def test_a_flow_has_to_hold_together() -> None:
     raw = _raw("deliver-issue")
     _task(raw, "implement")["with"]["minutes"] = 600
     assert "setting" in _rules(raw)
+    # A model and a reasoning level are chosen by subscription, among what its client has.
+    for wrong in (
+        ["opus"],
+        {"gemini": {"model": "pro"}},
+        {"claude": "opus"},
+        {"claude": {"model": "opus", "temperature": 1}},
+        {"claude": {"model": "not a model"}},
+        {"claude": {"effort": "ultra"}},
+        {"chatgpt": {"model": "gpt-6-luna", "effort": "ultra"}},
+    ):
+        raw = _raw("deliver-issue")
+        _task(raw, "implement")["with"]["models"] = wrong
+        assert "setting" in _rules(raw), wrong
+    raw = _raw("deliver-issue")
+    _task(raw, "implement")["with"]["models"] = {
+        "claude": {"model": "opus", "effort": "high"},
+        "chatgpt": {"model": "a-name-not-listed", "effort": "max"},
+    }
+    _task(raw, "review")["with"]["models"] = {"chatgpt": {"effort": "low"}}
+    assert _rules(raw) == set()
     raw = _raw("deliver-issue")
     _task(raw, "review")["next"]["maybe"] = "verify"
     assert "outcome" in _rules(raw)
@@ -328,9 +364,18 @@ async def test_a_run_follows_the_version_in_force_when_it_started(world: Any) ->
     world.runs.request_cancel(UUID(before["id"]))
     await world.launcher.tick()
 
-    # Claude first, a reworded implementer, and one round only.
+    # Claude first, a reworded implementer, and one round only. The implementer works
+    # with a model of its own on each subscription; the reviewer with one on ChatGPT.
     changed = _raw("deliver-issue")
     _task(changed, "implement")["with"]["providers"] = ["claude", "chatgpt"]
+    _task(changed, "implement")["with"]["models"] = {
+        "claude": {"model": "opus", "effort": "xhigh"},
+        "chatgpt": {"model": "gpt-6.1-sol"},
+    }
+    _task(changed, "review")["with"]["models"] = {
+        "chatgpt": {"model": "gpt-6-astra", "effort": "ultra"},
+        "claude": {"effort": "max"},
+    }
     changed["prompts"] = {
         "implementer": {"role": "You implement {{subject}}. Keep the change as small as it can be."}
     }
@@ -344,6 +389,11 @@ async def test_a_run_follows_the_version_in_force_when_it_started(world: Any) ->
     await world.launcher.tick()
     job = world.job()
     assert job["commands"][0]["argv"][0] == "claude", "the flow's order of subscriptions"
+    # The model and how hard it reasons, as the flow chose them for this subscription.
+    argv = job["commands"][0]["argv"]
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+    assert "gpt-6.1-sol" not in argv
     prompt = job["commands"][0]["stdin"]
     assert prompt.startswith(
         f"You implement issue #11 of {REPOSITORY}. Keep the change as small as it can be."
@@ -356,12 +406,20 @@ async def test_a_run_follows_the_version_in_force_when_it_started(world: Any) ->
     used = steps[-1]["input"]["prompt"]
     own = {"role": "You implement {{subject}}. Keep the change as small as it can be."}
     assert used == {"name": "implementer", "sha256": CONTRACTS["implementer"].sha256(own)}
+    # And so is the model the agent was started with.
+    assert steps[-1]["input"]["model"] == {"provider": "claude", "model": "opus", "effort": "xhigh"}
     world.fake.finish(_implemented("claude"))
     await world.launcher.tick()
 
     # The review goes to the other subscription than the one that implemented.
     await world.launcher.tick()
-    assert world.job()["commands"][0]["argv"][0] == "codex"
+    argv = world.job()["commands"][0]["argv"]
+    assert argv[0] == "codex"
+    # Codex is told before the word that says its prompt comes on standard input.
+    assert argv[-1] == "-" and argv[argv.index("-m") + 1] == "gpt-6-astra"
+    assert argv[argv.index('model_reasoning_effort="ultra"') - 1] == "-c"
+    reviewed = world.run(run["id"])["steps"][-1]["input"]["model"]
+    assert reviewed == {"provider": "chatgpt", "model": "gpt-6-astra", "effort": "ultra"}
     asked = {"decision": "REQUEST_CHANGES", "summary": "Too large.", "findings": []}
     world.fake.finish(_reviewed(asked, provider="chatgpt"))
     await world.launcher.tick()

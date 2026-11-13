@@ -20,6 +20,7 @@ import functools
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
+from engineering_control.agent_models import flags
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import ProjectNotFound, application_host
 from engineering_control.engine.catalogue import (
@@ -63,6 +64,8 @@ class Context:
     dry: bool = False
     # Which prompt the step was given, with the hash of its wording.
     prompt_used: dict[str, str] | None = None
+    # Which model the step's agent was started with, when the flow chose one.
+    model_used: dict[str, str] | None = None
 
     @property
     def data(self) -> dict[str, Any]:
@@ -75,6 +78,16 @@ class Context:
     @property
     def params(self) -> dict[str, Any]:
         return {**self.task.defaults(), **self.node.params}
+
+    def model(self, provider: str) -> dict[str, str]:
+        """The model and the reasoning level the flow chose for this task on that
+        subscription: only what was chosen."""
+        chosen = (self.params.get("models") or {}).get(provider) or {}
+        return {
+            key: str(chosen[key]).strip()
+            for key in ("model", "effort")
+            if isinstance(chosen, dict) and str(chosen.get(key) or "").strip()
+        }
 
     def each(self, over: str) -> int | None:
         """Where the run is in the list it goes through, when the step is inside one."""
@@ -196,9 +209,18 @@ def _words(value: Any, limit: int = 500) -> str:
 def _agent(ctx: Context, lease: Lease | None, job: dict[str, Any]) -> Plan:
     """A sandbox for an agent: the account's client, the checkout, and time to work."""
     seconds = ctx.minutes() * 60
+    chosen = ctx.model(lease.provider) if lease is not None else {}
+    said = flags(lease.provider, chosen.get("model"), chosen.get("effort")) if lease else []
     for command in job["commands"]:
         if command.get("name") == "agent":
             command["timeout"] = seconds
+            argv = command["argv"]
+            # Codex reads its prompt from standard input, which its last word says.
+            at = len(argv) - 1 if argv and argv[-1] == "-" else len(argv)
+            argv[at:at] = said
+    if lease is not None and (chosen.get("model") or chosen.get("effort")):
+        # Which model the agent was started with: traceable like the prompt's wording.
+        ctx.model_used = {"provider": lease.provider, **chosen}
     return Plan(job, workspace=True, memory="6Gi", deadline_seconds=seconds + 600)
 
 

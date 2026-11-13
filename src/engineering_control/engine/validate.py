@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from engineering_control.agent_models import problem as model_problem
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
@@ -61,6 +62,16 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
         return None
     if param.kind == "choice":
         return None if value in param.choices else f"{name} is one of: {', '.join(param.choices)}"
+    if param.kind == "models":
+        if not isinstance(value, dict):
+            return f"{name} names a model and a reasoning level by subscription"
+        for provider, chosen in value.items():
+            if not isinstance(chosen, dict) or set(chosen) - {"model", "effort"}:
+                return f"{name} gives a model and a reasoning level for {provider}"
+            wrong = model_problem(str(provider), chosen.get("model"), chosen.get("effort"))
+            if wrong is not None:
+                return f"{name}: {wrong}"
+        return None
     if param.kind == "task":
         target = nodes.get(str(value)) if value else None
         if target is None or target.id == node.id:

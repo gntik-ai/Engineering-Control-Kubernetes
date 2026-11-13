@@ -248,6 +248,13 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
                 .join(' or ')}
             </Badge>
           ) : null}
+          {step.input?.model ? (
+            <Badge tone="neutral" size="sm">
+              {[step.input.model.model, step.input.model.effort ? `${step.input.model.effort} reasoning` : null]
+                .filter(Boolean)
+                .join(', ')}
+            </Badge>
+          ) : null}
           <span className="ml-auto flex items-center gap-3 text-[12px] text-muted-foreground">
             {step.input?.round && step.input.round > 1 ? <span>Round {step.input.round}</span> : null}
             {step.usage ? (

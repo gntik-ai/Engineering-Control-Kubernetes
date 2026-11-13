@@ -59,7 +59,7 @@ export interface FlowListed extends Flow {
 /** One setting of a task. */
 export interface TaskParam {
   name: string;
-  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice';
+  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models';
   default: unknown;
   doc: string;
   low: number | null;
@@ -114,6 +114,8 @@ export interface FlowCatalogue {
   prompts: PromptShown[];
   budgets: TaskParam[];
   providers: string[];
+  /** The models an agent's task can be set to, by subscription, with the levels each has. */
+  models: Record<string, ModelChoices>;
   saved: SavedTask[];
 }
 
@@ -698,8 +700,13 @@ export interface RunStep {
   finished_at: string | null;
   /** What the step's agent reported using, when an agent worked in it. */
   usage?: { tokens: number; input: number; output: number; cached: number } | null;
-  /** What the step was given: the round, and which wording of which prompt. */
-  input?: { round?: number; prompt?: { name: string; sha256: string } } | null;
+  /** What the step was given: the round, which wording of which prompt, which model. */
+  input?: {
+    round?: number;
+    prompt?: { name: string; sha256: string };
+    /** The model the flow chose for the step's agent, when it chose one. */
+    model?: { provider: string; model?: string; effort?: string };
+  } | null;
   log?: string;
 }
 

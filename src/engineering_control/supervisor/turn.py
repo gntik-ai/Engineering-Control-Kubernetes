@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Final
 
+from engineering_control.agent_models import flags
 from engineering_control.sandbox import deliver, steps
 from engineering_control.sandbox.flows import MAX_ACCOUNT_RETRIES, End, Follow, Plan, Result
 from engineering_control.sandbox.pods import WORKSPACE
@@ -168,10 +169,7 @@ def turn_job(
         if tools_url is not None and tools:
             argv += ["--allowed-tools", *[f"mcp__{SERVER}__{name}" for name in tools]]
         argv += ["--disable-slash-commands", "--system-prompt", SYSTEM]
-        if model:
-            argv += ["--model", model]
-        if effort:
-            argv += ["--effort", effort]
+        argv += flags(provider, model, effort)
         commands = [
             {
                 "name": "agent",
@@ -204,10 +202,7 @@ def turn_job(
                 f"mcp_servers.{SERVER}.bearer_token_env_var={json.dumps(TOKEN_VARIABLE)}",
             ]
             environment[TOKEN_VARIABLE] = token
-        if model:
-            argv += ["-m", model]
-        if effort:
-            argv += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+        argv += flags(provider, model, effort)
         argv += ["--output-last-message", ANSWER_FILE, "-"]
         commands = [
             {

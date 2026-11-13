@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
+from engineering_control.agent_models import choices as model_choices
 from engineering_control.cluster import Cluster
 from engineering_control.dashboard.accounts import (
     check_credential,
@@ -37,7 +38,6 @@ from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
-from engineering_control.supervisor.definition import choices as model_choices
 
 
 class DashboardService:
@@ -460,6 +460,8 @@ class DashboardService:
             "prompts": [contract.describe({}) for contract in CONTRACTS.values()],
             "budgets": [param.as_dict() for param in BUDGETS.values()],
             "providers": list(AGENT_PROVIDERS),
+            # The models an agent's task can be set to, and the levels each has.
+            "models": model_choices(),
             "saved": await asyncio.to_thread(self.repository.flows.saved_tasks),
         }
 

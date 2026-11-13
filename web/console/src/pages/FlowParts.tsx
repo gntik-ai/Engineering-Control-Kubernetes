@@ -1,5 +1,6 @@
 import { Field, FieldDescription, FieldLabel, Input, SimpleSelect, Switch } from '@gntik-ai/ui';
 import type { FlowCatalogue, FlowDocument, FlowNode, TaskParam, TaskType } from '../api';
+import { ModelChoice } from '../modelChoice';
 
 /** What the flow pages share: names, and the editor of one setting of a task. */
 
@@ -15,6 +16,7 @@ const SETTING_NAMES: Record<string, string> = {
   providers: 'Subscriptions',
   minutes: 'Minutes at most',
   other_than: 'Judges the work of',
+  models: 'Model and reasoning',
   install: 'Install what the project needs',
   baseline: 'Run the tests before any change',
   rounds: 'Rounds',
@@ -44,6 +46,26 @@ const providerChoices = (providers: string[]) => [
   }),
   ...providers.map((only) => ({ value: only, label: `${PROVIDER_NAMES[only] ?? only} only` })),
 ];
+
+/**
+ * The subscriptions a task's agent may come to run on: the ones it names, or, for a task
+ * that judges another's work, the other than the one that task works on.
+ */
+export function mayRunOn(node: FlowNode, document: FlowDocument, catalogue: FlowCatalogue): string[] {
+  const all = catalogue.providers;
+  const typeOf = (task: FlowNode) => catalogue.tasks.find((type) => type.key === task.task);
+  const named = (task: FlowNode) => (Array.isArray(task.with.providers) ? (task.with.providers as string[]) : all);
+  const judges = typeOf(node)?.params.some((param) => param.name === 'other_than');
+  if (!judges) return named(node);
+  const target = document.tasks.find((task) => task.id === node.with.other_than);
+  if (!target || typeOf(target)?.params.some((param) => param.name === 'other_than')) return all;
+  const theirs = named(target);
+  return theirs.length === 1 ? all.filter((name) => name !== theirs[0]) : all;
+}
+
+const namesOf = (providers: string[]) => providers.map((name) => PROVIDER_NAMES[name] ?? name).join(' or ');
+
+type Chosen = Record<string, { model?: string; effort?: string }>;
 
 export function Setting({
   param,
@@ -89,6 +111,40 @@ export function Setting({
       </Field>
     );
   }
+  if (param.kind === 'models') {
+    const set = (value && typeof value === 'object' ? value : {}) as Chosen;
+    const providers = mayRunOn(node, document, catalogue);
+    return (
+      <div className="grid max-w-xl gap-2">
+        <span className="text-sm font-medium">{label}</span>
+        {providers.map((provider) => (
+          <div key={provider} className="grid gap-1">
+            <span className="text-[12px] text-muted-foreground">
+              {providers.length > 1 ? 'When it runs on' : 'On'} {PROVIDER_NAMES[provider] ?? provider}
+            </span>
+            <ModelChoice
+              provider={provider}
+              choices={catalogue.models?.[provider]}
+              value={{ model: set[provider]?.model ?? null, effort: set[provider]?.effort ?? null }}
+              onChange={(next) => {
+                const all: Chosen = { ...set };
+                const entry = {
+                  ...(next.model ? { model: next.model } : {}),
+                  ...(next.effort ? { effort: next.effort } : {}),
+                };
+                if (Object.keys(entry).length) all[provider] = entry;
+                else delete all[provider];
+                onChange(all);
+              }}
+            />
+          </div>
+        ))}
+        <span className="text-[12px] text-muted-foreground">
+          {param.doc} More reasoning is slower and uses more of the subscription.
+        </span>
+      </div>
+    );
+  }
   let items: { value: string; label: string }[];
   let chosen: string;
   if (param.kind === 'providers') {
@@ -115,7 +171,12 @@ export function Setting({
           onChange(param.kind === 'providers' ? next.split(',') : next);
         }}
       />
-      <FieldDescription>{param.doc}</FieldDescription>
+      <FieldDescription>
+        {param.doc}
+        {param.kind === 'task' && chosen
+          ? ` Its agent is ${namesOf(mayRunOn(node, document, catalogue))}: never the subscription ${chosen} worked on, so that no agent judges its own work. To fix which one it is, give ${chosen} one subscription only.`
+          : ''}
+      </FieldDescription>
     </Field>
   );
 }

@@ -264,7 +264,7 @@ def test_the_definition_starts_as_the_platforms_own_and_every_save_is_a_version(
 
 
 def test_the_model_and_how_hard_it_reasons_are_chosen_by_provider(world: Any) -> None:
-    from engineering_control.supervisor.definition import EFFORTS, choices
+    from engineering_control.agent_models import EFFORTS, choices
 
     offered = choices()
     assert set(offered) == {"claude", "chatgpt"}

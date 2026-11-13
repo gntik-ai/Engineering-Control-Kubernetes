@@ -41,7 +41,7 @@ class Param:
     """One setting of a task."""
 
     name: str
-    kind: str  # "bool", "int", "providers", "task", "choice"
+    kind: str  # "bool", "int", "providers", "task", "choice", "models"
     default: Any
     doc: str
     low: int | None = None
@@ -111,6 +111,13 @@ _PROVIDERS: Final = Param(
     list(PROVIDERS),
     "The subscriptions the agent may work on, the most wanted first.",
 )
+_MODELS: Final = Param(
+    "models",
+    "models",
+    {},
+    "The model the agent works with on each subscription it may run on, and how hard it "
+    "reasons. Nothing chosen leaves both to the subscription's client.",
+)
 _MINUTES: Final = Param(
     "minutes",
     "int",
@@ -153,7 +160,7 @@ _TASKS: Final = (
         needs=("checkout",),
         produces=("change",),
         outcomes=("done",),
-        params=(_PROVIDERS, _MINUTES),
+        params=(_PROVIDERS, _MODELS, _MINUTES),
         prompt="implementer",
     ),
     TaskType(
@@ -167,7 +174,7 @@ _TASKS: Final = (
         needs=("change",),
         produces=("review",),
         outcomes=("pass", "changes"),
-        params=(_OTHER, _MINUTES),
+        params=(_OTHER, _MODELS, _MINUTES),
         prompt="reviewer",
     ),
     TaskType(
@@ -263,7 +270,7 @@ _TASKS: Final = (
         needs=("checkout",),
         produces=("areas",),
         outcomes=("areas", "none"),
-        params=(_PROVIDERS, _MINUTES),
+        params=(_PROVIDERS, _MODELS, _MINUTES),
         prompt="planner",
     ),
     TaskType(
@@ -277,7 +284,7 @@ _TASKS: Final = (
         needs=("checkout",),
         produces=("candidates",),
         outcomes=("candidates", "nothing"),
-        params=(_PROVIDERS, _MINUTES),
+        params=(_PROVIDERS, _MODELS, _MINUTES),
         prompt="auditor",
     ),
     TaskType(
@@ -294,6 +301,7 @@ _TASKS: Final = (
         outcomes=("done",),
         params=(
             _OTHER,
+            _MODELS,
             Param(
                 "rounds",
                 "int",
@@ -320,7 +328,7 @@ _TASKS: Final = (
         needs=("checkout",),
         produces=("candidates",),
         outcomes=("candidates", "nothing"),
-        params=(_PROVIDERS, _MINUTES),
+        params=(_PROVIDERS, _MODELS, _MINUTES),
         prompt="application_auditor",
     ),
     TaskType(
@@ -337,6 +345,7 @@ _TASKS: Final = (
         outcomes=("done",),
         params=(
             _OTHER,
+            _MODELS,
             Param(
                 "rounds",
                 "int",
@@ -381,7 +390,7 @@ _TASKS: Final = (
         needs=("checkout",),
         produces=("proposals",),
         outcomes=("proposals", "nothing"),
-        params=(_PROVIDERS, _MINUTES),
+        params=(_PROVIDERS, _MODELS, _MINUTES),
         prompt="discoverer",
     ),
     TaskType(
@@ -395,7 +404,7 @@ _TASKS: Final = (
         needs=("proposals",),
         produces=("reviews",),
         outcomes=("done",),
-        params=(_OTHER, _MINUTES),
+        params=(_OTHER, _MODELS, _MINUTES),
         prompt="proposal_reviewer",
     ),
     TaskType(
