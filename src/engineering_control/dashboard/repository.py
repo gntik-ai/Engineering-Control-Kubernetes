@@ -52,6 +52,9 @@ from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.sandbox.runs import Runs
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.supervisor.conversation import Conversation
+from engineering_control.supervisor.definition import Definitions
+from engineering_control.supervisor.tools import Toolbox
 
 _EVENT_METADATA_KEYS = frozenset(
     {
@@ -129,6 +132,19 @@ class DashboardRepository:
         self.backlog = BacklogItems(self.sessions)
         self.accounts = Accounts(self.sessions)
         self.runs = Runs(self.sessions)
+        self.definitions = Definitions(self.sessions)
+        self.conversation = Conversation(self.sessions, self.definitions)
+        # The console decides on what the supervisor proposed and reads its record; the
+        # supervisor's own calls go through the tool service.
+        self.toolbox = Toolbox(
+            self.sessions,
+            projects=self.projects,
+            sections=self.sections,
+            backlog=self.backlog,
+            accounts=self.accounts,
+            runs=self.runs,
+            conversation=self.conversation,
+        )
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)

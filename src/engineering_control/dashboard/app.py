@@ -77,6 +77,9 @@ from engineering_control.dashboard.schemas import (
     SectionGuideInput,
     SectionRemoveInput,
     SectionUpdateInput,
+    SupervisorDecisionInput,
+    SupervisorDefinitionInput,
+    SupervisorMessageInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
@@ -116,6 +119,7 @@ CONSOLE_VIEWS = frozenset(
         "accounts",
         "runs",
         "run",
+        "supervisor",
         "executions",
         "execution",
     }
@@ -1065,6 +1069,100 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse(await service(request).inbox())
+
+    @app.get("/api/dashboard/supervisor")
+    async def supervisor_api(request: Request, after: str | None = None) -> Response:
+        """The conversation with the supervisor: the latest messages, or those after a
+        moment, whether it is answering, and what it proposed that waits."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        moment = None
+        if after is not None:
+            try:
+                moment = datetime.fromisoformat(after)
+            except ValueError:
+                return JSONResponse({"detail": "invalid request"}, status_code=422)
+        return JSONResponse(await service(request).supervisor(after=moment))
+
+    @app.post("/api/dashboard/supervisor/messages")
+    async def supervisor_say_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            SupervisorMessageInput,
+            lambda body: service(request).say_to_supervisor(body.text),
+            event="dashboard.supervisor_asked",
+            status_code=201,
+            entity="message",
+        )
+
+    @app.post("/api/dashboard/supervisor/stop")
+    async def supervisor_stop_api(request: Request) -> Response:
+        """Stop the turn the supervisor is answering in."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).stop_supervisor(),
+            event="dashboard.supervisor_stopped",
+            entity="run",
+        )
+
+    @app.get("/api/dashboard/supervisor/settings")
+    async def supervisor_settings_api(request: Request) -> Response:
+        """The supervisor's definition in force, its versions and the tools it can have."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).supervisor_settings())
+
+    @app.get("/api/dashboard/supervisor/versions/{version}")
+    async def supervisor_version_api(version: int, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).supervisor_version(version))
+
+    @app.post("/api/dashboard/supervisor/settings")
+    async def supervisor_save_api(request: Request) -> Response:
+        """Save a new version of the definition. It decides what the supervisor may do
+        without asking, so it asks for the password."""
+        return await project_change(
+            request,
+            SupervisorDefinitionInput,
+            lambda body: service(request).save_supervisor(
+                prompt=body.prompt,
+                skills=body.skills,
+                tools=body.tools,
+                providers=body.providers,
+                account_id=body.account_id,
+                exclusive=body.exclusive,
+                models=body.models,
+                note=body.note,
+            ),
+            event="dashboard.supervisor_defined",
+            password=True,
+            entity="definition",
+        )
+
+    @app.get("/api/dashboard/supervisor/record")
+    async def supervisor_record_api(request: Request, everything: bool = False) -> Response:
+        """What the supervisor did: what it applied, proposed, was refused, and what the
+        administrator answered. With ``everything``, what it read as well."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).supervisor_record(everything=everything))
+
+    @app.post("/api/dashboard/supervisor/actions/{action_id}/decide")
+    async def supervisor_decide_api(action_id: UUID, request: Request) -> Response:
+        """Accept or reject something the supervisor proposed and that waits."""
+        return await project_change(
+            request,
+            SupervisorDecisionInput,
+            lambda body: service(request).decide_action(action_id, body.accept),
+            event="dashboard.supervisor_action_decided",
+            entity="action",
+        )
 
     @app.get("/api/dashboard/accounts")
     async def accounts_api(request: Request) -> Response:

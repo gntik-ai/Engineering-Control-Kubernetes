@@ -248,6 +248,13 @@ class Settings(BaseSettings):
         "proxy.golang.org",
         "sum.golang.org",
     )
+    # The supervisor's tools: the listener of the service that serves them, and where the
+    # launcher tells a turn of the supervisor to find it.
+    supervisor_tools_host: str = "127.0.0.1"
+    supervisor_tools_port: int = Field(default=8790, ge=1024, le=65535)
+    supervisor_tools_url: str | None = Field(
+        default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
+    )
     # How many steps may run in sandboxes at the same time, over all runs.
     sandbox_parallel_steps: int = Field(default=4, ge=1, le=32)
     sandbox_pull_secret: str = Field(
@@ -425,6 +432,8 @@ class Settings(BaseSettings):
             raise ValueError("the evidence ingest service cannot bind to every interface")
         if self.sandbox_egress_host in every_interface:
             raise ValueError("the sandboxes' proxy cannot bind to every interface")
+        if self.supervisor_tools_host in every_interface:
+            raise ValueError("the supervisor's tool service cannot bind to every interface")
         return self
 
     @field_validator("dashboard_allowed_hosts")

@@ -39,3 +39,30 @@ spec:
       ports:
         - protocol: TCP
           port: 8888
+---
+# The sandbox of a turn of the supervisor carries the label engineering-control/tools:
+# supervisor. It may, besides the proxy, reach the platform's tool service and nothing
+# else of the control plane. Every call there needs the token of that turn.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: supervisor-tools
+  namespace: engineering-control-sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      engineering-control/tools: supervisor
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: engineering-control
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: engineering-control
+              app.kubernetes.io/component: tools
+      ports:
+        - protocol: TCP
+          port: 8790

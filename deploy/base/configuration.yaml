@@ -44,6 +44,10 @@ data:
   # looks this name up and hands the sandbox the address.
   ENGINEERING_SANDBOX_EGRESS_HOST: 0.0.0.0
   ENGINEERING_SANDBOX_EGRESS_PROXY: http://engineering-control-egress:8888
+  # The supervisor's tools (deploy/base/tools.yaml): where the service listens, and where
+  # the launcher tells a turn of the supervisor to find it, again by address.
+  ENGINEERING_SUPERVISOR_TOOLS_HOST: 0.0.0.0
+  ENGINEERING_SUPERVISOR_TOOLS_URL: http://engineering-control-tools:8790
   ENGINEERING_TEMPORAL_TARGET: engineering-control-temporal:7233
   ENGINEERING_TEMPORAL_NAMESPACE: engineering-control
   # Temporal is reached over TLS: the server must show a certificate for this name, signed

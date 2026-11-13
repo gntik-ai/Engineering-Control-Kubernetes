@@ -476,10 +476,11 @@ class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
 class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     """One piece of work wanted on a project (migration 0027).
 
-    It comes from a GitHub issue of the project's repository or is written by the
-    administrator. It is routed to one section of the project, or to none yet; the
-    section's flow is what will run for it. ``routed_by`` says who decided: a label of the
-    issue, or the administrator, whose choice a later import never changes.
+    It comes from a GitHub issue of the project's repository, is written by the
+    administrator, or is proposed by the supervisor. It is routed to one section of the
+    project, or to none yet; the section's flow is what will run for it. ``routed_by`` says
+    who decided: a label of the issue, the supervisor, or the administrator, whose choice
+    nothing else ever changes.
     """
 
     __tablename__ = "backlog_items"
@@ -494,6 +495,9 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     state: Mapped[str] = mapped_column(String(16), index=True)
     routed_by: Mapped[str | None] = mapped_column(String(16))
     routing_reason: Mapped[str | None] = mapped_column(String(300))
+    # Who proposed an item that did not come from GitHub: nobody named means the
+    # administrator wrote it; ``supervisor`` means the supervisor proposed it (migration 0031).
+    proposed_by: Mapped[str | None] = mapped_column(String(16))
     # For an item that came from GitHub: where it is, and how it looked at the last import.
     repository: Mapped[str | None] = mapped_column(String(140))
     issue_number: Mapped[int | None] = mapped_column(Integer)
@@ -1155,3 +1159,84 @@ Index(
     postgresql_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
     sqlite_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
 )
+
+
+class SupervisorDefinition(UUIDPrimaryKey, Timestamps, Base):
+    """One version of the supervisor's definition (migration 0031).
+
+    The supervisor is an agent like any other: a prompt, skills, the tools it may call and
+    how each is confirmed, and which subscription it works on. Every save is a new version;
+    the highest one is in force. Nothing here is a credential.
+    """
+
+    __tablename__ = "supervisor_definitions"
+    version: Mapped[int] = mapped_column(Integer, unique=True)
+    prompt: Mapped[str] = mapped_column(Text)
+    skills: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    tools: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # The providers it may work on, most wanted first, and optionally one account of its own.
+    providers: Mapped[list[str]] = mapped_column(JSON, default=list)
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("provider_accounts.id", ondelete="SET NULL")
+    )
+    # When set, the account above is the supervisor's alone: no other work is given it.
+    exclusive: Mapped[bool] = mapped_column(Boolean, default=False)
+    models: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    note: Mapped[str | None] = mapped_column(String(300))
+
+
+class SupervisorMessage(UUIDPrimaryKey, Timestamps, Base):
+    """One message of the conversation between the administrator and the supervisor
+    (migration 0031). There is one conversation; the console and the chat channel are two
+    ways into it. ``platform`` messages are what the platform itself adds: a decision the
+    administrator took on a proposal, a turn that could not be answered."""
+
+    __tablename__ = "supervisor_messages"
+    role: Mapped[str] = mapped_column(String(16), index=True)
+    channel: Mapped[str] = mapped_column(String(16))
+    text: Mapped[str] = mapped_column(Text)
+    # The turn that answers an administrator's message, or produced a supervisor's.
+    run_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("sandbox_runs.id", ondelete="SET NULL"), index=True
+    )
+    __table_args__ = (
+        CheckConstraint("role IN ('administrator', 'supervisor', 'platform')", name="role"),
+        CheckConstraint("channel IN ('console', 'chat', 'platform')", name="channel"),
+    )
+
+
+class SupervisorAction(UUIDPrimaryKey, Timestamps, Base):
+    """One call the supervisor made to a tool, and what became of it (migration 0031).
+
+    ``outcome`` is what the platform did with the call: ``read`` (answered), ``applied``
+    (carried out), ``pending`` (waits for the administrator), ``accepted`` or ``rejected``
+    (their answer), ``refused`` (against a rule) or ``failed``. This table is the record of
+    the supervisor's decisions.
+    """
+
+    __tablename__ = "supervisor_actions"
+    run_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("sandbox_runs.id", ondelete="SET NULL"), index=True
+    )
+    tool: Mapped[str] = mapped_column(String(40), index=True)
+    # What kind of tool it is: read, plan, operate or ask.
+    kind: Mapped[str] = mapped_column(String(16))
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome: Mapped[str] = mapped_column(String(16), index=True)
+    # What the action is, in a sentence the administrator can decide on.
+    summary: Mapped[str | None] = mapped_column(String(600))
+    reason: Mapped[str | None] = mapped_column(String(600))
+    detail: Mapped[str | None] = mapped_column(String(600))
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_via: Mapped[str | None] = mapped_column(String(16))
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('read', 'applied', 'pending', 'accepted', 'rejected', 'refused', "
+            "'failed')",
+            name="outcome",
+        ),
+        CheckConstraint("kind IN ('read', 'plan', 'operate', 'ask')", name="kind"),
+    )

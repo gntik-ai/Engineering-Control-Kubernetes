@@ -31,7 +31,10 @@ from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import pods, steps
 from engineering_control.sandbox.flows import AccountCheck, DeliverIssue, Flow, Follow
-from engineering_control.sandbox.runs import Lease, Runs, StepWork
+from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
+from engineering_control.supervisor.conversation import Conversation
+from engineering_control.supervisor.definition import Definitions
+from engineering_control.supervisor.turn import SupervisorTurn
 
 LOG = structlog.get_logger(__name__)
 PASS_SECONDS: Final = 3.0
@@ -92,21 +95,34 @@ class Launcher:
         github: GitHubApp | None = None,
         *,
         parallel_steps: int = 4,
+        conversation: Conversation | None = None,
+        tools_url: str | None = None,
     ) -> None:
         self.runs = runs
         self.cluster = cluster
         self.sandboxes = sandboxes
         self.parallel_steps = parallel_steps
         self._running = 0
-        self._proxy: tuple[str, float] | None = None
+        self._addresses: dict[str, tuple[str, float]] = {}
+        self.conversation = conversation
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
             "deliver_issue": DeliverIssue(runs, github),
         }
+        if conversation is not None:
+            self.flows[CONVERSATION] = SupervisorTurn(
+                runs,
+                conversation,
+                conversation.definitions,
+                lambda: self._address(tools_url),
+            )
 
     async def tick(self) -> int:
         """One pass over every unfinished run. Returns how many it looked at. A run whose
         step fails here is retried on the next pass; it never stops the others."""
+        if self.conversation is not None:
+            # Turns that ended without a reply are said so; messages that waited get theirs.
+            await asyncio.to_thread(self.conversation.settle)
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -148,16 +164,16 @@ class Launcher:
 
     # --- starting ------------------------------------------------------------------------
 
-    async def _sandboxes(self) -> pods.Sandboxes:
-        """The sandboxes' settings with the proxy as an address. A sandbox has no name
-        server, so the launcher looks the proxy's name up for it; the address of a service
-        stays the same for as long as the service exists."""
-        configured = self.sandboxes.proxy
-        if configured is None:
-            return self.sandboxes
+    async def _address(self, url: str | None) -> str | None:
+        """A service of the platform as http://address:port. A sandbox has no name server,
+        so the launcher looks the name up for it; the address of a service stays the same
+        for as long as the service exists."""
+        if url is None:
+            return None
         now = asyncio.get_running_loop().time()
-        if self._proxy is None or now - self._proxy[1] > PROXY_LOOKUP_SECONDS:
-            host, _, port = configured.removeprefix("http://").rpartition(":")
+        known = self._addresses.get(url)
+        if known is None or now - known[1] > PROXY_LOOKUP_SECONDS:
+            host, _, port = url.removeprefix("http://").rpartition(":")
             try:
                 ipaddress.ip_address(host)
                 address = host
@@ -166,8 +182,15 @@ class Launcher:
                     host, int(port), family=socket.AF_INET, type=socket.SOCK_STREAM
                 )
                 address = str(found[0][4][0])
-            self._proxy = (f"http://{address}:{port}", now)
-        return dataclasses.replace(self.sandboxes, proxy=self._proxy[0])
+            known = (f"http://{address}:{port}", now)
+            self._addresses[url] = known
+        return known[0]
+
+    async def _sandboxes(self) -> pods.Sandboxes:
+        """The sandboxes' settings with the proxy as an address."""
+        if self.sandboxes.proxy is None:
+            return self.sandboxes
+        return dataclasses.replace(self.sandboxes, proxy=await self._address(self.sandboxes.proxy))
 
     async def _start(self, item: StepWork) -> None:
         if self._running >= self.parallel_steps:
@@ -225,6 +248,7 @@ class Launcher:
             cpu=plan.cpu,
             memory=plan.memory,
             deadline_seconds=plan.deadline_seconds,
+            labels=plan.labels,
         )
         await self.cluster.create_pod(manifest)
         await asyncio.to_thread(self.runs.step_started, item.step_id, manifest["metadata"]["name"])
@@ -374,12 +398,15 @@ async def serve(settings: Settings | None = None) -> None:
         connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
     )
     github = GitHubApp.from_settings(resolved)
+    sessions = sessionmaker(engine, expire_on_commit=False)
     launcher = Launcher(
-        Runs(sessionmaker(engine, expire_on_commit=False)),
+        Runs(sessions),
         cluster,
         sandboxes,
         github,
         parallel_steps=resolved.sandbox_parallel_steps,
+        conversation=Conversation(sessions, Definitions(sessions)),
+        tools_url=resolved.supervisor_tools_url,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

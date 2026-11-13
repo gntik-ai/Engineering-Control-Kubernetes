@@ -1,0 +1,137 @@
+# The supervisor's tools. A turn of the supervisor runs in a sandbox, where its client is
+# given one tool server: this service. Every call carries the token the launcher issued for
+# that turn, valid only while the turn's sandbox runs, and is checked against the
+# supervisor's definition and the platform's rules before it has any effect
+# (src/engineering_control/supervisor/tools.py).
+#
+# It has the platform's database and, to read an issue's text, the GitHub App's key. It has
+# no identity towards the cluster. From outside the control plane only the sandbox of a
+# turn of the supervisor can reach it (network-policy.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineering-control-tools
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: tools
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: tools
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: tools
+    spec:
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
+      containers:
+        - name: tools
+          image: engineering-control
+          command: ["engineering-tools"]
+          ports:
+            - name: tools
+              containerPort: 8790
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: tools
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: tools
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: tools
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 160Mi
+            limits:
+              memory: 384Mi
+          volumeMounts:
+            - name: github-app
+              mountPath: /var/run/secrets/engineering-control-github-app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The GitHub App's private key: the supervisor reads the text of an issue through
+        # the platform, with a token the platform issues and never hands on.
+        - name: github-app
+          secret:
+            secretName: engineering-control-github-app
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: engineering-control-tools
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: tools
+spec:
+  selector:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: tools
+  ports:
+    - name: tools
+      port: 8790
+      targetPort: tools

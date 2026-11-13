@@ -122,3 +122,30 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+---
+# The supervisor's tools are reached, from outside the namespace, only by the sandbox of a
+# turn of the supervisor (the label engineering-control/tools: supervisor), and each call
+# still needs that turn's token.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: supervisor-tools
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: tools
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: engineering-control-sandboxes
+          podSelector:
+            matchLabels:
+              engineering-control/tools: supervisor
+      ports:
+        - protocol: TCP
+          port: 8790

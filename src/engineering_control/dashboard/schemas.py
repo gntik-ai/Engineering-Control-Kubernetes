@@ -145,6 +145,32 @@ class ActionExecuteInput(DashboardModel):
     confirmation_phrase: str | None = Field(default=None, max_length=120)
 
 
+class SupervisorMessageInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    text: str = Field(min_length=1, max_length=8000)
+
+
+class SupervisorDecisionInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    accept: bool
+
+
+class SupervisorDefinitionInput(DashboardModel):
+    """A new version of the supervisor's definition. It decides what the supervisor does
+    without asking, so saving it needs the password again."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=20000)
+    skills: list[dict[str, Any]] = Field(max_length=20)
+    tools: dict[str, dict[str, Any]]
+    providers: list[str] = Field(min_length=1, max_length=4)
+    account_id: UUID | None = None
+    exclusive: bool = False
+    models: dict[str, str] = Field(default_factory=dict)
+    note: str | None = Field(default=None, max_length=300)
+
+
 class AccountCreateInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     name: str = Field(min_length=1, max_length=200)

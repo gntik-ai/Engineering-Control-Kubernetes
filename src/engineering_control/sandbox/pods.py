@@ -106,9 +106,13 @@ def step_pod(
     cpu: str = "2",
     memory: str = "4Gi",
     deadline_seconds: int = 1800,
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """The pod of one step. ``job`` is what the runner inside executes; it holds no secret."""
+    """The pod of one step. ``job`` is what the runner inside executes. It holds no
+    credential of an account or of GitHub's that outlives the step: at most a token the
+    platform issued for this step alone and takes back when the step ends."""
     labels = {
+        **(labels or {}),
         **PART_OF,
         "app.kubernetes.io/name": "sandbox",
         "engineering-control/run": str(run_id),

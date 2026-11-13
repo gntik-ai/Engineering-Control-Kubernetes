@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from engineering_control.config import Settings
@@ -24,6 +25,10 @@ LAUNCHER_ACCOUNT = "engineering-control-launcher"
 EGRESS_LABELS = {
     "app.kubernetes.io/name": "engineering-control",
     "app.kubernetes.io/component": "egress",
+}
+TOOLS_LABELS = {
+    "app.kubernetes.io/name": "engineering-control",
+    "app.kubernetes.io/component": "tools",
 }
 PRIVATE_NETWORKS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
 SANDBOXES = BASE.parent / "sandboxes"
@@ -165,7 +170,7 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
         if document["kind"] != "Namespace":
             assert document["metadata"]["namespace"] == SANDBOX_NAMESPACE, document["kind"]
     policies = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "NetworkPolicy"}
-    assert set(policies) == {"deny-everything", "egress-internet"}
+    assert set(policies) == {"deny-everything", "egress-internet", "supervisor-tools"}
     assert policies["deny-everything"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
     # A step that may reach out reaches the platform's proxy and nothing else: no name
     # server, no public address, nothing of the cluster. Nothing is ever let in.
@@ -184,6 +189,24 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
         ],
         "ports": [{"protocol": "TCP", "port": 8888}],
     }
+    # The sandbox of a turn of the supervisor also reaches the platform's tool service,
+    # and nothing else of the control plane.
+    tools = policies["supervisor-tools"]
+    assert tools["podSelector"] == {"matchLabels": {"engineering-control/tools": "supervisor"}}
+    assert tools["policyTypes"] == ["Egress"]
+    assert tools["egress"] == [
+        {
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": "engineering-control"}
+                    },
+                    "podSelector": {"matchLabels": TOOLS_LABELS},
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 8790}],
+        }
+    ]
     assert not any("ingress" in spec for spec in policies.values())
     settings = next(
         d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
@@ -387,12 +410,76 @@ def test_sandboxes_reach_the_proxy_and_the_proxy_reaches_public_https_only() -> 
     assert settings.sandbox_egress_port == 8888
 
 
+def test_only_a_turn_of_the_supervisor_reaches_the_tool_service_from_outside() -> None:
+    documents = _documents()
+    [policy] = [
+        d["spec"]
+        for d in documents
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "supervisor-tools"
+    ]
+    assert policy["podSelector"] == {"matchLabels": TOOLS_LABELS}
+    assert policy["policyTypes"] == ["Ingress"]
+    assert policy["ingress"] == [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": SANDBOX_NAMESPACE}
+                    },
+                    "podSelector": {"matchLabels": {"engineering-control/tools": "supervisor"}},
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 8790}],
+        }
+    ]
+    # The service: the platform's image, the database, no identity towards the cluster,
+    # never on the sandboxes' node.
+    [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-tools")]
+    assert name == "Deployment/engineering-control-tools"
+    assert spec["serviceAccountName"] == "engineering-control"
+    [container] = spec["containers"]
+    assert container["command"] == ["engineering-tools"]
+    assert container["ports"] == [{"name": "tools", "containerPort": 8790}]
+    assert {entry["name"] for entry in container["env"]} == {
+        "DATABASE_USER",
+        "DATABASE_PASSWORD",
+        "ENGINEERING_DATABASE_URL",
+    }
+    deployment = next(
+        d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == name[11:]
+    )
+    assert deployment["spec"]["template"]["metadata"]["labels"] == TOOLS_LABELS
+    service = next(
+        d
+        for d in documents
+        if d["kind"] == "Service" and d["metadata"]["name"] == "engineering-control-tools"
+    )
+    assert service["spec"]["selector"] == TOOLS_LABELS
+    assert service["spec"]["ports"] == [{"name": "tools", "port": 8790, "targetPort": "tools"}]
+    data = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+    )
+    assert data["ENGINEERING_SUPERVISOR_TOOLS_URL"] == "http://engineering-control-tools:8790"
+    settings = Settings(
+        network_boundary="cluster",
+        supervisor_tools_host=data["ENGINEERING_SUPERVISOR_TOOLS_HOST"],
+        supervisor_tools_url=data["ENGINEERING_SUPERVISOR_TOOLS_URL"],
+    )
+    assert settings.supervisor_tools_port == 8790
+    with pytest.raises(ValueError, match="tool service"):
+        Settings(supervisor_tools_host="0.0.0.0")  # noqa: S104 - refused outside a cluster
+
+
 def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     documents = _documents()
     policies = [
         d
         for d in documents
-        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] != "egress-proxy"
+        if d["kind"] == "NetworkPolicy"
+        # The two a sandbox may reach have tests of their own.
+        and d["metadata"]["name"] not in {"egress-proxy", "supervisor-tools"}
     ]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]
@@ -533,9 +620,7 @@ def test_temporal_is_reached_over_tls_and_only_the_server_holds_its_key() -> Non
         assert mounts["temporal-ca"]["readOnly"] is True
 
 
-def test_only_the_console_and_the_launcher_hold_the_github_app_key_never_its_client_secret() -> (
-    None
-):
+def test_only_three_processes_hold_the_github_app_key_and_none_its_client_secret() -> None:
     documents = _documents()
     settings = next(
         d["data"]
@@ -548,10 +633,12 @@ def test_only_the_console_and_the_launcher_hold_the_github_app_key_never_its_cli
         for volume in spec.get("volumes", []):
             if volume.get("secret", {}).get("secretName") == "engineering-control-github-app":
                 holders[pod] = volume
-    # The console reads repositories and issues; the launcher checks out and publishes.
+    # The console reads repositories and issues; the launcher checks out and publishes;
+    # the supervisor's tools read the text of an issue.
     assert set(holders) == {
         "Deployment/engineering-control-console",
         "Deployment/engineering-control-launcher",
+        "Deployment/engineering-control-tools",
     }
     for pod, volume in holders.items():
         assert volume["secret"]["items"] == [{"key": "private-key.pem", "path": "private-key.pem"}]

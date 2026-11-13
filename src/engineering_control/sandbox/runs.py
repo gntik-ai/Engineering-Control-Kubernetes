@@ -28,9 +28,12 @@ from engineering_control.db.models import (
     ProviderAccount,
     SandboxRun,
     SandboxStep,
+    SupervisorDefinition,
 )
 
 ACTIVE: Final = ("queued", "running", "waiting")
+# The kind of run that is a turn of the supervisor's conversation.
+CONVERSATION: Final = "supervisor_turn"
 FINISHED: Final = ("succeeded", "failed", "cancelled")
 MAX_LOG_CHARACTERS: Final = 400_000
 # Clients that renew their sign-in in place need a volume of the account's own.
@@ -325,11 +328,28 @@ class Runs:
             )
             return bool(running or trying)
 
-    def listing(self, *, limit: int = 50) -> dict[str, Any]:
+    def listing(
+        self,
+        *,
+        limit: int = 50,
+        state: str | None = None,
+        project: str | None = None,
+        conversation: bool = False,
+    ) -> dict[str, Any]:
+        """Runs, newest first. The supervisor's turns are a conversation, not work: they
+        are listed only when asked for."""
+        query = select(SandboxRun).order_by(SandboxRun.created_at.desc())
+        query = query.where(
+            SandboxRun.kind == CONVERSATION if conversation else SandboxRun.kind != CONVERSATION
+        )
+        if state is not None:
+            query = query.where(SandboxRun.state == state)
+        if project is not None:
+            query = query.join(ProjectRecord, SandboxRun.project_id == ProjectRecord.id).where(
+                ProjectRecord.name == project
+            )
         with self.sessions() as session:
-            runs = session.scalars(
-                select(SandboxRun).order_by(SandboxRun.created_at.desc()).limit(limit)
-            ).all()
+            runs = session.scalars(query.limit(max(1, min(limit, 200)))).all()
             return {"items": [_run_row(run) for run in runs], "total": len(runs)}
 
     def get(self, run_id: UUID) -> dict[str, Any]:
@@ -423,8 +443,22 @@ class Runs:
             step = session.get(SandboxStep, step_id)
             if step is None or step.provider is None:
                 return None
-            # A step may name the providers it accepts, most wanted first.
+            # A step may name the providers it accepts, most wanted first, and an account
+            # it would rather have.
             wanted = [name for name in step.provider.split(",") if name]
+            preferred = str((step.input or {}).get("prefer_account") or "")
+            # An account that is the supervisor's own is given to no other work.
+            run = session.get(SandboxRun, step.run_id)
+            latest = session.scalar(
+                select(SupervisorDefinition).order_by(SupervisorDefinition.version.desc()).limit(1)
+            )
+            reserved = (
+                latest.account_id
+                if latest is not None
+                and latest.exclusive
+                and (run is None or run.kind != CONVERSATION)
+                else None
+            )
             using = (
                 select(SandboxStep.account_id, func.count().label("running"))
                 .where(SandboxStep.state == "running", SandboxStep.account_id.is_not(None))
@@ -445,10 +479,13 @@ class Runs:
             if step.account_id is not None:
                 query = query.where(ProviderAccount.id == step.account_id)
             candidates = sorted(
-                session.execute(query).all(), key=lambda row: wanted.index(row[0].provider)
+                session.execute(query).all(),
+                key=lambda row: (str(row[0].id) != preferred, wanted.index(row[0].provider)),
             )
             for account, running in candidates:
                 if step.account_id is None:
+                    if reserved is not None and account.id == reserved:
+                        continue
                     limited = (
                         account.state == "limited"
                         and account.limited_until is not None

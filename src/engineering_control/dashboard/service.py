@@ -17,6 +17,8 @@ from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import toolchain_for
+from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
+from engineering_control.supervisor.definition import catalogue as tool_catalogue
 
 
 class DashboardService:
@@ -261,14 +263,73 @@ class DashboardService:
 
     async def inbox(self) -> dict[str, object]:
         # An account nobody can work with stops everything, so it comes first.
-        entries = await asyncio.to_thread(
-            lambda: (
-                self.repository.runs.inbox()
-                + self.repository.accounts.inbox()
-                + self.repository.backlog.inbox()
-            )
-        )
+        entries = await asyncio.to_thread(self.repository.toolbox.inbox_entries)
         return {"items": entries, "total": len(entries)}
+
+    # --- the supervisor ------------------------------------------------------------------
+
+    async def supervisor(self, *, after: datetime | None = None) -> dict[str, object]:
+        """The conversation, whether the supervisor is answering, and what it proposed
+        that waits for the administrator."""
+
+        def read() -> dict[str, Any]:
+            listing = self.repository.conversation.listing(after=after)
+            return {**listing, "pending": self.repository.toolbox.pending()}
+
+        return await asyncio.to_thread(read)
+
+    async def say_to_supervisor(self, text: str) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: {
+                **self.repository.conversation.post(text, channel="console"),
+                "message": "console",
+            }
+        )
+
+    async def stop_supervisor(self) -> dict[str, object]:
+        def stop() -> dict[str, Any]:
+            turn = self.repository.conversation.listing(limit=1)["turn"]
+            if turn is None:
+                raise ProjectConflict("The supervisor is not answering right now")
+            return self.repository.runs.request_cancel(UUID(turn["run_id"]))
+
+        return await asyncio.to_thread(stop)
+
+    async def supervisor_settings(self) -> dict[str, object]:
+        def read() -> dict[str, Any]:
+            accounts = [
+                {key: account[key] for key in ("id", "name", "provider", "state")}
+                for account in self.repository.accounts.listing()["items"]
+            ]
+            return {
+                "definition": self.repository.definitions.current(),
+                "versions": self.repository.definitions.versions(),
+                "catalogue": tool_catalogue(),
+                "providers": list(SUPERVISOR_PROVIDERS),
+                "accounts": accounts,
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def supervisor_version(self, version: int) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.definitions.get, version)
+
+    async def save_supervisor(self, **fields: Any) -> dict[str, object]:
+        def save() -> dict[str, Any]:
+            saved = self.repository.definitions.save(**fields)
+            return {**saved, "definition": f"version {saved['version']}"}
+
+        return await asyncio.to_thread(save)
+
+    async def decide_action(self, action_id: UUID, accept: bool) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.toolbox.decide(action_id, accept=accept, via="console")
+        )
+
+    async def supervisor_record(self, *, everything: bool = False) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.toolbox.record(decisions_only=not everything)
+        )
 
     async def accounts(self) -> dict[str, object]:
         def read() -> dict[str, Any]:

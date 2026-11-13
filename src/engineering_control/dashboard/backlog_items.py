@@ -84,6 +84,7 @@ def serialize(
         "source": item.source,
         "state": item.state,
         "routed_by": item.routed_by,
+        "proposed_by": item.proposed_by,
         "routing_reason": item.routing_reason,
         "repository": item.repository,
         "issue_number": item.issue_number,
@@ -360,6 +361,61 @@ class BacklogItems:
             session.commit()
             return serialize(item, record, found)
 
+    def get(self, item_id: UUID) -> dict[str, Any]:
+        with self.sessions() as session:
+            item, record = self._item(session, item_id)
+            found = session.get(ProjectSection, item.section_id) if item.section_id else None
+            return {**serialize(item, record, found), "project_id": str(record.id)}
+
+    def propose(
+        self, project: str, *, title: str, section: str | None, reason: str
+    ) -> dict[str, Any] | None:
+        """An item the supervisor proposes. It waits, as proposed, for the administrator to
+        accept, edit or reject it. None when the project already has an open item of that
+        title: proposing it again would only repeat it."""
+        clean = clean_title(title)
+        with self.sessions() as session:
+            record = self._project(session, project)
+            found = self._section(session, record, section) if section else None
+            same = session.scalar(
+                select(func.count())
+                .select_from(BacklogItem)
+                .where(
+                    BacklogItem.project_id == record.id,
+                    func.lower(BacklogItem.title) == clean.lower(),
+                    BacklogItem.state.in_(OPEN_STATES),
+                )
+            )
+            if same:
+                return None
+            item = BacklogItem(
+                project_id=record.id,
+                section_id=found.id if found else None,
+                title=clean,
+                source="manual",
+                state="proposed",
+                proposed_by="supervisor",
+                routed_by="supervisor" if found else None,
+                routing_reason=" ".join(reason.split())[:300] or None,
+                issue_labels=[],
+            )
+            session.add(item)
+            session.commit()
+            return serialize(item, record, found)
+
+    def route_as_supervisor(self, item_id: UUID, section: str, reason: str) -> dict[str, Any]:
+        """The supervisor's choice of section, with its reason. A label of the issue that
+        names a section still decides at the next import; the administrator's own choice
+        is changed only by them."""
+        with self.sessions() as session:
+            item, record = self._item(session, item_id)
+            found = self._section(session, record, section)
+            item.section_id = found.id
+            item.routed_by = "supervisor"
+            item.routing_reason = " ".join(reason.split())[:300] or None
+            session.commit()
+            return serialize(item, record, found)
+
     def route(self, item_id: UUID, section: str | None) -> dict[str, Any]:
         """The administrator's choice of section, or of none. An import keeps it."""
         with self.sessions() as session:
@@ -440,6 +496,9 @@ class BacklogItems:
                 item.issue_updated_at = issue.updated_at
                 if item.routed_by != "administrator":
                     section, reason = route_by_labels(sections, labels)
+                    if section is None and item.routed_by == "supervisor":
+                        # No label decides: what the supervisor chose stands.
+                        continue
                     if section is not None and item.section_id != section.id:
                         counts["routed"] += 1
                     item.section_id = section.id if section else None

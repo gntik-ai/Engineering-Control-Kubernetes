@@ -35,6 +35,8 @@ class Plan:
     cpu: str = "2"
     memory: str = "4Gi"
     deadline_seconds: int = 1800
+    # Labels the pod carries beyond its own, for a network rule to select it by.
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

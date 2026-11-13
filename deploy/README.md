@@ -17,7 +17,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
 | 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
 | 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
-| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
+| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy, the supervisor's tools; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
 | 4 | API, workflow worker | The command bus and the workflow engine's worker |
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
@@ -196,6 +196,43 @@ module registries. When a project needs another host, the proxy's log says which
 
 Add the host by setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` in `base/configuration.yaml` to
 the whole list, and release.
+
+## The supervisor
+
+The supervisor is an agent the administrator talks to: in the panel that opens from the top
+bar of every page, and in chat. It is defined like any agent, and the definition is edited
+on the Supervisor page: its instructions, its skills, which tools it has and whether what
+each does is carried out at once or waits for the administrator, and the subscription it
+works on. Every save is a new version and needs the password.
+
+A message is answered by a turn: a run of kind `supervisor_turn` with one step, in a
+sandbox like any other, on a subscription account (the first provider named in the
+definition, the other when that one is limited or signed out; optionally an account kept
+for the supervisor alone). The sandbox holds the provider's client and nothing to work on.
+One turn runs at a time; messages that arrive meanwhile are answered together by the next.
+
+What the supervisor can do is decided by the platform, not by its prompt. Its client is
+given one tool server: `engineering-control-tools` (`base/tools.yaml`,
+`src/engineering_control/supervisor/`), reached directly from the turn's sandbox and from
+nothing else outside the control plane. Each call carries a token the launcher issued for
+that turn; the platform keeps only its digest, and the token opens nothing once the turn's
+sandbox has ended. For every call the service checks, in this order:
+
+- the tool is switched on in the definition the turn runs with;
+- what it names exists: a section of the item's own project, an item that is still open;
+- whether it has to wait for the administrator: because the definition says so for that
+  tool, because the supervisor said it is not sure of a section, because it would change a
+  section the administrator chose, or because the supervisor reached its limit of actions
+  without asking (40 a turn, 200 an hour).
+
+What waits is in the inbox and in the panel, with Accept and Reject; what was decided is
+said in the conversation, so the supervisor reads it on its next turn. Every call is
+recorded with its arguments, its reason and what became of it (Supervisor → Record).
+
+The supervisor reads projects, sections with their routing brief, the backlog, runs,
+accounts and the inbox; proposes backlog items; routes items to sections; and starts work
+on an item when asked. It never publishes, approves or touches a sign-in: there is no tool
+for those.
 
 ## Delivering an issue
 

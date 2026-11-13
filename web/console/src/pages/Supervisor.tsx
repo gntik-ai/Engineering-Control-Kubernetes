@@ -1,0 +1,856 @@
+import {
+  Alert,
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  EmptyState,
+  Field,
+  FieldDescription,
+  FieldLabel,
+  Input,
+  Page,
+  PasswordInput,
+  SimpleSelect,
+  Skeleton,
+  Switch,
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  Tabs,
+  TabsList,
+  TabsPanel,
+  TabsTab,
+  Textarea,
+} from "@gntik-ai/ui";
+import { History, Plus, Save, Trash2, Undo2 } from "@gntik-ai/icons";
+import { useEffect, useMemo, useState } from "react";
+import {
+  ApiError,
+  apiUrl,
+  postJson,
+  useResource,
+  type Listing,
+  type SupervisorDefinition,
+  type SupervisorRecordEntry,
+  type SupervisorSettings,
+  type SupervisorSkill,
+  type SupervisorTool,
+  type ToolMode,
+} from "../api";
+import { LoadError, RefreshButton, Rows, TableFrame, When } from "../parts";
+import { useSubmit } from "./ProjectDialogs";
+
+const PROVIDER_NAMES: Record<string, string> = {
+  claude: "Claude",
+  chatgpt: "ChatGPT",
+};
+const KINDS: Record<
+  SupervisorTool["kind"],
+  { title: string; description: string }
+> = {
+  read: {
+    title: "Read",
+    description:
+      "Looking things up. Nothing is changed, so nothing is confirmed.",
+  },
+  plan: {
+    title: "Plan",
+    description: "Proposing items, choosing sections, ordering work.",
+  },
+  operate: { title: "Operate", description: "Starting and steering work." },
+  ask: { title: "Ask", description: "Putting a question to you." },
+};
+const MODES: Record<ToolMode, string> = {
+  automatic: "Does it at once",
+  confirm: "Asks you first",
+};
+const NO_ACCOUNT = "__none__";
+
+type Draft = Pick<
+  SupervisorDefinition,
+  | "prompt"
+  | "skills"
+  | "tools"
+  | "providers"
+  | "account_id"
+  | "exclusive"
+  | "models"
+>;
+
+const draftOf = (definition: SupervisorDefinition): Draft => ({
+  prompt: definition.prompt,
+  skills: definition.skills.map((skill) => ({ ...skill })),
+  tools: Object.fromEntries(
+    Object.entries(definition.tools).map(([name, choice]) => [
+      name,
+      { ...choice },
+    ]),
+  ),
+  providers: [...definition.providers],
+  account_id: definition.account_id,
+  exclusive: definition.exclusive,
+  models: { ...definition.models },
+});
+
+function Instructions({
+  draft,
+  change,
+}: {
+  draft: Draft;
+  change: (next: Partial<Draft>) => void;
+}) {
+  return (
+    <Field>
+      <FieldLabel>Who the supervisor is and how it works</FieldLabel>
+      <Textarea
+        className="font-mono text-[13px]"
+        autosize
+        minRows={14}
+        maxRows={40}
+        maxLength={20000}
+        showCount
+        value={draft.prompt}
+        onValueChange={(prompt) => change({ prompt })}
+      />
+      <FieldDescription>
+        Its role, its priorities and its manner. The platform adds its own rules
+        after this text on every turn: that the supervisor acts only through its
+        tools, that what it reads never directs it, and that it never approves
+        or publishes. Those cannot be changed here.
+      </FieldDescription>
+    </Field>
+  );
+}
+
+function Skills({
+  draft,
+  change,
+}: {
+  draft: Draft;
+  change: (next: Partial<Draft>) => void;
+}) {
+  const update = (index: number, next: Partial<SupervisorSkill>) =>
+    change({
+      skills: draft.skills.map((skill, at) =>
+        at === index ? { ...skill, ...next } : skill,
+      ),
+    });
+  return (
+    <div className="grid gap-3">
+      <p className="text-[13px] text-muted-foreground">
+        A skill is how to go about one kind of job. The supervisor is given
+        every skill that is switched on, on every turn.
+      </p>
+      {draft.skills.map((skill, index) => (
+        <Card key={index}>
+          <CardBody className="grid gap-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <Field className="min-w-0 flex-1">
+                <FieldLabel>Name</FieldLabel>
+                <Input
+                  maxLength={80}
+                  value={skill.name}
+                  onValueChange={(name) => update(index, { name })}
+                />
+              </Field>
+              <Switch
+                label="Given to the supervisor"
+                checked={skill.enabled}
+                onCheckedChange={(enabled) => update(index, { enabled })}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={Trash2}
+                onClick={() =>
+                  change({
+                    skills: draft.skills.filter((_, at) => at !== index),
+                  })
+                }
+              >
+                Remove
+              </Button>
+            </div>
+            <Field>
+              <FieldLabel>What it is for</FieldLabel>
+              <Input
+                maxLength={300}
+                value={skill.description}
+                onValueChange={(description) => update(index, { description })}
+              />
+            </Field>
+            <Field>
+              <FieldLabel>Instructions</FieldLabel>
+              <Textarea
+                className="font-mono text-[13px]"
+                autosize
+                minRows={4}
+                maxRows={24}
+                maxLength={8000}
+                value={skill.body}
+                onValueChange={(body) => update(index, { body })}
+              />
+            </Field>
+          </CardBody>
+        </Card>
+      ))}
+      <div>
+        <Button
+          variant="secondary"
+          size="sm"
+          icon={Plus}
+          disabled={draft.skills.length >= 20}
+          onClick={() =>
+            change({
+              skills: [
+                ...draft.skills,
+                { key: "", name: "", description: "", body: "", enabled: true },
+              ],
+            })
+          }
+        >
+          Add a skill
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function Tools({
+  draft,
+  catalogue,
+  change,
+}: {
+  draft: Draft;
+  catalogue: SupervisorTool[];
+  change: (next: Partial<Draft>) => void;
+}) {
+  const set = (
+    name: string,
+    next: Partial<{ enabled: boolean; mode: ToolMode }>,
+  ) =>
+    change({
+      tools: { ...draft.tools, [name]: { ...draft.tools[name]!, ...next } },
+    });
+  const kinds = (Object.keys(KINDS) as SupervisorTool["kind"][]).filter(
+    (kind) => catalogue.some((tool) => tool.kind === kind),
+  );
+  return (
+    <div className="grid gap-5">
+      <p className="text-[13px] text-muted-foreground">
+        The tools are what the supervisor can do at all; the platform checks
+        every call. Switch a tool off and the supervisor does not have it. For a
+        tool that changes something, choose whether it is done at once or waits
+        for your answer in the inbox. Some things wait whatever is chosen here:
+        a section the supervisor is not sure about, a change to a section you
+        chose, and anything past its limit of actions without asking.
+      </p>
+      {kinds.map((kind) => (
+        <section key={kind} className="grid gap-2">
+          <div>
+            <h2 className="text-sm font-medium">{KINDS[kind].title}</h2>
+            <p className="text-[13px] text-muted-foreground">
+              {KINDS[kind].description}
+            </p>
+          </div>
+          <TableFrame>
+            <Table>
+              <TableCaption className="sr-only">
+                {KINDS[kind].title} tools
+              </TableCaption>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Tool</TableHead>
+                  <TableHead className="w-40">Available</TableHead>
+                  <TableHead className="w-56">When it is called</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {catalogue
+                  .filter((tool) => tool.kind === kind)
+                  .map((tool) => {
+                    const choice = draft.tools[tool.name] ?? {
+                      enabled: true,
+                      mode: tool.default_mode,
+                    };
+                    return (
+                      <TableRow key={tool.name}>
+                        <TableCell>
+                          <div className="font-medium">{tool.title}</div>
+                          <div className="text-[12px] text-muted-foreground">
+                            {tool.description}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <Switch
+                            aria-label={`${tool.title}: available`}
+                            checked={choice.enabled}
+                            onCheckedChange={(enabled) =>
+                              set(tool.name, { enabled })
+                            }
+                          />
+                        </TableCell>
+                        <TableCell>
+                          {tool.modes.length > 1 ? (
+                            <SimpleSelect
+                              aria-label={`${tool.title}: when it is called`}
+                              size="sm"
+                              disabled={!choice.enabled}
+                              items={tool.modes.map((mode) => ({
+                                value: mode,
+                                label: MODES[mode],
+                              }))}
+                              value={choice.mode}
+                              onValueChange={(mode) =>
+                                mode &&
+                                set(tool.name, { mode: mode as ToolMode })
+                              }
+                            />
+                          ) : (
+                            <span className="text-[13px] text-muted-foreground">
+                              Answered at once
+                            </span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+              </TableBody>
+            </Table>
+          </TableFrame>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function Subscription({
+  draft,
+  settings,
+  change,
+}: {
+  draft: Draft;
+  settings: SupervisorSettings;
+  change: (next: Partial<Draft>) => void;
+}) {
+  const first = draft.providers[0] ?? settings.providers[0] ?? "claude";
+  const others = settings.providers.filter((name) => name !== first);
+  const fallback = draft.providers.length > 1;
+  const accounts = settings.accounts.filter((account) =>
+    draft.providers.includes(account.provider),
+  );
+  const setProviders = (providers: string[]) => {
+    const account = settings.accounts.find(
+      (item) => item.id === draft.account_id,
+    );
+    const kept = account && providers.includes(account.provider);
+    change({
+      providers,
+      account_id: kept ? draft.account_id : null,
+      exclusive: kept ? draft.exclusive : false,
+    });
+  };
+  return (
+    <div className="grid max-w-2xl gap-5">
+      <p className="text-[13px] text-muted-foreground">
+        The supervisor works on a subscription, like every agent here; no API
+        key is used. Each of its turns takes an account for as long as the turn
+        runs.
+      </p>
+      <Field>
+        <FieldLabel>Provider</FieldLabel>
+        <SimpleSelect
+          aria-label="Provider"
+          className="w-64"
+          items={settings.providers.map((name) => ({
+            value: name,
+            label: PROVIDER_NAMES[name] ?? name,
+          }))}
+          value={first}
+          onValueChange={(name) =>
+            name &&
+            setProviders(
+              fallback
+                ? [name, ...settings.providers.filter((p) => p !== name)]
+                : [name],
+            )
+          }
+        />
+      </Field>
+      <Switch
+        label={`Fall back to ${others.map((name) => PROVIDER_NAMES[name] ?? name).join(" or ")} when it is limited or signed out`}
+        checked={fallback}
+        onCheckedChange={(on) =>
+          setProviders(on ? [first, ...others] : [first])
+        }
+      />
+      <Field>
+        <FieldLabel>Account</FieldLabel>
+        <SimpleSelect
+          aria-label="Account"
+          className="w-64"
+          items={[
+            { value: NO_ACCOUNT, label: "Whichever is free" },
+            ...accounts.map((account) => ({
+              value: account.id,
+              label: `${account.name} (${PROVIDER_NAMES[account.provider] ?? account.provider})`,
+            })),
+          ]}
+          value={draft.account_id ?? NO_ACCOUNT}
+          onValueChange={(value) => {
+            const account_id = !value || value === NO_ACCOUNT ? null : value;
+            change({
+              account_id,
+              exclusive: account_id ? draft.exclusive : false,
+            });
+          }}
+        />
+        <FieldDescription>
+          With an account chosen, the supervisor takes it first whenever it is
+          free and falls back to the others.
+        </FieldDescription>
+      </Field>
+      <Switch
+        label="Keep this account for the supervisor alone"
+        disabled={!draft.account_id}
+        checked={draft.exclusive}
+        onCheckedChange={(exclusive) => change({ exclusive })}
+      />
+      <p className="-mt-3 text-[13px] text-muted-foreground">
+        No run of work is then given this account, so the supervisor answers
+        even while every other account is busy or limited. Work that needs two
+        providers still needs an account of each among the others.
+      </p>
+      {draft.providers.map((name) => (
+        <Field key={name}>
+          <FieldLabel>Model on {PROVIDER_NAMES[name] ?? name}</FieldLabel>
+          <Input
+            className="w-64"
+            maxLength={60}
+            placeholder="The client's default"
+            value={draft.models[name] ?? ""}
+            onValueChange={(value) =>
+              change({ models: { ...draft.models, [name]: value } })
+            }
+          />
+          <FieldDescription>
+            Leave empty to use the model the provider's client chooses by
+            itself.
+          </FieldDescription>
+        </Field>
+      ))}
+    </div>
+  );
+}
+
+function Versions({
+  settings,
+  onLoad,
+}: {
+  settings: SupervisorSettings;
+  onLoad: (version: number) => void;
+}) {
+  if (settings.versions.length === 0) {
+    return (
+      <EmptyState
+        icon={History}
+        title="Nothing was saved yet"
+        description="The supervisor runs on the platform's own definition. Every save becomes a version listed here."
+      />
+    );
+  }
+  return (
+    <TableFrame>
+      <Table>
+        <TableCaption className="sr-only">
+          Versions of the definition
+        </TableCaption>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-28">Version</TableHead>
+            <TableHead>What changed</TableHead>
+            <TableHead className="w-44">Saved</TableHead>
+            <TableHead className="w-48" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {settings.versions.map((item) => (
+            <TableRow key={item.version}>
+              <TableCell>
+                <span className="font-medium">{item.version}</span>{" "}
+                {item.version === settings.definition.version ? (
+                  <Badge tone="success" size="sm">
+                    In force
+                  </Badge>
+                ) : null}
+              </TableCell>
+              <TableCell className="text-[13px]">
+                {item.note ?? <span className="text-muted-foreground">—</span>}
+              </TableCell>
+              <TableCell>
+                <When value={item.saved_at} />
+              </TableCell>
+              <TableCell className="text-right">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={Undo2}
+                  onClick={() => onLoad(item.version)}
+                >
+                  Load into the editor
+                </Button>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </TableFrame>
+  );
+}
+
+const OUTCOMES: Record<
+  SupervisorRecordEntry["outcome"],
+  {
+    label: string;
+    tone: "neutral" | "success" | "warning" | "destructive" | "info";
+  }
+> = {
+  read: { label: "Read", tone: "neutral" },
+  applied: { label: "Done at once", tone: "success" },
+  pending: { label: "Waits for you", tone: "warning" },
+  accepted: { label: "You accepted", tone: "success" },
+  rejected: { label: "You rejected", tone: "neutral" },
+  refused: { label: "Refused by the platform", tone: "destructive" },
+  failed: { label: "Failed", tone: "destructive" },
+};
+
+function RecordTable() {
+  const record = useResource<Listing<SupervisorRecordEntry>>(
+    apiUrl("supervisor/record"),
+    30_000,
+  );
+  return (
+    <div className="grid gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[13px] text-muted-foreground">
+          Every action the supervisor took or proposed, newest first, with its
+          reason and what became of it.
+        </p>
+        <RefreshButton resource={record} />
+      </div>
+      <LoadError resource={record} />
+      <TableFrame>
+        <Table>
+          <TableCaption className="sr-only">
+            What the supervisor did
+          </TableCaption>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Action</TableHead>
+              <TableHead className="w-44">What became of it</TableHead>
+              <TableHead>Why</TableHead>
+              <TableHead className="w-40">When</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <Rows
+              resource={record}
+              columns={4}
+              empty="The supervisor has not acted yet"
+            >
+              {(items) =>
+                items.map((entry) => (
+                  <TableRow key={entry.id}>
+                    <TableCell className="max-w-md">
+                      <div className="font-medium">
+                        {entry.summary ?? entry.title}
+                      </div>
+                      <div className="text-[12px] text-muted-foreground">
+                        {entry.title}
+                        {entry.project_name ? ` · ${entry.project_name}` : ""}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge tone={OUTCOMES[entry.outcome].tone} size="sm">
+                        {OUTCOMES[entry.outcome].label}
+                      </Badge>
+                      {entry.decided_via ? (
+                        <div className="mt-1 text-[12px] text-muted-foreground">
+                          in the {entry.decided_via}
+                        </div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="max-w-md text-[13px]">
+                      {entry.reason ?? (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                      {entry.detail ? (
+                        <div className="text-[12px] text-muted-foreground">
+                          {entry.detail}
+                        </div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      <When value={entry.at} />
+                    </TableCell>
+                  </TableRow>
+                ))
+              }
+            </Rows>
+          </TableBody>
+        </Table>
+      </TableFrame>
+    </div>
+  );
+}
+
+function SaveDialog({
+  draft,
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  draft: Draft;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [note, setNote] = useState("");
+  const { pending, problem, submit, reset } = useSubmit(
+    () =>
+      postJson("supervisor/settings", {
+        ...draft,
+        models: Object.fromEntries(
+          Object.entries(draft.models).filter(([, value]) => value.trim()),
+        ),
+        note: note.trim() || null,
+        current_password: password,
+      }),
+    () => {
+      onSaved();
+      onOpenChange(false);
+    },
+  );
+  useEffect(() => {
+    if (!open) return;
+    setPassword("");
+    reset();
+    // Only when it opens: the password field and the last error are cleared.
+  }, [open]);
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Save a new version?</AlertDialogTitle>
+          <AlertDialogDescription>
+            The supervisor works by it from its next turn. It decides what the
+            supervisor does without asking you, so saving it needs your
+            password.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {problem ? <Alert tone="destructive" title={problem} /> : null}
+        <Field>
+          <FieldLabel>What changed</FieldLabel>
+          <Input
+            maxLength={300}
+            placeholder="Optional, for the list of versions"
+            value={note}
+            onValueChange={setNote}
+          />
+        </Field>
+        <Field>
+          <FieldLabel>Your password, to confirm</FieldLabel>
+          <PasswordInput
+            name="current_password"
+            autoComplete="current-password"
+            maxLength={128}
+            value={password}
+            onValueChange={setPassword}
+          />
+        </Field>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Not yet</AlertDialogCancel>
+          <Button
+            loading={pending}
+            disabled={!password}
+            onClick={() => void submit()}
+          >
+            Save version
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+export function SupervisorPage() {
+  const settings = useResource<SupervisorSettings>(
+    apiUrl("supervisor/settings"),
+  );
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [loadedFrom, setLoadedFrom] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [tab, setTab] = useState("instructions");
+  const definition = settings.data?.definition;
+  // The editor starts from the definition in force, and again after every save.
+  useEffect(() => {
+    if (definition) {
+      setDraft(draftOf(definition));
+      setLoadedFrom(null);
+    }
+  }, [definition?.version]);
+  const dirty = useMemo(
+    () =>
+      Boolean(
+        definition &&
+        draft &&
+        JSON.stringify(draftOf(definition)) !== JSON.stringify(draft),
+      ),
+    [definition, draft],
+  );
+  const change = (next: Partial<Draft>) =>
+    setDraft((previous) => (previous ? { ...previous, ...next } : previous));
+  const load = (version: number) => {
+    setProblem(null);
+    fetch(apiUrl(`supervisor/versions/${version}`), {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    })
+      .then(async (response) => {
+        if (!response.ok)
+          throw new ApiError(
+            `The version could not be read (${response.status}).`,
+            response.status,
+          );
+        setDraft(draftOf((await response.json()) as SupervisorDefinition));
+        setLoadedFrom(version);
+        setTab("instructions");
+      })
+      .catch((error: unknown) =>
+        setProblem(
+          error instanceof Error
+            ? error.message
+            : "The version could not be read.",
+        ),
+      );
+  };
+  const data = settings.data;
+  return (
+    <Page
+      title="Supervisor"
+      description="The agent you talk to in the panel and in chat: what it is told, what it can do, and what it did."
+      actionBar={
+        dirty && draft ? (
+          <div className="flex w-full flex-wrap items-center justify-end gap-3">
+            <span className="mr-auto text-[13px] text-muted-foreground">
+              {loadedFrom
+                ? `Version ${loadedFrom} is in the editor. Saving it makes it the newest version.`
+                : "There are changes that are not saved."}
+            </span>
+            <Button
+              variant="secondary"
+              onClick={() =>
+                definition &&
+                (setDraft(draftOf(definition)), setLoadedFrom(null))
+              }
+            >
+              Discard
+            </Button>
+            <Button
+              icon={Save}
+              disabled={!draft.prompt.trim()}
+              onClick={() => setSaving(true)}
+            >
+              Save as a new version
+            </Button>
+          </div>
+        ) : undefined
+      }
+      actionBarLabel="Save the definition"
+    >
+      <div className="grid gap-4">
+        <LoadError resource={settings} />
+        {problem ? (
+          <Alert
+            tone="destructive"
+            title={problem}
+            onDismiss={() => setProblem(null)}
+          />
+        ) : null}
+        {data && draft ? (
+          <>
+            <p className="text-[13px] text-muted-foreground">
+              {data.definition.version === 0
+                ? "In force: the platform’s own definition. Nothing has been saved yet."
+                : `In force: version ${data.definition.version}${data.definition.note ? ` (${data.definition.note})` : ""}.`}
+            </p>
+            <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
+              <TabsList aria-label="Supervisor">
+                <TabsTab value="instructions">Instructions</TabsTab>
+                <TabsTab
+                  value="skills"
+                  count={draft.skills.filter((skill) => skill.enabled).length}
+                >
+                  Skills
+                </TabsTab>
+                <TabsTab value="tools">Tools</TabsTab>
+                <TabsTab value="subscription">Subscription</TabsTab>
+                <TabsTab
+                  value="versions"
+                  count={data.versions.length || undefined}
+                >
+                  Versions
+                </TabsTab>
+                <TabsTab value="record">Record</TabsTab>
+              </TabsList>
+              <TabsPanel value="instructions" className="pt-4">
+                <Instructions draft={draft} change={change} />
+              </TabsPanel>
+              <TabsPanel value="skills" className="pt-4">
+                <Skills draft={draft} change={change} />
+              </TabsPanel>
+              <TabsPanel value="tools" className="pt-4">
+                <Tools
+                  draft={draft}
+                  catalogue={data.catalogue}
+                  change={change}
+                />
+              </TabsPanel>
+              <TabsPanel value="subscription" className="pt-4">
+                <Subscription draft={draft} settings={data} change={change} />
+              </TabsPanel>
+              <TabsPanel value="versions" className="pt-4">
+                <Versions settings={data} onLoad={load} />
+              </TabsPanel>
+              <TabsPanel value="record" className="pt-4">
+                <RecordTable />
+              </TabsPanel>
+            </Tabs>
+            <SaveDialog
+              draft={draft}
+              open={saving}
+              onOpenChange={setSaving}
+              onSaved={settings.reload}
+            />
+          </>
+        ) : (
+          !settings.error && <Skeleton className="h-96 w-full" />
+        )}
+      </div>
+    </Page>
+  );
+}
