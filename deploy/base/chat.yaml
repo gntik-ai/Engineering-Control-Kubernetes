@@ -70,6 +70,11 @@ spec:
                   key: password
             - name: ENGINEERING_DATABASE_URL
               value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+            # Telegram's address holds the bot's token, and the HTTP client names the address
+            # of every request at the informational level. This process therefore logs
+            # warnings and errors only, whatever the platform's level is.
+            - name: ENGINEERING_LOG_LEVEL
+              value: WARNING
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
