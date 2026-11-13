@@ -20,6 +20,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    application_host,
     paused_refusal,
 )
 from engineering_control.db.models import (
@@ -1153,6 +1154,15 @@ def application_of(project: ProjectRecord) -> dict[str, Any]:
     whether a test identity is stored, and the Secret that holds it. Never the identity."""
     return {
         "url": project.application_url,
+        # Every host a step that looks at the application may reach: the address's own
+        # and the others the project names.
+        "hosts": [
+            host
+            for host in dict.fromkeys(
+                [application_host(project.application_url), *(project.application_hosts or [])]
+            )
+            if host
+        ],
         "identity": project.application_identity_at is not None,
         "secret": identity_secret(project.id),
     }

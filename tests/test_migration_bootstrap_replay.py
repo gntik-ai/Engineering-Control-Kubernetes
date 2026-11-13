@@ -94,10 +94,13 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
-    # 0038: whether a test identity is stored for a project's application.
-    assert "application_identity_at" in {c["name"] for c in inspect(engine).get_columns("projects")}
+    # 0038: the other hosts of a project's application, and whether a test identity is
+    # stored for it.
+    assert {"application_identity_at", "application_hosts"} <= {
+        c["name"] for c in inspect(engine).get_columns("projects")
+    }
     command.downgrade(config, parent)
-    assert "application_identity_at" not in {
+    assert not {"application_identity_at", "application_hosts"} & {
         c["name"] for c in inspect(engine).get_columns("projects")
     }
     parent = "0036"

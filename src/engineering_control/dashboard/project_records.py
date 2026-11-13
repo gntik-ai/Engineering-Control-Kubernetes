@@ -204,16 +204,25 @@ class ProjectRecords:
             return serialize(record)
 
     def set_application(
-        self, name: str, *, url: str | None, identity: bool | None = None
+        self,
+        name: str,
+        *,
+        url: str | None,
+        hosts: Any = None,
+        identity: bool | None = None,
     ) -> dict[str, Any]:
-        """Where the project's application runs, for flows that look at it in a browser.
-        ``identity`` says whether a test identity is stored now; None leaves that as it is."""
+        """Where the project's application runs, for flows that look at it in a browser,
+        and the other hosts it uses. ``identity`` says whether a test identity is stored
+        now; None leaves that as it is, as None for ``hosts`` leaves the hosts."""
         address = clean_application_url(url)
         with self.sessions() as session:
             record = self._active(session, name)
             record.application_url = address
+            if hosts is not None:
+                record.application_hosts = clean_application_hosts(hosts) or None
             if address is None:
                 identity = False
+                record.application_hosts = None
             if identity is not None:
                 record.application_identity_at = datetime.now(UTC) if identity else None
             session.commit()
@@ -290,6 +299,7 @@ def serialize(record: ProjectRecord) -> dict[str, Any]:
         "paused": paused(record),
         "application": {
             "url": record.application_url,
+            "hosts": list(record.application_hosts or []),
             "identity": record.application_identity_at is not None,
         }
         if record.application_url
@@ -326,6 +336,37 @@ def clean_application_url(url: str | None) -> str | None:
 
 def application_host(url: str | None) -> str | None:
     return (urlsplit(url).hostname or "").lower() or None if url else None
+
+
+APPLICATION_HOST_PATTERN: Final = re.compile(
+    r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+MAX_APPLICATION_HOSTS: Final = 8
+
+
+def clean_application_hosts(hosts: Any) -> list[str]:
+    """The other hosts an application uses, as they are kept: names, or every host under
+    a domain of at least two parts (``*.staging.example.com``), a few at most."""
+    if isinstance(hosts, str):
+        hosts = re.split(r"[\s,]+", hosts)
+    if not isinstance(hosts, list):
+        raise ProjectInvalid("The other hosts are given as a list of names")
+    found: list[str] = []
+    for entry in hosts:
+        host = str(entry or "").strip().lower().rstrip(".")
+        if not host or host in found:
+            continue
+        if not APPLICATION_HOST_PATTERN.fullmatch(host):
+            raise ProjectInvalid(f"{host} is not a host's name")
+        if host.startswith("*.") and host.count(".") < 3:
+            raise ProjectInvalid(
+                f"{host} is too wide: name the hosts, or a domain of the application's own "
+                "such as *.staging.example.com"
+            )
+        found.append(host)
+    if len(found) > MAX_APPLICATION_HOSTS:
+        raise ProjectInvalid(f"An application has at most {MAX_APPLICATION_HOSTS} other hosts")
+    return found
 
 
 def paused(record: ProjectRecord) -> dict[str, Any] | None:

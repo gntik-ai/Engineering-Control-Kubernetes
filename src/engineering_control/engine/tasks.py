@@ -656,7 +656,9 @@ def _browsing(ctx: Context, plan: Plan) -> Plan:
     return dataclasses.replace(
         plan,
         job=job,
-        application_host=application_host(url),
+        application_hosts=tuple(
+            str(host) for host in (application.get("hosts") or [application_host(url)]) if host
+        ),
         identity_secret=str(application["secret"])
         if application.get("identity") and application.get("secret")
         else None,

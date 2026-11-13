@@ -125,6 +125,8 @@ class ProjectApplicationInput(DashboardModel):
 
     csrf_token: str = Field(min_length=20, max_length=200)
     url: str = Field(default="", max_length=300)
+    # The other hosts the application uses: its API, where it signs in.
+    hosts: list[str] | None = Field(default=None, max_length=16)
     username: str = Field(default="", max_length=200)
     password: str = Field(default="", max_length=400)
     forget_identity: bool = False

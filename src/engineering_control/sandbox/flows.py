@@ -35,9 +35,9 @@ class Plan:
     deadline_seconds: int = 1800
     # Labels the pod carries beyond its own, for a network rule to select it by.
     labels: dict[str, str] = field(default_factory=dict)
-    # For a step that looks at a project's application in a browser: the host it may
+    # For a step that looks at a project's application in a browser: the hosts it may
     # reach beyond the proxy's list, and the Secret that holds the test identity.
-    application_host: str | None = None
+    application_hosts: tuple[str, ...] = ()
     identity_secret: str | None = None
 
 

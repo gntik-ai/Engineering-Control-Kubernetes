@@ -31,17 +31,31 @@ export function ApplicationCard({
   onChanged: () => void;
 }) {
   const [url, setUrl] = useState(application?.url ?? '');
+  const [hosts, setHosts] = useState((application?.hosts ?? []).join(', '));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   useEffect(() => setUrl(application?.url ?? ''), [application?.url]);
+  const kept = (application?.hosts ?? []).join(', ');
+  useEffect(() => setHosts(kept), [kept]);
+  const named = hosts
+    .split(/[\s,]+/)
+    .map((host) => host.trim())
+    .filter(Boolean);
   const done = () => {
     setUsername('');
     setPassword('');
     onChanged();
   };
-  const save = useSubmit(() => postJson(`projects/${project}/application`, { url, username, password }), done);
-  const forget = useSubmit(() => postJson(`projects/${project}/application`, { url, forget_identity: true }), done);
-  const changed = url.trim() !== (application?.url ?? '') || username !== '' || password !== '';
+  const save = useSubmit(
+    () => postJson(`projects/${project}/application`, { url, hosts: named, username, password }),
+    done,
+  );
+  const forget = useSubmit(
+    () => postJson(`projects/${project}/application`, { url, hosts: named, forget_identity: true }),
+    done,
+  );
+  const changed =
+    url.trim() !== (application?.url ?? '') || named.join(', ') !== kept || username !== '' || password !== '';
   const half = (username === '') !== (password === '');
   return (
     <Card>
@@ -88,6 +102,21 @@ export function ApplicationCard({
             inputClassName="font-mono"
           />
           <FieldDescription>Empty for a project without a running application.</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel>Other hosts it uses</FieldLabel>
+          <Input
+            maxLength={600}
+            placeholder="api.staging.example.com, iam.staging.example.com"
+            value={hosts}
+            onValueChange={setHosts}
+            inputClassName="font-mono"
+          />
+          <FieldDescription>
+            Where its pages fetch from and where it signs in, when those are other hosts than the address: names
+            separated by commas, or every host under a domain of the application’s own, such as *.staging.example.com. A
+            browser in a sandbox reaches these and the address, and nothing else.
+          </FieldDescription>
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field>

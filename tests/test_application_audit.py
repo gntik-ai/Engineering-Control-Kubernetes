@@ -19,6 +19,7 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     ProjectRecords,
     application_host,
+    clean_application_hosts,
     clean_application_url,
 )
 from engineering_control.dashboard.project_sections import SectionRecords
@@ -56,6 +57,21 @@ def test_an_applications_address_is_https_a_host_by_name_and_carries_no_sign_in(
             clean_application_url(wrong)
     assert application_host("https://staging.example.com/app") == "staging.example.com"
     assert application_host(None) is None
+    # The other hosts an application uses: names, or the hosts under a domain of its own.
+    assert clean_application_hosts(" API.staging.example.com, *.cdn.staging.example.com\n") == [
+        "api.staging.example.com",
+        "*.cdn.staging.example.com",
+    ]
+    assert clean_application_hosts([]) == [] and clean_application_hosts("") == []
+    for wrong, said in (
+        (["*.example.com"], "too wide"),
+        (["*.com"], "not a host's name"),
+        (["https://api.example.com"], "not a host's name"),
+        (["10.0.0.7"], "not a host's name"),
+        ([f"h{n}.example.com" for n in range(9)], "at most 8"),
+    ):
+        with pytest.raises(ProjectInvalid, match=said):
+            clean_application_hosts(wrong)
 
 
 def test_the_tasks_that_look_at_the_application_say_so() -> None:
@@ -79,7 +95,11 @@ def test_the_tasks_that_look_at_the_application_say_so() -> None:
         "repository": REPOSITORY,
         "base_sha": "a" * 40,
         "max_findings": 8,
-        "application": {"url": "https://staging.example.com/", "identity": True},
+        "application": {
+            "url": "https://staging.example.com/",
+            "hosts": ["staging.example.com", "iam.example.com"],
+            "identity": True,
+        },
         "scope": {"title": "", "text": "The sign-in page"},
     }
     told = CONTRACTS["application_auditor"].render(
@@ -88,6 +108,7 @@ def test_the_tasks_that_look_at_the_application_say_so() -> None:
     assert told.startswith(f"Look at {REPOSITORY}.")
     assert "The application runs at https://staging.example.com/" in told
     assert "require('sandbox-browser')" in told
+    assert "can be reached (staging.example.com, iam.example.com)" in told
     assert "/run/application/username and /run/application/password" in told
     assert "never print the password" in told
     assert "<scope>\nThe sign-in page\n</scope>" in told
@@ -161,7 +182,11 @@ async def test_the_identity_goes_to_the_cluster_and_the_record_only_says_there_i
     assert kept == {}
 
     set_ = await change(url="https://staging.example.com/app")
-    assert set_["application"] == {"url": "https://staging.example.com/app", "identity": False}
+    assert set_["application"] == {
+        "url": "https://staging.example.com/app",
+        "hosts": [],
+        "identity": False,
+    }
     stored = await change(url="https://staging.example.com/app", username="tester", password=secret)
     assert stored["application"]["identity"] is True
     project_id = ProjectRecords(world.sessions).identity_of(PROJECT)
@@ -171,8 +196,14 @@ async def test_the_identity_goes_to_the_cluster_and_the_record_only_says_there_i
     # The record holds the address and that there is an identity: never the identity.
     assert "s3cret" not in json.dumps(stored) and "tester" not in json.dumps(stored)
     # Changing the address keeps the identity; forgetting it takes it out of the cluster.
-    moved = await change(url="https://app.example.com")
-    assert moved["application"] == {"url": "https://app.example.com/", "identity": True}
+    moved = await change(url="https://app.example.com", hosts=["iam.example.com"])
+    assert moved["application"] == {
+        "url": "https://app.example.com/",
+        "hosts": ["iam.example.com"],
+        "identity": True,
+    }
+    with pytest.raises(ProjectInvalid, match="too wide"):
+        await change(url="https://app.example.com", hosts=["*.example.com"])
     forgotten = await change(url="https://app.example.com", forget_identity=True)
     assert forgotten["application"]["identity"] is False and kept == {}
     # Without an address there is no application, and no identity either.
@@ -205,13 +236,19 @@ async def test_a_ui_audit_looks_at_the_application_and_proposes_what_is_confirme
     # Nothing to look at until the project says where its application runs.
     with pytest.raises(ProjectInvalid, match="where the project's application runs"):
         world.runs.start_for_section(PROJECT, "ui-audit", scope="", toolchain={})
-    projects.set_application(PROJECT, url="https://staging.example.com/app", identity=True)
+    projects.set_application(
+        PROJECT,
+        url="https://staging.example.com/app",
+        hosts=["iam.example.com", "*.api.staging.example.com"],
+        identity=True,
+    )
 
     run = world.runs.start_for_section(PROJECT, "ui-audit", scope="The sign-in page", toolchain={})
     assert (run["kind"], run["title"]) == ("flow", "UI audit: The sign-in page")
     project_id = projects.identity_of(PROJECT)
     assert run["data"]["application"] == {
         "url": "https://staging.example.com/app",
+        "hosts": ["staging.example.com", "iam.example.com", "*.api.staging.example.com"],
         "identity": True,
         "secret": f"application-{project_id}",
     }
@@ -228,8 +265,9 @@ async def test_a_ui_audit_looks_at_the_application_and_proposes_what_is_confirme
     assert agent["env"]["APPLICATION_URL"] == "https://staging.example.com/app"
     assert "tester" not in json.dumps(job) and 'password":' not in json.dumps(job)
     env = {entry["name"]: entry["value"] for entry in pod["spec"]["containers"][0]["env"]}
-    assert granted(KEY, env["SANDBOX_BROWSER_GRANT"], "staging.example.com")
-    assert not granted(KEY, env["SANDBOX_BROWSER_GRANT"], "github.com"), "that one host only"
+    for host in ("staging.example.com", "iam.example.com", "v2.api.staging.example.com"):
+        assert granted(KEY, env["SANDBOX_BROWSER_GRANT"], host), host
+    assert not granted(KEY, env["SANDBOX_BROWSER_GRANT"], "github.com"), "those hosts only"
     volume = next(v for v in pod["spec"]["volumes"] if v["name"] == "identity")
     assert volume["secret"] == {
         "secretName": f"application-{project_id}",

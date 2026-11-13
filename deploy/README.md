@@ -210,7 +210,7 @@ the whole list, and release.
 
 One kind of host is never on the list: where a project's own application runs, which a
 step that looks at the application in a browser has to reach. The launcher gives such a
-step a grant for that one host, good for the step's time and signed with a key that only
+step a grant for the hosts the project names, good for the step's time and signed with a key that only
 the launcher and the proxy hold (`egress-grant.key` of the service Secret, which the
 bootstrap job generates). The browser presents the grant with its tunnel request; the
 proxy checks the signature, the host and the time, and knows nothing of projects. The
@@ -540,12 +540,14 @@ other.
 **UI audit** and **UX audit** look at the project's application as it runs. One agent
 goes through it in a browser, the other subscription repeats each finding in a browser
 of its own, and what holds becomes an item. They need to know where the application
-runs: the project's page has an Application card for the address (https, a public host)
-and, where a sign-in is needed, a test identity. The identity is stored as a Secret of
+runs: the project's page has an Application card for the address (https, a public host),
+the other hosts the application uses (where its pages fetch from, where it signs in:
+names, or every host under a domain of its own), and, where a sign-in is needed, a test
+identity. The identity is stored as a Secret of
 the sandbox namespace (`application-<project id>`), mounted as files into the steps
 that look at that application and nowhere else, and never shown again; the record only
 says that there is one. Use an identity made for testing: the agents can do what it can
-do. A step of these flows reaches the application's host through the proxy with a grant
+do. A step of these flows reaches the application's hosts through the proxy with a grant
 (see "The sandboxes' way out") and nothing else beyond what every sandbox reaches.
 
 ### Triggers

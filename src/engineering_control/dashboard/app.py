@@ -1854,6 +1854,7 @@ def create_app(
             lambda body: service(request).set_application(
                 name,
                 url=body.url,
+                hosts=body.hosts,
                 username=body.username,
                 password=body.password,
                 forget_identity=body.forget_identity,

@@ -322,12 +322,12 @@ class Launcher:
             memory=plan.memory,
             deadline_seconds=plan.deadline_seconds,
             labels=plan.labels,
-            # A step that looks at the project's application may reach that one host
-            # for as long as the step may last, and not a host more.
+            # A step that looks at the project's application may reach the hosts the
+            # project names for it, for as long as the step may last, and not a host more.
             browser_grant=grant(
-                self.grant_key, plan.application_host, seconds=plan.deadline_seconds + 300
+                self.grant_key, plan.application_hosts, seconds=plan.deadline_seconds + 300
             )
-            if plan.application_host and self.grant_key
+            if plan.application_hosts and self.grant_key
             else None,
             identity_secret=plan.identity_secret,
         )

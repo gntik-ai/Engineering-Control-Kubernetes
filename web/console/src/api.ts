@@ -397,7 +397,7 @@ export interface ProjectDetail {
   sections: Section[];
   work?: WorkStatus;
   /** Where the project's application runs, and whether a test identity is stored for it. */
-  application?: { url: string; identity: boolean } | null;
+  application?: { url: string; hosts: string[]; identity: boolean } | null;
 }
 
 export interface ItemFacts {

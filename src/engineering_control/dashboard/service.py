@@ -16,6 +16,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    clean_application_hosts,
     clean_application_url,
 )
 from engineering_control.dashboard.project_sections import Guide
@@ -224,12 +225,14 @@ class DashboardService:
         password: str,
         forget_identity: bool,
         cluster: Cluster | None,
+        hosts: list[str] | None = None,
     ) -> dict[str, object]:
         """Where the project's application runs, and the identity a step signs in to it
         with. The identity goes to the cluster as a Secret of the sandbox namespace and
         is not kept anywhere else; the record only says that there is one."""
         projects = self.repository.projects
         address = clean_application_url(url)
+        others = clean_application_hosts(hosts) if hosts is not None else None
         project_id = await asyncio.to_thread(projects.identity_of, project)
         secret = identity_secret(project_id)
         identity: bool | None = None
@@ -256,7 +259,7 @@ class DashboardService:
                 await cluster.delete_secret(secret)
             identity = False
         return await asyncio.to_thread(
-            lambda: projects.set_application(project, url=address, identity=identity)
+            lambda: projects.set_application(project, url=address, hosts=others, identity=identity)
         )
 
     async def pause_project(self, project: str, reason: str) -> dict[str, object]:

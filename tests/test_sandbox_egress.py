@@ -155,6 +155,12 @@ def test_a_grant_opens_one_host_for_a_time_and_only_with_the_right_key() -> None
         token.rsplit(".", 1)[1],
     )
     assert not granted(key, f"{int(expires) + 9999}.{host}.{signature}", host, now=1_500.0)
+    # A grant may name several hosts, and every host under a domain, as the list does.
+    several = grant(key, ["staging.example.com", "*.api.example.com"], seconds=600, now=1_000.0)
+    for host in ("staging.example.com", "v1.api.example.com"):
+        assert granted(key, several, host, now=1_500.0), host
+    for host in ("api.example.com", "example.com", "staging.example.com.evil.net"):
+        assert not granted(key, several, host, now=1_500.0), host
     for junk in ("", "x", "1.2", "soon.staging.example.com.abc", "..", "9999999999.a.b"):
         assert not granted(key, junk, "staging.example.com", now=1_500.0)
 

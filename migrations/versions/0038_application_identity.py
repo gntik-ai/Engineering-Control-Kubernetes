@@ -1,12 +1,14 @@
-"""Whether a test identity for a project's application is stored.
+"""The other hosts of a project's application, and whether a test identity is stored.
 
 Revision ID: 0038
 Revises: 0037
 
-``projects.application_identity_at`` says since when the cluster holds a test identity
-for the project's application. The identity itself is a Secret of the sandbox namespace.
+``projects.application_hosts`` names the hosts an application uses beside its address's
+own (its API, where it signs in). ``projects.application_identity_at`` says since when
+the cluster holds a test identity for the application. The identity itself is a Secret
+of the sandbox namespace.
 
-Locking: one nullable column without a default; bounded as in 0022-0037.
+Locking: two nullable columns without a default; bounded as in 0022-0037.
 """
 
 from collections.abc import Sequence
@@ -20,7 +22,10 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _PROJECTS = "projects"
-_COLUMN = "application_identity_at"
+_COLUMNS = {
+    "application_identity_at": sa.DateTime(timezone=True),
+    "application_hosts": sa.JSON(),
+}
 
 
 def _bound() -> None:
@@ -32,19 +37,23 @@ def _bound() -> None:
         op.execute(sa.text("SET LOCAL statement_timeout = '30s'"))
 
 
-def _has() -> bool:
+def _there() -> set[str]:
     columns = sa.inspect(op.get_bind()).get_columns(_PROJECTS)
-    return _COLUMN in {str(item["name"]) for item in columns}
+    return {str(item["name"]) for item in columns}
 
 
 def upgrade() -> None:
     _bound()
-    # Revision 0001 bootstraps the current models, so a fresh install has it already.
-    if not _has():
-        op.add_column(_PROJECTS, sa.Column(_COLUMN, sa.DateTime(timezone=True), nullable=True))
+    # Revision 0001 bootstraps the current models, so a fresh install has them already.
+    there = _there()
+    for name, kind in _COLUMNS.items():
+        if name not in there:
+            op.add_column(_PROJECTS, sa.Column(name, kind, nullable=True))
 
 
 def downgrade() -> None:
     _bound()
-    if _has():
-        op.drop_column(_PROJECTS, _COLUMN)
+    there = _there()
+    for name in _COLUMNS:
+        if name in there:
+            op.drop_column(_PROJECTS, name)

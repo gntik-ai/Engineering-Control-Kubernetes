@@ -643,6 +643,7 @@ def _the_application(values: dict[str, Any]) -> str:
             "The project has no application address, so there is nothing to open. Answer "
             "BLOCKED and say so."
         )
+    hosts = ", ".join(str(host) for host in application.get("hosts") or []) or "its address's"
     identity = (
         "To sign in, a test identity made for this purpose is in the files "
         "/run/application/username and /run/application/password. Read them in your "
@@ -660,8 +661,8 @@ def _the_application(values: dict[str, Any]) -> str:
         "    const browser = await launch();\n"
         "    const page = await browser.newPage();\n"
         "    await page.goto(process.env.APPLICATION_URL);\n\n"
-        "Only the application's own host can be reached; the rest of the internet "
-        "cannot, and that is not a fault of the application. Go by what a page shows: "
+        f"Only the application's own hosts can be reached ({hosts}); the rest of the "
+        "internet cannot, and that is not a fault of the application. Go by what a page shows: "
         "its text, its accessibility tree (page.accessibility or roles and labels), "
         "screenshots you look at, the console and failed requests. Use the application "
         "as one of its users would. Do not change or delete data beyond what the journey "

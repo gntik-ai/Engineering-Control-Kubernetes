@@ -12,9 +12,10 @@ out to need is found and added to the list.
 
 One kind of host is not on the list: where a project's own application runs, which a step
 that looks at the application in a browser has to reach. The launcher gives such a step a
-grant for that one host, signed with a key only the launcher and this proxy hold and
-good for the step's time; the browser presents it with its tunnel request. The proxy
-knows nothing of projects: it checks the signature, the host and the time.
+grant for the hosts the project names for its application, signed with a key only the
+launcher and this proxy hold and good for the step's time; the browser presents it with
+its tunnel requests. The proxy knows nothing of projects: it checks the signature, the
+hosts and the time.
 """
 
 from __future__ import annotations
@@ -61,10 +62,12 @@ def allowed(host: str, hosts: Sequence[str]) -> bool:
     return False
 
 
-def grant(key: bytes, host: str, *, seconds: int, now: float | None = None) -> str:
-    """A grant to open tunnels to ``host`` for ``seconds``, signed with ``key``."""
+def grant(key: bytes, hosts: str | Sequence[str], *, seconds: int, now: float | None = None) -> str:
+    """A grant to open tunnels to ``hosts`` for ``seconds``, signed with ``key``. A host is
+    named exactly or, as on the proxy's own list, as every host under a domain (``*.``)."""
+    named = [hosts] if isinstance(hosts, str) else list(hosts)
     expires = int((time.time() if now is None else now) + seconds)
-    said = f"{expires}.{host.lower()}"
+    said = f"{expires}.{','.join(host.lower() for host in named)}"
     signature = hmac.new(key, said.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{said}.{signature}"
 
@@ -78,7 +81,7 @@ def granted(key: bytes, token: str, host: str, *, now: float | None = None) -> b
     wanted = hmac.new(key, f"{expires}.{named}".encode("ascii", "replace"), hashlib.sha256)
     if not hmac.compare_digest(wanted.hexdigest(), signature):
         return False
-    return named == host and int(expires) > (time.time() if now is None else now)
+    return allowed(host, named.split(",")) and int(expires) > (time.time() if now is None else now)
 
 
 def presented(head: bytes) -> str | None:
