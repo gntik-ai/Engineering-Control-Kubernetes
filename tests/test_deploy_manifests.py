@@ -565,24 +565,19 @@ def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     assert sorted(trusted) == sorted(addresses)
 
 
-def test_what_holds_a_data_volume_and_is_no_longer_used_is_kept_apart() -> None:
-    """A deployment never deletes a volume by itself: what the original's way of working
-    left behind stays, in a file of its own, until the administrator removes it."""
-    leftovers = [d for d in yaml.safe_load_all((BASE / "leftovers.yaml").read_text()) if d]
-    assert [(d["kind"], d["metadata"]["name"]) for d in leftovers] == [
-        ("PersistentVolumeClaim", "engineering-control-evidence"),
-        ("Cluster", "engineering-control-temporal-postgres"),
-    ]
-    # Nothing of the platform mounts a claim or names that database.
+def test_nothing_is_left_of_what_the_original_ran_and_nothing_mounts_a_claim() -> None:
+    """The platform's only data volume is its database's, which the operator owns."""
     documents = _documents()
+    assert not [d for d in documents if d["kind"] == "PersistentVolumeClaim"]
+    assert [d["metadata"]["name"] for d in documents if d["kind"] == "Cluster"] == [
+        "engineering-control-postgres"
+    ]
     for document in documents:
         if document["kind"] in {"Deployment", "StatefulSet", "Job"}:
             volumes = document["spec"]["template"]["spec"].get("volumes", [])
             assert not any("persistentVolumeClaim" in volume for volume in volumes)
-    others = "\n".join(
-        path.read_text() for path in BASE.glob("*.yaml") if path.name != "leftovers.yaml"
-    )
-    assert "temporal" not in others.lower() and "evidence" not in others.lower()
+    text = "\n".join(path.read_text() for path in BASE.glob("*.yaml"))
+    assert "temporal" not in text.lower() and "evidence" not in text.lower()
 
 
 def test_no_storage_class_is_named() -> None:
@@ -617,7 +612,7 @@ def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:
         assert spec.get("affinity", {}).get("nodeAffinity") == rule, name
         assert "nodeSelector" not in spec and "tolerations" not in spec, name
     clusters = [d for d in _documents() if d["kind"] == "Cluster"]
-    assert len(clusters) == 2
+    assert len(clusters) == 1
     for cluster in clusters:
         name = cluster["metadata"]["name"]
         assert cluster["spec"]["affinity"]["nodeAffinity"] == rule, name

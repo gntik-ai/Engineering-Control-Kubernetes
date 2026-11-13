@@ -529,7 +529,7 @@ def test_nothing_is_moved_in_the_middle_of_a_run_of_the_original_unless_told(sit
 def test_the_export_says_what_the_original_still_has_under_way(site: Any, tmp_path: Path) -> None:
     from datetime import UTC, datetime, timedelta
 
-    from engineering_control.db.models import Run
+    from engineering_control.db.models import AgentExecution, Run
 
     now = datetime.now(UTC)
     with site.sessions.begin() as session:
@@ -538,15 +538,36 @@ def test_the_export_says_what_the_original_still_has_under_way(site: Any, tmp_pa
             ("ended", now - timedelta(hours=3), now - timedelta(hours=1)),
             # A run that never ended, from long ago, is not what holds a move up.
             ("forgotten", now - timedelta(days=60), None),
+            # Nor is an attempt of last week the original never recorded the end of ...
+            ("left-open", now - timedelta(days=5), None),
+            # ... unless an agent still works for it.
+            ("long-running", now - timedelta(days=4), None),
+        ):
+            run = Run(
+                workflow_id=workflow,
+                run_type="IssueDeliveryWorkflow",
+                status="RUNNING" if finished is None else "COMPLETED",
+                project="falcone-workflow",
+                started_at=started,
+                finished_at=finished,
+            )
+            session.add(run)
+            session.flush()
+            # The record itself was last touched when the run started.
+            run.updated_at = started
+        for workflow, heartbeat in (
+            ("left-open", now - timedelta(days=4)),
+            ("long-running", now - timedelta(minutes=3)),
         ):
             session.add(
-                Run(
+                AgentExecution(
                     workflow_id=workflow,
-                    run_type="IssueDeliveryWorkflow",
-                    status="RUNNING" if finished is None else "COMPLETED",
                     project="falcone-workflow",
-                    started_at=started,
-                    finished_at=finished,
+                    provider="codex",
+                    role="maker",
+                    status="RUNNING",
+                    started_at=now - timedelta(days=4),
+                    last_heartbeat_at=heartbeat,
                 )
             )
     output = tmp_path / "records.json"
@@ -567,10 +588,41 @@ def test_the_export_says_what_the_original_still_has_under_way(site: Any, tmp_pa
         check=False,
     )
     assert ran.returncode == 0, ran.stderr
-    assert "still has 1 run(s) under way" in ran.stdout and "under-way (RUNNING)" in ran.stdout
+    assert "still has 2 run(s) under way" in ran.stdout
+    assert "long-running (RUNNING, last seen 3 minute(s) ago)" in ran.stdout
+    assert "under-way (RUNNING, last seen 2 hour(s) ago)" in ran.stdout
+    assert "marks 1 more run(s) of this project as running" in ran.stdout
+    assert "the latest of them 4 day(s) ago" in ran.stdout and "left-open" not in ran.stdout
     exported = json.loads(output.read_text())
-    assert [run["workflow_id"] for run in exported["in_flight"]] == ["under-way"]
-    assert Plan(exported).summary()["in_flight_count"] == 1
+    assert sorted(run["workflow_id"] for run in exported["in_flight"]) == [
+        "long-running",
+        "under-way",
+    ]
+    assert exported["left_open"]["count"] == 1
+    summary = Plan(exported).summary()
+    assert summary["in_flight_count"] == 2 and summary["left_open_count"] == 1
+    # With a shorter time, what was seen two hours ago is left open too.
+    again = subprocess.run(  # noqa: S603 - the repository's own script
+        [
+            sys.executable,
+            str(script),
+            "--project",
+            "falcone-workflow",
+            "--output",
+            str(output),
+            "--database-url",
+            str(site.sessions.kw["bind"].url),
+            "--quiet-hours",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert again.returncode == 0, again.stderr
+    assert "still has 1 run(s) under way" in again.stdout
+    assert "marks 2 more run(s)" in again.stdout
+    assert Plan(json.loads(output.read_text())).summary()["left_open_count"] == 2
 
 
 def test_the_command_line_does_what_the_page_does(site: Any, tmp_path: Path) -> None:

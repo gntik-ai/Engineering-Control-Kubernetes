@@ -304,6 +304,11 @@ class Plan:
             for run in document.get("in_flight") or []
             if isinstance(run, dict)
         ][:200]
+        # Runs the original marked as running and never recorded the end of: counted for
+        # the record, and not what holds a move up.
+        left = document.get("left_open")
+        count = left.get("count") if isinstance(left, dict) else None
+        self.left_open = count if isinstance(count, int) and 0 <= count < 1_000_000 else 0
 
     def _mark(
         self, issue: tuple[str, int], facts: dict[str, Any], original: dict[str, Any]
@@ -326,6 +331,7 @@ class Plan:
             "records": self.archive,
             "in_flight": self.in_flight[:20],
             "in_flight_count": len(self.in_flight),
+            "left_open_count": self.left_open,
         }
 
 

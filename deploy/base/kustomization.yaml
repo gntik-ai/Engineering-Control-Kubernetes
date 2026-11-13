@@ -10,7 +10,6 @@ resources:
   - access.yaml
   - network-policy.yaml
   - postgres.yaml
-  - leftovers.yaml
   - bootstrap-jobs.yaml
   - console.yaml
   - launcher.yaml

@@ -598,7 +598,12 @@ work is moved here. Moving is two things, both on the administrator's side:
    work on a project only when it is told to (it has no schedule per project), so
    stopping it for the project means starting nothing more for it there. The script only
    reads (a read-only transaction of SELECTs) and writes one file readable by its owner
-   alone. It also says which runs the original still has under way for the project:
+   alone. It also says which runs the original still has under way for the project. The
+   original marks a run as running until it records its end, and for many attempts it
+   never does; so a run counts as under way only if it also showed a sign of life in the
+   last 24 hours, in its own record or in the agents that worked for it
+   (`--quiet-hours` changes the time). The others are counted and told, and do not hold
+   the move up:
 
    ```bash
    sudo /opt/engineering-control/venv/bin/python export_original_records.py \
@@ -889,14 +894,11 @@ the migration (`migrations/versions/`) before going back across one that does mo
 
 With phase 8 the platform stopped carrying the original's way of working: its workflows,
 its command API, Temporal, the notifier and the evidence ingest are gone from the code
-and from the cluster. Four things were left in the cluster. The first is left on purpose, because removing it
-deletes data for good and that is the administrator's decision; the others are harmless
-and need a command only the administrator can run:
+and from the cluster. The two objects that held a data volume and were no longer used
+(the claim `engineering-control-evidence` and Temporal's PostgreSQL cluster) were removed
+on the administrator's word. Three harmless things remain, each needing a command only
+the administrator can run:
 
-- `base/leftovers.yaml` keeps the two objects that hold a data volume: the claim
-  `engineering-control-evidence` and the PostgreSQL cluster
-  `engineering-control-temporal-postgres`. Nothing uses either. To remove them, delete the
-  file and its line in `base/kustomization.yaml`, and synchronise with pruning.
 - The Secret `engineering-control-secrets` still holds the keys the removed processes
   read (`api.token`, `evidence-ingest.token`, the `*-runner.token` keys). Nothing mounts
   them; they go when the Secret is next created anew, or by hand.
@@ -904,7 +906,6 @@ and need a command only the administrator can run:
   made for them (`engineering-control-ca`, `engineering-control-temporal-tls`) stay until
   deleted: `kubectl -n engineering-control delete secret engineering-control-ca
   engineering-control-temporal-tls`.
-
 - Two finished Jobs of Temporal's (`temporal-schema`, `temporal-namespace`) are still
   listed in the namespace. They ran as part of a synchronisation, which is why pruning
   does not take them: `kubectl -n engineering-control delete job temporal-schema

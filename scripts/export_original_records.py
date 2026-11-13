@@ -77,6 +77,25 @@ def _plain(value: Any, *, structured: bool = False) -> Any:
     return value
 
 
+def _moment(value: Any) -> datetime.datetime | None:
+    """A time as the database's driver hands it over, as a time in UTC."""
+    if isinstance(value, str):
+        try:
+            value = datetime.datetime.fromisoformat(value.strip().replace(" ", "T", 1))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime.datetime):
+        return None
+    return value.replace(tzinfo=datetime.UTC) if value.tzinfo is None else value
+
+
+def _ago(moment: datetime.datetime, now: datetime.datetime) -> str:
+    hours = max(0.0, (now - moment).total_seconds() / 3600)
+    if hours < 1:
+        return f"{round(hours * 60)} minute(s) ago"
+    return f"{round(hours)} hour(s) ago" if hours < 48 else f"{round(hours / 24)} day(s) ago"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -84,6 +103,13 @@ def main() -> None:
     )
     parser.add_argument("--output", required=True, help="the file to write")
     parser.add_argument("--database-url", default=None)
+    parser.add_argument(
+        "--quiet-hours",
+        type=float,
+        default=24.0,
+        help="a run marked as running that showed no sign of life for this long is taken "
+        "to have been left open, not to be under way (default: 24)",
+    )
     arguments = parser.parse_args()
 
     try:
@@ -165,17 +191,56 @@ def main() -> None:
         tables["backlog_issue_records"] = list(latest.values())
         # Work the original still has under way for the project: nothing is brought over
         # in the middle of a run, so the import says so and waits unless told otherwise.
-        since = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=14)).isoformat()
-        in_flight = [
-            {key: row.get(key) for key in ("workflow_id", "run_type", "status", "started_at")}
-            for row in rows(
-                "runs",
-                "project = :project AND finished_at IS NULL AND started_at IS NOT NULL "
-                "AND CAST(started_at AS VARCHAR(40)) > :since",
-                project=project,
-                since=since,
-            )
-        ]
+        # The original marks a run as running until it records its end, and for many
+        # attempts it never does: a run is under way only if it also showed a sign of
+        # life lately, in its own record or in the agents that worked for it.
+        now = datetime.datetime.now(datetime.UTC)
+        since = (now - datetime.timedelta(days=14)).isoformat()
+        signs: dict[str, datetime.datetime] = {}
+        if "agent_executions" in present:
+            for workflow, *moments in connection.execute(
+                text(
+                    "SELECT workflow_id, MAX(last_heartbeat_at), MAX(started_at), MAX(ended_at) "
+                    "FROM agent_executions WHERE project = :project GROUP BY workflow_id"
+                ),
+                {"project": project},
+            ):
+                known = [found for found in map(_moment, moments) if found is not None]
+                if known:
+                    signs[str(workflow)] = max(known)
+        quiet = datetime.timedelta(hours=max(0.0, arguments.quiet_hours))
+        in_flight: list[dict[str, Any]] = []
+        left_open: list[datetime.datetime | None] = []
+        for row in rows(
+            "runs",
+            "project = :project AND finished_at IS NULL AND started_at IS NOT NULL "
+            "AND CAST(started_at AS VARCHAR(40)) > :since",
+            project=project,
+            since=since,
+        ):
+            known = [
+                found
+                for found in (
+                    _moment(row.get("updated_at")),
+                    _moment(row.get("started_at")),
+                    signs.get(str(row.get("workflow_id"))),
+                )
+                if found is not None
+            ]
+            last = max(known) if known else None
+            if last is not None and now - last <= quiet:
+                in_flight.append(
+                    {
+                        **{
+                            key: row.get(key)
+                            for key in ("workflow_id", "run_type", "status", "started_at")
+                        },
+                        "last_sign": last.isoformat(),
+                    }
+                )
+            else:
+                left_open.append(last)
+        latest_left = max((found for found in left_open if found is not None), default=None)
         revision = None
         if "alembic_version" in present:
             revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -187,6 +252,12 @@ def main() -> None:
         "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "schema_revision": revision,
         "in_flight": in_flight,
+        # Runs the original never recorded the end of: told, and not what holds a move up.
+        "left_open": {
+            "count": len(left_open),
+            "last_sign": latest_left.isoformat() if latest_left else None,
+            "quiet_hours": arguments.quiet_hours,
+        },
         "tables": tables,
     }
     with open(arguments.output, "w", encoding="utf-8") as output:
@@ -198,14 +269,24 @@ def main() -> None:
         print(f"  {name}: {len(found)}")
     if not any(tables.values()):
         print("Nothing was found. Is the project's name written as the original has it?")
+    if left_open:
+        print(
+            f"The original marks {len(left_open)} more run(s) of this project as running that "
+            f"showed no sign of life for {arguments.quiet_hours:g} hours or more"
+            + (f" (the latest of them {_ago(latest_left, now)})" if latest_left else "")
+            + ": it left them open, and they do not hold the move up."
+        )
     if in_flight:
         print(
             f"The original system still has {len(in_flight)} run(s) under way for this project, "
-            "started within the last 14 days:"
+            f"with a sign of life in the last {arguments.quiet_hours:g} hours:"
         )
-        for run in in_flight[:20]:
-            print(f"  {run['run_type']} {run['workflow_id']} ({run['status']})")
+        for run in sorted(in_flight, key=lambda found: str(found["last_sign"]), reverse=True)[:20]:
+            seen = _ago(_moment(run["last_sign"]) or now, now)
+            print(f"  {run['run_type']} {run['workflow_id']} ({run['status']}, last seen {seen})")
         print("Let them end and export again, or bring the file over knowing that they run.")
+    else:
+        print("Nothing is under way for this project on the original: the file can be moved.")
 
 
 if __name__ == "__main__":
