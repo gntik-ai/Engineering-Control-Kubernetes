@@ -75,7 +75,11 @@ def pod_progress(pod: dict[str, Any]) -> tuple[str, str | None]:
             return "starting", _STUCK[waiting["reason"]]
     for condition in status.get("conditions") or []:
         if condition.get("type") == "PodScheduled" and condition.get("status") == "False":
-            return "starting", "Waiting for room on the sandbox node."
+            # What the cluster's scheduler says is the only way to tell a full node from
+            # one that is away, cordoned or missing its label.
+            why = " ".join(str(condition.get("message") or "").split())[:400]
+            waiting = "Waiting for a place on the sandbox node."
+            return "starting", f"{waiting} The cluster says: {why}" if why else waiting
     return "starting", None
 
 

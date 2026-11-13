@@ -349,7 +349,17 @@ def test_how_the_cluster_describes_a_pod_becomes_one_of_four_states() -> None:
     )
     unscheduled = {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}
     assert pod_progress({"status": {"phase": "Pending", "conditions": [unscheduled]}})[1] == (
-        "Waiting for room on the sandbox node."
+        "Waiting for a place on the sandbox node."
+    )
+    # What the scheduler says is passed on: it tells a full node from one that is away.
+    unscheduled["message"] = (
+        "0/4 nodes are available: 1 node(s) had untolerated taint "
+        "{node.kubernetes.io/unreachable: }, 3 node(s) didn't match Pod's node selector."
+    )
+    assert pod_progress({"status": {"phase": "Pending", "conditions": [unscheduled]}})[1] == (
+        "Waiting for a place on the sandbox node. The cluster says: 0/4 nodes are available: "
+        "1 node(s) had untolerated taint {node.kubernetes.io/unreachable: }, 3 node(s) didn't "
+        "match Pod's node selector."
     )
     assert pod_progress({}) == ("starting", None)
 
