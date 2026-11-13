@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from sqlalchemy import select
 
 from engineering_control.dashboard.app import (
     CONSOLE_INLINE_STYLE,
@@ -10,9 +11,8 @@ from engineering_control.dashboard.app import (
     CONSOLE_ROOT,
     sign_in_assets,
 )
-from engineering_control.db.models import AgentExecution, Run
+from engineering_control.db.models import ProjectRecord, SandboxRun
 from engineering_control.projects import PROJECTS
-from tests.test_dashboard_repository import _backlog_campaign, _issue
 from tests.test_dashboard_web import _authenticated_client
 
 
@@ -114,8 +114,8 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             "/console",
             "/console/projects",
             "/console/backlog",
-            "/console/executions",
-            "/console/execution",
+            "/console/runs",
+            "/console/flow",
         ):
             response = client.get(path)
             assert response.status_code == 200
@@ -195,71 +195,41 @@ def test_login_returns_to_the_console(tmp_path: Path) -> None:
         token = re.search(r'"csrf_token":\s*"([^"]+)"', login.text)
         assert token
         response = client.post(
-            "/login?next=/console/executions",
+            "/login?next=/console/runs",
             data={
                 "csrf_token": token.group(1),
                 "password": "correct horse battery staple",
-                "next_path": "/console/executions",
+                "next_path": "/console/runs",
             },
             follow_redirects=False,
         )
         assert response.status_code == 303
-        assert response.headers["location"] == "/console/executions"
+        assert response.headers["location"] == "/console/runs"
     finally:
         client.__exit__(None, None, None)
 
 
-def test_projects_api_lists_every_project_with_grouped_counts(tmp_path: Path) -> None:
+def test_projects_api_lists_every_project_with_its_items_and_runs(tmp_path: Path) -> None:
     client, repository = _authenticated_client(tmp_path)
     try:
-        now = datetime.now(UTC)
+        for title in ("Seven", "Eight"):
+            repository.backlog.add("falcone", title=title, section=None)
         with repository.sessions.begin() as session:
-            first = _backlog_campaign("falcone", "backlog-1")
-            second = _backlog_campaign("falcone", "backlog-2")
-            session.add_all([first, second])
-            session.flush()
-            # Issue 7 is in both campaigns: one tracked issue, not two.
-            session.add_all(
-                [
-                    _issue(first.id, 7, "Seven", "CANDIDATE"),
-                    _issue(second.id, 7, "Seven", "CANDIDATE"),
-                    _issue(second.id, 8, "Eight", "CANDIDATE"),
-                ]
+            falcone_id = session.scalar(
+                select(ProjectRecord.id).where(ProjectRecord.name == "falcone")
             )
-            for index, status in enumerate(["RUNNING", "PAUSED", "COMPLETED", "FAILED"]):
+            for state in ("running", "waiting", "succeeded", "failed"):
                 session.add(
-                    Run(
-                        workflow_id=f"workflow-{index}",
-                        run_type="delivery",
-                        status=status,
-                        project="falcone",
-                        worker="controller",
-                        started_at=now - timedelta(minutes=index),
-                        finished_at=now if status in {"COMPLETED", "FAILED"} else None,
-                        summary=None,
+                    SandboxRun(
+                        kind="flow", state=state, title=f"A {state} run", project_id=falcone_id
                     )
                 )
-            for index, (status, ended) in enumerate(
-                [("RUNNING", None), ("RUNNING", None), ("COMPLETED", now)]
-            ):
-                session.add(
-                    AgentExecution(
-                        workflow_id="workflow-0",
-                        project="falcone",
-                        provider="codex",
-                        role="maker",
-                        status=status,
-                        phase="delivery.invoke_maker",
-                        attempt=index + 1,
-                        max_attempts=3,
-                        started_at=now,
-                        ended_at=ended,
-                        output_truncated=False,
-                        transcript_incomplete=False,
-                        total_log_bytes=0,
-                        redaction_count=0,
-                    )
+            # A turn of the supervisor is a conversation, not work of the project.
+            session.add(
+                SandboxRun(
+                    kind="supervisor_turn", state="running", title="A turn", project_id=falcone_id
                 )
+            )
         response = client.get("/api/dashboard/projects")
         assert response.status_code == 200
         body = response.json()
@@ -268,14 +238,17 @@ def test_projects_api_lists_every_project_with_grouped_counts(tmp_path: Path) ->
         assert falcone["source_repository"] == "gntik-ai/falcone"
         assert falcone["deployment_repository"] == "gntik-ai/falcone-charts"
         assert falcone["self_contained"] is False
-        assert falcone["backlog_issues"] == 2
-        assert falcone["workflows"] == 4
-        assert falcone["active_workflows"] == 2
-        assert falcone["running_executions"] == 2
+        assert falcone["open_items"] == 2
+        assert falcone["runs"] == 4
+        assert falcone["active_runs"] == 2
         assert falcone["last_activity_at"]
         idle = next(item for item in body["items"] if item["project"] == "gntik-ui")
         assert idle["self_contained"] is True
-        assert (idle["backlog_issues"], idle["workflows"], idle["running_executions"]) == (0, 0, 0)
+        assert (idle["open_items"], idle["runs"], idle["active_runs"]) == (0, 0, 0)
         assert idle["last_activity_at"] is None
+        # The runs page lists a project's runs alone.
+        listed = client.get("/api/dashboard/runs?project=falcone").json()["items"]
+        assert len(listed) == 4
+        assert client.get("/api/dashboard/runs?project=gntik-ui").json()["items"] == []
     finally:
         client.__exit__(None, None, None)

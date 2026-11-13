@@ -7,18 +7,12 @@ import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
-from fastapi import Request
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
-from starlette.datastructures import QueryParams
-from starlette.responses import StreamingResponse
 
 from engineering_control.config import Settings
-from engineering_control.dashboard import app as dashboard_app_module
 from engineering_control.dashboard import repository as repository_module
 from engineering_control.dashboard.app import create_app, sign_in_assets
 from engineering_control.dashboard.auth import (
@@ -28,10 +22,8 @@ from engineering_control.dashboard.auth import (
     write_password_atomically,
 )
 from engineering_control.dashboard.repository import DashboardRepository
-from engineering_control.dashboard.schemas import ActivityEventInput
-from engineering_control.dashboard.service import DashboardService
 from engineering_control.db.base import Base
-from engineering_control.db.models import AgentExecution, DashboardSessionRevocation
+from engineering_control.db.models import DashboardSessionRevocation
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
 NEW_PASSWORD = "a different long dashboard password"  # noqa: S105 - test fixture
@@ -49,18 +41,7 @@ def _repository(tmp_path: Path, *, initialized: bool = True) -> DashboardReposit
 def _client(
     repository: DashboardRepository, *, limiter: LoginFailureLimiter | None = None
 ) -> TestClient:
-    # Merged with main (NEW-09/13): R3 candidates read the project contract first, so the
-    # fixture supplies a private (0644) copy of the repository's own project manifests.
-    projects = Path(str(repository.engine.url.database)).parent / "projects.d"
-    if not projects.is_dir():
-        projects.mkdir(mode=0o755)
-        for manifest in (Path(__file__).resolve().parents[1] / "config" / "projects").glob(
-            "*.yaml"
-        ):
-            target = projects / manifest.name
-            target.write_bytes(manifest.read_bytes())
-            target.chmod(0o644)
-    settings = Settings(database_url=str(repository.engine.url), project_config_root=projects)
+    settings = Settings(database_url=str(repository.engine.url))
     return TestClient(
         create_app(
             settings=settings,
@@ -96,27 +77,6 @@ def _login(client: TestClient, password: str = PASSWORD) -> object:
         },
         follow_redirects=False,
     )
-
-
-def test_injected_dashboard_repository_never_loads_live_admission(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def forbidden(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("fixture attempted live admission client construction")
-
-    monkeypatch.setattr(dashboard_app_module, "AdmissionReader", forbidden)
-    repository = _repository(tmp_path)
-    try:
-        with _client(repository) as client:
-            assert client.get("/api/dashboard/overview").status_code == 401
-            _login(client)
-            response = client.get("/api/dashboard/overview")
-            assert response.status_code == 200
-            assert response.json()["admission"]["status"] == "UNKNOWN"
-            assert response.json()["admission"]["observed_at"] is None
-    finally:
-        repository.engine.dispose()
 
 
 def test_argon2id_password_hash_and_session_expiration() -> None:
@@ -207,28 +167,28 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
         )
         assert (
             client.get(
-                "/api/dashboard/r3-issues/candidate",
+                "/api/dashboard/projects",
                 headers={"Origin": "https://attacker.invalid"},
             ).status_code
             == 401
         )
 
-        r3_path = "/api/dashboard/r3-issues/candidate"
-        for suffix in (
+        # Who asks is settled before what is asked: without a session every request is
+        # refused the same way, whatever its query or its body says.
+        items_path = "/api/dashboard/items"
+        suffixes = (
             "",
-            "?project=invalid&surface=source&issue_number=1119",
-            "?project=musematic&surface=invalid&issue_number=1119",
-            "?project=musematic&surface=source&issue_number=not-an-integer",
-            "?project=musematic&surface=source&issue_number=1119&extra=value",
-            "?project=musematic&project=musematic&surface=source&issue_number=1119",
-            "?project=musematic&surface=source&issue_number=1119&issue_number=1119",
-            "?project=" + "m" * 300 + "&surface=source&issue_number=1119",
-        ):
-            response = client.get(r3_path + suffix)
+            "?project=invalid",
+            "?state=invalid",
+            "?page=not-an-integer",
+            "?project=" + "m" * 300,
+        )
+        for suffix in suffixes:
+            response = client.get(items_path + suffix)
             assert response.status_code == 401
             assert response.json() == {"detail": "authentication required"}
 
-            response = client.post(r3_path + suffix, content=b"not-json")
+            response = client.post("/api/dashboard/projects" + suffix, content=b"not-json")
             assert response.status_code == 401
             assert response.json() == {"detail": "authentication required"}
 
@@ -241,44 +201,9 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
         assert response.status_code == 303
         csrf = _session_csrf(client)
 
-        for suffix in (
-            "",
-            "?project=invalid&surface=source&issue_number=1119",
-            "?project=musematic&surface=invalid&issue_number=1119",
-            "?project=musematic&surface=source&issue_number=not-an-integer",
-            "?project=musematic&surface=source&issue_number=1119&extra=value",
-            "?project=musematic&project=musematic&surface=source&issue_number=1119",
-            "?project=musematic&surface=source&issue_number=1119&issue_number=1119",
-            "?project=" + "m" * 300 + "&surface=source&issue_number=1119",
-        ):
-            invalid_target = client.get(r3_path + suffix)
-            assert invalid_target.status_code == 422
-            assert invalid_target.json() == {"detail": "invalid request"}
-            invalid_post_target = client.post(r3_path + suffix, content=b"not-json")
-            assert invalid_post_target.status_code == 422
-            assert invalid_post_target.json() == {"detail": "invalid request"}
-
-        oversized_fixed_query = SimpleNamespace(
-            url=SimpleNamespace(query="x" * 257),
-            query_params=QueryParams("project=musematic&surface=source&issue_number=1119"),
-        )
-        with pytest.raises(ValueError, match="invalid R3 candidate target"):
-            dashboard_app_module._r3_candidate_target(oversized_fixed_query)
-
-        valid_target = "?project=musematic&surface=source&issue_number=1119"
-        missing_candidate = client.get(r3_path + valid_target)
-        assert missing_candidate.status_code == 404
-        assert missing_candidate.json() == {
-            "detail": "current backlog issue is not an approval-bound R3 issue"
-        }
-        create_without_backlog_binding = client.post(
-            r3_path + valid_target,
-            json={"csrf_token": csrf},
-        )
-        assert create_without_backlog_binding.status_code == 409
-        assert create_without_backlog_binding.json() == {
-            "detail": "current backlog issue is not an approval-bound R3 issue"
-        }
+        for suffix in suffixes[1:]:
+            assert client.get(items_path + suffix).status_code == 422
+        assert client.post("/api/dashboard/projects", content=b"not-json").status_code == 415
 
         assert (
             client.post(
@@ -420,80 +345,6 @@ def test_opaque_origin_browser_login_requires_exact_fetch_metadata_and_csrf(
         )
         assert accepted.status_code == 303
         assert accepted.headers["location"] == "/console"
-
-
-def test_r3_candidate_authentication_precedes_query_and_body_validation(tmp_path: Path) -> None:
-    repository = _repository(tmp_path)
-    r3_path = "/api/dashboard/r3-issues/candidate"
-    valid_target = "?project=musematic&surface=source&issue_number=1119"
-    malformed_targets = (
-        "",
-        "?project=invalid&surface=source&issue_number=1119",
-        "?project=musematic&surface=source&issue_number=1119&extra=value",
-        "?project=musematic&project=musematic&surface=source&issue_number=1119",
-        "?project=" + "m" * 300 + "&surface=source&issue_number=1119",
-    )
-    with _client(repository) as client:
-        valid_anonymous_get = client.get(r3_path + valid_target)
-        assert valid_anonymous_get.status_code == 401
-        assert valid_anonymous_get.json() == {"detail": "authentication required"}
-        valid_anonymous_post = client.post(r3_path + valid_target, content=b"not-json")
-        assert valid_anonymous_post.status_code == 401
-        assert valid_anonymous_post.json() == {"detail": "authentication required"}
-        for suffix in malformed_targets:
-            anonymous_get = client.get(r3_path + suffix)
-            assert anonymous_get.status_code == 401
-            assert anonymous_get.json() == {"detail": "authentication required"}
-            anonymous_post = client.post(r3_path + suffix, content=b"not-json")
-            assert anonymous_post.status_code == 401
-            assert anonymous_post.json() == {"detail": "authentication required"}
-
-        assert _login(client).status_code == 303
-        csrf = _session_csrf(client)
-        for suffix in malformed_targets:
-            authenticated_get = client.get(r3_path + suffix)
-            assert authenticated_get.status_code == 422
-            assert authenticated_get.json() == {"detail": "invalid request"}
-            malformed_target_post = client.post(r3_path + suffix, content=b"not-json")
-            assert malformed_target_post.status_code == 422
-            assert malformed_target_post.json() == {"detail": "invalid request"}
-
-        malformed_json = client.post(
-            r3_path + valid_target,
-            content=b"not-json",
-            headers={"Content-Type": "application/json"},
-        )
-        assert malformed_json.status_code == 400
-        assert malformed_json.json() == {"detail": "invalid JSON"}
-        unsupported_media = client.post(
-            r3_path + valid_target,
-            content=b"{}",
-            headers={"Content-Type": "text/plain"},
-        )
-        assert unsupported_media.status_code == 415
-        assert unsupported_media.json() == {"detail": "unsupported JSON encoding"}
-        oversized_body = client.post(
-            r3_path + valid_target,
-            content=b"x" * 32_769,
-            headers={"Content-Type": "application/json"},
-        )
-        assert oversized_body.status_code == 413
-        assert oversized_body.json() == {"detail": "request is too large"}
-        invalid_body = client.post(r3_path + valid_target, json={})
-        assert invalid_body.status_code == 422
-        assert invalid_body.json() == {"detail": "invalid request"}
-        invalid_csrf = client.post(
-            r3_path + valid_target,
-            json={"csrf_token": "x" * 32},
-        )
-        assert invalid_csrf.status_code == 403
-        assert invalid_csrf.json() == {"detail": "invalid request"}
-        assert client.get(r3_path + valid_target).status_code == 404
-        accepted_body = client.post(
-            r3_path + valid_target,
-            json={"csrf_token": csrf},
-        )
-        assert accepted_body.status_code == 409
 
 
 def test_logout_revokes_only_the_current_session_and_survives_app_restart(
@@ -725,201 +576,6 @@ def test_readiness_touches_revocation_schema_and_recovers_safely(
     assert "dashboard readiness persistence check recovered" in caplog.text
     assert "dashboard_session_revocations" not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_activity_stream_route_rechecks_durable_session_revocation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = _repository(tmp_path)
-    settings = Settings(database_url=str(repository.engine.url))
-    app = create_app(settings=settings, repository=repository, session_key=b"s" * 48)
-    app.state.dashboard_repository = repository
-    version = await repository.authentication_version()
-    assert version is not None
-    manager = SignedSessionManager(b"s" * 48, lifetime_seconds=12 * 3600)
-    token = manager.create(version)
-    event_id = await repository.record_event(
-        ActivityEventInput(
-            level="INFO",
-            event_type="audit.sse_route_binding",
-            source="dashboard",
-            message="Synthetic route-binding marker",
-        )
-    )
-    original = dashboard_app_module.sse_events
-
-    def bounded_stream(
-        stream_repository: DashboardRepository,
-        *,
-        after_id: int,
-        disconnected: object,
-        authorized: object,
-    ) -> object:
-        return original(
-            stream_repository,
-            after_id=after_id,
-            disconnected=disconnected,  # type: ignore[arg-type]
-            authorized=authorized,  # type: ignore[arg-type]
-            poll_seconds=0.01,
-            heartbeat_seconds=0,
-            authorization_seconds=0.02,
-            maximum_iterations=100,
-        )
-
-    monkeypatch.setattr(dashboard_app_module, "sse_events", bounded_stream)
-    route = next(
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path == "/api/dashboard/activity/stream"
-    )
-    scope = {
-        "type": "http",
-        "http_version": "1.1",
-        "method": "GET",
-        "scheme": "https",
-        "path": route.path,
-        "raw_path": route.path.encode(),
-        "query_string": b"",
-        "headers": [
-            (b"cookie", f"engineering_dashboard_session={token}".encode()),
-        ],
-        "client": ("127.0.0.1", 12345),
-        "server": ("ade.musematic.ai", 443),
-        "app": app,
-    }
-    request = Request(scope)
-
-    async def connected() -> bool:
-        return False
-
-    request.is_disconnected = connected  # type: ignore[method-assign]
-    response = await route.endpoint(request, after_id=event_id - 1)
-    assert isinstance(response, StreamingResponse)
-    chunks: list[bytes | str | memoryview] = []
-
-    async def consume() -> None:
-        async for chunk in response.body_iterator:
-            chunks.append(chunk)
-
-    consumer = asyncio.create_task(consume())
-    for _ in range(50):
-        if chunks:
-            break
-        await asyncio.sleep(0.01)
-    assert chunks and "audit.sse_route_binding" in str(chunks[0])
-    await repository.revoke_session(
-        manager.binding_digest(token),
-        password_version=version,
-        expires_at=datetime.now(UTC) + timedelta(hours=12),
-    )
-    await asyncio.wait_for(consumer, timeout=1)
-
-
-@pytest.mark.asyncio
-async def test_transcript_stream_route_rechecks_durable_session_revocation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = _repository(tmp_path)
-    settings = Settings(database_url=str(repository.engine.url))
-    app = create_app(settings=settings, repository=repository, session_key=b"s" * 48)
-    app.state.dashboard_repository = repository
-    app.state.dashboard_service = DashboardService(repository)
-    version = await repository.authentication_version()
-    assert version is not None
-    manager = SignedSessionManager(b"s" * 48, lifetime_seconds=12 * 3600)
-    token = manager.create(version)
-    execution_id = uuid4()
-    with repository.sessions() as session, session.begin():
-        session.add(
-            AgentExecution(
-                id=execution_id,
-                workflow_id="synthetic-transcript-route",
-                project="platform",
-                provider="codex",
-                role="maker",
-                status="RUNNING",
-                attempt=1,
-                max_attempts=1,
-                output_truncated=False,
-                transcript_incomplete=False,
-                total_log_bytes=0,
-                redaction_count=0,
-            )
-        )
-    original = dashboard_app_module.transcript_sse
-
-    def bounded_stream(
-        projection: object,
-        selected_execution_id: object,
-        *,
-        after_sequence: int,
-        disconnected: object,
-        authorized: object,
-    ) -> object:
-        return original(
-            projection,  # type: ignore[arg-type]
-            selected_execution_id,  # type: ignore[arg-type]
-            after_sequence=after_sequence,
-            disconnected=disconnected,  # type: ignore[arg-type]
-            authorized=authorized,  # type: ignore[arg-type]
-            poll_seconds=0.01,
-            heartbeat_seconds=0,
-            authorization_seconds=0.02,
-            maximum_iterations=100,
-        )
-
-    monkeypatch.setattr(dashboard_app_module, "transcript_sse", bounded_stream)
-    route = next(
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path == "/api/dashboard/executions/{execution_id}/stream"
-    )
-    path = f"/api/dashboard/executions/{execution_id}/stream"
-    scope = {
-        "type": "http",
-        "http_version": "1.1",
-        "method": "GET",
-        "scheme": "https",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "headers": [
-            (b"cookie", f"engineering_dashboard_session={token}".encode()),
-        ],
-        "client": ("127.0.0.1", 12345),
-        "server": ("ade.musematic.ai", 443),
-        "app": app,
-    }
-    request = Request(scope)
-
-    async def connected() -> bool:
-        return False
-
-    request.is_disconnected = connected  # type: ignore[method-assign]
-    response = await route.endpoint(execution_id, request)
-    assert isinstance(response, StreamingResponse)
-    chunks: list[bytes | str | memoryview] = []
-
-    async def consume() -> None:
-        async for chunk in response.body_iterator:
-            chunks.append(chunk)
-
-    consumer = asyncio.create_task(consume())
-    for _ in range(50):
-        if chunks:
-            break
-        await asyncio.sleep(0.01)
-    assert chunks and "heartbeat" in str(chunks[0])
-    await repository.revoke_session(
-        manager.binding_digest(token),
-        password_version=version,
-        expires_at=datetime.now(UTC) + timedelta(hours=12),
-    )
-    await asyncio.wait_for(consumer, timeout=1)
 
 
 def test_login_csrf_survives_page_asset_and_repeated_challenge_requests(tmp_path: Path) -> None:

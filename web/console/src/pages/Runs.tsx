@@ -30,8 +30,8 @@ import {
 import { ArrowLeft, Bot, CircleSlash, GitBranch, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
-import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
-import { BASE, RouterLink, useLocation } from '../router';
+import { LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
+import { BASE, RouterLink, setQuery, useLocation } from '../router';
 import { minutes, tokens, versionName } from './Flows';
 import { RunGraph } from './RunGraph';
 import { useSubmit } from './ProjectDialogs';
@@ -95,7 +95,8 @@ const active = (run: Pick<Run, 'state'> | null | undefined) =>
 
 export function RunsPage() {
   const [busy, setBusy] = useState(false);
-  const runs = useResource<Listing<Run>>(apiUrl('runs'), busy ? 5_000 : 30_000);
+  const project = useLocation().query.get('project');
+  const runs = useResource<Listing<Run>>(apiUrl('runs', { project }), busy ? 5_000 : 30_000);
   const any = runs.data?.items.some(active) ?? false;
   useEffect(() => setBusy(any), [any]);
   return (
@@ -105,12 +106,15 @@ export function RunsPage() {
       actions={<RefreshButton resource={runs} />}
     >
       <div className="grid gap-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <ProjectFilter value={project} onChange={(value) => setQuery({ project: value })} />
+        </div>
         <LoadError resource={runs} />
         {runs.data?.items.length === 0 ? (
           <EmptyState
             icon={Bot}
-            title="Nothing has run yet"
-            description="Try an account on the Accounts page, or deliver an issue from the backlog."
+            title={project ? 'Nothing has run for this project yet' : 'Nothing has run yet'}
+            description="Try an account on the Accounts page, or start an item from the backlog."
           />
         ) : (
           <TableFrame>

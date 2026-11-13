@@ -8,20 +8,17 @@ import {
   ListTodo,
   LogOut,
   Sparkles,
-  SquareActivity,
   Workflow,
 } from '@gntik-ai/icons';
 import { useEffect, useState, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { AccountsPage } from './pages/Accounts';
-import { ExecutionPage } from './pages/Execution';
 import { FlowPage } from './pages/Flow';
 import { FlowsPage } from './pages/Flows';
 import { InboxPage } from './pages/Inbox';
 import { NotFoundPage } from './pages/NotFound';
 import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
-import { ExecutionsPage } from './pages/Executions';
 import { ProjectsPage } from './pages/Projects';
 import { QueuePage, QueuesPage } from './pages/Queues';
 import { RunPage, RunsPage } from './pages/Runs';
@@ -49,7 +46,6 @@ const navigation = (waiting: number): NavGroup[] => [
       { label: 'Flows', href: `${BASE}/flows`, icon: Workflow },
       { label: 'Supervisor', href: `${BASE}/supervisor`, icon: Sparkles },
       { label: 'Accounts', href: `${BASE}/accounts`, icon: KeyRound },
-      { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
     ],
   },
 ];
@@ -67,8 +63,6 @@ const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/flows`]: () => <FlowsPage />,
   [`${BASE}/flow`]: () => <FlowPage />,
   [`${BASE}/supervisor`]: () => <SupervisorPage />,
-  [`${BASE}/executions`]: () => <ExecutionsPage />,
-  [`${BASE}/execution`]: () => <ExecutionPage />,
 };
 
 /** What the browser tab says for each view. */
@@ -85,8 +79,6 @@ const TITLES: Record<string, string> = {
   [`${BASE}/flows`]: 'Flows',
   [`${BASE}/flow`]: 'Flow',
   [`${BASE}/supervisor`]: 'Supervisor',
-  [`${BASE}/executions`]: 'Executions',
-  [`${BASE}/execution`]: 'Execution',
 };
 
 function SignOut({ onError }: { onError: (message: string) => void }) {
@@ -136,9 +128,7 @@ export default function App() {
           <NavList
             groups={navigation(inbox.data?.total ?? 0)}
             currentHref={
-              current === `${BASE}/execution`
-                ? `${BASE}/executions`
-                : current === `${BASE}/project`
+              current === `${BASE}/project`
                   ? `${BASE}/projects`
                   : current === `${BASE}/run`
                     ? `${BASE}/runs`

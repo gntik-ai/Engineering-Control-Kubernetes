@@ -30,7 +30,6 @@ from fastapi.responses import (
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
-from engineering_control.dashboard.admission import AdmissionReader
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_COOKIE,
@@ -42,7 +41,6 @@ from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
-from engineering_control.dashboard.events import sse_events, transcript_sse
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -59,9 +57,6 @@ from engineering_control.dashboard.schemas import (
     AccountRemoveInput,
     AccountSignInInput,
     AccountUpdateInput,
-    ActionCandidateInput,
-    ActionExecuteInput,
-    ActionReauthenticationInput,
     ActivityEventInput,
     BacklogSyncInput,
     BudgetInput,
@@ -85,7 +80,6 @@ from engineering_control.dashboard.schemas import (
     QueueCreateInput,
     QueueItemsInput,
     QueueUpdateInput,
-    R3CandidateCreateInput,
     RecordsApplyInput,
     RecordsInput,
     RunDecisionInput,
@@ -104,13 +98,8 @@ from engineering_control.dashboard.schemas import (
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
-from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
-from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
-from engineering_control.operations.models import parse_command
-from engineering_control.operations.registry import COMMAND_REGISTRY
-from engineering_control.operations.repository import OperationsRepository
 from engineering_control.projects import PROJECT_SET
 
 PACKAGE_ROOT = Path(__file__).parent
@@ -144,8 +133,6 @@ CONSOLE_VIEWS = frozenset(
         "queue",
         "flows",
         "flow",
-        "executions",
-        "execution",
     }
 )
 CONSOLE_FONT_SUFFIXES = frozenset({".woff", ".woff2"})
@@ -180,8 +167,6 @@ def create_app(
     repository: DashboardRepository | None = None,
     session_key: bytes | None = None,
     limiter: LoginFailureLimiter | None = None,
-    operations_repository: OperationsRepository | None = None,
-    admission_reader: AdmissionReader | None = None,
     github_app: GitHubApp | None = None,
     cluster: Cluster | None = None,
 ) -> FastAPI:
@@ -258,33 +243,13 @@ def create_app(
             resolved.database_url.get_secret_value()
         )
         app.state.dashboard_repository = resolved_repository
-        resolved_admission = admission_reader
-        # Injected fixture repositories must never fall back to live networking.
-        if resolved_admission is None and repository is None:
-            try:
-                resolved_admission = AdmissionReader(
-                    resolved.api_host, resolved.api_port, service=resolved.api_service_name
-                )
-            except ValueError:
-                LOGGER.warning("dashboard API admission observation is unavailable")
-        app.state.dashboard_service = DashboardService(resolved_repository, resolved_admission)
+        app.state.dashboard_service = DashboardService(resolved_repository)
         try:
             # The projects the workflows know by name are records too; a release that adds
             # one to the registry gets its record here.
             await app.state.dashboard_service.sync_registry_projects()
         except Exception as error:  # noqa: BLE001 - the console must start without it
             log_failure("project-registry", "dashboard project registry sync failed", error)
-        resolved_operations = operations_repository or OperationsRepository(
-            resolved.database_url.get_secret_value(),
-            export_retention_days=resolved.dashboard_operation_export_retention_days,
-            export_max_bytes=resolved.dashboard_operation_export_max_bytes,
-            project_config_root=resolved.project_config_root,
-            projection_reconciliation_enabled=resolved.projection_reconciliation_enabled,
-            projection_reconciliation_interval_seconds=resolved.projection_reconciliation_interval_seconds,
-            projection_reconciliation_cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
-            projection_reconciliation_max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
-        )
-        app.state.operations_repository = resolved_operations
         resolved_github = github_app
         # As above: a fixture repository never reaches out to GitHub by itself.
         if resolved_github is None and repository is None:
@@ -315,12 +280,8 @@ def create_app(
             await resolved_github.aclose()
         if cluster is None and resolved_cluster is not None:
             await resolved_cluster.aclose()
-        if admission_reader is None and resolved_admission is not None:
-            await resolved_admission.aclose()
         if repository is None:
             resolved_repository.engine.dispose()
-        if operations_repository is None:
-            resolved_operations.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control Console",
@@ -371,12 +332,7 @@ def create_app(
     def service(request: Request) -> DashboardService:
         return cast(DashboardService, request.app.state.dashboard_service)
 
-    def operations(request: Request) -> OperationsRepository:
-        return cast(OperationsRepository, request.app.state.operations_repository)
-
-    async def check_filters(
-        request: Request, project: str | None, status: str | None, provider: str | None = None
-    ) -> None:
+    async def check_project(request: Request, project: str | None) -> None:
         """A project filter names a project of the registry or an active record."""
         if (
             project is not None
@@ -386,7 +342,6 @@ def create_app(
             )
         ):
             raise HTTPException(status_code=422, detail="invalid project filter")
-        _validate_observability_filters(None, status, provider)
 
     def session_authorization(authenticated: AuthenticatedSession) -> SessionAuthorization:
         return SessionAuthorization(
@@ -641,192 +596,6 @@ def create_app(
             }
         )
 
-    @app.get("/api/dashboard/backlog")
-    async def backlog_api(
-        request: Request,
-        project: str | None = None,
-        status: str | None = None,
-        search: str | None = Query(default=None, max_length=200),
-        page: int = Query(default=1, ge=1, le=10_000),
-        page_size: int = Query(default=50, ge=10, le=100),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, status)
-        result = await service(request).backlog(
-            project=project,
-            status=status,
-            search=search,
-            page=page,
-            page_size=page_size,
-        )
-        return JSONResponse(result)
-
-    @app.get("/api/dashboard/overview")
-    async def overview_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return JSONResponse(await service(request).overview())
-
-    @app.get("/api/dashboard/workflows")
-    async def workflows_api(
-        request: Request,
-        project: str | None = None,
-        workflow_type: str | None = Query(default=None, max_length=80),
-        status: str | None = None,
-        provider: str | None = None,
-        role: str | None = Query(default=None, max_length=80),
-        worker: str | None = Query(default=None, max_length=32),
-        search: str | None = Query(default=None, max_length=200),
-        date_from: datetime | None = None,
-        date_to: datetime | None = None,
-        cursor: str | None = Query(default=None, max_length=1000),
-        limit: int = Query(default=50, ge=1, le=100),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, status, provider)
-        try:
-            value = await service(request).workflows(
-                project=project,
-                workflow_type=workflow_type,
-                status=status,
-                provider=provider,
-                role=role,
-                worker=worker,
-                search=search,
-                date_from=date_from,
-                date_to=date_to,
-                cursor=cursor,
-                limit=limit,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/workflows/{workflow_id}")
-    async def workflow_api(workflow_id: str, request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        if not 1 <= len(workflow_id) <= 240:
-            raise HTTPException(status_code=404, detail="workflow not found")
-        value = await service(request).workflow(workflow_id)
-        if value is None:
-            raise HTTPException(status_code=404, detail="workflow not found")
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/executions")
-    async def executions_api(
-        request: Request,
-        project: str | None = None,
-        workflow_id: str | None = Query(default=None, max_length=240),
-        issue_number: int | None = Query(default=None, ge=1),
-        campaign_id: UUID | None = None,
-        provider: str | None = None,
-        role: str | None = Query(default=None, max_length=80),
-        status: str | None = None,
-        worker: str | None = Query(default=None, max_length=32),
-        host: str | None = Query(default=None, max_length=253),
-        phase: str | None = Query(default=None, max_length=120),
-        search: str | None = Query(default=None, max_length=200),
-        date_from: datetime | None = None,
-        date_to: datetime | None = None,
-        cursor: str | None = Query(default=None, max_length=1000),
-        limit: int = Query(default=50, ge=1, le=100),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, status, provider)
-        try:
-            value = await service(request).executions(
-                project=project,
-                workflow_id=workflow_id,
-                issue_number=issue_number,
-                campaign_id=campaign_id,
-                provider=provider,
-                role=role,
-                status=status,
-                worker=worker,
-                host=host,
-                phase=phase,
-                search=search,
-                date_from=date_from,
-                date_to=date_to,
-                cursor=cursor,
-                limit=limit,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/executions/{execution_id}")
-    async def execution_api(execution_id: UUID, request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        value = await service(request).execution(execution_id)
-        if value is None:
-            raise HTTPException(status_code=404, detail="execution not found")
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/executions/{execution_id}/logs")
-    async def execution_logs_api(
-        execution_id: UUID,
-        request: Request,
-        limit: int = Query(default=200, ge=1, le=500),
-        before_sequence: int | None = Query(default=None, ge=1),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        value = await service(request).execution_logs(
-            execution_id,
-            limit=limit,
-            before_sequence=before_sequence,
-        )
-        if value is None:
-            raise HTTPException(status_code=404, detail="execution not found")
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/executions/{execution_id}/stream")
-    async def execution_stream_api(execution_id: UUID, request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        if await service(request).execution(execution_id) is None:
-            raise HTTPException(status_code=404, detail="execution not found")
-        raw_id = request.headers.get("last-event-id", "0")
-        try:
-            after_sequence = max(0, int(raw_id))
-        except ValueError:
-            after_sequence = 0
-        stream_authorization = StreamAuthorization(lambda: request_authorized(request))
-        response = RevocableStreamingResponse(
-            transcript_sse(
-                repo(request).observability,
-                execution_id,
-                after_sequence=after_sequence,
-                disconnected=request.is_disconnected,
-                authorized=stream_authorization.refresh,
-            ),
-            stream_authorization,
-        )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Accel-Buffering"] = "no"
-        return response
-
-    @app.get("/api/dashboard/services")
-    async def services_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return JSONResponse(await service(request).services())
-
     @app.get("/api/dashboard/projects")
     async def projects_api(request: Request) -> Response:
         authenticated = await require_session(request, api=True)
@@ -1076,7 +845,7 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        await check_filters(request, project, None)
+        await check_project(request, project)
         if state is not None and state not in BACKLOG_STATES:
             raise HTTPException(status_code=422, detail="invalid state filter")
         if section is not None and section != "none" and not SECTION_KEY.fullmatch(section):
@@ -1655,11 +1424,12 @@ def create_app(
         return JSONResponse(await service(request).usage(max(1, min(days, 365))))
 
     @app.get("/api/dashboard/runs")
-    async def runs_api(request: Request) -> Response:
+    async def runs_api(request: Request, project: str | None = None) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse(await service(request).runs())
+        await check_project(request, project)
+        return JSONResponse(await service(request).runs(project=project))
 
     @app.get("/api/dashboard/runs/{run_id}")
     async def run_api(run_id: UUID, request: Request) -> Response:
@@ -1965,279 +1735,16 @@ def create_app(
             password=True,
         )
 
-    @app.get("/api/dashboard/root-blockers")
-    async def root_blockers_api(
-        request: Request,
-        project: str | None = None,
-        campaign_id: UUID | None = None,
-        cursor: str | None = Query(default=None, max_length=1000),
-        limit: int = Query(default=100, ge=1, le=100),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, None)
-        try:
-            value = await service(request).root_blockers(
-                project=project,
-                campaign_id=campaign_id,
-                cursor=cursor,
-                limit=limit,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        return JSONResponse(value)
-
-    @app.get("/api/dashboard/audits")
-    async def audits_api(
-        request: Request, project: str | None = None, status: str | None = None
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, status)
-        return JSONResponse(await service(request).audits(project=project, status=status))
-
-    @app.get("/api/dashboard/commands")
-    async def commands_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        return JSONResponse({"items": COMMAND_REGISTRY})
-
-    @app.get("/api/dashboard/r3-issues/candidate")
-    async def dashboard_r3_issue_candidate_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        try:
-            project, surface, issue_number = _r3_candidate_target(request)
-        except ValueError:
-            return JSONResponse({"detail": "invalid request"}, status_code=422)
-        try:
-            return JSONResponse(
-                await operations(request).r3_issue_candidate_status(project, surface, issue_number)
-            )
-        except ValueError as error:
-            return JSONResponse({"detail": str(error)}, status_code=404)
-
-    @app.post("/api/dashboard/r3-issues/candidate", status_code=201)
-    async def dashboard_r3_issue_candidate_create_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        try:
-            project, surface, issue_number = _r3_candidate_target(request)
-        except ValueError:
-            return JSONResponse({"detail": "invalid request"}, status_code=422)
-        body = await _json(request)
-        try:
-            candidate = R3CandidateCreateInput.model_validate(body)
-        except ValueError:
-            return JSONResponse({"detail": "invalid request"}, status_code=422)
-        if not _valid_csrf(authenticated, candidate.csrf_token):
-            return JSONResponse({"detail": "invalid request"}, status_code=403)
-        try:
-            return JSONResponse(
-                await operations(request).r3_issue_candidate(project, surface, issue_number),
-                status_code=201,
-            )
-        except ValueError as error:
-            return JSONResponse({"detail": str(error)}, status_code=409)
-
-    @app.get("/api/dashboard/findings")
-    async def findings_api(
-        request: Request,
-        project: str | None = None,
-        limit: int = Query(default=100, ge=1, le=200),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, None)
-        return JSONResponse(await service(request).findings(project=project, limit=limit))
-
-    @app.get("/api/dashboard/enhancements")
-    async def enhancements_api(
-        request: Request,
-        project: str | None = None,
-        limit: int = Query(default=100, ge=1, le=200),
-    ) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        await check_filters(request, project, None)
-        return JSONResponse(await service(request).enhancements(project=project, limit=limit))
-
-    @app.post("/api/dashboard/actions/candidates")
-    async def action_candidate_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        try:
-            body = ActionCandidateInput.model_validate(await _json(request))
-            if not _valid_csrf(authenticated, body.csrf_token):
-                return JSONResponse({"detail": "invalid request"}, status_code=403)
-            command = parse_command(body.command)
-            value = await operations(request).candidate(
-                command, sessions.binding_digest(authenticated.token)
-            )
-            return JSONResponse(value.model_dump(mode="json"))
-        except ValueError as error:
-            return JSONResponse({"detail": str(error)}, status_code=409)
-        except Exception:  # noqa: BLE001 - never reflect form or password values
-            return JSONResponse({"detail": "unable to prepare action"}, status_code=400)
-
-    @app.post("/api/dashboard/actions/reauthenticate")
-    async def action_reauthenticate_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        address = _client_address(request, trusted_proxies)
-        if login_limiter.blocked(f"reauth:{address}"):
-            return JSONResponse({"detail": "unable to authorize action"}, status_code=429)
-        try:
-            body = ActionReauthenticationInput.model_validate(await _json(request))
-            if not _valid_csrf(authenticated, body.csrf_token):
-                return JSONResponse({"detail": "invalid request"}, status_code=403)
-            version = await repo(request).verify_password(body.current_password)
-            if version != authenticated.data.password_version:
-                login_limiter.failure(f"reauth:{address}")
-                return JSONResponse({"detail": "unable to authorize action"}, status_code=401)
-            replacement = sessions.create(version)
-            replacement_data = sessions.verify(replacement)
-            if replacement_data is None:
-                raise ValueError("replacement session is invalid")
-            token, expires_at = await operations(request).rotate_reauthentication(
-                body.candidate_id,
-                session_authorization(authenticated),
-                sessions.binding_digest(replacement),
-            )
-            login_limiter.success(f"reauth:{address}")
-            response = JSONResponse(
-                {
-                    "reauthentication_token": token,
-                    "expires_in": max(0, int((expires_at - datetime.now(UTC)).total_seconds())),
-                    "expires_at": expires_at.isoformat(),
-                    "csrf_token": replacement_data.csrf_token,
-                    "session_rotated": True,
-                }
-            )
-            _set_cookie(
-                response,
-                SESSION_COOKIE,
-                replacement,
-                max_age=resolved.dashboard_session_hours * 3600,
-            )
-            return response
-        except Exception:  # noqa: BLE001 - never reflect password values
-            return JSONResponse({"detail": "unable to authorize action"}, status_code=400)
-
-    @app.post("/api/dashboard/actions/execute", status_code=202)
-    async def action_execute_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        try:
-            body = ActionExecuteInput.model_validate(await _json(request))
-            if not _valid_csrf(authenticated, body.csrf_token):
-                return JSONResponse({"detail": "invalid request"}, status_code=403)
-            value = await operations(request).queue_candidate(
-                body.candidate_id,
-                body.reauthentication_token,
-                sessions.binding_digest(authenticated.token),
-                body.confirmation_phrase,
-                authorization=session_authorization(authenticated),
-            )
-            return JSONResponse(
-                await service(request).operation_response(value.model_dump(mode="json")),
-                status_code=202,
-            )
-        except ValueError as error:
-            return JSONResponse({"detail": str(error)}, status_code=409)
-        except Exception:  # noqa: BLE001 - safe action boundary
-            return JSONResponse({"detail": "unable to execute action"}, status_code=400)
-
-    @app.get("/api/dashboard/operations/{operation_id}")
-    async def dashboard_operation_api(operation_id: UUID, request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        value = await operations(request).operation(operation_id)
-        if value is None:
-            raise HTTPException(status_code=404, detail="operation not found")
-        return JSONResponse(
-            await service(request).operation_response(value.model_dump(mode="json"))
-        )
-
-    @app.get("/api/dashboard/operations/{operation_id}/export")
-    async def dashboard_operation_export_api(operation_id: UUID, request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        value = await operations(request).export_content(operation_id)
-        if value is None:
-            raise HTTPException(status_code=404, detail="operation export not found")
-        payload = (
-            json.dumps(
-                value,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            + b"\n"
-        )
-        return Response(
-            payload,
-            media_type="application/json",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="engineering-control-export-{operation_id}.json"'
-                )
-            },
-        )
-
-    @app.get("/api/dashboard/connections")
-    async def connections_api(request: Request) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        items = await operations(request).connections()
-        return JSONResponse({"items": [item.model_dump(mode="json") for item in items]})
-
     @app.get("/api/dashboard/activity/recent")
     async def recent_activity(
         request: Request, limit: int = Query(default=500, ge=1, le=500)
     ) -> Response:
+        """The record of what was done in the console: who changed what, and when."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
         items = await repo(request).recent_events(limit=limit)
         return JSONResponse({"items": items, "last_event_id": int(items[-1]["id"]) if items else 0})
-
-    @app.get("/api/dashboard/activity/stream")
-    async def activity_stream(request: Request, after_id: int = Query(default=0, ge=0)) -> Response:
-        authenticated = await require_session(request, api=True)
-        if isinstance(authenticated, Response):
-            return authenticated
-        raw_id = request.headers.get("last-event-id", str(after_id))
-        try:
-            after_id = max(0, int(raw_id))
-        except ValueError:
-            after_id = 0
-        stream_authorization = StreamAuthorization(lambda: request_authorized(request))
-        response = RevocableStreamingResponse(
-            sse_events(
-                repo(request),
-                after_id=after_id,
-                disconnected=request.is_disconnected,
-                authorized=stream_authorization.refresh,
-            ),
-            stream_authorization,
-        )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Accel-Buffering"] = "no"
-        return response
 
     @app.get("/console/assets/{name}")
     async def console_asset(name: str, request: Request) -> Response:
@@ -2429,40 +1936,6 @@ def _canonical_origin(value: str, *, allow_path: bool) -> str:
         return origin
     except ValueError:
         return ""
-
-
-def _validate_filters(project: str | None, status: str | None) -> None:
-    if project is not None and project not in PROJECTS:
-        raise HTTPException(status_code=422, detail="invalid project filter")
-    if status is not None and status not in NORMALIZED_STATUSES:
-        raise HTTPException(status_code=422, detail="invalid status filter")
-
-
-def _r3_candidate_target(request: Request) -> tuple[str, str, int]:
-    """Validate the fixed R3 lookup only after the caller is authenticated."""
-    if len(request.url.query) > 256:
-        raise ValueError("invalid R3 candidate target")
-    items = list(request.query_params.multi_items())
-    if len(items) != 3 or {key for key, _value in items} != {
-        "project",
-        "surface",
-        "issue_number",
-    }:
-        raise ValueError("invalid R3 candidate target")
-    project = request.query_params.get("project")
-    surface = request.query_params.get("surface")
-    issue_number = request.query_params.get("issue_number")
-    if project != "musematic" or surface != "source" or issue_number != "1119":
-        raise ValueError("invalid R3 candidate target")
-    return project, surface, 1119
-
-
-def _validate_observability_filters(
-    project: str | None, status: str | None, provider: str | None
-) -> None:
-    _validate_filters(project, status)
-    if provider is not None and provider not in {"codex", "claude"}:
-        raise HTTPException(status_code=422, detail="invalid provider filter")
 
 
 async def _record_safely(repository: DashboardRepository, event: ActivityEventInput) -> None:

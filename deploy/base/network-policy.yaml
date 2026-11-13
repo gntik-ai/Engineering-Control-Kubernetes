@@ -53,22 +53,6 @@ spec:
         - protocol: TCP
           port: 8750
 ---
-# Temporal accepts connections only from this namespace.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: temporal-ingress
-  annotations:
-    argocd.argoproj.io/sync-wave: "-1"
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: engineering-control-temporal
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        - podSelector: {}
----
 # The sandboxes' proxy is the one process a sandbox may reach, and only a sandbox whose
 # step may reach out at all (the label engineering-control/egress: internet). The proxy in
 # turn resolves names and opens HTTPS connections to public addresses, and nothing else:

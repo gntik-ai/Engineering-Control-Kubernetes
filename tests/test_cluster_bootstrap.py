@@ -11,7 +11,6 @@ from engineering_control.cluster_bootstrap import (
     ADMIN_PASSWORD_KEY,
     ADMIN_SECRET,
     SERVICE_SECRET,
-    UPLOADER_IDENTITIES,
     NamespaceSecrets,
     bootstrap_admin_password,
     bootstrap_service_secrets,
@@ -65,9 +64,7 @@ def test_service_secret_is_created_once_with_every_key() -> None:
     cluster = FakeCluster()
     store = cluster.store()
     added = bootstrap_service_secrets(store)
-    expected = {"api.token", "evidence-ingest.token", "egress-grant.key", "session.key"} | {
-        f"{identity}.token" for identity in UPLOADER_IDENTITIES
-    }
+    expected = {"egress-grant.key", "session.key"}
     assert set(added) == expected == set(service_secret_generators())
     values = {
         key: base64.b64decode(value) for key, value in cluster.secrets[SERVICE_SECRET].items()
@@ -88,13 +85,13 @@ def test_a_missing_key_is_added_without_touching_the_others() -> None:
     store = cluster.store()
     bootstrap_service_secrets(store)
     kept = dict(cluster.secrets[SERVICE_SECRET])
-    del cluster.secrets[SERVICE_SECRET]["scan-runner.token"]
-    del kept["scan-runner.token"]
+    del cluster.secrets[SERVICE_SECRET]["egress-grant.key"]
+    del kept["egress-grant.key"]
 
-    assert bootstrap_service_secrets(store) == ["scan-runner.token"]
+    assert bootstrap_service_secrets(store) == ["egress-grant.key"]
     after = cluster.secrets[SERVICE_SECRET]
     assert {key: after[key] for key in kept} == kept
-    assert "scan-runner.token" in after
+    assert "egress-grant.key" in after
 
 
 def test_a_secret_created_by_a_concurrent_run_is_completed_not_replaced() -> None:
@@ -106,7 +103,7 @@ def test_a_secret_created_by_a_concurrent_run_is_completed_not_replaced() -> Non
     def racing(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and not raced["done"]:
             raced["done"] = True
-            cluster.secrets[SERVICE_SECRET] = {"api.token": base64.b64encode(b"theirs").decode()}
+            cluster.secrets[SERVICE_SECRET] = {"session.key": base64.b64encode(b"theirs").decode()}
         return original(request)
 
     store.client = httpx.Client(
@@ -115,8 +112,8 @@ def test_a_secret_created_by_a_concurrent_run_is_completed_not_replaced() -> Non
         headers={"Authorization": "Bearer service-account-token"},
     )
     added = bootstrap_service_secrets(store)
-    assert "api.token" not in added
-    assert base64.b64decode(cluster.secrets[SERVICE_SECRET]["api.token"]) == b"theirs"
+    assert "session.key" not in added
+    assert base64.b64decode(cluster.secrets[SERVICE_SECRET]["session.key"]) == b"theirs"
     assert set(cluster.secrets[SERVICE_SECRET]) == set(service_secret_generators())
 
 

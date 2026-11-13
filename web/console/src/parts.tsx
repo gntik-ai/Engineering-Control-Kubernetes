@@ -5,7 +5,6 @@ import {
   Link,
   SimpleSelect,
   Skeleton,
-  StatusTag,
   TableCell,
   TableRow,
   Timestamp,
@@ -15,7 +14,6 @@ import {
 import { Inbox, RefreshCw } from '@gntik-ai/icons';
 import type { ReactNode } from 'react';
 import { apiUrl, useResource, type Listing, type ProjectSummary, type Resource } from './api';
-import { STATUSES } from './status';
 
 /** Names the page in the browser tab while it is shown. */
 export function usePageTitle(page: string | undefined) {
@@ -23,10 +21,6 @@ export function usePageTitle(page: string | undefined) {
 }
 
 export const mono = 'font-mono text-[12px] whitespace-nowrap text-muted-foreground';
-
-export function Status({ value }: { value: string }) {
-  return <StatusTag status={value} statuses={STATUSES} size="sm" />;
-}
 
 export function When({ value }: { value: string | null }) {
   return value ? <Timestamp value={value} live className="text-[12px]" /> : <span className={mono}>—</span>;

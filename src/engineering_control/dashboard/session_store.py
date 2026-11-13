@@ -42,26 +42,6 @@ def lock_authentication(session: Session) -> DashboardAuthentication:
     return row
 
 
-def require_authorization(session: Session, authorization: SessionAuthorization) -> None:
-    row = lock_authentication(session)
-    now = datetime.now(UTC)  # Recheck expiry AFTER waiting for the shared lock.
-    if (
-        _DIGEST.fullmatch(authorization.binding_hash) is None
-        or authorization.password_version != row.password_version
-        or authorization.expires_at.tzinfo is None
-        or authorization.expires_at <= now
-        or session.scalar(
-            select(DashboardSessionRevocation.session_binding_hash).where(
-                DashboardSessionRevocation.session_binding_hash == authorization.binding_hash,
-                DashboardSessionRevocation.password_version == authorization.password_version,
-                DashboardSessionRevocation.expires_at > now,
-            )
-        )
-        is not None
-    ):
-        raise ValueError("dashboard session is no longer authorized")
-
-
 def retire_session(session: Session, authorization: SessionAuthorization) -> None:
     """Caller owns the authentication lock. Store a digest, never bearer material."""
     if _DIGEST.fullmatch(authorization.binding_hash) is None:

@@ -1,4 +1,0 @@
-name: engineering-control
-version: 0.1.0
-description: "Narrow Engineering Control commands; execution is handled by an authenticated gateway hook."
-author: gntik-ai

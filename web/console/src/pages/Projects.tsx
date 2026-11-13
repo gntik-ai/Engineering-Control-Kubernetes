@@ -32,7 +32,7 @@ function Metric({ label, value, href }: { label: string; value: number; href: st
 }
 
 function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () => void }) {
-  const busy = item.running_executions > 0;
+  const busy = item.active_runs > 0;
   const [dialog, setDialog] = useState<'rename' | 'remove' | null>(null);
   const removable = item.origin === 'console';
   return (
@@ -74,12 +74,12 @@ function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () 
       </CardHeader>
       <CardBody className="grid gap-3">
         <div className="grid grid-cols-3 gap-2">
-          <Metric label="Backlog issues" value={item.backlog_issues} href={filtered('backlog', item.project)} />
-          <Metric label="Active workflows" value={item.active_workflows} href={filtered('executions', item.project)} />
-          <Metric label="Running agents" value={item.running_executions} href={filtered('executions', item.project)} />
+          <Metric label="Items to do" value={item.open_items} href={filtered('backlog', item.project)} />
+          <Metric label="Runs under way" value={item.active_runs} href={filtered('runs', item.project)} />
+          <Metric label="Runs so far" value={item.runs} href={filtered('runs', item.project)} />
         </div>
         <div className="flex items-center justify-between text-[12px] text-muted-foreground">
-          <StatusDot tone={busy ? 'success' : 'neutral'} pulse={busy} label={busy ? 'Executing' : 'Idle'} />
+          <StatusDot tone={busy ? 'success' : 'neutral'} pulse={busy} label={busy ? 'Working' : 'Idle'} />
           <span>
             Last activity <When value={item.last_activity_at} />
           </span>

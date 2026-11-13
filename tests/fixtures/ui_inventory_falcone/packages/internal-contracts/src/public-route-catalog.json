@@ -1,4 +1,0 @@
-{"version": "fixture", "routes": [
-  {"method": "GET", "path": "/v1/plans", "operationId": "listPlans"},
-  {"method": "GET", "path": "/v1/plans/{planId}", "operationId": "getPlan"}
-]}

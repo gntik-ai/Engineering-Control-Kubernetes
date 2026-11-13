@@ -1,4 +1,4 @@
-# Non-secret settings shared by every control-plane process.
+# Non-secret settings shared by every process of the platform.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,23 +9,16 @@ data:
   ENGINEERING_ENVIRONMENT: cluster
   # Listeners are on the pod interface; network policy decides who may reach them.
   ENGINEERING_NETWORK_BOUNDARY: cluster
-  ENGINEERING_API_HOST: 0.0.0.0
-  # The console reads the admission state of the API through its Service.
-  ENGINEERING_API_SERVICE_NAME: engineering-control-api
   ENGINEERING_DASHBOARD_HOST: 0.0.0.0
-  ENGINEERING_EVIDENCE_INGEST_HOST: 0.0.0.0
   # The ingress controller connects from a node address (see network-policy.yaml); only
   # such connections may say which client address a sign-in attempt is counted against.
   ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS: >-
     ["10.0.1.1/32", "10.42.0.0/32", "100.64.0.7/32", "10.42.3.0/32",
     "100.64.0.6/32", "10.42.5.0/32", "100.64.0.5/32", "10.42.17.0/32"]
-  ENGINEERING_API_TOKEN_FILE: /var/run/secrets/engineering-control/api.token
   ENGINEERING_DASHBOARD_SESSION_KEY_FILE: /var/run/secrets/engineering-control/session.key
-  ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE: /var/run/secrets/engineering-control/evidence-ingest.token
   # What a step's grant to reach a project's own application is signed with: the
   # launcher signs, the sandboxes' proxy checks.
   ENGINEERING_SANDBOX_EGRESS_GRANT_KEY_FILE: /var/run/secrets/engineering-control/egress-grant.key
-  ENGINEERING_EVIDENCE_INGEST_TOKEN_DIRECTORY: /var/run/secrets/engineering-control
   # The GitHub App "Engineering Control" of the organisation, installed on the repositories
   # the platform works on. Identifiers only; the private key and the client secret are in
   # the Secret engineering-control-github-app, created by the administrator.
@@ -56,9 +49,3 @@ data:
   # the launcher tells a turn of the supervisor to find it, again by address.
   ENGINEERING_SUPERVISOR_TOOLS_HOST: 0.0.0.0
   ENGINEERING_SUPERVISOR_TOOLS_URL: http://engineering-control-tools:8790
-  ENGINEERING_TEMPORAL_TARGET: engineering-control-temporal:7233
-  ENGINEERING_TEMPORAL_NAMESPACE: engineering-control
-  # Temporal is reached over TLS: the server must show a certificate for this name, signed
-  # by the platform's certificate authority (deploy/base/certificates.yaml).
-  ENGINEERING_TEMPORAL_TLS_CA_FILE: /var/run/secrets/engineering-control-temporal/ca.crt
-  ENGINEERING_TEMPORAL_TLS_SERVER_NAME: engineering-control-temporal

@@ -1,9 +1,0 @@
-version: 1
-enabled: false
-project: falcone
-environment: staging
-strategy: helm
-target_context: UNCONFIGURED
-target_namespace: UNCONFIGURED
-blocker: SCOPED_FALCONE_STAGING_TARGET_REQUIRED
-configuration: {}

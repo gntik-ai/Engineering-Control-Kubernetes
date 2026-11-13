@@ -14,11 +14,6 @@ from engineering_control.config import Settings
 
 BASE = Path(__file__).parents[1] / "deploy" / "base"
 IMAGE = "engineering-control"  # the placeholder kustomization.yaml pins to a commit
-# Temporal's own images, pinned by digest, and the user they run as.
-THIRD_PARTY_IMAGES = {
-    "temporalio/server:1.31.2@sha256:b5ecdb8282bededae2a10c36e8d862e27d0bc2d247fc73c5416025997ab4a1da",
-    "temporalio/admin-tools:1.31.2@sha256:dbc5fcd6ee8f0f4d808bf765af9a87dea9d8a283abfdcfbd2fc148496ba66107",
-}
 BOOTSTRAP_ACCOUNT = "engineering-control-bootstrap"
 CONSOLE_ACCOUNT = "engineering-control-console"
 LAUNCHER_ACCOUNT = "engineering-control-launcher"
@@ -89,10 +84,8 @@ def test_every_pod_runs_unprivileged_with_a_read_only_filesystem() -> None:
         pod = spec["securityContext"]
         assert pod["runAsNonRoot"] is True, name
         images = {container["image"] for container in spec["containers"]}
-        third_party = images <= THIRD_PARTY_IMAGES
-        assert third_party or images == {IMAGE}, name  # never a mix, never anything else
-        user = 1000 if third_party else 10001
-        assert pod["runAsUser"] == user and pod["runAsGroup"] == user, name
+        assert images == {IMAGE}, name  # the platform's own image, and nothing else
+        assert pod["runAsUser"] == 10001 and pod["runAsGroup"] == 10001, name
         assert pod["seccompProfile"] == {"type": "RuntimeDefault"}, name
         assert not spec.get("hostNetwork") and not spec.get("hostPID"), name
         for container in spec["containers"] + spec.get("initContainers", []):
@@ -411,7 +404,7 @@ def test_sandboxes_reach_the_proxy_and_the_proxy_reaches_public_https_only() -> 
     data = next(
         d["data"]
         for d in documents
-        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
     )
     assert data["ENGINEERING_SANDBOX_EGRESS_PROXY"] == "http://engineering-control-egress:8888"
     settings = Settings(
@@ -471,7 +464,7 @@ def test_only_a_turn_of_the_supervisor_reaches_the_tool_service_from_outside() -
     data = next(
         d["data"]
         for d in documents
-        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
     )
     assert data["ENGINEERING_SUPERVISOR_TOOLS_URL"] == "http://engineering-control-tools:8790"
     settings = Settings(
@@ -517,7 +510,7 @@ def test_the_chat_channel_reads_alone_holds_the_bots_token_and_has_no_listener()
     data = next(
         d["data"]
         for d in documents
-        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
     )
     assert data["ENGINEERING_TELEGRAM_TOKEN_FILE"] == f"{mount['mountPath']}/bot-token"
     host = data["ENGINEERING_CONSOLE_PUBLIC_URL"].removeprefix("https://")
@@ -562,31 +555,30 @@ def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     settings = next(
         d["data"]
         for d in documents
-        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
     )
     trusted = json.loads(settings["ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS"])
     assert sorted(trusted) == sorted(addresses)
 
 
-def test_a_volume_claim_is_never_in_an_earlier_wave_than_the_pod_that_mounts_it() -> None:
-    # The cluster's storage class binds a claim when its first pod is scheduled. Argo CD
-    # waits for each wave to be healthy, so a claim in an earlier wave would never bind.
-    def wave(document: dict[str, Any]) -> int:
-        return int(document["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"])
-
+def test_what_holds_a_data_volume_and_is_no_longer_used_is_kept_apart() -> None:
+    """A deployment never deletes a volume by itself: what the original's way of working
+    left behind stays, in a file of its own, until the administrator removes it."""
+    leftovers = [d for d in yaml.safe_load_all((BASE / "leftovers.yaml").read_text()) if d]
+    assert [(d["kind"], d["metadata"]["name"]) for d in leftovers] == [
+        ("PersistentVolumeClaim", "engineering-control-evidence"),
+        ("Cluster", "engineering-control-temporal-postgres"),
+    ]
+    # Nothing of the platform mounts a claim or names that database.
     documents = _documents()
-    claims = {
-        d["metadata"]["name"]: wave(d) for d in documents if d["kind"] == "PersistentVolumeClaim"
-    }
-    assert claims
-    mounted: dict[str, int] = {}
     for document in documents:
         if document["kind"] in {"Deployment", "StatefulSet", "Job"}:
-            for volume in document["spec"]["template"]["spec"].get("volumes", []):
-                if "persistentVolumeClaim" in volume:
-                    name = volume["persistentVolumeClaim"]["claimName"]
-                    mounted[name] = min(mounted.get(name, 99), wave(document))
-    assert claims == mounted
+            volumes = document["spec"]["template"]["spec"].get("volumes", [])
+            assert not any("persistentVolumeClaim" in volume for volume in volumes)
+    others = "\n".join(
+        path.read_text() for path in BASE.glob("*.yaml") if path.name != "leftovers.yaml"
+    )
+    assert "temporal" not in others.lower() and "evidence" not in others.lower()
 
 
 def test_no_storage_class_is_named() -> None:
@@ -616,7 +608,7 @@ def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:
         }
     }
     pods = _pod_specs()
-    assert len(pods) >= 11
+    assert len(pods) >= 8
     for name, spec in pods:
         assert spec.get("affinity", {}).get("nodeAffinity") == rule, name
         assert "nodeSelector" not in spec and "tolerations" not in spec, name
@@ -628,67 +620,12 @@ def test_nothing_of_the_platform_may_run_on_the_sandbox_node() -> None:
         assert "tolerations" not in cluster["spec"]["affinity"], name
 
 
-def test_temporal_is_reached_over_tls_and_only_the_server_holds_its_key() -> None:
-    documents = _documents()
-    settings = next(
-        d
-        for d in documents
-        if d["kind"] == "ConfigMap" and "data" in d and ("ENGINEERING_TEMPORAL_TARGET" in d["data"])
-    )["data"]
-    name = settings["ENGINEERING_TEMPORAL_TLS_SERVER_NAME"]
-    assert settings["ENGINEERING_TEMPORAL_TARGET"] == f"{name}:7233"
-    authority_file = settings["ENGINEERING_TEMPORAL_TLS_CA_FILE"]
-
-    certificates = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Certificate"}
-    server = certificates["engineering-control-temporal-tls"]["spec"]
-    assert name in server["dnsNames"] and "server auth" in server["usages"]
-    assert server["issuerRef"]["kind"] == "Issuer"  # the platform's own authority, not a public one
-    authority = certificates["engineering-control-ca"]["spec"]
-    assert authority["isCA"] is True
-    issuers = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "Issuer"}
-    assert issuers[server["issuerRef"]["name"]] == {"ca": {"secretName": authority["secretName"]}}
-
-    # The server is configured with the certificate, and rereads it without a restart.
-    config = yaml.safe_load(
-        next(
-            d for d in documents if d["metadata"]["name"] == "engineering-control-temporal-config"
-        )["data"]["docker.yaml"]
-    )
-    tls = config["global"]["tls"]
-    assert tls["frontend"]["server"]["certFile"].endswith("/tls.crt")
-    assert tls["frontend"]["server"]["keyFile"].endswith("/tls.key")
-    assert tls["frontend"]["client"]["serverName"] == name
-    assert tls["refreshInterval"]
-
-    holders = {}
-    for pod, spec in _pod_specs():
-        for volume in spec.get("volumes", []):
-            if volume.get("secret", {}).get("secretName") == server["secretName"]:
-                holders[pod] = volume["secret"].get("items")
-    only_authority = [{"key": "ca.crt", "path": "ca.crt"}]
-    assert holders == {
-        "Deployment/engineering-control-temporal": None,  # the whole secret: it is the server
-        "Job/temporal-namespace": only_authority,
-        "Deployment/engineering-control-api": only_authority,
-        "Deployment/engineering-control-workflow-worker": only_authority,
-    }
-    # The clients find the authority where the settings say it is.
-    for pod in (
-        "Deployment/engineering-control-api",
-        "Deployment/engineering-control-workflow-worker",
-    ):
-        spec = dict(_pod_specs())[pod]
-        mounts = {m["name"]: m for c in spec["containers"] for m in c["volumeMounts"]}
-        assert f"{mounts['temporal-ca']['mountPath']}/ca.crt" == authority_file
-        assert mounts["temporal-ca"]["readOnly"] is True
-
-
 def test_only_three_processes_hold_the_github_app_key_and_none_its_client_secret() -> None:
     documents = _documents()
     settings = next(
         d["data"]
         for d in documents
-        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
     )
     key_file = settings["ENGINEERING_GITHUB_APP_PRIVATE_KEY_FILE"]
     holders = {}

@@ -96,8 +96,8 @@ def test_issues_are_imported_and_routed_by_their_labels(tmp_path: Path, github: 
         assert status["open_issues"] == 5 and status["error"] is None and status["synced_at"]
         # The project list counts what is still to do.
         projects = client.get("/api/dashboard/projects").json()["items"]
-        assert next(p for p in projects if p["project"] == "falcone")["backlog_issues"] == 5
-        assert next(p for p in projects if p["project"] == "musematic")["backlog_issues"] == 0
+        assert next(p for p in projects if p["project"] == "falcone")["open_items"] == 5
+        assert next(p for p in projects if p["project"] == "musematic")["open_items"] == 0
     finally:
         client.__exit__(None, None, None)
 

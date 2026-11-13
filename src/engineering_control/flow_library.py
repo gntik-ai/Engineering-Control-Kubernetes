@@ -1,8 +1,8 @@
-"""The built-in flows a section can be assigned.
+"""The names of the flows the platform knows from the start.
 
-Each one stands for work the original system does through its workflows
-(``docs/design/kubernetes-architecture-study.md``, section 13.5). Until flows become
-editable records, this list is the whole library: a name the administrator can assign.
+The first six are flows of the platform's own (``engine/builtin.py``). The last four
+name work the original system did and this platform does not do yet: a section can be
+given one, and nothing runs for it until a flow of that key is made in the designer.
 Assigning a flow records the choice; it does not start anything.
 
 A flow says two things about its section. What starting one of the section's items runs

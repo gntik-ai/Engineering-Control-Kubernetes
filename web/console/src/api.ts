@@ -11,10 +11,11 @@ export interface ProjectSummary {
   source_repository: string;
   deployment_repository: string;
   self_contained: boolean;
-  backlog_issues: number;
-  workflows: number;
-  active_workflows: number;
-  running_executions: number;
+  /** Items of the backlog still to do. */
+  open_items: number;
+  /** Runs of the project's work, and how many of them are under way. */
+  runs: number;
+  active_runs: number;
   last_activity_at: string | null;
 }
 
@@ -815,73 +816,6 @@ export interface GitHubRepositories {
   items: GitHubRepository[];
 }
 
-export interface BacklogItem {
-  project: string;
-  repository?: string | null;
-  issue_number: number | null;
-  issue_url: string | null;
-  title: string;
-  risk?: string | null;
-  normalized_status: string;
-  raw_status: string | null;
-  current_phase: string | null;
-  last_activity_at: string | null;
-  blocker: string | null;
-  workflow_id: string | null;
-}
-
-export interface Execution {
-  execution_id: string;
-  workflow_id: string;
-  project: string;
-  repository: string | null;
-  issue_number: number | null;
-  provider: string;
-  role: string;
-  host: string | null;
-  worker_kind: string | null;
-  normalized_status: string;
-  raw_status: string;
-  phase: string | null;
-  attempt: number;
-  max_attempts: number;
-  started_at: string | null;
-  last_heartbeat: string | null;
-  ended_at: string | null;
-  blocker_code: string | null;
-  error_summary: string | null;
-}
-
-export interface Workflow {
-  workflow_id: string;
-  project: string;
-  repository: string | null;
-  issue_number: number | null;
-  issue_url: string | null;
-  workflow_type: string;
-  normalized_status: string;
-  raw_status: string;
-  current_phase: string | null;
-  active_provider: string | null;
-  active_role: string | null;
-  started_at: string | null;
-  last_activity_at: string | null;
-  blocker_code: string | null;
-}
-
-export interface LogChunk {
-  id: number | string;
-  sequence: number;
-  stream: string;
-  timestamp: string | null;
-  text: string;
-  is_truncated: boolean;
-}
-
-export interface ExecutionLogs extends Listing<LogChunk> {
-  last_sequence: number;
-}
-
 export interface Listing<T> {
   items: T[];
   refreshed_at?: string | null;
@@ -890,9 +824,6 @@ export interface Paged<T> extends Listing<T> {
   page: number;
   pages: number;
   total: number;
-}
-export interface Cursored<T> extends Listing<T> {
-  next_cursor: string | null;
 }
 
 export type Params = Record<string, string | number | null | undefined>;

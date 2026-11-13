@@ -225,21 +225,3 @@ def redact_detail_text(text: str, redactor: SecretRedactor | None = None) -> str
     ran first could blank only part of a value and hide the rest from this one)."""
     inline = _redact_inline_credentials(_ANSI_ESCAPE.sub("", text))
     return str((redactor or SecretRedactor()).redact_text(inline).value)
-
-
-def bounded_detail(
-    text: str, redactor: SecretRedactor | None = None, *, limit: int = BLOCKER_DETAIL_LIMIT
-) -> str:
-    """One redacted line of at most ``limit`` characters.
-
-    Redacted before it is cut, so a cut never leaves part of a secret unrecognised. Besides
-    the redactor's rules, credential assignments are redacted anywhere in the line, so a
-    label or an exception's own prefix in front of ``password=...`` cannot hide it."""
-    # NEW-146 reviews 5-6: inline credentials (spanning newlines) are redacted on the raw
-    # text before the redactor's rules, and again after flattening to one line.
-    redacted = redact_detail_text(text, redactor)
-    line = " ".join(redacted.split())
-    line = _redact_inline_credentials(line)
-    if len(line) > limit:
-        line = line[: limit - 3].rstrip() + "..."
-    return line

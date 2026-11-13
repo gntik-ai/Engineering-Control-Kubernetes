@@ -4,9 +4,9 @@ Run as Jobs from the control-plane image, with a service account that may read a
 Secrets in its own namespace and nothing else:
 
 ``secrets``
-    Create the Secret that holds the service tokens and the dashboard session key, with
-    random values. Keys that already exist are never changed, so re-running is harmless and
-    a later release can add a key without rotating the others.
+    Create the Secret that holds the console's session key and the key of the sandboxes'
+    grants, with random values. Keys that already exist are never changed, so re-running
+    is harmless and a later release can add a key without rotating the others.
 
 ``admin-password``
     Give the dashboard its first password. The password is stored in a Secret first and
@@ -35,15 +35,6 @@ SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 SERVICE_SECRET = "engineering-control-secrets"  # noqa: S105 - the name of a Secret object
 ADMIN_SECRET = "engineering-control-admin"  # noqa: S105 - the name of a Secret object
 ADMIN_PASSWORD_KEY = "initial-password"  # noqa: S105 - a key name, not a password
-UPLOADER_IDENTITIES = (
-    "codex-runner",
-    "claude-runner",
-    "browser-runner",
-    "scan-runner",
-    "delivery-runner",
-    "release-runner",
-    "github-runner",
-)
 
 
 def _token() -> bytes:
@@ -52,17 +43,12 @@ def _token() -> bytes:
 
 def service_secret_generators() -> dict[str, Callable[[], bytes]]:
     """Every key of the service Secret and how a missing one is generated."""
-    generators: dict[str, Callable[[], bytes]] = {
-        "api.token": _token,
-        "evidence-ingest.token": _token,
+    return {
         # What a step's grant to reach a project's application is signed with
         # (sandbox/egress.py): the launcher signs, the proxy checks.
         "egress-grant.key": _token,
         "session.key": lambda: secrets.token_bytes(64),
     }
-    for identity in UPLOADER_IDENTITIES:
-        generators[f"{identity}.token"] = _token
-    return generators
 
 
 class NamespaceSecrets:

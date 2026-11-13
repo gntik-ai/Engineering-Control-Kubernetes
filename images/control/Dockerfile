@@ -30,7 +30,6 @@ WORKDIR /app
 # Migrations run from this image as a Job; schemas and default policies are read at runtime.
 COPY alembic.ini ./
 COPY migrations ./migrations
-COPY schemas ./schemas
 COPY config ./config
 # The script the console hands out for exporting a project's records from the original
 # system. It runs there, not here.
@@ -41,4 +40,4 @@ ENV PATH=/opt/venv/bin:${PATH} \
 # ENGINEERING_BUILD_ID is deliberately not set here: it switches on Temporal worker
 # versioning, which is a deployment decision made in the manifests, not in the image.
 USER 10001:10001
-CMD ["engineering-api"]
+CMD ["engineering-dashboard"]

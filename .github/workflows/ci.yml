@@ -55,7 +55,7 @@ jobs:
   test:
     name: Unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,29 +67,8 @@ jobs:
           cache-dependency-path: requirements.lock
       - name: Install constrained project and development dependencies
         run: python -m pip install --constraint requirements.lock --editable ".[dev]"
-      - name: Install the Temporal CLI (pinned, checksum verified)
-        # With `temporal` on PATH the workflow replay tests run instead of skipping.
-        run: .github/scripts/install-temporal-cli.sh
-      - name: Fetch the Temporal test server once
-        # The workflow tests start a local Temporal server, downloaded on first use. Doing
-        # it here keeps parallel test workers from each downloading it.
-        run: |
-          python - <<'PY'
-          import asyncio
-
-          from temporalio.testing import WorkflowEnvironment
-
-
-          async def main() -> None:
-              async with await WorkflowEnvironment.start_local():
-                  pass
-
-
-          asyncio.run(main())
-          PY
       - name: Run the unit suite
-        # Tests that need a real PostgreSQL server skip here; the PostgreSQL acceptance
-        # workflow runs them.
+        # A real PostgreSQL is met in the image's boot test, which runs the migrations.
         run: python -m pytest -q -n auto -p no:cacheprovider
 
   console:
@@ -154,26 +133,24 @@ jobs:
           from engineering_control.sandbox.launcher import run as launcher
           from engineering_control.chat.service import run as chat
           from engineering_control.supervisor.service import run as tools
-          from engineering_control.workflows.definitions import ALL_WORKFLOWS
+          from engineering_control.engine.builtin import BUILTIN
 
           assert os.geteuid() != 0, "the image must not run as root"
           assert (CONSOLE_ROOT / "index.html").is_file(), "console bundle missing"
           assert (CONSOLE_ROOT / "login.html").is_file(), "sign-in page missing"
           assert sign_in_assets(), "the sign-in page names no files"
-          assert ALL_WORKFLOWS, "no workflows registered"
+          assert BUILTIN, "no flows of the platform's own"
           assert callable(launcher), "the launcher is missing"
-          print("ok", engineering_control.__name__, len(ALL_WORKFLOWS), "workflows")
+          print("ok", engineering_control.__name__, len(BUILTIN), "flows")
           PY
           docker run --rm engineering-control:ci alembic --help >/dev/null
           # The export script for the original system's records is handed out by the
           # console and by the command line: it has to be in the image.
           docker run --rm engineering-control:ci engineering-ctl records script | grep -q "SET TRANSACTION READ ONLY"
-      - name: Install the Temporal CLI (pinned, checksum verified)
-        run: .github/scripts/install-temporal-cli.sh
       - name: Boot the image as a cluster would
-        # Non-root, read-only filesystem, secrets as a mounted Secret volume, real
-        # PostgreSQL and Temporal: migrations, API, console, evidence ingest, notifier,
-        # scheduler and workflow worker must all start from configuration alone.
+        # Non-root, read-only filesystem, secrets as a mounted Secret volume, a real
+        # PostgreSQL: migrations, the console, the sandboxes' proxy, the supervisor's
+        # tools and the chat channel must all start from configuration alone.
         run: images/control/boot-test.sh engineering-control:ci
       - name: Log in to the registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0

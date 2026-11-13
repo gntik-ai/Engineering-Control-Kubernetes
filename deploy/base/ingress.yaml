@@ -1,5 +1,5 @@
-# The only route from outside the cluster: the console, over HTTPS. The API, the evidence
-# ingest, the notifier and Temporal have no route.
+# The only route from outside the cluster: the console, over HTTPS. Nothing else of the
+# platform has a route.
 #
 # Both resources are in the last wave so that a certificate that cannot be issued (for
 # example, a DNS record that does not point at this cluster) never blocks the platform.

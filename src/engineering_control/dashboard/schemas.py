@@ -32,21 +32,6 @@ class ActivityEventInput(DashboardModel):
     occurred_at: datetime | None = None
 
 
-class PasswordChangeInput(DashboardModel):
-    current_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=14, max_length=128)
-    confirmation: str = Field(min_length=14, max_length=128)
-
-
-class ActionCandidateInput(DashboardModel):
-    csrf_token: str = Field(min_length=20, max_length=200)
-    command: dict[str, Any]
-
-
-class R3CandidateCreateInput(DashboardModel):
-    csrf_token: str = Field(min_length=20, max_length=200)
-
-
 class ProjectCreateInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     name: str = Field(min_length=1, max_length=32)
@@ -184,19 +169,6 @@ class ItemBulkInput(DashboardModel):
 
 class BacklogSyncInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
-
-
-class ActionReauthenticationInput(DashboardModel):
-    csrf_token: str = Field(min_length=20, max_length=200)
-    candidate_id: UUID
-    current_password: str = Field(min_length=1, max_length=128)
-
-
-class ActionExecuteInput(DashboardModel):
-    csrf_token: str = Field(min_length=20, max_length=200)
-    candidate_id: UUID
-    reauthentication_token: str = Field(min_length=32, max_length=200)
-    confirmation_phrase: str | None = Field(default=None, max_length=120)
 
 
 class QueueCreateInput(DashboardModel):

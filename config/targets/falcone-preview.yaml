@@ -1,9 +1,0 @@
-version: 1
-enabled: false
-project: falcone
-environment: preview
-strategy: helm
-target_context: UNCONFIGURED
-target_namespace: UNCONFIGURED
-blocker: SCOPED_PREVIEW_TARGET_AND_CREDENTIALS_REQUIRED
-configuration: {}
