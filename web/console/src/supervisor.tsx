@@ -45,8 +45,9 @@ function inline(text: string): ReactNode[] {
 }
 
 /**
- * The supervisor writes plain sentences with short lists and bold. That much is shown as
- * such; everything else is shown as the text it is. No HTML is ever made from a reply.
+ * The supervisor writes plain sentences with short lists and bold, and an item's own text
+ * has headings besides. That much is shown as such; everything else is shown as the text
+ * it is. No HTML is ever made from a reply.
  */
 export function Reply({ text }: { text: string }) {
   const blocks: ReactNode[] = [];
@@ -81,16 +82,25 @@ export function Reply({ text }: { text: string }) {
     const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
     const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
     const found = bullet ?? numbered;
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
     if (found) {
       const ordered = !bullet;
       if (paragraph.length || (list && list.ordered !== ordered)) flush();
       list ??= { ordered, items: [] };
-      list.items.push(found[1] ?? '');
+      // A criterion to tick off ("- [ ] …") is shown as the line it is.
+      list.items.push((found[1] ?? '').replace(/^\[[ xX]\]\s+/, ''));
     } else if (!line.trim()) {
       flush();
+    } else if (heading) {
+      flush();
+      blocks.push(
+        <p key={blocks.length} className="mt-1 font-semibold">
+          {inline(heading[1] ?? '')}
+        </p>,
+      );
     } else {
       if (list) flush();
-      paragraph.push(line.replace(/^#{1,6}\s+/, ''));
+      paragraph.push(line);
     }
   }
   flush();

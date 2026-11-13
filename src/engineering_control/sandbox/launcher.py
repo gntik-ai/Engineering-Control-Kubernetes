@@ -27,20 +27,25 @@ from sqlalchemy.orm import sessionmaker
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
+from engineering_control.dashboard.backlog_items import BacklogItems
+from engineering_control.flow_library import AUDIT, DISCOVER
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import pods, steps
 from engineering_control.sandbox.flows import AccountCheck, DeliverIssue, Flow, Follow
+from engineering_control.sandbox.producers import AuditCode, DiscoverEnhancements
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
+from engineering_control.supervisor.operations import Operations
 from engineering_control.supervisor.turn import SupervisorTurn
 
 LOG = structlog.get_logger(__name__)
 PASS_SECONDS: Final = 3.0
 WORKSPACE_GIBIBYTES: Final = 10
 PROXY_LOOKUP_SECONDS: Final = 60.0
+WATCH_SECONDS: Final = 20.0
 # How much of a running step's output is shown, and how far back the result is looked for.
 # A long line reaches the cluster's log in pieces, each counted as a line.
 SHOWN_LINES: Final = 600
@@ -99,6 +104,7 @@ class Launcher:
         conversation: Conversation | None = None,
         tools_url: str | None = None,
         queues: Queues | None = None,
+        backlog: BacklogItems | None = None,
     ) -> None:
         self.runs = runs
         self.cluster = cluster
@@ -110,14 +116,21 @@ class Launcher:
         self.queues = queues
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
-            "deliver_issue": DeliverIssue(runs, github),
+            "deliver_issue": DeliverIssue(runs, github, backlog),
         }
+        if backlog is not None:
+            self.flows[AUDIT] = AuditCode(runs, github, backlog)
+            self.flows[DISCOVER] = DiscoverEnhancements(runs, github, backlog)
+        # The operations role: what went wrong is noticed here, on every few passes.
+        self.operations = Operations(runs.sessions, conversation) if conversation else None
+        self._watched = 0.0
         if conversation is not None:
             self.flows[CONVERSATION] = SupervisorTurn(
                 runs,
                 conversation,
                 conversation.definitions,
                 lambda: self._address(tools_url),
+                self.operations,
             )
 
     async def tick(self) -> int:
@@ -129,6 +142,8 @@ class Launcher:
         if self.queues is not None:
             # Queues follow the runs of their items and start the next ones.
             await asyncio.to_thread(self.queues.advance)
+        if self.operations is not None:
+            await self._operate()
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -143,6 +158,24 @@ class Launcher:
             except Exception as error:  # noqa: BLE001 - one run must not stop the loop
                 LOG.error("launcher_step_error", run=str(item.run_id), error=repr(error)[:300])
         return len(work)
+
+    async def _operate(self, *, force: bool = False) -> None:
+        """Notice trouble, close what the supervisor has dealt with, and ask it about what
+        is new. Trouble does not need looking for every three seconds."""
+        if self.operations is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if not force and now - self._watched < WATCH_SECONDS:
+            return
+        self._watched = now
+        operations = self.operations
+
+        def look() -> None:
+            operations.watch()
+            operations.settle()
+            operations.dispatch()
+
+        await asyncio.to_thread(look)
 
     async def _advance(self, item: StepWork) -> None:
         flow = self.flows.get(item.run_kind)
@@ -415,6 +448,7 @@ async def serve(settings: Settings | None = None) -> None:
         conversation=Conversation(sessions, Definitions(sessions)),
         tools_url=resolved.supervisor_tools_url,
         queues=Queues(sessions, runs, Budgets(sessions)),
+        backlog=BacklogItems(sessions),
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

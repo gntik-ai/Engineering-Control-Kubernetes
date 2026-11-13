@@ -31,6 +31,7 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
+from engineering_control.flow_library import AUDIT, FLOWS, run_for_item
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -200,9 +201,14 @@ class Runs:
             session.flush()
             return _run_row(run)
 
-    def start_delivery(self, item_id: UUID, *, toolchain: dict[str, Any]) -> dict[str, Any]:
-        """Deliver a backlog item: a run that implements its issue, has it reviewed and
-        tested, and then waits for the administrator before anything reaches GitHub."""
+    def start_item(self, item_id: UUID, *, toolchain: dict[str, Any]) -> dict[str, Any]:
+        """Start work on a backlog item: the run its section's flow says.
+
+        Most items are delivered: a run implements what the item asks for, has it reviewed
+        and tested, and then waits for the administrator before anything reaches GitHub.
+        In a section that audits, an item that is not a finding is a request, and the run
+        is an audit of what it names.
+        """
         with self.sessions.begin() as session:
             found = session.execute(
                 select(BacklogItem, ProjectRecord, ProjectSection)
@@ -214,19 +220,22 @@ class Runs:
             if found is None:
                 raise ProjectNotFound(str(item_id))
             item, project, section = found
-            if item.issue_number is None or not item.repository:
-                raise ProjectInvalid(
-                    "Only an item that is an issue of the repository can be delivered for now"
-                )
             if item.state not in ("proposed", "accepted"):
                 raise ProjectInvalid("The item is not open any more")
             if section is None:
                 raise ProjectInvalid("Route the item to a section first")
-            if section.flow_key != "deliver-issue":
+            kind = run_for_item(section.flow_key, finding=is_finding(item))
+            if kind is None:
                 raise ProjectInvalid(
-                    f"The section {section.name} has no flow that delivers issues. Assign "
+                    f"The section {section.name} has no flow that can run here. Assign "
                     "Deliver issue to it on the project's page."
+                    if section.flow_key is None
+                    else f"The flow of the section {section.name} cannot run on this "
+                    "platform yet. Assign another one on the project's page."
                 )
+            repository = item.repository or project.source_repository
+            if not repository:
+                raise ProjectInvalid("Connect a repository to the project first")
             busy = session.scalar(
                 select(func.count())
                 .select_from(SandboxRun)
@@ -234,10 +243,12 @@ class Runs:
             )
             if busy:
                 raise ProjectConflict("A run for this item is already under way")
+            numbered = item.issue_number is not None
+            title = f"#{item.issue_number} {item.title}" if numbered else item.title
             run = SandboxRun(
-                kind="deliver_issue",
+                kind=kind,
                 state="queued",
-                title=f"#{item.issue_number} {item.title}"[:300],
+                title=(f"Audit: {title}" if kind == AUDIT else title)[:300],
                 project_id=project.id,
                 item_id=item.id,
                 cancel_requested=False,
@@ -245,25 +256,111 @@ class Runs:
             )
             session.add(run)
             session.flush()
-            run.data = {
+            common = {
                 "project": project.name,
                 "project_name": project.display_name,
-                "repository": item.repository,
+                "repository": repository,
                 "base_branch": project.default_branch or "main",
-                "branch": f"engineering-control/issue-{item.issue_number}-{run.id.hex[:8]}",
-                "issue": {
-                    "number": item.issue_number,
-                    "title": item.title,
-                    "url": item.issue_url,
-                },
                 "toolchain": toolchain,
             }
+            if kind == AUDIT:
+                run.data = {
+                    **common,
+                    "section": section.key,
+                    "scope": {"title": item.title, "text": item.description or ""},
+                }
+            else:
+                name = f"issue-{item.issue_number}" if numbered else f"item-{item.id.hex[:8]}"
+                run.data = {
+                    **common,
+                    "branch": f"engineering-control/{name}-{run.id.hex[:8]}",
+                    # What is to be done. For an issue of the repository its text is read
+                    # from GitHub when the run starts; an item of the platform's own
+                    # carries its text itself.
+                    "issue": {
+                        "number": item.issue_number,
+                        "title": item.title,
+                        "url": item.issue_url,
+                        **({} if numbered else {"body": item.description or ""}),
+                    },
+                }
             session.add(
                 SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
             )
             # Starting work on an item is deciding that it is wanted.
             if item.state == "proposed":
                 item.state = "accepted"
+            session.flush()
+            return _run_row(run)
+
+    def start_delivery(self, item_id: UUID, *, toolchain: dict[str, Any]) -> dict[str, Any]:
+        """The older name of ``start_item``, from when every item was delivered."""
+        return self.start_item(item_id, toolchain=toolchain)
+
+    def start_for_section(
+        self, project: str, section: str, *, scope: str, toolchain: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Start what a section runs by itself to produce items: an audit of the code, or
+        a search for enhancements. ``scope`` narrows it, in the administrator's words;
+        empty means the whole repository."""
+        with self.sessions.begin() as session:
+            record = session.scalar(
+                select(ProjectRecord)
+                .where(ProjectRecord.name == project, ProjectRecord.archived_at.is_(None))
+                .with_for_update()
+            )
+            if record is None:
+                raise ProjectNotFound(project)
+            found = session.scalar(
+                select(ProjectSection).where(
+                    ProjectSection.project_id == record.id, ProjectSection.key == section
+                )
+            )
+            if found is None:
+                raise ProjectNotFound(section)
+            flow = FLOWS.get(found.flow_key) if found.flow_key else None
+            if flow is None or flow.for_section is None:
+                raise ProjectInvalid(
+                    f"The section {found.name} has no flow that produces items by itself"
+                )
+            if not record.source_repository:
+                raise ProjectInvalid("Connect a repository to the project first")
+            busy = session.scalar(
+                select(func.count())
+                .select_from(SandboxRun)
+                .where(
+                    SandboxRun.project_id == record.id,
+                    SandboxRun.kind == flow.for_section,
+                    SandboxRun.item_id.is_(None),
+                    SandboxRun.state.in_(ACTIVE),
+                )
+            )
+            if busy:
+                raise ProjectConflict(f"{flow.name} is already under way for this project")
+            narrowed = " ".join(scope.split())[:2000]
+            what = "Audit" if flow.for_section == AUDIT else "Enhancements"
+            where = narrowed[:200] if narrowed else "the whole repository"
+            run = SandboxRun(
+                kind=flow.for_section,
+                state="queued",
+                title=f"{what}: {where}"[:300],
+                project_id=record.id,
+                cancel_requested=False,
+                data={
+                    "project": record.name,
+                    "project_name": record.display_name,
+                    "repository": record.source_repository,
+                    "base_branch": record.default_branch or "main",
+                    "toolchain": toolchain,
+                    "section": found.key,
+                    "scope": {"title": "", "text": narrowed},
+                },
+            )
+            session.add(run)
+            session.flush()
+            session.add(
+                SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
+            )
             session.flush()
             return _run_row(run)
 
@@ -656,6 +753,48 @@ class Runs:
             )
             return dict(step.output) if step is not None and step.output else None
 
+    def tries(self, run_id: UUID) -> int:
+        """How many times within a day the work of that run was started: runs for the same
+        item, or of the same kind by the same section when it has no item."""
+        since = datetime.now(UTC) - timedelta(hours=24)
+        with self.sessions() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is None:
+                return 0
+            query = (
+                select(func.count())
+                .select_from(SandboxRun)
+                .where(SandboxRun.kind == run.kind, SandboxRun.created_at > since)
+            )
+            if run.item_id is not None:
+                query = query.where(SandboxRun.item_id == run.item_id)
+            else:
+                query = query.where(
+                    SandboxRun.project_id == run.project_id, SandboxRun.item_id.is_(None)
+                )
+            return int(session.scalar(query) or 0)
+
+    def item_of(self, run_id: UUID) -> UUID | None:
+        """The backlog item the run works on, when it works on one."""
+        with self.sessions() as session:
+            run = session.get(SandboxRun, run_id)
+            return run.item_id if run is not None else None
+
+    def step_outputs(self, run_id: UUID, name: str) -> list[dict[str, Any]]:
+        """What each of the run's steps of that name produced, in the order they ran.
+        Steps that failed, or were given again to another account, produced nothing."""
+        with self.sessions() as session:
+            steps = session.scalars(
+                select(SandboxStep)
+                .where(
+                    SandboxStep.run_id == run_id,
+                    SandboxStep.name == name,
+                    SandboxStep.state == "succeeded",
+                )
+                .order_by(SandboxStep.position)
+            ).all()
+            return [dict(step.output) for step in steps if step.output]
+
     def account_learned(
         self,
         account_id: UUID,
@@ -677,6 +816,11 @@ class Runs:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def is_finding(item: BacklogItem) -> bool:
+    """Whether the item is something an audit found, as opposed to a request."""
+    return (item.facts or {}).get("kind") == "finding"
 
 
 def _spent_accounts(session: Session, now: datetime) -> set[UUID]:

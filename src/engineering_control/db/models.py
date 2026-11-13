@@ -439,6 +439,10 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     default_branch: Mapped[str] = mapped_column(String(100), default="main")
     origin: Mapped[str] = mapped_column(String(16))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the project's work moved from the original system to this platform, and what
+    # was brought along from there (migration 0034). Not set: the original still works on it.
+    cut_over_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    brought_over: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 
@@ -477,10 +481,10 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     """One piece of work wanted on a project (migration 0027).
 
     It comes from a GitHub issue of the project's repository, is written by the
-    administrator, or is proposed by the supervisor. It is routed to one section of the
-    project, or to none yet; the section's flow is what will run for it. ``routed_by`` says
-    who decided: a label of the issue, the supervisor, or the administrator, whose choice
-    nothing else ever changes.
+    administrator, or is proposed: by the supervisor, by an audit (a finding) or by a
+    search for enhancements. It is routed to one section of the project, or to none yet;
+    the section's flow is what will run for it. ``routed_by`` says who decided: a label of
+    the issue, the supervisor, or the administrator, whose choice nothing else ever changes.
     """
 
     __tablename__ = "backlog_items"
@@ -496,8 +500,19 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     routed_by: Mapped[str | None] = mapped_column(String(16))
     routing_reason: Mapped[str | None] = mapped_column(String(300))
     # Who proposed an item that did not come from GitHub: nobody named means the
-    # administrator wrote it; ``supervisor`` means the supervisor proposed it (migration 0031).
+    # administrator wrote it; ``supervisor`` means the supervisor proposed it (migration
+    # 0031); ``audit`` and ``discovery`` mean a run of that kind did, and ``original`` that
+    # it was brought over from the original system (migration 0034).
     proposed_by: Mapped[str | None] = mapped_column(String(16))
+    # What an item that is not a GitHub issue asks for, in its own words (migration 0034).
+    description: Mapped[str | None] = mapped_column(Text)
+    # Facts about the item worth showing: a finding's severity and files, an enhancement's
+    # effort, a pull request that already exists for it.
+    facts: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # The run that produced the item, and a name for where it came from that is the same
+    # every time the same thing is produced, so that nothing is proposed twice.
+    source_run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    origin_ref: Mapped[str | None] = mapped_column(String(160))
     # For an item that came from GitHub: where it is, and how it looked at the last import.
     repository: Mapped[str | None] = mapped_column(String(140))
     issue_number: Mapped[int | None] = mapped_column(Integer)
@@ -509,6 +524,9 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
         UniqueConstraint(
             "project_id", "repository", "issue_number", name="uq_backlog_items_project_issue"
         ),
+        # An index, not a constraint: a constraint cannot be added to a table that exists
+        # on every engine, and empty values count as different either way.
+        Index("uq_backlog_items_project_origin", "project_id", "origin_ref", unique=True),
         CheckConstraint("source IN ('github', 'manual')", name="source"),
         CheckConstraint("state IN ('proposed', 'accepted', 'skipped', 'done')", name="state"),
     )
@@ -1183,6 +1201,9 @@ class SupervisorDefinition(UUIDPrimaryKey, Timestamps, Base):
     exclusive: Mapped[bool] = mapped_column(Boolean, default=False)
     models: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     note: Mapped[str | None] = mapped_column(String(300))
+    # Whether it looks at failed and stuck work by itself, and how often within an hour
+    # (migration 0034). Not set: the platform's defaults.
+    operations: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 class SupervisorMessage(UUIDPrimaryKey, Timestamps, Base):
@@ -1239,6 +1260,43 @@ class SupervisorAction(UUIDPrimaryKey, Timestamps, Base):
             name="outcome",
         ),
         CheckConstraint("kind IN ('read', 'plan', 'operate', 'ask')", name="kind"),
+    )
+
+
+class SupervisorIncident(UUIDPrimaryKey, Timestamps, Base):
+    """Something that went wrong with the work and that the platform noticed by itself
+    (migration 0034): a run that failed, a run that makes no progress, a queue that paused
+    itself, an account that can no longer be used.
+
+    Noticing is the platform's and needs no model. What to do about it is the
+    supervisor's: ``open`` until it has looked, then ``handled`` with its diagnosis and what
+    it did, or ``waiting`` when what it wants to do waits for the administrator.
+    ``dismissed`` is the administrator's. ``kind`` and ``ref`` together name the thing, so
+    that the same trouble is one incident however often it is seen.
+    """
+
+    __tablename__ = "supervisor_incidents"
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    ref: Mapped[str] = mapped_column(String(120))
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    summary: Mapped[str] = mapped_column(String(600))
+    # What the platform knows about it, to show and to tell the supervisor.
+    facts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    item_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    # The supervisor's turn that looked at it, and what it concluded.
+    turn_run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    diagnosis: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[str | None] = mapped_column(String(8))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("kind", "ref", name="uq_supervisor_incidents_kind_ref"),
+        CheckConstraint(
+            "state IN ('open', 'looking', 'handled', 'waiting', 'dismissed')", name="state"
+        ),
     )
 
 

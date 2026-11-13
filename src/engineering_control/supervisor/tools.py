@@ -37,13 +37,21 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import ProjectRecord, SupervisorAction
+from engineering_control.flow_library import WORK_KINDS, run_for_item
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import Runs
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS
+from engineering_control.supervisor.operations import Operations
 
+# How often the same work may run within a day before trying it again needs the
+# administrator, and the outcomes that trying again does not change.
+TRIES_A_DAY: Final = 3
+WILL_REPEAT: Final = frozenset(
+    {"blocked", "rejected", "protected_files", "secret_found", "no_change", "changes_requested"}
+)
 # Changes carried out without asking, per turn and per hour. Past either, the next waits.
 AUTOMATIC_PER_TURN: Final = 40
 AUTOMATIC_PER_HOUR: Final = 200
@@ -108,7 +116,9 @@ class Toolbox:
         conversation: Conversation,
         queues: Queues | None = None,
         github: GitHubApp | None = None,
+        operations: Operations | None = None,
     ) -> None:
+        self.operations = operations
         self.sessions = sessions
         self.projects = projects
         self.sections = sections
@@ -191,7 +201,7 @@ class Toolbox:
                 "Not done: this waits for the administrator's confirmation and is now in "
                 f"their inbox ({why}) Do not call it again; tell them it waits for them."
             )
-        result = self._perform(name, arguments)
+        result = self._perform(name, arguments, run_id)
         self._record(
             run_id,
             name,
@@ -335,6 +345,13 @@ class Toolbox:
                         "routed_by": item["routed_by"],
                         "proposed_by": item["proposed_by"],
                         "labels": item["labels"],
+                        # What kind of thing it is, when a run produced it: a finding of
+                        # an audit, an enhancement, with its severity or risk.
+                        "facts": {
+                            key: value
+                            for key, value in item["facts"].items()
+                            if key in ("kind", "severity", "risk", "pull_request")
+                        },
                         "run": runs.get(item["id"]),
                         # The queue under way it is in, by name; such an item is not
                         # proposed for another.
@@ -384,6 +401,8 @@ class Toolbox:
                     for key in ("id", "kind", "title", "state", "outcome", "detail", "project")
                 },
                 "pull_request": (run.get("data") or {}).get("pull_request"),
+                # What an audit or a search for enhancements ended with.
+                "result": (run.get("data") or {}).get("result"),
                 "steps": steps,
             }
         if name == "list_queues":
@@ -445,6 +464,8 @@ class Toolbox:
             ]
         if name == "get_inbox":
             return self.inbox_entries()
+        if name == "list_incidents":
+            return self._operations().listing()["items"]
         raise ProjectInvalid("That tool reads nothing")
 
     def _queues(self) -> Queues:
@@ -452,12 +473,19 @@ class Toolbox:
             raise ProjectInvalid("Queues are not available here")
         return self.queues
 
+    def _operations(self) -> Operations:
+        if self.operations is None:
+            raise ProjectInvalid("Incidents are not available here")
+        return self.operations
+
     def inbox_entries(self) -> list[dict[str, Any]]:
         """Everything that waits for the administrator, most pressing first."""
         queued = self.queues.inbox() if self.queues is not None else []
+        trouble = self.operations.inbox() if self.operations is not None else []
         return (
             self.runs.inbox()
             + self.accounts.inbox()
+            + trouble
             + self.pending()
             + queued
             + self.backlog.inbox()
@@ -468,7 +496,10 @@ class Toolbox:
     def _intent(self, name: str, arguments: dict[str, Any]) -> Intent:
         """Check a change against what exists and put it into words. Raises when it cannot
         be done at all."""
-        if not _words(arguments.get("reason")) and name != "propose_items":
+        if not _words(arguments.get("reason")) and name not in (
+            "propose_items",
+            "conclude_incident",
+        ):
             raise ProjectInvalid("Say why: a reason is required")
         if name == "propose_items":
             project = str(arguments.get("project") or "")
@@ -524,7 +555,12 @@ class Toolbox:
                 raise ProjectInvalid("The item is not open any more")
             if item["section"] is None:
                 raise ProjectInvalid("The item has no section yet: route it first")
-            if item["section"]["flow"] != "deliver-issue":
+            if (
+                run_for_item(
+                    item["section"]["flow"], finding=item["facts"].get("kind") == "finding"
+                )
+                is None
+            ):
                 raise ProjectInvalid(
                     f"The section {item['section']['name']} has no flow that can run yet"
                 )
@@ -559,6 +595,90 @@ class Toolbox:
                 f"{'; '.join(queued[:3])}{more}.",
                 project=project,
             )
+        if name == "start_section_run":
+            project = str(arguments.get("project") or "")
+            wanted = str(arguments.get("section") or "")
+            section = next(
+                (s for s in self.sections.of_project(project) if s["key"] == wanted), None
+            )
+            if section is None:
+                raise ProjectInvalid(f"The project has no section {wanted}")
+            action = (section["flow"] or {}).get("section_action")
+            if not action:
+                raise ProjectInvalid(
+                    f"The section {section['name']} has no flow that produces items by itself"
+                )
+            self._room(project)
+            scope = _words(arguments.get("scope"), 200) or "the whole repository"
+            return Intent(f"{action} for {project}: {scope}.", project=project)
+        if name == "retry_run":
+            run = self.runs.get(_uuid(arguments.get("run"), "a run"))
+            if run["kind"] not in WORK_KINDS:
+                raise ProjectInvalid("Only a run of work on a project can be tried again")
+            if run["state"] != "failed":
+                raise ProjectConflict(f"The run is {run['state']}, not failed")
+            self._room(run["project"])
+            tries = self.runs.tries(UUID(run["id"]))
+            confirm = self._unsure(arguments)
+            if confirm is None and tries >= TRIES_A_DAY:
+                confirm = f"This work already ran {tries} times within a day."
+            if confirm is None and run["outcome"] in WILL_REPEAT:
+                confirm = "The run failed for a reason that trying again does not remove."
+            return Intent(
+                f"Try “{_words(run['title'], 160)}” again.", project=run["project"], confirm=confirm
+            )
+        if name == "cancel_run":
+            run = self.runs.get(_uuid(arguments.get("run"), "a run"))
+            if run["kind"] not in WORK_KINDS:
+                raise ProjectInvalid("Only a run of work on a project can be stopped this way")
+            if run["state"] not in ("queued", "running", "waiting"):
+                raise ProjectConflict(f"The run has already ended ({run['state']})")
+            holds = run["state"] == "waiting" or any(
+                step["name"] == "implement" and step["state"] == "succeeded"
+                for step in run["steps"]
+            )
+            return Intent(
+                f"Stop the run “{_words(run['title'], 160)}”.",
+                project=run["project"],
+                confirm="The run holds work that would be discarded." if holds else None,
+            )
+        if name == "skip_item":
+            item = self._item(arguments)
+            if item["state"] not in OPEN_STATES:
+                raise ProjectInvalid("The item is not open any more")
+            if (item.get("run") or {}).get("state") in ("queued", "running", "waiting"):
+                raise ProjectConflict("A run for this item is under way: stop it first")
+            return Intent(
+                f"Skip “{_words(item['title'], 120)}”: {_words(arguments.get('reason'), 240)}",
+                project=item["project"],
+                confirm=self._unsure(arguments),
+            )
+        if name == "requeue_item":
+            queue = self._queues().get(_uuid(arguments.get("queue"), "a queue"))
+            wanted = str(_uuid(arguments.get("item"), "an item"))
+            entry = next((e for e in queue["entries"] if e["item_id"] == wanted), None)
+            if entry is None:
+                raise ProjectInvalid("The item is not in that queue")
+            if entry["state"] != "failed":
+                raise ProjectConflict(f"The item is {entry['state']} in the queue, not failed")
+            return Intent(
+                f"Return “{_words(entry['title'], 120)}” to the queue “"
+                f"{_words(queue['name'], 120)}”.",
+                project=queue["project"],
+                confirm="It was returned to the queue once already."
+                if self._requeued(queue["id"], wanted)
+                else None,
+            )
+        if name == "conclude_incident":
+            incident = self._operations().get(_uuid(arguments.get("incident"), "an incident"))
+            if incident["state"] not in ("open", "looking", "waiting"):
+                raise ProjectConflict("The incident is closed already")
+            if not _words(arguments.get("diagnosis")):
+                raise ProjectInvalid("Say what the cause is")
+            return Intent(
+                f"Close the incident: {_words(incident['summary'], 200)}",
+                project=incident["project"],
+            )
         if name in ("reorder_queue", "start_queue", "pause_queue"):
             queue = self._queues().get(_uuid(arguments.get("queue"), "a queue"))
             label = f"“{_words(queue['name'], 120)}” ({queue['project']})"
@@ -591,7 +711,7 @@ class Toolbox:
             return Intent(f"Pause the queue {label}.", project=queue["project"])
         raise ProjectInvalid("That tool changes nothing")
 
-    def _perform(self, name: str, arguments: dict[str, Any]) -> Any:
+    def _perform(self, name: str, arguments: dict[str, Any], run_id: UUID | None = None) -> Any:
         if name == "propose_items":
             project = str(arguments["project"])
             proposed, repeated = [], []
@@ -616,8 +736,69 @@ class Toolbox:
             item_id = UUID(str(arguments["item"]))
             of = self.backlog.project_of(item_id)
             toolchain = toolchain_for(of).as_dict() if of else {}
-            run = self.runs.start_delivery(item_id, toolchain=toolchain)
+            run = self.runs.start_item(item_id, toolchain=toolchain)
             return {"run": run["id"], "state": run["state"]}
+        if name == "start_section_run":
+            project = str(arguments["project"])
+            run = self.runs.start_for_section(
+                project,
+                str(arguments["section"]),
+                scope=str(arguments.get("scope") or ""),
+                toolchain=toolchain_for(project).as_dict(),
+            )
+            return {"run": run["id"], "state": run["state"]}
+        if name == "retry_run":
+            failed = self.runs.get(UUID(str(arguments["run"])))
+            project = str(failed["project"])
+            toolchain = toolchain_for(project).as_dict()
+            if failed["item_id"]:
+                run = self.runs.start_item(UUID(failed["item_id"]), toolchain=toolchain)
+            else:
+                data = failed["data"]
+                run = self.runs.start_for_section(
+                    project,
+                    str(data.get("section") or ""),
+                    scope=str((data.get("scope") or {}).get("text") or ""),
+                    toolchain=toolchain,
+                )
+            return {"run": run["id"], "state": run["state"]}
+        if name == "cancel_run":
+            run_to_stop = UUID(str(arguments["run"]))
+            if self.runs.get(run_to_stop)["state"] == "waiting":
+                # A run that waits with its change is ended by discarding the change.
+                stopped = self.runs.decide(run_to_stop, "discard")
+            else:
+                stopped = self.runs.request_cancel(run_to_stop)
+            return {"run": stopped["id"], "state": stopped["state"]}
+        if name == "skip_item":
+            item_id = UUID(str(arguments["item"]))
+            skipped = self.backlog.set_state(item_id, "skipped")
+            self.backlog.note_facts(
+                item_id,
+                {"skipped_by": "supervisor", "skipped_reason": _words(arguments.get("reason"))},
+            )
+            return {"item": skipped["id"], "state": skipped["state"]}
+        if name == "requeue_item":
+            queue = self._queues().requeue(
+                UUID(str(arguments["queue"])),
+                UUID(str(arguments["item"])),
+                _words(arguments.get("reason"), 200),
+            )
+            return {
+                "queue": queue["id"],
+                "state": queue["state"],
+                "waiting": queue["counts"]["waiting"],
+            }
+        if name == "conclude_incident":
+            said = _words(arguments.get("diagnosis"), 4000)
+            done = _words(arguments.get("action"), 1000)
+            closed = self._operations().conclude(
+                UUID(str(arguments["incident"])),
+                diagnosis=f"{said}\n\nWhat was done: {done}" if done else said,
+                confidence=str(arguments.get("confidence") or ""),
+                run_id=run_id,
+            )
+            return {"incident": closed["id"], "state": closed["state"]}
         if name == "propose_queue":
             entries = arguments["items"]
             made = self._queues().create(
@@ -644,6 +825,39 @@ class Toolbox:
             )
             return {"queue": queue["id"], "state": queue["state"]}
         raise ProjectInvalid("That tool changes nothing")
+
+    def _room(self, project: str | None) -> None:
+        """Refuse when the budgets leave no room for another run on the project."""
+        if self.queues is not None and project:
+            refusal = self.queues.budgets.may_start(project)
+            if refusal is not None:
+                raise ProjectConflict(f"Nothing more can start right now. {refusal}")
+
+    @staticmethod
+    def _unsure(arguments: dict[str, Any]) -> str | None:
+        """Why an action waits when the supervisor is not sure of its diagnosis."""
+        confidence = str(arguments.get("confidence") or "").lower()
+        if confidence == "high":
+            return None
+        return f"The supervisor is not sure (confidence: {confidence or 'not given'})."
+
+    def _requeued(self, queue_id: str, item_id: str) -> bool:
+        """Whether the supervisor already returned that item to that queue."""
+        with self.sessions() as session:
+            earlier = session.scalars(
+                select(SupervisorAction)
+                .where(
+                    SupervisorAction.tool == "requeue_item",
+                    SupervisorAction.outcome.in_(("applied", "accepted")),
+                )
+                .order_by(SupervisorAction.created_at.desc())
+                .limit(200)
+            ).all()
+            return any(
+                str((action.arguments or {}).get("queue")) == queue_id
+                and str((action.arguments or {}).get("item")) == item_id
+                for action in earlier
+            )
 
     # --- the administrator's side --------------------------------------------------------
 
@@ -726,7 +940,7 @@ class Toolbox:
             else:
                 try:
                     self._intent(action.tool, dict(action.arguments or {}))
-                    self._perform(action.tool, dict(action.arguments or {}))
+                    self._perform(action.tool, dict(action.arguments or {}), action.run_id)
                 except REFUSALS as error:
                     detail = (
                         "What it was about is no longer there."

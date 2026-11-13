@@ -29,9 +29,21 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Textarea,
   type StatusDefinition,
 } from '@gntik-ai/ui';
-import { Bot, Check, CircleSlash, ListChecks, ListOrdered, Plus, RefreshCw, Route, RotateCcw } from '@gntik-ai/icons';
+import {
+  Bot,
+  Check,
+  CircleSlash,
+  FileText,
+  ListChecks,
+  ListOrdered,
+  Plus,
+  RefreshCw,
+  Route,
+  RotateCcw,
+} from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -47,12 +59,16 @@ import {
 } from '../api';
 import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, navigate, setQuery, useLocation } from '../router';
+import { ItemBadges, ItemDialog } from './ItemDialog';
 import { QueueDialog } from './QueueDialog';
 import { RunState } from './Runs';
 
 const PAGE_SIZE = 50;
 const UNROUTED = 'none';
 const NO_SECTION = '__none__';
+
+// The flows that run something when an item of their section is started.
+const RUNNABLE = ['deliver-issue', 'audit-code', 'discover-enhancements'];
 
 const STATES: Record<string, StatusDefinition> = {
   proposed: { label: 'Proposed', tone: 'neutral' },
@@ -81,12 +97,14 @@ function AddItemDialog({
   onSaved: () => void;
 }) {
   const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
   const [section, setSection] = useState(NO_SECTION);
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
     if (!open) return;
     setTitle('');
+    setDescription('');
     setSection(NO_SECTION);
     setProblem(null);
     // Only when it opens: the form starts empty.
@@ -97,7 +115,11 @@ function AddItemDialog({
     setPending(true);
     setProblem(null);
     try {
-      await postJson(`projects/${project}/items`, { title, section: section === NO_SECTION ? null : section });
+      await postJson(`projects/${project}/items`, {
+        title,
+        description: description.trim() || null,
+        section: section === NO_SECTION ? null : section,
+      });
       onSaved();
       onOpenChange(false);
     } catch (error) {
@@ -121,6 +143,13 @@ function AddItemDialog({
             <Field>
               <FieldLabel>What should be done</FieldLabel>
               <Input name="title" value={title} onValueChange={setTitle} maxLength={300} autoFocus />
+            </Field>
+            <Field>
+              <FieldLabel>Description</FieldLabel>
+              <Textarea name="description" value={description} onValueChange={setDescription} maxLength={40000} rows={6} />
+              <FieldDescription>
+                What the agents are given when the item is worked on: what is wanted, and how to tell that it is done.
+              </FieldDescription>
             </Field>
             <Field>
               <FieldLabel>Section</FieldLabel>
@@ -330,6 +359,7 @@ function ItemRow({
   showProject,
   selected,
   onSelect,
+  onOpen,
   onChanged,
   onProblem,
 }: {
@@ -339,6 +369,7 @@ function ItemRow({
   /** Undefined where items cannot be selected: no project is chosen. */
   selected?: boolean;
   onSelect?: (selected: boolean) => void;
+  onOpen: () => void;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
@@ -357,12 +388,11 @@ function ItemRow({
   };
   const closed = item.issue_state === 'closed';
   const runActive = item.run ? ['queued', 'running', 'waiting'].includes(item.run.state) : false;
+  const flow = item.section?.flow ?? null;
   const deliverable =
-    item.issue_number !== null &&
-    !closed &&
-    item.section?.flow === 'deliver-issue' &&
-    (item.state === 'proposed' || item.state === 'accepted') &&
-    !runActive;
+    !closed && flow !== null && RUNNABLE.includes(flow) && (item.state === 'proposed' || item.state === 'accepted') && !runActive;
+  // In a section that audits, an item that is not a finding asks for an audit.
+  const audits = flow === 'audit-code' && item.facts?.kind !== 'finding';
   const deliver = async () => {
     setPending(true);
     try {
@@ -375,7 +405,8 @@ function ItemRow({
     }
   };
   const actions = [
-    deliverable ? { label: 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
+    { label: 'Open', icon: FileText, onSelect: onOpen },
+    deliverable ? { label: audits ? 'Audit what it names' : 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
     item.state !== 'accepted' && !closed
       ? { label: 'Accept', icon: Check, onSelect: () => void change('state', { state: 'accepted' }) }
       : null,
@@ -403,17 +434,18 @@ function ItemRow({
       <TableCell className="max-w-xl">
         <div className="flex items-baseline gap-2">
           {item.issue_number ? <IssueRef number={item.issue_number} url={item.issue_url} /> : null}
-          <span className="truncate font-medium" title={item.title}>
+          <button
+            type="button"
+            className="truncate text-left font-medium hover:underline"
+            title={item.title}
+            onClick={onOpen}
+          >
             {item.title}
-          </span>
+          </button>
         </div>
-        {item.labels.length || item.proposed_by === 'supervisor' ? (
+        {item.labels.length || item.proposed_by || item.facts?.kind ? (
           <div className="mt-1 flex flex-wrap gap-1">
-            {item.proposed_by === 'supervisor' ? (
-              <Badge tone="info" size="sm">
-                Proposed by the supervisor
-              </Badge>
-            ) : null}
+            <ItemBadges item={item} />
             {item.labels.map((label) => (
               <Badge key={label} tone="neutral" size="sm">
                 {label}
@@ -488,6 +520,8 @@ export function BacklogPage() {
   const state = query.get('state');
   const search = query.get('search') ?? '';
   const page = Math.max(1, Number(query.get('page')) || 1);
+  // The item whose text is open, named in the address so that a run can link to it.
+  const opened = query.get('item');
   const [draft, setDraft] = useState(search);
   const [adding, setAdding] = useState(false);
   const [bulk, setBulk] = useState<BulkChange | null>(null);
@@ -650,6 +684,7 @@ export function BacklogPage() {
                               )
                           : undefined
                       }
+                      onOpen={() => setQuery({ item: item.id })}
                       onChanged={backlog.reload}
                       onProblem={setProblem}
                     />
@@ -667,6 +702,11 @@ export function BacklogPage() {
           />
         ) : null}
       </div>
+      <ItemDialog
+        itemId={opened}
+        onOpenChange={(open) => (open ? null : setQuery({ item: null }))}
+        onChanged={backlog.reload}
+      />
       {project ? <QueueDialog project={project} items={selection} open={queueing} onOpenChange={setQueueing} /> : null}
       {project && sections ? (
         <>

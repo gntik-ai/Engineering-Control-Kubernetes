@@ -40,10 +40,10 @@ from engineering_control.db.models import (
     WorkQueue,
     WorkQueueEntry,
 )
+from engineering_control.flow_library import WORK_KINDS
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.runs import Runs
 
-WORK: Final = "deliver_issue"
 UNDER_WAY: Final = ("draft", "running", "paused")
 MAX_ITEMS: Final = 200
 # After this many items in a row failed, the queue stops and waits for the administrator.
@@ -187,7 +187,7 @@ class Budgets:
         query = (
             select(func.count())
             .select_from(SandboxRun)
-            .where(SandboxRun.kind == WORK, SandboxRun.state.in_(("queued", "running")))
+            .where(SandboxRun.kind.in_(WORK_KINDS), SandboxRun.state.in_(("queued", "running")))
         )
         if project_id is not None:
             query = query.where(SandboxRun.project_id == project_id)
@@ -198,7 +198,7 @@ class Budgets:
         query = (
             select(func.count())
             .select_from(SandboxRun)
-            .where(SandboxRun.kind == WORK, SandboxRun.created_at > since)
+            .where(SandboxRun.kind.in_(WORK_KINDS), SandboxRun.created_at > since)
         )
         if project_id is not None:
             query = query.where(SandboxRun.project_id == project_id)
@@ -585,6 +585,34 @@ class Queues:
             session.flush()
             return self._detail(session, queue, project)
 
+    def requeue(self, queue_id: UUID, item_id: UUID, reason: str) -> dict[str, Any]:
+        """Put an item that failed back among the waiting ones: the queue works on it
+        again when its turn comes. A queue that paused itself stays paused, and one that
+        had finished is paused: resuming it is a decision of its own."""
+        with self.sessions.begin() as session:
+            queue, project = self._one(session, queue_id, lock=True)
+            if queue.state == "finished":
+                queue.state = "paused"
+                queue.finished_at = None
+                queue.pause_reason = (
+                    "An item was returned to the queue after it had finished. Resume the "
+                    "queue to work on it."
+                )
+            entry = session.scalar(
+                select(WorkQueueEntry).where(
+                    WorkQueueEntry.queue_id == queue.id, WorkQueueEntry.item_id == item_id
+                )
+            )
+            if entry is None:
+                raise ProjectNotFound(str(item_id))
+            if entry.state != "failed":
+                raise ProjectConflict(f"The item is {entry.state} in the queue, not failed")
+            entry.state = "waiting"
+            entry.run_id = None
+            entry.detail = _words(f"Returned to the queue: {reason}", 300)
+            session.flush()
+            return self._detail(session, queue, project)
+
     def discard(self, queue_id: UUID) -> dict[str, Any]:
         """Remove a queue that is not running anything. Its items stay in the backlog."""
         with self.sessions.begin() as session:
@@ -678,7 +706,7 @@ class Queues:
             run_id: UUID | None = None
             detail: str | None = None
             try:
-                begun = self.runs.start_delivery(
+                begun = self.runs.start_item(
                     item_id, toolchain=toolchain_for(project_name).as_dict()
                 )
             except (ProjectInvalid, ProjectConflict, ProjectNotFound) as error:

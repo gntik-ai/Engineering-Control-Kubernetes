@@ -55,6 +55,7 @@ from engineering_control.sandbox.runs import Runs
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
+from engineering_control.supervisor.operations import Operations
 from engineering_control.supervisor.tools import Toolbox
 
 _EVENT_METADATA_KEYS = frozenset(
@@ -137,6 +138,7 @@ class DashboardRepository:
         self.queues = Queues(self.sessions, self.runs, self.budgets)
         self.definitions = Definitions(self.sessions)
         self.conversation = Conversation(self.sessions, self.definitions)
+        self.operations = Operations(self.sessions, self.conversation)
         # The console decides on what the supervisor proposed and reads its record; the
         # supervisor's own calls go through the tool service.
         self.toolbox = Toolbox(
@@ -148,6 +150,7 @@ class DashboardRepository:
             runs=self.runs,
             conversation=self.conversation,
             queues=self.queues,
+            operations=self.operations,
         )
 
     async def ping(self) -> bool:

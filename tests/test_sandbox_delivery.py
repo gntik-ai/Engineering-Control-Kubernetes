@@ -19,7 +19,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.cluster import Cluster
 from engineering_control.dashboard.accounts import Accounts
-from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -626,16 +625,18 @@ async def test_a_change_to_protected_files_is_refused_and_a_failed_publication_c
 # --- what may be delivered ---------------------------------------------------------------
 
 
-def test_only_an_open_issue_in_a_section_that_delivers_can_be_started(world: Any) -> None:
-    backlog = BacklogItems(world.sessions)
-    manual = backlog.add("falcone-workflow", title="Written by hand", section="issues")
-    with pytest.raises(ProjectInvalid, match="issue of the repository"):
-        world.runs.start_delivery(UUID(manual["id"]), toolchain={})
+def test_only_an_open_item_in_a_section_with_a_flow_that_runs_can_be_started(world: Any) -> None:
     with world.sessions.begin() as session:
         item = session.get(BacklogItem, world.item_id)
         section = session.get(ProjectSection, item.section_id)
-        section.flow_key = None
-    with pytest.raises(ProjectInvalid, match="no flow that delivers issues"):
+        # A flow of the library that this platform cannot run yet.
+        section.flow_key = "recover-deployment"
+    with pytest.raises(ProjectInvalid, match="cannot run on this platform yet"):
+        world.runs.start_delivery(world.item_id, toolchain={})
+    with world.sessions.begin() as session:
+        item = session.get(BacklogItem, world.item_id)
+        session.get(ProjectSection, item.section_id).flow_key = None
+    with pytest.raises(ProjectInvalid, match="no flow that can run here"):
         world.runs.start_delivery(world.item_id, toolchain={})
     with world.sessions.begin() as session:
         item = session.get(BacklogItem, world.item_id)

@@ -243,19 +243,49 @@ class DashboardService:
         return await asyncio.to_thread(read)
 
     async def deliver_item(self, item_id: UUID) -> dict[str, object]:
+        """Start the run the item's section says: a delivery, or the audit it asks for."""
+
         def start() -> dict[str, Any]:
             project = self.repository.backlog.project_of(item_id)
             toolchain = toolchain_for(project).as_dict() if project else {}
-            return self.repository.runs.start_delivery(item_id, toolchain=toolchain)
+            return self.repository.runs.start_item(item_id, toolchain=toolchain)
 
         return await asyncio.to_thread(start)
+
+    async def run_section(self, project: str, section: str, scope: str) -> dict[str, object]:
+        """Start what the section runs by itself: an audit, or a search for enhancements."""
+        return await asyncio.to_thread(
+            lambda: self.repository.runs.start_for_section(
+                project, section, scope=scope, toolchain=toolchain_for(project).as_dict()
+            )
+        )
+
+    async def item(self, item_id: UUID) -> dict[str, object]:
+        def read() -> dict[str, Any]:
+            found = self.repository.backlog.get(item_id)
+            found["run"] = self.repository.runs.for_items([found["id"]]).get(found["id"])
+            found["queue"] = self.repository.queues.for_items([found["id"]]).get(found["id"])
+            return found
+
+        return await asyncio.to_thread(read)
+
+    async def edit_item(
+        self, item_id: UUID, *, title: str | None, description: str | None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.backlog.edit(item_id, title=title, description=description)
+        )
 
     async def decide_run(self, run_id: UUID, decision: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.decide, run_id, decision)
 
-    async def add_item(self, project: str, *, title: str, section: str | None) -> dict[str, object]:
+    async def add_item(
+        self, project: str, *, title: str, section: str | None, description: str | None = None
+    ) -> dict[str, object]:
         return await asyncio.to_thread(
-            lambda: self.repository.backlog.add(project, title=title, section=section)
+            lambda: self.repository.backlog.add(
+                project, title=title, section=section, description=description
+            )
         )
 
     async def route_item(self, item_id: UUID, section: str | None) -> dict[str, object]:
@@ -380,6 +410,19 @@ class DashboardService:
         return await asyncio.to_thread(
             lambda: self.repository.toolbox.decide(action_id, accept=accept, via="console")
         )
+
+    async def incidents(self, *, everything: bool = False) -> dict[str, object]:
+        """What went wrong with the work and what the supervisor made of it."""
+        return await asyncio.to_thread(
+            lambda: self.repository.operations.listing(everything=everything)
+        )
+
+    async def dismiss_incident(self, incident_id: UUID) -> dict[str, object]:
+        def dismiss() -> dict[str, Any]:
+            closed = self.repository.operations.dismiss(incident_id)
+            return {**closed, "incident": closed["summary"]}
+
+        return await asyncio.to_thread(dismiss)
 
     async def supervisor_record(self, *, everything: bool = False) -> dict[str, object]:
         return await asyncio.to_thread(

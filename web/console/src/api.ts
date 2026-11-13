@@ -23,6 +23,10 @@ export interface Flow {
   key: string;
   name: string;
   summary: string;
+  /** Whether starting an item of a section with this flow runs something on this platform. */
+  runs_items?: boolean;
+  /** What the section can run by itself to produce items, as the button names it. */
+  section_action?: string | null;
 }
 
 /**
@@ -48,6 +52,17 @@ export interface ProjectDetail {
   sections: Section[];
 }
 
+export interface ItemFacts {
+  kind?: 'finding' | 'enhancement';
+  severity?: 'low' | 'medium' | 'high' | 'critical';
+  lens?: string;
+  component?: string;
+  risk?: string;
+  persona?: string;
+  pull_request?: { number: number; url: string };
+  [key: string]: unknown;
+}
+
 /** One piece of work wanted on a project: an issue of its repository, or written by hand. */
 export interface WorkItem {
   id: string;
@@ -60,8 +75,17 @@ export interface WorkItem {
   state: 'proposed' | 'accepted' | 'skipped' | 'done';
   /** Who chose the section: a label of the issue, the supervisor, or the administrator. */
   routed_by: 'label' | 'administrator' | 'supervisor' | null;
-  /** Set when the supervisor proposed the item. */
-  proposed_by?: 'supervisor' | null;
+  /**
+   * Who proposed an item that is not an issue: the supervisor, an audit (a finding), a
+   * search for enhancements, or the original system it was brought over from.
+   */
+  proposed_by?: 'supervisor' | 'audit' | 'discovery' | 'original' | null;
+  /** What an item that is not an issue asks for. A list carries only its beginning. */
+  description?: string | null;
+  /** What is known about the item: a finding's severity, an enhancement's risk, its pull request. */
+  facts?: ItemFacts;
+  /** The run that produced the item, when one did. */
+  source_run_id?: string | null;
   routing_reason: string | null;
   repository: string | null;
   issue_number: number | null;
@@ -99,6 +123,7 @@ export interface InboxEntry {
     | 'supervisor_action'
     | 'queue_proposed'
     | 'queue_paused'
+    | 'incident'
     | 'sync_failed'
     | 'section_without_flow'
     | 'unrouted'
@@ -106,6 +131,9 @@ export interface InboxEntry {
   /** For a queue the supervisor proposed, or one the platform paused. */
   queue_id?: string;
   queue?: string;
+  /** For trouble with the work that is left to the administrator. */
+  incident_id?: string;
+  diagnosis?: string | null;
   /** For something the supervisor proposed: what it is, why, and why it waits. */
   action_id?: string;
   summary?: string | null;
@@ -224,8 +252,31 @@ export interface SupervisorDefinition {
   account_id: string | null;
   exclusive: boolean;
   models: Record<string, string>;
+  /** Whether it looks at failed and stuck work by itself, and how often within an hour. */
+  operations: { enabled: boolean; per_hour: number };
   note: string | null;
   saved_at: string | null;
+}
+
+/** Trouble with the work that the platform noticed, and what the supervisor made of it. */
+export interface Incident {
+  id: string;
+  kind: 'run_failed' | 'run_stalled' | 'queue_paused';
+  state: 'open' | 'looking' | 'handled' | 'waiting' | 'dismissed';
+  summary: string;
+  facts: { needs?: 'decision' | 'administrator'; queue_id?: string; [key: string]: unknown };
+  project: string | null;
+  project_name: string | null;
+  run_id: string | null;
+  item_id: string | null;
+  diagnosis: string | null;
+  confidence: 'high' | 'medium' | 'low' | null;
+  at: string | null;
+  closed_at: string | null;
+}
+
+export interface Incidents extends Listing<Incident> {
+  settings: { enabled: boolean; per_hour: number };
 }
 
 export interface SupervisorTool {
@@ -278,10 +329,36 @@ export interface RunStep {
   log?: string;
 }
 
-/** Work done in sandboxes: trying an account, or delivering an issue. */
+/** What an audit or a search for enhancements made of one candidate. */
+export interface ProducedEntry {
+  number: number;
+  title: string;
+  severity?: string;
+  lens?: string;
+  risk?: string;
+  persona?: string;
+  disposition: string;
+  notes: string[];
+  duplicate_of: string | null;
+  /** The backlog item it became, when it became one. */
+  item_id: string | null;
+}
+
+/** What a run that produces items ended with. */
+export interface RunResult {
+  summary?: string | null;
+  covered?: string[];
+  not_covered?: string[];
+  open_questions?: string[];
+  findings?: ProducedEntry[];
+  proposals?: ProducedEntry[];
+  counts?: Record<string, number>;
+}
+
+/** Work done in sandboxes: trying an account, delivering an item, auditing, looking for enhancements. */
 export interface Run {
   id: string;
-  kind: 'account_check' | 'deliver_issue';
+  kind: 'account_check' | 'deliver_issue' | 'audit_code' | 'discover_enhancements';
   state: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
   title: string;
   outcome: string | null;
@@ -292,7 +369,9 @@ export interface Run {
   data: {
     repository?: string;
     branch?: string;
-    issue?: { number: number; title: string; url: string | null };
+    issue?: { number: number | null; title: string; url: string | null };
+    scope?: { title: string; text: string };
+    result?: RunResult;
     toolchain?: { note?: string | null };
     change?: {
       summary: string;

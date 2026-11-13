@@ -43,6 +43,12 @@ _PROJECT: Final = {
 }
 _ITEM: Final = {"type": "string", "description": "The item's id, as list_items gives it."}
 _QUEUE: Final = {"type": "string", "description": "The queue's id, as list_queues gives it."}
+_RUN: Final = {"type": "string", "description": "The run's id, as list_runs gives it."}
+_CONFIDENCE: Final = {
+    "type": "string",
+    "enum": ["high", "medium", "low"],
+    "description": "How sure you are of the cause. Anything but high asks the administrator.",
+}
 _REASON: Final = {
     "type": "string",
     "description": "Why, in one or two sentences the administrator can check.",
@@ -301,6 +307,103 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         default_mode="confirm",
         modes=MODES,
     ),
+    Tool(
+        "start_section_run",
+        "operate",
+        "Start an audit or a search for enhancements",
+        "Start what a section runs by itself to produce backlog items: an audit of the "
+        "code (a section whose flow is Audit code) or a search for enhancements (Discover "
+        "enhancements). The scope narrows where to look, in a sentence or two; leave it "
+        "empty for the whole repository. Only when the administrator asked for it.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "section": {"type": "string", "description": "The section's key."},
+                "scope": {"type": "string", "maxLength": 2000},
+                "reason": _REASON,
+            },
+            ("project", "section", "reason"),
+        ),
+        default_mode="confirm",
+        modes=MODES,
+    ),
+    Tool(
+        "list_incidents",
+        "read",
+        "List incidents",
+        "Trouble with the work that the platform noticed by itself and that is not closed: "
+        "runs that failed, runs that make no progress, queues that paused themselves. Each "
+        "with the ids of what it is about.",
+        _schema({}),
+    ),
+    Tool(
+        "retry_run",
+        "operate",
+        "Try a failed run again",
+        "Start the work of a run that failed once more: the same item, or the same audit "
+        "or search. For causes that pass by themselves (an account that was limited, a "
+        "sandbox that did not start, an agent that gave no answer). It waits for the "
+        "administrator when you are not sure, or when the work already failed several "
+        "times within a day.",
+        _schema(
+            {"run": _RUN, "reason": _REASON, "confidence": _CONFIDENCE},
+            ("run", "reason", "confidence"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
+        "cancel_run",
+        "operate",
+        "Stop a run",
+        "Stop a run that is under way. A run that has made no change yet is stopped at "
+        "once; one that holds work (it has implemented something, or its change waits to "
+        "be published) is stopped only with the administrator's confirmation, because "
+        "that work is discarded.",
+        _schema({"run": _RUN, "reason": _REASON}, ("run", "reason")),
+        modes=MODES,
+    ),
+    Tool(
+        "skip_item",
+        "operate",
+        "Skip an item",
+        "Set an open item aside, with the reason recorded on it: it stays in the backlog "
+        "and can be reopened. For an item that cannot be worked on as it is written. It "
+        "waits for the administrator when you are not sure.",
+        _schema(
+            {"item": _ITEM, "reason": _REASON, "confidence": _CONFIDENCE},
+            ("item", "reason", "confidence"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
+        "requeue_item",
+        "operate",
+        "Return an item to its queue",
+        "Put an item of a queue that failed back among the waiting ones, so that the queue "
+        "works on it again. Once per item without asking; after that it waits for the "
+        "administrator.",
+        _schema({"queue": _QUEUE, "item": _ITEM, "reason": _REASON}, ("queue", "item", "reason")),
+        modes=MODES,
+    ),
+    Tool(
+        "conclude_incident",
+        "operate",
+        "Close an incident",
+        "Record what you made of an incident: the cause in one or two sentences, how sure "
+        "you are, and what you did or why you did nothing. Call it once for every "
+        "incident you were asked to look at.",
+        _schema(
+            {
+                "incident": {"type": "string", "description": "The incident's id."},
+                "diagnosis": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "confidence": _CONFIDENCE,
+                "action": {"type": "string", "maxLength": 1000},
+            },
+            ("incident", "diagnosis", "confidence"),
+        ),
+        # Recording a diagnosis changes nothing but the incident: there is nothing to confirm.
+        modes=("automatic",),
+    ),
 )
 TOOLS: Final = {tool.name: tool for tool in CATALOGUE}
 
@@ -409,6 +512,50 @@ DEFAULT_SKILLS: Final[tuple[dict[str, Any], ...]] = (
         ),
         "enabled": True,
     },
+    {
+        "key": "handle-trouble",
+        "name": "Handle trouble with the work",
+        "description": "Looking at a failed or stuck run when the platform asks, or the "
+        "administrator does.",
+        "body": (
+            "When a run failed or makes no progress:\n"
+            "1. Read it (get_run): which step failed, its outcome and detail; the end of "
+            "that step's output only when those do not explain it.\n"
+            "2. Name the cause and where it lies: with the account or the sandbox (it "
+            "passes), with the item (it will fail again as written), or with the project "
+            "(every item will fail until it is fixed).\n"
+            "3. Try again (retry_run) only for causes that pass. Never try again what "
+            "failed for the same reason twice.\n"
+            "4. Skip an item (skip_item) only when it cannot be worked on as written, and "
+            "say in the reason what would have to change.\n"
+            "5. When the cause is in the project, pause the queue that would repeat the "
+            "failure and tell the administrator what to fix; do not skip the items.\n"
+            "6. Give your confidence honestly. A wrong automatic action costs more than a "
+            "question."
+        ),
+        "enabled": True,
+    },
+    {
+        "key": "audit-and-discover",
+        "name": "Audit code and look for enhancements",
+        "description": "Starting an audit or a search for enhancements, and reporting "
+        "what came of it.",
+        "body": (
+            "An audit (start_section_run on the section whose flow is Audit code) reads "
+            "the code for defects; a second agent verifies each finding twice, and the "
+            "confirmed ones appear as proposed items of that section. A search for "
+            "enhancements (the section whose flow is Discover enhancements) proposes "
+            "improvements; a second agent reviews them, and the approved ones appear as "
+            "proposed items.\n"
+            "1. Ask what to look at when the request is broad, and put it in the scope: a "
+            "narrow audit finds more than a wide one.\n"
+            "2. When the run has ended, read it (get_run) and report: what was confirmed "
+            "or approved, what was dropped and why, what was not looked at.\n"
+            "3. A finding or an approved enhancement is an item like any other: it is "
+            "delivered when the administrator starts it or puts it in a queue."
+        ),
+        "enabled": True,
+    },
 )
 
 
@@ -492,6 +639,26 @@ def clean_providers(providers: Any) -> list[str]:
     return [str(name) for name in providers]
 
 
+# Whether the supervisor looks at trouble with the work by itself, and how often within an
+# hour at most. See ``supervisor/operations.py``.
+OPERATIONS: Final = {"enabled": True, "per_hour": 6}
+OPERATIONS_PER_HOUR_MAX: Final = 30
+
+
+def clean_operations(value: Any) -> dict[str, Any]:
+    """The administrator's choice, checked. Nothing given is the platform's default."""
+    if value is None:
+        return dict(OPERATIONS)
+    if not isinstance(value, dict):
+        raise ProjectInvalid("Say whether the supervisor looks at trouble by itself")
+    per_hour = value.get("per_hour", OPERATIONS["per_hour"])
+    if not isinstance(per_hour, int) or isinstance(per_hour, bool):
+        raise ProjectInvalid("How often within an hour is a whole number")
+    if not 1 <= per_hour <= OPERATIONS_PER_HOUR_MAX:
+        raise ProjectInvalid(f"Between 1 and {OPERATIONS_PER_HOUR_MAX} times within an hour")
+    return {"enabled": bool(value.get("enabled", True)), "per_hour": per_hour}
+
+
 def clean_models(models: Any) -> dict[str, str]:
     if not isinstance(models, dict):
         raise ProjectInvalid("The models are given by provider")
@@ -525,6 +692,7 @@ def _row(definition: SupervisorDefinition | None) -> dict[str, Any]:
             "account_id": None,
             "exclusive": False,
             "models": {},
+            "operations": dict(OPERATIONS),
             "note": "The platform's own definition",
             "saved_at": None,
         }
@@ -538,6 +706,7 @@ def _row(definition: SupervisorDefinition | None) -> dict[str, Any]:
         "account_id": str(definition.account_id) if definition.account_id else None,
         "exclusive": bool(definition.exclusive),
         "models": dict(definition.models or {}),
+        "operations": {**OPERATIONS, **(definition.operations or {})},
         "note": definition.note,
         "saved_at": _when(definition.created_at),
     }
@@ -613,6 +782,7 @@ class Definitions:
         exclusive: bool,
         models: Any,
         note: str | None,
+        operations: Any = None,
     ) -> dict[str, Any]:
         text = prompt.strip()
         if not 1 <= len(text) <= MAX_PROMPT:
@@ -621,6 +791,7 @@ class Definitions:
         cleaned_tools = clean_tools(tools)
         cleaned_providers = clean_providers(providers)
         cleaned_models = clean_models(models)
+        cleaned_operations = clean_operations(operations)
         with self.sessions.begin() as session:
             if account_id is not None:
                 account = session.get(ProviderAccount, account_id)
@@ -643,6 +814,7 @@ class Definitions:
                 account_id=account_id,
                 exclusive=bool(exclusive and account_id is not None),
                 models=cleaned_models,
+                operations=cleaned_operations,
                 note=" ".join((note or "").split())[:300] or None,
             )
             session.add(definition)

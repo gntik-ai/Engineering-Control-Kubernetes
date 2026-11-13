@@ -65,6 +65,7 @@ from engineering_control.dashboard.schemas import (
     BudgetInput,
     ItemBulkInput,
     ItemCreateInput,
+    ItemEditInput,
     ItemRouteInput,
     ItemStateInput,
     PlainChangeInput,
@@ -80,6 +81,7 @@ from engineering_control.dashboard.schemas import (
     SectionFlowInput,
     SectionGuideInput,
     SectionRemoveInput,
+    SectionRunInput,
     SectionUpdateInput,
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
@@ -1238,6 +1240,7 @@ def create_app(
                 exclusive=body.exclusive,
                 models=body.models,
                 note=body.note,
+                operations=body.operations,
             ),
             event="dashboard.supervisor_defined",
             password=True,
@@ -1262,6 +1265,26 @@ def create_app(
             lambda body: service(request).decide_action(action_id, body.accept),
             event="dashboard.supervisor_action_decided",
             entity="action",
+        )
+
+    @app.get("/api/dashboard/supervisor/incidents")
+    async def incidents_api(request: Request, everything: bool = False) -> Response:
+        """Trouble with the work that the platform noticed, and what the supervisor made
+        of it: what is not closed, or with ``everything`` the closed ones as well."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).incidents(everything=everything))
+
+    @app.post("/api/dashboard/supervisor/incidents/{incident_id}/dismiss")
+    async def dismiss_incident_api(incident_id: UUID, request: Request) -> Response:
+        """The administrator has seen an incident: nothing more is done about it."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).dismiss_incident(incident_id),
+            event="dashboard.incident_dismissed",
+            entity="incident",
         )
 
     @app.get("/api/dashboard/accounts")
@@ -1438,10 +1461,46 @@ def create_app(
         return await project_change(
             request,
             ItemCreateInput,
-            lambda body: service(request).add_item(name, title=body.title, section=body.section),
+            lambda body: service(request).add_item(
+                name, title=body.title, section=body.section, description=body.description
+            ),
             event="dashboard.item_added",
             subject=name,
             status_code=201,
+        )
+
+    @app.get("/api/dashboard/items/{item_id}")
+    async def item_api(item_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).item(item_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/items/{item_id}/edit")
+    async def edit_item_api(item_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ItemEditInput,
+            lambda body: service(request).edit_item(
+                item_id, title=body.title, description=body.description
+            ),
+            event="dashboard.item_edited",
+            subject=str(item_id),
+        )
+
+    @app.post("/api/dashboard/projects/{name}/sections/{key}/run", status_code=201)
+    async def run_section_api(name: str, key: str, request: Request) -> Response:
+        """Start what the section runs by itself: an audit, a search for enhancements."""
+        return await project_change(
+            request,
+            SectionRunInput,
+            lambda body: service(request).run_section(name, key, body.scope),
+            event="dashboard.run_started",
+            status_code=201,
+            entity="run",
         )
 
     @app.post("/api/dashboard/items/{item_id}/route")

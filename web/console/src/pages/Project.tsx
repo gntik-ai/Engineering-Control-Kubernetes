@@ -34,7 +34,7 @@ import {
   Textarea,
   TokenInput,
 } from '@gntik-ai/ui';
-import { ArrowLeft, Bot, FolderKanban, Pencil, Plus, Trash2 } from '@gntik-ai/icons';
+import { ArrowLeft, Bot, FolderKanban, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -43,10 +43,11 @@ import {
   type Flow,
   type Listing,
   type ProjectDetail,
+  type Run,
   type Section,
 } from '../api';
 import { LoadError, RefreshButton } from '../parts';
-import { BASE, RouterLink, useLocation } from '../router';
+import { BASE, RouterLink, navigate, useLocation } from '../router';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 const NO_FLOW = '__none__';
@@ -280,6 +281,7 @@ function SectionCard({
   onRemove: () => void;
 }) {
   const [pending, setPending] = useState(false);
+  const [running, setRunning] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const assign = async (value: string | null) => {
     const flow = !value || value === NO_FLOW ? null : value;
@@ -342,9 +344,97 @@ function SectionCard({
         <p className="text-[12px] text-muted-foreground">
           {section.flow ? section.flow.summary : 'Nothing runs for this section until a flow is assigned.'}
         </p>
+        {section.flow && section.flow.runs_items === false && !section.flow.section_action ? (
+          <p className="text-[12px] text-muted-foreground">This flow cannot run on this platform yet.</p>
+        ) : null}
+        {section.flow?.section_action ? (
+          <div>
+            <Button size="sm" variant="secondary" icon={Play} onClick={() => setRunning(true)}>
+              {section.flow.section_action}
+            </Button>
+          </div>
+        ) : null}
         {problem ? <Alert tone="destructive" title={problem} /> : null}
       </CardBody>
+      {section.flow?.section_action ? (
+        <SectionRunDialog project={project} section={section} open={running} onOpenChange={setRunning} />
+      ) : null}
     </Card>
+  );
+}
+
+/**
+ * Start what a section runs by itself to produce items: an audit of the code, or a search
+ * for enhancements. What to look at can be narrowed in a few words.
+ */
+function SectionRunDialog({
+  project,
+  section,
+  open,
+  onOpenChange,
+}: {
+  project: string;
+  section: Section;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [scope, setScope] = useState('');
+  const [pending, setPending] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    setScope('');
+    setProblem(null);
+  }, [open]);
+  const audit = section.flow?.key === 'audit-code';
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (pending) return;
+    setPending(true);
+    setProblem(null);
+    try {
+      const run = await postJson<Run>(`projects/${project}/sections/${section.key}/run`, { scope });
+      navigate(`${BASE}/run?id=${run.id}`);
+    } catch (error) {
+      setProblem(message(error));
+      setPending(false);
+    }
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="md">
+        <form onSubmit={submit} noValidate>
+          <DialogHeader>
+            <DialogTitle>{section.flow?.section_action}</DialogTitle>
+            <DialogDescription>
+              {audit
+                ? 'One subscription audits the code, the other verifies each finding twice. Confirmed findings appear in the backlog as proposed items of this section. Nothing is changed and nothing reaches GitHub.'
+                : 'One subscription proposes enhancements, the other reviews each one. Approved proposals appear in the backlog as proposed items of this section and wait for you. Nothing is implemented until you start an item.'}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            <Field>
+              <FieldLabel>What to look at</FieldLabel>
+              <Textarea name="scope" value={scope} onValueChange={setScope} maxLength={2000} showCount rows={4} autoFocus />
+              <FieldDescription>
+                {audit
+                  ? 'For example: "The session handling in src/auth" or "Everything that checks permissions". Leave it empty to audit the whole repository, starting with what carries the most risk.'
+                  : 'For example: "The reports pages" or "What an operator does every day". Leave it empty to look at the whole product.'}
+              </FieldDescription>
+            </Field>
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" loading={pending}>
+              Start
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
   );
 }
 

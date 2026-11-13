@@ -139,17 +139,38 @@ class Conversation:
         )
         if busy:
             return None
-        definition = self.definitions.current()
         first = " ".join(unanswered[-1].text.split())
+        run = self.open_turn(
+            session, title=f"Supervisor: {first}", data={"channel": unanswered[-1].channel}
+        )
+        if run is None:
+            return None
+        for message in unanswered:
+            message.run_id = run.id
+        return run
+
+    def open_turn(self, session: Session, *, title: str, data: dict[str, Any]) -> SandboxRun | None:
+        """A turn of the supervisor, as a run with its one step, unless one is under way
+        or a message of the administrator still waits for its own."""
+        busy = session.scalar(
+            select(func.count())
+            .select_from(SandboxRun)
+            .where(SandboxRun.kind == KIND, SandboxRun.state.in_(ACTIVE))
+        )
+        waiting = session.scalar(
+            select(func.count())
+            .select_from(SupervisorMessage)
+            .where(SupervisorMessage.role == "administrator", SupervisorMessage.run_id.is_(None))
+        )
+        if busy or (waiting and data.get("channel") not in CHANNELS):
+            return None
+        definition = self.definitions.current()
         run = SandboxRun(
             kind=KIND,
             state="queued",
-            title=f"Supervisor: {first}"[:300],
+            title=title[:300],
             cancel_requested=False,
-            data={
-                "definition_version": definition["version"],
-                "channel": unanswered[-1].channel,
-            },
+            data={"definition_version": definition["version"], **data},
         )
         session.add(run)
         session.flush()
@@ -167,8 +188,6 @@ class Conversation:
                 attempt=0,
             )
         )
-        for message in unanswered:
-            message.run_id = run.id
         return run
 
     def history(self, run_id: UUID) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -209,6 +228,28 @@ class Conversation:
             return [shown(message) for message in reversed(before)], [
                 _row(message) for message in asked
             ]
+
+    def recent(self, run_id: UUID, *, limit: int = 12) -> list[dict[str, Any]]:
+        """The latest of what was said, for a turn that answers no message: so that the
+        supervisor knows what the administrator and it were about."""
+        with self.sessions() as session:
+            found = session.scalars(
+                select(SupervisorMessage)
+                .where(
+                    or_(SupervisorMessage.run_id.is_(None), SupervisorMessage.run_id != run_id),
+                    or_(
+                        SupervisorMessage.role != "administrator",
+                        SupervisorMessage.run_id.is_not(None),
+                    ),
+                )
+                .order_by(SupervisorMessage.created_at.desc())
+                .limit(limit)
+            ).all()
+            rows = [_row(message) for message in reversed(found)]
+            for row in rows:
+                if len(row["text"]) > HISTORY_CHARACTERS // 2:
+                    row["text"] = row["text"][: HISTORY_CHARACTERS // 2] + " […]"
+            return rows
 
     def answered(self, run_id: UUID, text: str) -> None:
         """The supervisor's reply of a turn."""

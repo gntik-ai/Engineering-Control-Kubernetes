@@ -83,6 +83,18 @@ function shown(entry: InboxEntry): Shown {
         action: 'Open the queue',
         href: `${BASE}/queue?id=${entry.queue_id}`,
       };
+    case 'incident':
+      return {
+        icon: CircleAlert,
+        tone: 'destructive',
+        label: 'Trouble',
+        title: entry.detail ?? 'Something went wrong with the work',
+        detail:
+          entry.diagnosis ??
+          'The supervisor does not look at trouble by itself, so this is yours to look at. Dismiss it on the supervisor page once you have.',
+        action: entry.run_id ? 'Open the run' : 'Open the supervisor',
+        href: entry.run_id ? `${BASE}/run?id=${entry.run_id}` : `${BASE}/supervisor`,
+      };
     case 'sync_failed':
       return {
         icon: CircleAlert,
@@ -166,7 +178,7 @@ export function InboxPage() {
         {entries
           ? entries.map((entry) => (
               <Entry
-                key={`${entry.kind}/${entry.action_id ?? entry.queue_id ?? entry.run_id ?? entry.project ?? entry.account_id}/${entry.section?.key ?? ''}`}
+                key={`${entry.kind}/${entry.incident_id ?? entry.action_id ?? entry.queue_id ?? entry.run_id ?? entry.project ?? entry.account_id}/${entry.section?.key ?? ''}`}
                 entry={entry}
                 onDecided={inbox.reload}
               />

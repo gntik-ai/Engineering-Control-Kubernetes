@@ -16,6 +16,7 @@ import {
   FieldDescription,
   FieldLabel,
   Input,
+  Link,
   Page,
   PasswordInput,
   SimpleSelect,
@@ -41,6 +42,8 @@ import {
   apiUrl,
   postJson,
   useResource,
+  type Incident,
+  type Incidents,
   type Listing,
   type SupervisorDefinition,
   type SupervisorRecordEntry,
@@ -50,6 +53,7 @@ import {
   type ToolMode,
 } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When } from '../parts';
+import { BASE } from '../router';
 import { useSubmit } from './ProjectDialogs';
 
 const PROVIDER_NAMES: Record<string, string> = {
@@ -76,7 +80,7 @@ const NO_ACCOUNT = '__none__';
 
 type Draft = Pick<
   SupervisorDefinition,
-  'prompt' | 'skills' | 'tools' | 'providers' | 'account_id' | 'exclusive' | 'models'
+  'prompt' | 'skills' | 'tools' | 'providers' | 'account_id' | 'exclusive' | 'models' | 'operations'
 >;
 
 const draftOf = (definition: SupervisorDefinition): Draft => ({
@@ -87,6 +91,7 @@ const draftOf = (definition: SupervisorDefinition): Draft => ({
   account_id: definition.account_id,
   exclusive: definition.exclusive,
   models: { ...definition.models },
+  operations: { ...definition.operations },
 });
 
 function Instructions({ draft, change }: { draft: Draft; change: (next: Partial<Draft>) => void }) {
@@ -509,6 +514,147 @@ function RecordTable() {
   );
 }
 
+const INCIDENT_STATES: Record<Incident['state'], { label: string; tone: 'neutral' | 'info' | 'warning' | 'success' }> = {
+  open: { label: 'Not looked at yet', tone: 'warning' },
+  looking: { label: 'The supervisor is looking', tone: 'info' },
+  waiting: { label: 'Waits for you', tone: 'warning' },
+  handled: { label: 'Dealt with', tone: 'success' },
+  dismissed: { label: 'Dismissed by you', tone: 'neutral' },
+};
+
+/**
+ * Whether the supervisor looks at failed and stuck work by itself, and what it made of
+ * the trouble the platform noticed.
+ */
+function Trouble({ draft, change }: { draft: Draft; change: (next: Partial<Draft>) => void }) {
+  const incidents = useResource<Incidents>(apiUrl('supervisor/incidents', { everything: 'true' }), 30_000);
+  const [problem, setProblem] = useState<string | null>(null);
+  const dismiss = (id: string) => {
+    setProblem(null);
+    postJson(`supervisor/incidents/${id}/dismiss`)
+      .then(incidents.reload)
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setProblem(error instanceof Error ? error.message : 'The request failed.');
+      });
+  };
+  return (
+    <div className="grid gap-4">
+      <Card>
+        <CardBody className="grid gap-4">
+          <label className="flex items-start gap-3">
+            <Switch
+              checked={draft.operations.enabled}
+              onCheckedChange={(enabled) => change({ operations: { ...draft.operations, enabled } })}
+              aria-label="The supervisor looks at trouble by itself"
+            />
+            <span>
+              <span className="font-medium">The supervisor looks at trouble by itself</span>
+              <span className="block text-[13px] text-muted-foreground">
+                When a run fails, makes no progress for 20 minutes, or a queue pauses itself, the platform asks the
+                supervisor to look at it. It tries again what failed for a passing reason, and asks you before anything
+                it is not sure of or that would discard work. Each look uses the subscription like one message to it.
+                Switched off, trouble waits in your inbox instead.
+              </span>
+            </span>
+          </label>
+          <Field className="max-w-xs">
+            <FieldLabel>Looks within an hour, at most</FieldLabel>
+            <Input
+              type="number"
+              min={1}
+              max={30}
+              disabled={!draft.operations.enabled}
+              value={String(draft.operations.per_hour)}
+              onValueChange={(value) => {
+                const per_hour = Math.max(1, Math.min(30, Math.round(Number(value)) || 1));
+                change({ operations: { ...draft.operations, per_hour } });
+              }}
+            />
+            <FieldDescription>One look covers up to five incidents. Past the limit, trouble waits for the next hour.</FieldDescription>
+          </Field>
+        </CardBody>
+      </Card>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[13px] text-muted-foreground">
+          What went wrong with the work, newest first, and what the supervisor made of it.
+        </p>
+        <RefreshButton resource={incidents} />
+      </div>
+      {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
+      <LoadError resource={incidents} />
+      <TableFrame>
+        <Table>
+          <TableCaption className="sr-only">Trouble with the work</TableCaption>
+          <TableHeader>
+            <TableRow>
+              <TableHead>What happened</TableHead>
+              <TableHead className="w-48">State</TableHead>
+              <TableHead>What the supervisor made of it</TableHead>
+              <TableHead className="w-40">When</TableHead>
+              <TableHead className="w-24">
+                <span className="sr-only">Actions</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <Rows resource={incidents} columns={5} empty="Nothing went wrong yet">
+              {(items) =>
+                items.map((incident) => (
+                  <TableRow key={incident.id}>
+                    <TableCell className="max-w-md">
+                      <div className="text-[13px]">{incident.summary}</div>
+                      <div className="text-[12px] text-muted-foreground">
+                        {incident.project_name ?? ''}
+                        {incident.run_id ? (
+                          <>
+                            {incident.project_name ? ' · ' : ''}
+                            <Link href={`${BASE}/run?id=${incident.run_id}`}>The run</Link>
+                          </>
+                        ) : null}
+                        {incident.facts.queue_id ? (
+                          <>
+                            {incident.project_name ? ' · ' : ''}
+                            <Link href={`${BASE}/queue?id=${incident.facts.queue_id}`}>The queue</Link>
+                          </>
+                        ) : null}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge tone={INCIDENT_STATES[incident.state].tone} size="sm">
+                        {INCIDENT_STATES[incident.state].label}
+                      </Badge>
+                      {incident.state === 'waiting' && incident.facts.needs === 'decision' ? (
+                        <div className="mt-1 text-[12px] text-muted-foreground">Its proposal is in your inbox</div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="max-w-md text-[13px] whitespace-pre-wrap">
+                      {incident.diagnosis ?? <span className="text-muted-foreground">—</span>}
+                      {incident.confidence ? (
+                        <div className="text-[12px] text-muted-foreground">Confidence: {incident.confidence}</div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      <When value={incident.at} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {incident.state === 'open' || incident.state === 'waiting' ? (
+                        <Button variant="ghost" size="sm" onClick={() => dismiss(incident.id)}>
+                          Dismiss
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                ))
+              }
+            </Rows>
+          </TableBody>
+        </Table>
+      </TableFrame>
+    </div>
+  );
+}
+
 function SaveDialog({
   draft,
   open,
@@ -664,6 +810,7 @@ export function SupervisorPage() {
                 <TabsTab value="versions" count={data.versions.length || undefined}>
                   Versions
                 </TabsTab>
+                <TabsTab value="trouble">Trouble</TabsTab>
                 <TabsTab value="record">Record</TabsTab>
               </TabsList>
               <TabsPanel value="instructions" className="pt-4">
@@ -680,6 +827,9 @@ export function SupervisorPage() {
               </TabsPanel>
               <TabsPanel value="versions" className="pt-4">
                 <Versions settings={data} onLoad={load} />
+              </TabsPanel>
+              <TabsPanel value="trouble" className="pt-4">
+                <Trouble draft={draft} change={change} />
               </TabsPanel>
               <TabsPanel value="record" className="pt-4">
                 <RecordTable />

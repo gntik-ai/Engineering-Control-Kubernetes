@@ -38,7 +38,8 @@ from engineering_control.db.models import (
     SupervisorMessage,
     WorkQueue,
 )
-from engineering_control.sandbox.queues import WORK, Queues
+from engineering_control.flow_library import DELIVER, WORK_KINDS
+from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import CONVERSATION, Runs
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.tools import Toolbox
@@ -223,7 +224,7 @@ class ChatChannel:
         with self.sessions() as session:
             running = session.scalars(
                 select(SandboxRun)
-                .where(SandboxRun.kind == WORK, SandboxRun.state.in_(("queued", "running")))
+                .where(SandboxRun.kind.in_(WORK_KINDS), SandboxRun.state.in_(("queued", "running")))
                 .order_by(SandboxRun.created_at)
                 .limit(10)
             ).all()
@@ -336,7 +337,7 @@ class ChatChannel:
         with self.sessions() as session:
             runs = session.execute(
                 select(SandboxRun.state, func.count())
-                .where(SandboxRun.kind == WORK, SandboxRun.created_at > since)
+                .where(SandboxRun.kind.in_(WORK_KINDS), SandboxRun.created_at > since)
                 .group_by(SandboxRun.state)
             ).all()
             actions = session.execute(
@@ -436,9 +437,13 @@ class ChatChannel:
                 .limit(50)
             ):
                 run = session.get(SandboxRun, message.run_id)
-                if run is None or (run.data or {}).get("channel") != "chat":
-                    continue
-                news.append(("message", str(message.id), message.text, None))
+                channel = (run.data or {}).get("channel") if run is not None else None
+                if channel == "operations" and message.role == "supervisor":
+                    # What the supervisor did about trouble it was asked to look at.
+                    text = f"The supervisor looked at trouble with the work:\n{message.text}"
+                    news.append(("message", str(message.id), text, None))
+                elif channel == "chat":
+                    news.append(("message", str(message.id), message.text, None))
             for action in session.scalars(
                 select(SupervisorAction)
                 .where(SupervisorAction.outcome == "pending", SupervisorAction.created_at > since)
@@ -461,14 +466,22 @@ class ChatChannel:
             for run in session.scalars(
                 select(SandboxRun)
                 .where(
-                    SandboxRun.kind == WORK,
-                    SandboxRun.state.in_(("waiting", "failed")),
+                    SandboxRun.kind.in_(WORK_KINDS),
+                    SandboxRun.state.in_(("waiting", "failed", "succeeded")),
                     SandboxRun.updated_at > since,
                 )
                 .order_by(SandboxRun.updated_at)
                 .limit(30)
             ):
-                if run.state == "waiting":
+                if run.state == "succeeded":
+                    # A delivery that ended well was published by the administrator, who
+                    # knows. An audit or a search that ended has something to say.
+                    if run.kind == DELIVER:
+                        continue
+                    text = f"**{run.title}** has ended. {run.detail or ''}"
+                    if (run.outcome or "") in ("findings", "proposed"):
+                        text += " They wait in the backlog as proposed items."
+                elif run.state == "waiting":
                     text = (
                         f"A change is ready: **{run.title}**. {run.detail or ''} Publishing "
                         "needs your password, so decide in the console."

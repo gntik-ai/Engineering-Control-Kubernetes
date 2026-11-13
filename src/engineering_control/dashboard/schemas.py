@@ -99,6 +99,24 @@ class ItemCreateInput(DashboardModel):
     title: str = Field(min_length=1, max_length=1000)
     # The key of a section of the project; None leaves the item unrouted.
     section: str | None = Field(default=None, max_length=40)
+    # What the item asks for, in the administrator's words.
+    description: str | None = Field(default=None, max_length=40000)
+
+
+class ItemEditInput(DashboardModel):
+    """New words for an item that is not an issue of the repository. A field left out is
+    left as it is."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    title: str | None = Field(default=None, min_length=1, max_length=1000)
+    description: str | None = Field(default=None, max_length=40000)
+
+
+class SectionRunInput(DashboardModel):
+    """Start what a section runs by itself. ``scope`` narrows it; empty is everything."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    scope: str = Field(default="", max_length=2000)
 
 
 class ItemRouteInput(DashboardModel):
@@ -199,6 +217,9 @@ class SupervisorDefinitionInput(DashboardModel):
     exclusive: bool = False
     models: dict[str, str] = Field(default_factory=dict)
     note: str | None = Field(default=None, max_length=300)
+    # Whether the supervisor looks at failed and stuck work by itself, and how often
+    # within an hour. Left out: the platform's default.
+    operations: dict[str, Any] | None = None
 
 
 class AccountCreateInput(DashboardModel):

@@ -375,8 +375,12 @@ def implement_job(provider: str, generation: int, prompt: str, message: str) -> 
     return job
 
 
-def review_job(provider: str, generation: int, prompt: str) -> dict[str, Any]:
-    job = _agent(provider, generation, prompt, CHECKER_SCHEMA)
+def review_job(
+    provider: str, generation: int, prompt: str, schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """An agent that reads and judges and whose answer has the given shape: a reviewer of
+    a change, an auditor, a verifier."""
+    job = _agent(provider, generation, prompt, schema or CHECKER_SCHEMA)
     # Whatever the reviewer changed while looking is thrown away: what goes on is the
     # commit it was asked to review.
     job["commands"].append(
@@ -465,6 +469,20 @@ def _rules(toolchain: Toolchain) -> str:
     return "\n".join(f"{number}. {rule}" for number, rule in enumerate(rules, start=1))
 
 
+def subject(issue: dict[str, Any], repository: str) -> str:
+    """What the work is about, as the prompts name it: an issue of the repository by its
+    number, or an item of the platform's backlog, which has none."""
+    if issue.get("number"):
+        return f"issue #{issue['number']} of {repository}"
+    return f"a backlog item of {repository}"
+
+
+def commit_message(issue: dict[str, Any]) -> str:
+    if issue.get("number"):
+        return f"{issue['title']}\n\nResolves #{issue['number']}."
+    return str(issue["title"])
+
+
 def maker_prompt(
     *,
     repository: str,
@@ -474,7 +492,7 @@ def maker_prompt(
     failures: list[str] | None = None,
 ) -> str:
     parts = [
-        f"You are the implementer for issue #{issue['number']} of {repository}. The "
+        f"You are the implementer for {subject(issue, repository)}. The "
         "repository is checked out in the current directory on a branch made for this "
         "issue. Make the change that resolves the issue, with tests where the repository "
         "has tests for the code you touch, and run the tests that cover it.",
@@ -513,8 +531,8 @@ def checker_prompt(
 ) -> str:
     return "\n\n".join(
         [
-            f"You are the reviewer of a change for issue #{issue['number']} of "
-            f"{repository}. The repository is checked out in the current directory with "
+            f"You are the reviewer of a change for {subject(issue, repository)}. "
+            "The repository is checked out in the current directory with "
             f"the change committed. See it with: git diff {base_sha}..HEAD",
             f"Title: {issue['title']}",
             _fenced("issue", str(issue.get("body") or ""), 40_000),

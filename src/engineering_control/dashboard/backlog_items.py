@@ -47,6 +47,17 @@ def clean_title(value: str) -> str:
     return text[:TITLE_MAX]
 
 
+DESCRIPTION_MAX = 40_000
+
+
+def clean_description(value: str | None) -> str | None:
+    """An item's own text: kept as written, without control characters, bounded."""
+    if value is None:
+        return None
+    text = "".join(ch for ch in value if ch in "\n\t" or ch >= " ").strip()
+    return text[:DESCRIPTION_MAX] or None
+
+
 def route_by_labels(
     sections: Sequence[ProjectSection], labels: Sequence[str]
 ) -> tuple[ProjectSection | None, str | None]:
@@ -85,6 +96,9 @@ def serialize(
         "state": item.state,
         "routed_by": item.routed_by,
         "proposed_by": item.proposed_by,
+        "description": item.description,
+        "facts": dict(item.facts or {}),
+        "source_run_id": str(item.source_run_id) if item.source_run_id else None,
         "routing_reason": item.routing_reason,
         "repository": item.repository,
         "issue_number": item.issue_number,
@@ -126,7 +140,14 @@ class BacklogItems:
                 .offset((page - 1) * page_size)
             ).all()
             return {
-                "items": [serialize(item, record, found) for item, record, found in rows],
+                # A list shows the start of an item's text; the item itself has it whole.
+                "items": [
+                    {
+                        **(row := serialize(item, record, found)),
+                        "description": (row["description"] or "")[:400] or None,
+                    }
+                    for item, record, found in rows
+                ],
                 "total": int(total),
                 "page": page,
                 "page_size": page_size,
@@ -341,7 +362,9 @@ class BacklogItems:
         with self.sessions() as session:
             return self._project(session, project).source_repository
 
-    def add(self, project: str, *, title: str, section: str | None) -> dict[str, Any]:
+    def add(
+        self, project: str, *, title: str, section: str | None, description: str | None = None
+    ) -> dict[str, Any]:
         """An item the administrator wrote. It is accepted: they would not write it otherwise."""
         clean = clean_title(title)
         with self.sessions() as session:
@@ -355,11 +378,115 @@ class BacklogItems:
                 state="accepted",
                 routed_by="administrator" if found else None,
                 routing_reason=None,
+                description=clean_description(description),
                 issue_labels=[],
             )
             session.add(item)
             session.commit()
             return serialize(item, record, found)
+
+    def edit(
+        self, item_id: UUID, *, title: str | None = None, description: str | None = None
+    ) -> dict[str, Any]:
+        """Change the words of an item that is the platform's own. An issue of the
+        repository is edited on GitHub: the next import would undo a change made here."""
+        with self.sessions() as session:
+            item, record = self._item(session, item_id)
+            if item.issue_number is not None:
+                raise ProjectInvalid("This item is an issue of the repository; edit it on GitHub")
+            if title is not None:
+                item.title = clean_title(title)
+            if description is not None:
+                item.description = clean_description(description)
+            session.commit()
+            found = session.get(ProjectSection, item.section_id) if item.section_id else None
+            return serialize(item, record, found)
+
+    def produce(
+        self,
+        project: str,
+        *,
+        title: str,
+        section: str | None,
+        description: str,
+        facts: dict[str, Any],
+        proposed_by: str,
+        origin_ref: str,
+        reason: str,
+        run_id: UUID | None = None,
+        state: str = "proposed",
+    ) -> dict[str, Any] | None:
+        """An item a run produced, or one brought over from the original system: a finding
+        of an audit, a proposed enhancement. It waits, as proposed, for the administrator.
+
+        ``origin_ref`` names what it came from. None when the project already has an item
+        from there, or an open item of the same title: producing it again would repeat it.
+        """
+        clean = clean_title(title)
+        with self.sessions() as session:
+            record = self._project(session, project)
+            found = None
+            if section:
+                found = session.scalar(
+                    select(ProjectSection).where(
+                        ProjectSection.project_id == record.id, ProjectSection.key == section
+                    )
+                )
+            same = session.scalar(
+                select(func.count())
+                .select_from(BacklogItem)
+                .where(
+                    BacklogItem.project_id == record.id,
+                    (BacklogItem.origin_ref == origin_ref)
+                    | (
+                        (func.lower(BacklogItem.title) == clean.lower())
+                        & BacklogItem.state.in_(OPEN_STATES)
+                    ),
+                )
+            )
+            if same:
+                return None
+            item = BacklogItem(
+                project_id=record.id,
+                section_id=found.id if found else None,
+                title=clean,
+                source="manual",
+                state=state,
+                proposed_by=proposed_by[:16],
+                routed_by=proposed_by[:16] if found else None,
+                routing_reason=" ".join(reason.split())[:300] or None,
+                description=clean_description(description),
+                facts=facts,
+                source_run_id=run_id,
+                origin_ref=origin_ref[:160],
+                issue_labels=[],
+            )
+            session.add(item)
+            session.commit()
+            return serialize(item, record, found)
+
+    def open_titles(self, project: str, *, limit: int = 400) -> list[str]:
+        """The titles of the project's open items, newest first: what is already known."""
+        with self.sessions() as session:
+            record = self._project(session, project)
+            rows = session.execute(
+                select(BacklogItem.issue_number, BacklogItem.title)
+                .where(BacklogItem.project_id == record.id, BacklogItem.state.in_(OPEN_STATES))
+                .order_by(BacklogItem.created_at.desc())
+                .limit(limit)
+            ).all()
+            return [f"#{number} {title}" if number else title for number, title in rows]
+
+    def note_facts(self, item_id: UUID, facts: dict[str, Any], *, state: str | None = None) -> None:
+        """Add to what is known about an item, and optionally close it."""
+        with self.sessions() as session:
+            item = session.get(BacklogItem, item_id)
+            if item is None:
+                return
+            item.facts = {**(item.facts or {}), **facts}
+            if state is not None and item.state in OPEN_STATES:
+                item.state = state
+            session.commit()
 
     def get(self, item_id: UUID) -> dict[str, Any]:
         with self.sessions() as session:

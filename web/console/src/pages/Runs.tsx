@@ -29,7 +29,7 @@ import {
 } from '@gntik-ai/ui';
 import { ArrowLeft, Bot, CircleSlash, GitBranch, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState } from 'react';
-import { apiUrl, postJson, useResource, type Listing, type Run, type RunStep } from '../api';
+import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, RouterLink, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
@@ -61,11 +61,17 @@ const STEP_NAMES: Record<string, string> = {
   review: 'Review',
   verify: 'Test and scan',
   bundle: 'Collect the change',
+  audit: 'Audit',
+  discover: 'Look for enhancements',
 };
+// In a run that produces items, these steps mean something else than in a delivery.
+const PRODUCER_STEP_NAMES: Record<string, string> = { verify: 'Verify the findings', review: 'Review the proposals' };
 
 const KINDS: Record<Run['kind'], string> = {
   account_check: 'Trying an account',
-  deliver_issue: 'Delivering an issue',
+  deliver_issue: 'Delivering an item',
+  audit_code: 'Auditing code',
+  discover_enhancements: 'Looking for enhancements',
 };
 
 const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
@@ -210,7 +216,7 @@ function DecideDialog({
   );
 }
 
-function Step({ step }: { step: RunStep }) {
+function Step({ step, producer = false }: { step: RunStep; producer?: boolean }) {
   // The output of the step that is running, or that failed, is what one came to see.
   const [open, setOpen] = useState(step.state === 'running' || step.state === 'failed');
   const shown = STEP_STATES[step.state];
@@ -219,7 +225,9 @@ function Step({ step }: { step: RunStep }) {
       <CardBody className="grid gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <span className={mono}>{step.position}</span>
-          <span className="font-medium">{STEP_NAMES[step.name] ?? step.name}</span>
+          <span className="font-medium">
+            {(producer ? PRODUCER_STEP_NAMES[step.name] : undefined) ?? STEP_NAMES[step.name] ?? step.name}
+          </span>
           <Badge tone={shown.tone} size="sm">
             {shown.label}
           </Badge>
@@ -294,6 +302,89 @@ function Change({ change }: { change: NonNullable<Run['data']['change']> }) {
             The diff is longer than is shown here. The pull request shows all of it.
           </p>
         )}
+      </CardBody>
+    </Card>
+  );
+}
+
+const DISPOSITIONS: Record<string, { label: string; tone: Tone }> = {
+  CONFIRMED: { label: 'Confirmed', tone: 'success' },
+  REJECTED: { label: 'Not reproduced', tone: 'neutral' },
+  FLAKY: { label: 'Reproduced once only', tone: 'warning' },
+  BLOCKED: { label: 'Not judged', tone: 'warning' },
+  DUPLICATE: { label: 'Already known', tone: 'neutral' },
+  APPROVE: { label: 'Approved in review', tone: 'success' },
+  REQUEST_CHANGES: { label: 'Would need changes', tone: 'warning' },
+  NOT_REVIEWED: { label: 'Not reviewed', tone: 'warning' },
+};
+
+function Names({ title, values }: { title: string; values: string[] | undefined }) {
+  if (!values?.length) return null;
+  return (
+    <div>
+      <p className="text-[12px] font-medium text-muted-foreground">{title}</p>
+      <ul className="mt-1 list-disc space-y-0.5 pl-5 text-[13px]">
+        {values.map((value, index) => (
+          <li key={index}>{value}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** What an audit or a search for enhancements ended with: each candidate and what became of it. */
+function Produced({ run, result }: { run: Run; result: RunResult }) {
+  const entries = result.findings ?? result.proposals ?? [];
+  const audit = run.kind === 'audit_code';
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{audit ? 'Findings' : 'Proposals'}</CardTitle>
+      </CardHeader>
+      <CardBody className="grid gap-4">
+        {result.summary ? <p className="text-[13px] text-muted-foreground">{result.summary}</p> : null}
+        {entries.length ? (
+          <ul className="grid gap-3">
+            {entries.map((entry) => (
+              <li key={entry.number} className="grid gap-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={DISPOSITIONS[entry.disposition]?.tone ?? 'neutral'} size="sm">
+                    {DISPOSITIONS[entry.disposition]?.label ?? entry.disposition}
+                  </Badge>
+                  <span className="text-[13px] font-medium">{entry.title}</span>
+                  {entry.severity ? (
+                    <Badge tone="neutral" size="sm">
+                      {entry.severity}
+                    </Badge>
+                  ) : null}
+                  {entry.risk ? (
+                    <Badge tone="neutral" size="sm">
+                      Risk {entry.risk}
+                    </Badge>
+                  ) : null}
+                  {entry.item_id && run.project ? (
+                    <Link href={`${BASE}/backlog?project=${run.project}&item=${entry.item_id}`}>Open the item</Link>
+                  ) : null}
+                </div>
+                {entry.duplicate_of ? (
+                  <p className="text-[12px] text-muted-foreground">Same as: {entry.duplicate_of}</p>
+                ) : null}
+                {entry.notes
+                  .filter((note) => note)
+                  .map((note, index) => (
+                    <p key={index} className="text-[12px] text-muted-foreground">
+                      {note}
+                    </p>
+                  ))}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-[13px]">{audit ? 'The audit reported no finding.' : 'The search proposed nothing.'}</p>
+        )}
+        <Names title="Looked at" values={result.covered} />
+        <Names title="Not looked at" values={result.not_covered} />
+        <Names title="Questions for you" values={result.open_questions} />
       </CardBody>
     </Card>
   );
@@ -390,10 +481,16 @@ function RunDetail({ id }: { id: string }) {
               </p>
             ) : null}
             {run.data.toolchain?.note ? <Alert tone="warning" title={run.data.toolchain.note} /> : null}
+            {run.data.scope?.text ? (
+              <p className="text-[13px]">
+                <span className="text-muted-foreground">Asked to look at:</span> {run.data.scope.text}
+              </p>
+            ) : null}
+            {run.data.result ? <Produced run={run} result={run.data.result} /> : null}
             {run.data.change ? <Change change={run.data.change} /> : null}
             <div className="grid gap-2">
               {(run.steps ?? []).map((step) => (
-                <Step key={step.id} step={step} />
+                <Step key={step.id} step={step} producer={run.kind === 'audit_code' || run.kind === 'discover_enhancements'} />
               ))}
             </div>
             <DecideDialog

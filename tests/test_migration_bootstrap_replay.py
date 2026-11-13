@@ -29,7 +29,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0033 (the chat channel's memory) follows 0032 (queues and budgets), 0031 (the
+    # 0034 (items with their own text, incidents, cut-over) follows 0033 (the chat
+    # channel's memory), 0032 (queues and budgets), 0031 (the
     # supervisor), 0030 (what a step was
     # given), 0029 (runs in sandboxes),
     # 0028 (subscription accounts), 0027 (the backlog),
@@ -37,7 +38,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0033", "0032")
+    assert (head, parent) == ("0034", "0033")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -91,9 +92,36 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0034: items with their own text, incidents and a project's cut-over. An item's
+    # description is what it asks for, and an open incident is trouble not yet looked at,
+    # so a downgrade must not drop either.
+    assert "supervisor_incidents" in set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE backlog_items SET description = 'Keep me' "
+                "WHERE id = (SELECT id FROM backlog_items LIMIT 1)"
+            )
+        )
+        described = connection.scalar(
+            text("SELECT COUNT(*) FROM backlog_items WHERE description IS NOT NULL")
+        )
+    if described:
+        with pytest.raises(RuntimeError, match="refuses to drop"):
+            command.downgrade(config, parent)
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE backlog_items SET description = NULL"))
+    command.downgrade(config, parent)
+    assert "supervisor_incidents" not in set(inspect(engine).get_table_names())
+    assert "description" not in {
+        column["name"] for column in inspect(engine).get_columns("backlog_items")
+    }
+    assert "cut_over_at" not in {
+        column["name"] for column in inspect(engine).get_columns("projects")
+    }
     # 0033: what the chat channel remembers. Without it the channel starts again from now.
     assert {"chat_state", "chat_deliveries"} <= set(inspect(engine).get_table_names())
-    command.downgrade(config, parent)
+    command.downgrade(config, "0032")
     assert "chat_state" not in set(inspect(engine).get_table_names())
     # 0032: queues and budgets. A queue that is under way is an order still to be worked
     # on, so a downgrade must not drop it; drafts and finished queues may go.

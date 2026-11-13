@@ -229,7 +229,7 @@ def test_the_brief_is_what_the_supervisor_reads(tmp_path: Path) -> None:
             "Do not use it when: The request asks for something new (use Enhancement)",
             "- Signing in fails when the session cookie has expired.",
             "belongs here without further judgement: bug, defect, regression, fix.",
-            "Flow: Deliver issue. Reproduce an issue",
+            "Flow: Deliver issue. Implement what an item asks for",
         ):
             assert part in issues, part
         ui_audit = brief[brief.index("## UI audit") : brief.index("## UX audit")]

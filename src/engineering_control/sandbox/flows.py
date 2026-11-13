@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 from uuid import UUID
 
+from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.github_app import ChangedFile, GitHubApp, GitHubAppError
 from engineering_control.sandbox import deliver, steps
 from engineering_control.sandbox.pods import Egress
@@ -124,16 +125,126 @@ def _last_line(command: dict[str, Any]) -> str:
     return lines[-1].strip() if lines else ""
 
 
+def account_trouble(
+    item: StepWork, commands: list[dict[str, Any]], *, retry_provider: str | None
+) -> Result | None:
+    """A step whose agent was refused by the subscription says so about the account and
+    is given to another account, a few times at most. ``retry_provider`` names the
+    providers the step may be tried on again."""
+    agent = next((c for c in commands if c.get("name") in ("agent", "setup")), None)
+    if agent is None or (agent.get("exit_code") == 0 and not agent.get("timed_out")):
+        return None
+    problem = (
+        Verdict(
+            False,
+            "sign_in_required",
+            "The stored sign-in could not be used.",
+            account_state="sign_in_required",
+            account_reason="The stored sign-in could not be read. Sign the account in again.",
+        )
+        if agent.get("name") == "setup"
+        # Only what the client itself reported: the rest of an agent's output is the
+        # repository's own text and says nothing about the account.
+        else steps.account_problem(
+            {"stdout": deliver.agent_errors(item.provider or "", commands)},
+            datetime.now(UTC),
+        )
+    )
+    if problem is None:
+        return None
+    retries = int(item.input.get("account_retries") or 0)
+    if retries >= MAX_ACCOUNT_RETRIES:
+        return Result(problem)
+    # The same step again, for whichever account is free: this one is now out.
+    again = {**item.input, "account_retries": retries + 1}
+    return Result(
+        Verdict(
+            True,
+            problem.outcome,
+            f"{problem.detail} The step is tried again with another account.",
+            account_state=problem.account_state,
+            account_reason=problem.account_reason,
+            limited_until=problem.limited_until,
+        ),
+        follow=(Follow(item.name, retry_provider, again),),
+    )
+
+
+def why_no_answer(provider: str, commands: list[dict[str, Any]]) -> str:
+    """Why an agent ended without its closing answer, in a few words."""
+    agent = next((c for c in commands if c.get("name") == "agent"), commands[0])
+    if agent.get("timed_out"):
+        return "it ran out of time"
+    return _short(deliver.agent_errors(provider, commands)) or "it ended early"
+
+
+class Checkouts:
+    """Checking a repository out for a run: a token for that one clone, revoked when the
+    step that used it has ended. A token forgotten here expires by itself within the hour."""
+
+    def __init__(self, github: GitHubApp | None) -> None:
+        self.github = github
+        self._tokens: dict[UUID, str] = {}
+
+    async def plan(self, item: StepWork, *, branch: str, toolchain: deliver.Toolchain) -> Plan:
+        if self.github is None:
+            raise GitHubAppError("The GitHub App is not configured, so nothing can be checked out")
+        data = item.run_data
+        token = await self.github.repository_token(data["repository"], {"contents": "read"})
+        self._tokens[item.step_id] = token
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+        return Plan(
+            deliver.prepare_job(
+                repository=data["repository"],
+                base_branch=data["base_branch"],
+                branch=branch,
+                authorization=f"Basic {basic}",
+                toolchain=toolchain,
+            ),
+            workspace=True,
+            deadline_seconds=3600,
+        )
+
+    async def ended(self, item: StepWork) -> None:
+        token = self._tokens.pop(item.step_id, None)
+        if token is not None and self.github is not None:
+            await self.github.revoke(token)
+
+    @staticmethod
+    def read(commands: list[dict[str, Any]]) -> tuple[str | None, Result | None]:
+        """The commit the checkout is at, or why there is none."""
+        by_name = {str(command.get("name")): command for command in commands}
+        checkout = by_name.get("checkout")
+        if checkout is None or checkout.get("exit_code") != 0:
+            return None, _failed(
+                "checkout_failed",
+                "The repository could not be checked out: " + _tail(checkout or commands[-1]),
+            )
+        for command in commands:
+            name = str(command.get("name"))
+            if name.startswith("install") and command.get("exit_code") != 0:
+                return None, _failed(
+                    "install_failed", f"Installing what the project needs failed: {_tail(command)}"
+                )
+        base_sha = _last_line(checkout)
+        if len(base_sha) != 40:
+            return None, _failed(
+                "checkout_failed", "The checkout did not say which commit it is at."
+            )
+        return base_sha, None
+
+
 class DeliverIssue:
     """Check out, implement, review, verify, bundle; then wait for the administrator and
     publish the change as a pull request, or discard it."""
 
-    def __init__(self, runs: Runs, github: GitHubApp | None) -> None:
+    def __init__(
+        self, runs: Runs, github: GitHubApp | None, backlog: BacklogItems | None = None
+    ) -> None:
         self.runs = runs
         self.github = github
-        # Tokens issued for a checkout, by step, so that each is revoked when its step
-        # has ended. A token forgotten here expires by itself within the hour.
-        self._tokens: dict[UUID, str] = {}
+        self.backlog = backlog
+        self.checkouts = Checkouts(github)
 
     # --- planning ------------------------------------------------------------------------
 
@@ -146,33 +257,22 @@ class DeliverIssue:
                     "The GitHub App is not configured, so nothing can be checked out"
                 )
             # The issue as it reads now, for the agents; then a token for this checkout.
-            issue = await self.github.issue(data["repository"], int(data["issue"]["number"]))
-            await asyncio.to_thread(
-                self.runs.merge_data,
-                item.run_id,
-                {
-                    "issue": {
-                        "number": issue.number,
-                        "title": issue.title or data["issue"]["title"],
-                        "url": issue.url or data["issue"].get("url"),
-                        "body": issue.body,
-                    }
-                },
-            )
-            token = await self.github.repository_token(data["repository"], {"contents": "read"})
-            self._tokens[item.step_id] = token
-            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
-            return Plan(
-                deliver.prepare_job(
-                    repository=data["repository"],
-                    base_branch=data["base_branch"],
-                    branch=data["branch"],
-                    authorization=f"Basic {basic}",
-                    toolchain=toolchain,
-                ),
-                workspace=True,
-                deadline_seconds=3600,
-            )
+            # An item of the platform's own carries its text already.
+            if data["issue"].get("number"):
+                issue = await self.github.issue(data["repository"], int(data["issue"]["number"]))
+                await asyncio.to_thread(
+                    self.runs.merge_data,
+                    item.run_id,
+                    {
+                        "issue": {
+                            "number": issue.number,
+                            "title": issue.title or data["issue"]["title"],
+                            "url": issue.url or data["issue"].get("url"),
+                            "body": issue.body,
+                        }
+                    },
+                )
+            return await self.checkouts.plan(item, branch=data["branch"], toolchain=toolchain)
         if item.name == "implement":
             if lease is None:
                 raise ValueError("implementing needs an account")
@@ -183,7 +283,7 @@ class DeliverIssue:
                 findings=item.input.get("findings"),
                 failures=item.input.get("failures"),
             )
-            message = f"{data['issue']['title']}\n\nResolves #{data['issue']['number']}."
+            message = deliver.commit_message(data["issue"])
             return Plan(
                 deliver.implement_job(lease.provider, lease.generation, prompt, message),
                 workspace=True,
@@ -226,9 +326,7 @@ class DeliverIssue:
         raise ValueError(f"a delivery has no step {item.name}")
 
     async def ended(self, item: StepWork) -> None:
-        token = self._tokens.pop(item.step_id, None)
-        if token is not None and self.github is not None:
-            await self.github.revoke(token)
+        await self.checkouts.ended(item)
 
     # --- reading results -----------------------------------------------------------------
 
@@ -245,21 +343,9 @@ class DeliverIssue:
 
     def _after_prepare(self, item: StepWork, commands: list[dict[str, Any]], log: str) -> Result:
         by_name = {str(command.get("name")): command for command in commands}
-        checkout = by_name.get("checkout")
-        if checkout is None or checkout.get("exit_code") != 0:
-            return _failed(
-                "checkout_failed",
-                "The repository could not be checked out: " + _tail(checkout or commands[-1]),
-            )
-        for command in commands:
-            name = str(command.get("name"))
-            if name.startswith("install") and command.get("exit_code") != 0:
-                return _failed(
-                    "install_failed", f"Installing what the project needs failed: {_tail(command)}"
-                )
-        base_sha = _last_line(checkout)
-        if len(base_sha) != 40:
-            return _failed("checkout_failed", "The checkout did not say which commit it is at.")
+        base_sha, failure = Checkouts.read(commands)
+        if failure is not None or base_sha is None:
+            return failure or _failed("checkout_failed", "The checkout gave no commit.")
         baseline = {
             name.removeprefix("baseline "): command.get("exit_code")
             for name, command in by_name.items()
@@ -273,34 +359,6 @@ class DeliverIssue:
         )
 
     def _account_trouble(self, item: StepWork, commands: list[dict[str, Any]]) -> Result | None:
-        """A step whose agent was refused by the subscription says so about the account and
-        is given to another account, a few times at most."""
-        agent = next((c for c in commands if c.get("name") in ("agent", "setup")), None)
-        if agent is None or (agent.get("exit_code") == 0 and not agent.get("timed_out")):
-            return None
-        problem = (
-            Verdict(
-                False,
-                "sign_in_required",
-                "The stored sign-in could not be used.",
-                account_state="sign_in_required",
-                account_reason="The stored sign-in could not be read. Sign the account in again.",
-            )
-            if agent.get("name") == "setup"
-            # Only what the client itself reported: the rest of an agent's output is the
-            # repository's own text and says nothing about the account.
-            else steps.account_problem(
-                {"stdout": deliver.agent_errors(item.provider or "", commands)},
-                datetime.now(UTC),
-            )
-        )
-        if problem is None:
-            return None
-        retries = int(item.input.get("account_retries") or 0)
-        if retries >= MAX_ACCOUNT_RETRIES:
-            return Result(problem)
-        # The same step again, for whichever account is free: this one is now out.
-        again = {**item.input, "account_retries": retries + 1}
         provider = ",".join(deliver.PROVIDERS) if item.name == "implement" else item.provider
         if (
             item.name == "implement"
@@ -308,17 +366,7 @@ class DeliverIssue:
             and item.input.get("round", 1) > 1
         ):
             provider = item.run_data["maker"]
-        return Result(
-            Verdict(
-                True,
-                problem.outcome,
-                f"{problem.detail} The step is tried again with another account.",
-                account_state=problem.account_state,
-                account_reason=problem.account_reason,
-                limited_until=problem.limited_until,
-            ),
-            follow=(Follow(item.name, provider, again),),
-        )
+        return account_trouble(item, commands, retry_provider=provider)
 
     def _after_implement(self, item: StepWork, commands: list[dict[str, Any]], log: str) -> Result:
         trouble = self._account_trouble(item, commands)
@@ -557,7 +605,11 @@ class DeliverIssue:
         issue = data["issue"]
         body = "\n\n".join(
             [
-                f"Resolves #{issue['number']}.",
+                f"Resolves #{issue['number']}."
+                if issue.get("number")
+                # An item of the platform's backlog has no issue to close: the pull
+                # request says itself what was asked for.
+                else "What was asked for:\n\n" + str(issue.get("body") or issue["title"])[:20_000],
                 str((data.get("change") or {}).get("summary") or ""),
                 "Made by Engineering Control: implemented by an agent on one subscription, "
                 "reviewed by an agent on another, tests run in a sandbox. Published after "
@@ -570,7 +622,7 @@ class DeliverIssue:
                 base_branch=data["base_branch"],
                 base_sha=data["base_sha"],
                 branch=data["branch"],
-                message=f"{issue['title']}\n\nResolves #{issue['number']}.",
+                message=deliver.commit_message(issue),
                 title=str(issue["title"]),
                 body=body,
                 files=files,
@@ -580,9 +632,21 @@ class DeliverIssue:
             return End(
                 "waiting", "publish_failed", wait=("publish_failed", f"Publishing failed: {error}")
             )
+        opened = {"number": pull.number, "url": pull.url}
+        item_id = await asyncio.to_thread(self.runs.item_of, item.run_id)
+        if self.backlog is not None and item_id is not None:
+            # An issue of the repository is closed by GitHub when the pull request is
+            # merged, and the next import says so. An item of the platform's own has
+            # nothing else to close it: what it asked for now exists as a pull request.
+            closes = None if issue.get("number") else "done"
+            await asyncio.to_thread(
+                lambda: self.backlog.note_facts(  # type: ignore[union-attr]
+                    item_id, {"pull_request": opened}, state=closes
+                )
+            )
         return End(
             "succeeded",
             "published",
             f"Pull request #{pull.number} is open.",
-            data={"pull_request": {"number": pull.number, "url": pull.url}},
+            data={"pull_request": opened},
         )

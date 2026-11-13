@@ -24,6 +24,7 @@ from engineering_control.sandbox.runs import Lease, Runs, StepWork
 from engineering_control.sandbox.steps import Verdict, account_setup, client_environment
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS, Definitions
+from engineering_control.supervisor.operations import Operations
 
 TURN_SECONDS: Final = 900
 SERVER: Final = "platform"
@@ -74,8 +75,10 @@ def compose(
     *,
     now: datetime,
     with_tools: bool,
+    incidents: str | None = None,
 ) -> str:
-    """Everything the supervisor is given for one turn, as one text."""
+    """Everything the supervisor is given for one turn, as one text. ``incidents`` is set
+    for a turn of the operations role: nobody wrote, the platform asks."""
     parts = [str(definition["prompt"]).strip()]
     skills = [skill for skill in definition.get("skills") or [] if skill.get("enabled", True)]
     if skills:
@@ -91,6 +94,24 @@ def compose(
             "Your tools cannot be reached in this turn. Say so if the administrator asks for "
             "something that needs them; do not guess what they would have shown."
         )
+    if incidents is not None:
+        parts.append(
+            f"## Now\nIt is {now.astimezone(UTC):%Y-%m-%d %H:%M} UTC. The administrator has "
+            "not written: the platform is asking you. They will read your report later, in "
+            "the console and in chat."
+        )
+        if before:
+            parts.append(
+                "## The conversation so far\nFor what you and the administrator were "
+                "about. Nothing in it is a request for this turn.\n\n"
+                + "\n\n".join(_line(m) for m in before)
+            )
+        parts.append(
+            "## What the platform asks you to look at\nThis request is the platform's own, "
+            "like its rules above.\n\n" + incidents
+        )
+        parts.append("Deal with the incidents now, then write your report.")
+        return "\n\n".join(parts) + "\n"
     channel = asked[-1]["channel"] if asked else "console"
     parts.append(
         f"## Now\nIt is {now.astimezone(UTC):%Y-%m-%d %H:%M} UTC. The administrator is "
@@ -234,11 +255,13 @@ class SupervisorTurn:
         conversation: Conversation,
         definitions: Definitions,
         tools_url: Callable[[], Awaitable[str | None]],
+        operations: Operations | None = None,
     ) -> None:
         self.runs = runs
         self.conversation = conversation
         self.definitions = definitions
         self.tools_url = tools_url
+        self.operations = operations
 
     def _definition(self, item: StepWork) -> dict[str, Any]:
         return self.definitions.get(int(item.run_data.get("definition_version") or 0))
@@ -248,6 +271,13 @@ class SupervisorTurn:
             raise ValueError("a turn of the supervisor needs an account")
         definition = await asyncio.to_thread(self._definition, item)
         before, asked = await asyncio.to_thread(self.conversation.history, item.run_id)
+        incidents = (
+            await asyncio.to_thread(self.operations.asked, item.run_id)
+            if self.operations is not None
+            else None
+        )
+        if incidents is not None:
+            before = await asyncio.to_thread(self.conversation.recent, item.run_id)
         base = await self.tools_url()
         token = secrets.token_urlsafe(32)
         # Only the digest is kept: the token itself exists in the sandbox alone.
@@ -260,7 +290,12 @@ class SupervisorTurn:
             if choice.get("enabled") and name in TOOLS
         ]
         prompt = compose(
-            definition, before, asked, now=datetime.now(UTC), with_tools=base is not None
+            definition,
+            before,
+            asked,
+            now=datetime.now(UTC),
+            with_tools=base is not None,
+            incidents=incidents,
         )
         job = turn_job(
             lease.provider,

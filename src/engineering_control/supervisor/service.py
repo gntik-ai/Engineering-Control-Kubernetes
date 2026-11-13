@@ -38,6 +38,7 @@ from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Runs
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS, Definitions
+from engineering_control.supervisor.operations import Operations
 from engineering_control.supervisor.tools import Toolbox
 from engineering_control.supervisor.turn import token_digest
 
@@ -50,6 +51,7 @@ SERVER_INFO: Final = {"name": "engineering-control", "title": "Engineering Contr
 def toolbox_from(sessions: sessionmaker[Session], github: GitHubApp | None) -> Toolbox:
     definitions = Definitions(sessions)
     runs = Runs(sessions)
+    conversation = Conversation(sessions, definitions)
     return Toolbox(
         sessions,
         projects=ProjectRecords(sessions),
@@ -57,9 +59,10 @@ def toolbox_from(sessions: sessionmaker[Session], github: GitHubApp | None) -> T
         backlog=BacklogItems(sessions),
         accounts=Accounts(sessions),
         runs=runs,
-        conversation=Conversation(sessions, definitions),
+        conversation=conversation,
         queues=Queues(sessions, runs, Budgets(sessions)),
         github=github,
+        operations=Operations(sessions, conversation),
     )
 
 

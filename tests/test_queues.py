@@ -285,7 +285,7 @@ def test_several_at_once_failures_in_a_row_and_items_that_cannot_start(world: An
     states = dict(world.states(queue["id"]))
     assert states["Expired cookie"] == "running" and states["Export to CSV"] == "skipped"
     skipped = world.queues.get(queue_id)["entries"][1]
-    assert "no flow that delivers issues" in skipped["detail"]
+    assert "no flow that can run here" in skipped["detail"]
     assert world.queues.advance() == 1, "the place of the skipped item is taken by the next"
     assert dict(world.states(queue["id"]))["Slow search"] == "running"
     world.end(0, "failed", "The tests failed.")
