@@ -2,6 +2,7 @@ import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -29,18 +30,9 @@ import {
   TableHeader,
   TableRow,
   type StatusDefinition,
-} from "@gntik-ai/ui";
-import {
-  Bot,
-  Check,
-  CircleSlash,
-  ListChecks,
-  Plus,
-  RefreshCw,
-  Route,
-  RotateCcw,
-} from "@gntik-ai/icons";
-import { useEffect, useState, type FormEvent } from "react";
+} from '@gntik-ai/ui';
+import { Bot, Check, CircleSlash, ListChecks, ListOrdered, Plus, RefreshCw, Route, RotateCcw } from '@gntik-ai/icons';
+import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
   postJson,
@@ -52,39 +44,27 @@ import {
   type Section,
   type SyncResult,
   type WorkItem,
-} from "../api";
-import {
-  FilterSelect,
-  IssueRef,
-  LoadError,
-  ProjectFilter,
-  RefreshButton,
-  Rows,
-  TableFrame,
-  When,
-  mono,
-} from "../parts";
-import { BASE, navigate, setQuery, useLocation } from "../router";
-import { RunState } from "./Runs";
+} from '../api';
+import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
+import { BASE, navigate, setQuery, useLocation } from '../router';
+import { QueueDialog } from './QueueDialog';
+import { RunState } from './Runs';
 
 const PAGE_SIZE = 50;
-const UNROUTED = "none";
-const NO_SECTION = "__none__";
+const UNROUTED = 'none';
+const NO_SECTION = '__none__';
 
 const STATES: Record<string, StatusDefinition> = {
-  proposed: { label: "Proposed", tone: "neutral" },
-  accepted: { label: "Accepted", tone: "info" },
-  skipped: { label: "Skipped", tone: "neutral" },
-  done: { label: "Done", tone: "success" },
+  proposed: { label: 'Proposed', tone: 'neutral' },
+  accepted: { label: 'Accepted', tone: 'info' },
+  skipped: { label: 'Skipped', tone: 'neutral' },
+  done: { label: 'Done', tone: 'success' },
 };
-const STATE_ITEMS = Object.entries(STATES).map(([value, { label }]) => ({
-  value,
-  label,
-}));
+const STATE_ITEMS = Object.entries(STATES).map(([value, { label }]) => ({ value, label }));
 
 function message(error: unknown): string | null {
-  if (error instanceof DOMException && error.name === "AbortError") return null;
-  return error instanceof Error ? error.message : "The request failed.";
+  if (error instanceof DOMException && error.name === 'AbortError') return null;
+  return error instanceof Error ? error.message : 'The request failed.';
 }
 
 function AddItemDialog({
@@ -100,13 +80,13 @@ function AddItemDialog({
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
 }) {
-  const [title, setTitle] = useState("");
+  const [title, setTitle] = useState('');
   const [section, setSection] = useState(NO_SECTION);
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
     if (!open) return;
-    setTitle("");
+    setTitle('');
     setSection(NO_SECTION);
     setProblem(null);
     // Only when it opens: the form starts empty.
@@ -117,10 +97,7 @@ function AddItemDialog({
     setPending(true);
     setProblem(null);
     try {
-      await postJson(`projects/${project}/items`, {
-        title,
-        section: section === NO_SECTION ? null : section,
-      });
+      await postJson(`projects/${project}/items`, { title, section: section === NO_SECTION ? null : section });
       onSaved();
       onOpenChange(false);
     } catch (error) {
@@ -136,21 +113,14 @@ function AddItemDialog({
           <DialogHeader>
             <DialogTitle>Add an item</DialogTitle>
             <DialogDescription>
-              Something you want done on this project that is not an issue on
-              GitHub. It is added as accepted.
+              Something you want done on this project that is not an issue on GitHub. It is added as accepted.
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
             {problem ? <Alert tone="destructive" title={problem} /> : null}
             <Field>
               <FieldLabel>What should be done</FieldLabel>
-              <Input
-                name="title"
-                value={title}
-                onValueChange={setTitle}
-                maxLength={300}
-                autoFocus
-              />
+              <Input name="title" value={title} onValueChange={setTitle} maxLength={300} autoFocus />
             </Field>
             <Field>
               <FieldLabel>Section</FieldLabel>
@@ -158,27 +128,17 @@ function AddItemDialog({
                 aria-label="Section"
                 className="w-full"
                 items={[
-                  { value: NO_SECTION, label: "Not routed yet" },
-                  ...sections.map((item) => ({
-                    value: item.key,
-                    label: item.name,
-                  })),
+                  { value: NO_SECTION, label: 'Not routed yet' },
+                  ...sections.map((item) => ({ value: item.key, label: item.name })),
                 ]}
                 value={section}
                 onValueChange={(next) => setSection(next ?? NO_SECTION)}
               />
-              <FieldDescription>
-                The section's flow is what will run for it. You can route it
-                later.
-              </FieldDescription>
+              <FieldDescription>The section's flow is what will run for it. You can route it later.</FieldDescription>
             </Field>
           </DialogBody>
           <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-            >
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button type="submit" loading={pending} disabled={!title.trim()}>
@@ -191,9 +151,7 @@ function AddItemDialog({
   );
 }
 
-type BulkChange =
-  | { kind: "route" }
-  | { kind: "state"; state: "accepted" | "skipped" };
+type BulkChange = { kind: 'route' } | { kind: 'state'; state: 'accepted' | 'skipped' };
 
 /**
  * One change to every item the page's filters match. It says how many, and asks for the
@@ -217,48 +175,45 @@ function BulkDialog({
   onDone: (notice: string) => void;
 }) {
   // Empty until the administrator chooses: "no section" is a choice too, never a default.
-  const [target, setTarget] = useState("");
-  const [password, setPassword] = useState("");
+  const [target, setTarget] = useState('');
+  const [password, setPassword] = useState('');
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   useEffect(() => {
     if (!change) return;
-    setTarget("");
-    setPassword("");
+    setTarget('');
+    setPassword('');
     setProblem(null);
     // Only when it opens: nothing is carried over from the last change.
   }, [change]);
-  const items = `${total.toLocaleString("en")} ${total === 1 ? "item" : "items"}`;
+  const items = `${total.toLocaleString('en')} ${total === 1 ? 'item' : 'items'}`;
   const what =
-    change?.kind === "state"
-      ? change.state === "accepted"
+    change?.kind === 'state'
+      ? change.state === 'accepted'
         ? `Accept ${items}`
         : `Skip ${items}`
       : `Route ${items}`;
-  const ready = password !== "" && (change?.kind !== "route" || target !== "");
+  const ready = password !== '' && (change?.kind !== 'route' || target !== '');
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!change || !ready || pending) return;
     setPending(true);
     setProblem(null);
     try {
-      const result = await postJson<{ changed: number; unchanged: number }>(
-        `projects/${project}/items/bulk`,
-        {
-          current_password: password,
-          section: filters.section,
-          state: filters.state,
-          search: filters.search || null,
-          expected: total,
-          ...(change.kind === "state"
-            ? { state_to: change.state }
-            : target === NO_SECTION
-              ? { clear_route: true }
-              : { route_to: target }),
-        },
-      );
+      const result = await postJson<{ changed: number; unchanged: number }>(`projects/${project}/items/bulk`, {
+        current_password: password,
+        section: filters.section,
+        state: filters.state,
+        search: filters.search || null,
+        expected: total,
+        ...(change.kind === 'state'
+          ? { state_to: change.state }
+          : target === NO_SECTION
+            ? { clear_route: true }
+            : { route_to: target }),
+      });
       onDone(
-        `${result.changed.toLocaleString("en")} changed${result.unchanged ? `, ${result.unchanged.toLocaleString("en")} left as they were` : ""}.`,
+        `${result.changed.toLocaleString('en')} changed${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} left as they were` : ''}.`,
       );
       onOpenChange(false);
     } catch (error) {
@@ -274,13 +229,13 @@ function BulkDialog({
           <DialogHeader>
             <DialogTitle>{what}</DialogTitle>
             <DialogDescription>
-              This changes every item of {project} that the filters on the page
-              match now: {items}. Items outside the filters are not touched.
+              This changes every item of {project} that the filters on the page match now: {items}. Items outside
+              the filters are not touched.
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
             {problem ? <Alert tone="destructive" title={problem} /> : null}
-            {change?.kind === "route" ? (
+            {change?.kind === 'route' ? (
               <Field>
                 <FieldLabel>Section</FieldLabel>
                 <SimpleSelect
@@ -288,18 +243,14 @@ function BulkDialog({
                   className="w-full"
                   placeholder="Choose where they go"
                   items={[
-                    ...sections.map((item) => ({
-                      value: item.key,
-                      label: item.name,
-                    })),
-                    { value: NO_SECTION, label: "No section" },
+                    ...sections.map((item) => ({ value: item.key, label: item.name })),
+                    { value: NO_SECTION, label: 'No section' },
                   ]}
                   value={target || null}
-                  onValueChange={(next) => setTarget(next ?? "")}
+                  onValueChange={(next) => setTarget(next ?? '')}
                 />
                 <FieldDescription>
-                  They become your choice: a later reading of GitHub will not
-                  move them by their labels.
+                  They become your choice: a later reading of GitHub will not move them by their labels.
                 </FieldDescription>
               </Field>
             ) : null}
@@ -315,11 +266,7 @@ function BulkDialog({
             </Field>
           </DialogBody>
           <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-            >
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button type="submit" loading={pending} disabled={!ready}>
@@ -333,33 +280,20 @@ function BulkDialog({
 }
 
 /** Reads a project's open issues from GitHub now, and says what that changed. */
-function SyncButton({
-  project,
-  onSynced,
-}: {
-  project: string;
-  onSynced: (result: string | null, problem: string | null) => void;
-}) {
-  const status = useResource<BacklogStatus>(
-    apiUrl(`projects/${project}/backlog`),
-  );
+function SyncButton({ project, onSynced }: { project: string; onSynced: (result: string | null, problem: string | null) => void }) {
+  const status = useResource<BacklogStatus>(apiUrl(`projects/${project}/backlog`));
   const [pending, setPending] = useState(false);
   const sync = async () => {
     setPending(true);
     try {
-      const result = await postJson<SyncResult>(
-        `projects/${project}/backlog/sync`,
-      );
+      const result = await postJson<SyncResult>(`projects/${project}/backlog/sync`);
       const parts = [
-        `${result.open_issues} open ${result.open_issues === 1 ? "issue" : "issues"} on GitHub`,
+        `${result.open_issues} open ${result.open_issues === 1 ? 'issue' : 'issues'} on GitHub`,
         `${result.imported} new`,
         `${result.closed} closed`,
         `${result.routed} routed by a label`,
       ];
-      onSynced(
-        `${parts.join(", ")}.${result.complete ? "" : " GitHub has more open issues than were read."}`,
-        null,
-      );
+      onSynced(`${parts.join(', ')}.${result.complete ? '' : ' GitHub has more open issues than were read.'}`, null);
       status.reload();
     } catch (error) {
       onSynced(null, message(error));
@@ -394,12 +328,17 @@ function ItemRow({
   item,
   sections,
   showProject,
+  selected,
+  onSelect,
   onChanged,
   onProblem,
 }: {
   item: WorkItem;
   sections: Section[] | null;
   showProject: boolean;
+  /** Undefined where items cannot be selected: no project is chosen. */
+  selected?: boolean;
+  onSelect?: (selected: boolean) => void;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
@@ -416,15 +355,13 @@ function ItemRow({
       setPending(false);
     }
   };
-  const closed = item.issue_state === "closed";
-  const runActive = item.run
-    ? ["queued", "running", "waiting"].includes(item.run.state)
-    : false;
+  const closed = item.issue_state === 'closed';
+  const runActive = item.run ? ['queued', 'running', 'waiting'].includes(item.run.state) : false;
   const deliverable =
     item.issue_number !== null &&
     !closed &&
-    item.section?.flow === "deliver-issue" &&
-    (item.state === "proposed" || item.state === "accepted") &&
+    item.section?.flow === 'deliver-issue' &&
+    (item.state === 'proposed' || item.state === 'accepted') &&
     !runActive;
   const deliver = async () => {
     setPending(true);
@@ -432,58 +369,47 @@ function ItemRow({
       const run = await postJson<Run>(`items/${item.id}/deliver`);
       navigate(`${BASE}/run?id=${run.id}`);
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      onProblem(error instanceof Error ? error.message : "The request failed.");
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      onProblem(error instanceof Error ? error.message : 'The request failed.');
       setPending(false);
     }
   };
   const actions = [
-    deliverable
-      ? { label: "Deliver", icon: Bot, onSelect: () => void deliver() }
+    deliverable ? { label: 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
+    item.state !== 'accepted' && !closed
+      ? { label: 'Accept', icon: Check, onSelect: () => void change('state', { state: 'accepted' }) }
       : null,
-    item.state !== "accepted" && !closed
-      ? {
-          label: "Accept",
-          icon: Check,
-          onSelect: () => void change("state", { state: "accepted" }),
-        }
+    item.state !== 'skipped'
+      ? { label: 'Skip', icon: CircleSlash, onSelect: () => void change('state', { state: 'skipped' }) }
       : null,
-    item.state !== "skipped"
-      ? {
-          label: "Skip",
-          icon: CircleSlash,
-          onSelect: () => void change("state", { state: "skipped" }),
-        }
+    item.state !== 'proposed' && !closed
+      ? { label: 'Back to proposed', icon: RotateCcw, onSelect: () => void change('state', { state: 'proposed' }) }
       : null,
-    item.state !== "proposed" && !closed
-      ? {
-          label: "Back to proposed",
-          icon: RotateCcw,
-          onSelect: () => void change("state", { state: "proposed" }),
-        }
-      : null,
-    item.state !== "done"
-      ? {
-          label: "Mark done",
-          icon: Check,
-          onSelect: () => void change("state", { state: "done" }),
-        }
-      : null,
+    item.state !== 'done' ? { label: 'Mark done', icon: Check, onSelect: () => void change('state', { state: 'done' }) } : null,
   ].filter((action) => action !== null);
   return (
     <TableRow>
+      {onSelect ? (
+        <TableCell className="w-8">
+          <Checkbox
+            aria-label={`Select ${item.title}`}
+            checked={selected ?? false}
+            // Only open items that are in no queue yet can be queued.
+            disabled={(item.state !== 'proposed' && item.state !== 'accepted') || Boolean(item.queue)}
+            onCheckedChange={(checked) => onSelect(checked === true)}
+          />
+        </TableCell>
+      ) : null}
       <TableCell className="max-w-xl">
         <div className="flex items-baseline gap-2">
-          {item.issue_number ? (
-            <IssueRef number={item.issue_number} url={item.issue_url} />
-          ) : null}
+          {item.issue_number ? <IssueRef number={item.issue_number} url={item.issue_url} /> : null}
           <span className="truncate font-medium" title={item.title}>
             {item.title}
           </span>
         </div>
-        {item.labels.length || item.proposed_by === "supervisor" ? (
+        {item.labels.length || item.proposed_by === 'supervisor' ? (
           <div className="mt-1 flex flex-wrap gap-1">
-            {item.proposed_by === "supervisor" ? (
+            {item.proposed_by === 'supervisor' ? (
               <Badge tone="info" size="sm">
                 Proposed by the supervisor
               </Badge>
@@ -496,9 +422,7 @@ function ItemRow({
           </div>
         ) : null}
       </TableCell>
-      {showProject ? (
-        <TableCell className={mono}>{item.project}</TableCell>
-      ) : null}
+      {showProject ? <TableCell className={mono}>{item.project}</TableCell> : null}
       <TableCell>
         {sections ? (
           <SimpleSelect
@@ -507,50 +431,43 @@ function ItemRow({
             className="w-44"
             disabled={pending}
             items={[
-              { value: NO_SECTION, label: "Not routed" },
-              ...sections.map((section) => ({
-                value: section.key,
-                label: section.name,
-              })),
+              { value: NO_SECTION, label: 'Not routed' },
+              ...sections.map((section) => ({ value: section.key, label: section.name })),
             ]}
             value={item.section?.key ?? NO_SECTION}
             onValueChange={(next) => {
               const section = !next || next === NO_SECTION ? null : next;
-              if (section !== (item.section?.key ?? null))
-                void change("route", { section });
+              if (section !== (item.section?.key ?? null)) void change('route', { section });
             }}
           />
         ) : (
-          <span className="text-[13px]">
-            {item.section?.name ?? (
-              <span className="text-muted-foreground">Not routed</span>
-            )}
-          </span>
+          <span className="text-[13px]">{item.section?.name ?? <span className="text-muted-foreground">Not routed</span>}</span>
         )}
         <div className="mt-1 text-[12px] text-muted-foreground">
-          {item.routed_by === "administrator"
-            ? "Chosen by you"
-            : item.routed_by === "supervisor"
-              ? `Supervisor: ${item.routing_reason ?? "no reason given"}`
+          {item.routed_by === 'administrator'
+            ? 'Chosen by you'
+            : item.routed_by === 'supervisor'
+              ? `Supervisor: ${item.routing_reason ?? 'no reason given'}`
               : (item.routing_reason ??
                 (item.section
-                  ? ""
-                  : item.proposed_by === "supervisor"
-                    ? "The supervisor found no fitting section"
-                    : "No label of a section"))}
+                  ? ''
+                  : item.proposed_by === 'supervisor'
+                    ? 'The supervisor found no fitting section'
+                    : 'No label of a section'))}
         </div>
       </TableCell>
       <TableCell>
         <StatusTag status={item.state} statuses={STATES} size="sm" />
-        {closed ? (
-          <div className="mt-1 text-[12px] text-muted-foreground">
-            Closed on GitHub
-          </div>
-        ) : null}
+        {closed ? <div className="mt-1 text-[12px] text-muted-foreground">Closed on GitHub</div> : null}
         {item.run ? (
           <div className="mt-1 flex items-center gap-1.5 text-[12px]">
             <Link href={`${BASE}/run?id=${item.run.id}`}>Run</Link>
             <RunState run={item.run} />
+          </div>
+        ) : null}
+        {item.queue ? (
+          <div className="mt-1 text-[12px]">
+            In the queue <Link href={`${BASE}/queue?id=${item.queue.id}`}>{item.queue.name}</Link>
           </div>
         ) : null}
       </TableCell>
@@ -558,12 +475,7 @@ function ItemRow({
         <When value={item.updated_at} />
       </TableCell>
       <TableCell className="text-right">
-        <MoreMenu
-          label={`Actions for ${item.title}`}
-          size="sm"
-          align="end"
-          items={actions}
-        />
+        <MoreMenu label={`Actions for ${item.title}`} size="sm" align="end" items={actions} />
       </TableCell>
     </TableRow>
   );
@@ -571,14 +483,18 @@ function ItemRow({
 
 export function BacklogPage() {
   const { query } = useLocation();
-  const project = query.get("project");
-  const section = query.get("section");
-  const state = query.get("state");
-  const search = query.get("search") ?? "";
-  const page = Math.max(1, Number(query.get("page")) || 1);
+  const project = query.get('project');
+  const section = query.get('section');
+  const state = query.get('state');
+  const search = query.get('search') ?? '';
+  const page = Math.max(1, Number(query.get('page')) || 1);
   const [draft, setDraft] = useState(search);
   const [adding, setAdding] = useState(false);
   const [bulk, setBulk] = useState<BulkChange | null>(null);
+  // The items chosen for a queue. They are of one project, so a change of project clears them.
+  const [selection, setSelection] = useState<string[]>([]);
+  const [queueing, setQueueing] = useState(false);
+  useEffect(() => setSelection([]), [project]);
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   // Typing filters after a short pause, Enter at once; any filter change returns to the
@@ -588,24 +504,12 @@ export function BacklogPage() {
   };
 
   const backlog = useResource<Paged<WorkItem>>(
-    apiUrl("items", {
-      project,
-      section,
-      state,
-      search,
-      page,
-      page_size: PAGE_SIZE,
-    }),
+    apiUrl('items', { project, section, state, search, page, page_size: PAGE_SIZE }),
     30_000,
   );
   // The sections of the chosen project: what an item can be routed to.
-  const detail = useResource<ProjectDetail>(
-    project ? apiUrl(`projects/${project}`) : apiUrl("flows"),
-  );
-  const sections =
-    project && detail.data && "sections" in detail.data
-      ? detail.data.sections
-      : null;
+  const detail = useResource<ProjectDetail>(project ? apiUrl(`projects/${project}`) : apiUrl('flows'));
+  const sections = project && detail.data && 'sections' in detail.data ? detail.data.sections : null;
   const total = backlog.data?.total;
 
   return (
@@ -613,8 +517,8 @@ export function BacklogPage() {
       title="Backlog"
       description={
         total === undefined
-          ? "The work wanted on each project, and the section each item is routed to."
-          : `${total.toLocaleString("en")} ${total === 1 ? "item" : "items"}${project ? ` in ${project}` : " across all projects"}.`
+          ? 'The work wanted on each project, and the section each item is routed to.'
+          : `${total.toLocaleString('en')} ${total === 1 ? 'item' : 'items'}${project ? ` in ${project}` : ' across all projects'}.`
       }
       actions={
         <div className="flex flex-wrap items-center justify-end gap-2">
@@ -632,34 +536,25 @@ export function BacklogPage() {
           ) : null}
           {sections && total ? (
             <MoreMenu
-              label={`Change all ${total.toLocaleString("en")} listed`}
+              label={`Change all ${total.toLocaleString('en')} listed`}
               size="sm"
               align="end"
               items={[
+                { label: `Route all ${total.toLocaleString('en')}…`, icon: Route, onSelect: () => setBulk({ kind: 'route' }) },
                 {
-                  label: `Route all ${total.toLocaleString("en")}…`,
-                  icon: Route,
-                  onSelect: () => setBulk({ kind: "route" }),
-                },
-                {
-                  label: `Accept all ${total.toLocaleString("en")}…`,
+                  label: `Accept all ${total.toLocaleString('en')}…`,
                   icon: ListChecks,
-                  onSelect: () => setBulk({ kind: "state", state: "accepted" }),
+                  onSelect: () => setBulk({ kind: 'state', state: 'accepted' }),
                 },
                 {
-                  label: `Skip all ${total.toLocaleString("en")}…`,
+                  label: `Skip all ${total.toLocaleString('en')}…`,
                   icon: CircleSlash,
-                  onSelect: () => setBulk({ kind: "state", state: "skipped" }),
+                  onSelect: () => setBulk({ kind: 'state', state: 'skipped' }),
                 },
               ]}
             />
           ) : null}
-          <Button
-            icon={Plus}
-            size="sm"
-            disabled={!sections}
-            onClick={() => setAdding(true)}
-          >
+          <Button icon={Plus} size="sm" disabled={!sections} onClick={() => setAdding(true)}>
             Add item
           </Button>
         </div>
@@ -667,23 +562,12 @@ export function BacklogPage() {
     >
       <div className="grid gap-4">
         <div className="flex flex-wrap items-center gap-2">
-          <ProjectFilter
-            value={project}
-            onChange={(value) =>
-              setQuery({ project: value, section: null, page: null })
-            }
-          />
+          <ProjectFilter value={project} onChange={(value) => setQuery({ project: value, section: null, page: null })} />
           {sections ? (
             <FilterSelect
               label="Section"
               allLabel="All sections"
-              items={[
-                { value: UNROUTED, label: "Not routed" },
-                ...sections.map((item) => ({
-                  value: item.key,
-                  label: item.name,
-                })),
-              ]}
+              items={[{ value: UNROUTED, label: 'Not routed' }, ...sections.map((item) => ({ value: item.key, label: item.name }))]}
               value={section}
               onChange={(value) => setQuery({ section: value, page: null })}
             />
@@ -704,38 +588,40 @@ export function BacklogPage() {
             onValueChange={setDraft}
             onSearch={find}
             debounceMs={350}
-            pending={
-              backlog.loading && draft.trim() !== "" && draft.trim() === search
-            }
+            pending={backlog.loading && draft.trim() !== '' && draft.trim() === search}
           />
         </div>
         {project ? null : (
           <p className="text-[13px] text-muted-foreground">
-            Choose a project to read its issues from GitHub, add an item or
-            route items to a section.
+            Choose a project to read its issues from GitHub, add an item or route items to a section.
           </p>
         )}
-        {notice ? (
-          <Alert
-            tone="success"
-            title="Done"
-            description={notice}
-            onDismiss={() => setNotice(null)}
-          />
+        {project && selection.length ? (
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card px-3 py-2">
+            <span className="text-[13px]">
+              {selection.length === 1 ? '1 item selected' : `${selection.length} items selected`}
+            </span>
+            <Button size="sm" icon={ListOrdered} onClick={() => setQueueing(true)}>
+              Add to a queue…
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setSelection([])}>
+              Clear
+            </Button>
+          </div>
         ) : null}
-        {problem ? (
-          <Alert
-            tone="destructive"
-            title={problem}
-            onDismiss={() => setProblem(null)}
-          />
-        ) : null}
+        {notice ? <Alert tone="success" title="Done" description={notice} onDismiss={() => setNotice(null)} /> : null}
+        {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
         <LoadError resource={backlog} />
         <TableFrame>
           <Table density="compact" containerLabel="Backlog">
             <TableCaption srOnly>Backlog items</TableCaption>
             <TableHeader>
               <TableRow>
+                {project ? (
+                  <TableHead className="w-8">
+                    <span className="sr-only">Select</span>
+                  </TableHead>
+                ) : null}
                 <TableHead>Item</TableHead>
                 {project ? null : <TableHead>Project</TableHead>}
                 <TableHead>Section</TableHead>
@@ -747,11 +633,7 @@ export function BacklogPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              <Rows
-                resource={backlog}
-                columns={project ? 5 : 6}
-                empty="No items match these filters"
-              >
+              <Rows resource={backlog} columns={6} empty="No items match these filters">
                 {(items) =>
                   items.map((item) => (
                     <ItemRow
@@ -759,6 +641,15 @@ export function BacklogPage() {
                       item={item}
                       sections={sections}
                       showProject={!project}
+                      selected={project ? selection.includes(item.id) : undefined}
+                      onSelect={
+                        project
+                          ? (checked) =>
+                              setSelection((previous) =>
+                                checked ? [...previous, item.id] : previous.filter((id) => id !== item.id),
+                              )
+                          : undefined
+                      }
                       onChanged={backlog.reload}
                       onProblem={setProblem}
                     />
@@ -772,21 +663,14 @@ export function BacklogPage() {
           <Pagination
             page={backlog.data.page}
             pageCount={backlog.data.pages}
-            onPageChange={(next) =>
-              setQuery({ page: next > 1 ? String(next) : null })
-            }
+            onPageChange={(next) => setQuery({ page: next > 1 ? String(next) : null })}
           />
         ) : null}
       </div>
+      {project ? <QueueDialog project={project} items={selection} open={queueing} onOpenChange={setQueueing} /> : null}
       {project && sections ? (
         <>
-          <AddItemDialog
-            project={project}
-            sections={sections}
-            open={adding}
-            onOpenChange={setAdding}
-            onSaved={backlog.reload}
-          />
+          <AddItemDialog project={project} sections={sections} open={adding} onOpenChange={setAdding} onSaved={backlog.reload} />
           <BulkDialog
             project={project}
             sections={sections}

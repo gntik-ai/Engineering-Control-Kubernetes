@@ -229,10 +229,34 @@ What waits is in the inbox and in the panel, with Accept and Reject; what was de
 said in the conversation, so the supervisor reads it on its next turn. Every call is
 recorded with its arguments, its reason and what became of it (Supervisor → Record).
 
-The supervisor reads projects, sections with their routing brief, the backlog, runs,
-accounts and the inbox; proposes backlog items; routes items to sections; and starts work
-on an item when asked. It never publishes, approves or touches a sign-in: there is no tool
+The supervisor reads projects, sections with their routing brief, the backlog, queues,
+runs, accounts and the inbox; proposes backlog items and queues; routes items to sections;
+and starts work on an item or a queue when asked. It never publishes, approves or touches a sign-in: there is no tool
 for those.
+
+## Queues and budgets
+
+A queue is items of one project in the order they are to be worked on (Queues; made from
+the backlog by selecting items, or proposed by the supervisor with its reasons). It is a
+draft until the administrator starts it. The launcher then moves it forward on every pass:
+it follows the runs of the items under way and starts the next, as many at the same time as
+the queue allows (one to four). An item whose change waits for a decision counts as done
+for the queue: approvals collect in the inbox while the queue goes on. An item that cannot
+be started (no section, a section without a flow) is skipped with the reason. After two
+items in a row failed, the queue pauses itself and says so in the inbox. A queue can be
+paused, reordered (drag and drop, or the arrows) and extended while it runs.
+
+Budgets (on the same page) say how much the platform starts by itself: for the whole
+platform and for each project, how many runs of work at the same time and how many within
+a day; for each account, how many steps within a day. They hold back a queue's next item
+and work the supervisor starts. A run the administrator starts from the backlog is their
+own decision and is not held back, except that an account past its budget is given to no
+step at all. Budgets per component and per risk class follow when items carry those.
+
+The supervisor reads queues, proposes one (always as a draft), reorders a draft it proposed,
+and pauses a running queue with its reason. Starting or resuming a queue, and reordering a
+queue the administrator made or one under way, wait for the administrator's answer unless
+the definition says otherwise.
 
 ## Delivering an issue
 

@@ -62,6 +62,7 @@ from engineering_control.dashboard.schemas import (
     ActionReauthenticationInput,
     ActivityEventInput,
     BacklogSyncInput,
+    BudgetInput,
     ItemBulkInput,
     ItemCreateInput,
     ItemRouteInput,
@@ -70,6 +71,9 @@ from engineering_control.dashboard.schemas import (
     ProjectArchiveInput,
     ProjectCreateInput,
     ProjectRenameInput,
+    QueueCreateInput,
+    QueueItemsInput,
+    QueueUpdateInput,
     R3CandidateCreateInput,
     RunDecisionInput,
     SectionCreateInput,
@@ -120,6 +124,8 @@ CONSOLE_VIEWS = frozenset(
         "runs",
         "run",
         "supervisor",
+        "queues",
+        "queue",
         "executions",
         "execution",
     }
@@ -1069,6 +1075,100 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse(await service(request).inbox())
+
+    @app.get("/api/dashboard/queues")
+    async def queues_api(request: Request, project: str | None = None) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).queues(project=project))
+
+    @app.get("/api/dashboard/queues/{queue_id}")
+    async def queue_api(queue_id: UUID, request: Request) -> Response:
+        """One queue with its items in order."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).queue(queue_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/queues")
+    async def create_queue_api(name: str, request: Request) -> Response:
+        """Make a queue from items of the project. It is a draft until it is started."""
+        return await project_change(
+            request,
+            QueueCreateInput,
+            lambda body: service(request).create_queue(
+                name, name=body.name, items=body.items, at_once=body.at_once
+            ),
+            event="dashboard.queue_created",
+            status_code=201,
+            entity="queue",
+        )
+
+    def queue_change(change: str, model: type[Any], event: str) -> Any:
+        async def handler(queue_id: UUID, request: Request) -> Response:
+            return await project_change(
+                request,
+                model,
+                lambda body: service(request).change_queue(
+                    queue_id,
+                    change,
+                    **{
+                        key: getattr(body, key)
+                        for key in ("items", "name", "at_once")
+                        if hasattr(body, key)
+                    },
+                ),
+                event=event,
+                entity="queue",
+            )
+
+        return handler
+
+    for change, model, event in (
+        ("add", QueueItemsInput, "dashboard.queue_extended"),
+        ("order", QueueItemsInput, "dashboard.queue_reordered"),
+        ("update", QueueUpdateInput, "dashboard.queue_changed"),
+        ("start", PlainChangeInput, "dashboard.queue_started"),
+        ("pause", PlainChangeInput, "dashboard.queue_paused"),
+        ("discard", PlainChangeInput, "dashboard.queue_discarded"),
+    ):
+        app.post(f"/api/dashboard/queues/{{queue_id}}/{change}")(queue_change(change, model, event))
+
+    @app.post("/api/dashboard/queues/{queue_id}/items/{item_id}/remove")
+    async def remove_queue_item_api(queue_id: UUID, item_id: UUID, request: Request) -> Response:
+        """Take an item that still waits out of a queue. It stays in the backlog."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).change_queue(queue_id, "remove", item=item_id),
+            event="dashboard.queue_shortened",
+            entity="queue",
+        )
+
+    @app.get("/api/dashboard/budgets")
+    async def budgets_api(request: Request) -> Response:
+        """How much may run for the platform, each project and each account, and how much
+        of it is used."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).budgets())
+
+    @app.post("/api/dashboard/budgets")
+    async def set_budget_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            BudgetInput,
+            lambda body: service(request).set_budget(
+                body.scope, body.scope_id, at_once=body.at_once, per_day=body.per_day
+            ),
+            event="dashboard.budget_set",
+            entity="budget",
+        )
 
     @app.get("/api/dashboard/supervisor")
     async def supervisor_api(request: Request, after: str | None = None) -> Response:

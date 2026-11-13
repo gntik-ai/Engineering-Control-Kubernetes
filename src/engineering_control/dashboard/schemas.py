@@ -145,6 +145,36 @@ class ActionExecuteInput(DashboardModel):
     confirmation_phrase: str | None = Field(default=None, max_length=120)
 
 
+class QueueCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    items: list[UUID] = Field(min_length=1, max_length=200)
+    at_once: int = Field(default=1, ge=1, le=4)
+
+
+class QueueItemsInput(DashboardModel):
+    """Items to add to a queue, or the items that still wait in their new order."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    items: list[UUID] = Field(min_length=1, max_length=200)
+
+
+class QueueUpdateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    at_once: int | None = Field(default=None, ge=1, le=4)
+
+
+class BudgetInput(DashboardModel):
+    """The limits of one scope. A limit left out does not limit."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    scope: str = Field(pattern=r"^(platform|project|account)$")
+    scope_id: UUID | None = None
+    at_once: int | None = Field(default=None, ge=1, le=100)
+    per_day: int | None = Field(default=None, ge=1, le=10000)
+
+
 class SupervisorMessageInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     text: str = Field(min_length=1, max_length=8000)

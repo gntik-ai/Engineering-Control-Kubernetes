@@ -34,6 +34,7 @@ from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import SandboxRun, SandboxStep
 from engineering_control.github_app import GitHubApp
 from engineering_control.logging import configure_logging
+from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Runs
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS, Definitions
@@ -48,14 +49,16 @@ SERVER_INFO: Final = {"name": "engineering-control", "title": "Engineering Contr
 
 def toolbox_from(sessions: sessionmaker[Session], github: GitHubApp | None) -> Toolbox:
     definitions = Definitions(sessions)
+    runs = Runs(sessions)
     return Toolbox(
         sessions,
         projects=ProjectRecords(sessions),
         sections=SectionRecords(sessions),
         backlog=BacklogItems(sessions),
         accounts=Accounts(sessions),
-        runs=Runs(sessions),
+        runs=runs,
         conversation=Conversation(sessions, definitions),
+        queues=Queues(sessions, runs, Budgets(sessions)),
         github=github,
     )
 

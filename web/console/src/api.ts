@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 /** Rows of the read-only dashboard API (src/engineering_control/dashboard). */
 export interface ProjectSummary {
@@ -6,7 +6,7 @@ export interface ProjectSummary {
   /** What the administrator calls it; the name above is the identifier and never changes. */
   display_name: string;
   /** "registry": the workflows run for it and it cannot be removed. "console": made here. */
-  origin: "registry" | "console";
+  origin: 'registry' | 'console';
   default_branch: string;
   source_repository: string;
   deployment_repository: string;
@@ -39,7 +39,7 @@ export interface Section {
   /** An item carrying one of these (a GitHub label) belongs here without a judgement. */
   labels: string[];
   examples: string[];
-  kind: "core" | "custom";
+  kind: 'core' | 'custom';
   flow: Flow | null;
 }
 
@@ -56,31 +56,29 @@ export interface WorkItem {
   /** The section it is routed to; null while it is not routed. */
   section: { key: string; name: string; flow?: string | null } | null;
   title: string;
-  source: "github" | "manual";
-  state: "proposed" | "accepted" | "skipped" | "done";
+  source: 'github' | 'manual';
+  state: 'proposed' | 'accepted' | 'skipped' | 'done';
   /** Who chose the section: a label of the issue, the supervisor, or the administrator. */
-  routed_by: "label" | "administrator" | "supervisor" | null;
+  routed_by: 'label' | 'administrator' | 'supervisor' | null;
   /** Set when the supervisor proposed the item. */
-  proposed_by?: "supervisor" | null;
+  proposed_by?: 'supervisor' | null;
   routing_reason: string | null;
   repository: string | null;
   issue_number: number | null;
   issue_url: string | null;
-  issue_state: "open" | "closed" | null;
+  issue_state: 'open' | 'closed' | null;
   labels: string[];
   updated_at: string | null;
   /** The item's latest run, when it has one. */
-  run?: { id: string; state: Run["state"]; outcome: string | null } | null;
+  run?: { id: string; state: Run['state']; outcome: string | null } | null;
+  /** The queue under way the item is in, when it is in one. */
+  queue?: { id: string; name: string; state: Queue['state'] } | null;
 }
 
 /** Whether a project's backlog can be read from GitHub, and how the last reading went. */
 export interface BacklogStatus {
   github: boolean;
-  last_sync: {
-    synced_at: string;
-    open_issues: number;
-    error: string | null;
-  } | null;
+  last_sync: { synced_at: string; open_issues: number; error: string | null } | null;
 }
 
 export interface SyncResult {
@@ -96,13 +94,18 @@ export interface SyncResult {
 /** One thing waiting for the administrator, and how many items it covers. */
 export interface InboxEntry {
   kind:
-    | "run_waiting"
-    | "account_sign_in"
-    | "supervisor_action"
-    | "sync_failed"
-    | "section_without_flow"
-    | "unrouted"
-    | "undecided";
+    | 'run_waiting'
+    | 'account_sign_in'
+    | 'supervisor_action'
+    | 'queue_proposed'
+    | 'queue_paused'
+    | 'sync_failed'
+    | 'section_without_flow'
+    | 'unrouted'
+    | 'undecided';
+  /** For a queue the supervisor proposed, or one the platform paused. */
+  queue_id?: string;
+  queue?: string;
   /** For something the supervisor proposed: what it is, why, and why it waits. */
   action_id?: string;
   summary?: string | null;
@@ -125,11 +128,70 @@ export interface Inbox {
   total: number;
 }
 
+/** One item's place in a queue, and what became of it. */
+export interface QueueEntry {
+  item_id: string;
+  position: number;
+  state: 'waiting' | 'running' | 'done' | 'failed' | 'skipped';
+  /** Why it stands where it does, when the supervisor proposed the order. */
+  reason: string | null;
+  detail: string | null;
+  title: string;
+  issue_number: number | null;
+  issue_url: string | null;
+  item_state: WorkItem['state'];
+  section: { key: string; name: string; flow?: string | null } | null;
+  run: { id: string; state: Run['state']; outcome: string | null } | null;
+}
+
+/** Items of one project to be worked on in order. A draft until it is started. */
+export interface Queue {
+  id: string;
+  name: string;
+  project: string;
+  project_name: string;
+  state: 'draft' | 'running' | 'paused' | 'finished';
+  /** How many of its items run at the same time. */
+  at_once: number;
+  proposed_by: 'supervisor' | null;
+  reason: string | null;
+  pause_reason: string | null;
+  counts: Record<QueueEntry['state'] | 'total', number>;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface QueueDetail extends Queue {
+  /** Why nothing further starts right now, when a budget holds the queue back. */
+  waiting_for: string | null;
+  entries: QueueEntry[];
+}
+
+/** The limits of one scope and how much of them is used. Null does not limit. */
+export interface BudgetRow {
+  scope: 'platform' | 'project' | 'account';
+  scope_id: string | null;
+  at_once: number | null;
+  per_day: number | null;
+  running?: number;
+  started_today: number;
+  name?: string;
+  display_name?: string;
+  provider?: string;
+}
+
+export interface Budgets {
+  platform: BudgetRow;
+  projects: BudgetRow[];
+  accounts: BudgetRow[];
+}
+
 /** One message of the conversation with the supervisor. */
 export interface SupervisorMessage {
   id: string;
-  role: "administrator" | "supervisor" | "platform";
-  channel: "console" | "chat" | "platform";
+  role: 'administrator' | 'supervisor' | 'platform';
+  channel: 'console' | 'chat' | 'platform';
   text: string;
   at: string | null;
 }
@@ -137,12 +199,7 @@ export interface SupervisorMessage {
 /** The conversation as the panel shows it. `turn` is set while the supervisor answers. */
 export interface SupervisorConversation {
   items: SupervisorMessage[];
-  turn: {
-    run_id: string;
-    state: "queued" | "running";
-    detail: string | null;
-    provider: string | null;
-  } | null;
+  turn: { run_id: string; state: 'queued' | 'running'; detail: string | null; provider: string | null } | null;
   /** What the supervisor proposed and that waits for a decision. */
   pending: InboxEntry[];
 }
@@ -155,7 +212,7 @@ export interface SupervisorSkill {
   enabled: boolean;
 }
 
-export type ToolMode = "automatic" | "confirm";
+export type ToolMode = 'automatic' | 'confirm';
 
 export interface SupervisorDefinition {
   /** 0 is the platform's own definition, before anything was saved. */
@@ -173,7 +230,7 @@ export interface SupervisorDefinition {
 
 export interface SupervisorTool {
   name: string;
-  kind: "read" | "plan" | "operate" | "ask";
+  kind: 'read' | 'plan' | 'operate' | 'ask';
   title: string;
   description: string;
   modes: ToolMode[];
@@ -193,15 +250,8 @@ export interface SupervisorRecordEntry {
   id: string;
   tool: string;
   title: string;
-  kind: SupervisorTool["kind"];
-  outcome:
-    | "read"
-    | "applied"
-    | "pending"
-    | "accepted"
-    | "rejected"
-    | "refused"
-    | "failed";
+  kind: SupervisorTool['kind'];
+  outcome: 'read' | 'applied' | 'pending' | 'accepted' | 'rejected' | 'refused' | 'failed';
   summary: string | null;
   reason: string | null;
   detail: string | null;
@@ -217,13 +267,7 @@ export interface RunStep {
   id: string;
   position: number;
   name: string;
-  state:
-    | "pending"
-    | "running"
-    | "succeeded"
-    | "failed"
-    | "cancelled"
-    | "skipped";
+  state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
   provider: string | null;
   attempt: number;
   exit_code: number | null;
@@ -237,14 +281,8 @@ export interface RunStep {
 /** Work done in sandboxes: trying an account, or delivering an issue. */
 export interface Run {
   id: string;
-  kind: "account_check" | "deliver_issue";
-  state:
-    | "queued"
-    | "running"
-    | "waiting"
-    | "succeeded"
-    | "failed"
-    | "cancelled";
+  kind: 'account_check' | 'deliver_issue';
+  state: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
   title: string;
   outcome: string | null;
   detail: string | null;
@@ -277,7 +315,7 @@ export interface Account {
   provider: string;
   provider_name: string;
   client: string | null;
-  state: "signed_out" | "unchecked" | "ready" | "limited" | "sign_in_required";
+  state: 'signed_out' | 'unchecked' | 'ready' | 'limited' | 'sign_in_required';
   state_reason: string | null;
   paused: boolean;
   max_concurrent: number;
@@ -295,7 +333,7 @@ export interface ProviderType {
   key: string;
   name: string;
   client: string | null;
-  credential: "token" | "auth_file" | null;
+  credential: 'token' | 'auth_file' | null;
   available: boolean;
   steps: string[];
   note: string;
@@ -408,28 +446,20 @@ export type Params = Record<string, string | number | null | undefined>;
 export function apiUrl(path: string, params: Params = {}): string {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (value !== null && value !== undefined && value !== "")
-      query.set(key, String(value));
+    if (value !== null && value !== undefined && value !== '') query.set(key, String(value));
   }
   const search = query.toString();
-  return `/api/dashboard/${path}${search ? `?${search}` : ""}`;
+  return `/api/dashboard/${path}${search ? `?${search}` : ''}`;
 }
 
 async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
-  const response = await fetch(url, {
-    signal,
-    credentials: "same-origin",
-    headers: { Accept: "application/json" },
-  });
+  const response = await fetch(url, { signal, credentials: 'same-origin', headers: { Accept: 'application/json' } });
   if (response.status === 401) {
     // The session ended: the dashboard's own sign-in page brings the operator back here.
-    window.location.assign(
-      `/login?next=${encodeURIComponent(window.location.pathname)}`,
-    );
-    throw new DOMException("Signed out", "AbortError");
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
+    throw new DOMException('Signed out', 'AbortError');
   }
-  if (!response.ok)
-    throw new Error(`The dashboard API answered ${response.status}.`);
+  if (!response.ok) throw new Error(`The dashboard API answered ${response.status}.`);
   return (await response.json()) as T;
 }
 
@@ -445,37 +475,24 @@ export class ApiError extends Error {
 
 /** A change: the session's CSRF token is fetched and sent with the body. */
 /** Sent on the window after every change the administrator made. */
-export const CHANGED = "engineering-control:changed";
+export const CHANGED = 'engineering-control:changed';
 
-export async function postJson<T>(
-  path: string,
-  body: Record<string, unknown> = {},
-): Promise<T> {
+export async function postJson<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
   const controller = new AbortController();
-  const session = await getJson<{ csrf_token: string }>(
-    apiUrl("session"),
-    controller.signal,
-  );
+  const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
   const response = await fetch(apiUrl(path), {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ ...body, csrf_token: session.csrf_token }),
   });
-  const payload = (await response.json().catch(() => null)) as {
-    detail?: unknown;
-  } | null;
+  const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null;
   if (response.status === 401) {
-    window.location.assign(
-      `/login?next=${encodeURIComponent(window.location.pathname)}`,
-    );
-    throw new DOMException("Signed out", "AbortError");
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
+    throw new DOMException('Signed out', 'AbortError');
   }
   if (!response.ok) {
-    const detail =
-      typeof payload?.detail === "string"
-        ? payload.detail
-        : `The request was refused (${response.status}).`;
+    const detail = typeof payload?.detail === 'string' ? payload.detail : `The request was refused (${response.status}).`;
     throw new ApiError(detail, response.status);
   }
   // Something changed: whatever counts things (the inbox in the navigation) counts again.
@@ -486,23 +503,17 @@ export async function postJson<T>(
 /** Ends the dashboard session (the server revokes it) and returns to the sign-in page. */
 export async function signOut(): Promise<void> {
   const controller = new AbortController();
-  const session = await getJson<{ csrf_token: string }>(
-    apiUrl("session"),
-    controller.signal,
-  );
-  const response = await fetch("/logout", {
-    method: "POST",
-    credentials: "same-origin",
-    redirect: "manual",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
+  const response = await fetch('/logout', {
+    method: 'POST',
+    credentials: 'same-origin',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ csrf_token: session.csrf_token }).toString(),
   });
   // A followed redirect is opaque here; anything but an explicit error means signed out.
-  if (response.status >= 400)
-    throw new Error(
-      `Sign-out failed (${response.status}); the session is still active.`,
-    );
-  window.location.assign("/login");
+  if (response.status >= 400) throw new Error(`Sign-out failed (${response.status}); the session is still active.`);
+  window.location.assign('/login');
 }
 
 export interface Resource<T> {
@@ -518,11 +529,8 @@ export interface Resource<T> {
  * GET `url` now and every `intervalMs` while the tab is visible. The previous data stays
  * on screen during a refresh and after a failed one (with `error` set), never a blank table.
  */
-export function useResource<T>(
-  url: string,
-  intervalMs: number | null = null,
-): Resource<T> {
-  const [state, setState] = useState<Omit<Resource<T>, "reload">>({
+export function useResource<T>(url: string, intervalMs: number | null = null): Resource<T> {
+  const [state, setState] = useState<Omit<Resource<T>, 'reload'>>({
     data: null,
     error: null,
     loading: true,
@@ -536,27 +544,13 @@ export function useResource<T>(
     const changed = latest.current !== url;
     latest.current = url;
     const controller = new AbortController();
-    setState((previous) => ({
-      ...previous,
-      loading: true,
-      data: changed ? null : previous.data,
-    }));
+    setState((previous) => ({ ...previous, loading: true, data: changed ? null : previous.data }));
     getJson<T>(url, controller.signal)
-      .then((data) =>
-        setState({ data, error: null, loading: false, fetchedAt: Date.now() }),
-      )
+      .then((data) => setState({ data, error: null, loading: false, fetchedAt: Date.now() }))
       .catch((error: unknown) => {
-        if (error instanceof DOMException && error.name === "AbortError")
-          return;
-        const message =
-          error instanceof Error
-            ? error.message
-            : "The dashboard API is unreachable.";
-        setState((previous) => ({
-          ...previous,
-          error: message,
-          loading: false,
-        }));
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        const message = error instanceof Error ? error.message : 'The dashboard API is unreachable.';
+        setState((previous) => ({ ...previous, error: message, loading: false }));
       });
     return () => controller.abort();
   }, [url, tick]);
@@ -564,7 +558,7 @@ export function useResource<T>(
   useEffect(() => {
     if (!intervalMs) return;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") reload();
+      if (document.visibilityState === 'visible') reload();
     }, intervalMs);
     return () => window.clearInterval(timer);
   }, [intervalMs, reload]);

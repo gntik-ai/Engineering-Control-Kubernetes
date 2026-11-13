@@ -39,6 +39,7 @@ from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import ProjectRecord, SupervisorAction
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import toolchain_for
+from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import Runs
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS
@@ -105,6 +106,7 @@ class Toolbox:
         accounts: Accounts,
         runs: Runs,
         conversation: Conversation,
+        queues: Queues | None = None,
         github: GitHubApp | None = None,
     ) -> None:
         self.sessions = sessions
@@ -114,6 +116,7 @@ class Toolbox:
         self.accounts = accounts
         self.runs = runs
         self.conversation = conversation
+        self.queues = queues
         self.github = github
 
     # --- a call from the supervisor ------------------------------------------------------
@@ -314,7 +317,9 @@ class Toolbox:
                 page=int(arguments.get("page") or 1),
                 page_size=min(int(arguments.get("page_size") or 25), 50),
             )
-            runs = self.runs.for_items([item["id"] for item in listing["items"]])
+            ids = [item["id"] for item in listing["items"]]
+            runs = self.runs.for_items(ids)
+            queued = self.queues.for_items(ids) if self.queues is not None else {}
             return {
                 "total": listing["total"],
                 "page": listing["page"],
@@ -331,6 +336,9 @@ class Toolbox:
                         "proposed_by": item["proposed_by"],
                         "labels": item["labels"],
                         "run": runs.get(item["id"]),
+                        # The queue under way it is in, by name; such an item is not
+                        # proposed for another.
+                        "queue": (queued.get(item["id"]) or {}).get("name"),
                     }
                     for item in listing["items"]
                 ],
@@ -378,6 +386,47 @@ class Toolbox:
                 "pull_request": (run.get("data") or {}).get("pull_request"),
                 "steps": steps,
             }
+        if name == "list_queues":
+            return [
+                {
+                    key: queue[key]
+                    for key in ("id", "name", "project", "state", "proposed_by", "counts")
+                }
+                for queue in self._queues().listing(project=arguments.get("project") or None)[
+                    "items"
+                ]
+            ]
+        if name == "get_queue":
+            queue = self._queues().get(_uuid(arguments.get("queue"), "a queue"))
+            return {
+                **{
+                    key: queue[key]
+                    for key in (
+                        "id",
+                        "name",
+                        "project",
+                        "state",
+                        "at_once",
+                        "proposed_by",
+                        "reason",
+                        "pause_reason",
+                        "waiting_for",
+                        "counts",
+                    )
+                },
+                "items": [
+                    {
+                        "item": entry["item_id"],
+                        "title": entry["title"],
+                        "issue": entry["issue_number"],
+                        "state": entry["state"],
+                        "reason": entry["reason"],
+                        "detail": entry["detail"],
+                        "run": entry["run"],
+                    }
+                    for entry in queue["entries"]
+                ],
+            }
         if name == "list_accounts":
             return [
                 {
@@ -398,9 +447,21 @@ class Toolbox:
             return self.inbox_entries()
         raise ProjectInvalid("That tool reads nothing")
 
+    def _queues(self) -> Queues:
+        if self.queues is None:
+            raise ProjectInvalid("Queues are not available here")
+        return self.queues
+
     def inbox_entries(self) -> list[dict[str, Any]]:
         """Everything that waits for the administrator, most pressing first."""
-        return self.runs.inbox() + self.accounts.inbox() + self.pending() + self.backlog.inbox()
+        queued = self.queues.inbox() if self.queues is not None else []
+        return (
+            self.runs.inbox()
+            + self.accounts.inbox()
+            + self.pending()
+            + queued
+            + self.backlog.inbox()
+        )
 
     # --- changing ------------------------------------------------------------------------
 
@@ -467,10 +528,67 @@ class Toolbox:
                 raise ProjectInvalid(
                     f"The section {item['section']['name']} has no flow that can run yet"
                 )
+            if self.queues is not None:
+                refusal = self.queues.budgets.may_start(item["project"])
+                if refusal is not None:
+                    raise ProjectConflict(f"Nothing more can start right now. {refusal}")
             return Intent(
                 f"Start work on “{_words(item['title'], 120)}” ({item['project']}).",
                 project=item["project"],
             )
+        if name == "propose_queue":
+            project = str(arguments.get("project") or "")
+            self.sections.of_project(project)  # refuses a project that does not exist
+            items = arguments.get("items")
+            if not isinstance(items, list) or not 1 <= len(items) <= 50:
+                raise ProjectInvalid("A queue is proposed with between 1 and 50 items")
+            queued: list[str] = []
+            for entry in items:
+                if not isinstance(entry, dict) or not _words(entry.get("reason")):
+                    raise ProjectInvalid("Each item of a queue needs a reason for its place")
+                found = self.backlog.get(_uuid(entry.get("item"), "an item"))
+                if found["project"] != project:
+                    raise ProjectInvalid("A queue holds items of its own project only")
+                queued.append(_words(found["title"], 60))
+            if not _words(arguments.get("name")):
+                raise ProjectInvalid("Give the queue a name")
+            more = f" and {len(queued) - 3} more" if len(queued) > 3 else ""
+            return Intent(
+                f"Propose the queue “{_words(arguments.get('name'), 120)}” for {project} with "
+                f"{len(queued)} item{'s' if len(queued) != 1 else ''}: "
+                f"{'; '.join(queued[:3])}{more}.",
+                project=project,
+            )
+        if name in ("reorder_queue", "start_queue", "pause_queue"):
+            queue = self._queues().get(_uuid(arguments.get("queue"), "a queue"))
+            label = f"“{_words(queue['name'], 120)}” ({queue['project']})"
+            if name == "reorder_queue":
+                if queue["state"] == "finished":
+                    raise ProjectConflict("The queue has finished")
+                waiting = {e["item_id"] for e in queue["entries"] if e["state"] == "waiting"}
+                given = [str(item) for item in arguments.get("items") or []]
+                if set(given) != waiting or len(given) != len(waiting):
+                    raise ProjectInvalid(
+                        "Name every item of the queue that still waits, once, in the new order"
+                    )
+                own_draft = queue["proposed_by"] == "supervisor" and queue["state"] == "draft"
+                return Intent(
+                    f"Reorder the queue {label}.",
+                    project=queue["project"],
+                    confirm=None
+                    if own_draft
+                    else "It would reorder a queue you made, or one that is under way.",
+                )
+            if name == "start_queue":
+                if queue["state"] not in ("draft", "paused"):
+                    raise ProjectConflict(f"The queue is {queue['state']}")
+                if not queue["counts"]["waiting"]:
+                    raise ProjectInvalid("No item of the queue waits to be worked on")
+                verb = "Start" if queue["state"] == "draft" else "Resume"
+                return Intent(f"{verb} the queue {label}.", project=queue["project"])
+            if queue["state"] != "running":
+                raise ProjectConflict(f"The queue is {queue['state']}, not running")
+            return Intent(f"Pause the queue {label}.", project=queue["project"])
         raise ProjectInvalid("That tool changes nothing")
 
     def _perform(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -500,6 +618,31 @@ class Toolbox:
             toolchain = toolchain_for(of).as_dict() if of else {}
             run = self.runs.start_delivery(item_id, toolchain=toolchain)
             return {"run": run["id"], "state": run["state"]}
+        if name == "propose_queue":
+            entries = arguments["items"]
+            made = self._queues().create(
+                str(arguments["project"]),
+                name=str(arguments["name"]),
+                item_ids=[UUID(str(entry["item"])) for entry in entries],
+                proposed_by="supervisor",
+                reason=str(arguments.get("reason") or ""),
+                reasons={UUID(str(entry["item"])): str(entry["reason"]) for entry in entries},
+            )
+            return {"queue": made["id"], "state": made["state"], "items": made["counts"]["total"]}
+        if name == "reorder_queue":
+            queue = self._queues().reorder(
+                UUID(str(arguments["queue"])), [UUID(str(item)) for item in arguments["items"]]
+            )
+            return {"queue": queue["id"], "order": [e["title"] for e in queue["entries"]][:20]}
+        if name == "start_queue":
+            queue = self._queues().start(UUID(str(arguments["queue"])))
+            return {"queue": queue["id"], "state": queue["state"]}
+        if name == "pause_queue":
+            queue = self._queues().pause(
+                UUID(str(arguments["queue"])),
+                f"Paused by the supervisor: {_words(arguments.get('reason'), 240)}",
+            )
+            return {"queue": queue["id"], "state": queue["state"]}
         raise ProjectInvalid("That tool changes nothing")
 
     # --- the administrator's side --------------------------------------------------------

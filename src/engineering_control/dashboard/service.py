@@ -232,9 +232,12 @@ class DashboardService:
                 page_size=page_size,
             )
             # Each item with its latest run, so the backlog shows what is being worked on.
-            runs = self.repository.runs.for_items([item["id"] for item in listing["items"]])
+            ids = [item["id"] for item in listing["items"]]
+            runs = self.repository.runs.for_items(ids)
+            queued = self.repository.queues.for_items(ids)
             for item in listing["items"]:
                 item["run"] = runs.get(item["id"])
+                item["queue"] = queued.get(item["id"])
             return listing
 
         return await asyncio.to_thread(read)
@@ -265,6 +268,58 @@ class DashboardService:
         # An account nobody can work with stops everything, so it comes first.
         entries = await asyncio.to_thread(self.repository.toolbox.inbox_entries)
         return {"items": entries, "total": len(entries)}
+
+    # --- queues and budgets --------------------------------------------------------------
+
+    async def queues(self, *, project: str | None = None) -> dict[str, object]:
+        return await asyncio.to_thread(lambda: self.repository.queues.listing(project=project))
+
+    async def queue(self, queue_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.queues.get, queue_id)
+
+    async def create_queue(
+        self, project: str, *, name: str, items: list[UUID], at_once: int
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.queues.create(
+                project, name=name, item_ids=items, at_once=at_once
+            )
+        )
+
+    async def change_queue(self, queue_id: UUID, change: str, **fields: Any) -> dict[str, object]:
+        """One change to a queue, by name: add, order, remove, update, start, pause, discard."""
+        queues = self.repository.queues
+
+        def apply() -> dict[str, Any]:
+            if change == "add":
+                return queues.add_items(queue_id, fields["items"])
+            if change == "order":
+                return queues.reorder(queue_id, fields["items"])
+            if change == "remove":
+                return queues.remove_item(queue_id, fields["item"])
+            if change == "update":
+                return queues.update(
+                    queue_id, name=fields.get("name"), at_once=fields.get("at_once")
+                )
+            if change == "start":
+                return queues.start(queue_id)
+            if change == "pause":
+                return queues.pause(queue_id)
+            if change == "discard":
+                return queues.discard(queue_id)
+            raise ProjectInvalid("That is not a change a queue can take")
+
+        return await asyncio.to_thread(apply)
+
+    async def budgets(self) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.budgets.listing)
+
+    async def set_budget(
+        self, scope: str, scope_id: UUID | None, *, at_once: int | None, per_day: int | None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.budgets.save(scope, scope_id, at_once=at_once, per_day=per_day)
+        )
 
     # --- the supervisor ------------------------------------------------------------------
 

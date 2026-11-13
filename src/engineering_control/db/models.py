@@ -1240,3 +1240,79 @@ class SupervisorAction(UUIDPrimaryKey, Timestamps, Base):
         ),
         CheckConstraint("kind IN ('read', 'plan', 'operate', 'ask')", name="kind"),
     )
+
+
+class WorkQueue(UUIDPrimaryKey, Timestamps, Base):
+    """Items of one project to be worked on in order (migration 0032).
+
+    A queue is made by the administrator from items of the backlog, or proposed by the
+    supervisor with its reasons. It is a ``draft`` until the administrator starts it; then
+    its items run in order, as many at the same time as ``at_once`` allows, until it is
+    ``finished``. It can be paused, reordered and extended while it runs.
+    """
+
+    __tablename__ = "work_queues"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    at_once: Mapped[int] = mapped_column(Integer, default=1)
+    # Who made it (nobody named: the administrator) and, for the supervisor, why this order.
+    proposed_by: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(600))
+    # Why it is paused, when the platform paused it itself.
+    pause_reason: Mapped[str | None] = mapped_column(String(300))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint("state IN ('draft', 'running', 'paused', 'finished')", name="state"),
+        CheckConstraint("at_once BETWEEN 1 AND 4", name="at_once"),
+    )
+
+
+class WorkQueueEntry(UUIDPrimaryKey, Timestamps, Base):
+    """One item's place in a queue (migration 0032). ``state`` follows the item's run:
+    ``waiting`` for its turn, ``running``, then ``done`` (its run ended well, or its change
+    waits for the administrator), ``failed`` or ``skipped`` (it could not be started)."""
+
+    __tablename__ = "work_queue_entries"
+    queue_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("work_queues.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("backlog_items.id", ondelete="CASCADE"), index=True
+    )
+    position: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    run_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("sandbox_runs.id", ondelete="SET NULL"), index=True
+    )
+    # Why the item is at this place (the supervisor's), and what became of it.
+    reason: Mapped[str | None] = mapped_column(String(300))
+    detail: Mapped[str | None] = mapped_column(String(300))
+    __table_args__ = (
+        UniqueConstraint("queue_id", "item_id", name="uq_work_queue_entries_queue_item"),
+        CheckConstraint(
+            "state IN ('waiting', 'running', 'done', 'failed', 'skipped')", name="state"
+        ),
+    )
+
+
+class Budget(UUIDPrimaryKey, Timestamps, Base):
+    """How much may run for a scope (migration 0032): the whole platform, one project or
+    one subscription account. A limit left empty does not limit. For the platform and a
+    project the limits count runs of work; for an account they count steps, since an
+    account is leased to a step."""
+
+    __tablename__ = "budgets"
+    scope: Mapped[str] = mapped_column(String(16))
+    # The project or the account; empty for the platform.
+    scope_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    at_once: Mapped[int | None] = mapped_column(Integer)
+    per_day: Mapped[int | None] = mapped_column(Integer)
+    __table_args__ = (
+        CheckConstraint("scope IN ('platform', 'project', 'account')", name="scope"),
+        CheckConstraint("at_once IS NULL OR at_once BETWEEN 1 AND 100", name="at_once"),
+        CheckConstraint("per_day IS NULL OR per_day BETWEEN 1 AND 10000", name="per_day"),
+    )

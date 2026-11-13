@@ -9,7 +9,7 @@ as the step is running: that, counted against the account's limit, is all a leas
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
@@ -23,6 +23,7 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.db.models import (
     BacklogItem,
+    Budget,
     ProjectRecord,
     ProjectSection,
     ProviderAccount,
@@ -482,7 +483,12 @@ class Runs:
                 session.execute(query).all(),
                 key=lambda row: (str(row[0].id) != preferred, wanted.index(row[0].provider)),
             )
+            spent = _spent_accounts(session, now)
             for account, running in candidates:
+                if account.id in spent:
+                    # Its budget of steps for a day is used up: no step gets it, not even
+                    # one that names it.
+                    continue
                 if step.account_id is None:
                     if reserved is not None and account.id == reserved:
                         continue
@@ -666,3 +672,22 @@ class Runs:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _spent_accounts(session: Session, now: datetime) -> set[UUID]:
+    """The accounts whose budget of steps within a day is used up (see sandbox/queues.py)."""
+    since = now - timedelta(hours=24)
+    spent: set[UUID] = set()
+    for budget in session.scalars(
+        select(Budget).where(Budget.scope == "account", Budget.per_day.is_not(None))
+    ):
+        if budget.scope_id is None or budget.per_day is None:
+            continue
+        used = session.scalar(
+            select(func.count())
+            .select_from(SandboxStep)
+            .where(SandboxStep.account_id == budget.scope_id, SandboxStep.started_at > since)
+        )
+        if (used or 0) >= budget.per_day:
+            spent.add(budget.scope_id)
+    return spent

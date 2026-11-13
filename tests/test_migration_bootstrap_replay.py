@@ -29,13 +29,14 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0031 (the supervisor) follows 0030 (what a step was given), 0029 (runs in sandboxes),
+    # 0032 (queues and budgets) follows 0031 (the supervisor), 0030 (what a step was
+    # given), 0029 (runs in sandboxes),
     # 0028 (subscription accounts), 0027 (the backlog),
     # 0026 (sections of a project) and 0025 (projects as records), which follow
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0031", "0030")
+    assert (head, parent) == ("0032", "0031")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -89,6 +90,31 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0032: queues and budgets. A queue that is under way is an order still to be worked
+    # on, so a downgrade must not drop it; drafts and finished queues may go.
+    assert {"work_queues", "work_queue_entries", "budgets"} <= set(
+        inspect(engine).get_table_names()
+    )
+    with engine.begin() as connection:
+        project_id = connection.scalar(text("SELECT id FROM projects WHERE name = 'falcone'"))
+        for queue_id, state in (
+            ("00000000000000000000000000000009", "draft"),
+            ("0000000000000000000000000000000a", "paused"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO work_queues (id, project_id, name, state, at_once, created_at, "
+                    "updated_at) VALUES (:id, :project, 'Next', :state, 1, CURRENT_TIMESTAMP, "
+                    "CURRENT_TIMESTAMP)"
+                ),
+                {"id": queue_id, "project": project_id, "state": state},
+            )
+    with pytest.raises(RuntimeError, match="queues that are under way"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE work_queues SET state = 'finished'"))
+    command.downgrade(config, parent)
+    assert "work_queues" not in set(inspect(engine).get_table_names())
     # 0031: the supervisor's definition, conversation and record of actions, and who
     # proposed an item. An action that waits for the administrator is a decision not taken
     # yet, so a downgrade must not drop it.
@@ -105,10 +131,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             )
         )
     with pytest.raises(RuntimeError, match="wait for the administrator"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0030")
     with engine.begin() as connection:
         connection.execute(text("UPDATE supervisor_actions SET outcome = 'rejected'"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0030")
     assert "supervisor_actions" not in set(inspect(engine).get_table_names())
     assert "proposed_by" not in {c["name"] for c in inspect(engine).get_columns("backlog_items")}
     # 0030: one nullable column, added and dropped without touching a row.

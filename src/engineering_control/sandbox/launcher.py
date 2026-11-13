@@ -31,6 +31,7 @@ from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import pods, steps
 from engineering_control.sandbox.flows import AccountCheck, DeliverIssue, Flow, Follow
+from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
@@ -97,6 +98,7 @@ class Launcher:
         parallel_steps: int = 4,
         conversation: Conversation | None = None,
         tools_url: str | None = None,
+        queues: Queues | None = None,
     ) -> None:
         self.runs = runs
         self.cluster = cluster
@@ -105,6 +107,7 @@ class Launcher:
         self._running = 0
         self._addresses: dict[str, tuple[str, float]] = {}
         self.conversation = conversation
+        self.queues = queues
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
             "deliver_issue": DeliverIssue(runs, github),
@@ -123,6 +126,9 @@ class Launcher:
         if self.conversation is not None:
             # Turns that ended without a reply are said so; messages that waited get theirs.
             await asyncio.to_thread(self.conversation.settle)
+        if self.queues is not None:
+            # Queues follow the runs of their items and start the next ones.
+            await asyncio.to_thread(self.queues.advance)
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -399,14 +405,16 @@ async def serve(settings: Settings | None = None) -> None:
     )
     github = GitHubApp.from_settings(resolved)
     sessions = sessionmaker(engine, expire_on_commit=False)
+    runs = Runs(sessions)
     launcher = Launcher(
-        Runs(sessions),
+        runs,
         cluster,
         sandboxes,
         github,
         parallel_steps=resolved.sandbox_parallel_steps,
         conversation=Conversation(sessions, Definitions(sessions)),
         tools_url=resolved.supervisor_tools_url,
+        queues=Queues(sessions, runs, Budgets(sessions)),
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

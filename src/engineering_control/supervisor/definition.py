@@ -42,6 +42,7 @@ _PROJECT: Final = {
     "description": "The project's name, as list_projects gives it.",
 }
 _ITEM: Final = {"type": "string", "description": "The item's id, as list_items gives it."}
+_QUEUE: Final = {"type": "string", "description": "The queue's id, as list_queues gives it."}
 _REASON: Final = {
     "type": "string",
     "description": "Why, in one or two sentences the administrator can check.",
@@ -145,6 +146,21 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         ),
     ),
     Tool(
+        "list_queues",
+        "read",
+        "List the queues",
+        "The queues of work: name, project, state (draft, running, paused, finished) and "
+        "how many of their items wait, run, are done or failed.",
+        _schema({"project": _PROJECT}),
+    ),
+    Tool(
+        "get_queue",
+        "read",
+        "Read a queue",
+        "One queue with its items in order: what each is, where it stands and its run.",
+        _schema({"queue": _QUEUE}, ("queue",)),
+    ),
+    Tool(
         "list_accounts",
         "read",
         "List the subscription accounts",
@@ -215,6 +231,67 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         modes=MODES,
     ),
     Tool(
+        "propose_queue",
+        "plan",
+        "Propose a queue",
+        "Propose an order to work on items of one project in. The queue is a draft the "
+        "administrator starts, reorders or discards; nothing runs until they start it. "
+        "Give the reason for the order as a whole and, for each item, why it stands where "
+        "it does: what it depends on, its risk, its priority.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "name": {"type": "string", "maxLength": 120},
+                "reason": _REASON,
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "description": "In the order they are to be worked on.",
+                    "items": _schema({"item": _ITEM, "reason": _REASON}, ("item", "reason")),
+                },
+            },
+            ("project", "name", "reason", "items"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
+        "reorder_queue",
+        "plan",
+        "Reorder a queue",
+        "Put the items of a queue that still wait into another order. Name every waiting "
+        "item once. A queue the administrator made, or one that is running, is reordered "
+        "only with their confirmation.",
+        _schema(
+            {
+                "queue": _QUEUE,
+                "items": {"type": "array", "minItems": 1, "maxItems": 200, "items": _ITEM},
+                "reason": _REASON,
+            },
+            ("queue", "items", "reason"),
+        ),
+        modes=MODES,
+    ),
+    Tool(
+        "start_queue",
+        "operate",
+        "Start or resume a queue",
+        "Start a draft queue, or resume a paused one: its items then run in order. Only "
+        "when the administrator asked for it.",
+        _schema({"queue": _QUEUE, "reason": _REASON}, ("queue", "reason")),
+        default_mode="confirm",
+        modes=MODES,
+    ),
+    Tool(
+        "pause_queue",
+        "operate",
+        "Pause a queue",
+        "Stop a running queue from starting further items. What is running runs to its "
+        "end; nothing is lost and the queue can be resumed.",
+        _schema({"queue": _QUEUE, "reason": _REASON}, ("queue", "reason")),
+        modes=MODES,
+    ),
+    Tool(
         "start_item",
         "operate",
         "Start work on an item",
@@ -247,8 +324,9 @@ do not try it again.
 
 What you decide and what you do not
 - You plan: you propose backlog items, say which section an item belongs to, and propose \
-the order to work in.
-- You start work only when the administrator asked for it.
+the order to work in as a queue.
+- You start work, or a queue, only when the administrator asked for it. You may pause a \
+queue yourself when its items keep failing; say why.
 - The administrator decides what is published. You never approve, merge, deploy or publish \
 anything, and you never touch accounts or credentials.
 """
@@ -292,6 +370,26 @@ DEFAULT_SKILLS: Final[tuple[dict[str, Any], ...]] = (
             "When two sections could claim it, it is 'medium' at most: say which two.\n"
             "When asked to route many items, work through them in batches and report "
             "counts per section, then the ones you could not place."
+        ),
+        "enabled": True,
+    },
+    {
+        "key": "order-a-queue",
+        "name": "Order a queue",
+        "description": "Proposing the order in which to work on items.",
+        "body": (
+            "When asked what to work on next, or to queue up work:\n"
+            "1. Read the open items of the project (list_items) and what is already "
+            "queued or running (list_queues, list_runs). Leave out items that are in a "
+            "queue, have a run under way, or have no section whose flow can run.\n"
+            "2. Order by, first, what other items depend on; then what is small and safe "
+            "before what is large or risky; then what the administrator said matters "
+            "most. When you cannot tell, keep the backlog's order and say so.\n"
+            "3. Propose the queue (propose_queue) with one reason for the whole order "
+            "and one per item. Keep it short: a queue of five items that will run is "
+            "better than one of thirty.\n"
+            "4. Tell the administrator the order and why. The queue is a draft: they "
+            "start it, reorder it or discard it. Start it yourself only if they asked."
         ),
         "enabled": True,
     },
