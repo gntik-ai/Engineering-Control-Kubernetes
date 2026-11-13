@@ -275,5 +275,5 @@ def paused_refusal(record: ProjectRecord) -> str | None:
     if record.paused_at is None:
         return None
     who = "the supervisor" if record.paused_by == "supervisor" else "you"
-    why = f": {record.pause_reason}" if record.pause_reason else ""
+    why = f": {record.pause_reason.rstrip('. ')}" if record.pause_reason else ""
     return f"The project {record.display_name} was paused by {who}{why}. Resume it on its page."
