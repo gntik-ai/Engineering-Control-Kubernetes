@@ -29,7 +29,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0035 (paused projects) follows
+    # 0036 (flows as documents, usage, evaluations) follows 0035 (paused projects),
     # 0034 (items with their own text, incidents, cut-over), 0033 (the chat
     # channel's memory), 0032 (queues and budgets), 0031 (the
     # supervisor), 0030 (what a step was
@@ -39,7 +39,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0035", "0034")
+    assert (head, parent) == ("0036", "0035")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -93,6 +93,29 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0036: flows as versioned documents. A published version may be what sections and
+    # runs follow, so a downgrade must not drop it; drafts and evaluations may go.
+    assert {"flow_versions", "evaluations", "evaluation_cases"} <= set(
+        inspect(engine).get_table_names()
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO flow_versions (id, flow_key, version, state, document, sha256, "
+                "created_at, updated_at) VALUES ('00000000000000000000000000000036', "
+                "'deliver-issue', 1, 'published', '{}', 'x', CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="refuses to drop published"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE flow_versions SET state = 'draft'"))
+    command.downgrade(config, parent)
+    assert "flow_versions" not in set(inspect(engine).get_table_names())
+    assert "usage" not in {
+        column["name"] for column in inspect(engine).get_columns("sandbox_steps")
+    }
     # 0035: a project can be paused. A paused project must not start working again
     # because of a downgrade.
     with engine.begin() as connection:
@@ -100,10 +123,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             text("UPDATE projects SET paused_at = CURRENT_TIMESTAMP WHERE name = 'falcone'")
         )
     with pytest.raises(RuntimeError, match="refuses to resume"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0034")
     with engine.begin() as connection:
         connection.execute(text("UPDATE projects SET paused_at = NULL"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0034")
     assert "paused_at" not in {column["name"] for column in inspect(engine).get_columns("projects")}
     # 0034: items with their own text, incidents and a project's cut-over. An item's
     # description is what it asks for, and an open incident is trouble not yet looked at,

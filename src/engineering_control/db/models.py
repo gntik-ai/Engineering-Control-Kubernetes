@@ -634,6 +634,9 @@ class SandboxStep(UUIDPrimaryKey, Timestamps, Base):
     input: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     log: Mapped[str | None] = mapped_column(Text)
+    # What the step's agent reported using: tokens in and out, and how long its client
+    # says it worked (migration 0036). Not set for a step without an agent.
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
@@ -643,6 +646,67 @@ class SandboxStep(UUIDPrimaryKey, Timestamps, Base):
             name="state",
         ),
     )
+
+
+class FlowVersion(UUIDPrimaryKey, Timestamps, Base):
+    """One version of a flow other than the platform's own (migration 0036).
+
+    A flow is a document (``engine/document.py``). The platform's own flows are version 0
+    of their key and live in the code; every version made here is a row. A ``draft`` can
+    still be changed and runs nothing; ``published`` is what cannot be changed any more,
+    and the highest published version of a key is the one in force. A run keeps the
+    version it started with.
+    """
+
+    __tablename__ = "flow_versions"
+    flow_key: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    document: Mapped[dict[str, Any]] = mapped_column(JSON)
+    sha256: Mapped[str] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(String(300))
+    # What validation said when the version was last saved.
+    problems: Mapped[list[Any] | None] = mapped_column(JSON)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("flow_key", "version", name="uq_flow_versions_key_version"),
+        CheckConstraint("state IN ('draft', 'published')", name="state"),
+    )
+
+
+class Evaluation(UUIDPrimaryKey, Timestamps, Base):
+    """A version of a flow tried on past work before it is put in force (migration 0036).
+
+    Each case replays one piece of past work on one version: the candidate, and the
+    version it is compared with. The runs are ordinary runs of kind ``evaluation`` that
+    leave nothing behind: nothing is published and nothing is added to the backlog.
+    """
+
+    __tablename__ = "evaluations"
+    flow_key: Mapped[str] = mapped_column(String(64), index=True)
+    candidate_version: Mapped[int] = mapped_column(Integer)
+    baseline_version: Mapped[int] = mapped_column(Integer)
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    note: Mapped[str | None] = mapped_column(String(300))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (CheckConstraint("state IN ('running', 'finished', 'stopped')", name="state"),)
+
+
+class EvaluationCase(UUIDPrimaryKey, Timestamps, Base):
+    """One piece of past work replayed on one version of a flow (migration 0036)."""
+
+    __tablename__ = "evaluation_cases"
+    evaluation_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("evaluations.id", ondelete="CASCADE"), index=True
+    )
+    arm: Mapped[str] = mapped_column(String(16))
+    # What is replayed: the item's words or the scope, and the commit it was worked on at.
+    subject: Mapped[dict[str, Any]] = mapped_column(JSON)
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    __table_args__ = (CheckConstraint("arm IN ('candidate', 'baseline')", name="arm"),)
 
 
 class BacklogSync(Base):

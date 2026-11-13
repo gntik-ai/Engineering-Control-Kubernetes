@@ -32,6 +32,8 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
+from engineering_control.engine.builtin import FLOW_OF_KIND
+from engineering_control.engine.records import in_force
 from engineering_control.flow_library import AUDIT, FLOWS, WORK_KINDS, run_for_item
 
 ACTIVE: Final = ("queued", "running", "waiting")
@@ -261,7 +263,11 @@ class Runs:
             )
             session.add(run)
             session.flush()
+            flow = FLOW_OF_KIND[kind]
+            version = in_force(session, flow) or (0, "")
             common = {
+                # The flow the run follows, at the version in force now: it keeps it.
+                "flow": {"key": flow, "version": version[0], "sha256": version[1]},
                 "project": project.name,
                 "project_name": project.display_name,
                 "repository": repository,
@@ -357,6 +363,7 @@ class Runs:
                 project_id=record.id,
                 cancel_requested=False,
                 data={
+                    "flow": _flow_now(session, FLOW_OF_KIND[flow.for_section]),
                     "project": record.name,
                     "project_name": record.display_name,
                     "repository": record.source_repository,
@@ -809,6 +816,31 @@ class Runs:
             run = session.get(SandboxRun, run_id)
             return run.item_id if run is not None else None
 
+    def note_step(self, step_id: UUID, noted: dict[str, Any]) -> None:
+        """Add to what a step was given: which prompt, in which wording."""
+        with self.sessions.begin() as session:
+            step = session.get(SandboxStep, step_id)
+            if step is not None and noted:
+                step.input = {**(step.input or {}), **noted}
+
+    def minutes_running(self, run_id: UUID) -> int:
+        """How long the run has been under way, in whole minutes."""
+        with self.sessions() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is None or run.started_at is None:
+                return 0
+            return int((datetime.now(UTC) - _aware(run.started_at)).total_seconds() // 60)
+
+    def tokens_used(self, run_id: UUID) -> int:
+        """How many tokens the run's agents have reported using so far."""
+        with self.sessions() as session:
+            used = session.scalars(
+                select(SandboxStep.usage).where(
+                    SandboxStep.run_id == run_id, SandboxStep.usage.is_not(None)
+                )
+            ).all()
+            return sum(int((entry or {}).get("tokens") or 0) for entry in used)
+
     def step_outputs(self, run_id: UUID, name: str) -> list[dict[str, Any]]:
         """What each of the run's steps of that name produced, in the order they ran.
         Steps that failed, or were given again to another account, produced nothing."""
@@ -845,6 +877,12 @@ class Runs:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _flow_now(session: Session, key: str) -> dict[str, Any]:
+    """The flow of that key at the version in force now, as a run records it."""
+    version = in_force(session, key) or (0, "")
+    return {"key": key, "version": version[0], "sha256": version[1]}
 
 
 def is_finding(item: BacklogItem) -> bool:

@@ -28,12 +28,13 @@ from sqlalchemy.orm import sessionmaker
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.flow_library import AUDIT, DISCOVER
+from engineering_control.engine.interpreter import Engine
+from engineering_control.engine.records import FlowRecords
+from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import pods, steps
-from engineering_control.sandbox.flows import AccountCheck, DeliverIssue, Flow, Follow
-from engineering_control.sandbox.producers import AuditCode, DiscoverEnhancements
+from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
 from engineering_control.supervisor.conversation import Conversation
@@ -114,13 +115,13 @@ class Launcher:
         self._addresses: dict[str, tuple[str, float]] = {}
         self.conversation = conversation
         self.queues = queues
+        # One engine runs every flow: the kind of a run only says what it is recorded as.
+        sessions = getattr(runs, "sessions", None)
+        engine = Engine(runs, github, backlog, FlowRecords(sessions).document if sessions else None)
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
-            "deliver_issue": DeliverIssue(runs, github, backlog),
+            **{kind: engine for kind in (*WORK_KINDS, EVALUATION)},
         }
-        if backlog is not None:
-            self.flows[AUDIT] = AuditCode(runs, github, backlog)
-            self.flows[DISCOVER] = DiscoverEnhancements(runs, github, backlog)
         # The operations role: what went wrong is noticed here, on every few passes.
         self.operations = Operations(runs.sessions, conversation) if conversation else None
         self._watched = 0.0

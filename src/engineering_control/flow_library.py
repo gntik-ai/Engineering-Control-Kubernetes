@@ -44,6 +44,8 @@ DELIVER: Final = "deliver_issue"
 AUDIT: Final = "audit_code"
 DISCOVER: Final = "discover_enhancements"
 WORK_KINDS: Final = (DELIVER, AUDIT, DISCOVER)
+# A run of the evaluation lab: it follows a flow like work does and leaves nothing behind.
+EVALUATION: Final = "evaluation"
 
 _FLOWS: Final = (
     BuiltInFlow(

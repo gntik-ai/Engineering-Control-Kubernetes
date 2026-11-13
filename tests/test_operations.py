@@ -675,11 +675,15 @@ async def test_a_delivery_out_of_rounds_can_be_given_more_up_to_the_ceiling(site
 async def test_a_run_with_more_rounds_goes_back_to_the_implementer_past_the_third(
     site: Any,
 ) -> None:
-    from engineering_control.sandbox.flows import DeliverIssue
+    from engineering_control.engine.interpreter import Engine
+    from engineering_control.engine.tasks import Done
     from engineering_control.sandbox.runs import StepWork
 
-    def review(round_number: int, max_rounds: int | None) -> Any:
-        data: dict[str, Any] = {"maker": "chatgpt"}
+    engine = Engine(site.runs, None, None)
+
+    async def review(round_number: int, max_rounds: int | None) -> Any:
+        data: dict[str, Any] = {"flow": {"key": "deliver-issue", "version": 0}}
+        data["ran"] = {"implement": "chatgpt"}
         if max_rounds is not None:
             data["max_rounds"] = max_rounds
         item = StepWork(
@@ -696,15 +700,20 @@ async def test_a_run_with_more_rounds_goes_back_to_the_implementer_past_the_thir
             pod_name=None,
             attempt=1,
             started_at=None,
-            input={"round": round_number},
+            input={"round": round_number, "seen": ["prepare", "implement"]},
         )
-        return DeliverIssue(site.runs, None)._rework(item, "changes_requested", "Asked.", {}, {})
+        asked = Done("changes", "changes_requested", "Asked.")
+        return await engine._route(engine._context(item), asked)
 
-    assert review(3, None).verdict.succeeded is False, "three rounds, as always"
-    more = review(3, 5)
-    assert more.verdict.succeeded and more.follow[0].given == {"round": 4}
-    assert review(5, 5).verdict.succeeded is False
-    assert "round 5, the last one" in review(5, 5).verdict.detail
+    assert (await review(3, None)).verdict.succeeded is False, "three rounds, as always"
+    more = await review(3, 5)
+    assert more.verdict.succeeded
+    again = more.follow[0]
+    # Back to the implementer, on the subscription it had, for round four.
+    assert (again.name, again.provider, again.given["round"]) == ("implement", "chatgpt", 4)
+    last = await review(5, 5)
+    assert last.verdict.succeeded is False
+    assert "round 5, the last one" in last.verdict.detail
 
 
 def test_the_console_pauses_and_resumes_a_project(site: Any) -> None:
