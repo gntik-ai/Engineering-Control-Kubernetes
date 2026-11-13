@@ -1,0 +1,100 @@
+# The chat channel: the administrator's way to the platform from Telegram. It asks Telegram
+# for what the administrator wrote (long polling), so nothing outside the cluster ever calls
+# the platform for it and it has no listener. It answers one account only
+# (ENGINEERING_TELEGRAM_ADMINISTRATOR_ID), in a private chat with the bot.
+#
+# The bot's token is the Secret engineering-control-telegram (key bot-token), created by
+# the administrator. Without it the process stays up and waits, so the rest of the platform
+# deploys all the same.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineering-control-chat
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: chat
+spec:
+  # One reader: Telegram gives each update to one, and two would take them from each other.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: chat
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: chat
+    spec:
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
+      containers:
+        - name: chat
+          image: engineering-control
+          command: ["engineering-chat"]
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: telegram
+              mountPath: /var/run/secrets/engineering-control-telegram
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: telegram
+          secret:
+            secretName: engineering-control-telegram
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: bot-token
+                path: bot-token
+        - name: tmp
+          emptyDir: {}

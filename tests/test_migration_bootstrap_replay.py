@@ -29,14 +29,15 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0032 (queues and budgets) follows 0031 (the supervisor), 0030 (what a step was
+    # 0033 (the chat channel's memory) follows 0032 (queues and budgets), 0031 (the
+    # supervisor), 0030 (what a step was
     # given), 0029 (runs in sandboxes),
     # 0028 (subscription accounts), 0027 (the backlog),
     # 0026 (sections of a project) and 0025 (projects as records), which follow
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0032", "0031")
+    assert (head, parent) == ("0033", "0032")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -90,6 +91,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0033: what the chat channel remembers. Without it the channel starts again from now.
+    assert {"chat_state", "chat_deliveries"} <= set(inspect(engine).get_table_names())
+    command.downgrade(config, parent)
+    assert "chat_state" not in set(inspect(engine).get_table_names())
     # 0032: queues and budgets. A queue that is under way is an order still to be worked
     # on, so a downgrade must not drop it; drafts and finished queues may go.
     assert {"work_queues", "work_queue_entries", "budgets"} <= set(
@@ -110,10 +115,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
                 {"id": queue_id, "project": project_id, "state": state},
             )
     with pytest.raises(RuntimeError, match="queues that are under way"):
-        command.downgrade(config, parent)
+        command.downgrade(config, "0031")
     with engine.begin() as connection:
         connection.execute(text("UPDATE work_queues SET state = 'finished'"))
-    command.downgrade(config, parent)
+    command.downgrade(config, "0031")
     assert "work_queues" not in set(inspect(engine).get_table_names())
     # 0031: the supervisor's definition, conversation and record of actions, and who
     # proposed an item. An action that waits for the administrator is a decision not taken

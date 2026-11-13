@@ -472,6 +472,57 @@ def test_only_a_turn_of_the_supervisor_reaches_the_tool_service_from_outside() -
         Settings(supervisor_tools_host="0.0.0.0")  # noqa: S104 - refused outside a cluster
 
 
+def test_the_chat_channel_reads_alone_holds_the_bots_token_and_has_no_listener() -> None:
+    documents = _documents()
+    [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-chat")]
+    assert name == "Deployment/engineering-control-chat"
+    deployment = next(
+        d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == name[11:]
+    )
+    # Telegram gives each update to one reader: never two at the same time.
+    assert deployment["spec"]["replicas"] == 1
+    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+    [container] = spec["containers"]
+    assert container["command"] == ["engineering-chat"]
+    assert "ports" not in container
+    assert not [
+        d for d in documents if d["kind"] == "Service" and d["metadata"]["name"].endswith("-chat")
+    ]
+    # The bot's token is mounted into this process and no other; a cluster where the
+    # administrator has not made the Secret yet still starts.
+    holders = {
+        pod: volume
+        for pod, pod_spec in _pod_specs()
+        for volume in pod_spec.get("volumes", [])
+        if volume.get("secret", {}).get("secretName") == "engineering-control-telegram"
+    }
+    assert set(holders) == {name}
+    volume = holders[name]
+    assert volume["secret"]["optional"] is True
+    assert volume["secret"]["items"] == [{"key": "bot-token", "path": "bot-token"}]
+    mount = next(m for m in container["volumeMounts"] if m["name"] == volume["name"])
+    assert mount["readOnly"] is True
+    data = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_API_HOST" in d["data"]
+    )
+    assert data["ENGINEERING_TELEGRAM_TOKEN_FILE"] == f"{mount['mountPath']}/bot-token"
+    host = data["ENGINEERING_CONSOLE_PUBLIC_URL"].removeprefix("https://")
+    settings = Settings(
+        network_boundary="cluster",
+        telegram_administrator_id=int(data["ENGINEERING_TELEGRAM_ADMINISTRATOR_ID"]),
+        telegram_token_file=data["ENGINEERING_TELEGRAM_TOKEN_FILE"],
+        console_public_url=data["ENGINEERING_CONSOLE_PUBLIC_URL"],
+        chat_digest_hour=int(data["ENGINEERING_CHAT_DIGEST_HOUR"]),
+    )
+    assert host in settings.dashboard_allowed_hosts
+    # The token is never a setting: no variable of any pod carries it.
+    for _pod, pod_spec in _pod_specs():
+        for item in pod_spec["containers"]:
+            assert not [e for e in item.get("env", []) if "TELEGRAM" in e["name"]]
+
+
 def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     documents = _documents()
     policies = [

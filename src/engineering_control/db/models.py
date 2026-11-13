@@ -1316,3 +1316,22 @@ class Budget(UUIDPrimaryKey, Timestamps, Base):
         CheckConstraint("at_once IS NULL OR at_once BETWEEN 1 AND 100", name="at_once"),
         CheckConstraint("per_day IS NULL OR per_day BETWEEN 1 AND 10000", name="per_day"),
     )
+
+
+class ChatState(Timestamps, Base):
+    """What the chat channel remembers between restarts (migration 0033): how far it has
+    read the transport's updates, and since when it tells the administrator about things."""
+
+    __tablename__ = "chat_state"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[str] = mapped_column(String(200))
+
+
+class ChatDelivery(UUIDPrimaryKey, Timestamps, Base):
+    """Something the chat channel told the administrator (migration 0033), so that it is
+    told once. ``ref`` names the thing: a message, a run in a state, a day's digest."""
+
+    __tablename__ = "chat_deliveries"
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    ref: Mapped[str] = mapped_column(String(120))
+    __table_args__ = (UniqueConstraint("kind", "ref", name="uq_chat_deliveries_kind_ref"),)

@@ -17,7 +17,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
 | 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
 | 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
-| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy, the supervisor's tools; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
+| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
 | 4 | API, workflow worker | The command bus and the workflow engine's worker |
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
@@ -233,6 +233,35 @@ The supervisor reads projects, sections with their routing brief, the backlog, q
 runs, accounts and the inbox; proposes backlog items and queues; routes items to sections;
 and starts work on an item or a queue when asked. It never publishes, approves or touches a sign-in: there is no tool
 for those.
+
+## The chat channel
+
+`engineering-control-chat` (`base/chat.yaml`, `src/engineering_control/chat/`) is the
+administrator's way to the platform from Telegram. It asks Telegram for what was written
+to the bot (long polling), so nothing outside the cluster calls the platform and no route
+is opened for it. It answers one account, in a private chat with the bot, and ignores
+everyone else without a reply.
+
+Create the bot's token once (the bot is made with Telegram's BotFather; the administrator's
+numeric user id is `ENGINEERING_TELEGRAM_ADMINISTRATOR_ID` in `base/configuration.yaml`):
+
+    kubectl -n engineering-control create secret generic engineering-control-telegram \
+      --from-literal=bot-token='<the token>'
+
+Without the Secret the process stays up and waits. What the channel carries:
+
+- commands the platform answers itself: `/status`, `/inbox`, `/runs`, `/queues`, `/digest`,
+  `/help`;
+- anything else written to the bot is a message to the supervisor, in the same
+  conversation as the console's panel; its reply comes back to the chat;
+- news, each told once: a change that is ready (with a link: publishing needs the
+  password and is done in the console), a run that failed, a queue that finished, paused
+  or was proposed, an account that needs a new sign-in, and what the supervisor proposed
+  and waits for an answer, with Accept and Reject buttons;
+- once a day after `ENGINEERING_CHAT_DIGEST_HOUR` (UTC), the digest of the last day: the
+  runs started and how they ended, what the supervisor did, what waits.
+
+It reports from the moment it first ran; nothing older is sent.
 
 ## Queues and budgets
 

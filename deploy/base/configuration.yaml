@@ -33,6 +33,11 @@ data:
   # The chat channel answers this Telegram account only. The bot's token is in the Secret
   # engineering-control-telegram, created by the administrator.
   ENGINEERING_TELEGRAM_ADMINISTRATOR_ID: "685699815"
+  ENGINEERING_TELEGRAM_TOKEN_FILE: /var/run/secrets/engineering-control-telegram/bot-token
+  # Where the console is reached from outside, for the links in chat messages, and the
+  # hour (UTC) after which the chat channel sends the day's digest.
+  ENGINEERING_CONSOLE_PUBLIC_URL: https://ade.musematic.ai
+  ENGINEERING_CHAT_DIGEST_HOUR: "7"
   # Where the sandboxes run and the sign-ins of subscription accounts are stored
   # (deploy/sandboxes). Only the console has an identity that may write there.
   ENGINEERING_SANDBOX_NAMESPACE: engineering-control-sandboxes

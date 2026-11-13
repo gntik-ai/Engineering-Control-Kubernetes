@@ -210,6 +210,14 @@ class Settings(BaseSettings):
     # The one Telegram account the chat channel answers: the administrator's numeric user
     # id. The bot's token is a mounted secret, never a setting.
     telegram_administrator_id: int | None = Field(default=None, ge=1)
+    telegram_token_file: Path | None = None
+    telegram_api_url: str = Field(
+        default="https://api.telegram.org", pattern=r"^https://[a-z0-9.-]{3,200}$"
+    )
+    # Where the console is reached from outside, for the links in chat messages; and the
+    # hour of the day (UTC) after which the chat channel sends the daily digest.
+    console_public_url: str | None = Field(default=None, pattern=r"^https://[a-z0-9.-]{3,200}$")
+    chat_digest_hour: int = Field(default=7, ge=0, le=23)
     # The namespace the sandboxes run in. Without it the platform acts on no cluster:
     # accounts can be listed but not signed in, and nothing can be run.
     sandbox_namespace: str | None = Field(
