@@ -4,6 +4,7 @@ platform, anything else goes to the supervisor, and news is told once."""
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -178,8 +179,14 @@ def test_replies_are_sent_as_plain_text_with_bold_and_code_and_nothing_else() ->
     assert all(len(part) <= 50 for part in chunks("x" * 500, 50))
 
 
-async def test_the_transport_never_puts_the_token_into_an_error() -> None:
+async def test_the_transport_never_puts_the_token_into_an_error_or_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     seen: list[httpx.Request] = []
+    # The HTTP client logs each request's address when asked for informational messages,
+    # and Telegram's address holds the token: asked for them here, it must log none.
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    caplog.set_level(logging.INFO)
 
     def answer(request: httpx.Request) -> httpx.Response:
         seen.append(request)
@@ -220,6 +227,9 @@ async def test_the_transport_never_puts_the_token_into_an_error() -> None:
     for error in (refused.value, failed.value):
         assert TOKEN not in str(error) and TOKEN not in repr(error.__cause__)
     await telegram.aclose()
+    assert len(seen) >= 4
+    assert not [r for r in caplog.records if TOKEN in r.getMessage() or "bot" in r.getMessage()]
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
 
 
 def test_the_token_is_read_from_its_mounted_file_or_not_at_all(tmp_path: Path) -> None:

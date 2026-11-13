@@ -8,6 +8,7 @@ request's address, so no address is ever logged or put into an error.
 from __future__ import annotations
 
 import html
+import logging
 import re
 from typing import Any, Final
 
@@ -18,6 +19,13 @@ POLL_SECONDS: Final = 25
 _BOLD: Final = re.compile(r"\*\*([^*\n]+)\*\*")
 _CODE: Final = re.compile(r"`([^`\n]+)`")
 _HEADING: Final = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+
+
+def quiet_addresses() -> None:
+    """Keep request addresses out of the log. The HTTP client names the address of every
+    request at the informational level, and Telegram's address holds the bot's token."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 class TelegramError(RuntimeError):
@@ -58,6 +66,7 @@ class Telegram:
         base_url: str = "https://api.telegram.org",
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        quiet_addresses()
         self._client = httpx.AsyncClient(
             base_url=f"{base_url}/bot{token}/",
             timeout=httpx.Timeout(POLL_SECONDS + 15, connect=10),
