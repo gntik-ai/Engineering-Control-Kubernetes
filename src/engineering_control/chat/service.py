@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from engineering_control.chat.channel import ChatChannel
 from engineering_control.chat.telegram import Telegram, TelegramError
 from engineering_control.config import Settings, get_settings
+from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import Runs
@@ -32,6 +33,7 @@ LOG = structlog.get_logger(__name__)
 DELIVER_SECONDS: Final = 5.0
 RETRY_SECONDS: Final = 15.0
 NOT_SET_UP_SECONDS: Final = 60.0
+STALLED_SECONDS: Final = 900.0
 
 
 def token_from(settings: Settings) -> str | None:
@@ -43,11 +45,15 @@ def token_from(settings: Settings) -> str | None:
     return token or None
 
 
-async def read_updates(channel: ChatChannel, telegram: Telegram, stop: asyncio.Event) -> None:
+async def read_updates(
+    channel: ChatChannel, telegram: Telegram, stop: asyncio.Event, health: Health | None = None
+) -> None:
     """Handle every update once, in order. How far it has read survives a restart."""
     stored = channel.remembered("offset")
     offset = int(stored) if stored and stored.isdigit() else None
     while not stop.is_set():
+        if health is not None:
+            health.beat("updates")
         try:
             updates = await telegram.updates(offset)
         except TelegramError as error:
@@ -70,8 +76,12 @@ async def read_updates(channel: ChatChannel, telegram: Telegram, stop: asyncio.E
                 await asyncio.to_thread(channel.remember, "offset", str(offset))
 
 
-async def tell_news(channel: ChatChannel, stop: asyncio.Event) -> None:
+async def tell_news(
+    channel: ChatChannel, stop: asyncio.Event, health: Health | None = None
+) -> None:
     while not stop.is_set():
+        if health is not None:
+            health.beat("news")
         try:
             await channel.deliver()
         except TelegramError as error:
@@ -89,6 +99,15 @@ async def serve(settings: Settings | None = None) -> None:
     loop = asyncio.get_running_loop()
     for name in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(name, stop.set)
+    health = Health("chat")
+    told = await listen(health, resolved.health_host, resolved.health_port)
+    try:
+        await _serve(resolved, stop, health)
+    finally:
+        told.close()
+
+
+async def _serve(resolved: Settings, stop: asyncio.Event, health: Health) -> None:
     while not stop.is_set():
         token = token_from(resolved)
         if token is not None and resolved.telegram_administrator_id is not None:
@@ -126,9 +145,13 @@ async def serve(settings: Settings | None = None) -> None:
         digest_hour=resolved.chat_digest_hour,
     )
     LOG.info("chat_started", since=channel.since().isoformat())
+    # A request for updates waits up to half a minute; a message to the supervisor is
+    # answered within its turn. Either loop standing for this long is a process to restart.
+    health.expect("updates", within=STALLED_SECONDS)
+    health.expect("news", within=STALLED_SECONDS)
     tasks = [
-        asyncio.create_task(read_updates(channel, telegram, stop)),
-        asyncio.create_task(tell_news(channel, stop)),
+        asyncio.create_task(read_updates(channel, telegram, stop, health)),
+        asyncio.create_task(tell_news(channel, stop, health)),
     ]
     try:
         # A request for updates waits up to half a minute: on a stop it is not waited for.

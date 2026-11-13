@@ -4,7 +4,9 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 
 | Path | What it is |
 | --- | --- |
-| `base/` | Kustomize manifests for the control plane: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, Temporal, API, console, evidence ingest, notifier, workflow worker |
+| `base/` | Kustomize manifests for the platform: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, console, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel |
+| `sandboxes/` | The namespace the sandboxes run in: its rules, its quota, what may act in it |
+| `monitoring/` | For a cluster with the Prometheus operator: what reads the platform's numbers, and the alert rules |
 | `registry/` | A one-template Helm chart that creates the image pull Secret from parameters held in Argo CD |
 | `argocd/` | The Argo CD project and applications, as applied |
 
@@ -12,31 +14,35 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 
 | Wave | Resource | Purpose |
 | --- | --- | --- |
-| −2, −1 | Namespace, settings, service accounts, role, network policies, Temporal configuration | Everything the rest needs |
-| −1, 0 | Certificate authority and Temporal's certificate | TLS between the platform and Temporal |
-| 0 | Two PostgreSQL clusters; Job `bootstrap-secrets` | The platform's database and Temporal's; the Secret with service tokens and the session key, generated in the cluster |
-| 1 | Jobs `migrate-database` and `temporal-schema` | `alembic upgrade head`; Temporal's schemas |
-| 2 | Job `bootstrap-admin-password`; Temporal server | First dashboard password, stored in the Secret `engineering-control-admin`; one pod running Temporal's four services |
-| 3 | Console, evidence ingest (with its evidence volume), notifier, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel; Job `temporal-namespace` | Processes that need no Temporal; the platform's Temporal namespace |
-| 4 | API, workflow worker | The command bus and the workflow engine's worker |
+| −2, −1 | Namespace, settings, service accounts, role, network policies | Everything the rest needs |
+| 0 | The PostgreSQL cluster; Job `bootstrap-secrets` | The platform's database; the Secret with the console's session key and the key of the sandboxes' grants, generated in the cluster |
+| 1 | Job `migrate-database` | `alembic upgrade head` |
+| 2 | Job `bootstrap-admin-password` | First console password, stored in the Secret `engineering-control-admin` |
+| 3 | Console, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel | The platform's five processes |
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
-Not deployed yet: the scheduler (it would start recurring workflows whose activities need
-role workers that do not exist yet).
+The five processes, and what each is for:
 
-## TLS to Temporal
+| Process | What it does | Holds |
+| --- | --- | --- |
+| Console (`engineering-dashboard`) | The pages and their API; keeps the backlogs in step with GitHub | The session key, the GitHub App's key, an identity that may write sign-ins into the sandbox namespace |
+| Launcher (`engineering-launcher`) | Drives every run: starts each step as a pod in the sandbox namespace, reads what it did, decides what comes next by the run's flow | The GitHub App's key, the grant key, an identity that may act on pods in the sandbox namespace |
+| Proxy (`engineering-egress`) | The sandboxes' only way out: opens tunnels to named hosts | The grant key |
+| Tools (`engineering-tools`) | What the supervisor may read and do, called from the sandbox of its turn | The GitHub App's key |
+| Chat (`engineering-chat`) | The administrator's way in from Telegram | The bot's token |
 
-`base/certificates.yaml` asks the cluster's cert-manager for a certificate authority of the
-platform's own and for the certificate the Temporal server presents. The API, the workflow
-worker and the namespace Job mount the authority's certificate only, and refuse a server
-that cannot show a certificate signed by it. The server's key is mounted in the Temporal
-pod alone. cert-manager renews both; the server rereads its certificate every hour.
-Clients do not present a certificate: the network policy decides who may connect.
+A run's state is the run's record in the database, and nothing else holds a copy of it:
+the launcher writes it, the console and the chat channel read it. There is no workflow
+engine beside the launcher and nothing to reconcile.
+
+## Who reaches what
 
 Only the console is reachable from outside. The ingress controller runs on a node's own
 network, so a network policy lets the cluster's nodes, by address, reach the console's HTTP
 port; no pod outside the namespace can. Every other port and every other pod accepts
-connections from its own namespace only. The node addresses are listed in
+connections from its own namespace only, with two exceptions that `base/network-policy.yaml`
+spells out: a sandbox whose step may reach out reaches the proxy, and the sandbox of a
+turn of the supervisor reaches the tools. The node addresses are listed in
 `base/network-policy.yaml` and, for the sign-in counter, in `base/configuration.yaml`; both
 change if a node is added or renumbered.
 
@@ -72,16 +78,19 @@ administrator creates and which is not in this repository:
 kubectl -n engineering-control create secret generic engineering-control-github-app --from-file=private-key.pem=/path/to/key.pem --from-literal=client-secret='...'
 ```
 
-Only the console mounts it, and only the private key. With it the console lists the
-repositories the app is installed on and reads their open issues for the backlog, using a
-token limited to reading metadata and issues. It reads the issues of every project every
+The console, the launcher and the supervisor's tools mount it, and only the private key.
+With it the console lists the repositories the app is installed on and reads their open
+issues for the backlog, using a token limited to reading metadata and issues; the launcher
+checks a repository out for a run and publishes a change the administrator agreed to. It reads the issues of every project every
 fifteen minutes (`ENGINEERING_BACKLOG_SYNC_MINUTES`; zero leaves it to the Sync button).
 
 ## Rules the manifests keep
 
 `tests/test_deploy_manifests.py` fails if a pod could run as root, write its root
 filesystem, keep a capability, or hold a cluster identity it does not need; if the image is
-not pinned to a commit; or if a Secret value is committed.
+not pinned to a commit; or if a Secret value is committed. `tests/test_health.py` fails if
+a process with a loop could stand still without being restarted, or if an alert rule is
+written on a number the platform does not say.
 
 ## Releasing a version
 
@@ -100,7 +109,7 @@ Secret `engineering-control-admin` to the new, empty database.
 
 ## The first password
 
-After the first synchronisation the initial dashboard password is in the Secret
+After the first synchronisation the initial console password is in the Secret
 `engineering-control-admin`, key `initial-password`, in the `engineering-control` namespace:
 
 ```bash
@@ -611,17 +620,19 @@ From a terminal that has `kubectl` for the cluster, as the original's controller
 the same is three commands and no browser:
 
 ```bash
-kubectl -n engineering-control exec deploy/engineering-control-api -- \
+kubectl -n engineering-control exec deploy/engineering-control-console -- \
   engineering-ctl records script > export_original_records.py
 sudo /opt/engineering-control/venv/bin/python export_original_records.py \
   --project falcone-workflow --output falcone-workflow.records.json
 sudo cat falcone-workflow.records.json | kubectl -n engineering-control exec -i \
-  deploy/engineering-control-api -- engineering-ctl records bring-over falcone-workflow
+  deploy/engineering-control-console -- engineering-ctl records bring-over falcone-workflow
 ```
 
 `engineering-ctl records preview <project>` says what a file would bring over without
 storing anything; `--even-if-running` moves the work although the original still ran
-something.
+something; `engineering-ctl records status` says which projects have been moved;
+`engineering-ctl records move-without-records <project>` moves a project and keeps
+nothing of the original's.
 
 What is brought over (`dashboard/bring_over.py`):
 
@@ -637,6 +648,264 @@ What is brought over (`dashboard/bring_over.py`):
 
 The same file can be applied again; nothing is doubled. A project with nothing worth
 keeping can be moved without a file. The original system is not touched by any of this.
+
+### All the remaining projects in one pass
+
+On the original's controller host, with `kubectl` for the cluster. Each project is
+exported and brought over in turn; one the original still works on is held back and the
+others go on. Nothing is started on the original for a project once it is moved.
+
+```bash
+kubectl -n engineering-control exec deploy/engineering-control-console -- \
+  engineering-ctl records script > export_original_records.py
+for project in falcone musematic llmwiki gntik-ui falcone-serverless; do
+  sudo /opt/engineering-control/venv/bin/python export_original_records.py \
+    --project "$project" --output "$project.records.json" &&
+  sudo cat "$project.records.json" | kubectl -n engineering-control exec -i \
+    deploy/engineering-control-console -- engineering-ctl records bring-over "$project"
+done
+kubectl -n engineering-control exec deploy/engineering-control-console -- \
+  engineering-ctl records status
+```
+
+The last command lists every project with `"here": true` once its work is on this
+platform. The files hold the projects' records (findings, approvals, issue texts): remove
+them from the host when the status says what it should.
+
+### Retiring the original's hosts
+
+When `records status` says `"here": true` for every project, the original has nothing left
+to do. Retiring it is done on its two hosts, by the administrator; this platform is not
+involved and nothing here depends on those hosts. In this order:
+
+1. On both hosts, stop and disable the original's units, so that nothing starts again
+   after a restart:
+
+   ```bash
+   sudo systemctl disable --now 'engineering-*.service' 'engineering-*.timer' 'engineering-*.path'
+   ```
+
+   On the controller host this includes `engineering-infrastructure.service`, which stops
+   the original's PostgreSQL and Temporal containers and keeps their data.
+
+2. Keep a copy of the original's database before anything is removed. It is the only
+   place that has what was not brought over (finished campaigns, transcripts, the record
+   of what was done):
+
+   ```bash
+   sudo systemctl start engineering-infrastructure.service
+   sudo docker exec engineering-postgresql sh -c 'pg_dumpall --username "$POSTGRES_USER"' \
+     | gzip > engineering-control-original.sql.gz
+   sudo systemctl stop engineering-infrastructure.service
+   ```
+
+   Keep the evidence directory (`/srv/engineering/evidence`) with it for as long as the
+   records might be asked for.
+
+3. The Hermes gateway on the controller host talked to the original's API. With the API
+   stopped its engineering commands answer nothing; switch its engineering plugin off, or
+   retire the gateway, as suits what else it is used for. The platform's own chat channel
+   (`engineering-control-chat`) has taken its place.
+
+4. Credentials that only the original used can be withdrawn: the GitHub tokens of its
+   service identities, the subscription sign-ins on the worker host (the platform has its
+   own, stored in the cluster), and the DNS or tunnel entries that pointed at the hosts.
+   `ade.musematic.ai` already points at the cluster and stays.
+
+5. What remains on the hosts (`/opt/engineering-control`, `/etc/engineering-control`,
+   `/var/lib/engineering-control`, `/srv/engineering`) can be deleted once the copy of
+   step 2 is somewhere safe. Until then the original can be started again exactly as it
+   was, by enabling its units.
+
+The original repository is not changed by any of this and keeps the original's code.
+
+## Watching the platform
+
+Every process says how it is doing on one more port (8799, `ENGINEERING_HEALTH_PORT`),
+for the cluster alone: the port is in no Service and behind no route
+(`src/engineering_control/health.py`).
+
+- `/healthz` answers 200 while every loop the process has named turned within its time,
+  and 503 with the names of the ones that did not. The launcher's pass over the work and
+  the chat channel's two loops are watched this way, and the kubelet restarts a process
+  whose loop stands. The console, the proxy and the tools are probed on their own ports.
+- `/metrics` gives the same and what the process counts, in the text format Prometheus
+  reads. The launcher adds the state of the work, read from the records at that moment
+  (`platform_metrics.py`): runs by state, how long the oldest queued run has waited, runs
+  ended in the last hour, steps running, accounts by state, troubles not closed, queues,
+  open items, backlogs that could not be synced, and whether the database answers.
+
+To look by hand:
+
+```bash
+kubectl -n engineering-control port-forward deploy/engineering-control-launcher 8799 &
+curl -s localhost:8799/metrics | grep -v '^#'
+```
+
+The pods carry the annotations `prometheus.io/scrape`, `prometheus.io/port` and
+`prometheus.io/path`, which a Prometheus set up to follow annotations reads without more.
+For a cluster with the Prometheus operator, `deploy/monitoring` has a PodMonitor, the
+alert rules, and the network policy that lets the monitoring namespace reach the health
+port. It is not part of `base`, because a cluster without the operator's kinds could not
+take it. Set the namespace Prometheus runs in in `monitoring/network-policy.yaml`, then:
+
+```bash
+kubectl apply -k deploy/monitoring
+```
+
+Without any of that the platform still tells what matters where the administrator
+already looks: a run that failed, an account that needs a sign-in, a queue that paused
+and what the supervisor proposes are in the Inbox and are told in the chat channel once
+each (see "The chat channel" and "Trouble with the work").
+
+## When something is wrong
+
+Each alert rule in `deploy/monitoring/rules.yaml` names one of the sections below. The
+commands assume `kubectl` for the cluster; `<process>` is one of `console`, `launcher`,
+`egress`, `tools`, `chat`.
+
+### A process is down or restarts
+
+```bash
+kubectl -n engineering-control get pods
+kubectl -n engineering-control describe pod -l app.kubernetes.io/component=<process>
+kubectl -n engineering-control logs deploy/engineering-control-<process> --tail=100
+kubectl -n engineering-control logs deploy/engineering-control-<process> --previous --tail=100
+```
+
+- `ImagePullBackOff`: the pull Secret is missing or its token has ended. See "Pulling the
+  image".
+- Restarted by its liveness probe, with `stalled: pass` (launcher) or `stalled: updates`
+  or `news` (chat) in the events: a loop stood still. The restart is the remedy; if it
+  repeats, the log before the restart (`--previous`) says what it was waiting for, most
+  often the cluster's API or the database.
+- A process that exits at start with a `ValidationError` names the setting it could not
+  read: `base/configuration.yaml`, or a Secret that is not mounted.
+- Nothing is lost by restarting any of them: `kubectl -n engineering-control rollout
+  restart deploy/engineering-control-<process>`. The launcher picks every run up where its
+  record says it is; a step whose pod is still there is read, not started again.
+
+### The database does not answer
+
+`engineering_database_up 0`, the console answering 503 on `/health/ready`, or
+`launcher_pass_failed` in the launcher's log.
+
+```bash
+kubectl -n engineering-control get cluster.postgresql.cnpg.io
+kubectl -n engineering-control get pods -l cnpg.io/cluster=engineering-control-postgres
+kubectl -n engineering-control logs engineering-control-postgres-1 --tail=50
+```
+
+- The pod is not running: the operator (CloudNativePG, in its own namespace) brings it
+  back; its events say why it cannot (most often the node or the volume).
+- The pod runs and the platform still cannot connect: the password changed because the
+  cluster was created again. Restart the five deployments ("Replacing a database").
+- Runs under way are not lost while the database is away: the launcher's passes fail and
+  go on when it is back, and the sandboxes' pods keep running meanwhile.
+
+### Runs wait and do not start
+
+The Runs page says for each run what it waits for. The usual reasons:
+
+- "Waiting for a place on the sandbox node": the node is full, or it lost its label and
+  taint ("The sandbox node"). `kubectl -n engineering-control-sandboxes get pods` shows
+  what is running there.
+- No account can be used: every account of the subscription the step needs is limited,
+  paused or needs a sign-in. The Accounts page says which, and when a limit ends.
+- As many steps as may run at once are running (`ENGINEERING_SANDBOX_PARALLEL_STEPS`), or
+  the namespace's quota is reached (`deploy/sandboxes/quota.yaml`).
+- The project is paused, a budget is reached, or the run belongs to a queue that is
+  paused: the project's page and the Queues page say so ("Queues and budgets").
+
+### Runs fail
+
+A run that fails is told in the Inbox and in chat, and the supervisor looks at it by
+itself ("Trouble with the work"): its diagnosis is on the run's page and in the
+supervisor's record. To look yourself: the run's page shows every step with what it
+printed; a step that never started says what the cluster answered. Several runs failing
+at the same step within an hour is rarely the work itself: look at the accounts (a
+subscription refusing), at the proxy's log (a host that is not named), and at
+`kubectl -n engineering-control-sandboxes get events --sort-by=.lastTimestamp`.
+
+### An account needs a new sign-in
+
+The provider ended the sign-in. On the Accounts page, sign the account in again; the
+platform stores the new sign-in in the sandbox namespace and tries it. Runs that waited
+for the account go on by themselves. While no account of a subscription is ready, steps
+that need it wait; they do not fail.
+
+### A backlog is not in step with GitHub
+
+The project's page says what GitHub answered. The usual reasons: the GitHub App is no
+longer installed on the repository (install it again in the organisation's settings),
+the repository was renamed or removed, or the App's key was replaced (create the Secret
+`engineering-control-github-app` again, "The GitHub App", and restart the console, the
+launcher and the tools). "Sync with GitHub" on the Backlog page tries at once.
+
+### A sandbox cannot reach a host
+
+```bash
+kubectl -n engineering-control logs deploy/engineering-control-egress --tail=200 | grep egress_refused
+```
+
+Each refusal names the host and why. A host a project's work really needs is added to the
+list ("The sandboxes' way out"); a project's own application is reached with a grant, by
+naming the application and its other hosts on the project's page ("Code clean, and the
+audits of the running application"). An agent asking for hosts nobody named is worth a
+look at what it was doing: the run's page has its steps.
+
+### The console's password is lost
+
+```bash
+kubectl -n engineering-control exec deploy/engineering-control-console -- \
+  engineering-ctl dashboard reset-password --output-file /tmp/password
+kubectl -n engineering-control exec deploy/engineering-control-console -- cat /tmp/password
+kubectl -n engineering-control exec deploy/engineering-control-console -- rm /tmp/password
+```
+
+Every session that was signed in ends. Change the password after signing in if the
+terminal's history is kept.
+
+### The chat channel is silent
+
+```bash
+kubectl -n engineering-control logs deploy/engineering-control-chat --tail=50
+```
+
+`chat_not_set_up` says which of the two things it needs is missing: the bot's token (the
+Secret `engineering-control-telegram`) or the administrator's account id (a setting).
+`chat_transport_error` is Telegram not answering or refusing the token; after replacing
+the token, restart the deployment, which reads it at start ("The chat channel").
+
+### Going back to the release before
+
+Every release is a commit of `base/kustomization.yaml` that names an image. Going back is
+synchronising the application to the commit before. A migration that the newer release
+applied stays applied. The platform's migrations so far only add tables and columns the
+older code does not need to fill, so the release before runs on the newer schema; read
+the migration (`migrations/versions/`) before going back across one that does more.
+
+## What consolidation left behind
+
+With phase 8 the platform stopped carrying the original's way of working: its workflows,
+its command API, Temporal, the notifier and the evidence ingest are gone from the code
+and from the cluster. Three things were left in the cluster on purpose, because removing
+them deletes something for good and that is the administrator's decision:
+
+- `base/leftovers.yaml` keeps the two objects that hold a data volume: the claim
+  `engineering-control-evidence` and the PostgreSQL cluster
+  `engineering-control-temporal-postgres`. Nothing uses either. To remove them, delete the
+  file and its line in `base/kustomization.yaml`, and synchronise with pruning.
+- The Secret `engineering-control-secrets` still holds the keys the removed processes
+  read (`api.token`, `evidence-ingest.token`, the `*-runner.token` keys). Nothing mounts
+  them; they go when the Secret is next created anew, or by hand.
+- The certificates of the connection to Temporal were removed; the Secrets cert-manager
+  made for them (`engineering-control-ca`, `engineering-control-temporal-tls`) stay until
+  deleted: `kubectl -n engineering-control delete secret engineering-control-ca
+  engineering-control-temporal-tls`.
+
+The tables the original's records were brought into stay in the database as they are:
+they are what "Moving a project's work here" filled, and nothing else writes them.
 
 ## The sandbox image
 

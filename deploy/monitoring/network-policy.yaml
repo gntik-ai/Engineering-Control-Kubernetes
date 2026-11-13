@@ -1,0 +1,20 @@
+# The platform's pods accept connections from their own namespace only
+# (deploy/base/network-policy.yaml). This lets the namespace Prometheus runs in reach the
+# health port, and nothing else. Change the namespace's name below to the one in use.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitoring-reads-health
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8799

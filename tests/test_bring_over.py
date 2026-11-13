@@ -35,6 +35,7 @@ from engineering_control.db.models import (
     FindingVerification,
     ProjectRecord,
 )
+from engineering_control.projects import PROJECTS
 
 REPOSITORY = "gntik-ai/falcone-workflow"
 NOW = "2026-11-01T10:00:00+00:00"
@@ -605,6 +606,32 @@ def test_the_command_line_does_what_the_page_does(site: Any, tmp_path: Path) -> 
     assert wrong.returncode == 1 and "not of musematic" in wrong.stderr
     # Only the projects the original knows have records there.
     assert ctl("records", "preview", "made-here", "--file", str(exported)).returncode == 2
+    # Which projects are here, for the administrator who moves the rest in one pass.
+    status = json.loads(ctl("records", "status").stdout)
+    assert status["falcone-workflow"]["here"] is True
+    assert status["musematic"]["here"] is False and set(status) == set(PROJECTS)
+    # A project with nothing worth keeping is moved without a file.
+    ProjectRecords(site.sessions).sync_registry()
+    moved = ctl("records", "move-without-records", "llmwiki")
+    assert moved.returncode == 0, moved.stderr
+    assert json.loads(ctl("records", "status").stdout)["llmwiki"]["here"] is True
+    # Without the database's address the command says so in one line.
+    without = {k: v for k, v in os.environ.items() if k != "ENGINEERING_DATABASE_URL"}
+    lost = subprocess.run(  # noqa: S603 - the package's own command
+        [
+            sys.executable,
+            "-c",
+            "from engineering_control.cli import main; main()",
+            "records",
+            "status",
+        ],
+        env=without,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert lost.returncode == 1
+    assert lost.stderr.strip() == "engineering-ctl: ENGINEERING_DATABASE_URL is unavailable"
 
 
 def test_the_console_previews_brings_over_and_shows_where_the_work_is(site: Any) -> None:

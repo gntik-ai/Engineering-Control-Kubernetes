@@ -33,7 +33,9 @@ from engineering_control.engine.interpreter import Engine
 from engineering_control.engine.records import FlowRecords
 from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
+from engineering_control.platform_metrics import platform_metrics, unavailable
 from engineering_control.sandbox import deliver, pods, steps
 from engineering_control.sandbox.egress import grant, read_grant_key
 from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
@@ -47,6 +49,9 @@ from engineering_control.supervisor.turn import SupervisorTurn
 
 LOG = structlog.get_logger(__name__)
 PASS_SECONDS: Final = 3.0
+# A pass looks at every step under way and asks the cluster about each: minutes at most.
+# One that has not come back after this long is taken to stand, and the process restarted.
+STALLED_SECONDS: Final = 600.0
 WORKSPACE_GIBIBYTES: Final = 10
 PROXY_LOOKUP_SECONDS: Final = 60.0
 WATCH_SECONDS: Final = 20.0
@@ -501,6 +506,18 @@ async def serve(settings: Settings | None = None) -> None:
     loop = asyncio.get_running_loop()
     for name in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(name, stop.set)
+    health = Health("launcher")
+
+    async def state_of_the_work() -> list[str]:
+        try:
+            return await asyncio.to_thread(platform_metrics, sessions)
+        except Exception:  # noqa: BLE001 - said as a number: the database does not answer
+            return unavailable()
+
+    told = await listen(health, resolved.health_host, resolved.health_port, extra=state_of_the_work)
+    # A pass that fails (the database away for a moment) still turns the loop: a restart
+    # would not bring the database back. A pass that never returns does not.
+    health.expect("pass", within=STALLED_SECONDS)
     LOG.info("launcher_started", namespace=sandboxes.namespace, image=sandboxes.image)
     try:
         while not stop.is_set():
@@ -508,9 +525,12 @@ async def serve(settings: Settings | None = None) -> None:
                 await launcher.tick()
             except Exception as error:  # noqa: BLE001 - the database may be away for a moment
                 LOG.error("launcher_pass_failed", error=repr(error)[:300])
+                health.count("launcher_pass_failed")
+            health.beat("pass")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=PASS_SECONDS)
     finally:
+        told.close()
         await cluster.aclose()
         if github is not None:
             await github.aclose()

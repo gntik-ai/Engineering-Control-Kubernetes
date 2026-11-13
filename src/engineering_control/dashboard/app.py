@@ -99,6 +99,7 @@ from engineering_control.dashboard.schemas import (
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
 from engineering_control.projects import PROJECT_SET
 
@@ -185,11 +186,17 @@ def create_app(
         "health-readiness": 0,
         "logout-revocation": 0,
         "session-validation": 0,
+        "backlog-sync": 0,
+        "project-registry": 0,
+        "record-cleanup": 0,
     }
+    health = Health("console")
 
     def log_failure(key: str, message: str, error: BaseException) -> None:
         active_failures.add(key)
-        failure_totals[key] += 1
+        # A key that is not listed above is still counted: a failure is never an error
+        # of its own.
+        failure_totals[key] = failure_totals.get(key, 0) + 1
         now = time.monotonic()
         if now < failure_log_next.get(key, 0.0):
             failure_log_suppressed[key] = failure_log_suppressed.get(key, 0) + 1
@@ -224,6 +231,7 @@ def create_app(
         repository gone, GitHub not answering) never stops the others or the console."""
         await asyncio.sleep(min(60, interval_seconds))
         while True:
+            health.beat("backlog-sync")
             try:
                 names = await backlog_service.active_project_names()
             except Exception as error:  # noqa: BLE001 - try again at the next interval
@@ -237,6 +245,48 @@ def create_app(
                     log_failure("backlog-sync", "dashboard backlog sync failed", error)
             await asyncio.sleep(interval_seconds)
 
+    async def keep_the_record_short(kept: DashboardRepository) -> None:
+        """Four times a day, drop what the record of the console holds beyond its time."""
+        while True:
+            try:
+                await kept.delete_expired_events(
+                    retention_days=resolved.dashboard_event_retention_days
+                )
+                log_recovery("record-cleanup", "dashboard record clean-up recovered")
+            except Exception as error:  # noqa: BLE001 - tried again at the next turn
+                log_failure("record-cleanup", "dashboard record clean-up failed", error)
+            await asyncio.sleep(6 * 3600)
+
+    def own_metrics() -> list[str]:
+        """What the console counts about itself: failures at the edges it guards."""
+        labels = {key: key.replace("-", "_").removeprefix("health_") for key in failure_totals}
+        lines = [
+            "# HELP engineering_dashboard_persistence_failures_total "
+            "Fixed-boundary persistence failures.",
+            "# TYPE engineering_dashboard_persistence_failures_total counter",
+        ]
+        lines.extend(
+            "engineering_dashboard_persistence_failures_total"
+            f'{{operation="{label}"}} {failure_totals[key]}'
+            for key, label in labels.items()
+        )
+        lines.extend(
+            [
+                "# HELP engineering_dashboard_persistence_failure_active "
+                "One while the fixed persistence boundary has not recovered.",
+                "# TYPE engineering_dashboard_persistence_failure_active gauge",
+            ]
+        )
+        lines.extend(
+            "engineering_dashboard_persistence_failure_active"
+            f'{{operation="{label}"}} {int(key in active_failures)}'
+            for key, label in labels.items()
+        )
+        return lines
+
+    async def told_to_the_cluster() -> list[str]:
+        return own_metrics()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -245,8 +295,8 @@ def create_app(
         app.state.dashboard_repository = resolved_repository
         app.state.dashboard_service = DashboardService(resolved_repository)
         try:
-            # The projects the workflows know by name are records too; a release that adds
-            # one to the registry gets its record here.
+            # The projects the original system worked on are records too; a release that
+            # adds one to the registry gets its record here.
             await app.state.dashboard_service.sync_registry_projects()
         except Exception as error:  # noqa: BLE001 - the console must start without it
             log_failure("project-registry", "dashboard project registry sync failed", error)
@@ -260,19 +310,33 @@ def create_app(
         if resolved_cluster is None and repository is None:
             resolved_cluster = Cluster.from_settings(resolved)
         app.state.cluster = resolved_cluster
-        keeper: asyncio.Task[None] | None = None
+        keepers: list[asyncio.Task[None]] = []
         # Keep every project's backlog in step with GitHub, unless a fixture supplied the
         # app (a test drives the import itself) or the interval is zero.
         if github_app is None and resolved_github is not None and resolved.backlog_sync_minutes:
-            keeper = asyncio.create_task(
-                keep_backlogs_in_step(
-                    app.state.dashboard_service,
-                    resolved_github,
-                    interval_seconds=resolved.backlog_sync_minutes * 60,
+            interval = resolved.backlog_sync_minutes * 60
+            # GitHub may be slow for every project in turn; three intervals without a
+            # pass is a loop that stands.
+            health.expect("backlog-sync", within=3 * interval + 600)
+            keepers.append(
+                asyncio.create_task(
+                    keep_backlogs_in_step(
+                        app.state.dashboard_service, resolved_github, interval_seconds=interval
+                    )
                 )
             )
+        told: asyncio.Server | None = None
+        # The process itself, not an app a test made: it says how it is doing to the
+        # cluster, and keeps its own record within its time.
+        if repository is None:
+            keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
+            told = await listen(
+                health, resolved.health_host, resolved.health_port, extra=told_to_the_cluster
+            )
         yield
-        if keeper is not None:
+        if told is not None:
+            told.close()
+        for keeper in keepers:
             keeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await keeper
@@ -427,33 +491,7 @@ def create_app(
     async def internal_metrics(request: Request) -> Response:
         if _request_host(request.headers.get("host")) not in {"127.0.0.1", "localhost", "::1"}:
             return Response(status_code=404)
-        labels = {
-            "health-readiness": "readiness",
-            "logout-revocation": "logout_revocation",
-            "session-validation": "session_validation",
-        }
-        lines = [
-            "# HELP engineering_dashboard_persistence_failures_total "
-            "Fixed-boundary persistence failures.",
-            "# TYPE engineering_dashboard_persistence_failures_total counter",
-        ]
-        lines.extend(
-            "engineering_dashboard_persistence_failures_total"
-            f'{{operation="{label}"}} {failure_totals[key]}'
-            for key, label in labels.items()
-        )
-        lines.extend(
-            [
-                "# HELP engineering_dashboard_persistence_failure_active "
-                "One while the fixed persistence boundary has not recovered.",
-                "# TYPE engineering_dashboard_persistence_failure_active gauge",
-            ]
-        )
-        lines.extend(
-            "engineering_dashboard_persistence_failure_active"
-            f'{{operation="{label}"}} {int(key in active_failures)}'
-            for key, label in labels.items()
-        )
+        lines = own_metrics()
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.get("/robots.txt")

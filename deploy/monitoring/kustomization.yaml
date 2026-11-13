@@ -1,0 +1,14 @@
+# For a cluster that has the Prometheus operator: what reads the platform's numbers and
+# the rules written on them. It is not part of deploy/base, because a cluster without the
+# operator's kinds could not take it; apply it by itself where they exist
+# (deploy/README.md, "Watching the platform").
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: engineering-control
+resources:
+  - pod-monitor.yaml
+  - rules.yaml
+  - network-policy.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: engineering-control

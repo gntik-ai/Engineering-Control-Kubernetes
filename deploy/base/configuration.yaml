@@ -10,6 +10,9 @@ data:
   # Listeners are on the pod interface; network policy decides who may reach them.
   ENGINEERING_NETWORK_BOUNDARY: cluster
   ENGINEERING_DASHBOARD_HOST: 0.0.0.0
+  # Where each process says how it is doing: to the kubelet and to whatever reads the
+  # platform's numbers. In no Service and behind no route.
+  ENGINEERING_HEALTH_HOST: 0.0.0.0
   # The ingress controller connects from a node address (see network-policy.yaml); only
   # such connections may say which client address a sign-in attempt is counted against.
   ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS: >-

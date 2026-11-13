@@ -26,6 +26,12 @@ spec:
       app.kubernetes.io/component: chat
   template:
     metadata:
+      annotations:
+        # Where the process says how it is doing (health.py): read by a Prometheus that
+        # follows these annotations, or by the monitors in deploy/monitoring.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8799"
+        prometheus.io/path: /metrics
       labels:
         app.kubernetes.io/name: engineering-control
         app.kubernetes.io/component: chat
@@ -54,6 +60,9 @@ spec:
         - name: chat
           image: engineering-control
           command: ["engineering-chat"]
+          ports:
+            - name: health
+              containerPort: 8799
           envFrom:
             - configMapRef:
                 name: engineering-control-settings
@@ -75,6 +84,20 @@ spec:
             # warnings and errors only, whatever the platform's level is.
             - name: ENGINEERING_LOG_LEVEL
               value: WARNING
+          # A loop that stands is a process to restart: /healthz says so (health.py).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

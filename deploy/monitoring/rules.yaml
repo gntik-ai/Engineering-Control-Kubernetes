@@ -1,0 +1,132 @@
+# What is worth being told about. Each rule names the section of deploy/README.md
+# ("When something is wrong") that says what to look at and what to do. The numbers are
+# the platform's own (src/engineering_control/health.py and platform_metrics.py);
+# tests/test_health.py checks that every name used here is one the platform exports.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: engineering-control
+spec:
+  groups:
+    - name: engineering-control.processes
+      rules:
+        - alert: EngineeringLauncherDown
+          expr: absent(engineering_process_uptime_seconds{process="launcher"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The launcher is not running; no run can start or go on.
+            runbook: deploy/README.md#a-process-is-down-or-restarts
+        - alert: EngineeringConsoleDown
+          expr: absent(engineering_process_uptime_seconds{process="console"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The console is not running.
+            runbook: deploy/README.md#a-process-is-down-or-restarts
+        - alert: EngineeringEgressDown
+          expr: absent(engineering_process_uptime_seconds{process="egress"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The sandboxes' proxy is not running; no sandbox can reach out.
+            runbook: deploy/README.md#a-process-is-down-or-restarts
+        - alert: EngineeringChatDown
+          expr: absent(engineering_process_uptime_seconds{process="chat"})
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The chat channel is not running; nothing is told on Telegram.
+            runbook: deploy/README.md#a-process-is-down-or-restarts
+        - alert: EngineeringLoopStalled
+          expr: engineering_loop_stalled == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "The loop {{ $labels.loop }} of {{ $labels.process }} stands still."
+            runbook: deploy/README.md#a-process-is-down-or-restarts
+        - alert: EngineeringDatabaseDown
+          expr: engineering_database_up == 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: The platform's database does not answer.
+            runbook: deploy/README.md#the-database-does-not-answer
+        - alert: EngineeringLauncherPassesFailing
+          expr: increase(engineering_launcher_pass_failed_total[10m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: The launcher's passes over the work keep failing.
+            runbook: deploy/README.md#the-database-does-not-answer
+        - alert: EngineeringConsolePersistenceFailing
+          expr: engineering_dashboard_persistence_failure_active == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The console fails at {{ $labels.operation }} and has not recovered."
+            runbook: deploy/README.md#the-database-does-not-answer
+    - name: engineering-control.work
+      rules:
+        - alert: EngineeringRunsWaitForRoom
+          expr: engineering_run_oldest_queued_seconds > 1800
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A run has waited to start for more than half an hour.
+            runbook: deploy/README.md#runs-wait-and-do-not-start
+        - alert: EngineeringRunsFailing
+          expr: engineering_runs_ended_last_hour{state="failed"} >= 3
+          labels:
+            severity: warning
+          annotations:
+            summary: Three or more runs failed within an hour.
+            runbook: deploy/README.md#runs-fail
+        - alert: EngineeringAccountNeedsSignIn
+          expr: engineering_accounts{state="sign_in_required"} > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A subscription account needs a new sign-in.
+            runbook: deploy/README.md#an-account-needs-a-new-sign-in
+        - alert: EngineeringNoAccountReady
+          expr: sum(engineering_accounts{state="ready"}) == 0 and sum(engineering_accounts) > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: No subscription account can be used; no agent step can run.
+            runbook: deploy/README.md#an-account-needs-a-new-sign-in
+        - alert: EngineeringTroubleNotLookedAt
+          expr: engineering_incidents{state="open"} > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Something went wrong with the work and the supervisor has not looked at it.
+            runbook: deploy/README.md#runs-fail
+        - alert: EngineeringBacklogSyncFailing
+          expr: engineering_backlog_sync_failing > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: A project's backlog cannot be brought in step with GitHub.
+            runbook: deploy/README.md#a-backlog-is-not-in-step-with-github
+        - alert: EngineeringSandboxesRefused
+          expr: increase(engineering_egress_refused_total[15m]) > 10
+          labels:
+            severity: info
+          annotations:
+            summary: Sandboxes keep asking for hosts they may not reach.
+            runbook: deploy/README.md#a-sandbox-cannot-reach-a-host

@@ -110,6 +110,10 @@ class Settings(BaseSettings):
     cluster_token_file: Path = Path("/var/run/secrets/engineering-control-cluster/token")
     cluster_ca_file: Path = Path("/var/run/secrets/engineering-control-cluster/ca.crt")
     log_level: str = "INFO"
+    # Where a process says how it is doing, to the cluster alone (health.py): whether its
+    # loops still turn, and its numbers. In no Service and behind no route.
+    health_host: str = "127.0.0.1"
+    health_port: int = Field(default=8799, ge=1024, le=65535)
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)
     dashboard_allowed_hosts: tuple[str, ...] = (
@@ -155,6 +159,8 @@ class Settings(BaseSettings):
             raise ValueError("the sandboxes' proxy cannot bind to every interface")
         if self.supervisor_tools_host in every_interface:
             raise ValueError("the supervisor's tool service cannot bind to every interface")
+        if self.health_host in every_interface:
+            raise ValueError("the health listener cannot bind to every interface")
         return self
 
     @field_validator("dashboard_allowed_hosts")

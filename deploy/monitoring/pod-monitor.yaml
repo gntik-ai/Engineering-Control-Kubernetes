@@ -1,0 +1,14 @@
+# Every process of the platform says how it is doing on its port "health" (health.py).
+# The supervisor's tools have no such port and are left out by it.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: engineering-control
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+  podMetricsEndpoints:
+    - port: health
+      path: /metrics
+      interval: 30s

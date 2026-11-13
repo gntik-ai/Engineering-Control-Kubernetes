@@ -38,6 +38,7 @@ from typing import Final
 import structlog
 
 from engineering_control.config import Settings, get_settings
+from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
 
 LOG = structlog.get_logger(__name__)
@@ -142,9 +143,16 @@ def public_addresses(found: Sequence[tuple[object, ...]]) -> list[str]:
 
 class EgressProxy:
     def __init__(
-        self, hosts: Sequence[str], *, upstream_port: int = 443, grant_key: bytes | None = None
+        self,
+        hosts: Sequence[str],
+        *,
+        upstream_port: int = 443,
+        grant_key: bytes | None = None,
+        health: Health | None = None,
     ) -> None:
         self.hosts = tuple(hosts)
+        # Where the tunnels opened and refused are counted, when the process has one.
+        self.health = health
         # What grants for hosts that are not on the list are checked against.
         self.grant_key = grant_key
         # Always 443 in service; a test points it at a listener of its own.
@@ -170,6 +178,9 @@ class EgressProxy:
         self, writer: asyncio.StreamWriter, status: str, host: str, why: str, *, ask: bool = False
     ) -> None:
         LOG.warning("egress_refused", host=host, reason=why)
+        # A browser that is asked for its grant and then shows it was not refused.
+        if self.health is not None and not ask:
+            self.health.count("egress_refused")
         # A browser presents its grant only once it is asked for one.
         asked = 'Proxy-Authenticate: Basic realm="sandbox"\r\n' if ask else ""
         writer.write(
@@ -224,6 +235,8 @@ class EgressProxy:
             return
         self._tunnels += 1
         LOG.info("egress_tunnel", host=host)
+        if self.health is not None:
+            self.health.count("egress_tunnels")
         try:
             writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
             await writer.drain()
@@ -255,10 +268,13 @@ async def _copy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 async def serve(settings: Settings | None = None) -> None:
     resolved = settings or get_settings()
     configure_logging(resolved.log_level)
+    health = Health("egress")
     proxy = EgressProxy(
         resolved.sandbox_egress_hosts,
         grant_key=read_grant_key(resolved.sandbox_egress_grant_key_file),
+        health=health,
     )
+    told = await listen(health, resolved.health_host, resolved.health_port)
     server = await asyncio.start_server(
         proxy.handle,
         resolved.sandbox_egress_host,
@@ -275,7 +291,7 @@ async def serve(settings: Settings | None = None) -> None:
         hosts=len(proxy.hosts),
         grants=proxy.grant_key is not None,
     )
-    async with server:
+    async with server, told:
         await stop.wait()
 
 

@@ -16,6 +16,12 @@ spec:
       app.kubernetes.io/component: console
   template:
     metadata:
+      annotations:
+        # Where the process says how it is doing (health.py): read by a Prometheus that
+        # follows these annotations, or by the monitors in deploy/monitoring.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8799"
+        prometheus.io/path: /metrics
       labels:
         app.kubernetes.io/name: engineering-control
         app.kubernetes.io/component: console
@@ -47,6 +53,8 @@ spec:
           ports:
             - name: http
               containerPort: 8750
+            - name: health
+              containerPort: 8799
           envFrom:
             - configMapRef:
                 name: engineering-control-settings

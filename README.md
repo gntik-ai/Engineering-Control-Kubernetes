@@ -1,62 +1,62 @@
-# Engineering Control on Kubernetes
-
-This repository is where Engineering Control is rebuilt for Kubernetes. It was seeded from
-[`gntik-ai/engineering-control`](https://github.com/gntik-ai/engineering-control) with its
-full history; that repository is not changed by this work and keeps running the current
-two-host deployment until each project is cut over.
-
-- **Plan and design:** [`docs/design/kubernetes-architecture-study.md`](docs/design/kubernetes-architecture-study.md).
-  Start with the summary, then section 13.6 (consolidated plan) and sections 14–15.
-- **State of this repository:** the imported platform code, plus the gntik-ui console
-  (`web/console`). Host-only files (systemd units, Compose and Caddy files, bootstrap and
-  cut-over scripts, operational notes) have been removed from the working tree. Nothing has
-  been deployed from here yet.
-- **Still describing the old deployment:** everything below this section and most of
-  `docs/`. They are kept as reference and will be rewritten as each part is replaced.
-
----
-
 # Engineering Control
 
-`engineering-control` is the external, durable control plane for autonomous engineering work on
-Falcone and Musematic. It keeps authoritative workflow state in Temporal and PostgreSQL, invokes
-native subscription-authenticated Codex and Claude CLIs through isolated workers, and places all
-Git, deployment, approval, and evidence transitions behind deterministic policy code.
+Engineering Control runs engineering work for software projects on a Kubernetes cluster:
+it resolves issues, audits code, looks for improvements and for things to clean up, and
+audits a running application's interface, each as a flow of steps done by coding agents in
+isolated sandboxes. One administrator directs it from a web console and from chat; a
+supervisor agent helps build and route the backlog, proposes queues and flows, and looks
+at what goes wrong.
 
-The control plane is deliberately independent of both products and their Kubernetes workloads.
-Hermes and Telegram are clients of its narrow authenticated API; they are not the workflow engine
-and do not receive release credentials.
+- **What it is and why it is built this way:**
+  [`docs/design/kubernetes-architecture-study.md`](docs/design/kubernetes-architecture-study.md).
+  Sections 11–17 describe the product; section 18 the phases it was built in and what was
+  verified in each.
+- **How it is deployed and operated:** [`deploy/README.md`](deploy/README.md): what runs
+  in the cluster, every part of the platform in turn, how to watch it, and what to do when
+  something is wrong.
 
-Existing paired GitHub issue backlogs use the fixed Telegram/API/CLI contract documented in
-[`docs/EXISTING-GITHUB-BACKLOG.md`](docs/EXISTING-GITHUB-BACKLOG.md). Import and planning are
-read-only; every write remains bound to an exact expiring Telegram campaign approval.
+## What is in this repository
 
-Current bootstrap status and host-specific blockers are recorded outside this repository under
-`/home/hermes/engineering-bootstrap/`. No cleanup, Kubernetes mutation, product edit, remote
-repository creation, or credential copy is performed by this repository's bootstrap scripts.
+| Path | What it is |
+| --- | --- |
+| `src/engineering_control/` | The platform: the console (`dashboard/`), runs in sandboxes and the launcher that drives them (`sandbox/`), the flow engine (`engine/`), the supervisor (`supervisor/`), the chat channel (`chat/`) |
+| `web/console/` | The console's pages (React, the gntik-ui kit); the built bundle is committed under `src/engineering_control/dashboard/console/` |
+| `migrations/` | The database's schema, step by step |
+| `images/` | The platform's image and the image a sandbox runs, with their tests |
+| `deploy/` | What Argo CD applies to the cluster |
+| `config/projects/` | Per project: the tools its repository needs and the rules its makers keep |
+| `scripts/export_original_records.py` | Run on the original system's host to move a project's records here |
+| `tests/` | The unit suite |
 
-## Safety invariants
+## How it runs work
 
-- one ChangeSet and one bounded issue per worktree;
-- maker and checker are separate invocations, preferably separate providers;
-- LLM identities cannot deploy or merge;
-- release identities cannot read model credentials;
-- approvals bind to immutable source, deployment, image, target, and evidence digests;
-- R3 work requires typed human approval and cross-provider verification;
-- unknown quota is represented as unknown, never invented;
-- provider invocation outcomes and exposed usage are durably tracked by role without storing prompts;
-- native CLI rate limits produce a durable `RATE_LIMITED` handoff, never paid API fallback;
-- all persisted output passes through central secret redaction.
-- every controller, worker, bootstrap, upgrade, and end-to-end verification runs the fail-closed
-  `scripts/verify-no-omniroute.sh` negative policy before acceptance.
+A project has sections (Issues, Code audit, Enhancement, Code clean, UI audit, UX audit,
+and any the administrator adds), each with a flow. An item of the backlog is routed to a
+section; starting it starts a run of the section's flow. A run is a record in the
+database; each of its steps is a pod in a namespace of its own, on a node of its own, with
+no way out but a proxy that opens tunnels to named hosts. The agents work with
+subscription accounts the administrator signs in on the console; no API key is used.
+What a run changes becomes a pull request only after the administrator agrees, with the
+password.
 
-A lecture-style walkthrough of the whole platform (components, software choices, workflows,
-state machines, control surfaces, security gates, operations) lives in
-[`docs/architecture-course/README.md`](docs/architecture-course/README.md). A higher-level
-companion for presenting the platform to mixed audiences (Hermes and Temporal, the GitHub
-backlog, orchestration, agents, skills, and tools) is
-[`docs/architecture-course/functional-overview/README.md`](docs/architecture-course/functional-overview/README.md).
+## Where it came from
 
-See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
-`docs/OPERATOR-CHEATSHEET.md`. Exact PR/CI, signed candidate image, and digest-only deployment
-reconciliation is specified in `docs/CI-ARTIFACT-RECONCILIATION.md`.
+The platform was rebuilt from
+[`gntik-ai/engineering-control`](https://github.com/gntik-ai/engineering-control), which
+ran on two hosts with Temporal workflows. That repository is not changed by this one and
+keeps the original's code and documents; this repository's history before November 2026
+is the original's. `deploy/README.md` ("Moving a project's work here") says how a
+project's records are brought over and how the original's hosts are retired.
+
+## Working on it
+
+```bash
+python -m pip install --constraint requirements.lock --editable ".[dev]"
+ruff check src tests && ruff format --check src tests && mypy
+python -m pytest -q -n auto
+(cd web/console && npm ci && npm run build)
+```
+
+CI runs the same, builds both images, boots the platform's image against a real
+PostgreSQL, and pushes the images tagged with their commit. Deploying is naming that
+commit in `deploy/base/kustomization.yaml` and synchronising the Argo CD application.

@@ -46,6 +46,7 @@ jobs:
           # The patch that pins the sandbox image must have reached the launcher.
           grep --quiet 'value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:' /tmp/base.yaml
           kubectl kustomize deploy/sandboxes > /dev/null
+          kubectl kustomize deploy/monitoring > /dev/null
           test -z "$(helm template deploy/registry)"
           helm template deploy/registry --set username=someone --set token=example \
             > /tmp/registry.yaml

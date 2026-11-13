@@ -23,6 +23,12 @@ spec:
       app.kubernetes.io/component: launcher
   template:
     metadata:
+      annotations:
+        # Where the process says how it is doing (health.py): read by a Prometheus that
+        # follows these annotations, or by the monitors in deploy/monitoring.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8799"
+        prometheus.io/path: /metrics
       labels:
         app.kubernetes.io/name: engineering-control
         app.kubernetes.io/component: launcher
@@ -51,6 +57,9 @@ spec:
         - name: launcher
           image: engineering-control
           command: ["engineering-launcher"]
+          ports:
+            - name: health
+              containerPort: 8799
           envFrom:
             - configMapRef:
                 name: engineering-control-settings
@@ -71,6 +80,20 @@ spec:
             # the control plane's own image.
             - name: ENGINEERING_SANDBOX_IMAGE
               value: engineering-control-sandbox
+          # A loop that stands is a process to restart: /healthz says so (health.py).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

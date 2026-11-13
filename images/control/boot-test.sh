@@ -94,6 +94,7 @@ common=(
   --env ENGINEERING_SANDBOX_EGRESS_HOST=0.0.0.0
   --env "ENGINEERING_SANDBOX_EGRESS_GRANT_KEY_FILE=${mount}/egress-grant.key"
   --env ENGINEERING_SUPERVISOR_TOOLS_HOST=0.0.0.0
+  --env ENGINEERING_HEALTH_HOST=0.0.0.0
 )
 
 # --- one-off jobs ---------------------------------------------------------------------
@@ -104,8 +105,13 @@ docker run --name boot-password "${common[@]}" --volume "${work}/out:/out" "${im
 docker run --name boot-ctl "${common[@]}" "${image}" engineering-ctl records status >/dev/null
 
 # --- long-running processes -----------------------------------------------------------
+# On one network here, so each process is given a health port of its own; in a cluster
+# each has its pod's.
+health_port=8800
 for name in "${services[@]}"; do
-  docker run --detach --name "boot-${name}" "${common[@]}" "${image}" "engineering-${name}" >/dev/null
+  health_port=$((health_port + 1))
+  docker run --detach --name "boot-${name}" "${common[@]}" \
+    --env "ENGINEERING_HEALTH_PORT=${health_port}" "${image}" "engineering-${name}" >/dev/null
 done
 
 status() { curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 "$@"; }
@@ -130,13 +136,27 @@ expect "sign-in token is issued" 200 http://127.0.0.1:8750/login/challenge
 expect "console requires a session" 303 http://127.0.0.1:8750/console
 expect "the supervisor's tools answer" 200 http://127.0.0.1:8790/healthz
 # The sandboxes' proxy opens no tunnel to a host that is not named.
-refused="$(curl --silent --output /dev/null --write-out '%{http_connect}' --max-time 5 \
-  --proxy http://127.0.0.1:8888 https://example.invalid/ || true)"
-if [[ "${refused}" != "403" ]]; then
-  echo "FAIL the proxy answered ${refused} to a host that is not named" >&2
+# The sandboxes' proxy opens no tunnel to a host that is not named: it asks for a grant
+# (407) where grants are honoured, and refuses a port that is not HTTPS outright (403).
+connect() { curl --silent --output /dev/null --write-out '%{http_connect}' --max-time 5 \
+  --proxy http://127.0.0.1:8888 "$1" || true; }
+asked="$(connect https://example.invalid/)"
+refused="$(connect https://example.invalid:8443/)"
+if [[ "${asked}" != "407" || "${refused}" != "403" ]]; then
+  echo "FAIL the proxy answered ${asked} and ${refused} to hosts that are not named" >&2
   exit 1
 fi
-echo "ok   the proxy refuses a host that is not named (${refused})"
+echo "ok   the proxy opens no tunnel to a host that is not named (${asked}, ${refused})"
+# Every process says how it is doing, to the cluster alone (the tools have their own).
+expect "the console says how it is doing" 200 http://127.0.0.1:8801/healthz
+expect "the proxy says how it is doing" 200 http://127.0.0.1:8802/healthz
+expect "the chat channel says how it is doing" 200 http://127.0.0.1:8804/healthz
+if ! curl --silent --max-time 5 http://127.0.0.1:8802/metrics \
+  | grep --quiet '^engineering_egress_refused_total{process="egress"} 1$'; then
+  echo "FAIL the proxy did not count the tunnel it refused" >&2
+  exit 1
+fi
+echo "ok   the proxy counts what it refuses"
 
 # Nothing may have exited or logged an unhandled error after a settling period.
 sleep 15

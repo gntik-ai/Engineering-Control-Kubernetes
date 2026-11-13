@@ -389,7 +389,10 @@ def test_sandboxes_reach_the_proxy_and_the_proxy_reaches_public_https_only() -> 
     [container] = spec["containers"]
     assert container["command"] == ["engineering-egress"]
     assert "env" not in container
-    assert container["ports"] == [{"name": "proxy", "containerPort": 8888}]
+    assert container["ports"] == [
+        {"name": "proxy", "containerPort": 8888},
+        {"name": "health", "containerPort": 8799},
+    ]
     deployment = next(
         d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == name[11:]
     )
@@ -489,7 +492,8 @@ def test_the_chat_channel_reads_alone_holds_the_bots_token_and_has_no_listener()
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
     [container] = spec["containers"]
     assert container["command"] == ["engineering-chat"]
-    assert "ports" not in container
+    # Its only listener says how it is doing, to the cluster alone.
+    assert container["ports"] == [{"name": "health", "containerPort": 8799}]
     assert not [
         d for d in documents if d["kind"] == "Service" and d["metadata"]["name"].endswith("-chat")
     ]

@@ -73,6 +73,7 @@ def _records_command(arguments: argparse.Namespace) -> None:
 
     from engineering_control.dashboard.backlog_items import BacklogItems
     from engineering_control.dashboard.bring_over import BringOver, export_script
+    from engineering_control.dashboard.project_records import ProjectNotFound
 
     if arguments.records_command == "script":
         sys.stdout.write(export_script())
@@ -83,7 +84,13 @@ def _records_command(arguments: argparse.Namespace) -> None:
         moving = BringOver(sessions, BacklogItems(sessions))
         result: Any
         if arguments.records_command == "status":
-            result = {name: moving.status(name) for name in PROJECTS}
+            result = {}
+            for name in PROJECTS:
+                # A project the console has not made a record of yet is not here.
+                try:
+                    result[name] = moving.status(name)
+                except ProjectNotFound:
+                    result[name] = {"here": False, "origin": "registry"}
         elif arguments.records_command == "move-without-records":
             result = moving.cut_over(arguments.project)
         else:
