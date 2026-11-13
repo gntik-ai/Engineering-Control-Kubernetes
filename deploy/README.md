@@ -889,8 +889,9 @@ the migration (`migrations/versions/`) before going back across one that does mo
 
 With phase 8 the platform stopped carrying the original's way of working: its workflows,
 its command API, Temporal, the notifier and the evidence ingest are gone from the code
-and from the cluster. Three things were left in the cluster on purpose, because removing
-them deletes something for good and that is the administrator's decision:
+and from the cluster. Four things were left in the cluster. The first is left on purpose, because removing it
+deletes data for good and that is the administrator's decision; the others are harmless
+and need a command only the administrator can run:
 
 - `base/leftovers.yaml` keeps the two objects that hold a data volume: the claim
   `engineering-control-evidence` and the PostgreSQL cluster
@@ -903,6 +904,11 @@ them deletes something for good and that is the administrator's decision:
   made for them (`engineering-control-ca`, `engineering-control-temporal-tls`) stay until
   deleted: `kubectl -n engineering-control delete secret engineering-control-ca
   engineering-control-temporal-tls`.
+
+- Two finished Jobs of Temporal's (`temporal-schema`, `temporal-namespace`) are still
+  listed in the namespace. They ran as part of a synchronisation, which is why pruning
+  does not take them: `kubectl -n engineering-control delete job temporal-schema
+  temporal-namespace`.
 
 The tables the original's records were brought into stay in the database as they are:
 they are what "Moving a project's work here" filled, and nothing else writes them.

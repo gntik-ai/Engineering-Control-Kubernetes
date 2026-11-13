@@ -1,6 +1,9 @@
 # Architecture study: Engineering Control on Kubernetes
 
-Status: proposal for discussion. Nothing in this document is implemented.
+Status: built. Sections 1–17 are the study as it was written, iteration by iteration, and
+are kept as the record of why; section 18 says what was built in each phase and what was
+verified; section 19 says what the platform is at the end and where it departs from the
+earlier sections.
 
 Sections 1–10 are the first iteration. Section 11 is a second iteration that adds designable
 flows, a supervising agent and the options those two make necessary.
@@ -13,10 +16,11 @@ Section 16 records what a read-only inspection of the existing cluster showed.
 Section 17 records the product model the administrator asked for: projects, sections,
 backlog, queue and the supervisor as an agent.
 Section 18 is the current plan: every feature to build and the phases they are built in.
+Section 19 records the consolidation of phase 8.
 
-File paths in sections 3–5 and the appendices refer to the code as imported from
-`gntik-ai/engineering-control`; some of the host-only files they cite are no longer in this
-repository's working tree (section 14).
+File paths in sections 3–5 and the appendices refer to the code of
+`gntik-ai/engineering-control`, the original system. That code was in this repository
+until phase 8 and is in its history; the original repository keeps it (section 19).
 
 This study answers two questions asked ahead of the Kubernetes migration:
 
@@ -1780,10 +1784,10 @@ Status: **done**, **in progress**, or blank for not started.
 | A2 | Control-plane image | done |
 | A3 | Every control-plane process starts from configuration alone (environment and mounted secrets), proven by a boot test in CI | done for the control plane; the CLI and the role workers follow in phases 1 and 3 |
 | A4 | Manifests (Kustomize); Argo CD project and application; namespace and network policies | done: the control plane, and the sandbox namespace as a second application (pod security "restricted", all traffic denied until a rule allows it) |
-| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | in progress: both run; the server presents a certificate issued in the cluster and every client verifies it; clients do not present one yet |
+| A5 | PostgreSQL and Temporal in the cluster, Temporal with TLS | done for PostgreSQL. Temporal ran in the cluster with TLS until phase 8 and was then removed: nothing of the platform's own work used it (section 19) |
 | A6 | Object storage for evidence, transcripts and change bundles | set aside: the administrator keeps evidence on a volume |
 | A7 | Secrets delivered by the cluster's secret operator | set aside for now by the administrator |
-| A8 | Probes, metrics, alert rules, runbooks | |
+| A8 | Probes, metrics, alert rules, runbooks | done: every process says on a port of its own, for the cluster alone, whether its loops still turn and what it counts; the launcher and the chat channel are restarted when a loop stands; the launcher gives the state of the work as numbers read from the records; alert rules for a cluster with the Prometheus operator are written on those numbers and each names its runbook; the runbooks are in `deploy/README.md` |
 
 **B. Access**
 
@@ -1874,8 +1878,8 @@ renders no HTML of its own.
 
 | Id | Feature |
 | --- | --- |
-| I1 | Run status read from Temporal; explicit projector; references instead of payloads |
-| I2 | Reconciliation code and legacy loops removed |
+| I1 | Run status read from Temporal; explicit projector; references instead of payloads (done differently: a run's state is the run's record, written by the launcher and read by everything else, so there is nothing to project and nothing to mirror. Temporal is not used at all, section 19) |
+| I2 | Reconciliation code and legacy loops removed (done: with them went everything else of the original's way of working, 187 modules, and the processes that served it) |
 | I3 | Projects moved over one at a time; original hosts retired (built for one project at a time: a project is marked as moved when its records are brought over, or without records. The export says which runs the original still has under way, and nothing is moved in the middle of one unless the administrator says so. Retiring the original's hosts is done on those hosts) |
 
 ### 18.2 Phases
@@ -1890,7 +1894,7 @@ renders no HTML of its own.
 | 5. All current work on the cluster | Code audit and Enhancement sections run the existing workflows; the supervisor handles stalls and errors; existing projects and records are migrated and the first project is cut over. Built and verified on the cluster on 2026-11-13, with new, smaller flows in place of the existing workflows, as in phase 3: an audit of falcone-workflow's matrix validator confirmed one finding after two independent reproductions by the other subscription, and a search for enhancements proposed two that the other subscription approved; all three wait in the backlog as proposed items. The supervisor looked by itself at three runs that failed: it asked before retrying a failure it was not sure would pass, did not retry the repeat, and named the cause of the third. The first of those failures was a defect of phase 3's proxy that no run had met before (a checkout was refused in the pod's first moment); it is fixed. **Done** on 2026-11-13 with the first project: the administrator exported falcone-workflow's records on the original's host and brought them over. All 74 records were kept as they are (two campaigns, two findings with their cells and verifications, two published issues, one change set, two backlog campaigns and the latest record of 60 issues), the 60 issues the original knew are marked in the backlog with what it had done (it had started none of them and had no pull request open), nothing was under way there, and the project is marked as moved. The other five projects are moved the same way when their turn comes. Added afterwards and verified on the cluster the same day: an audit without a scope plans the repository's areas and audits each in turn, as the original's campaigns covered their cells (falcone-workflow in two areas and seven minutes: two new findings confirmed, and the one from the morning recognised as known); a project can be paused and resumed; a delivery that ran out of rounds can be granted more; the move of a project can be done from one terminal | G4, C5, D7, I3 (first project) | 9–12 |
 | 6. Flow engine | The same sections now run on the new engine; prompts can be edited; changes are tested on past items before use. **Done** on 2026-11-13. The three flows are documents run by one engine, with the rules of section 13 checked on every draft and kept during every run; the console has a Flows page where settings, the wording of prompts and budgets are changed as a draft, gone through on paper, tried on past runs, and put in force with the password. Verified on the cluster the same day with a draft of Audit code (one round of verification instead of two, and one more sentence for the auditor): it kept every rule, a flow without its verifier's counterpart was refused, and the draft went through the work of a past audit of falcone-workflow again at that audit's commit, in sandboxes, the auditor on ChatGPT with the new wording and the verifier on Claude. It came to the same result as the run had (one candidate, already known) in one round instead of two, made no item and opened nothing, and the clients' own reports of what the agents used were recorded with each step (66,704 tokens read new and written, 228,764 read again from cache). The draft was then discarded, so the platform's own flows are what is in force. Left for phase 7: adding and connecting tasks by drawing (the document can be edited as text meanwhile), flows other than the three, and triggers. Runs from before this phase carry no usage, so comparisons of tokens start with the runs made from now on | F1, F2, F3, F4, F7, F10, F12 | 18–23 |
 | 7. Designer and new flows | Design flows by dragging tasks; ask the supervisor for a flow; Code clean, UI audit and UX audit exist. **Done** on 2026-11-13. A flow is drawn as a graph and changed there: tasks are dragged from a list onto the canvas or onto a connection, connected from their outcomes, set in an inspector, and every rule of section 13 is checked while the flow is edited. Flows are made, copied, taken out as files and brought in; a run is shown on its flow, task by task. Triggers start a section's flow at set times, when the default branch has moved, or when an item arrives. The supervisor drafts a flow on request as a proposal: accepted, a flow that only reads is in force, one that writes or publishes is a draft for the administrator. Three flows were added: Code clean, and UI audit and UX audit, which look at the running application in a browser inside the sandbox, with a test identity the project stores and a grant for the application's own hosts only. Verified on the cluster the same day: the designer drew and checked the flows with no error in the browser; Code clean, given to falcone-workflow's section and started by a trigger, finished in two minutes with the auditor on ChatGPT and the verifier on Claude and proposed one clean-up as an item; the supervisor, asked in the console, read the tasks and the flows, checked its own draft and proposed a flow named Dependency check, which waits for the administrator. For the two audits of the application, the cluster has the migration, the proxy with its grant key, the flows without a problem and the project's Application card; a run of them was not made there, because no project on the cluster says yet where its application runs. Before that, the sandbox image started its browser in the build's test, and a browser reached a granted host through the proxy and was refused every other. Not built: gates drawn as locked nodes, a comparison of two versions, and the original's journey runner and UI inventory | F5, F6, F8, F9, F11, G5 | 18–24 |
-| 8. Consolidation | Remaining projects moved; original hosts switched off; simpler state handling | I1, I2, I3, A8 | 6–8 |
+| 8. Consolidation | Remaining projects moved; original hosts switched off; simpler state handling. **Built and deployed** on 2026-11-13; moving the last five projects and switching the original's hosts off are the administrator's, on those hosts, and are described step by step. The platform now stands on its own code: a run's state is the run's record and nothing mirrors it, so there is no reconciliation and no workflow engine beside the launcher (section 19 says why Temporal went rather than became the source of status). The original's workflows, activities, reconciliation, command API and everything that served them left the code (187 of 252 modules) and the cluster (Temporal, the API, the workflow worker, the notifier, the evidence ingest). Every process says whether its loops still turn and what it counts; the launcher and the chat channel are restarted when a loop stands; the state of the work is given as numbers read from the records; alert rules are written on them and each names its runbook. Verified on the cluster the same day: Argo CD pruned the removed parts and nothing that holds a data volume; five processes and the database run and are healthy, each listening for its health; the console lists every project with its items and runs from the records and answers 404 where the original's views were; an account was tried, which is one real step through the launcher, a sandbox of the new image, the proxy and the provider, and succeeded in under a minute; the eleven earlier runs of falcone-workflow, its backlog and the flows in force are as they were. Not verified on the cluster: the numbers themselves, which are read on a port only the cluster reaches (the image's boot test in CI reads them, and the unit suite checks every one); and the alert rules, which need a Prometheus the cluster may not have. Left for the administrator: the two objects that hold a data volume and are no longer used, and two finished jobs of Temporal's | I1, I2, I3, A8 | 6–8 |
 | | | **Total remaining** | **87–114** |
 
 For a team of three this is roughly twelve to fourteen months. The total agrees with section
@@ -1904,6 +1908,8 @@ Points at which the result is usable on its own:
 - **After phase 5:** everything the original does today runs on the cluster, with the
   supervisor and the queue added.
 - **After phase 7:** the full product described in sections 11–17.
+- **After phase 8:** the same product on its own code alone, watched and with runbooks;
+  the original can be retired once the last project is moved.
 
 ### 18.3 What each phase depends on from outside the code
 
@@ -1914,6 +1920,62 @@ Points at which the result is usable on its own:
 | 3 | A dedicated node for sandboxes; the subscription accounts, and confirmation that the plans allow this use |
 | 4 | A chat bot for the new system; a subscription account for the supervisor |
 | 5 | A decision on which project is cut over first |
+
+## 19. Consolidation (phase 8): what the platform is, and where it departs from this study
+
+### 19.1 What runs
+
+Five processes of one image, one PostgreSQL, and the sandboxes in a namespace and on a
+node of their own:
+
+| Process | What it does |
+| --- | --- |
+| Console | The pages and their API; keeps the backlogs in step with GitHub |
+| Launcher | Drives every run: starts each step as a pod, reads what it did, decides what comes next by the run's flow; looks at triggers, queues and budgets |
+| Proxy | The sandboxes' only way out: tunnels to named hosts, and to a project's own application with a grant |
+| Tools | What the supervisor may read and do, called from the sandbox of its turn |
+| Chat | The administrator's way in from Telegram |
+
+A run is a record in the database. Its steps are pods; what a step printed, found and
+used is on its record; its change is a branch on GitHub until the administrator agrees to
+publish it. The launcher holds nothing that is not in the database or in the cluster, so
+restarting it loses nothing. Flows are documents interpreted by one engine, with the rules
+of section 13 checked on every draft and kept during every run.
+
+### 19.2 Where it departs from the earlier sections
+
+| The earlier sections say | What was built | Why |
+| --- | --- | --- |
+| Temporal orchestrates the work; a run's status is read from Temporal; one projector feeds the console (sections 6 and 13, feature I1) | No Temporal. The launcher's loop over the run records is the orchestration, and the record is the status | The original's workflows assume two hosts that share disks and could not run on the cluster as they were. From phase 3 each kind of work got a smaller flow of its own, and from phase 6 one engine interprets flow documents. A step is a pod whose result is read back, and a run survives a restart because everything is in the database. A workflow engine beside that had nothing left to do, and keeping it would have meant a second copy of every run's state: the thing the original's reconciliation code existed to repair |
+| The existing workflows are imported as flows (section 13.5) | Six flows written for the engine: Deliver issue, Audit code, Discover enhancements, Code clean, UI audit, UX audit | The rules that make the original's work trustworthy were kept (the other subscription reviews or verifies, the administrator approves with the password, a finding is reproduced before it counts); the machinery around them was not needed in sandboxes |
+| Change request, UI migration planning, backlog decomposition and deployment recovery become flows too (section 13.5) | Not rebuilt. Their names can be given to a section and run nothing | They are not among the six sections of section 17. A flow for any of them can be designed, or asked of the supervisor |
+| Evidence in object storage (A6); secrets from the cluster's operator (A7) | A run's evidence is its record; secrets are Kubernetes Secrets made by the administrator or by a bootstrap Job | Both set aside by the administrator |
+| The API takes the actor from a verified token (finding I1 of section 4) | There is no API beside the console's. The console is behind the password, with the password asked again for what cannot be undone; the supervisor's tools take the token of its turn | One administrator, one way in |
+| Hermes: keep the gateway as a chat client or replace it (section 1) | The platform has its own chat channel; Hermes is not used | The channel needs to answer one account and tell news once; that is small enough to own |
+
+### 19.3 What phase 8 removed
+
+- From the code: 187 of 252 modules (about 134,000 lines down to 25,000), with their
+  tests, the host configuration, the scripts, the Hermes integration and the documents
+  that describe the original. The settings went from about 170 to 39. The unit suite is
+  352 tests and runs in two minutes; it took nineteen.
+- From the cluster: Temporal with its certificates and jobs, the command API, the
+  workflow worker, the notifier and the evidence ingest. They were deployed and idle.
+- Kept on purpose: the tables the original's records were brought into, as they are; and,
+  until the administrator removes them, the two objects that hold a data volume and are
+  no longer used (`deploy/base/leftovers.yaml`).
+
+Nothing of this touched the original repository, which keeps all of it and still runs
+the original on its two hosts for the projects that have not been moved.
+
+### 19.4 What is left to do, and whose it is
+
+| What | Whose | Where it is described |
+| --- | --- | --- |
+| Move the five projects still on the original | The administrator, on the original's controller host | `deploy/README.md`, "All the remaining projects in one pass" |
+| Retire the original's two hosts | The administrator, on those hosts | `deploy/README.md`, "Retiring the original's hosts" |
+| Remove what consolidation left in the cluster | The administrator's decision | `deploy/README.md`, "What consolidation left behind" |
+| Point a Prometheus at the platform, if one is wanted | The administrator | `deploy/README.md`, "Watching the platform" |
 
 ## Appendix A. Documentation drift found during the audit
 
