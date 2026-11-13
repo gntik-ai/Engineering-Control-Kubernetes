@@ -1808,12 +1808,12 @@ Status: **done**, **in progress**, or blank for not started.
 
 | Id | Feature |
 | --- | --- |
-| D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals (done for GitHub issues and for items the administrator writes; findings, chat and supervisor proposals come with phases 4 and 5) |
+| D1 | Backlog items from GitHub issues, audit findings, chat and supervisor proposals (done for GitHub issues and for items the administrator writes; the supervisor proposes items, from the console's panel or from chat, which appear in the backlog as proposed by it with its reason; audit findings come with phase 5) |
 | D2 | Import and keep in step with GitHub issues (done: the open issues of a project's repository are read through the GitHub App on demand and every fifteen minutes; an issue closed on GitHub closes its item, a reopened one is proposed again) |
-| D3 | Route an item to a section, by the supervisor or by hand (done by label and by hand: an issue carrying a label of exactly one section goes there; the administrator's choice is never changed by an import. The supervisor's routing comes in phase 4) |
+| D3 | Route an item to a section, by the supervisor or by hand (done by label and by hand: an issue carrying a label of exactly one section goes there; the administrator's choice is never changed by an import. The supervisor routes from the project's routing brief: a section it is sure of is applied with its reason, anything less is shown for confirmation, and a section the administrator chose is changed only with their confirmation; a label still decides at the next import) |
 | D4 | Run one item at a time (done: Deliver on a backlog item whose section runs "Deliver issue" starts a run; one run per item at a time) |
-| D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder |
-| D6 | Scheduler with budgets per account, project, component and risk class |
+| D5 | Queues: chosen and ordered by hand, or proposed by the supervisor; pause and reorder (done: items are selected in the backlog and queued; the queue's page orders them by drag and drop or with arrows; the supervisor proposes a queue as a draft with its reasons; a queue is started, paused, resumed, extended and discarded; the launcher runs its items in order, one to four at once, skips an item that cannot start and pauses after two failures in a row) |
+| D6 | Scheduler with budgets per account, project, component and risk class (done for the platform, each project and each account: runs at the same time and within a day, steps within a day for an account; they hold back a queue's next item and work the supervisor starts. Budgets per component and per risk class follow when items carry those, with the flows of phases 5 and 6) |
 | D7 | Existing campaigns, issues, change sets, findings and approvals migrated |
 
 **E. Execution**
@@ -1848,13 +1848,13 @@ Status: **done**, **in progress**, or blank for not started.
 
 | Id | Feature |
 | --- | --- |
-| G1 | Agent definition — prompt, skills, tools, model — editable and versioned |
-| G2 | Tool service with policy checks on every call |
-| G3 | Planning role: build the backlog, route items, propose queues. It routes by section, never by flow, from the routing brief of the project (C3): one section per item, never the nearest when none fits, never another section when the fitting one has no flow |
+| G1 | Agent definition — prompt, skills, tools, model — editable and versioned (done: instructions, skills, the tools with how each is confirmed, the providers, an account of its own and the model are edited on the Supervisor page; every save is a new version and needs the password; an older version is loaded and saved again) |
+| G2 | Tool service with policy checks on every call (done: `engineering-control-tools` speaks the tool protocol of both clients; it is reached only from the sandbox of a turn, with a token valid while that sandbox runs; every call is checked against the definition and the platform's rules, then applied, held for the administrator or refused, and recorded) |
+| G3 | Planning role: build the backlog, route items, propose queues. It routes by section, never by flow, from the routing brief of the project (C3): one section per item, never the nearest when none fits, never another section when the fitting one has no flow (done: tools to read projects, the routing brief, backlog, queues, runs, accounts and the inbox; to propose items, route an item and propose or reorder a queue; skills for building the backlog, routing and ordering a queue. The platform refuses a section that is not of the item's project and holds back a routing the supervisor is not sure of) |
 | G4 | Operations role: detect stalls and errors; act automatically, wait, or never (12.3) |
 | G5 | Design role: draft flows on request (15.2) |
-| G6 | Its own subscription account, with the other provider as fallback |
-| G7 | Record of every decision; daily digest |
+| G6 | Its own subscription account, with the other provider as fallback (done: the definition names the providers in order and, optionally, one account the supervisor takes first; that account can be kept for the supervisor alone, so no run of work is given it. A turn refused by the subscription is given to the next account) |
+| G7 | Record of every decision; daily digest (done: every call to a tool is recorded with its arguments, its reason and what became of it, shown on the Supervisor page; the chat channel sends a digest of the last day once a day and on request) |
 
 **H. Console and chat**
 
@@ -1863,12 +1863,12 @@ renders no HTML of its own.
 
 | Id | Feature |
 | --- | --- |
-| H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, sections, backlog, accounts and runs exist; a run's page shows its steps, what each printed, the change and the decision; the queue follows in phase 4) |
-| H2 | Supervisor panel on every page |
-| H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions (started: the inbox lists what waits in the data that exists, each entry leading to where it is acted on: a backlog that could not be read, a section with work and no flow, items without a section, items not decided on. Approvals, supervisor actions, sign-ins and questions join it when they exist) |
+| H1 | Pages for projects, sections, flows, backlog, queue and runs (projects, sections, backlog, accounts and runs exist; a run's page shows its steps, what each printed, the change and the decision; queues have a list with the budgets and a page per queue) |
+| H2 | Supervisor panel on every page (done: a button in the top bar opens the conversation; replies, what waits with Accept and Reject, and the turn under way are shown; the same conversation as the chat channel's) |
+| H3 | Inbox: approvals, waiting supervisor actions, account sign-ins, questions (started: the inbox lists what waits in the data that exists, each entry leading to where it is acted on: a backlog that could not be read, a section with work and no flow, items without a section, items not decided on. Runs that wait for a decision, accounts that need a sign-in, what the supervisor proposed (answered in the inbox itself), and queues it proposed or the platform paused are in it) |
 | H4 | Commands from the console, with the password asked again for approvals (started: one change to every item a filter matches, and removing a project, are confirmed with the password; a wrong one is counted like a failed sign-in. Approvals of runs come with phase 3) |
-| H5 | Chat channel (Telegram first) for commands, questions and notifications |
-| H6 | Supervisor settings page |
+| H5 | Chat channel (Telegram first) for commands, questions and notifications (done: `engineering-control-chat` reads the bot's updates by long polling, so no route from outside is needed; it answers the administrator's account only; fixed commands are answered by the platform, anything else goes to the supervisor; news is told once, proposals are answered with buttons, a change that is ready links to the console because publishing needs the password) |
+| H6 | Supervisor settings page (done: instructions, skills, tools, subscription, versions and the record) |
 
 **I. State and cut-over**
 
