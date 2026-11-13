@@ -415,6 +415,70 @@ section. It waits for the administrator; an accepted one is delivered like any i
 Both count against the budgets of queues like deliveries, and the chat channel says when
 one has ended.
 
+## Flows
+
+What a section runs is a flow, and a flow is a document (`engine/document.py`): a list of
+tasks, how each is set, and for each outcome of a task the task that comes next. Tasks are
+code, shipped with the platform (`engine/catalogue.py`, `engine/tasks.py`): checking a
+repository out, an agent that implements, an agent of the other subscription that
+reviews, the tests and the secret scan, collecting the change, the administrator's
+decision, the pull request, the audit's planner, auditor and verifier, the search for
+enhancements and its reviewer, and two tasks that only choose the way (a condition, and
+going through a list). One engine (`engine/interpreter.py`) runs every flow; the three
+flows of phases 3 and 5 are the platform's own documents (`engine/builtin.py`) and behave
+as before.
+
+**What holds for every flow** is checked when a draft is saved and again by the engine
+while a run goes (`engine/validate.py`, `engine/routing.py`), whoever wrote the flow:
+
+- After the last task that can change the checkout, a change has to pass a review by the
+  other subscription, the tests and the scan, be collected, and be decided on by the
+  administrator, in that order, before a task that reaches GitHub. A flow in which any
+  way round leads past one of them cannot be put in force.
+- A task that judges another's work is given to the other subscription than the one that
+  did the work. A task that is gone back to keeps its subscription.
+- Going back to a task is a round. A run has as many as its flow says, five at most.
+- Only the platform's own tasks reach GitHub or the backlog, they come after the
+  sandboxes' tasks, and no sandbox holds a credential that can write.
+- A run stops before a further task once it is past its flow's budget of time or tokens.
+
+**Prompts** (`engine/prompts.py`) are put together from parts. The platform sets some:
+the rules of the sandbox, how material from the repository is fenced and marked as
+material, and the shape of the answer the platform reads. A flow may word the others:
+who the agent is, what counts, how to judge. A wording may name only what the prompt has
+(`{{subject}}`, `{{repository}}` and so on). Which wording an agent was given is recorded
+with the step, as a hash, so an answer can be traced to a version.
+
+**Versions.** The platform's own flow is version 0. Changing anything on the Flows page
+(a setting, a wording, a budget, or the document itself) and saving it makes a draft,
+which nothing runs by. Putting the draft in force asks for the password; from then on
+every run that starts follows it. A run keeps the version it started with, and says which
+on its page. An earlier version can be opened in the editor and put in force again as a
+new one.
+
+**Before a draft is put in force** it can be tried in two ways.
+
+- *On paper* (`engine/simulate.py`): the engine's own routing goes through the flow
+  without a sandbox. Each task ends the way it is told, or its usual way, or the way it
+  ended in a run that happened. It shows the tasks in order, who would be given each, the
+  round, the wording, and how the run would end. It costs nothing and cannot say what
+  agents would answer.
+- *In the evaluation lab* (`engine/evaluations.py`): the draft goes through the work of
+  up to eight runs that happened, each at the commit the run worked on and with the words
+  it had. These are ordinary runs in ordinary sandboxes on the subscriptions, one after
+  the other, and nothing leaves them: they end where the administrator would decide, no
+  pull request is opened, nothing is added to the backlog and no item is touched. Each
+  case is put next to the run as it went: whether the work came through, in how many
+  rounds, how long, how many tokens. The verdict goes by the first two only; what the
+  work is worth is for people to judge, and each case links to both runs.
+
+**What runs use.** The clients report how many tokens an agent read and wrote; the
+launcher keeps that with each step (`sandbox_steps.usage`). Subscriptions are not paid by
+the token, so it is a measure and not a price: it is what a flow's token budget is
+counted in and what versions are compared by. What an agent read again from its cache is
+counted apart. The Flows page shows the totals by project and by version of a flow, with
+the minutes spent in sandboxes; a run's page shows its own.
+
 ## Moving a project's work here
 
 The projects the original system works on are marked as such on their page until their

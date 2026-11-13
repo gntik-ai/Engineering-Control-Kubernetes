@@ -1831,18 +1831,18 @@ Status: **done**, **in progress**, or blank for not started.
 
 | Id | Feature |
 | --- | --- |
-| F1 | Flow interpreter and the catalogue of typed tasks |
-| F2 | Safety rules enforced by the engine on every flow |
-| F3 | Prompt templates: fixed contract, editable instructions, versions |
-| F4 | Existing workflows imported as built-in flows (13.5) |
+| F1 | Flow interpreter and the catalogue of typed tasks (done: a flow is a document of tasks and of where each outcome leads; sixteen kinds of task, each saying where it runs, whether an agent works in it, what it needs and leaves, and how it can be set; one engine runs every flow) |
+| F2 | Safety rules enforced by the engine on every flow (done: checked when a draft is saved and kept by the engine while a run goes: review by the other subscription, tests and scan, collection and the administrator's decision before anything reaches GitHub, on every way through the flow; rounds, time and tokens bounded; only the platform's own tasks hold credentials that write) |
+| F3 | Prompt templates: fixed contract, editable instructions, versions (done: seven prompts, each put together from parts the platform sets and parts a flow may word; the wording an agent was given is recorded with its step) |
+| F4 | Existing workflows imported as built-in flows (13.5) (done for the three that run here: deliver an issue, audit code, look for enhancements are documents of the engine and behave as before) |
 | F5 | New flows: Code clean, UI audit, UX audit |
 | F6 | Flow library: create, import into a project, versions, export |
-| F7 | Validation and dry-run simulation |
+| F7 | Validation and dry-run simulation (done: a draft says which rule it breaks and where; a flow is gone through on paper by the engine's own routing, with chosen outcomes or those of a run that happened) |
 | F8 | Visual designer: task list, drag and drop, inspector, prompt editor |
 | F9 | Run view on the canvas |
-| F10 | Evaluation lab: replay past items against a changed flow |
+| F10 | Evaluation lab: replay past items against a changed flow (done: a version goes through the work of past runs again at the same commit, in sandboxes, leaving nothing behind, and each case is put next to the run as it went) |
 | F11 | Triggers from GitHub events and schedules |
-| F12 | Budgets and cost per run, flow and project |
+| F12 | Budgets and cost per run, flow and project (done as usage, since subscriptions are not paid by the token: tokens the clients report and minutes in sandboxes, per step, run, project and version of a flow; a flow's budgets of rounds, time and tokens end a run that is past them) |
 
 **G. Supervisor**
 
