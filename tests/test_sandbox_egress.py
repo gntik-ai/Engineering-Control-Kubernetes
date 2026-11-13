@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -240,3 +247,66 @@ def test_the_launcher_gives_sandboxes_the_proxy_by_address() -> None:
         "http://10.43.12.34:8888",
         None,
     )
+
+
+# --- the step's own wait for its way out -------------------------------------------------
+
+STEP = Path(__file__).resolve().parents[1] / "images" / "sandbox" / "sandbox-step"
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _step(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    job = {"commands": [{"name": "work", "argv": ["echo", "the command ran"], "timeout": 20}]}
+    return subprocess.run(  # noqa: S603 - the repository's own step runner
+        [sys.executable, str(STEP)],
+        env={"PATH": "/usr/bin:/bin", "SANDBOX_JOB": json.dumps(job), **environment},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_a_step_waits_until_its_way_out_opens_before_its_first_command() -> None:
+    """The cluster's network rules learn of a new sandbox a moment after it has started.
+    A command that connects at once (a clone) would be refused in that moment."""
+    port = _free_port()
+
+    def open_later() -> None:
+        time.sleep(1.5)
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen(4)
+            listener.settimeout(20)
+            with contextlib.suppress(OSError):
+                listener.accept()[0].close()
+
+    opener = threading.Thread(target=open_later)
+    opener.start()
+    ran = _step({"HTTPS_PROXY": f"http://127.0.0.1:{port}"})
+    opener.join()
+    assert ran.returncode == 0, ran.stderr
+    waited, command = ran.stdout.index("for the way out"), ran.stdout.index("the command ran")
+    assert waited < command, "the command ran only once the way out was open"
+    assert "sandbox-step: waited 1." in ran.stdout or "sandbox-step: waited 2." in ran.stdout
+
+
+def test_a_step_does_not_wait_for_ever_and_one_without_a_way_out_does_not_wait() -> None:
+    closed = _free_port()
+    started = time.monotonic()
+    ran = _step({"https_proxy": f"http://127.0.0.1:{closed}", "SANDBOX_WAY_OUT_SECONDS": "1"})
+    assert ran.returncode == 0 and 1.0 <= time.monotonic() - started < 15
+    assert f"the way out at 127.0.0.1:{closed} did not open in 1 s" in ran.stdout
+    assert "the command ran" in ran.stdout, "the commands run anyway and say what fails"
+    # No proxy named, or a value that names none: nothing to wait for, nothing said.
+    for environment in ({}, {"HTTPS_PROXY": "nonsense"}):
+        started = time.monotonic()
+        ran = _step(environment)
+        assert ran.returncode == 0 and "way out" not in ran.stdout
+        assert time.monotonic() - started < 5

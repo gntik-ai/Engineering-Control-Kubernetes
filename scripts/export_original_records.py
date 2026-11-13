@@ -58,8 +58,9 @@ def _database_url(given: str | None) -> str:
     )
 
 
-def _plain(value: Any) -> Any:
-    """A value as JSON can hold it."""
+def _plain(value: Any, *, structured: bool = False) -> Any:
+    """A value as JSON can hold it. ``structured`` says the column holds JSON: a driver
+    that hands such a column over as text has it read."""
     if isinstance(value, datetime.datetime | datetime.date):
         return value.isoformat()
     if isinstance(value, uuid.UUID):
@@ -68,14 +69,11 @@ def _plain(value: Any) -> Any:
         return float(value)
     if isinstance(value, bytes | memoryview):
         return None
-    if isinstance(value, str):
-        # A JSON column read through a driver that leaves it as text.
-        text = value.strip()
-        if text[:1] in "[{" and text[-1:] in "]}":
-            try:
-                return json.loads(text)
-            except ValueError:
-                return value
+    if structured and isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
     return value
 
 
@@ -100,15 +98,27 @@ def main() -> None:
     with engine.connect() as connection:
         if connection.dialect.name == "postgresql":
             connection.execute(text("SET TRANSACTION READ ONLY"))
-        present = set(inspect(connection).get_table_names())
+        inspector = inspect(connection)
+        present = set(inspector.get_table_names())
+        structured: dict[str, set[str]] = {}
 
         def rows(table: str, where: str, **parameters: Any) -> list[dict[str, Any]]:
             if table not in present:
                 return []
+            if table not in structured:
+                structured[table] = {
+                    str(column["name"])
+                    for column in inspector.get_columns(table)
+                    if "JSON" in str(column["type"]).upper()
+                }
             found = connection.execute(text(f"SELECT * FROM {table} WHERE {where}"), parameters)  # noqa: S608
             left_out = OMITTED.get(table, set())
             return [
-                {key: _plain(value) for key, value in row.items() if key not in left_out}
+                {
+                    key: _plain(value, structured=key in structured[table])
+                    for key, value in row.items()
+                    if key not in left_out
+                }
                 for row in found.mappings()
             ]
 

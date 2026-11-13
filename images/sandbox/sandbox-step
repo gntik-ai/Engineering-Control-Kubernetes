@@ -31,6 +31,7 @@ import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -41,6 +42,8 @@ ARTIFACT = "::sandbox-artifact::"
 ECHO = 2 * 1024 * 1024
 STDOUT_TAIL = 512 * 1024
 STDERR_TAIL = 64 * 1024
+# How long a step waits for its way out before it runs its commands anyway.
+WAY_OUT_SECONDS = 60.0
 
 
 def fail(message):
@@ -150,6 +153,40 @@ def run(command, environment):
     }
 
 
+def wait_for_way_out(environment):
+    """Wait until the proxy that is this sandbox's way out can be reached.
+
+    A sandbox may reach nothing but that proxy, and the cluster's network rules learn of a
+    new pod a moment after it has started. A command that connects in its first
+    milliseconds (a clone) is refused in that moment, and would fail for nothing; an
+    agent's client starts slowly enough never to notice. So the step waits, a bounded
+    time, and says so when it had to. A sandbox without a way out has nothing to wait for.
+    """
+    proxy = environment.get("HTTPS_PROXY") or environment.get("https_proxy") or ""
+    address = proxy.split("://", 1)[-1].rstrip("/")
+    host, _, port = address.rpartition(":")
+    if not host or not port.isdigit():
+        return
+    try:
+        limit = float(environment.get("SANDBOX_WAY_OUT_SECONDS", WAY_OUT_SECONDS))
+    except ValueError:
+        limit = WAY_OUT_SECONDS
+    started = time.monotonic()
+    while True:
+        try:
+            socket.create_connection((host, int(port)), timeout=2).close()
+            break
+        except OSError as error:
+            if time.monotonic() - started >= limit:
+                print(f"sandbox-step: the way out at {address} did not open in {limit:.0f} s: "
+                      f"{error}", flush=True)
+                return
+            time.sleep(0.5)
+    waited = time.monotonic() - started
+    if waited >= 1.0:
+        print(f"sandbox-step: waited {waited:.1f} s for the way out", flush=True)
+
+
 def main():
     try:
         job = json.loads(os.environ["SANDBOX_JOB"])
@@ -172,6 +209,7 @@ def main():
                     "stdout": "", "stderr": f"the step could not be set up: {error}"}]
     else:
         results = []
+        wait_for_way_out(environment)
         for command in commands:
             print(f"--- {command['name']}", flush=True)
             result = run(command, environment)

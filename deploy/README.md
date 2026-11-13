@@ -191,6 +191,12 @@ goes through a tunnel: that is TLS between the sandbox and the host, and the pro
 key and no sign-in. Network policy backs it on both sides: only sandboxes with the label
 reach the proxy, and the proxy itself reaches name resolution and public HTTPS only.
 
+The cluster's network rules learn of a new pod a moment after it has started, and until
+then the proxy refuses it. So every step first waits until it can reach the proxy
+(`sandbox-step`, up to a minute) and says in its output when it had to; a step that
+checks a repository out in its first milliseconds would otherwise fail with "Couldn't
+connect to server".
+
 The list is the setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` (a JSON list; a leading `*.`
 names every host under a domain). Its default, in `src/engineering_control/config.py`,
 holds the two subscriptions' hosts (`api.anthropic.com`; `chatgpt.com`, `auth.openai.com`,
