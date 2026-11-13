@@ -273,6 +273,46 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class FlowDraftInput(DashboardModel):
+    """A changed flow, kept as the draft of its key."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    document: dict[str, Any]
+    note: str | None = Field(default=None, max_length=300)
+
+
+class FlowPublishInput(DashboardModel):
+    """Put a flow's draft in force. Every run that starts afterwards follows it, so it
+    needs the password again."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=300)
+
+
+class FlowSimulationInput(DashboardModel):
+    """Go through a flow on paper: the document given, or else a version of the flow.
+    ``outcomes`` says how tasks end; ``run_id`` takes them from a run that happened."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    document: dict[str, Any] | None = None
+    version: int | None = Field(default=None, ge=0)
+    run_id: UUID | None = None
+    outcomes: dict[str, list[str]] = Field(default_factory=dict)
+    scope: bool = True
+    entries: int = Field(default=2, ge=0, le=6)
+    max_rounds: int | None = Field(default=None, ge=1, le=5)
+
+
+class EvaluationInput(DashboardModel):
+    """Try a version of a flow on the work of runs that happened."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    version: int = Field(ge=0)
+    run_ids: list[UUID] = Field(min_length=1, max_length=8)
+    note: str | None = Field(default=None, max_length=300)
+
+
 class RunDecisionInput(DashboardModel):
     """What to do with the change of a run that waits. It needs the password again."""
 

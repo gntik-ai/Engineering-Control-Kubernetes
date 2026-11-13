@@ -692,6 +692,9 @@ class Evaluation(UUIDPrimaryKey, Timestamps, Base):
     state: Mapped[str] = mapped_column(String(16), index=True)
     note: Mapped[str | None] = mapped_column(String(300))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The candidate as it was when the evaluation started: a draft may change afterwards.
+    document: Mapped[dict[str, Any]] = mapped_column(JSON)
+    sha256: Mapped[str] = mapped_column(String(64))
     __table_args__ = (CheckConstraint("state IN ('running', 'finished', 'stopped')", name="state"),)
 
 

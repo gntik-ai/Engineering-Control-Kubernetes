@@ -9,11 +9,14 @@ import {
   LogOut,
   Sparkles,
   SquareActivity,
+  Workflow,
 } from '@gntik-ai/icons';
 import { useEffect, useState, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { AccountsPage } from './pages/Accounts';
 import { ExecutionPage } from './pages/Execution';
+import { FlowPage } from './pages/Flow';
+import { FlowsPage } from './pages/Flows';
 import { InboxPage } from './pages/Inbox';
 import { NotFoundPage } from './pages/NotFound';
 import { ProjectPage } from './pages/Project';
@@ -43,6 +46,7 @@ const navigation = (waiting: number): NavGroup[] => [
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
       { label: 'Queues', href: `${BASE}/queues`, icon: ListOrdered },
       { label: 'Runs', href: `${BASE}/runs`, icon: Bot },
+      { label: 'Flows', href: `${BASE}/flows`, icon: Workflow },
       { label: 'Supervisor', href: `${BASE}/supervisor`, icon: Sparkles },
       { label: 'Accounts', href: `${BASE}/accounts`, icon: KeyRound },
       { label: 'Executions', href: `${BASE}/executions`, icon: SquareActivity },
@@ -60,6 +64,8 @@ const VIEWS: Record<string, () => ReactNode> = {
   [`${BASE}/queue`]: () => <QueuePage />,
   [`${BASE}/runs`]: () => <RunsPage />,
   [`${BASE}/run`]: () => <RunPage />,
+  [`${BASE}/flows`]: () => <FlowsPage />,
+  [`${BASE}/flow`]: () => <FlowPage />,
   [`${BASE}/supervisor`]: () => <SupervisorPage />,
   [`${BASE}/executions`]: () => <ExecutionsPage />,
   [`${BASE}/execution`]: () => <ExecutionPage />,
@@ -76,6 +82,8 @@ const TITLES: Record<string, string> = {
   [`${BASE}/queue`]: 'Queue',
   [`${BASE}/runs`]: 'Runs',
   [`${BASE}/run`]: 'Run',
+  [`${BASE}/flows`]: 'Flows',
+  [`${BASE}/flow`]: 'Flow',
   [`${BASE}/supervisor`]: 'Supervisor',
   [`${BASE}/executions`]: 'Executions',
   [`${BASE}/execution`]: 'Execution',
@@ -136,7 +144,9 @@ export default function App() {
                     ? `${BASE}/runs`
                     : current === `${BASE}/queue`
                       ? `${BASE}/queues`
-                      : current
+                      : current === `${BASE}/flow`
+                        ? `${BASE}/flows`
+                        : current
             }
             collapsed={collapsed}
             label="Console"

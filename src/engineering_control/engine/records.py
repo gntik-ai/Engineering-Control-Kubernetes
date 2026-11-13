@@ -23,7 +23,9 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import FlowVersion
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import BUILTIN
+from engineering_control.engine.catalogue import TASKS, budget
 from engineering_control.engine.document import Document, FlowInvalid, parse
+from engineering_control.engine.prompts import CONTRACTS
 
 
 def _when(value: datetime | None) -> str | None:
@@ -46,6 +48,21 @@ def in_force(session: Session, key: str) -> tuple[int, str] | None:
     if key in BUILTIN:
         return 0, BUILTIN[key].sha256()
     return None
+
+
+def described(document: Document) -> dict[str, Any]:
+    """A document with what validation says about it and its prompts part by part."""
+    names: list[str] = []
+    for node in document.nodes:
+        name = TASKS[node.task].prompt if node.task in TASKS else None
+        if name and name in CONTRACTS and name not in names:
+            names.append(name)
+    return {
+        "document": document.as_dict(),
+        "sha256": document.sha256(),
+        "problems": validate.problems(document),
+        "prompts": [CONTRACTS[name].describe(document.prompts.get(name) or {}) for name in names],
+    }
 
 
 def _row(version: FlowVersion) -> dict[str, Any]:
@@ -86,6 +103,49 @@ class FlowRecords:
                 return parse(row.document)
             except FlowInvalid:
                 return None
+
+    def summary(self) -> list[dict[str, Any]]:
+        """Every flow in a line: what it is, which version is in force, and whether a
+        draft is being worked on."""
+        listed = []
+        for key in self.keys():
+            version = self.version_in_force(key)
+            document = self.document(key, version)
+            if document is None:
+                continue
+            tasks = [TASKS[node.task] for node in document.nodes if node.task in TASKS]
+            listed.append(
+                {
+                    "key": key,
+                    "name": document.name,
+                    "summary": document.summary,
+                    "version": version,
+                    "draft": self.draft(key),
+                    "builtin": key in BUILTIN,
+                    "tasks": len(document.nodes),
+                    "agents": sum(1 for task in tasks if task.account),
+                    "prompts_changed": sorted(
+                        name
+                        for name, parts in document.prompts.items()
+                        if name in CONTRACTS
+                        and CONTRACTS[name].sha256(parts) != CONTRACTS[name].sha256({})
+                    ),
+                    "budgets": {
+                        name: budget(name, document.budgets)
+                        for name in ("rounds", "minutes", "tokens")
+                    },
+                }
+            )
+        return listed
+
+    def shown(self, key: str, version: int) -> dict[str, Any]:
+        """One version of a flow as the console shows it: the document, what validation
+        says about it, and its prompts part by part."""
+        document = self.document(key, version)
+        if document is None:
+            raise ProjectNotFound(f"{key} version {version}")
+        row = next((row for row in self.versions(key) if row["version"] == version), None)
+        return {**(row or {"version": version}), **described(document)}
 
     def version_in_force(self, key: str) -> int:
         with self.sessions() as session:

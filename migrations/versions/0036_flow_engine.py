@@ -89,6 +89,8 @@ def upgrade() -> None:
             sa.Column("state", sa.String(16), nullable=False),
             sa.Column("note", sa.String(300), nullable=True),
             sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("document", sa.JSON(), nullable=False),
+            sa.Column("sha256", sa.String(64), nullable=False),
             *_stamps(),
             sa.PrimaryKeyConstraint("id", name=op.f("pk_evaluations")),
             sa.ForeignKeyConstraint(

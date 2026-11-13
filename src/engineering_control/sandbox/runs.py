@@ -25,6 +25,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import (
     BacklogItem,
     Budget,
+    FlowVersion,
     ProjectRecord,
     ProjectSection,
     ProviderAccount,
@@ -32,9 +33,9 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
-from engineering_control.engine.builtin import FLOW_OF_KIND
+from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.records import in_force
-from engineering_control.flow_library import AUDIT, FLOWS, WORK_KINDS, run_for_item
+from engineering_control.flow_library import AUDIT, EVALUATION, FLOWS, WORK_KINDS, run_for_item
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -96,6 +97,7 @@ def _step_row(step: SandboxStep, *, with_log: bool) -> dict[str, Any]:
         "detail": step.detail,
         "started_at": _when(step.started_at),
         "finished_at": _when(step.finished_at),
+        "usage": step.usage,
     }
     if with_log:
         row["log"] = step.log or ""
@@ -143,8 +145,9 @@ def _shown_data(data: dict[str, Any]) -> dict[str, Any]:
 
     The digest of a supervisor turn's tool token is for the tool service alone.
     """
-    if "tools_token" in data:
-        data = {key: value for key, value in data.items() if key != "tools_token"}
+    if "tools_token" in data or "flow_document" in data:
+        # A run of the evaluation lab carries the flow it tries: the lab shows it.
+        data = {k: v for k, v in data.items() if k not in ("tools_token", "flow_document")}
     issue = data.get("issue")
     if isinstance(issue, dict) and "body" in issue:
         data = {**data, "issue": {key: value for key, value in issue.items() if key != "body"}}
@@ -265,6 +268,7 @@ class Runs:
             session.flush()
             flow = FLOW_OF_KIND[kind]
             version = in_force(session, flow) or (0, "")
+            start = first_task(session, flow, version[0])
             common = {
                 # The flow the run follows, at the version in force now: it keeps it.
                 "flow": {"key": flow, "version": version[0], "sha256": version[1]},
@@ -299,7 +303,7 @@ class Runs:
                     # More rounds of correction than usual, granted for this run.
                     run.data = {**run.data, "max_rounds": int(max_rounds)}
             session.add(
-                SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
+                SandboxStep(run_id=run.id, position=1, name=start, state="pending", attempt=0)
             )
             # Starting work on an item is deciding that it is wanted.
             if item.state == "proposed":
@@ -363,7 +367,7 @@ class Runs:
                 project_id=record.id,
                 cancel_requested=False,
                 data={
-                    "flow": _flow_now(session, FLOW_OF_KIND[flow.for_section]),
+                    "flow": (now := _flow_now(session, FLOW_OF_KIND[flow.for_section])),
                     "project": record.name,
                     "project_name": record.display_name,
                     "repository": record.source_repository,
@@ -376,7 +380,13 @@ class Runs:
             session.add(run)
             session.flush()
             session.add(
-                SandboxStep(run_id=run.id, position=1, name="prepare", state="pending", attempt=0)
+                SandboxStep(
+                    run_id=run.id,
+                    position=1,
+                    name=first_task(session, now["key"], now["version"]),
+                    state="pending",
+                    attempt=0,
+                )
             )
             session.flush()
             return _run_row(run)
@@ -470,7 +480,11 @@ class Runs:
             )
         with self.sessions() as session:
             runs = session.scalars(query.limit(max(1, min(limit, 200)))).all()
-            return {"items": [_run_row(run) for run in runs], "total": len(runs)}
+            used = usage_of(session, [run.id for run in runs])
+            return {
+                "items": [{**_run_row(run), "usage": used.get(run.id)} for run in runs],
+                "total": len(runs),
+            }
 
     def get(self, run_id: UUID) -> dict[str, Any]:
         with self.sessions() as session:
@@ -482,7 +496,11 @@ class Runs:
                 .where(SandboxStep.run_id == run.id)
                 .order_by(SandboxStep.position)
             ).all()
-            return {**_run_row(run), "steps": [_step_row(step, with_log=True) for step in steps]}
+            return {
+                **_run_row(run),
+                "usage": usage_of(session, [run.id]).get(run.id),
+                "steps": [_step_row(step, with_log=True) for step in steps],
+            }
 
     def request_cancel(self, run_id: UUID) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -823,6 +841,125 @@ class Runs:
             if step is not None and noted:
                 step.input = {**(step.input or {}), **noted}
 
+    def note_usage(self, step_id: UUID, used: dict[str, Any]) -> None:
+        """What the step's agent reported using."""
+        with self.sessions.begin() as session:
+            step = session.get(SandboxStep, step_id)
+            if step is not None:
+                step.usage = used
+
+    def usage_totals(self, *, days: int = 30) -> dict[str, Any]:
+        """What the runs created in the last ``days`` days used, by project and by
+        version of a flow. The supervisor's turns are counted under their own name."""
+        since = datetime.now(UTC) - timedelta(days=max(1, min(days, 365)))
+        with self.sessions() as session:
+            runs = session.scalars(select(SandboxRun).where(SandboxRun.created_at > since)).all()
+            used = usage_of(session, [run.id for run in runs])
+            projects: dict[str, dict[str, Any]] = {}
+            flows: dict[tuple[str, int, bool], dict[str, Any]] = {}
+
+            def add(total: dict[str, Any], run: SandboxRun) -> None:
+                spent = used.get(run.id) or {}
+                total["runs"] += 1
+                total["succeeded"] += run.state == "succeeded"
+                total["failed"] += run.state == "failed"
+                for name in ("tokens", "cached", "minutes", "sandboxes"):
+                    total[name] += int(spent.get(name) or 0)
+
+            def empty(**named: Any) -> dict[str, Any]:
+                return {
+                    **named,
+                    "runs": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "tokens": 0,
+                    "cached": 0,
+                    "minutes": 0,
+                    "sandboxes": 0,
+                }
+
+            for run in runs:
+                data = run.data or {}
+                if run.kind == "account_check":
+                    continue
+                name = str(data.get("project") or "")
+                if name:
+                    add(
+                        projects.setdefault(
+                            name,
+                            empty(project=name, project_name=data.get("project_name") or name),
+                        ),
+                        run,
+                    )
+                flow = data.get("flow") or {}
+                key = str(flow.get("key") or FLOW_OF_KIND.get(run.kind) or run.kind)
+                version = int(flow.get("version") or 0)
+                tried = bool(data.get("evaluation"))
+                add(
+                    flows.setdefault(
+                        (key, version, tried), empty(key=key, version=version, evaluation=tried)
+                    ),
+                    run,
+                )
+        return {
+            "days": days,
+            "since": _when(since),
+            "projects": sorted(projects.values(), key=lambda row: -row["tokens"]),
+            "flows": sorted(
+                flows.values(), key=lambda row: (row["key"], -row["version"], row["evaluation"])
+            ),
+        }
+
+    def start_evaluation(
+        self,
+        past_run_id: UUID,
+        *,
+        flow: dict[str, Any],
+        document: dict[str, Any],
+        start: str,
+        evaluation_id: UUID,
+    ) -> dict[str, Any]:
+        """Start a run that goes through a past run's work again on another version of
+        its flow: the same words, the same commit. Nothing leaves such a run."""
+        with self.sessions.begin() as session:
+            past = session.get(SandboxRun, past_run_id)
+            if past is None:
+                raise ProjectNotFound(str(past_run_id))
+            data = past.data or {}
+            if not data.get("base_sha") or not data.get("repository"):
+                raise ProjectInvalid("That run never checked the repository out")
+            project = session.get(ProjectRecord, past.project_id) if past.project_id else None
+            if project is None or project.archived_at is not None:
+                raise ProjectInvalid("The project of that run is not there any more")
+            if refusal := paused_refusal(project):
+                raise ProjectConflict(refusal)
+            kept = ("project", "project_name", "repository", "base_branch", "toolchain")
+            run = SandboxRun(
+                kind=EVALUATION,
+                state="queued",
+                title=f"Evaluation: {past.title}"[:300],
+                project_id=project.id,
+                cancel_requested=False,
+                data={},
+            )
+            session.add(run)
+            session.flush()
+            run.data = {
+                **{name: data[name] for name in kept if name in data},
+                **{name: data[name] for name in ("issue", "scope", "section") if name in data},
+                "flow": flow,
+                # The flow as it was when the evaluation started: a draft may change.
+                "flow_document": document,
+                "evaluation": {"id": str(evaluation_id), "of_run": str(past.id)},
+                "at_commit": data["base_sha"],
+                "branch": f"engineering-control/evaluation-{run.id.hex[:8]}",
+            }
+            session.add(
+                SandboxStep(run_id=run.id, position=1, name=start, state="pending", attempt=0)
+            )
+            session.flush()
+            return _run_row(run)
+
     def minutes_running(self, run_id: UUID) -> int:
         """How long the run has been under way, in whole minutes."""
         with self.sessions() as session:
@@ -877,6 +1014,50 @@ class Runs:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def usage_of(session: Session, run_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    """What each of the runs used: tokens its agents reported, and minutes in sandboxes."""
+    found: dict[UUID, dict[str, Any]] = {}
+    if not run_ids:
+        return found
+    rows = session.execute(
+        select(
+            SandboxStep.run_id, SandboxStep.usage, SandboxStep.started_at, SandboxStep.finished_at
+        ).where(SandboxStep.run_id.in_(run_ids))
+    ).all()
+    seconds: dict[UUID, float] = {}
+    for run_id, usage, started, finished in rows:
+        total = found.setdefault(
+            run_id,
+            {"tokens": 0, "input": 0, "output": 0, "cached": 0, "minutes": 0, "sandboxes": 0},
+        )
+        for name in ("tokens", "input", "output", "cached"):
+            try:
+                total[name] += int((usage or {}).get(name) or 0)
+            except (TypeError, ValueError):
+                continue
+        if started is not None:
+            total["sandboxes"] += 1
+            if finished is not None:
+                took = (_aware(finished) - _aware(started)).total_seconds()
+                seconds[run_id] = seconds.get(run_id, 0.0) + max(0.0, took)
+    for run_id, took in seconds.items():
+        found[run_id]["minutes"] = round(took / 60)
+    return found
+
+
+def first_task(session: Session, key: str, version: int) -> str:
+    """The task a run of that version of the flow starts at."""
+    if version:
+        row = session.scalar(
+            select(FlowVersion.document).where(
+                FlowVersion.flow_key == key, FlowVersion.version == version
+            )
+        )
+        if isinstance(row, dict) and row.get("start"):
+            return str(row["start"])
+    return BUILTIN[key].start if key in BUILTIN else "prepare"
 
 
 def _flow_now(session: Session, key: str) -> dict[str, Any]:

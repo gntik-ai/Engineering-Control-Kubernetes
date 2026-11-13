@@ -65,6 +65,10 @@ from engineering_control.dashboard.schemas import (
     ActivityEventInput,
     BacklogSyncInput,
     BudgetInput,
+    EvaluationInput,
+    FlowDraftInput,
+    FlowPublishInput,
+    FlowSimulationInput,
     ItemBulkInput,
     ItemCreateInput,
     ItemEditInput,
@@ -96,7 +100,6 @@ from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
 from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
-from engineering_control.flow_library import flow_catalogue
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.operations.models import parse_command
@@ -133,6 +136,8 @@ CONSOLE_VIEWS = frozenset(
         "supervisor",
         "queues",
         "queue",
+        "flows",
+        "flow",
         "executions",
         "execution",
     }
@@ -834,6 +839,7 @@ def create_app(
         password: bool = False,
         entity: str = "project",
         max_bytes: int = 32_768,
+        record: bool = True,
     ) -> Response:
         """One shape for every change the administrator makes: session, body, CSRF, change,
         record. ``entity`` names what was changed, a project unless said otherwise."""
@@ -877,6 +883,9 @@ def create_app(
             return JSONResponse({"detail": "not found"}, status_code=404)
         except (GitHubAppError, ClusterError) as error:
             return JSONResponse({"detail": str(error)}, status_code=502)
+        if not record:
+            # Something was only looked at: there is nothing to keep a record of.
+            return JSONResponse(changed, status_code=status_code)
         # What changed: a project by its name, a section as project/section, an account.
         label = subject or str(changed[entity])
         action = event.rsplit(".", 1)[-1].replace("_", " ")
@@ -965,11 +974,12 @@ def create_app(
 
     @app.get("/api/dashboard/flows")
     async def flows_api(request: Request) -> Response:
-        """The flows a section can be assigned."""
+        """The flows a section can be assigned, and for those that run here, the version
+        in force and whether a draft is being worked on."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse({"items": flow_catalogue()})
+        return JSONResponse(await service(request).flows())
 
     @app.get("/api/dashboard/projects/{name}")
     async def project_api(name: str, request: Request) -> Response:
@@ -1349,6 +1359,152 @@ def create_app(
             status_code=201,
             entity="run",
         )
+
+    # --- flows -----------------------------------------------------------------------------
+
+    @app.get("/api/dashboard/flows/catalogue")
+    async def flow_catalogue_api(request: Request) -> Response:
+        """What a flow can be built from: tasks, prompts and budgets."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).flow_catalogue())
+
+    @app.get("/api/dashboard/flows/{key}")
+    async def flow_api(key: str, request: Request) -> Response:
+        """One flow: the version in force, the draft when there is one, and its versions."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).flow(key))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.get("/api/dashboard/flows/{key}/versions/{version}")
+    async def flow_version_api(key: str, version: int, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).flow_version(key, version))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/flows/{key}/draft")
+    async def flow_draft_api(key: str, request: Request) -> Response:
+        """Keep a changed flow as its draft. A draft runs nothing."""
+        return await project_change(
+            request,
+            FlowDraftInput,
+            lambda body: service(request).save_flow_draft(key, body.document, body.note),
+            event="dashboard.flow_draft_saved",
+            subject=key,
+            entity="flow",
+            max_bytes=FLOW_BYTES,
+        )
+
+    @app.post("/api/dashboard/flows/{key}/draft/discard")
+    async def flow_draft_discard_api(key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).discard_flow_draft(key),
+            event="dashboard.flow_draft_discarded",
+            subject=key,
+            entity="flow",
+        )
+
+    @app.post("/api/dashboard/flows/{key}/publish")
+    async def flow_publish_api(key: str, request: Request) -> Response:
+        """Put the draft in force: every run that starts afterwards follows it. It asks
+        for the password."""
+        return await project_change(
+            request,
+            FlowPublishInput,
+            lambda body: service(request).publish_flow(key, body.note),
+            event="dashboard.flow_published",
+            subject=key,
+            password=True,
+            entity="flow",
+        )
+
+    @app.post("/api/dashboard/flows/{key}/simulate")
+    async def flow_simulate_api(key: str, request: Request) -> Response:
+        """Go through a flow on paper. Nothing runs and nothing is stored."""
+        return await project_change(
+            request,
+            FlowSimulationInput,
+            lambda body: service(request).simulate_flow(
+                key,
+                document=body.document,
+                version=body.version,
+                run_id=body.run_id,
+                outcomes=body.outcomes,
+                scope=body.scope,
+                entries=body.entries,
+                max_rounds=body.max_rounds,
+            ),
+            event="dashboard.flow_simulated",
+            subject=key,
+            entity="flow",
+            max_bytes=FLOW_BYTES,
+            record=False,
+        )
+
+    @app.get("/api/dashboard/flows/{key}/evaluations")
+    async def evaluations_api(key: str, request: Request) -> Response:
+        """The evaluations of a flow, and the runs that can be gone through again."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).evaluations(key))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/flows/{key}/evaluations")
+    async def start_evaluation_api(key: str, request: Request) -> Response:
+        """Try a version of the flow on the work of runs that happened. The runs use the
+        subscriptions like any other and leave nothing behind."""
+        return await project_change(
+            request,
+            EvaluationInput,
+            lambda body: service(request).start_evaluation(
+                key, version=body.version, run_ids=body.run_ids, note=body.note
+            ),
+            event="dashboard.evaluation_started",
+            status_code=201,
+            entity="evaluation",
+        )
+
+    @app.get("/api/dashboard/evaluations/{evaluation_id}")
+    async def evaluation_api(evaluation_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).evaluation(evaluation_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/evaluations/{evaluation_id}/stop")
+    async def stop_evaluation_api(evaluation_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).stop_evaluation(evaluation_id),
+            event="dashboard.evaluation_stopped",
+            entity="evaluation",
+        )
+
+    @app.get("/api/dashboard/usage")
+    async def usage_api(request: Request, days: int = 30) -> Response:
+        """What the runs of the last days used, by project and by version of a flow."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).usage(max(1, min(days, 365))))
 
     @app.get("/api/dashboard/runs")
     async def runs_api(request: Request) -> Response:
@@ -1966,6 +2122,8 @@ async def _form(request: Request) -> dict[str, str]:
 
 # A file of one project's records from the original system, as the console sends it.
 RECORDS_BYTES: Final = 64 * 1024 * 1024
+# A flow's document is bounded to a quarter of that by the engine; the rest is the request.
+FLOW_BYTES: Final = 512 * 1024
 
 
 async def _json(request: Request, limit: int = 32_768) -> dict[str, Any]:

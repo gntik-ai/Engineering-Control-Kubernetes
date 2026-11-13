@@ -29,10 +29,10 @@ from typing import Any, Final
 import structlog
 
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.engine import catalogue
+from engineering_control.engine import catalogue, routing
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS
-from engineering_control.engine.document import Document, Node
+from engineering_control.engine.document import Document, FlowInvalid, Node, parse
 from engineering_control.engine.tasks import (
     PLATFORM,
     SANDBOX,
@@ -44,7 +44,6 @@ from engineering_control.engine.tasks import (
     Services,
 )
 from engineering_control.github_app import GitHubApp
-from engineering_control.sandbox import deliver
 from engineering_control.sandbox.flows import (
     Checkouts,
     End,
@@ -57,19 +56,12 @@ from engineering_control.sandbox.runs import Lease, Runs, StepWork
 from engineering_control.sandbox.steps import Verdict
 
 LOG = structlog.get_logger(__name__)
-# How many tasks that only choose a way may follow one another before the engine stops
-# following: a flow that passes validation never comes near it.
-MAX_HOPS: Final = 30
+MAX_HOPS: Final = routing.MAX_HOPS
 Documents = Callable[[str, int], Document | None]
 
 
 def _failed(outcome: str, detail: str, output: dict[str, Any] | None = None) -> Result:
     return Result(Verdict(False, outcome, detail), output=output)
-
-
-def scope_given(data: dict[str, Any]) -> bool:
-    scope = data.get("scope") or {}
-    return bool(str(scope.get("title") or "").strip() or str(scope.get("text") or "").strip())
 
 
 class Engine:
@@ -90,6 +82,13 @@ class Engine:
     def document(self, item: StepWork) -> Document:
         """The flow the run follows: the version it started with."""
         flow = item.run_data.get("flow") or {}
+        carried = item.run_data.get("flow_document")
+        if carried:
+            # A run of the evaluation lab carries the flow it tries.
+            try:
+                return parse(carried)
+            except FlowInvalid as error:
+                raise ValueError(f"the flow the run carries cannot be read: {error}") from error
         key = str(flow.get("key") or FLOW_OF_KIND.get(item.run_kind) or "")
         version = int(flow.get("version") or 0)
         if version and self.documents is not None:
@@ -149,6 +148,10 @@ class Engine:
             if trouble is not None:
                 return trouble
         concluded = await SANDBOX[ctx.node.task].conclude(ctx, commands, log)
+        if isinstance(concluded, Done):
+            # How the task ended, in the flow's own words: what a simulation of a changed
+            # flow goes by when it is asked how this run would have gone on.
+            await asyncio.to_thread(self.runs.note_step, item.step_id, {"went": concluded.outcome})
         if isinstance(concluded, Failed):
             return _failed(concluded.label, concluded.detail, concluded.output)
         if isinstance(concluded, Again):
@@ -177,6 +180,15 @@ class Engine:
             if node is None or TASKS[node.task].where != "platform":
                 break
             ctx = self._context(item, node)
+            if ctx.dry and (ctx.task.publishes or ctx.task.approval):
+                # Nothing leaves a run of the evaluation lab, whatever its flow says.
+                last = End(
+                    "succeeded",
+                    "evaluated",
+                    "The run came to where the administrator would decide. Nothing is "
+                    "published in an evaluation.",
+                )
+                break
             ctx.item.run_data.update(gathered)
             performed = await PLATFORM[node.task].perform(ctx)
             gathered.update(performed.data)
@@ -206,22 +218,7 @@ class Engine:
 
     @staticmethod
     def _provider(node: Node, ran: dict[str, Any], *, again: bool) -> str | None:
-        """The subscriptions a task may be given to. ``ran`` says which subscription each
-        task of the run last worked on; ``again`` that the task is gone back to."""
-        task = TASKS[node.task]
-        if not task.account:
-            return None
-        other = node.params.get("other_than")
-        if other and ran.get(str(other)) in deliver.PROVIDERS:
-            # The other subscription than the one whose work is judged.
-            return next(name for name in deliver.PROVIDERS if name != ran[str(other)])
-        if again and ran.get(node.id) in deliver.PROVIDERS:
-            # A task that is gone back to stays with the subscription it had.
-            return str(ran[node.id])
-        providers = node.params.get("providers") or task.defaults().get("providers")
-        if isinstance(providers, list) and providers:
-            return ",".join(str(name) for name in providers if name in deliver.PROVIDERS)
-        return ",".join(deliver.PROVIDERS)
+        return routing.provider_for(node, ran, again=again)
 
     def _spent(self, item: StepWork, document: Document) -> str | None:
         """Why no further task may start for the run, when its budget is used up."""
@@ -248,79 +245,47 @@ class Engine:
         data = dict(done.data)
         if ctx.task.account and item.provider:
             data["ran"] = {**(item.run_data.get("ran") or {}), node.id: item.provider}
-        seen = [*(item.input.get("seen") or [])]
-        if node.id not in seen:
-            seen.append(node.id)
-        each = dict(item.input.get("each") or {})
         round_number = int(item.input.get("round") or 1)
-        known = {**item.run_data, **data}
-
-        # Follow the document, passing the tasks that only choose a way.
-        target = node.next.get(done.outcome)
-        for _hop in range(MAX_HOPS):
-            following = document.node(target) if target else None
-            if following is None or TASKS[following.task].where != "control":
-                break
-            if following.task == "control.when":
-                condition = following.params.get("condition") or "scope_given"
-                holds = scope_given(known) if condition == "scope_given" else False
-                target = following.next.get("yes" if holds else "no")
-                continue
-            # For each entry of a list: the next entry, or on when there is none left.
-            entries = known.get(str(following.params.get("over") or "areas")) or []
-            limit = min(len(entries), int(following.params.get("max") or catalogue.AREAS_CEILING))
-            index = int(each.get(following.id, -1)) + 1
-            if index < limit:
-                each[following.id] = index
-                # An entry is gone through from the start: its rounds are its own.
-                seen = [following.id]
-                round_number = 1
-                target = following.next.get("item")
-            else:
-                each.pop(following.id, None)
-                target = following.next.get("done")
-        else:
+        to = routing.follow(
+            document,
+            node,
+            done.outcome,
+            seen=[*(item.input.get("seen") or [])],
+            each=dict(item.input.get("each") or {}),
+            round_number=round_number,
+            known={**item.run_data, **data},
+            rounds=routing.rounds_allowed(document, item.run_data),
+        )
+        if to.kind == "loop":
             return _failed("loop", "The flow went round without reaching a task.", done.output)
-
-        following = document.node(target) if target else None
-        if following is None:
+        if to.kind == "end":
             # The flow ends here.
             data["at"] = None
             data["ended"] = {"outcome": done.label, "detail": done.detail}
             return Result(verdict, output=done.output, data=data)
-        kind = TASKS[following.task]
-        if kind.where == "platform":
+        following = document.node(str(to.target))
+        if following is None:  # ``follow`` names only tasks the document has
+            return _failed("unknown", f"The flow has no task {to.target}.", done.output)
+        if to.kind == "platform":
             data["at"] = following.id
-            if kind.approval and not ctx.dry:
+            if TASKS[following.task].approval and not ctx.dry:
                 return Result(verdict, output=done.output, data=data, wait=Approval.WAIT)
             return Result(verdict, output=done.output, data=data)
-
+        if to.kind == "last_round":
+            return _failed(
+                done.label,
+                f"{done.detail} That was round {round_number}, the last one.",
+                done.output,
+            )
         # A task in a sandbox follows.
-        rounds = max(
-            catalogue.budget("rounds", document.budgets) or deliver.MAX_ROUNDS,
-            deliver.rounds_of(item.run_data) if item.run_data.get("max_rounds") else 0,
-        )
-        rounds = min(rounds, deliver.ROUNDS_CEILING)
-        again = following.id in seen
-        if again:
-            # Going back to a task is a round, and rounds are counted.
-            if round_number >= rounds:
-                return _failed(
-                    done.label,
-                    f"{done.detail} That was round {round_number}, the last one.",
-                    done.output,
-                )
-            round_number += 1
-            # The tasks after it are gone through afresh in the new round.
-            seen = seen[: seen.index(following.id)]
         spent = await asyncio.to_thread(self._spent, item, document)
         if spent is not None:
             return _failed("over_budget", spent, done.output)
-        given = {**done.given, "round": round_number, "seen": seen}
-        if each:
-            given["each"] = each
+        given = {**done.given, "round": to.round, "seen": list(to.seen)}
+        if to.each:
+            given["each"] = to.each
         ran = {**(item.run_data.get("ran") or {}), **(data.get("ran") or {})}
-        provider = self._provider(following, ran, again=again)
+        provider = self._provider(following, ran, again=to.again)
         return Result(
             verdict,
             output=done.output,

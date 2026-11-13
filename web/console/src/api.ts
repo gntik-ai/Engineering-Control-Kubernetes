@@ -29,6 +29,257 @@ export interface Flow {
   section_action?: string | null;
 }
 
+/** What a flow that runs on this platform consists of, and which version is in force. */
+export interface FlowEngine {
+  key: string;
+  name: string;
+  summary: string;
+  /** 0 is the platform's own. */
+  version: number;
+  /** The version being worked on, when there is one. */
+  draft: number | null;
+  builtin: boolean;
+  tasks: number;
+  agents: number;
+  prompts_changed: string[];
+  budgets: { rounds: number | null; minutes: number | null; tokens: number | null };
+}
+
+/** A flow of the library, with what the engine knows of it when it runs here. */
+export interface FlowListed extends Flow {
+  engine: FlowEngine | null;
+}
+
+/** One setting of a task. */
+export interface TaskParam {
+  name: string;
+  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice';
+  default: unknown;
+  doc: string;
+  low: number | null;
+  high: number | null;
+  choices: string[];
+}
+
+/** A kind of task a flow can be built from. */
+export interface TaskType {
+  key: string;
+  group: string;
+  title: string;
+  summary: string;
+  where: 'sandbox' | 'platform' | 'control';
+  account: boolean;
+  writes: boolean;
+  publishes: boolean;
+  gate: boolean;
+  approval: boolean;
+  needs: string[];
+  produces: string[];
+  outcomes: string[];
+  params: TaskParam[];
+  prompt: string | null;
+}
+
+export type PromptPart =
+  | { kind: 'fixed'; title: string; text: string }
+  | { kind: 'editable'; name: string; title: string; text: string; default: string; changed: boolean };
+
+/** A prompt as its parts in order: what the platform fixes and what a flow may word. */
+export interface PromptShown {
+  name: string;
+  title: string;
+  variables: { name: string; doc: string }[];
+  parts: PromptPart[];
+  sha256: string;
+}
+
+export interface FlowCatalogue {
+  format: string;
+  tasks: TaskType[];
+  prompts: PromptShown[];
+  budgets: TaskParam[];
+  providers: string[];
+}
+
+export interface FlowNode {
+  id: string;
+  task: string;
+  with: Record<string, unknown>;
+  next: Record<string, string | null>;
+}
+
+/** A flow as a document: tasks, where each outcome leads, wording of prompts, budgets. */
+export interface FlowDocument {
+  format: string;
+  key: string;
+  name: string;
+  summary: string;
+  start: string;
+  tasks: FlowNode[];
+  prompts: Record<string, Record<string, string>>;
+  budgets: Record<string, number | null>;
+}
+
+export interface FlowProblem {
+  level: 'error' | 'warning';
+  rule: string;
+  where: string | null;
+  text: string;
+}
+
+export interface FlowVersionRow {
+  version: number;
+  state: 'draft' | 'published';
+  note: string | null;
+  sha256: string;
+  saved_at: string | null;
+  published_at: string | null;
+  errors: number;
+}
+
+/** One version of a flow with its document, what validation says, and its prompts. */
+export interface FlowVersionShown extends FlowVersionRow {
+  document: FlowDocument;
+  problems: FlowProblem[];
+  prompts: PromptShown[];
+}
+
+export interface FlowDetail {
+  key: string;
+  in_force: FlowVersionShown;
+  draft: FlowVersionShown | null;
+  versions: FlowVersionRow[];
+}
+
+export interface SimulatedStep {
+  task: string;
+  type: string;
+  title: string;
+  where: 'sandbox' | 'platform' | 'control';
+  provider: string | null;
+  round: number | null;
+  entry: number | null;
+  outcome: string;
+  /** Whether the outcome is the task's usual one, taken because none was told. */
+  assumed: boolean;
+  prompt: { name: string; sha256: string; changed: boolean } | null;
+  times: number;
+  note: string | null;
+}
+
+export interface Simulation {
+  steps: SimulatedStep[];
+  ends: { how: 'done' | 'ended' | 'failed' | 'discarded' | 'invalid' | 'long'; text: string };
+  problems: FlowProblem[];
+  totals?: { sandboxes: number; agents: Record<string, number>; rounds: number; of_rounds: number };
+  of_run: {
+    id: string;
+    title: string;
+    state: string;
+    outcome: string | null;
+    flow_version: number;
+    known: number;
+  } | null;
+}
+
+/** A run that can be gone through again in the evaluation lab. */
+export interface ReplayCandidate {
+  run_id: string;
+  title: string;
+  project: string | null;
+  project_name: string | null;
+  state: string;
+  outcome: string | null;
+  detail: string | null;
+  commit: string;
+  flow_version: number;
+  created_at: string | null;
+  minutes: number;
+  tokens: number;
+}
+
+/** What a run came to, in numbers that can be put next to another run's. */
+export interface Measured {
+  run_id: string;
+  state: string;
+  outcome: string | null;
+  detail: string | null;
+  flow_version: number;
+  through: boolean;
+  rounds: number;
+  path: { name: string; outcome: string | null; state: string }[];
+  sandboxes: number;
+  minutes: number;
+  tokens: number;
+  counts: Record<string, number> | null;
+  files: number;
+}
+
+export interface EvaluationCase {
+  subject: { n: number; title: string; project: string | null; project_name: string | null; commit: string; of_run: string };
+  baseline: Measured | null;
+  candidate: Measured | null;
+  skipped: string | null;
+  verdict: 'better' | 'same' | 'worse' | null;
+}
+
+interface EvaluationTotal {
+  cases: number;
+  through: number;
+  rounds: number;
+  minutes: number;
+  tokens: number;
+}
+
+/** A version of a flow tried on past work. */
+export interface Evaluation {
+  id: string;
+  flow: string;
+  candidate_version: number;
+  baseline_version: number;
+  state: 'running' | 'finished' | 'stopped';
+  note: string | null;
+  cases: number;
+  done: number;
+  created_at: string | null;
+  finished_at: string | null;
+  totals: { baseline: EvaluationTotal; candidate: EvaluationTotal };
+  verdicts: { better: number; same: number; worse: number };
+  items?: EvaluationCase[];
+}
+
+export interface EvaluationLab {
+  items: Evaluation[];
+  candidates: ReplayCandidate[];
+}
+
+/** What runs used: tokens their agents reported, and minutes in sandboxes. */
+export interface UsageRow {
+  runs: number;
+  succeeded: number;
+  failed: number;
+  tokens: number;
+  cached: number;
+  minutes: number;
+  sandboxes: number;
+}
+
+export interface Usage {
+  days: number;
+  since: string | null;
+  projects: (UsageRow & { project: string; project_name: string })[];
+  flows: (UsageRow & { key: string; version: number; evaluation: boolean })[];
+}
+
+export interface RunUsage {
+  tokens: number;
+  input: number;
+  output: number;
+  cached: number;
+  minutes: number;
+  sandboxes: number;
+}
+
 /**
  * One kind of work on a project. `flow` is null while none is assigned. The description,
  * the two "when" texts, the examples and the labels are its routing guide: what the
@@ -365,6 +616,10 @@ export interface RunStep {
   detail: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** What the step's agent reported using, when an agent worked in it. */
+  usage?: { tokens: number; input: number; output: number; cached: number } | null;
+  /** What the step was given: the round, and which wording of which prompt. */
+  input?: { round?: number; prompt?: { name: string; sha256: string } } | null;
   log?: string;
 }
 
@@ -401,7 +656,7 @@ export interface RunResult {
 /** Work done in sandboxes: trying an account, delivering an item, auditing, looking for enhancements. */
 export interface Run {
   id: string;
-  kind: 'account_check' | 'deliver_issue' | 'audit_code' | 'discover_enhancements';
+  kind: 'account_check' | 'deliver_issue' | 'audit_code' | 'discover_enhancements' | 'evaluation';
   state: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
   title: string;
   outcome: string | null;
@@ -409,9 +664,15 @@ export interface Run {
   cancel_requested: boolean;
   project: string | null;
   project_name: string | null;
+  /** What the run used so far. */
+  usage?: RunUsage | null;
   data: {
     repository?: string;
     branch?: string;
+    /** The flow the run follows, at the version it started with. */
+    flow?: { key: string; version: number; sha256: string };
+    /** Set for a run of the evaluation lab: which evaluation, and of which run's work. */
+    evaluation?: { id: string; of_run: string };
     issue?: { number: number | null; title: string; url: string | null };
     scope?: { title: string; text: string };
     result?: RunResult;

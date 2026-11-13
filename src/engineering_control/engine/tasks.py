@@ -239,9 +239,9 @@ class Checkout:
         if github is None:
             raise GitHubAppError("The GitHub App is not configured, so nothing can be checked out")
         issue = data.get("issue") or {}
-        if issue.get("number"):
+        if issue.get("number") and not ctx.dry:
             # The issue as it reads now, for the agents. An item of the platform's own
-            # carries its text already.
+            # carries its text already, and so does past work that is gone through again.
             fresh = await github.issue(data["repository"], int(issue["number"]))
             await asyncio.to_thread(
                 ctx.services.runs.merge_data,

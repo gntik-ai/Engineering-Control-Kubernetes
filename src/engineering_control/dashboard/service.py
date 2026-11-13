@@ -12,10 +12,23 @@ from engineering_control.dashboard.accounts import (
     secret_name,
 )
 from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
-from engineering_control.dashboard.project_records import ProjectConflict, ProjectInvalid
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectNotFound,
+)
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.engine.catalogue import BUDGETS
+from engineering_control.engine.catalogue import catalogue as task_catalogue
+from engineering_control.engine.document import FORMAT as FLOW_FORMAT
+from engineering_control.engine.document import FlowInvalid
+from engineering_control.engine.document import parse as parse_flow
+from engineering_control.engine.prompts import CONTRACTS
+from engineering_control.engine.simulate import recorded, simulate
+from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.sandbox.deliver import PROVIDERS as AGENT_PROVIDERS
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
@@ -468,6 +481,158 @@ class DashboardService:
 
     async def try_account(self, account_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.start_account_check, account_id)
+
+    # --- flows -----------------------------------------------------------------------------
+
+    async def flows(self) -> dict[str, object]:
+        """The library of flows. One that runs on this platform says so under ``engine``:
+        its version in force, its draft, what it consists of."""
+        running = {
+            row["key"]: row for row in await asyncio.to_thread(self.repository.flows.summary)
+        }
+        listed = [{**flow, "engine": running.pop(flow["key"], None)} for flow in library()]
+        # Flows made here that the library does not know.
+        listed += [
+            {"key": key, "name": row["name"], "summary": row["summary"], "engine": row}
+            for key, row in running.items()
+        ]
+        return {"items": listed}
+
+    async def flow_catalogue(self) -> dict[str, object]:
+        """What a flow can be built from: the tasks, the prompts and the budgets."""
+        return {
+            "format": FLOW_FORMAT,
+            "tasks": task_catalogue(),
+            "prompts": [contract.describe({}) for contract in CONTRACTS.values()],
+            "budgets": [param.as_dict() for param in BUDGETS.values()],
+            "providers": list(AGENT_PROVIDERS),
+        }
+
+    async def flow(self, key: str) -> dict[str, object]:
+        def read() -> dict[str, Any]:
+            flows = self.repository.flows
+            versions = flows.versions(key)
+            draft = flows.draft(key)
+            return {
+                "key": key,
+                "in_force": flows.shown(key, flows.version_in_force(key)),
+                "draft": flows.shown(key, draft) if draft is not None else None,
+                "versions": versions,
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def flow_version(self, key: str, version: int) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.flows.shown, key, version)
+
+    async def save_flow_draft(
+        self, key: str, document: dict[str, Any], note: str | None
+    ) -> dict[str, object]:
+        def save() -> dict[str, Any]:
+            saved = self.repository.flows.save_draft(key, document, note=note)
+            return {**self.repository.flows.shown(key, saved["version"]), "flow": key}
+
+        return await asyncio.to_thread(save)
+
+    async def discard_flow_draft(self, key: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.flows.discard_draft, key)
+
+    async def publish_flow(self, key: str, note: str | None) -> dict[str, object]:
+        return await asyncio.to_thread(lambda: self.repository.flows.publish(key, note=note))
+
+    async def simulate_flow(
+        self,
+        key: str,
+        *,
+        document: dict[str, Any] | None,
+        version: int | None,
+        run_id: UUID | None,
+        outcomes: dict[str, list[str]],
+        scope: bool,
+        entries: int,
+        max_rounds: int | None,
+    ) -> dict[str, object]:
+        """Go through a flow on paper. Nothing is stored and nothing runs."""
+
+        def go() -> dict[str, Any]:
+            flows = self.repository.flows
+            if document is not None:
+                try:
+                    flow = parse_flow(document)
+                except FlowInvalid as error:
+                    raise ProjectInvalid(str(error)) from error
+            else:
+                wanted = flows.version_in_force(key) if version is None else version
+                found = flows.document(key, wanted)
+                if found is None:
+                    raise ProjectNotFound(f"{key} version {wanted}")
+                flow = found
+            told = dict(outcomes)
+            of_run = None
+            given, listed = scope, entries
+            if run_id is not None:
+                run = self.repository.runs.get(run_id)
+                told = {**recorded(run["steps"], run["data"]), **told}
+                of_run = {
+                    "id": run["id"],
+                    "title": run["title"],
+                    "state": run["state"],
+                    "outcome": run["outcome"],
+                    "flow_version": (run["data"].get("flow") or {}).get("version", 0),
+                    "known": sum(len(ways) for ways in told.values()),
+                }
+                scoped = run["data"].get("scope")
+                if isinstance(scoped, dict):
+                    given = bool(str(scoped.get("title") or scoped.get("text") or "").strip())
+                areas = run["data"].get("areas")
+                if isinstance(areas, list):
+                    listed = len(areas)
+            result = simulate(
+                flow,
+                outcomes=told,
+                scope=given,
+                entries=listed,
+                max_rounds=max_rounds,
+            )
+            return {**result, "flow": key, "sha256": flow.sha256(), "of_run": of_run}
+
+        return await asyncio.to_thread(go)
+
+    async def usage(self, days: int) -> dict[str, object]:
+        return await asyncio.to_thread(lambda: self.repository.runs.usage_totals(days=days))
+
+    async def evaluations(self, key: str) -> dict[str, object]:
+        def read() -> dict[str, Any]:
+            return {
+                "items": self.repository.evaluations.listing(key),
+                "candidates": self.repository.evaluations.candidates(key),
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def start_evaluation(
+        self, key: str, *, version: int, run_ids: list[UUID], note: str | None
+    ) -> dict[str, object]:
+        def start() -> dict[str, Any]:
+            started = self.repository.evaluations.start(
+                key, version=version, run_ids=run_ids, note=note
+            )
+            return {**started, "evaluation": f"{key} version {version}"}
+
+        return await asyncio.to_thread(start)
+
+    async def evaluation(self, evaluation_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.evaluations.get, evaluation_id)
+
+    async def stop_evaluation(self, evaluation_id: UUID) -> dict[str, object]:
+        def stop() -> dict[str, Any]:
+            stopped = self.repository.evaluations.stop(evaluation_id)
+            return {
+                **stopped,
+                "evaluation": f"{stopped['flow']} version {stopped['candidate_version']}",
+            }
+
+        return await asyncio.to_thread(stop)
 
     async def runs(self) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.listing)

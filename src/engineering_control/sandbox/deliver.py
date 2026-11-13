@@ -541,6 +541,56 @@ def agent_answer(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any
     return _object(str((by_name.get("answer") or {}).get("stdout") or "").strip())
 
 
+def _count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def agent_usage(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """What the client says its agent used: tokens read, tokens written, and tokens read
+    again from its cache. None when the client reported nothing.
+
+    Subscriptions are not paid by the token, so this is a measure, not a price: it is
+    what budgets are counted in and what versions of a flow are compared by. ``tokens``
+    is what was read new and what was written; what was read from the cache is counted
+    apart, since an agent reads its own conversation again at every turn.
+    """
+    read = written = cached = 0
+    reported = False
+    for command in commands:
+        for line in str(command.get("stdout") or "").splitlines():
+            if not line.startswith("{") or '"usage"' not in line:
+                continue
+            event = _object(line)
+            found = event.get("usage") if event else None
+            if not event or not isinstance(found, dict):
+                continue
+            usage: dict[str, Any] = found
+
+            def count(name: str, usage: dict[str, Any] = usage) -> int:
+                return _count(usage.get(name))
+
+            if provider == "claude":
+                if event.get("type") != "result":
+                    continue
+                # The result counts the whole conversation: the last one stands.
+                read = count("input_tokens") + count("cache_creation_input_tokens")
+                cached = count("cache_read_input_tokens")
+                written = count("output_tokens")
+                reported = True
+            elif event.get("type") == "turn.completed":
+                again = count("cached_input_tokens")
+                read += max(0, count("input_tokens") - again)
+                cached += again
+                written += count("output_tokens")
+                reported = True
+    if not reported:
+        return None
+    return {"tokens": read + written, "input": read, "output": written, "cached": cached}
+
+
 def agent_errors(provider: str, commands: list[dict[str, Any]]) -> str:
     """What the client itself reported as an error, and nothing else it printed.
 

@@ -46,6 +46,8 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
+from engineering_control.engine.evaluations import Evaluations
+from engineering_control.engine.records import FlowRecords
 from engineering_control.operations.issue_delivery_approval import (
     expired_unreferenced_reissue_event_ids,
 )
@@ -136,6 +138,8 @@ class DashboardRepository:
         self.bring_over = BringOver(self.sessions, self.backlog)
         self.accounts = Accounts(self.sessions)
         self.runs = Runs(self.sessions)
+        self.flows = FlowRecords(self.sessions)
+        self.evaluations = Evaluations(self.sessions, self.runs)
         self.budgets = Budgets(self.sessions)
         self.queues = Queues(self.sessions, self.runs, self.budgets)
         self.definitions = Definitions(self.sessions)

@@ -28,12 +28,13 @@ from sqlalchemy.orm import sessionmaker
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.backlog_items import BacklogItems
+from engineering_control.engine.evaluations import Evaluations
 from engineering_control.engine.interpreter import Engine
 from engineering_control.engine.records import FlowRecords
 from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
-from engineering_control.sandbox import pods, steps
+from engineering_control.sandbox import deliver, pods, steps
 from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
@@ -117,6 +118,7 @@ class Launcher:
         self.queues = queues
         # One engine runs every flow: the kind of a run only says what it is recorded as.
         sessions = getattr(runs, "sessions", None)
+        self.evaluations = Evaluations(sessions, runs) if sessions else None
         engine = Engine(runs, github, backlog, FlowRecords(sessions).document if sessions else None)
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
@@ -145,6 +147,9 @@ class Launcher:
             await asyncio.to_thread(self.queues.advance)
         if self.operations is not None:
             await self._operate()
+        if self.evaluations is not None:
+            # Evaluations go through their cases one after the other.
+            await asyncio.to_thread(self.evaluations.advance)
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -327,6 +332,10 @@ class Launcher:
 
     async def _conclude(self, item: StepWork, log: str, said: str | None) -> None:
         commands = steps.parse_result(log)
+        if item.provider and commands:
+            used = deliver.agent_usage(item.provider, commands)
+            if used is not None:
+                await asyncio.to_thread(self.runs.note_usage, item.step_id, used)
         result = await self.flows[item.run_kind].conclude(item, commands, log)
         verdict = result.verdict
         if commands is None and said:

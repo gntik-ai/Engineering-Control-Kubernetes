@@ -32,6 +32,7 @@ import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, RouterLink, useLocation } from '../router';
+import { minutes, tokens, versionName } from './Flows';
 import { useSubmit } from './ProjectDialogs';
 
 type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
@@ -73,6 +74,7 @@ const KINDS: Record<Run['kind'], string> = {
   deliver_issue: 'Delivering an item',
   audit_code: 'Auditing code',
   discover_enhancements: 'Looking for enhancements',
+  evaluation: 'Trying a version of a flow',
 };
 
 const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
@@ -240,7 +242,13 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
                 .join(' or ')}
             </Badge>
           ) : null}
-          <span className="ml-auto text-[12px] text-muted-foreground">
+          <span className="ml-auto flex items-center gap-3 text-[12px] text-muted-foreground">
+            {step.input?.round && step.input.round > 1 ? <span>Round {step.input.round}</span> : null}
+            {step.usage ? (
+              <span title={`${step.usage.input.toLocaleString('en')} read, ${step.usage.output.toLocaleString('en')} written, ${step.usage.cached.toLocaleString('en')} read again from cache`}>
+                {tokens(step.usage.tokens)} tokens
+              </span>
+            ) : null}
             {step.started_at ? <When value={step.started_at} /> : null}
           </span>
         </div>
@@ -504,6 +512,32 @@ function RunDetail({ id }: { id: string }) {
                   </>
                 ) : null}
               </p>
+            ) : null}
+            {run.data.flow ? (
+              <p className="text-[13px] text-muted-foreground">
+                Follows <Link href={`${BASE}/flow?key=${run.data.flow.key}`}>{run.data.flow.key}</Link>,{' '}
+                {versionName(run.data.flow.version).toLowerCase()}
+                {run.usage?.sandboxes
+                  ? `. Used so far: ${tokens(run.usage.tokens)} tokens, ${minutes(run.usage.minutes)} in ${run.usage.sandboxes} ${run.usage.sandboxes === 1 ? 'sandbox' : 'sandboxes'}`
+                  : ''}
+                .
+              </p>
+            ) : null}
+            {run.data.evaluation ? (
+              <Alert
+                tone="info"
+                title="A run of the evaluation lab"
+                description={
+                  <>
+                    It goes through the work of{' '}
+                    <Link href={`${BASE}/run?id=${run.data.evaluation.of_run}`}>a run that happened</Link> again on
+                    another version of its flow. Nothing leaves it: no pull request, nothing in the backlog.{' '}
+                    {run.data.flow ? (
+                      <Link href={`${BASE}/flow?key=${run.data.flow.key}&tab=lab`}>Open the evaluation</Link>
+                    ) : null}
+                  </>
+                }
+              />
             ) : null}
             {run.data.toolchain?.note ? <Alert tone="warning" title={run.data.toolchain.note} /> : null}
             {run.data.scope?.text ? (
