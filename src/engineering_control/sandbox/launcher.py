@@ -82,10 +82,14 @@ class Launcher:
         cluster: Cluster,
         sandboxes: pods.Sandboxes,
         github: GitHubApp | None = None,
+        *,
+        parallel_steps: int = 4,
     ) -> None:
         self.runs = runs
         self.cluster = cluster
         self.sandboxes = sandboxes
+        self.parallel_steps = parallel_steps
+        self._running = 0
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
             "deliver_issue": DeliverIssue(runs, github),
@@ -95,6 +99,9 @@ class Launcher:
         """One pass over every unfinished run. Returns how many it looked at. A run whose
         step fails here is retried on the next pass; it never stops the others."""
         work = await asyncio.to_thread(self.runs.work)
+        # Steps already in a sandbox count against the limit; a step that has to wait for
+        # a free one says so and is looked at again on the next pass, oldest run first.
+        self._running = sum(1 for item in work if item.state == "running")
         for item in work:
             try:
                 await self._advance(item)
@@ -133,6 +140,13 @@ class Launcher:
     # --- starting ------------------------------------------------------------------------
 
     async def _start(self, item: StepWork) -> None:
+        if self._running >= self.parallel_steps:
+            await asyncio.to_thread(
+                self.runs.step_waiting,
+                item.step_id,
+                f"Waiting for a free sandbox: {self.parallel_steps} steps run at the same time.",
+            )
+            return
         lease: Lease | None = None
         if item.provider is not None:
             lease = await asyncio.to_thread(self.runs.lease, item.step_id)
@@ -184,6 +198,7 @@ class Launcher:
         )
         await self.cluster.create_pod(manifest)
         await asyncio.to_thread(self.runs.step_started, item.step_id, manifest["metadata"]["name"])
+        self._running += 1
         LOG.info("sandbox_started", run=str(item.run_id), step=item.name)
 
     # --- watching ------------------------------------------------------------------------
@@ -329,7 +344,11 @@ async def serve(settings: Settings | None = None) -> None:
     )
     github = GitHubApp.from_settings(resolved)
     launcher = Launcher(
-        Runs(sessionmaker(engine, expire_on_commit=False)), cluster, sandboxes, github
+        Runs(sessionmaker(engine, expire_on_commit=False)),
+        cluster,
+        sandboxes,
+        github,
+        parallel_steps=resolved.sandbox_parallel_steps,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

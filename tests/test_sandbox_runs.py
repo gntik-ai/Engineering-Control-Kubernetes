@@ -496,6 +496,30 @@ async def test_a_cluster_that_refuses_leaves_the_run_waiting_with_the_reason(wor
     assert world.runs.get(UUID(run["id"]))["state"] == "running"
 
 
+@pytest.mark.asyncio
+async def test_no_more_steps_run_at_once_than_the_launcher_allows(world: Any) -> None:
+    world.launcher.parallel_steps = 2
+    runs = [
+        world.runs.start_account_check(world.account(f"Claude {number}", "claude"))
+        for number in (1, 2, 3)
+    ]
+    await world.launcher.tick()
+    assert len(world.fake.pods) == 2, "the third waits for a free sandbox"
+    waiting = world.runs.get(UUID(runs[2]["id"]))
+    assert waiting["state"] == "queued"
+    assert "Waiting for a free sandbox: 2 steps" in waiting["steps"][0]["detail"]
+    await world.launcher.tick()
+    assert len(world.fake.pods) == 2
+    # One ends: the oldest waiting run gets its sandbox.
+    first = next(iter(world.fake.pods.values()))
+    first["status"] = {"phase": "Succeeded"}
+    world.fake.logs[first["metadata"]["name"]] = _result(_command(stdout="ready"))
+    await world.launcher.tick()
+    await world.launcher.tick()
+    assert world.runs.get(UUID(runs[2]["id"]))["state"] == "running"
+    assert len(world.fake.pods) == 2
+
+
 def test_an_account_is_leased_only_while_it_is_free_signed_in_and_not_paused(world: Any) -> None:
     def step(provider: str, account: UUID | None = None) -> UUID:
         with world.sessions.begin() as session:

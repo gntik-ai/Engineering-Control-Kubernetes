@@ -1,0 +1,19 @@
+# What all sandboxes together may take from the node reserved for them (aibot: 12
+# processors, 30 GiB of memory, 440 GiB of disk). The launcher itself starts at most four
+# steps at once (ENGINEERING_SANDBOX_PARALLEL_STEPS); this is the cluster's own ceiling
+# behind that, with room for two short steps more. A step that would exceed it is refused
+# by the cluster, and the launcher tries again when another has ended.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: sandboxes
+  namespace: engineering-control-sandboxes
+spec:
+  hard:
+    pods: "6"
+    requests.cpu: "3"
+    requests.memory: 6Gi
+    limits.cpu: "12"
+    limits.memory: 28Gi
+    persistentvolumeclaims: "40"
+    requests.storage: 400Gi

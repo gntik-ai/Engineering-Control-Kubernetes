@@ -8,6 +8,7 @@ resources:
   - namespace.yaml
   - network-policy.yaml
   - access.yaml
+  - quota.yaml
 labels:
   - pairs:
       app.kubernetes.io/part-of: engineering-control

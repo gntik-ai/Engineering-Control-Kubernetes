@@ -232,6 +232,18 @@ def test_the_console_writes_sign_ins_the_launcher_runs_pods_and_neither_reads_a_
     (account,) = [d for d in documents if d["kind"] == "ServiceAccount"]
     assert account["metadata"]["name"] == "sandbox"
     assert account["automountServiceAccountToken"] is False
+    # The cluster's ceiling for all sandboxes together leaves the launcher's own limit room
+    # and stays within the node (12 processors, 30 GiB).
+    (quota,) = [d for d in documents if d["kind"] == "ResourceQuota"]
+    hard = quota["spec"]["hard"]
+    settings = next(
+        d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
+    )
+    parallel = int(settings["data"]["ENGINEERING_SANDBOX_PARALLEL_STEPS"])
+    assert Settings(sandbox_parallel_steps=parallel).sandbox_parallel_steps == 4
+    assert int(hard["pods"]) >= parallel + 2
+    assert int(hard["limits.memory"].removesuffix("Gi")) >= parallel * 6
+    assert int(hard["limits.memory"].removesuffix("Gi")) <= 30 and int(hard["limits.cpu"]) <= 12
     # Nothing runs here by manifest: sandboxes are started by the platform, one per run.
     assert not [d for d in documents if d["kind"] in {"Deployment", "Job", "StatefulSet", "Pod"}]
 

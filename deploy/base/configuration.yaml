@@ -36,6 +36,9 @@ data:
   # Where the sandboxes run and the sign-ins of subscription accounts are stored
   # (deploy/sandboxes). Only the console has an identity that may write there.
   ENGINEERING_SANDBOX_NAMESPACE: engineering-control-sandboxes
+  # Steps in sandboxes at the same time. The node takes four agent steps of 6 GiB each;
+  # deploy/sandboxes/quota.yaml is the cluster's ceiling behind this number.
+  ENGINEERING_SANDBOX_PARALLEL_STEPS: "4"
   ENGINEERING_TEMPORAL_TARGET: engineering-control-temporal:7233
   ENGINEERING_TEMPORAL_NAMESPACE: engineering-control
   # Temporal is reached over TLS: the server must show a certificate for this name, signed

@@ -220,6 +220,8 @@ class Settings(BaseSettings):
         default=None,
         pattern=r"^[a-z0-9][a-z0-9./-]{2,200}(:[A-Za-z0-9._-]{1,128}|@sha256:[0-9a-f]{64})$",
     )
+    # How many steps may run in sandboxes at the same time, over all runs.
+    sandbox_parallel_steps: int = Field(default=4, ge=1, le=32)
     sandbox_pull_secret: str = Field(
         default="engineering-control-registry", pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
     )

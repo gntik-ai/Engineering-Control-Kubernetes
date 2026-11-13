@@ -156,6 +156,11 @@ only, create, read and delete pods, read what they printed, and create and delet
 claims. It cannot read a Secret: a sandbox gets its account's sign-in because the pod names
 the Secret, not because the launcher has seen it.
 
+At most four steps run at the same time, over all runs
+(`ENGINEERING_SANDBOX_PARALLEL_STEPS`); a step beyond that waits and says so. Behind that
+number the namespace has a quota (`deploy/sandboxes/quota.yaml`): six pods, 28 GiB of memory
+and 12 processors in limits, sized for the node (12 processors, 30 GiB, 440 GiB of disk).
+
 An account is leased to a step for as long as the step runs; the number of running steps
 per account never exceeds the account's "sandboxes at once". The first kind of run is
 trying an account (Accounts → Try it): one sandbox asks the account's client a trivial
