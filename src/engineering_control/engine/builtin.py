@@ -214,8 +214,94 @@ _CLEAN: Final[dict[str, Any]] = {
     "budgets": {"rounds": 1},
 }
 
+
+def _application_audit(
+    key: str, name: str, action: str, summary: str, kind: str, role: str, what_counts: str
+) -> dict[str, Any]:
+    """A flow that looks at the running application: one agent goes through it in a
+    browser, the other subscription repeats what it found, and what holds is proposed."""
+    return {
+        "format": FORMAT,
+        "key": key,
+        "items": "request",
+        "action": action,
+        "name": name,
+        "summary": summary,
+        "start": "prepare",
+        "tasks": [
+            {
+                "id": "prepare",
+                "task": "workspace.checkout",
+                "with": {"install": False, "baseline": False},
+                "next": {"ok": "audit"},
+            },
+            {
+                "id": "audit",
+                "task": "agent.audit_application",
+                "with": {"providers": _PROVIDERS},
+                "next": {"candidates": "verify", "nothing": "decide"},
+            },
+            {
+                "id": "verify",
+                "task": "agent.verify_application",
+                "with": {"other_than": "audit", "rounds": 1},
+                "next": {"done": "decide"},
+            },
+            {"id": "decide", "task": "findings.propose", "with": {"kind": kind}},
+        ],
+        "prompts": {"application_auditor": {"role": role, "what_counts": what_counts}},
+        "budgets": {"rounds": 1},
+    }
+
+
+_UI: Final = _application_audit(
+    "ui-audit",
+    "UI audit",
+    "Audit the interface",
+    "Go through the pages of the running application, compare what each does with what "
+    "it is meant to do, have each finding repeated independently, and propose the "
+    "confirmed ones as items. Each item is then delivered like any other.",
+    "ui-finding",
+    "You audit the interface of the running application of {{repository}}, page by "
+    "page, as its users meet it. The repository is checked out in the current directory "
+    "at commit {{base_sha}}, to read what each page is meant to do (its documents, its "
+    "tests, its journeys); do not modify files, whatever you change is discarded. "
+    "Report PASS only with evidence. Report FAIL only with findings another person can "
+    "repeat in a browser.",
+    "A finding is a page or a control that does not do what it is meant to do: an "
+    "action that fails or does nothing, a form that accepts what it should refuse or "
+    "refuses what it should accept, a value shown that is not the value stored, an "
+    "error the user is not told about, a page that breaks at a narrow or a wide window. "
+    "It is not an idea for something new. Give it the lens correctness, ux or "
+    "accessibility, whichever fits. Report at most {{max_findings}}, the most serious "
+    "first, each one on its own.",
+)
+_UX: Final = _application_audit(
+    "ux-audit",
+    "UX audit",
+    "Audit the experience",
+    "Walk the navigation of the running application as a user would: what can be "
+    "reached and how, dead ends, consistency and accessibility. Each finding is "
+    "repeated independently and the confirmed ones are proposed as items.",
+    "ux-finding",
+    "You audit how the running application of {{repository}} is to use: you walk its "
+    "navigation as someone who has not seen it before. The repository is checked out in "
+    "the current directory at commit {{base_sha}}, to read who its users are and what "
+    "they come to do; do not modify files, whatever you change is discarded. Report "
+    "PASS only with evidence. Report FAIL only with findings another person can repeat "
+    "in a browser.",
+    "A finding is something that gets in a user's way: a page that cannot be reached "
+    "from the navigation or that leads nowhere, a journey that needs more steps than "
+    "its goal warrants, the same thing named or placed differently on different pages, "
+    "a state the user is left in without being told what happened or what to do next, a "
+    "control that cannot be used with the keyboard or that a screen reader does not "
+    "name, text that cannot be read at its contrast or size. It is not a defect of the "
+    "data or an idea for a new feature. Give it the lens ux or accessibility. Report at "
+    "most {{max_findings}}, the ones that stop the most users first, each one on its own.",
+)
+
 BUILTIN: Final[dict[str, Document]] = {
-    str(raw["key"]): parse(raw) for raw in (_DELIVER, _AUDIT, _DISCOVER, _CLEAN)
+    str(raw["key"]): parse(raw) for raw in (_DELIVER, _AUDIT, _DISCOVER, _CLEAN, _UI, _UX)
 }
 # The kind of run each of the platform's flows is recorded as, and the flow of a run
 # that was started before runs said which flow they follow.

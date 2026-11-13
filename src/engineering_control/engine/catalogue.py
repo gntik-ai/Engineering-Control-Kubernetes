@@ -74,6 +74,7 @@ class TaskType:
     publishes: bool = False  # it reaches GitHub
     gate: bool = False  # it is the validation every change passes before it is published
     approval: bool = False  # the administrator decides here
+    application: bool = False  # it looks at the project's running application in a browser
     needs: tuple[str, ...] = ()
     produces: tuple[str, ...] = ()
     outcomes: tuple[str, ...] = ("ok",)
@@ -92,6 +93,7 @@ class TaskType:
             "publishes": self.publishes,
             "gate": self.gate,
             "approval": self.approval,
+            "application": self.application,
             "needs": list(self.needs),
             "produces": list(self.produces),
             "outcomes": list(self.outcomes),
@@ -303,6 +305,48 @@ _TASKS: Final = (
             _MINUTES,
         ),
         prompt="verifier",
+    ),
+    TaskType(
+        "agent.audit_application",
+        "Agents",
+        "Audit the running application",
+        "An agent opens the project's application in a browser, goes through it, and "
+        "reports candidate findings, each with the steps in the browser that show it. It "
+        "reaches that one host and nothing else, and changes nothing in the repository.",
+        "sandbox",
+        account=True,
+        application=True,
+        needs=("checkout",),
+        produces=("candidates",),
+        outcomes=("candidates", "nothing"),
+        params=(_PROVIDERS, _MINUTES),
+        prompt="application_auditor",
+    ),
+    TaskType(
+        "agent.verify_application",
+        "Review",
+        "Verify in the application",
+        "An agent of the other subscription repeats every candidate in a browser of its "
+        "own, with a positive and a negative control, as many times as there are rounds.",
+        "sandbox",
+        account=True,
+        application=True,
+        needs=("candidates",),
+        produces=("verification",),
+        outcomes=("done",),
+        params=(
+            _OTHER,
+            Param(
+                "rounds",
+                "int",
+                1,
+                "How many independent repetitions decide a finding.",
+                low=1,
+                high=VERIFY_ROUNDS_CEILING,
+            ),
+            _MINUTES,
+        ),
+        prompt="application_verifier",
     ),
     TaskType(
         "findings.propose",

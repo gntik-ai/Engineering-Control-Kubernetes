@@ -87,6 +87,24 @@ _FLOWS: Final = (
         section_action="Look for things to clean up",
     ),
     BuiltInFlow(
+        "ui-audit",
+        "UI audit",
+        "Go through the pages of the running application, compare what each does with "
+        "what it is meant to do, and propose what is confirmed as items.",
+        for_item=DELIVER,
+        for_section=FLOW,
+        section_action="Audit the interface",
+    ),
+    BuiltInFlow(
+        "ux-audit",
+        "UX audit",
+        "Walk the navigation of the running application as a user would: what can be "
+        "reached and how, dead ends, consistency and accessibility.",
+        for_item=DELIVER,
+        for_section=FLOW,
+        section_action="Audit the experience",
+    ),
+    BuiltInFlow(
         "change-request",
         "Change request",
         "Turn a request written in plain words into a reviewed, well-formed issue.",

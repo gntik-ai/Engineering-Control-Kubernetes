@@ -51,7 +51,7 @@ def traits(document: Document) -> dict[str, bool]:
         "writes": any(task.writes for task in tasks),
         "produces": any("items" in task.produces for task in tasks),
         "publishes": any(task.publishes for task in tasks),
-        "browses": any("application" in task.needs for task in tasks),
+        "browses": any(task.application for task in tasks),
     }
 
 

@@ -56,7 +56,14 @@ def _task(raw: dict[str, Any], node_id: str) -> dict[str, Any]:
 
 
 def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
-    assert set(BUILTIN) == {"deliver-issue", "audit-code", "discover-enhancements", "code-clean"}
+    assert set(BUILTIN) == {
+        "deliver-issue",
+        "audit-code",
+        "discover-enhancements",
+        "code-clean",
+        "ui-audit",
+        "ux-audit",
+    }
     for key, document in BUILTIN.items():
         assert validate.problems(document) == [], key
         # A document read back from its own normal form says the same thing.
@@ -250,7 +257,14 @@ def test_a_prompt_is_fixed_parts_and_editable_parts_in_order() -> None:
 
 def test_a_changed_flow_is_a_draft_until_it_is_published(world: Any) -> None:  # noqa: F811
     flows = FlowRecords(world.sessions)
-    assert flows.keys() == ["deliver-issue", "audit-code", "discover-enhancements", "code-clean"]
+    assert flows.keys() == [
+        "deliver-issue",
+        "audit-code",
+        "discover-enhancements",
+        "code-clean",
+        "ui-audit",
+        "ux-audit",
+    ]
     assert flows.version_in_force("deliver-issue") == 0 and flows.draft("deliver-issue") is None
     assert [v["version"] for v in flows.versions("deliver-issue")] == [0]
     with pytest.raises(ProjectNotFound):

@@ -451,6 +451,9 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     # Where the project's application runs, for flows that look at it in a browser
     # (migration 0037). Not set: such flows cannot run for the project.
     application_url: Mapped[str | None] = mapped_column(String(300))
+    # Since when a test identity for that application is stored (migration 0038). The
+    # identity itself is a Secret of the sandbox namespace, never a record.
+    application_identity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 

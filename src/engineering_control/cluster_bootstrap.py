@@ -55,6 +55,9 @@ def service_secret_generators() -> dict[str, Callable[[], bytes]]:
     generators: dict[str, Callable[[], bytes]] = {
         "api.token": _token,
         "evidence-ingest.token": _token,
+        # What a step's grant to reach a project's application is signed with
+        # (sandbox/egress.py): the launcher signs, the proxy checks.
+        "egress-grant.key": _token,
         "session.key": lambda: secrets.token_bytes(64),
     }
     for identity in UPLOADER_IDENTITIES:

@@ -317,6 +317,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/bring-over",
         "/api/dashboard/projects/{name}/bring-over/preview",
         "/api/dashboard/projects/{name}/cut-over",
+        "/api/dashboard/projects/{name}/application",
         "/api/dashboard/projects/{name}/pause",
         "/api/dashboard/projects/{name}/resume",
         "/api/dashboard/supervisor/incidents/{incident_id}/dismiss",

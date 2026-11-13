@@ -16,6 +16,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    clean_application_url,
 )
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
@@ -32,6 +33,7 @@ from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import PROVIDERS as AGENT_PROVIDERS
 from engineering_control.sandbox.deliver import toolchain_for
+from engineering_control.sandbox.pods import identity_secret
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
 
@@ -204,8 +206,58 @@ class DashboardService:
             if item["project"] == name:
                 sections = await asyncio.to_thread(self.repository.sections.of_project, name)
                 work = await asyncio.to_thread(self.repository.bring_over.status, name)
-                return {"project": item, "sections": sections, "work": work}
+                application = await asyncio.to_thread(self.repository.projects.application, name)
+                return {
+                    "project": item,
+                    "sections": sections,
+                    "work": work,
+                    "application": application,
+                }
         return None
+
+    async def set_application(
+        self,
+        project: str,
+        *,
+        url: str,
+        username: str,
+        password: str,
+        forget_identity: bool,
+        cluster: Cluster | None,
+    ) -> dict[str, object]:
+        """Where the project's application runs, and the identity a step signs in to it
+        with. The identity goes to the cluster as a Secret of the sandbox namespace and
+        is not kept anywhere else; the record only says that there is one."""
+        projects = self.repository.projects
+        address = clean_application_url(url)
+        project_id = await asyncio.to_thread(projects.identity_of, project)
+        secret = identity_secret(project_id)
+        identity: bool | None = None
+        if username or password:
+            if not (username and password):
+                raise ProjectInvalid("A test identity is a user name and a password")
+            if address is None:
+                raise ProjectInvalid("Say where the application runs before its identity")
+            if cluster is None:
+                raise ProjectInvalid(
+                    "This installation has no sandbox namespace, so an identity cannot be stored"
+                )
+            await cluster.put_secret(
+                secret,
+                {"username": username.encode(), "password": password.encode()},
+                {
+                    "app.kubernetes.io/part-of": "engineering-control",
+                    "engineering-control/project": str(project_id),
+                },
+            )
+            identity = True
+        elif forget_identity or address is None:
+            if cluster is not None:
+                await cluster.delete_secret(secret)
+            identity = False
+        return await asyncio.to_thread(
+            lambda: projects.set_application(project, url=address, identity=identity)
+        )
 
     async def pause_project(self, project: str, reason: str) -> dict[str, object]:
         return await asyncio.to_thread(

@@ -65,7 +65,7 @@ def test_service_secret_is_created_once_with_every_key() -> None:
     cluster = FakeCluster()
     store = cluster.store()
     added = bootstrap_service_secrets(store)
-    expected = {"api.token", "evidence-ingest.token", "session.key"} | {
+    expected = {"api.token", "evidence-ingest.token", "egress-grant.key", "session.key"} | {
         f"{identity}.token" for identity in UPLOADER_IDENTITIES
     }
     assert set(added) == expected == set(service_secret_generators())

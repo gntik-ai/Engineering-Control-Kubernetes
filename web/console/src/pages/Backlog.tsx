@@ -68,7 +68,6 @@ const UNROUTED = 'none';
 const NO_SECTION = '__none__';
 
 // The flows that run something when an item of their section is started.
-const RUNNABLE = ['deliver-issue', 'audit-code', 'discover-enhancements'];
 
 const STATES: Record<string, StatusDefinition> = {
   proposed: { label: 'Proposed', tone: 'neutral' },
@@ -388,11 +387,10 @@ function ItemRow({
   };
   const closed = item.issue_state === 'closed';
   const runActive = item.run ? ['queued', 'running', 'waiting'].includes(item.run.state) : false;
-  const flow = item.section?.flow ?? null;
-  const deliverable =
-    !closed && flow !== null && RUNNABLE.includes(flow) && (item.state === 'proposed' || item.state === 'accepted') && !runActive;
-  // In a section that audits, an item that is not a finding asks for an audit.
-  const audits = flow === 'audit-code' && item.facts?.kind !== 'finding';
+  // What starting the item does is its section's flow to say: deliver it, or look at what it names.
+  const starts = item.section?.starts ?? null;
+  const deliverable = !closed && starts !== null && (item.state === 'proposed' || item.state === 'accepted') && !runActive;
+  const audits = starts === 'scope';
   const deliver = async () => {
     setPending(true);
     try {
@@ -406,7 +404,7 @@ function ItemRow({
   };
   const actions = [
     { label: 'Open', icon: FileText, onSelect: onOpen },
-    deliverable ? { label: audits ? 'Audit what it names' : 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
+    deliverable ? { label: audits ? 'Look at what it names' : 'Deliver', icon: Bot, onSelect: () => void deliver() } : null,
     item.state !== 'accepted' && !closed
       ? { label: 'Accept', icon: Check, onSelect: () => void change('state', { state: 'accepted' }) }
       : null,

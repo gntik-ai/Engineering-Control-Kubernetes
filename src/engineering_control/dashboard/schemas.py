@@ -119,6 +119,17 @@ class SectionRunInput(DashboardModel):
     scope: str = Field(default="", max_length=2000)
 
 
+class ProjectApplicationInput(DashboardModel):
+    """Where a project's application runs, and the test identity a step signs in with.
+    The identity is stored in the cluster and never read back."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    url: str = Field(default="", max_length=300)
+    username: str = Field(default="", max_length=200)
+    password: str = Field(default="", max_length=400)
+    forget_identity: bool = False
+
+
 class ProjectPauseInput(DashboardModel):
     """Start no further work on a project, with an optional word on why."""
 

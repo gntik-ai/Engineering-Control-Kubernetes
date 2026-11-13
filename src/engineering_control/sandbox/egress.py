@@ -9,17 +9,29 @@ changes it.
 
 Refusals are logged with the host that was asked for, which is how a host a project turns
 out to need is found and added to the list.
+
+One kind of host is not on the list: where a project's own application runs, which a step
+that looks at the application in a browser has to reach. The launcher gives such a step a
+grant for that one host, signed with a key only the launcher and this proxy hold and
+good for the step's time; the browser presents it with its tunnel request. The proxy
+knows nothing of projects: it checks the signature, the host and the time.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import hashlib
+import hmac
 import ipaddress
 import re
 import signal
 import socket
+import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Final
 
 import structlog
@@ -47,6 +59,55 @@ def allowed(host: str, hosts: Sequence[str]) -> bool:
         elif host == entry:
             return True
     return False
+
+
+def grant(key: bytes, host: str, *, seconds: int, now: float | None = None) -> str:
+    """A grant to open tunnels to ``host`` for ``seconds``, signed with ``key``."""
+    expires = int((time.time() if now is None else now) + seconds)
+    said = f"{expires}.{host.lower()}"
+    signature = hmac.new(key, said.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{said}.{signature}"
+
+
+def granted(key: bytes, token: str, host: str, *, now: float | None = None) -> bool:
+    """Whether ``token`` is a grant for ``host`` that this key signed and that still holds."""
+    expires, _, rest = token.partition(".")
+    named, _, signature = rest.rpartition(".")
+    if not expires.isdigit() or not named or not signature:
+        return False
+    wanted = hmac.new(key, f"{expires}.{named}".encode("ascii", "replace"), hashlib.sha256)
+    if not hmac.compare_digest(wanted.hexdigest(), signature):
+        return False
+    return named == host and int(expires) > (time.time() if now is None else now)
+
+
+def presented(head: bytes) -> str | None:
+    """The grant a tunnel request carries (``Proxy-Authorization: Basic``, as the password),
+    or None."""
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() != b"proxy-authorization":
+            continue
+        scheme, _, encoded = value.strip().partition(b" ")
+        if scheme.lower() != b"basic":
+            return None
+        try:
+            decoded = base64.b64decode(encoded.strip(), validate=True).decode("ascii")
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+        return decoded.partition(":")[2] or None
+    return None
+
+
+def read_grant_key(path: Path | None) -> bytes | None:
+    """The key grants are signed with, or None when the installation has none."""
+    if path is None:
+        return None
+    try:
+        key = path.read_bytes().strip()
+    except OSError:
+        return None
+    return key if len(key) >= 32 else None
 
 
 def parse_connect(head: bytes) -> tuple[str, int] | None:
@@ -77,8 +138,12 @@ def public_addresses(found: Sequence[tuple[object, ...]]) -> list[str]:
 
 
 class EgressProxy:
-    def __init__(self, hosts: Sequence[str], *, upstream_port: int = 443) -> None:
+    def __init__(
+        self, hosts: Sequence[str], *, upstream_port: int = 443, grant_key: bytes | None = None
+    ) -> None:
         self.hosts = tuple(hosts)
+        # What grants for hosts that are not on the list are checked against.
+        self.grant_key = grant_key
         # Always 443 in service; a test points it at a listener of its own.
         self.upstream_port = upstream_port
         self._tunnels = 0
@@ -98,12 +163,27 @@ class EgressProxy:
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
 
-    async def _refuse(self, writer: asyncio.StreamWriter, status: str, host: str, why: str) -> None:
+    async def _refuse(
+        self, writer: asyncio.StreamWriter, status: str, host: str, why: str, *, ask: bool = False
+    ) -> None:
         LOG.warning("egress_refused", host=host, reason=why)
+        # A browser presents its grant only once it is asked for one.
+        asked = 'Proxy-Authenticate: Basic realm="sandbox"\r\n' if ask else ""
         writer.write(
-            f"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode()
+            f"HTTP/1.1 {status}\r\n{asked}Connection: close\r\nContent-Length: 0\r\n\r\n".encode()
         )
         await writer.drain()
+
+    def _may(self, host: str, head: bytes) -> str | None:
+        """None when a tunnel to ``host`` may be opened, else why not."""
+        if allowed(host, self.hosts):
+            return None
+        if self.grant_key is None:
+            return "not on the list"
+        token = presented(head)
+        if token is None:
+            return "not on the list, and no grant"
+        return None if granted(self.grant_key, token, host) else "not on the list, grant not good"
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_SECONDS)
@@ -115,8 +195,12 @@ class EgressProxy:
         if port != 443:
             await self._refuse(writer, "403 Forbidden", host, f"port {port}")
             return
-        if not allowed(host, self.hosts):
-            await self._refuse(writer, "403 Forbidden", host, "not on the list")
+        why = self._may(host, head)
+        if why is not None:
+            if why.endswith("no grant"):
+                await self._refuse(writer, "407 Proxy Authentication Required", host, why, ask=True)
+            else:
+                await self._refuse(writer, "403 Forbidden", host, why)
             return
         if self._tunnels >= MAX_TUNNELS:
             await self._refuse(writer, "503 Service Unavailable", host, "too many tunnels")
@@ -168,7 +252,10 @@ async def _copy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 async def serve(settings: Settings | None = None) -> None:
     resolved = settings or get_settings()
     configure_logging(resolved.log_level)
-    proxy = EgressProxy(resolved.sandbox_egress_hosts)
+    proxy = EgressProxy(
+        resolved.sandbox_egress_hosts,
+        grant_key=read_grant_key(resolved.sandbox_egress_grant_key_file),
+    )
     server = await asyncio.start_server(
         proxy.handle,
         resolved.sandbox_egress_host,
@@ -179,7 +266,12 @@ async def serve(settings: Settings | None = None) -> None:
     loop = asyncio.get_running_loop()
     for name in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(name, stop.set)
-    LOG.info("egress_started", port=resolved.sandbox_egress_port, hosts=len(proxy.hosts))
+    LOG.info(
+        "egress_started",
+        port=resolved.sandbox_egress_port,
+        hosts=len(proxy.hosts),
+        grants=proxy.grant_key is not None,
+    )
     async with server:
         await stop.wait()
 

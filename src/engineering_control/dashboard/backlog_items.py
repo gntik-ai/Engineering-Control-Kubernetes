@@ -15,7 +15,7 @@ from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
@@ -27,6 +27,7 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import SECTION_KEY
 from engineering_control.db.models import BacklogItem, BacklogSync, ProjectRecord, ProjectSection
+from engineering_control.engine.library import plan_for_item
 from engineering_control.github_app import Issue
 
 # proposed: seen, not decided. accepted: the administrator wants it done. skipped: the
@@ -78,6 +79,17 @@ def route_by_labels(
     return section, f"Label {shared[0]}"
 
 
+def _starts(item: BacklogItem, section: ProjectSection | None) -> str | None:
+    """What starting the item does: "item" when it is worked on (delivered), "scope" when
+    it asks its section's flow to look at what it names, None when nothing can run."""
+    session = object_session(item)
+    if session is None or section is None or not section.flow_key:
+        return None
+    produced = item.source_run_id is not None or bool((item.facts or {}).get("kind"))
+    plan = plan_for_item(session, section.flow_key, produced=produced)
+    return plan[1] if plan else None
+
+
 def serialize(
     item: BacklogItem, project: ProjectRecord, section: ProjectSection | None
 ) -> dict[str, Any]:
@@ -88,7 +100,12 @@ def serialize(
         "id": str(item.id),
         "project": project.name,
         "project_name": project.display_name,
-        "section": {"key": section.key, "name": section.name, "flow": section.flow_key}
+        "section": {
+            "key": section.key,
+            "name": section.name,
+            "flow": section.flow_key,
+            "starts": _starts(item, section),
+        }
         if section
         else None,
         "title": item.title,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import socket
@@ -21,8 +22,12 @@ from engineering_control.sandbox import pods
 from engineering_control.sandbox.egress import (
     EgressProxy,
     allowed,
+    grant,
+    granted,
     parse_connect,
+    presented,
     public_addresses,
+    read_grant_key,
 )
 from engineering_control.sandbox.launcher import Launcher
 
@@ -135,6 +140,72 @@ def test_the_proxy_refuses_everything_but_a_tunnel_to_a_named_public_host(
     assert answer.startswith(f"HTTP/1.1 {status} ".encode()), answer
     assert answer.endswith(b"\r\n\r\n")
     assert bool(proxy.asked) is resolved
+
+
+def test_a_grant_opens_one_host_for_a_time_and_only_with_the_right_key() -> None:
+    key, other = b"k" * 48, b"o" * 48
+    token = grant(key, "staging.example.com", seconds=600, now=1_000.0)
+    assert granted(key, token, "staging.example.com", now=1_500.0)
+    assert not granted(key, token, "other.example.com", now=1_500.0), "that host only"
+    assert not granted(key, token, "staging.example.com", now=1_601.0), "that long only"
+    assert not granted(other, token, "staging.example.com", now=1_500.0), "that key only"
+    expires, host, signature = (
+        token.split(".", 1)[0],
+        "staging.example.com",
+        token.rsplit(".", 1)[1],
+    )
+    assert not granted(key, f"{int(expires) + 9999}.{host}.{signature}", host, now=1_500.0)
+    for junk in ("", "x", "1.2", "soon.staging.example.com.abc", "..", "9999999999.a.b"):
+        assert not granted(key, junk, "staging.example.com", now=1_500.0)
+
+    basic = base64.b64encode(f"grant:{token}".encode()).decode()
+    head = f"CONNECT staging.example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {basic}\r\n\r\n"
+    assert presented(head.encode()) == token
+    assert presented(b"CONNECT a.example.com:443 HTTP/1.1\r\n\r\n") is None
+    assert (
+        presented(b"CONNECT a.example.com:443 HTTP/1.1\r\nProxy-Authorization: Bearer x\r\n\r\n")
+        is None
+    )
+    assert (
+        presented(b"CONNECT a.example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic !!\r\n\r\n")
+        is None
+    )
+
+    # A host on the list needs no grant; one that is not is asked for one, and a grant
+    # for another host or from another key is refused.
+    proxy = EgressProxy(("github.com",), grant_key=key)
+    assert proxy._may("github.com", b"CONNECT github.com:443 HTTP/1.1\r\n\r\n") is None
+    live = grant(key, "staging.example.com", seconds=600)
+    carrying = lambda value: (  # noqa: E731
+        "CONNECT x:443 HTTP/1.1\r\nProxy-Authorization: Basic "
+        + base64.b64encode(f"grant:{value}".encode()).decode()
+        + "\r\n\r\n"
+    ).encode()
+    assert proxy._may("staging.example.com", carrying(live)) is None
+    assert proxy._may("staging.example.com", b"CONNECT x:443 HTTP/1.1\r\n\r\n") == (
+        "not on the list, and no grant"
+    )
+    assert proxy._may("evil.example.com", carrying(live)) == "not on the list, grant not good"
+    assert (
+        proxy._may(
+            "staging.example.com", carrying(grant(other, "staging.example.com", seconds=600))
+        )
+        == "not on the list, grant not good"
+    )
+    # An installation without the key honours no grant at all.
+    assert EgressProxy(("github.com",))._may("staging.example.com", carrying(live)) == (
+        "not on the list"
+    )
+
+
+def test_the_key_of_grants_is_read_from_its_file_or_there_is_none(tmp_path: Path) -> None:
+    assert read_grant_key(None) is None and read_grant_key(tmp_path / "absent") is None
+    short = tmp_path / "short"
+    short.write_bytes(b"too short\n")
+    assert read_grant_key(short) is None
+    good = tmp_path / "good"
+    good.write_bytes(b"k" * 64 + b"\n")
+    assert read_grant_key(good) == b"k" * 64
 
 
 def test_a_tunnel_passes_bytes_both_ways_and_ends_with_either_side() -> None:

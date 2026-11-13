@@ -15,12 +15,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import dataclasses
 import functools
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.dashboard.project_records import ProjectNotFound
+from engineering_control.dashboard.project_records import ProjectNotFound, application_host
 from engineering_control.engine.catalogue import (
     AUDITING,
     ITEM_KINDS,
@@ -636,6 +637,32 @@ class PlanAreas:
         )
 
 
+def _browsing(ctx: Context, plan: Plan) -> Plan:
+    """A step that looks at the project's application: it is told where it runs, may
+    reach that one host, and finds the test identity when one is stored."""
+    application = ctx.data.get("application") or {}
+    url = str(application.get("url") or "")
+    if not url:
+        return plan
+    job = {
+        **plan.job,
+        "commands": [
+            {**command, "env": {**command.get("env", {}), "APPLICATION_URL": url}}
+            if command.get("name") == "agent"
+            else command
+            for command in plan.job.get("commands", [])
+        ],
+    }
+    return dataclasses.replace(
+        plan,
+        job=job,
+        application_host=application_host(url),
+        identity_secret=str(application["secret"])
+        if application.get("identity") and application.get("secret")
+        else None,
+    )
+
+
 class Audit:
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
         data = ctx.data
@@ -643,6 +670,7 @@ class Audit:
         planned = data.get("areas") or []
         prompt = ctx.prompt(
             {
+                "application": data.get("application"),
                 "repository": data["repository"],
                 "base_sha": data["base_sha"],
                 "max_findings": audit.MAX_FINDINGS,
@@ -652,7 +680,8 @@ class Audit:
                 else None,
             }
         )
-        return _reader(ctx, lease, prompt, audit.AUDIT_SCHEMA)
+        plan = _reader(ctx, lease, prompt, audit.AUDIT_SCHEMA)
+        return _browsing(ctx, plan) if ctx.task.application else plan
 
     async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
         answer, instead = _answer(ctx, commands, who="The auditor")
@@ -711,6 +740,7 @@ class Verify:
         mine = [output for output in found if output.get("area") == area]
         prompt = ctx.prompt(
             {
+                "application": data.get("application"),
                 "repository": data["repository"],
                 "base_sha": data["base_sha"],
                 "findings": (mine[-1] if mine else {}).get("candidates") or [],
@@ -719,7 +749,8 @@ class Verify:
                 "tests": [command.text for command in ctx.toolchain().tests],
             }
         )
-        return _reader(ctx, lease, prompt, audit.VERIFY_SCHEMA)
+        plan = _reader(ctx, lease, prompt, audit.VERIFY_SCHEMA)
+        return _browsing(ctx, plan) if ctx.task.application else plan
 
     async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
         answer, instead = _answer(ctx, commands, who="The verifier")
@@ -1068,6 +1099,10 @@ SANDBOX: Final[dict[str, SandboxTask]] = {
     "agent.plan_areas": PlanAreas(),
     "agent.audit": Audit(),
     "agent.verify": Verify(),
+    # The same two, looking at the running application: the catalogue says so, and the
+    # prompt and what the step may reach follow from that.
+    "agent.audit_application": Audit(),
+    "agent.verify_application": Verify(),
     "agent.discover": Discover(),
     "agent.review_proposals": ReviewProposals(),
 }

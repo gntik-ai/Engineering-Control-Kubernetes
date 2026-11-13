@@ -85,9 +85,22 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # The one key the proxy needs: what a step's grant to reach a project's own
+            # application is signed with. It holds no other secret of the platform.
+            - name: grant-key
+              mountPath: /var/run/secrets/engineering-control
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: grant-key
+          secret:
+            secretName: engineering-control-secrets
+            defaultMode: 0440
+            optional: true
+            items:
+              - key: egress-grant.key
+                path: egress-grant.key
 ---
 apiVersion: v1
 kind: Service

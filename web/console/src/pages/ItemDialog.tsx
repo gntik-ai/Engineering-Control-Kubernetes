@@ -26,6 +26,14 @@ import { Reply } from '../supervisor';
 const SEVERITY_TONE = { low: 'neutral', medium: 'info', high: 'warning', critical: 'destructive' } as const;
 
 /** Where an item that is not an issue came from, and what is known about it. */
+/** What a flow found, by the kind of item it made of it. */
+const FOUND: Record<string, string> = {
+  finding: 'Audit finding',
+  'clean-up': 'Clean-up',
+  'ui-finding': 'UI finding',
+  'ux-finding': 'UX finding',
+};
+
 export function ItemBadges({ item }: { item: WorkItem }) {
   const facts = item.facts ?? {};
   return (
@@ -35,9 +43,9 @@ export function ItemBadges({ item }: { item: WorkItem }) {
           Proposed by the supervisor
         </Badge>
       ) : null}
-      {facts.kind === 'finding' ? (
+      {facts.kind && FOUND[facts.kind] ? (
         <Badge tone="info" size="sm">
-          Audit finding
+          {FOUND[facts.kind]}
         </Badge>
       ) : null}
       {facts.kind === 'enhancement' ? (

@@ -43,6 +43,7 @@ from engineering_control.engine.library import (
 )
 from engineering_control.engine.records import in_force
 from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
+from engineering_control.sandbox.pods import identity_secret
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -291,6 +292,12 @@ class Runs:
                 "base_branch": project.default_branch or "main",
                 "toolchain": toolchain,
             }
+            if traits(document)["browses"] and not project.application_url:
+                raise ProjectInvalid(
+                    "Say where the project's application runs first, on the project's page"
+                )
+            if traits(document)["browses"]:
+                common = {**common, "application": application_of(project)}
             if mode == "scope":
                 run.data = {
                     **common,
@@ -414,6 +421,11 @@ class Runs:
                     "toolchain": toolchain,
                     "section": found.key,
                     "scope": {"title": "", "text": narrowed},
+                    **(
+                        {"application": application_of(record)}
+                        if traits(document)["browses"]
+                        else {}
+                    ),
                 },
             )
             session.add(run)
@@ -1012,7 +1024,11 @@ class Runs:
             session.flush()
             run.data = {
                 **{name: data[name] for name in kept if name in data},
-                **{name: data[name] for name in ("issue", "scope", "section") if name in data},
+                **{
+                    name: data[name]
+                    for name in ("issue", "scope", "section", "application")
+                    if name in data
+                },
                 "flow": flow,
                 # The flow as it was when the evaluation started: a draft may change.
                 "flow_document": document,
@@ -1130,6 +1146,16 @@ def _flow_now(session: Session, key: str) -> dict[str, Any]:
     """The flow of that key at the version in force now, as a run records it."""
     version = in_force(session, key) or (0, "")
     return {"key": key, "version": version[0], "sha256": version[1]}
+
+
+def application_of(project: ProjectRecord) -> dict[str, Any]:
+    """What a step that looks at the project's application is told of it: where it runs,
+    whether a test identity is stored, and the Secret that holds it. Never the identity."""
+    return {
+        "url": project.application_url,
+        "identity": project.application_identity_at is not None,
+        "secret": identity_secret(project.id),
+    }
 
 
 def is_finding(item: BacklogItem) -> bool:

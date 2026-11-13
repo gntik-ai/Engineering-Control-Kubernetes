@@ -50,6 +50,7 @@ import {
 import { LoadError, RefreshButton } from '../parts';
 import { BASE, RouterLink, navigate, useLocation } from '../router';
 import { BringOverDialog } from './BringOverDialog';
+import { ApplicationCard } from './Application';
 import { TriggersCard } from './Triggers';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
@@ -389,7 +390,22 @@ function SectionRunDialog({
     setScope('');
     setProblem(null);
   }, [open]);
-  const audit = section.flow?.key === 'audit-code';
+  const flow = section.flow;
+  // What is said of the two flows that have been here longest; any other says it itself.
+  const about =
+    flow?.key === 'audit-code'
+      ? 'One subscription audits the code, the other verifies each finding twice. Confirmed findings appear in the backlog as proposed items of this section. Nothing is changed and nothing reaches GitHub.'
+      : flow?.key === 'discover-enhancements'
+        ? 'One subscription proposes enhancements, the other reviews each one. Approved proposals appear in the backlog as proposed items of this section and wait for you. Nothing is implemented until you start an item.'
+        : `${flow?.summary ?? ''} What comes of it appears in the backlog as proposed items of this section. Nothing is changed and nothing reaches GitHub.`;
+  const hint =
+    flow?.key === 'audit-code'
+      ? 'For example: "The session handling in src/auth" or "Everything that checks permissions". Leave it empty to audit the whole repository: it is split into up to six areas, the riskiest first, and each is audited and verified in turn, which takes longer.'
+      : flow?.key === 'discover-enhancements'
+        ? 'For example: "The reports pages" or "What an operator does every day". Leave it empty to look at the whole product.'
+        : flow?.needs_application
+          ? 'For example: "Signing in and the first page after it" or "The settings pages". Leave it empty to look at the whole application, starting from its first page.'
+          : 'For example: "The helpers of the billing package". Leave it empty to look at the whole repository.';
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (pending) return;
@@ -409,22 +425,14 @@ function SectionRunDialog({
         <form onSubmit={submit} noValidate>
           <DialogHeader>
             <DialogTitle>{section.flow?.section_action}</DialogTitle>
-            <DialogDescription>
-              {audit
-                ? 'One subscription audits the code, the other verifies each finding twice. Confirmed findings appear in the backlog as proposed items of this section. Nothing is changed and nothing reaches GitHub.'
-                : 'One subscription proposes enhancements, the other reviews each one. Approved proposals appear in the backlog as proposed items of this section and wait for you. Nothing is implemented until you start an item.'}
-            </DialogDescription>
+            <DialogDescription>{about}</DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
             {problem ? <Alert tone="destructive" title={problem} /> : null}
             <Field>
               <FieldLabel>What to look at</FieldLabel>
               <Textarea name="scope" value={scope} onValueChange={setScope} maxLength={2000} showCount rows={4} autoFocus />
-              <FieldDescription>
-                {audit
-                  ? 'For example: "The session handling in src/auth" or "Everything that checks permissions". Leave it empty to audit the whole repository: it is split into up to six areas, the riskiest first, and each is audited and verified in turn, which takes longer.'
-                  : 'For example: "The reports pages" or "What an operator does every day". Leave it empty to look at the whole product.'}
-              </FieldDescription>
+              <FieldDescription>{hint}</FieldDescription>
             </Field>
           </DialogBody>
           <DialogFooter>
@@ -573,6 +581,14 @@ function Detail({ name }: { name: string }) {
               ))
             : !detail.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-40 w-full" />)}
         </div>
+        {sections ? (
+          <ApplicationCard
+            project={name}
+            application={detail.data?.application}
+            needed={sections.some((section) => section.flow?.needs_application)}
+            onChanged={detail.reload}
+          />
+        ) : null}
         {sections ? <TriggersCard project={name} sections={sections} /> : null}
       </div>
       <SectionDialog

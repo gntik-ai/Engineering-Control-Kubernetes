@@ -23,9 +23,18 @@ HOME: Final = "/home/agent"
 WORKSPACE: Final = "/workspace"
 ACCOUNT: Final = "/run/account"
 ACCOUNT_HOME: Final = "/account-home"
+# Where a step that looks at a project's application finds the test identity to sign in
+# with, as the files ``username`` and ``password``.
+IDENTITY: Final = "/run/application"
 RUNNER: Final = "sandbox-step"
 NODE_LABEL: Final = "engineering-control/sandbox"
 PART_OF: Final = {"app.kubernetes.io/part-of": "engineering-control"}
+
+
+def identity_secret(project_id: UUID) -> str:
+    """The Secret that holds the test identity of a project's application."""
+    return f"application-{project_id}"
+
 
 Egress = Literal["internet", "none"]
 
@@ -107,6 +116,8 @@ def step_pod(
     memory: str = "4Gi",
     deadline_seconds: int = 1800,
     labels: dict[str, str] | None = None,
+    browser_grant: str | None = None,
+    identity_secret: str | None = None,
 ) -> dict[str, Any]:
     """The pod of one step. ``job`` is what the runner inside executes. It holds no
     credential of an account or of GitHub's that outlives the step: at most a token the
@@ -131,6 +142,17 @@ def step_pod(
         if workspace
         else {"name": "workspace", "emptyDir": {"sizeLimit": "1Gi"}},
     ]
+    if identity_secret is not None:
+        # The identity a step signs in to the project's application with: a test
+        # identity the administrator stored for that purpose. Absent, the step starts
+        # all the same and looks at what can be seen without signing in.
+        mounts.append({"name": "identity", "mountPath": IDENTITY, "readOnly": True})
+        volumes.append(
+            {
+                "name": "identity",
+                "secret": {"secretName": identity_secret, "defaultMode": 0o440, "optional": True},
+            }
+        )
     if account is not None:
         labels["engineering-control/account"] = str(account.account_id)
         mounts.append({"name": "account", "mountPath": ACCOUNT, "readOnly": True})
@@ -186,6 +208,13 @@ def step_pod(
                             "value": json.dumps(job, separators=(",", ":"), sort_keys=True),
                         },
                         *_way_out(sandboxes, egress),
+                        # What the browser presents to the proxy to reach the one host
+                        # that is the project's application.
+                        *(
+                            [{"name": "SANDBOX_BROWSER_GRANT", "value": browser_grant}]
+                            if browser_grant
+                            else []
+                        ),
                     ],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,

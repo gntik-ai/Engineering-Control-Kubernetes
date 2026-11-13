@@ -235,6 +235,11 @@ class Settings(BaseSettings):
     sandbox_egress_proxy: str | None = Field(
         default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
     )
+    # The key the launcher signs, and the proxy checks, a step's grant to reach a project's
+    # own application with. Without the file no such grant is given or honoured.
+    sandbox_egress_grant_key_file: Path | None = Path(
+        "/etc/engineering-control/env/egress-grant.key"
+    )
     sandbox_egress_hosts: tuple[str, ...] = (
         # The subscriptions' clients.
         "api.anthropic.com",

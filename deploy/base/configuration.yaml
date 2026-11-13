@@ -22,6 +22,9 @@ data:
   ENGINEERING_API_TOKEN_FILE: /var/run/secrets/engineering-control/api.token
   ENGINEERING_DASHBOARD_SESSION_KEY_FILE: /var/run/secrets/engineering-control/session.key
   ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE: /var/run/secrets/engineering-control/evidence-ingest.token
+  # What a step's grant to reach a project's own application is signed with: the
+  # launcher signs, the sandboxes' proxy checks.
+  ENGINEERING_SANDBOX_EGRESS_GRANT_KEY_FILE: /var/run/secrets/engineering-control/egress-grant.key
   ENGINEERING_EVIDENCE_INGEST_TOKEN_DIRECTORY: /var/run/secrets/engineering-control
   # The GitHub App "Engineering Control" of the organisation, installed on the repositories
   # the platform works on. Identifiers only; the private key and the client secret are in

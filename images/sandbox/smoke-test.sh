@@ -36,15 +36,16 @@ expected="$(
   {
     jq --raw-output '.dependencies | to_entries[] | "\(.key) \(.value)"' \
       "${here}/node-tools/package.json" \
-      | sed -e 's|^@anthropic-ai/claude-code |claude |' -e 's|^@openai/codex |codex |'
+      | sed -e 's|^@anthropic-ai/claude-code |claude |' -e 's|^@openai/codex |codex |' \
+        -e 's|^playwright-core |playwright |'
     awk '$1 !~ /^#/ && NF { print $1, $2 }' "${here}/tools.lock"
     sed -n 's/^semgrep==\([0-9.]*\).*/semgrep \1/p' "${here}/semgrep.lock"
   } | sort
 )"
-[[ "$(wc -l <<<"${expected}")" -eq 9 ]] || fail "expected nine pinned tools, got: ${expected}"
+[[ "$(wc -l <<<"${expected}")" -eq 10 ]] || fail "expected ten pinned tools, got: ${expected}"
 reported="$(sandbox sandbox-versions)"
 echo "${reported}"
-actual="$(grep --invert-match --extended-regexp '^(node|git|python) ' <<<"${reported}" | sort)"
+actual="$(grep --invert-match --extended-regexp '^(node|git|python|chromium) ' <<<"${reported}" | sort)"
 [[ "${actual}" == "${expected}" ]] \
   || fail "versions differ from the lock files"$'\n'"expected:"$'\n'"${expected}"$'\n'"actual:"$'\n'"${actual}"
 grep --quiet --extended-regexp '^node 22\.' <<<"${reported}" || fail "Node.js is not version 22"
@@ -118,6 +119,25 @@ sandbox bash -euc '
   rg --quiet ConfigMap object.yaml
   jq --null-input --exit-status "true" >/dev/null
 ' || fail "git, the compiler, Node.js or Python do not work in the workspace"
+
+# The browser starts as the run's user, on a read-only image, without Chromium's own
+# sandbox (the pod is the sandbox), and reads a page by its roles.
+sandbox bash -euc '
+  cd /tmp
+  cat >browser.js <<"SCRIPT"
+const { launch } = require("sandbox-browser");
+(async () => {
+  const browser = await launch();
+  const page = await browser.newPage();
+  await page.setContent("<title>smoke</title><main><button>Press</button></main>");
+  const name = await page.getByRole("button").innerText();
+  const title = await page.title();
+  await browser.close();
+  if (name !== "Press" || title !== "smoke") process.exit(1);
+})().catch((error) => { console.error(error); process.exit(1); });
+SCRIPT
+  node browser.js
+' || fail "the browser does not start as the run user"
 
 # A step: the runner carries out a job and ends with a result the platform can read.
 job='{"commands":[{"name":"one","argv":["bash","-c","echo step-ran"]},{"name":"two","argv":["false"]},{"name":"never","argv":["true"]}]}'

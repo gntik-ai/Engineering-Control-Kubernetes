@@ -19,12 +19,14 @@ version() { # <name> <command...>: the first dotted number the command prints
 version claude claude --version
 version codex codex --version
 version pnpm pnpm --version
+version playwright node --print "require('playwright-core/package.json').version"
 version gitleaks gitleaks version
 version trivy trivy --version
 version syft syft version
 version kubeconform kubeconform -v
 version semgrep semgrep --version
 version uv uv --version
+version chromium chromium --version
 version node node --version
 version git git --version
 version python python3 --version

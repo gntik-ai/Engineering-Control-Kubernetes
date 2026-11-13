@@ -27,6 +27,8 @@ export interface Flow {
   runs_items?: boolean;
   /** What the section can run by itself to produce items, as the button names it. */
   section_action?: string | null;
+  /** Whether the flow looks at the project's running application, which then has to be named. */
+  needs_application?: boolean;
 }
 
 /** What a flow that runs on this platform consists of, and which version is in force. */
@@ -394,10 +396,12 @@ export interface ProjectDetail {
   project: ProjectSummary;
   sections: Section[];
   work?: WorkStatus;
+  /** Where the project's application runs, and whether a test identity is stored for it. */
+  application?: { url: string; identity: boolean } | null;
 }
 
 export interface ItemFacts {
-  kind?: 'finding' | 'enhancement';
+  kind?: 'finding' | 'enhancement' | 'clean-up' | 'ui-finding' | 'ux-finding';
   severity?: 'low' | 'medium' | 'high' | 'critical';
   lens?: string;
   component?: string;
@@ -417,7 +421,11 @@ export interface WorkItem {
   project: string;
   project_name: string;
   /** The section it is routed to; null while it is not routed. */
-  section: { key: string; name: string; flow?: string | null } | null;
+  /**
+   * `starts` says what starting the item does: "item" delivers it, "scope" asks its
+   * section's flow to look at what it names, null when nothing can run for it.
+   */
+  section: { key: string; name: string; flow?: string | null; starts?: 'item' | 'scope' | null } | null;
   title: string;
   source: 'github' | 'manual';
   state: 'proposed' | 'accepted' | 'skipped' | 'done';

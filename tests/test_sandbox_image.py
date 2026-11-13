@@ -101,6 +101,7 @@ def test_node_tools_are_exact_versions_with_integrity_hashes() -> None:
     assert set(manifest["dependencies"]) == {
         "@anthropic-ai/claude-code",
         "@openai/codex",
+        "playwright-core",
         "pnpm",
     }
     assert "devDependencies" not in manifest
@@ -143,8 +144,10 @@ def test_the_version_report_names_every_pinned_tool() -> None:
         "claude",
         "codex",
         "pnpm",
+        "playwright",
         *(row[0] for row in _tools()),
         "semgrep",
+        "chromium",
         "node",
         "git",
         "python",

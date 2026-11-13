@@ -35,6 +35,7 @@ from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.logging import configure_logging
 from engineering_control.sandbox import deliver, pods, steps
+from engineering_control.sandbox.egress import grant, read_grant_key
 from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
@@ -109,7 +110,10 @@ class Launcher:
         tools_url: str | None = None,
         queues: Queues | None = None,
         backlog: BacklogItems | None = None,
+        grant_key: bytes | None = None,
     ) -> None:
+        # What a step's grant to reach a project's own application is signed with.
+        self.grant_key = grant_key
         self.runs = runs
         self.cluster = cluster
         self.sandboxes = sandboxes
@@ -318,6 +322,14 @@ class Launcher:
             memory=plan.memory,
             deadline_seconds=plan.deadline_seconds,
             labels=plan.labels,
+            # A step that looks at the project's application may reach that one host
+            # for as long as the step may last, and not a host more.
+            browser_grant=grant(
+                self.grant_key, plan.application_host, seconds=plan.deadline_seconds + 300
+            )
+            if plan.application_host and self.grant_key
+            else None,
+            identity_secret=plan.identity_secret,
         )
         await self.cluster.create_pod(manifest)
         await asyncio.to_thread(self.runs.step_started, item.step_id, manifest["metadata"]["name"])
@@ -483,6 +495,7 @@ async def serve(settings: Settings | None = None) -> None:
         tools_url=resolved.supervisor_tools_url,
         queues=Queues(sessions, runs, Budgets(sessions)),
         backlog=BacklogItems(sessions),
+        grant_key=read_grant_key(resolved.sandbox_egress_grant_key_file),
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -2,10 +2,11 @@
   "name": "engineering-control-sandbox-node-tools",
   "version": "1.0.0",
   "private": true,
-  "description": "The agent clients and the package manager of the sandbox image, pinned. The lockfile carries the integrity hash of every package.",
+  "description": "The agent clients, the package manager and the browser driver of the sandbox image, pinned. The lockfile carries the integrity hash of every package.",
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.322",
     "@openai/codex": "0.167.2",
+    "playwright-core": "1.65.0",
     "pnpm": "10.34.5"
   }
 }

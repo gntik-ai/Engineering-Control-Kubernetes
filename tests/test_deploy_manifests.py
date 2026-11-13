@@ -375,12 +375,24 @@ def test_sandboxes_reach_the_proxy_and_the_proxy_reaches_public_https_only() -> 
     assert block["ipBlock"]["cidr"] == "0.0.0.0/0"
     for private in PRIVATE_NETWORKS:
         assert private in block["ipBlock"]["except"], private
-    # The proxy itself: the platform's image, no identity, no secret, no volume but /tmp,
-    # never on the sandboxes' node; its service is what the launcher hands to sandboxes.
+    # The proxy itself: the platform's image, no identity, no volume but /tmp and the one
+    # key grants are checked with (and no other of the platform's secrets), never on the
+    # sandboxes' node; its service is what the launcher hands to sandboxes.
     [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-egress")]
     assert name == "Deployment/engineering-control-egress"
     assert spec["serviceAccountName"] == "engineering-control"
-    assert spec["volumes"] == [{"name": "tmp", "emptyDir": {}}]
+    assert spec["volumes"] == [
+        {"name": "tmp", "emptyDir": {}},
+        {
+            "name": "grant-key",
+            "secret": {
+                "secretName": "engineering-control-secrets",
+                "defaultMode": 0o440,
+                "optional": True,
+                "items": [{"key": "egress-grant.key", "path": "egress-grant.key"}],
+            },
+        },
+    ]
     [container] = spec["containers"]
     assert container["command"] == ["engineering-egress"]
     assert "env" not in container

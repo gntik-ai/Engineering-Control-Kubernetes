@@ -36,8 +36,8 @@ FROM ${NODE_IMAGE}
 # image can raise privileges even where the runtime does not already forbid it.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        bubblewrap build-essential ca-certificates curl file git jq less patch procps \
-        python3 python3-venv ripgrep tini unzip xz-utils \
+        bubblewrap build-essential ca-certificates chromium curl file fonts-liberation \
+        git jq less patch procps python3 python3-venv ripgrep tini unzip xz-utils \
     && rm -rf /var/lib/apt/lists/* \
     && userdel --remove node \
     && groupadd --gid 10002 agent \
@@ -47,6 +47,9 @@ RUN apt-get update \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} +
 COPY --from=tools /out/ /usr/local/bin/
 COPY --from=node-tools /opt/sandbox/node /opt/sandbox/node
+# The browser of a step that looks at a project's running application: the base image's
+# Chromium, driven by the pinned driver through a helper that sets it up for a sandbox.
+COPY sandbox-browser/index.js /opt/sandbox/node/node_modules/sandbox-browser/index.js
 COPY semgrep.lock /opt/sandbox/semgrep.lock
 RUN python3 -m venv /opt/sandbox/semgrep \
     && uv pip install --python /opt/sandbox/semgrep/bin/python --no-cache \
@@ -59,6 +62,7 @@ COPY sandbox-versions sandbox-step sandbox-bundle /usr/local/bin/
 # The image is pinned, so the clients must not look for newer versions of themselves, and
 # the scanner must not report to its maker.
 ENV HOME=/home/agent \
+    NODE_PATH=/opt/sandbox/node/node_modules \
     DISABLE_AUTOUPDATER=1 \
     SEMGREP_ENABLE_VERSION_CHECK=0 \
     SEMGREP_SEND_METRICS=off \

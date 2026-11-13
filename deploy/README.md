@@ -208,6 +208,15 @@ module registries. When a project needs another host, the proxy's log says which
 Add the host by setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` in `base/configuration.yaml` to
 the whole list, and release.
 
+One kind of host is never on the list: where a project's own application runs, which a
+step that looks at the application in a browser has to reach. The launcher gives such a
+step a grant for that one host, good for the step's time and signed with a key that only
+the launcher and the proxy hold (`egress-grant.key` of the service Secret, which the
+bootstrap job generates). The browser presents the grant with its tunnel request; the
+proxy checks the signature, the host and the time, and knows nothing of projects. The
+address has to be https and resolve to a public address like any other: a grant does not
+open a way into the cluster. Without the key no grant is given or honoured.
+
 ## The supervisor
 
 The supervisor is an agent the administrator talks to: in the panel that opens from the top
@@ -479,6 +488,96 @@ counted in and what versions are compared by. What an agent read again from its 
 counted apart. The Flows page shows the totals by project and by version of a flow, with
 the minutes spent in sandboxes; a run's page shows its own.
 
+### The library
+
+The platform's own flows are six: deliver an issue, audit code, look for enhancements,
+code clean, UI audit and UX audit. Beside them the Flows page keeps the ones made here: a
+new flow starts as a copy of one that exists or with one task to build on, and a flow
+taken out as a file (`<key>-v<n>.flow.json`) can be brought in again here or on another
+installation. A flow made here is a draft until it is put in force; only then can a
+section have it. The four other names of the list (change request and the rest) are
+names only until someone builds them.
+
+What a flow means for its section is read from its document (`engine/library.py`):
+
+- A flow with a task that changes code works on items: starting an item runs it.
+- A flow that only produces items is started for the section, without an item, under the
+  name its document gives ("Start an audit"). What a run of it produced is delivered by
+  Deliver issue. Any other item of the section is delivered too, unless the flow says
+  that such an item is a request: then starting it runs the flow on what the item names
+  (the audits do).
+- Runs of the platform's own three first flows keep their kinds; a run of any other flow
+  is of the kind `flow` and says which flow and version it follows.
+
+### The designer
+
+The Design tab of a flow draws it as a graph (`@gntik-ai/flow`), top to bottom. Tasks are
+dragged from the list on the left onto the canvas, or onto a connection to go between
+the two tasks it joins; an outcome is connected by dragging from its point under a task
+to another task. Everything a drag does can be done without one: the plus of a task in
+the list adds it after the selected task, and the panel on the right says where each
+outcome of the selected task leads, sets it, renames it, takes it out (which joins what
+led to it with where it led) and makes it the start. With nothing selected the panel
+holds what is said of the flow as a whole.
+
+What is in the editor is checked against the rules a moment after every change, without
+being saved; a broken rule is shown on the task it is about and above the tabs. Where
+tasks are drawn is kept with the flow and is not part of what the flow says: moving a
+task makes no difference to a run, and two flows that differ only in their drawing have
+the same hash. A task as it is set, with the wording of its prompt, can be kept in the
+list under a name and dragged into other flows.
+
+A run's page draws the run on the version of the flow it follows: each task with its
+state, who worked in it and how often, and the connections the run went along.
+
+### Code clean, and the audits of the running application
+
+**Code clean** is the audit's tasks told to look for something else: code nothing uses,
+things written twice, what the project's linters warn about. The other subscription
+checks each candidate once, and what holds becomes a clean-up item, delivered like any
+other.
+
+**UI audit** and **UX audit** look at the project's application as it runs. One agent
+goes through it in a browser, the other subscription repeats each finding in a browser
+of its own, and what holds becomes an item. They need to know where the application
+runs: the project's page has an Application card for the address (https, a public host)
+and, where a sign-in is needed, a test identity. The identity is stored as a Secret of
+the sandbox namespace (`application-<project id>`), mounted as files into the steps
+that look at that application and nowhere else, and never shown again; the record only
+says that there is one. Use an identity made for testing: the agents can do what it can
+do. A step of these flows reaches the application's host through the proxy with a grant
+(see "The sandboxes' way out") and nothing else beyond what every sandbox reaches.
+
+### Triggers
+
+A section's flow can start without anyone asking (`sandbox/triggers.py`); the project's
+page lists and adds triggers:
+
+- at set times: every day or every week at an hour (UTC), with the scope the trigger
+  names;
+- when the default branch has moved since the trigger last looked (the launcher asks
+  GitHub every ten minutes), at most once in the trigger's pause;
+- when an item arrives in the section, as many in a day as the trigger allows: any
+  item, issues from GitHub only, or what a flow produced only. Items that were there
+  before the trigger was made are left alone.
+
+The first two fit flows that produce items; the third fits any flow. A trigger starts
+what the administrator could start by hand and under the same conditions: nothing
+starts on a paused project, the budgets hold, and a run that is under way is not
+started twice. What a trigger last did, or why it did nothing, is kept with it.
+
+### Flows drafted by the supervisor
+
+Asked for a flow, the supervisor reads the list of tasks and the flows that exist,
+drafts a document, checks it, and proposes it (`propose_flow`). A draft that breaks a
+rule is refused before it is proposed. The proposal waits in the inbox, where it can be
+opened as a graph with how a run would go on paper and what the supervisor worded.
+Accepting a flow that only reads and produces items puts it in force, in the console or
+in chat; one that can change code or publish is saved as the flow's draft and is put in
+force on the Flows page with the password, like any draft. The supervisor never writes
+over a draft that is being worked on, and proposing the same flow again replaces its
+earlier proposal.
+
 ## Moving a project's work here
 
 The projects the original system works on are marked as such on their page until their
@@ -540,10 +639,12 @@ keeping can be moved without a file. The original system is not touched by any o
 ## The sandbox image
 
 A run works in `images/sandbox`: the two agent clients (Claude Code and Codex), git, a
-compiler, Node.js 22 with pnpm, Python with uv, and the scanners (gitleaks, trivy, semgrep,
-syft, kubeconform). CI builds it, runs `images/sandbox/smoke-test.sh` against it and pushes
+compiler, Node.js 22 with pnpm, Python with uv, the scanners (gitleaks, trivy, semgrep,
+syft, kubeconform), and a browser for the flows that look at a running application
+(the base image's Chromium, driven by the pinned Playwright driver through
+`require('sandbox-browser')`, which sets it up for a sandbox). CI builds it, runs `images/sandbox/smoke-test.sh` against it and pushes
 it to `ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox`, tagged with its commit.
-Nothing deploys it yet: runs arrive with the sandbox launcher.
+The launcher starts every step of every run from it.
 
 - **Pinned.** The base image by digest; the Node packages by the integrity hashes of
   `node-tools/package-lock.json`; the Python packages by the hashes of `semgrep.lock`; the
@@ -557,8 +658,8 @@ Nothing deploys it yet: runs arrive with the sandbox launcher.
   bit. Publishing is the platform's, through the GitHub App.
 - **Run as it is tested.** User 10002, read-only root filesystem, no capabilities; the
   workspace, the home directory and `/tmp` are volumes of the run.
-- **Not in it yet.** The Rust and Go toolchains that `falcone-serverless` needs, and the
-  browsers of the journey runner; they are added when a flow needs them.
+- **Not in it yet.** The Rust and Go toolchains that `falcone-serverless` needs; they
+  are added when a flow needs them.
 
 `docker run <image>` prints the version of every tool. `sandbox-step` is what a step runs: it
 carries out the job the launcher wrote into `SANDBOX_JOB` (commands, in order) and ends

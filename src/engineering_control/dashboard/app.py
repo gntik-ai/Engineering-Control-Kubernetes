@@ -77,6 +77,7 @@ from engineering_control.dashboard.schemas import (
     ItemRouteInput,
     ItemStateInput,
     PlainChangeInput,
+    ProjectApplicationInput,
     ProjectArchiveInput,
     ProjectCreateInput,
     ProjectPauseInput,
@@ -1841,6 +1842,25 @@ def create_app(
             lambda body: service(request).set_item_state(item_id, body.state),
             event="dashboard.item_state_changed",
             subject=str(item_id),
+        )
+
+    @app.post("/api/dashboard/projects/{name}/application")
+    async def project_application_api(name: str, request: Request) -> Response:
+        """Where the project's application runs, and the test identity a step that looks
+        at it signs in with. The identity is stored in the cluster and never shown."""
+        return await project_change(
+            request,
+            ProjectApplicationInput,
+            lambda body: service(request).set_application(
+                name,
+                url=body.url,
+                username=body.username,
+                password=body.password,
+                forget_identity=body.forget_identity,
+                cluster=cluster_of(request),
+            ),
+            event="dashboard.project_application_set",
+            subject=name,
         )
 
     @app.post("/api/dashboard/projects/{name}/pause")

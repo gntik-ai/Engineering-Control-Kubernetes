@@ -11,7 +11,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -201,6 +203,33 @@ class ProjectRecords:
             session.commit()
             return serialize(record)
 
+    def set_application(
+        self, name: str, *, url: str | None, identity: bool | None = None
+    ) -> dict[str, Any]:
+        """Where the project's application runs, for flows that look at it in a browser.
+        ``identity`` says whether a test identity is stored now; None leaves that as it is."""
+        address = clean_application_url(url)
+        with self.sessions() as session:
+            record = self._active(session, name)
+            record.application_url = address
+            if address is None:
+                identity = False
+            if identity is not None:
+                record.application_identity_at = datetime.now(UTC) if identity else None
+            session.commit()
+            return serialize(record)
+
+    def application(self, name: str) -> dict[str, Any] | None:
+        """Where the project's application runs and whether an identity is stored."""
+        with self.sessions() as session:
+            found: dict[str, Any] | None = serialize(self._active(session, name))["application"]
+            return found
+
+    def identity_of(self, name: str) -> UUID:
+        """The project's id: what its application's identity is kept under."""
+        with self.sessions() as session:
+            return self._active(session, name).id
+
     def pause(self, name: str, *, reason: str, by: str) -> dict[str, Any]:
         """Start no further work on the project. What runs, runs to its end."""
         with self.sessions() as session:
@@ -259,7 +288,44 @@ def serialize(record: ProjectRecord) -> dict[str, Any]:
         "default_branch": record.default_branch,
         "origin": record.origin,
         "paused": paused(record),
+        "application": {
+            "url": record.application_url,
+            "identity": record.application_identity_at is not None,
+        }
+        if record.application_url
+        else None,
     }
+
+
+APPLICATION_HOST: Final = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+
+
+def clean_application_url(url: str | None) -> str | None:
+    """An application's address as it is kept: https, a public host name, the usual
+    port, no sign-in in the address. Empty means the project has none."""
+    text = (url or "").strip()
+    if not text:
+        return None
+    if len(text) > 300:
+        raise ProjectInvalid("The address is too long")
+    parsed = urlsplit(text)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https":
+        raise ProjectInvalid("The address starts with https://")
+    if parsed.username or parsed.password:
+        raise ProjectInvalid("An address carries no sign-in: store the test identity apart")
+    if parsed.port not in (None, 443):
+        raise ProjectInvalid("The sandboxes reach port 443 only")
+    if not APPLICATION_HOST.fullmatch(host):
+        raise ProjectInvalid("The address names a host by its name, such as staging.example.com")
+    path = parsed.path or "/"
+    return f"https://{host}{path}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+def application_host(url: str | None) -> str | None:
+    return (urlsplit(url).hostname or "").lower() or None if url else None
 
 
 def paused(record: ProjectRecord) -> dict[str, Any] | None:
