@@ -26,7 +26,7 @@ from typing import Any, Final
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
@@ -37,6 +37,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.db.models import ProjectRecord, ProjectSection
+from engineering_control.engine.library import describe, document_in_force
 from engineering_control.flow_library import FLOWS
 
 SECTION_KEY = re.compile(r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
@@ -250,8 +251,17 @@ def ensure_core_sections(session: Session, project: ProjectRecord) -> int:
     return added
 
 
+def _flow(section: ProjectSection) -> dict[str, Any] | None:
+    """The section's flow as it is in force now, or as the library names it."""
+    session = object_session(section)
+    if session is not None:
+        return describe(session, section.flow_key)
+    named = FLOWS.get(section.flow_key) if section.flow_key else None
+    return named.as_dict() if named else None
+
+
 def serialize(section: ProjectSection) -> dict[str, Any]:
-    flow = FLOWS.get(section.flow_key) if section.flow_key else None
+    flow = _flow(section)
     return {
         "key": section.key,
         "name": section.name,
@@ -261,7 +271,7 @@ def serialize(section: ProjectSection) -> dict[str, Any]:
         "labels": list(section.labels or []),
         "examples": list(section.examples or []),
         "kind": section.kind,
-        "flow": flow.as_dict() if flow else None,
+        "flow": flow,
     }
 
 
@@ -276,7 +286,7 @@ def routing_brief(project: ProjectRecord, sections: Sequence[ProjectSection]) ->
         "is not configured: never send the work to another section instead.",
     ]
     for section in sections:
-        flow = FLOWS.get(section.flow_key) if section.flow_key else None
+        flow = _flow(section)
         lines += ["", f"## {section.name} (section key: {section.key})"]
         lines.append(f"What belongs here: {section.description or 'Not described.'}")
         if section.use_when:
@@ -294,7 +304,7 @@ def routing_brief(project: ProjectRecord, sections: Sequence[ProjectSection]) ->
         if flow is None:
             lines.append("Flow: none assigned. This section cannot run work yet.")
         else:
-            lines.append(f"Flow: {flow.name}. {flow.summary}")
+            lines.append(f"Flow: {flow['name']}. {flow['summary']}")
     return "\n".join(lines) + "\n"
 
 
@@ -428,6 +438,25 @@ class SectionRecords:
                     )
             section.labels = labels
 
+    def using(self, flow: str) -> list[dict[str, str]]:
+        """The sections of projects that are not archived that have that flow."""
+        with self.sessions() as session:
+            rows = session.execute(
+                select(ProjectSection, ProjectRecord)
+                .join(ProjectRecord, ProjectSection.project_id == ProjectRecord.id)
+                .where(ProjectSection.flow_key == flow, ProjectRecord.archived_at.is_(None))
+                .order_by(ProjectRecord.name, ProjectSection.position)
+            ).all()
+            return [
+                {
+                    "project": record.name,
+                    "project_name": record.display_name,
+                    "section": section.key,
+                    "section_name": section.name,
+                }
+                for section, record in rows
+            ]
+
     def remove(self, project: str, key: str) -> dict[str, Any]:
         with self.sessions() as session:
             record = self._project(session, project)
@@ -440,9 +469,9 @@ class SectionRecords:
             return removed
 
     def assign(self, project: str, key: str, flow: str | None) -> dict[str, Any]:
-        if flow is not None and flow not in FLOWS:
-            raise ProjectInvalid("That flow is not in the library")
         with self.sessions() as session:
+            if flow is not None and flow not in FLOWS and document_in_force(session, flow) is None:
+                raise ProjectInvalid("That flow is not in the library, or was never put in force")
             record = self._project(session, project)
             section = self._section(session, record, key)
             section.flow_key = flow

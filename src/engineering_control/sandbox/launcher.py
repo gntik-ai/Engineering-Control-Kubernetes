@@ -38,6 +38,7 @@ from engineering_control.sandbox import deliver, pods, steps
 from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
+from engineering_control.sandbox.triggers import PUSH_LOOK_EVERY, Triggers
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
 from engineering_control.supervisor.operations import Operations
@@ -48,6 +49,7 @@ PASS_SECONDS: Final = 3.0
 WORKSPACE_GIBIBYTES: Final = 10
 PROXY_LOOKUP_SECONDS: Final = 60.0
 WATCH_SECONDS: Final = 20.0
+TRIGGERS_EVERY: Final = 60.0
 # How much of a running step's output is shown, and how far back the result is looked for.
 # A long line reaches the cluster's log in pieces, each counted as a line.
 SHOWN_LINES: Final = 600
@@ -119,6 +121,10 @@ class Launcher:
         # One engine runs every flow: the kind of a run only says what it is recorded as.
         sessions = getattr(runs, "sessions", None)
         self.evaluations = Evaluations(sessions, runs) if sessions else None
+        # Triggers start what queues' budgets allow; without queues there are none.
+        self.triggers = Triggers(sessions, runs, queues.budgets) if sessions and queues else None
+        self.github = github
+        self._triggered = self._looked = float("-inf")
         engine = Engine(runs, github, backlog, FlowRecords(sessions).document if sessions else None)
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
@@ -150,6 +156,8 @@ class Launcher:
         if self.evaluations is not None:
             # Evaluations go through their cases one after the other.
             await asyncio.to_thread(self.evaluations.advance)
+        if self.triggers is not None:
+            await self._trigger()
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -164,6 +172,22 @@ class Launcher:
             except Exception as error:  # noqa: BLE001 - one run must not stop the loop
                 LOG.error("launcher_step_error", run=str(item.run_id), error=repr(error)[:300])
         return len(work)
+
+    async def _trigger(self) -> None:
+        """Start what schedules and arriving items start, once a minute, and look for
+        moved branches every few minutes. Neither needs looking at every three seconds."""
+        if self.triggers is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._triggered >= TRIGGERS_EVERY:
+            self._triggered = now
+            await asyncio.to_thread(self.triggers.advance)
+        if self.github is not None and now - self._looked >= PUSH_LOOK_EVERY.total_seconds():
+            self._looked = now
+            try:
+                await self.triggers.look(self.github)
+            except GitHubAppError as error:
+                LOG.warning("triggers_look_failed", error=str(error)[:200])
 
     async def _operate(self, *, force: bool = False) -> None:
         """Notice trouble, close what the supervisor has dealt with, and ask it about what

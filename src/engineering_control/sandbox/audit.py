@@ -50,6 +50,8 @@ LENSES: Final = (
     "deployment",
     "supply-chain",
     "documentation",
+    # Not the original's: what can be taken out or tidied without changing behaviour.
+    "maintainability",
 )
 SEVERITIES: Final = ("low", "medium", "high", "critical")
 
@@ -310,6 +312,9 @@ def disposition(tried: list[dict[str, Any]], rounds: int = len(ROUNDS)) -> str:
     return "FLAKY"
 
 
+_TIMES: Final = {1: "once", 2: "twice"}
+
+
 def sections(finding: dict[str, Any]) -> list[str]:
     """What a finding says, as the sections of a backlog item's text."""
     steps = "\n".join(
@@ -343,7 +348,8 @@ def description(finding: dict[str, Any], tried: list[dict[str, Any]], base_sha: 
             f"**Component:** {finding['affected_component'] or 'not named'} · "
             f"**Found at commit:** {base_sha[:12]}",
             *sections(finding),
-            "## Verification\nReproduced twice, independently, by an agent of the other "
-            "subscription, each time with a positive and a negative control.\n" + seen,
+            f"## Verification\nReproduced {_TIMES.get(len(tried), f'{len(tried)} times')}, "
+            "independently, by an agent of the other subscription, each time with a positive "
+            "and a negative control.\n" + seen,
         ]
     )

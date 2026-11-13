@@ -281,6 +281,51 @@ class FlowDraftInput(DashboardModel):
     note: str | None = Field(default=None, max_length=300)
 
 
+class TriggerInput(DashboardModel):
+    """What starts a section's flow without anyone asking."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    section: str = Field(min_length=1, max_length=40)
+    kind: str = Field(pattern=r"^(schedule|push|item)$")
+    spec: dict[str, Any] = Field(default_factory=dict)
+
+
+class TriggerUpdateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    enabled: bool | None = None
+    spec: dict[str, Any] | None = None
+
+
+class FlowCheckInput(DashboardModel):
+    """A flow as it is in the editor, to be checked against the rules without saving."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    document: dict[str, Any]
+
+
+class SavedTaskInput(DashboardModel):
+    """A task as it is set in a flow, kept under a name to be used in others."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=80)
+    task: str = Field(min_length=1, max_length=64)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    wording: dict[str, str] = Field(default_factory=dict)
+
+
+class FlowCreateInput(DashboardModel):
+    """A new flow of the library: brought in as a document, copied from a flow that
+    exists, or empty."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    key: str = Field(default="", max_length=64)
+    name: str = Field(default="", max_length=80)
+    summary: str = Field(default="", max_length=400)
+    copy_of: str | None = Field(default=None, max_length=64)
+    version: int | None = Field(default=None, ge=0)
+    document: dict[str, Any] | None = None
+
+
 class FlowPublishInput(DashboardModel):
     """Put a flow's draft in force. Every run that starts afterwards follows it, so it
     needs the password again."""

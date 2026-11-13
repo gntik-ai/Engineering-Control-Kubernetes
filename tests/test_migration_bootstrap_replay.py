@@ -29,7 +29,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0036 (flows as documents, usage, evaluations) follows 0035 (paused projects),
+    # 0037 (triggers, where an application runs) follows
+    # 0036 (flows as documents, usage, evaluations), 0035 (paused projects),
     # 0034 (items with their own text, incidents, cut-over), 0033 (the chat
     # channel's memory), 0032 (queues and budgets), 0031 (the
     # supervisor), 0030 (what a step was
@@ -39,7 +40,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0036", "0035")
+    assert (head, parent) == ("0037", "0036")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -93,6 +94,36 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0037: triggers and the address of a project's application. A trigger that is
+    # switched on is work the administrator arranged: a downgrade must not drop it.
+    assert {"flow_triggers", "saved_tasks"} <= set(inspect(engine).get_table_names())
+    assert "application_url" in {c["name"] for c in inspect(engine).get_columns("projects")}
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, display_name, source_repository, "
+                "deployment_repository, default_branch, origin, created_at, updated_at) VALUES "
+                "('00000000000000000000000000000037', 'triggered', 'Triggered', 'o/r', 'o/r', "
+                "'main', 'console', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO flow_triggers (id, project_id, section_key, kind, spec, enabled, "
+                "fired, created_at, updated_at) VALUES ('00000000000000000000000000000137', "
+                "'00000000000000000000000000000037', 'code-audit', 'schedule', '{}', "
+                ":enabled, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"enabled": True},
+        )
+    with pytest.raises(RuntimeError, match="refuses to drop triggers"):
+        command.downgrade(config, parent)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE flow_triggers SET enabled = :enabled"), {"enabled": False})
+        connection.execute(text("DELETE FROM projects WHERE name = 'triggered'"))
+    command.downgrade(config, parent)
+    assert "flow_triggers" not in set(inspect(engine).get_table_names())
+    parent = "0035"
     # 0036: flows as versioned documents. A published version may be what sections and
     # runs follow, so a downgrade must not drop it; drafts and evaluations may go.
     assert {"flow_versions", "evaluations", "evaluation_cases"} <= set(

@@ -19,12 +19,14 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.engine.builtin import BUILTIN as BUILTIN_FLOWS
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
 from engineering_control.engine.document import FORMAT as FLOW_FORMAT
 from engineering_control.engine.document import FlowInvalid
 from engineering_control.engine.document import parse as parse_flow
 from engineering_control.engine.prompts import CONTRACTS
+from engineering_control.engine.records import described
 from engineering_control.engine.simulate import recorded, simulate
 from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
@@ -451,6 +453,10 @@ class DashboardService:
             lambda: self.repository.toolbox.decide(action_id, accept=accept, via="console")
         )
 
+    async def proposed_flow(self, action_id: UUID) -> dict[str, object]:
+        """A flow the supervisor proposed, to look at before it is decided."""
+        return await asyncio.to_thread(self.repository.toolbox.proposed_flow, action_id)
+
     async def incidents(self, *, everything: bool = False) -> dict[str, object]:
         """What went wrong with the work and what the supervisor made of it."""
         return await asyncio.to_thread(
@@ -482,6 +488,31 @@ class DashboardService:
     async def try_account(self, account_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.start_account_check, account_id)
 
+    # --- triggers --------------------------------------------------------------------------
+
+    async def triggers(self, project: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.triggers.of_project, project)
+
+    async def create_trigger(
+        self, project: str, section: str, kind: str, spec: dict[str, Any]
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.triggers.create(project, section, kind=kind, spec=spec)
+        )
+
+    async def update_trigger(
+        self, trigger_id: UUID, enabled: bool | None, spec: dict[str, Any] | None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.triggers.update(trigger_id, enabled=enabled, spec=spec)
+        )
+
+    async def remove_trigger(self, trigger_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.triggers.remove, trigger_id)
+
+    async def fire_trigger(self, trigger_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.triggers.fire, trigger_id)
+
     # --- flows -----------------------------------------------------------------------------
 
     async def flows(self) -> dict[str, object]:
@@ -506,18 +537,43 @@ class DashboardService:
             "prompts": [contract.describe({}) for contract in CONTRACTS.values()],
             "budgets": [param.as_dict() for param in BUDGETS.values()],
             "providers": list(AGENT_PROVIDERS),
+            "saved": await asyncio.to_thread(self.repository.flows.saved_tasks),
         }
+
+    async def check_flow(self, document: dict[str, Any]) -> dict[str, object]:
+        """What the rules say about a flow as it is in the editor. Nothing is stored."""
+        try:
+            flow = parse_flow(document)
+        except FlowInvalid as error:
+            raise ProjectInvalid(str(error)) from error
+        return described(flow)
+
+    async def save_task(
+        self, *, name: str, task: str, settings: dict[str, Any], wording: dict[str, str]
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.flows.save_task(
+                name=name, task=task, params=settings, wording=wording
+            )
+        )
+
+    async def remove_saved_task(self, saved_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.flows.remove_task, saved_id)
 
     async def flow(self, key: str) -> dict[str, object]:
         def read() -> dict[str, Any]:
             flows = self.repository.flows
             versions = flows.versions(key)
             draft = flows.draft(key)
+            current = flows.version_in_force(key)
             return {
                 "key": key,
-                "in_force": flows.shown(key, flows.version_in_force(key)),
+                # None for a flow that was made here and never put in force.
+                "in_force": flows.shown(key, current) if current is not None else None,
                 "draft": flows.shown(key, draft) if draft is not None else None,
                 "versions": versions,
+                "builtin": key in BUILTIN_FLOWS,
+                "used_by": self.repository.sections.using(key),
             }
 
         return await asyncio.to_thread(read)
@@ -533,6 +589,50 @@ class DashboardService:
             return {**self.repository.flows.shown(key, saved["version"]), "flow": key}
 
         return await asyncio.to_thread(save)
+
+    async def create_flow(
+        self,
+        *,
+        key: str,
+        name: str,
+        summary: str,
+        copy_of: str | None,
+        version: int | None,
+        document: dict[str, Any] | None,
+    ) -> dict[str, object]:
+        """A new flow of the library: a document that is brought in, a copy of a flow
+        that exists, or a flow with nothing in it yet. It starts as a draft."""
+
+        def create() -> dict[str, Any]:
+            flows = self.repository.flows
+            if document is not None:
+                raw = dict(document)
+                if flows.exists(str(raw.get("key") or "")):
+                    # A document of a flow that is here already becomes its draft.
+                    saved = flows.save_draft(str(raw["key"]), raw, note="Brought in")
+                    return {**flows.shown(str(raw["key"]), saved["version"]), "flow": raw["key"]}
+            elif copy_of is not None:
+                wanted = flows.version_in_force(copy_of) if version is None else version
+                found = flows.document(
+                    copy_of, wanted if wanted is not None else flows.draft(copy_of) or 0
+                )
+                if found is None:
+                    raise ProjectNotFound(copy_of)
+                raw = {**found.as_dict(), "key": key, "name": name, "summary": summary}
+            else:
+                raw = {
+                    "format": FLOW_FORMAT,
+                    "key": key,
+                    "name": name,
+                    "summary": summary,
+                    "start": "prepare",
+                    "tasks": [{"id": "prepare", "task": "workspace.checkout"}],
+                }
+            made = flows.create(raw, note="Brought in" if document is not None else None)
+            flow_key = str(raw.get("key"))
+            return {**flows.shown(flow_key, made["version"]), "flow": flow_key}
+
+        return await asyncio.to_thread(create)
 
     async def discard_flow_draft(self, key: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.flows.discard_draft, key)
@@ -562,7 +662,8 @@ class DashboardService:
                 except FlowInvalid as error:
                     raise ProjectInvalid(str(error)) from error
             else:
-                wanted = flows.version_in_force(key) if version is None else version
+                current = flows.version_in_force(key) if version is None else version
+                wanted = current if current is not None else flows.draft(key) or 0
                 found = flows.document(key, wanted)
                 if found is None:
                     raise ProjectNotFound(f"{key} version {wanted}")
@@ -639,6 +740,9 @@ class DashboardService:
 
     async def run(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.get, run_id)
+
+    async def run_flow(self, run_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.flow_of, run_id)
 
     async def cancel_run(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.request_cancel, run_id)

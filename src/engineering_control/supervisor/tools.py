@@ -37,7 +37,17 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import ProjectRecord, SupervisorAction
-from engineering_control.flow_library import DELIVER, WORK_KINDS, run_for_item
+from engineering_control.engine import validate
+from engineering_control.engine.catalogue import BUDGETS
+from engineering_control.engine.catalogue import catalogue as task_catalogue
+from engineering_control.engine.document import FORMAT as FLOW_FORMAT
+from engineering_control.engine.document import Document, FlowInvalid
+from engineering_control.engine.document import parse as parse_flow
+from engineering_control.engine.library import plan_for_item, traits
+from engineering_control.engine.prompts import CONTRACTS
+from engineering_control.engine.records import FlowRecords, described
+from engineering_control.engine.simulate import simulate
+from engineering_control.flow_library import DELIVER, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import ROUNDS_CEILING, rounds_of, toolchain_for
 from engineering_control.sandbox.queues import Queues
@@ -107,6 +117,25 @@ def _when(value: datetime | None) -> str | None:
     return (value if value.tzinfo else value.replace(tzinfo=UTC)).isoformat()
 
 
+def _checked(document: Document) -> dict[str, Any]:
+    """What validation says about a draft, and how a run would go through it on paper."""
+    went = simulate(document)
+    return {
+        "problems": [
+            f"{problem['level']}: {problem['text']}" for problem in validate.problems(document)
+        ],
+        "on_paper": {
+            "tasks": [
+                f"{step['task']}"
+                + (f" ({step['provider']})" if step["provider"] else "")
+                + f" ends with {step['outcome']}"
+                for step in went["steps"]
+            ],
+            "ends": went["ends"]["text"],
+        },
+    }
+
+
 class Toolbox:
     def __init__(
         self,
@@ -132,6 +161,7 @@ class Toolbox:
         self.conversation = conversation
         self.queues = queues
         self.github = github
+        self.flows = FlowRecords(sessions)
 
     # --- a call from the supervisor ------------------------------------------------------
 
@@ -190,6 +220,9 @@ class Toolbox:
         if why is None and self._over_limit(run_id):
             why = "The supervisor reached its limit of actions taken without asking."
         if why is not None:
+            if name == "propose_flow":
+                # A flow proposed again replaces the proposal that still waits.
+                self._withdraw_flow(str((arguments.get("document") or {}).get("key") or ""))
             self._record(
                 run_id,
                 name,
@@ -294,7 +327,133 @@ class Toolbox:
         item["run"] = self.runs.for_items([str(item_id)]).get(str(item_id))
         return item
 
+    def _withdraw_flow(self, key: str) -> None:
+        with self.sessions.begin() as session:
+            for action in session.scalars(
+                select(SupervisorAction).where(
+                    SupervisorAction.tool == "propose_flow", SupervisorAction.outcome == "pending"
+                )
+            ):
+                if ((action.arguments or {}).get("document") or {}).get("key") == key:
+                    action.outcome = "rejected"
+                    action.detail = "Replaced by a later proposal of the same flow."
+                    action.decided_at = datetime.now(UTC)
+                    action.decided_via = "supervisor"
+
+    def _flow_document(self, arguments: dict[str, Any]) -> Document:
+        try:
+            return parse_flow(arguments.get("document"))
+        except FlowInvalid as error:
+            raise ProjectInvalid(str(error)) from error
+
+    def proposed_flow(self, action_id: UUID) -> dict[str, Any]:
+        """A flow the supervisor proposed, as the console shows it before it is decided."""
+        with self.sessions() as session:
+            action = session.get(SupervisorAction, action_id)
+            if action is None or action.tool != "propose_flow":
+                raise ProjectNotFound(str(action_id))
+            arguments = dict(action.arguments or {})
+            row = {
+                "action_id": str(action.id),
+                "outcome": action.outcome,
+                "summary": action.summary,
+                "reason": action.reason,
+                "detail": action.detail,
+                "at": _when(action.created_at),
+            }
+        document = self._flow_document(arguments)
+        current = (
+            self.flows.version_in_force(document.key) if self.flows.exists(document.key) else None
+        )
+        return {
+            **row,
+            **described(document),
+            "exists": self.flows.exists(document.key),
+            "in_force": current,
+            "on_paper": simulate(document),
+        }
+
     def _read_records(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "list_tasks":
+            return {
+                "format": FLOW_FORMAT,
+                "tasks": [
+                    {
+                        "task": task["key"],
+                        "does": f"{task['title']}. {task['summary']}",
+                        "runs": {
+                            "sandbox": "in a sandbox",
+                            "platform": "by the platform itself, after the sandboxes' tasks",
+                            "control": "nowhere: it only chooses the way",
+                        }[task["where"]],
+                        "agent": task["account"],
+                        "outcomes": task["outcomes"],
+                        "settings": {
+                            param["name"]: f"{param['doc']} Usual: {json.dumps(param['default'])}."
+                            for param in task["params"]
+                        },
+                        "needs": task["needs"],
+                        "leaves": task["produces"],
+                        "prompt": task["prompt"],
+                    }
+                    for task in task_catalogue()
+                ],
+                "prompts": {
+                    contract.name: {
+                        "parts_a_flow_may_word": [
+                            part["name"]
+                            for part in contract.describe({})["parts"]
+                            if part["kind"] == "editable"
+                        ],
+                        "may_name": [f"{{{{{name}}}}}" for name in contract.variables],
+                    }
+                    for contract in CONTRACTS.values()
+                },
+                "budgets": {
+                    param.name: f"{param.doc} Between {param.low} and {param.high}."
+                    for param in BUDGETS.values()
+                },
+                "rules": [
+                    "After the last task that can change the checkout, a change is reviewed "
+                    "by the other subscription (agent.review), tested (check.change), "
+                    "collected (change.collect) and decided by the administrator "
+                    "(people.approval), in that order, before github.pull_request.",
+                    "A task that judges another's work names it in other_than and is given "
+                    "to the other subscription.",
+                    "The platform's own tasks come last: nothing in a sandbox follows them.",
+                    "A task needs what it needs from a task before it on every way there.",
+                ],
+            }
+        if name == "list_flows":
+            return [
+                {
+                    "flow": row["key"],
+                    "name": row["name"],
+                    "summary": row["summary"],
+                    "version_in_force": row["version"],
+                    "draft": row["draft"],
+                    "tasks": row["tasks"],
+                    "started_for_a_section_as": row["section_action"],
+                }
+                for row in self.flows.summary()
+            ]
+        if name == "get_flow":
+            key = str(arguments.get("flow") or "")
+            wanted = arguments.get("version")
+            version = self.flows.version_in_force(key) if wanted is None else int(wanted)
+            found = self.flows.document(
+                key, version if version is not None else self.flows.draft(key) or 0
+            )
+            if found is None:
+                raise ProjectNotFound(key)
+            return {
+                "version": version,
+                "document": found.as_dict(layout=False),
+                "problems": [p["text"] for p in validate.problems(found)],
+            }
+        if name == "check_flow":
+            document = self._flow_document(arguments)
+            return _checked(document)
         if name == "list_projects":
             counts = self.backlog.open_counts()
             return [
@@ -519,6 +678,50 @@ class Toolbox:
             "conclude_incident",
         ):
             raise ProjectInvalid("Say why: a reason is required")
+        if name == "propose_flow":
+            document = self._flow_document(arguments)
+            if len(_text(arguments)) >= 20_000:
+                raise ProjectInvalid(
+                    "The flow is too long to propose in one piece: word the prompts more briefly"
+                )
+            wrong = validate.errors(document)
+            if wrong:
+                raise ProjectInvalid(
+                    "The draft breaks a rule, so it is not proposed: "
+                    + " ".join(problem["text"] for problem in wrong[:4])
+                    + " Correct it, check it with check_flow, and propose it again."
+                )
+            exists = self.flows.exists(document.key)
+            if exists and self.flows.draft(document.key) is not None:
+                raise ProjectConflict(
+                    f"The flow {document.key} has a draft that is being worked on. The "
+                    "administrator puts it in force or discards it first."
+                )
+            current = self.flows.version_in_force(document.key) if exists else None
+            if current is not None:
+                same = self.flows.document(document.key, current)
+                if same is not None and same.sha256() == document.sha256():
+                    raise ProjectInvalid("That is the flow as it is in force: nothing would change")
+            went = simulate(document)
+            path = " → ".join(step["task"] for step in went["steps"] if step["where"] != "control")[
+                :240
+            ]
+            kind = traits(document)
+            after = (
+                "Accepting saves it as a draft; it is put in force on the Flows page, with "
+                "your password, because it can change code."
+                if kind["writes"] or kind["publishes"]
+                else "Accepting puts it in force."
+            )
+            what = (
+                f"A new version of the flow {document.name} ({document.key})"
+                if exists
+                else f"A new flow, {document.name} ({document.key})"
+            )
+            return Intent(
+                f"{what}: {path}. On paper: {went['ends']['text']} {after}",
+                confirm="A flow takes effect only when you accept it.",
+            )
         if name == "propose_items":
             project = str(arguments.get("project") or "")
             keys = {section["key"] for section in self.sections.of_project(project)}
@@ -573,12 +776,11 @@ class Toolbox:
                 raise ProjectInvalid("The item is not open any more")
             if item["section"] is None:
                 raise ProjectInvalid("The item has no section yet: route it first")
-            if (
-                run_for_item(
-                    item["section"]["flow"], finding=item["facts"].get("kind") == "finding"
+            with self.sessions() as session:
+                plan = plan_for_item(
+                    session, item["section"]["flow"], produced=bool(item["facts"].get("kind"))
                 )
-                is None
-            ):
+            if plan is None:
                 raise ProjectInvalid(
                     f"The section {item['section']['name']} has no flow that can run yet"
                 )
@@ -770,7 +972,33 @@ class Toolbox:
             return Intent(f"Pause the queue {label}.", project=queue["project"])
         raise ProjectInvalid("That tool changes nothing")
 
+    def _accept_flow(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Take a proposed flow into the library. One that only reads and produces items
+        is put in force; one that can change code stays a draft until the administrator
+        puts it in force with the password."""
+        document = self._flow_document(arguments)
+        raw = document.as_dict()
+        note = "Drafted by the supervisor"
+        if self.flows.exists(document.key):
+            saved = self.flows.save_draft(document.key, raw, note=note)
+        else:
+            saved = self.flows.create(raw, note=note)
+        kind = traits(document)
+        if kind["writes"] or kind["publishes"]:
+            return {
+                "flow": document.key,
+                "version": saved["version"],
+                "state": "draft",
+                "next": "Put it in force on the Flows page.",
+            }
+        published = self.flows.publish(
+            document.key, note="Drafted by the supervisor, accepted by the administrator"
+        )
+        return {"flow": document.key, "version": published["version"], "state": "in force"}
+
     def _perform(self, name: str, arguments: dict[str, Any], run_id: UUID | None = None) -> Any:
+        if name == "propose_flow":
+            return self._accept_flow(arguments)
         if name == "propose_items":
             project = str(arguments["project"])
             proposed, repeated = [], []

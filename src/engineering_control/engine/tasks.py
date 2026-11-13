@@ -21,7 +21,13 @@ from typing import Any, Final, Protocol
 
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import ProjectNotFound
-from engineering_control.engine.catalogue import TASKS, TaskType
+from engineering_control.engine.catalogue import (
+    AUDITING,
+    ITEM_KINDS,
+    TASKS,
+    VERIFYING,
+    TaskType,
+)
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.github_app import ChangedFile, GitHubApp, GitHubAppError
@@ -84,20 +90,22 @@ class Context:
         self.prompt_used = {"name": contract.name, "sha256": contract.sha256(overrides)}
         return contract.render(overrides, values)
 
-    async def outputs(self, task: str) -> list[dict[str, Any]]:
+    async def outputs(self, task: str | tuple[str, ...]) -> list[dict[str, Any]]:
         """What the run's steps of that kind of task produced, in the order they ran."""
+        kinds = (task,) if isinstance(task, str) else task
         found: list[dict[str, Any]] = []
         for node in self.document.nodes:
-            if node.task == task:
+            if node.task in kinds:
                 found += await asyncio.to_thread(
                     self.services.runs.step_outputs, self.item.run_id, node.id
                 )
         return found
 
-    def setting(self, task: str, name: str, default: int) -> int:
+    def setting(self, task: str | tuple[str, ...], name: str, default: int) -> int:
         """A numeric setting of the flow's task of that kind."""
+        kinds = (task,) if isinstance(task, str) else task
         for node in self.document.nodes:
-            if node.task == task:
+            if node.task in kinds:
                 try:
                     return int(node.params.get(name, default))
                 except (TypeError, ValueError):
@@ -699,7 +707,7 @@ class Verify:
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
         data = ctx.data
         area = ctx.each("areas")
-        found = await ctx.outputs("agent.audit")
+        found = await ctx.outputs(AUDITING)
         mine = [output for output in found if output.get("area") == area]
         prompt = ctx.prompt(
             {
@@ -761,14 +769,17 @@ class ProposeFindings:
         data = ctx.data
         services = ctx.services
         run_id = ctx.item.run_id
-        audits = await ctx.outputs("agent.audit")
+        audits = await ctx.outputs(AUDITING)
         if not audits:
             return Performed(end=End("failed", "unfinished", "The run ended without an audit."))
         plans = await ctx.outputs("agent.plan_areas")
         planned = data.get("areas") or []
-        rounds = await ctx.outputs("agent.verify")
+        rounds = await ctx.outputs(VERIFYING)
         # How many independent reproductions decide a finding: what the flow says.
-        wanted = max(1, min(ctx.setting("agent.verify", "rounds", len(audit.ROUNDS)), 3))
+        wanted = max(1, min(ctx.setting(VERIFYING, "rounds", len(audit.ROUNDS)), 3))
+        kind = str(ctx.params.get("kind") or "finding")
+        if kind not in ITEM_KINDS:
+            kind = "finding"
         # The latest audit of each area: a step given again to another account answers
         # once more for the same area.
         by_area: dict[int | None, dict[str, Any]] = {}
@@ -817,7 +828,7 @@ class ProposeFindings:
                             section=data.get("section"),
                             description=audit.description(finding, tried, data["base_sha"]),
                             facts={
-                                "kind": "finding",
+                                "kind": kind,
                                 "severity": finding["severity"],
                                 "lens": finding["lens"],
                                 "confidence": finding["confidence"],

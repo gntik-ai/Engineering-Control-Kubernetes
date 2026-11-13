@@ -43,7 +43,9 @@ class BuiltInFlow:
 DELIVER: Final = "deliver_issue"
 AUDIT: Final = "audit_code"
 DISCOVER: Final = "discover_enhancements"
-WORK_KINDS: Final = (DELIVER, AUDIT, DISCOVER)
+# A run of any other flow: which one, the run says itself (``data["flow"]``).
+FLOW: Final = "flow"
+WORK_KINDS: Final = (DELIVER, AUDIT, DISCOVER, FLOW)
 # A run of the evaluation lab: it follows a flow like work does and leaves nothing behind.
 EVALUATION: Final = "evaluation"
 
@@ -73,6 +75,16 @@ _FLOWS: Final = (
         for_item=DELIVER,
         for_section=DISCOVER,
         section_action="Look for enhancements",
+    ),
+    BuiltInFlow(
+        "code-clean",
+        "Code clean",
+        "Look for code nothing uses, things written twice and what the project's own "
+        "linters warn about, have each one checked independently, and propose the "
+        "confirmed ones as clean-up items.",
+        for_item=DELIVER,
+        for_section=FLOW,
+        section_action="Look for things to clean up",
     ),
     BuiltInFlow(
         "change-request",

@@ -29,6 +29,11 @@ AREAS_CEILING: Final = 6
 FINDINGS_CEILING: Final = 8
 PROPOSALS_CEILING: Final = 5
 VERIFY_ROUNDS_CEILING: Final = 3
+# What an item a flow produces can be, for the backlog to show and to sort by.
+ITEM_KINDS: Final = ("finding", "clean-up", "ui-finding", "ux-finding")
+# The tasks that report candidate findings, and the tasks that verify them.
+AUDITING: Final = ("agent.audit", "agent.audit_application")
+VERIFYING: Final = ("agent.verify", "agent.verify_application")
 
 
 @dataclass(frozen=True)
@@ -308,6 +313,17 @@ _TASKS: Final = (
         "platform",
         needs=("candidates",),
         produces=("items",),
+        params=(
+            Param(
+                "kind",
+                "choice",
+                "finding",
+                "What the items are: a finding is a defect, a clean-up changes nothing "
+                "the code does, and the other two are what looking at the running "
+                "application found.",
+                choices=ITEM_KINDS,
+            ),
+        ),
     ),
     TaskType(
         "agent.discover",

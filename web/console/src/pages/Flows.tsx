@@ -1,9 +1,22 @@
 import {
+  Alert,
   Badge,
+  Button,
   Card,
   CardBody,
   CardHeader,
   CardTitle,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Field,
+  FieldDescription,
+  FieldLabel,
+  Input,
   Link,
   Page,
   SimpleSelect,
@@ -15,12 +28,191 @@ import {
   TableHeader,
   TableRow,
 } from '@gntik-ai/ui';
-import { useState } from 'react';
-import { apiUrl, useResource, type FlowListed, type Listing, type Usage, type UsageRow } from '../api';
+import { Plus, Upload } from '@gntik-ai/icons';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import {
+  apiUrl,
+  postJson,
+  useResource,
+  type FlowListed,
+  type FlowVersionShown,
+  type Listing,
+  type Usage,
+  type UsageRow,
+} from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
-import { BASE } from '../router';
+import { BASE, navigate } from '../router';
+import { useSubmit } from './ProjectDialogs';
 
-export const versionName = (version: number) => (version === 0 ? 'The platform’s own' : `Version ${version}`);
+export const versionName = (version: number | null) =>
+  version === null ? 'Not in force yet' : version === 0 ? 'The platform’s own' : `Version ${version}`;
+
+const KEY = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
+const NOTHING = '__nothing__';
+
+/** "Dead code sweep" -> "dead-code-sweep": a starting point the administrator can change. */
+const suggestKey = (name: string) =>
+  name
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^[^a-z]+|-+$/g, '')
+    .slice(0, 48)
+    .replace(/-+$/, '');
+
+function NewFlowDialog({
+  open,
+  onOpenChange,
+  flows,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  flows: FlowListed[];
+}) {
+  const [name, setName] = useState('');
+  const [key, setKey] = useState('');
+  const [keyEdited, setKeyEdited] = useState(false);
+  const [summary, setSummary] = useState('');
+  const [from, setFrom] = useState(NOTHING);
+  const finalKey = keyEdited ? key : suggestKey(name);
+  const { pending, problem, submit, reset } = useSubmit(
+    () =>
+      postJson<FlowVersionShown>('flows', {
+        key: finalKey,
+        name: name.trim(),
+        summary: summary.trim(),
+        copy_of: from === NOTHING ? null : from,
+      }),
+    () => {
+      onOpenChange(false);
+      navigate(`${BASE}/flow?key=${finalKey}`);
+    },
+  );
+  useEffect(() => {
+    if (!open) return;
+    setName('');
+    setKey('');
+    setKeyEdited(false);
+    setSummary('');
+    setFrom(NOTHING);
+    reset();
+    // Only when it opens: the form starts clean each time.
+  }, [open]);
+  const taken = flows.some((flow) => flow.key === finalKey);
+  const ready = name.trim() !== '' && KEY.test(finalKey) && !taken;
+  const onSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    if (ready && !pending) void submit();
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="md">
+        <form onSubmit={onSubmit} noValidate>
+          <DialogHeader>
+            <DialogTitle>New flow</DialogTitle>
+            <DialogDescription>
+              It starts as a draft: nothing runs by it, and no section can have it, until you put it in force.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            <Field>
+              <FieldLabel>Name</FieldLabel>
+              <Input value={name} onValueChange={setName} maxLength={80} placeholder="Dead code sweep" autoFocus />
+            </Field>
+            <Field invalid={finalKey !== '' && (!KEY.test(finalKey) || taken)}>
+              <FieldLabel>Key</FieldLabel>
+              <Input
+                value={finalKey}
+                onValueChange={(value) => {
+                  setKeyEdited(true);
+                  setKey(value);
+                }}
+                maxLength={64}
+                inputClassName="font-mono"
+                placeholder="dead-code-sweep"
+              />
+              <FieldDescription>
+                {taken
+                  ? 'There is a flow with this key already.'
+                  : 'Lower-case letters, digits and hyphens. Runs and sections name the flow by it; it cannot be changed later.'}
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>What it is for</FieldLabel>
+              <Input value={summary} onValueChange={setSummary} maxLength={400} />
+            </Field>
+            <Field>
+              <FieldLabel>Start from</FieldLabel>
+              <SimpleSelect
+                items={[
+                  { value: NOTHING, label: 'Nothing: one task to build on' },
+                  ...flows
+                    .filter((flow) => flow.engine)
+                    .map((flow) => ({ value: flow.key, label: `A copy of ${flow.name}` })),
+                ]}
+                value={from}
+                onValueChange={(value) => setFrom(value ?? NOTHING)}
+              />
+            </Field>
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" loading={pending} disabled={!ready}>
+              Make the flow
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Bring a flow in from a file that was taken out here or elsewhere. */
+function BringIn({ onProblem }: { onProblem: (problem: string | null) => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  const [pending, setPending] = useState(false);
+  const chosen = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setPending(true);
+    onProblem(null);
+    file
+      .text()
+      .then((text) => postJson<FlowVersionShown & { flow: string }>('flows', { document: JSON.parse(text) as unknown }))
+      .then((made) => navigate(`${BASE}/flow?key=${made.flow}`))
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        onProblem(
+          error instanceof SyntaxError
+            ? 'That file is not a flow: it could not be read.'
+            : error instanceof Error
+              ? error.message
+              : 'The flow could not be brought in.',
+        );
+      })
+      .finally(() => setPending(false));
+  };
+  return (
+    <>
+      <input
+        ref={input}
+        type="file"
+        accept="application/json,.json"
+        aria-label="A flow as a file"
+        className="sr-only"
+        tabIndex={-1}
+        onChange={chosen}
+      />
+      <Button variant="secondary" size="sm" icon={Upload} loading={pending} onClick={() => input.current?.click()}>
+        Bring in a flow
+      </Button>
+    </>
+  );
+}
 
 /** 12,300 as "12.3k": tokens are counted in thousands and millions. */
 export function tokens(value: number): string {
@@ -147,14 +339,33 @@ function UsageCard() {
 
 export function FlowsPage() {
   const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
+  const [making, setMaking] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
   return (
     <Page
       title="Flows"
       description="What a section runs: the tasks, who does them, what the agents are told, and how much a run may use."
-      actions={<RefreshButton resource={flows} />}
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton resource={flows} />
+          <BringIn onProblem={setProblem} />
+          <Button size="sm" icon={Plus} onClick={() => setMaking(true)}>
+            New flow
+          </Button>
+        </div>
+      }
     >
       <div className="grid gap-6">
         <LoadError resource={flows} />
+        {problem ? (
+          <Alert
+            tone="destructive"
+            title="The flow was not brought in"
+            description={problem}
+            onDismiss={() => setProblem(null)}
+          />
+        ) : null}
+        <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
         <TableFrame>
           <Table>
             <TableCaption className="sr-only">Flows</TableCaption>
@@ -199,11 +410,13 @@ export function FlowsPage() {
                           </TableCell>
                           <TableCell className={mono}>{flow.engine.budgets.rounds ?? '—'}</TableCell>
                           <TableCell className="text-[13px]">
-                            {flow.engine.version === 0
-                              ? 'Nothing'
-                              : flow.engine.prompts_changed.length
-                                ? `Wording: ${flow.engine.prompts_changed.join(', ')}`
-                                : 'Settings'}
+                            {flow.engine.version === null
+                              ? 'Made here'
+                              : flow.engine.version === 0
+                                ? 'Nothing'
+                                : flow.engine.prompts_changed.length
+                                  ? `Wording: ${flow.engine.prompts_changed.join(', ')}`
+                                  : 'Settings'}
                           </TableCell>
                         </>
                       ) : (

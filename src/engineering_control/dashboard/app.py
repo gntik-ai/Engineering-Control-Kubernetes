@@ -66,6 +66,8 @@ from engineering_control.dashboard.schemas import (
     BacklogSyncInput,
     BudgetInput,
     EvaluationInput,
+    FlowCheckInput,
+    FlowCreateInput,
     FlowDraftInput,
     FlowPublishInput,
     FlowSimulationInput,
@@ -86,6 +88,7 @@ from engineering_control.dashboard.schemas import (
     RecordsApplyInput,
     RecordsInput,
     RunDecisionInput,
+    SavedTaskInput,
     SectionCreateInput,
     SectionFlowInput,
     SectionGuideInput,
@@ -95,6 +98,8 @@ from engineering_control.dashboard.schemas import (
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
     SupervisorMessageInput,
+    TriggerInput,
+    TriggerUpdateInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
@@ -1263,6 +1268,20 @@ def create_app(
             entity="definition",
         )
 
+    @app.get("/api/dashboard/supervisor/actions/{action_id}/flow")
+    async def proposed_flow_api(action_id: UUID, request: Request) -> Response:
+        """A flow the supervisor proposed: its document, what validation says, its prompts
+        and how a run would go through it on paper."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).proposed_flow(action_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        except ProjectInvalid as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+
     @app.get("/api/dashboard/supervisor/record")
     async def supervisor_record_api(request: Request, everything: bool = False) -> Response:
         """What the supervisor did: what it applied, proposed, was refused, and what the
@@ -1360,6 +1379,58 @@ def create_app(
             entity="run",
         )
 
+    # --- triggers --------------------------------------------------------------------------
+
+    @app.get("/api/dashboard/projects/{name}/triggers")
+    async def triggers_api(name: str, request: Request) -> Response:
+        """What starts the project's flows without anyone asking."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).triggers(name))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/triggers")
+    async def create_trigger_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            TriggerInput,
+            lambda body: service(request).create_trigger(name, body.section, body.kind, body.spec),
+            event="dashboard.trigger_added",
+            subject=name,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/triggers/{trigger_id}/update")
+    async def update_trigger_api(trigger_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            TriggerUpdateInput,
+            lambda body: service(request).update_trigger(trigger_id, body.enabled, body.spec),
+            event="dashboard.trigger_changed",
+        )
+
+    @app.post("/api/dashboard/triggers/{trigger_id}/remove")
+    async def remove_trigger_api(trigger_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_trigger(trigger_id),
+            event="dashboard.trigger_removed",
+        )
+
+    @app.post("/api/dashboard/triggers/{trigger_id}/fire")
+    async def fire_trigger_api(trigger_id: UUID, request: Request) -> Response:
+        """Do now what the trigger does when its time comes."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).fire_trigger(trigger_id),
+            event="dashboard.trigger_fired",
+        )
+
     # --- flows -----------------------------------------------------------------------------
 
     @app.get("/api/dashboard/flows/catalogue")
@@ -1390,6 +1461,82 @@ def create_app(
             return JSONResponse(await service(request).flow_version(key, version))
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.get("/api/dashboard/flows/{key}/versions/{version}/export")
+    async def flow_export_api(key: str, version: int, request: Request) -> Response:
+        """A version of a flow as a file: to keep, or to bring in elsewhere."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            shown = await service(request).flow_version(key, version)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return Response(
+            json.dumps(shown["document"], indent=2, ensure_ascii=False) + "\n",
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{key}-v{version}.flow.json"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/dashboard/flows")
+    async def flow_create_api(request: Request) -> Response:
+        """A new flow of the library, as a draft: brought in, copied, or empty."""
+        return await project_change(
+            request,
+            FlowCreateInput,
+            lambda body: service(request).create_flow(
+                key=body.key,
+                name=body.name,
+                summary=body.summary,
+                copy_of=body.copy_of,
+                version=body.version,
+                document=body.document,
+            ),
+            event="dashboard.flow_created",
+            status_code=201,
+            entity="flow",
+            max_bytes=FLOW_BYTES,
+        )
+
+    @app.post("/api/dashboard/flows/check")
+    async def flow_check_api(request: Request) -> Response:
+        """What the rules say about a flow as it is in the editor. Nothing is stored."""
+        return await project_change(
+            request,
+            FlowCheckInput,
+            lambda body: service(request).check_flow(body.document),
+            event="dashboard.flow_checked",
+            entity="flow",
+            max_bytes=FLOW_BYTES,
+            record=False,
+        )
+
+    @app.post("/api/dashboard/flows/saved-tasks")
+    async def save_task_api(request: Request) -> Response:
+        """Keep a task as it is set, under a name, for other flows."""
+        return await project_change(
+            request,
+            SavedTaskInput,
+            lambda body: service(request).save_task(
+                name=body.name, task=body.task, settings=body.settings, wording=body.wording
+            ),
+            event="dashboard.task_saved",
+            status_code=201,
+            entity="saved",
+        )
+
+    @app.post("/api/dashboard/flows/saved-tasks/{saved_id}/remove")
+    async def remove_saved_task_api(saved_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_saved_task(saved_id),
+            event="dashboard.saved_task_removed",
+            entity="saved",
+        )
 
     @app.post("/api/dashboard/flows/{key}/draft")
     async def flow_draft_api(key: str, request: Request) -> Response:
@@ -1521,6 +1668,17 @@ def create_app(
             return authenticated
         try:
             return JSONResponse(await service(request).run(run_id))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.get("/api/dashboard/runs/{run_id}/flow")
+    async def run_flow_api(run_id: UUID, request: Request) -> Response:
+        """The flow the run follows, at the version it started with."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).run_flow(run_id))
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
 

@@ -449,7 +449,7 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
   const running = lab.data?.items.some((row) => row.state === 'running') ?? false;
   useEffect(() => setBusy(running), [running]);
   // What can be tried: the draft, and versions that were in force before.
-  const versions = detail.versions.filter((row) => row.version !== detail.in_force.version && row.errors === 0);
+  const versions = detail.versions.filter((row) => row.version !== detail.in_force?.version && row.errors === 0);
   const [version, setVersion] = useState<number | null>(null);
   const tried = version ?? versions[0]?.version ?? null;
   const [chosen, setChosen] = useState<string[]>([]);

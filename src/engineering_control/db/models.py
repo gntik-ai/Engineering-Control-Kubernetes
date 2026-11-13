@@ -448,6 +448,9 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pause_reason: Mapped[str | None] = mapped_column(String(300))
     paused_by: Mapped[str | None] = mapped_column(String(16))
+    # Where the project's application runs, for flows that look at it in a browser
+    # (migration 0037). Not set: such flows cannot run for the project.
+    application_url: Mapped[str | None] = mapped_column(String(300))
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 
@@ -710,6 +713,42 @@ class EvaluationCase(UUIDPrimaryKey, Timestamps, Base):
     subject: Mapped[dict[str, Any]] = mapped_column(JSON)
     run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
     __table_args__ = (CheckConstraint("arm IN ('candidate', 'baseline')", name="arm"),)
+
+
+class SavedTask(UUIDPrimaryKey, Timestamps, Base):
+    """A task as it was set in one flow, kept under a name to be used in others
+    (migration 0037): its kind, its settings and the wording of its prompt."""
+
+    __tablename__ = "saved_tasks"
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    task: Mapped[str] = mapped_column(String(64))
+    params: Mapped[dict[str, Any]] = mapped_column(JSON)
+    wording: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class FlowTrigger(UUIDPrimaryKey, Timestamps, Base):
+    """What starts a section's flow without anyone asking (migration 0037).
+
+    ``kind`` says when: ``schedule`` at set times, ``push`` when the project's default
+    branch has moved, ``item`` when an item arrives in the section. ``spec`` holds the
+    details of the kind and ``state`` what the trigger last saw. A trigger starts what the
+    administrator could start by hand, within the same budgets and pauses.
+    """
+
+    __tablename__ = "flow_triggers"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    section_key: Mapped[str] = mapped_column(String(40))
+    kind: Mapped[str] = mapped_column(String(16))
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_result: Mapped[str | None] = mapped_column(String(300))
+    fired: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (CheckConstraint("kind IN ('schedule', 'push', 'item')", name="kind"),)
 
 
 class BacklogSync(Base):

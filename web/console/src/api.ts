@@ -34,11 +34,14 @@ export interface FlowEngine {
   key: string;
   name: string;
   summary: string;
-  /** 0 is the platform's own. */
-  version: number;
+  /** 0 is the platform's own; null for a flow made here that was never put in force. */
+  version: number | null;
   /** The version being worked on, when there is one. */
   draft: number | null;
   builtin: boolean;
+  /** What starting the flow for a section is called, when a section can run it by itself. */
+  section_action: string | null;
+  publishes: boolean;
   tasks: number;
   agents: number;
   prompts_changed: string[];
@@ -93,12 +96,22 @@ export interface PromptShown {
   sha256: string;
 }
 
+/** A task as it was set in one flow, kept under a name to be used in others. */
+export interface SavedTask {
+  id: string;
+  name: string;
+  task: string;
+  with: Record<string, unknown>;
+  wording: Record<string, string>;
+}
+
 export interface FlowCatalogue {
   format: string;
   tasks: TaskType[];
   prompts: PromptShown[];
   budgets: TaskParam[];
   providers: string[];
+  saved: SavedTask[];
 }
 
 export interface FlowNode {
@@ -118,6 +131,20 @@ export interface FlowDocument {
   tasks: FlowNode[];
   prompts: Record<string, Record<string, string>>;
   budgets: Record<string, number | null>;
+  /** For a flow that produces items: what starting an item of its section does. */
+  items?: 'request';
+  /** What starting the flow for a section is called. */
+  action?: string;
+  /** Where the designer drew each task. */
+  layout?: Record<string, { x: number; y: number }>;
+}
+
+/** What the rules say about a flow, and its prompts part by part. */
+export interface FlowChecked {
+  document: FlowDocument;
+  sha256: string;
+  problems: FlowProblem[];
+  prompts: PromptShown[];
 }
 
 export interface FlowProblem {
@@ -146,9 +173,41 @@ export interface FlowVersionShown extends FlowVersionRow {
 
 export interface FlowDetail {
   key: string;
-  in_force: FlowVersionShown;
+  /** Null for a flow made here that was never put in force. */
+  in_force: FlowVersionShown | null;
   draft: FlowVersionShown | null;
   versions: FlowVersionRow[];
+  builtin: boolean;
+  /** The sections that have this flow. */
+  used_by: { project: string; project_name: string; section: string; section_name: string }[];
+}
+
+/** A flow the supervisor proposed, before it is decided. */
+export interface ProposedFlow extends FlowChecked {
+  action_id: string;
+  outcome: string;
+  summary: string | null;
+  reason: string | null;
+  detail: string | null;
+  at: string | null;
+  exists: boolean;
+  in_force: number | null;
+  on_paper: Simulation;
+}
+
+/** What starts a section's flow without anyone asking. */
+export interface Trigger {
+  id: string;
+  section: string;
+  section_name: string;
+  kind: 'schedule' | 'push' | 'item';
+  spec: Record<string, unknown>;
+  says: string;
+  enabled: boolean;
+  next_due_at: string | null;
+  last_fired_at: string | null;
+  last_result: string | null;
+  fired: number;
 }
 
 export interface SimulatedStep {
@@ -426,6 +485,8 @@ export interface InboxEntry {
   diagnosis?: string | null;
   /** For something the supervisor proposed: what it is, why, and why it waits. */
   action_id?: string;
+  /** The tool the supervisor called: a proposed flow can be opened as a graph. */
+  tool?: string;
   summary?: string | null;
   reason?: string | null;
   /** Null for an entry that is about an account, not a project. */
@@ -656,7 +717,7 @@ export interface RunResult {
 /** Work done in sandboxes: trying an account, delivering an item, auditing, looking for enhancements. */
 export interface Run {
   id: string;
-  kind: 'account_check' | 'deliver_issue' | 'audit_code' | 'discover_enhancements' | 'evaluation';
+  kind: 'account_check' | 'deliver_issue' | 'audit_code' | 'discover_enhancements' | 'evaluation' | 'flow';
   state: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
   title: string;
   outcome: string | null;
@@ -671,6 +732,8 @@ export interface Run {
     branch?: string;
     /** The flow the run follows, at the version it started with. */
     flow?: { key: string; version: number; sha256: string };
+    /** Where the run stands among the tasks the platform does itself. */
+    at?: string | null;
     /** Set for a run of the evaluation lab: which evaluation, and of which run's work. */
     evaluation?: { id: string; of_run: string };
     issue?: { number: number | null; title: string; url: string | null };
@@ -860,7 +923,12 @@ export class ApiError extends Error {
 /** Sent on the window after every change the administrator made. */
 export const CHANGED = 'engineering-control:changed';
 
-export async function postJson<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+export async function postJson<T>(
+  path: string,
+  body: Record<string, unknown> = {},
+  // A question that changes nothing (a check, a simulation) is asked quietly.
+  { quiet = false }: { quiet?: boolean } = {},
+): Promise<T> {
   const controller = new AbortController();
   const session = await getJson<{ csrf_token: string }>(apiUrl('session'), controller.signal);
   const response = await fetch(apiUrl(path), {
@@ -879,7 +947,7 @@ export async function postJson<T>(path: string, body: Record<string, unknown> = 
     throw new ApiError(detail, response.status);
   }
   // Something changed: whatever counts things (the inbox in the navigation) counts again.
-  window.dispatchEvent(new Event(CHANGED));
+  if (!quiet) window.dispatchEvent(new Event(CHANGED));
   return payload as T;
 }
 

@@ -18,9 +18,7 @@ import {
   Input,
   Page,
   PasswordInput,
-  SimpleSelect,
   Skeleton,
-  Switch,
   Table,
   TableBody,
   TableCaption,
@@ -34,7 +32,7 @@ import {
   TabsTab,
   Textarea,
 } from '@gntik-ai/ui';
-import { ArrowLeft, Save, Trash2, Undo2, Workflow } from '@gntik-ai/icons';
+import { ArrowLeft, Download, Save, Trash2, Undo2, Workflow } from '@gntik-ai/icons';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ApiError,
@@ -42,137 +40,21 @@ import {
   postJson,
   useResource,
   type FlowCatalogue,
+  type FlowChecked,
   type FlowDetail,
   type FlowDocument,
-  type FlowNode,
   type FlowProblem,
   type FlowVersionShown,
   type PromptShown,
-  type TaskParam,
-  type TaskType,
 } from '../api';
 import { LoadError, TableFrame, When, mono } from '../parts';
 import { BASE, RouterLink, setQuery, useLocation } from '../router';
+import { Designer } from './FlowDesigner';
 import { EvaluationLab, TryOnPaper } from './FlowLab';
+import { Setting, WHERE, copy, same, settingName } from './FlowParts';
+import { FlowProposalPage } from './FlowProposal';
 import { versionName } from './Flows';
 import { useSubmit } from './ProjectDialogs';
-
-const PROVIDER_NAMES: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
-const WHERE: Record<TaskType['where'], string> = {
-  sandbox: 'In a sandbox',
-  platform: 'The platform itself',
-  control: 'Chooses the way',
-};
-
-/** What a setting is called on the page. */
-const SETTING_NAMES: Record<string, string> = {
-  providers: 'Subscriptions',
-  minutes: 'Minutes at most',
-  other_than: 'Judges the work of',
-  install: 'Install what the project needs',
-  baseline: 'Run the tests before any change',
-  rounds: 'Rounds',
-  condition: 'What decides',
-  over: 'The list it goes through',
-  max: 'Entries at most',
-  tokens: 'Tokens',
-};
-const settingName = (name: string) =>
-  SETTING_NAMES[name] ?? name.replace(/_/g, ' ').replace(/^./, (first) => first.toUpperCase());
-
-const same = (one: unknown, other: unknown) => JSON.stringify(one) === JSON.stringify(other);
-const copy = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-
-/** The order of subscriptions as one choice: which is tried first, or the only one. */
-const providerChoices = (providers: string[]) => [
-  ...providers.flatMap((first) => {
-    const rest = providers.filter((name) => name !== first);
-    return rest.length
-      ? [
-          {
-            value: [first, ...rest].join(','),
-            label: `${PROVIDER_NAMES[first] ?? first} first, then ${rest.map((name) => PROVIDER_NAMES[name] ?? name).join(', ')}`,
-          },
-        ]
-      : [];
-  }),
-  ...providers.map((only) => ({ value: only, label: `${PROVIDER_NAMES[only] ?? only} only` })),
-];
-
-function Setting({
-  param,
-  node,
-  document,
-  catalogue,
-  onChange,
-}: {
-  param: TaskParam;
-  node: FlowNode;
-  document: FlowDocument;
-  catalogue: FlowCatalogue;
-  onChange: (value: unknown) => void;
-}) {
-  const value = node.with[param.name] ?? param.default;
-  const label = settingName(param.name);
-  if (param.kind === 'bool') {
-    return (
-      <div className="grid gap-1">
-        <Switch label={label} checked={Boolean(value)} onCheckedChange={(checked) => onChange(checked)} />
-        <span className="text-[12px] text-muted-foreground">{param.doc}</span>
-      </div>
-    );
-  }
-  if (param.kind === 'int') {
-    return (
-      <Field className="max-w-xs">
-        <FieldLabel>{label}</FieldLabel>
-        <Input
-          type="number"
-          min={param.low ?? undefined}
-          max={param.high ?? undefined}
-          value={value === null || value === undefined ? '' : String(value)}
-          onValueChange={(text) => {
-            const number = Math.round(Number(text));
-            if (text.trim() && Number.isFinite(number)) onChange(number);
-          }}
-        />
-        <FieldDescription>
-          {param.doc}
-          {param.low !== null && param.high !== null ? ` Between ${param.low} and ${param.high}.` : ''}
-        </FieldDescription>
-      </Field>
-    );
-  }
-  let items: { value: string; label: string }[];
-  let chosen: string;
-  if (param.kind === 'providers') {
-    items = providerChoices(catalogue.providers);
-    chosen = Array.isArray(value) ? value.join(',') : String(value ?? '');
-  } else if (param.kind === 'task') {
-    // The tasks an agent works in, other than this one: whose work this task judges.
-    items = document.tasks
-      .filter((other) => other.id !== node.id && catalogue.tasks.find((task) => task.key === other.task)?.account)
-      .map((other) => ({ value: other.id, label: other.id }));
-    chosen = String(value ?? '');
-  } else {
-    items = param.choices.map((choice) => ({ value: choice, label: choice.replace(/_/g, ' ') }));
-    chosen = String(value ?? '');
-  }
-  return (
-    <Field className="max-w-sm">
-      <FieldLabel>{label}</FieldLabel>
-      <SimpleSelect
-        items={items}
-        value={chosen || null}
-        onValueChange={(next) => {
-          if (!next) return;
-          onChange(param.kind === 'providers' ? next.split(',') : next);
-        }}
-      />
-      <FieldDescription>{param.doc}</FieldDescription>
-    </Field>
-  );
-}
 
 function Tasks({
   document,
@@ -502,7 +384,7 @@ function Versions({ detail, onOpen }: { detail: FlowDetail; onOpen: (version: nu
                   <Badge tone="info" size="sm">
                     Draft
                   </Badge>
-                ) : version.version === detail.in_force.version ? (
+                ) : version.version === detail.in_force?.version ? (
                   <Badge tone="success" size="sm">
                     In force
                   </Badge>
@@ -599,27 +481,52 @@ function Editor({
   detail,
   catalogue,
   reload,
+  reloadCatalogue,
 }: {
   flowKey: string;
   detail: FlowDetail;
   catalogue: FlowCatalogue;
   reload: () => void;
+  reloadCatalogue: () => void;
 }) {
-  // What is saved: the draft when there is one, else the version in force.
-  const saved = detail.draft ?? detail.in_force;
+  // What is saved: the draft when there is one, else the version in force. A flow has
+  // one of the two: one that was never put in force is its draft.
+  const saved = (detail.draft ?? detail.in_force)!;
   const [document, setDocument] = useState<FlowDocument>(() => copy(saved.document));
   const [openedFrom, setOpenedFrom] = useState<number | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const { query } = useLocation();
-  const tab = query.get('tab') ?? 'tasks';
+  const tab = query.get('tab') ?? 'design';
   // The editor starts again from what is saved whenever that changes.
   useEffect(() => {
     setDocument(copy(saved.document));
     setOpenedFrom(null);
   }, [saved.sha256]);
   const dirty = !same(document, saved.document);
-  const errors = saved.problems.filter((entry) => entry.level === 'error');
+  // What is in the editor is checked against the rules a moment after it changes.
+  const [checked, setChecked] = useState<FlowProblem[] | null>(null);
+  useEffect(() => {
+    setChecked(null);
+    if (!dirty) return;
+    let stale = false;
+    const timer = window.setTimeout(() => {
+      postJson<FlowChecked>('flows/check', { document }, { quiet: true })
+        .then((answer) => (stale ? undefined : setChecked(answer.problems)))
+        .catch((error: unknown) => {
+          if (stale || (error instanceof DOMException && error.name === 'AbortError')) return;
+          const text = error instanceof Error ? error.message : 'The flow could not be checked.';
+          setChecked([{ level: 'error', rule: 'shape', where: null, text }]);
+        });
+    }, 600);
+    return () => {
+      stale = true;
+      window.clearTimeout(timer);
+    };
+  }, [document, dirty]);
+  const problems = dirty ? (checked ?? []) : saved.problems;
+  const errors = problems.filter((entry) => entry.level === 'error');
+  const savedErrors = saved.problems.filter((entry) => entry.level === 'error');
   const save = useSubmit(
     () => postJson<FlowVersionShown>(`flows/${flowKey}/draft`, { document }),
     () => reload(),
@@ -635,13 +542,14 @@ function Editor({
         if (!response.ok) throw new ApiError(`The version could not be read (${response.status}).`, response.status);
         setDocument(copy(((await response.json()) as FlowVersionShown).document));
         setOpenedFrom(version);
-        setQuery({ tab: 'tasks' });
+        setQuery({ tab: 'design' });
       })
       .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The version could not be read.'));
   };
   const failed = save.problem ?? discard.problem ?? problem;
   return (
     <Page
+      width="full"
       title={saved.document.name}
       description={saved.document.summary}
       actions={
@@ -660,10 +568,20 @@ function Editor({
               >
                 Discard the draft
               </Button>
-              <Button size="sm" disabled={errors.length > 0} onClick={() => setPublishing(true)}>
+              <Button size="sm" disabled={savedErrors.length > 0} onClick={() => setPublishing(true)}>
                 Put it in force
               </Button>
             </>
+          ) : null}
+          {!dirty ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={Download}
+              render={<a href={apiUrl(`flows/${flowKey}/versions/${saved.version}/export`)} download />}
+            >
+              Take it out as a file
+            </Button>
           ) : null}
         </div>
       }
@@ -695,22 +613,26 @@ function Editor({
       <div className="grid gap-4">
         {failed ? <Alert tone="destructive" title={failed} /> : null}
         <p className="text-[13px] text-muted-foreground">
-          In force: {versionName(detail.in_force.version).toLowerCase()}
-          {detail.in_force.note && detail.in_force.version ? ` (${detail.in_force.note})` : ''}.{' '}
+          {detail.in_force
+            ? `In force: ${versionName(detail.in_force.version).toLowerCase()}${
+                detail.in_force.note && detail.in_force.version ? ` (${detail.in_force.note})` : ''
+              }. `
+            : 'This flow was never put in force: nothing runs by it, and no section can have it yet. '}
           {detail.draft
             ? `Version ${detail.draft.version} is a draft: nothing runs by it until you put it in force.`
             : 'Change something and save it: that makes a draft, which nothing runs by until you put it in force.'}
+          {detail.used_by.length
+            ? ` It is the flow of ${detail.used_by.map((use) => `${use.section_name} of ${use.project_name}`).join(', ')}.`
+            : ''}
         </p>
-        {dirty ? (
-          <Alert
-            tone="info"
-            title="Not checked yet"
-            description="The rules every flow has to keep are checked when the draft is saved. You can also go through the changed flow on paper before saving it."
-          />
+        {dirty && checked === null ? (
+          <p className="text-[13px] text-muted-foreground">Checking it against the rules…</p>
         ) : errors.length ? (
           <Alert
             tone="destructive"
-            title={`The draft breaks ${errors.length === 1 ? 'a rule' : `${errors.length} rules`} and cannot be put in force`}
+            title={`${dirty ? 'What is in the editor' : 'The draft'} breaks ${
+              errors.length === 1 ? 'a rule' : `${errors.length} rules`
+            } and cannot be put in force`}
             description={
               <ul className="list-disc space-y-0.5 pl-5">
                 {errors.map((entry, index) => (
@@ -719,6 +641,12 @@ function Editor({
               </ul>
             }
           />
+        ) : dirty ? (
+          <Alert
+            tone="success"
+            title="What is in the editor keeps every rule"
+            description="Save it as the draft to try it on past work or to put it in force. It can be gone through on paper as it is."
+          />
         ) : detail.draft ? (
           <Alert
             tone="success"
@@ -726,13 +654,14 @@ function Editor({
             description="Try it on paper, or on past work in the evaluation lab, before you put it in force."
           />
         ) : null}
-        {!dirty
-          ? saved.problems
-              .filter((entry) => entry.level === 'warning')
-              .map((entry, index) => <Alert key={index} tone="warning" title={entry.text} />)
-          : null}
+        {problems
+          .filter((entry) => entry.level === 'warning')
+          .map((entry, index) => (
+            <Alert key={index} tone="warning" title={entry.text} />
+          ))}
         <Tabs value={tab} onValueChange={(value) => setQuery({ tab: String(value) })}>
           <TabsList aria-label="Flow">
+            <TabsTab value="design">Design</TabsTab>
             <TabsTab value="tasks" count={document.tasks.length}>
               Tasks
             </TabsTab>
@@ -745,13 +674,20 @@ function Editor({
             </TabsTab>
             <TabsTab value="document">Document</TabsTab>
           </TabsList>
+          <TabsPanel value="design" className="pt-4">
+            {tab === 'design' ? (
+              <Designer
+                document={document}
+                catalogue={catalogue}
+                problems={problems}
+                change={setDocument}
+                onPrompt={() => setQuery({ tab: 'prompts' })}
+                onCatalogueChanged={reloadCatalogue}
+              />
+            ) : null}
+          </TabsPanel>
           <TabsPanel value="tasks" className="pt-4">
-            <Tasks
-              document={document}
-              catalogue={catalogue}
-              problems={dirty ? [] : saved.problems}
-              change={setDocument}
-            />
+            <Tasks document={document} catalogue={catalogue} problems={problems} change={setDocument} />
           </TabsPanel>
           <TabsPanel value="prompts" className="pt-4">
             <Prompts document={document} catalogue={catalogue} change={setDocument} />
@@ -790,7 +726,15 @@ function FlowDetailPage({ flowKey }: { flowKey: string }) {
   const detail = useResource<FlowDetail>(apiUrl(`flows/${flowKey}`));
   const catalogue = useResource<FlowCatalogue>(apiUrl('flows/catalogue'));
   if (detail.data && catalogue.data) {
-    return <Editor flowKey={flowKey} detail={detail.data} catalogue={catalogue.data} reload={detail.reload} />;
+    return (
+      <Editor
+        flowKey={flowKey}
+        detail={detail.data}
+        catalogue={catalogue.data}
+        reload={detail.reload}
+        reloadCatalogue={catalogue.reload}
+      />
+    );
   }
   return (
     <Page title="Flow">
@@ -804,7 +748,11 @@ function FlowDetailPage({ flowKey }: { flowKey: string }) {
 }
 
 export function FlowPage() {
-  const key = useLocation().query.get('key') ?? '';
+  const { query } = useLocation();
+  const proposal = query.get('proposal') ?? '';
+  const key = query.get('key') ?? '';
+  // A flow the supervisor proposed is looked at before there is a flow to edit.
+  if (/^[0-9a-f-]{36}$/.test(proposal)) return <FlowProposalPage key={proposal} actionId={proposal} />;
   if (!/^[a-z][a-z0-9-]{1,62}[a-z0-9]$/.test(key)) {
     return (
       <Page title="Flow">

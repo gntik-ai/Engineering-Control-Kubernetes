@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,11 +21,12 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     ProjectNotFound,
 )
-from engineering_control.db.models import FlowVersion
+from engineering_control.db.models import FlowVersion, SavedTask
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS, budget
 from engineering_control.engine.document import Document, FlowInvalid, parse
+from engineering_control.engine.library import document_in_force, section_action, traits
 from engineering_control.engine.prompts import CONTRACTS
 
 
@@ -81,6 +83,97 @@ class FlowRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
 
+    # --- tasks kept under a name ----------------------------------------------------------
+
+    def saved_tasks(self) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(select(SavedTask).order_by(SavedTask.name)).all()
+            return [
+                {
+                    "id": str(row.id),
+                    "name": row.name,
+                    "task": row.task,
+                    "with": dict(row.params or {}),
+                    "wording": dict(row.wording or {}),
+                }
+                for row in rows
+                if row.task in TASKS
+            ]
+
+    def save_task(self, *, name: str, task: str, params: Any, wording: Any) -> dict[str, Any]:
+        """Keep a task as it is set, under a name. The same name again replaces it."""
+        label = " ".join(name.split())[:80]
+        if not label:
+            raise ProjectInvalid("Give the saved task a name")
+        kind = TASKS.get(task)
+        if kind is None or kind.where == "control":
+            raise ProjectInvalid("Only a task that does something can be saved")
+        known = {param.name for param in kind.params}
+        settings = {
+            str(key): value
+            for key, value in (params if isinstance(params, dict) else {}).items()
+            # Whose work a task judges belongs to the flow it is in, not to the task.
+            if key in known and key != "other_than"
+        }
+        words: dict[str, str] = {}
+        if kind.prompt and isinstance(wording, dict):
+            contract = CONTRACTS[kind.prompt]
+            wrong = contract.problems({str(k): str(v) for k, v in wording.items()})
+            if wrong:
+                raise ProjectInvalid(wrong[0])
+            words = {str(k): str(v) for k, v in wording.items() if str(v).strip()}
+        with self.sessions.begin() as session:
+            row = session.scalar(select(SavedTask).where(SavedTask.name == label))
+            if row is None:
+                if (session.scalar(select(func.count()).select_from(SavedTask)) or 0) >= 60:
+                    raise ProjectConflict("There are 60 saved tasks already: remove one first")
+                row = SavedTask(name=label, task=task, params={}, wording=None)
+                session.add(row)
+            row.task, row.params, row.wording = task, settings, words or None
+            session.flush()
+            return {"id": str(row.id), "name": row.name, "task": row.task, "saved": row.name}
+
+    def remove_task(self, saved_id: UUID) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            row = session.get(SavedTask, saved_id)
+            if row is None:
+                raise ProjectNotFound(str(saved_id))
+            gone = {"id": str(row.id), "name": row.name, "saved": row.name}
+            session.delete(row)
+            return gone
+
+    def exists(self, key: str) -> bool:
+        if key in BUILTIN:
+            return True
+        with self.sessions() as session:
+            return (
+                session.scalar(select(FlowVersion.id).where(FlowVersion.flow_key == key))
+                is not None
+            )
+
+    def create(self, raw: Any, *, note: str | None = None) -> dict[str, Any]:
+        """A new flow of the library, as the draft of a key nothing has yet."""
+        try:
+            document = parse(raw)
+        except FlowInvalid as error:
+            raise ProjectInvalid(str(error)) from error
+        if self.exists(document.key):
+            raise ProjectConflict(f"There is a flow {document.key} already")
+        found = validate.problems(document)
+        with self.sessions.begin() as session:
+            row = FlowVersion(
+                flow_key=document.key,
+                version=1,
+                state="draft",
+                document=document.as_dict(),
+                sha256=document.sha256(),
+                problems=found,
+                note=" ".join((note or "").split())[:300] or None,
+            )
+            session.add(row)
+            session.flush()
+            return {**_row(row), "problems": found}
+
     def keys(self) -> list[str]:
         """Every flow the platform can run: its own, and the ones made here."""
         with self.sessions() as session:
@@ -110,7 +203,9 @@ class FlowRecords:
         listed = []
         for key in self.keys():
             version = self.version_in_force(key)
-            document = self.document(key, version)
+            draft = self.draft(key)
+            # A flow that was never put in force is what its draft says.
+            document = self.document(key, version if version is not None else draft or 0)
             if document is None:
                 continue
             tasks = [TASKS[node.task] for node in document.nodes if node.task in TASKS]
@@ -120,8 +215,10 @@ class FlowRecords:
                     "name": document.name,
                     "summary": document.summary,
                     "version": version,
-                    "draft": self.draft(key),
+                    "draft": draft,
                     "builtin": key in BUILTIN,
+                    "section_action": section_action(document),
+                    "publishes": traits(document)["publishes"],
                     "tasks": len(document.nodes),
                     "agents": sum(1 for task in tasks if task.account),
                     "prompts_changed": sorted(
@@ -147,12 +244,15 @@ class FlowRecords:
         row = next((row for row in self.versions(key) if row["version"] == version), None)
         return {**(row or {"version": version}), **described(document)}
 
-    def version_in_force(self, key: str) -> int:
+    def version_in_force(self, key: str) -> int | None:
+        """The version runs follow, or None for a flow that was never put in force."""
         with self.sessions() as session:
             found = in_force(session, key)
-            if found is None:
+        if found is None:
+            if not self.exists(key):
                 raise ProjectNotFound(key)
-            return found[0]
+            return None
+        return found[0]
 
     def versions(self, key: str) -> list[dict[str, Any]]:
         """The versions of a flow, newest first, ending with the platform's own."""
@@ -198,9 +298,9 @@ class FlowRecords:
         if document.key != key:
             raise ProjectInvalid(f"The document is the flow {document.key}, not {key}")
         found = validate.problems(document)
+        if not self.exists(key):
+            raise ProjectNotFound(key)
         with self.sessions.begin() as session:
-            if in_force(session, key) is None:
-                raise ProjectNotFound(key)
             row = session.scalar(
                 select(FlowVersion)
                 .where(FlowVersion.flow_key == key, FlowVersion.state == "draft")
@@ -217,6 +317,8 @@ class FlowRecords:
             row.document = document.as_dict()
             row.sha256 = document.sha256()
             row.problems = found
+            # Saving is what updates the row, also when only the drawing changed.
+            row.updated_at = datetime.now(UTC)
             if note is not None:
                 row.note = " ".join(note.split())[:300] or None
             session.flush()
@@ -256,8 +358,9 @@ class FlowRecords:
                     f"The draft cannot be published: {wrong[0]['text']}"
                     + (f" (and {len(wrong) - 1} more)" if len(wrong) > 1 else "")
                 )
-            current = in_force(session, key)
-            if current is not None and current[1] == document.sha256():
+            current = document_in_force(session, key)
+            if current is not None and current[0].as_dict() == document.as_dict():
+                # A draft that only draws the flow another way is still a version.
                 raise ProjectConflict("The draft says the same as the version in force")
             row.state = "published"
             row.published_at = datetime.now(UTC)

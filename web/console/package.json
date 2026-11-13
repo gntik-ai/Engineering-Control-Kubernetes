@@ -12,9 +12,11 @@
   "dependencies": {
     "@fontsource/geist": "^5.2.8",
     "@fontsource/geist-mono": "^5.2.7",
+    "@gntik-ai/flow": "0.12.0",
     "@gntik-ai/icons": "0.5.0",
     "@gntik-ai/tokens": "0.4.0",
     "@gntik-ai/ui": "0.13.0",
+    "@xyflow/react": "12.12.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

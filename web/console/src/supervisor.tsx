@@ -25,7 +25,7 @@ import {
   type SupervisorConversation,
   type SupervisorMessage,
 } from './api';
-import { BASE } from './router';
+import { BASE, RouterLink } from './router';
 
 /** Bold and code inside one line of the supervisor's reply. Nothing else is interpreted. */
 function inline(text: string): ReactNode[] {
@@ -189,6 +189,15 @@ export function Proposal({ entry, onDecided }: { entry: InboxEntry; onDecided: (
         >
           Reject
         </Button>
+        {entry.tool === 'propose_flow' ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            render={<RouterLink href={`${BASE}/flow?proposal=${entry.action_id}`} />}
+          >
+            Open it as a graph
+          </Button>
+        ) : null}
       </div>
     </div>
   );

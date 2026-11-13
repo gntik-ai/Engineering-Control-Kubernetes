@@ -41,6 +41,7 @@ import {
   postJson,
   useResource,
   type Flow,
+  type FlowListed,
   type Listing,
   type ProjectDetail,
   type Run,
@@ -49,6 +50,7 @@ import {
 import { LoadError, RefreshButton } from '../parts';
 import { BASE, RouterLink, navigate, useLocation } from '../router';
 import { BringOverDialog } from './BringOverDialog';
+import { TriggersCard } from './Triggers';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 const NO_FLOW = '__none__';
@@ -453,7 +455,9 @@ function SupervisorBrief({ project }: { project: string }) {
 
 function Detail({ name }: { name: string }) {
   const detail = useResource<ProjectDetail>(apiUrl(`projects/${name}`));
-  const flows = useResource<Listing<Flow>>(apiUrl('flows'));
+  const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
+  // A flow made here that was never put in force cannot be given to a section.
+  const assignable = (flows.data?.items ?? []).filter((flow) => !flow.engine || flow.engine.version !== null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Section | null>(null);
   const [removing, setRemoving] = useState<Section | null>(null);
@@ -561,7 +565,7 @@ function Detail({ name }: { name: string }) {
                   key={section.key}
                   project={name}
                   section={section}
-                  flows={flows.data?.items ?? []}
+                  flows={assignable}
                   onChanged={detail.reload}
                   onEdit={() => setEditing(section)}
                   onRemove={() => setRemoving(section)}
@@ -569,6 +573,7 @@ function Detail({ name }: { name: string }) {
               ))
             : !detail.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-40 w-full" />)}
         </div>
+        {sections ? <TriggersCard project={name} sections={sections} /> : null}
       </div>
       <SectionDialog
         project={name}

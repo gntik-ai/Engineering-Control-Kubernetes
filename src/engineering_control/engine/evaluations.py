@@ -30,7 +30,7 @@ from engineering_control.db.models import (
     SandboxStep,
 )
 from engineering_control.engine import validate
-from engineering_control.engine.builtin import KIND_OF
+from engineering_control.engine.builtin import FLOW_OF_KIND, kind_of
 from engineering_control.engine.document import FlowInvalid, parse
 from engineering_control.engine.records import FlowRecords, in_force
 from engineering_control.sandbox.runs import FINISHED, Runs, usage_of
@@ -45,6 +45,13 @@ def _when(value: datetime | None) -> str | None:
     if value is None:
         return None
     return (value if value.tzinfo else value.replace(tzinfo=UTC)).isoformat()
+
+
+def _follows(run: SandboxRun, key: str) -> bool:
+    """Whether the run is one of that flow. A run of the platform's own flows from before
+    runs said which flow they follow is known by its kind."""
+    said = ((run.data or {}).get("flow") or {}).get("key")
+    return said == key if said else FLOW_OF_KIND.get(run.kind) == key
 
 
 def measure(
@@ -100,9 +107,9 @@ class Evaluations:
     ) -> list[dict[str, Any]]:
         """The runs of the flow that can be gone through again, newest first: the ones
         that got as far as checking the repository out."""
-        kind = KIND_OF.get(key)
-        if kind is None:
+        if not self.flows.exists(key):
             raise ProjectNotFound(key)
+        kind = kind_of(key)
         with self.sessions() as session:
             query = (
                 select(SandboxRun)
@@ -116,7 +123,9 @@ class Evaluations:
             runs = [
                 run
                 for run in session.scalars(query.limit(300))
-                if (run.data or {}).get("base_sha") and run.project_id is not None
+                if (run.data or {}).get("base_sha")
+                and run.project_id is not None
+                and _follows(run, key)
             ][: max(1, min(limit, 100))]
             used = usage_of(session, [run.id for run in runs])
             return [
@@ -143,9 +152,9 @@ class Evaluations:
         self, key: str, *, version: int, run_ids: list[UUID], note: str | None = None
     ) -> dict[str, Any]:
         """Try that version of the flow on those runs' work."""
-        kind = KIND_OF.get(key)
-        if kind is None:
+        if not self.flows.exists(key):
             raise ProjectNotFound(key)
+        kind = kind_of(key)
         document = self.flows.document(key, version)
         if document is None:
             raise ProjectNotFound(f"{key} version {version}")
@@ -171,7 +180,7 @@ class Evaluations:
             past: list[SandboxRun] = []
             for run_id in chosen:
                 run = session.get(SandboxRun, run_id)
-                if run is None or run.kind != kind:
+                if run is None or run.kind != kind or not _follows(run, key):
                     raise ProjectInvalid("One of those runs is not a run of this flow")
                 if run.state not in REPLAYABLE or not (run.data or {}).get("base_sha"):
                     raise ProjectInvalid(f"The run {run.title} cannot be gone through again")

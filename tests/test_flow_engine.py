@@ -18,7 +18,7 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.db.models import ProjectRecord, ProjectSection
 from engineering_control.engine import validate
-from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND, KIND_OF
+from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND, KIND_OF, kind_of
 from engineering_control.engine.catalogue import TASKS, budget, catalogue
 from engineering_control.engine.document import FORMAT, FlowInvalid, parse
 from engineering_control.engine.prompts import CONTRACTS
@@ -56,13 +56,13 @@ def _task(raw: dict[str, Any], node_id: str) -> dict[str, Any]:
 
 
 def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
-    assert set(BUILTIN) == {"deliver-issue", "audit-code", "discover-enhancements"}
+    assert set(BUILTIN) == {"deliver-issue", "audit-code", "discover-enhancements", "code-clean"}
     for key, document in BUILTIN.items():
         assert validate.problems(document) == [], key
         # A document read back from its own normal form says the same thing.
         again = parse(json.loads(json.dumps(document.as_dict())))
         assert again.sha256() == document.sha256()
-        assert KIND_OF[key] and FLOW_OF_KIND[KIND_OF[key]] == key
+        assert kind_of(key) == "flow" or FLOW_OF_KIND[KIND_OF[key]] == key
     deliver = BUILTIN["deliver-issue"]
     assert [node.id for node in deliver.nodes] == [
         "prepare",
@@ -250,7 +250,7 @@ def test_a_prompt_is_fixed_parts_and_editable_parts_in_order() -> None:
 
 def test_a_changed_flow_is_a_draft_until_it_is_published(world: Any) -> None:  # noqa: F811
     flows = FlowRecords(world.sessions)
-    assert flows.keys() == ["deliver-issue", "audit-code", "discover-enhancements"]
+    assert flows.keys() == ["deliver-issue", "audit-code", "discover-enhancements", "code-clean"]
     assert flows.version_in_force("deliver-issue") == 0 and flows.draft("deliver-issue") is None
     assert [v["version"] for v in flows.versions("deliver-issue")] == [0]
     with pytest.raises(ProjectNotFound):

@@ -33,9 +33,16 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
-from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
+from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND, kind_of
+from engineering_control.engine.library import (
+    document_in_force,
+    plan_for_item,
+    section_action,
+    section_word,
+    traits,
+)
 from engineering_control.engine.records import in_force
-from engineering_control.flow_library import AUDIT, EVALUATION, FLOWS, WORK_KINDS, run_for_item
+from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -234,8 +241,8 @@ class Runs:
                 raise ProjectInvalid("The item is not open any more")
             if section is None:
                 raise ProjectInvalid("Route the item to a section first")
-            kind = run_for_item(section.flow_key, finding=is_finding(item))
-            if kind is None:
+            plan = plan_for_item(session, section.flow_key, produced=is_produced(item))
+            if plan is None:
                 raise ProjectInvalid(
                     f"The section {section.name} has no flow that can run here. Assign "
                     "Deliver issue to it on the project's page."
@@ -253,12 +260,20 @@ class Runs:
             )
             if busy:
                 raise ProjectConflict("A run for this item is already under way")
+            flow, mode = plan
+            found_flow = document_in_force(session, flow)
+            if found_flow is None:  # ``plan_for_item`` names only flows that are in force
+                raise ProjectInvalid(f"The flow {flow} is not in force")
+            document, flow_version = found_flow
+            kind = kind_of(flow)
             numbered = item.issue_number is not None
             title = f"#{item.issue_number} {item.title}" if numbered else item.title
+            if mode == "scope":
+                title = f"{section_word(document)}: {title}"
             run = SandboxRun(
                 kind=kind,
                 state="queued",
-                title=(f"Audit: {title}" if kind == AUDIT else title)[:300],
+                title=title[:300],
                 project_id=project.id,
                 item_id=item.id,
                 cancel_requested=False,
@@ -266,19 +281,17 @@ class Runs:
             )
             session.add(run)
             session.flush()
-            flow = FLOW_OF_KIND[kind]
-            version = in_force(session, flow) or (0, "")
-            start = first_task(session, flow, version[0])
+            start = document.start
             common = {
                 # The flow the run follows, at the version in force now: it keeps it.
-                "flow": {"key": flow, "version": version[0], "sha256": version[1]},
+                "flow": {"key": flow, "version": flow_version, "sha256": document.sha256()},
                 "project": project.name,
                 "project_name": project.display_name,
                 "repository": repository,
                 "base_branch": project.default_branch or "main",
                 "toolchain": toolchain,
             }
-            if kind == AUDIT:
+            if mode == "scope":
                 run.data = {
                     **common,
                     "section": section.key,
@@ -338,11 +351,13 @@ class Runs:
             )
             if found is None:
                 raise ProjectNotFound(section)
-            flow = FLOWS.get(found.flow_key) if found.flow_key else None
-            if flow is None or flow.for_section is None:
+            in_force_now = document_in_force(session, found.flow_key) if found.flow_key else None
+            if in_force_now is None or section_action(in_force_now[0]) is None:
                 raise ProjectInvalid(
                     f"The section {found.name} has no flow that produces items by itself"
                 )
+            document, flow_version = in_force_now
+            kind = kind_of(document.key)
             if not record.source_repository:
                 raise ProjectInvalid("Connect a repository to the project first")
             busy = session.scalar(
@@ -350,24 +365,48 @@ class Runs:
                 .select_from(SandboxRun)
                 .where(
                     SandboxRun.project_id == record.id,
-                    SandboxRun.kind == flow.for_section,
+                    SandboxRun.kind == kind,
                     SandboxRun.item_id.is_(None),
                     SandboxRun.state.in_(ACTIVE),
                 )
             )
+            if kind == FLOW:
+                # Every flow made here is the same kind of run: which one, the run says.
+                busy = sum(
+                    1
+                    for data in session.scalars(
+                        select(SandboxRun.data).where(
+                            SandboxRun.project_id == record.id,
+                            SandboxRun.kind == kind,
+                            SandboxRun.item_id.is_(None),
+                            SandboxRun.state.in_(ACTIVE),
+                        )
+                    )
+                    if ((data or {}).get("flow") or {}).get("key") == document.key
+                )
             if busy:
-                raise ProjectConflict(f"{flow.name} is already under way for this project")
+                raise ProjectConflict(f"{document.name} is already under way for this project")
             narrowed = " ".join(scope.split())[:2000]
-            what = "Audit" if flow.for_section == AUDIT else "Enhancements"
+            what = section_word(document)
             where = narrowed[:200] if narrowed else "the whole repository"
+            if traits(document)["browses"]:
+                if not record.application_url:
+                    raise ProjectInvalid(
+                        "Say where the project's application runs first, on the project's page"
+                    )
+                where = narrowed[:200] if narrowed else "the whole application"
             run = SandboxRun(
-                kind=flow.for_section,
+                kind=kind,
                 state="queued",
                 title=f"{what}: {where}"[:300],
                 project_id=record.id,
                 cancel_requested=False,
                 data={
-                    "flow": (now := _flow_now(session, FLOW_OF_KIND[flow.for_section])),
+                    "flow": {
+                        "key": document.key,
+                        "version": flow_version,
+                        "sha256": document.sha256(),
+                    },
                     "project": record.name,
                     "project_name": record.display_name,
                     "repository": record.source_repository,
@@ -383,7 +422,7 @@ class Runs:
                 SandboxStep(
                     run_id=run.id,
                     position=1,
-                    name=first_task(session, now["key"], now["version"]),
+                    name=document.start,
                     state="pending",
                     attempt=0,
                 )
@@ -501,6 +540,33 @@ class Runs:
                 "usage": usage_of(session, [run.id]).get(run.id),
                 "steps": [_step_row(step, with_log=True) for step in steps],
             }
+
+    def flow_of(self, run_id: UUID) -> dict[str, Any]:
+        """The flow the run follows, as the document of the version it started with: what
+        its page draws the run on."""
+        with self.sessions() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is None:
+                raise ProjectNotFound(str(run_id))
+            data = run.data or {}
+            said = data.get("flow") or {}
+            key = str(said.get("key") or FLOW_OF_KIND.get(run.kind) or "")
+            version = int(said.get("version") or 0)
+            carried = data.get("flow_document")
+            if isinstance(carried, dict):
+                # A run of the evaluation lab carries the flow it tries.
+                return {"key": key, "version": version, "document": carried}
+            if version:
+                row = session.scalar(
+                    select(FlowVersion.document).where(
+                        FlowVersion.flow_key == key, FlowVersion.version == version
+                    )
+                )
+                if isinstance(row, dict):
+                    return {"key": key, "version": version, "document": row}
+            if key in BUILTIN:
+                return {"key": key, "version": 0, "document": BUILTIN[key].as_dict()}
+            raise ProjectNotFound(str(run_id))
 
     def request_cancel(self, run_id: UUID) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -1069,6 +1135,12 @@ def _flow_now(session: Session, key: str) -> dict[str, Any]:
 def is_finding(item: BacklogItem) -> bool:
     """Whether the item is something an audit found, as opposed to a request."""
     return (item.facts or {}).get("kind") == "finding"
+
+
+def is_produced(item: BacklogItem) -> bool:
+    """Whether a run produced the item (a finding, a proposal), as opposed to someone
+    asking for something."""
+    return item.source_run_id is not None or bool((item.facts or {}).get("kind"))
 
 
 def _spent_accounts(session: Session, now: datetime) -> set[UUID]:

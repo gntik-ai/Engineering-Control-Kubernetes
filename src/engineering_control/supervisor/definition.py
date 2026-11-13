@@ -434,6 +434,78 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         # Recording a diagnosis changes nothing but the incident: there is nothing to confirm.
         modes=("automatic",),
     ),
+    Tool(
+        "list_tasks",
+        "read",
+        "List the tasks flows are built from",
+        "The tasks a flow can consist of: what each does, where it runs, whether an agent "
+        "works in it, its outcomes, its settings, what it needs from the tasks before it "
+        "and what it leaves for the ones after. Also the prompts with the parts a flow "
+        "may word, the budgets, and the rules every flow has to keep. Read it before you "
+        "draft a flow: a flow can only use tasks from this list.",
+        _schema({}),
+    ),
+    Tool(
+        "list_flows",
+        "read",
+        "List the flows",
+        "The flows of the library: key, name, what each is for, the version in force and "
+        "whether a draft is being worked on.",
+        _schema({}),
+    ),
+    Tool(
+        "get_flow",
+        "read",
+        "Read a flow",
+        "One flow as its document: the tasks, where each outcome leads, the wording of "
+        "its prompts and its budgets, with what validation says about it. Without a "
+        "version, the one in force. Read a flow close to what is asked for before you "
+        "draft one: it is the best model of the format.",
+        _schema(
+            {
+                "flow": {"type": "string", "description": "The flow's key."},
+                "version": {"type": "integer", "minimum": 0},
+            },
+            ("flow",),
+        ),
+    ),
+    Tool(
+        "check_flow",
+        "read",
+        "Check a draft of a flow",
+        "Check a flow you drafted without proposing it: which rules it breaks and where, "
+        "and how a run would go through it on paper (the tasks in order, who would be "
+        "given each, how it ends). Use it until the draft keeps every rule.",
+        _schema(
+            {"document": {"type": "object", "description": "The flow's document."}}, ("document",)
+        ),
+    ),
+    Tool(
+        "propose_flow",
+        "plan",
+        "Propose a flow",
+        "Propose a new flow, or a changed version of one that exists, as its document. "
+        "The document has: format (as list_tasks gives it), key (lower-case letters, "
+        "digits, hyphens), name, summary, start (the id of the first task), tasks (each "
+        "with an id of its own, the task's key, its settings under 'with', and under "
+        "'next' the id of the task each outcome leads to; an outcome that leads nowhere "
+        "ends the flow), prompts (by prompt name, the parts you word), budgets, and for a "
+        "flow that produces items an 'action' (what starting it is called). A draft that "
+        "breaks a rule is refused: check it with check_flow first. The proposal goes to "
+        "the administrator, who accepts or rejects it; nothing you draft takes effect "
+        "before that. Proposing the same flow again replaces your earlier proposal, so "
+        "do that when they ask for a change. You cannot use a task that is not in "
+        "list_tasks: say so instead.",
+        _schema(
+            {
+                "document": {"type": "object", "description": "The flow's document."},
+                "reason": _REASON,
+            },
+            ("document", "reason"),
+        ),
+        default_mode="confirm",
+        modes=("confirm",),
+    ),
 )
 TOOLS: Final = {tool.name: tool for tool in CATALOGUE}
 
@@ -460,6 +532,8 @@ What you decide and what you do not
 the order to work in as a queue.
 - You start work, or a queue, only when the administrator asked for it. You may pause a \
 queue yourself when its items keep failing; say why.
+- You design flows when asked: you draft one from the tasks that exist, check it, and \
+propose it. A flow takes effect only when the administrator accepts it.
 - The administrator decides what is published. You never approve, merge, deploy or publish \
 anything, and you never touch accounts or credentials.
 """
@@ -587,6 +661,32 @@ DEFAULT_SKILLS: Final[tuple[dict[str, Any], ...]] = (
             "or approved, what was dropped and why, what was not looked at.\n"
             "3. A finding or an approved enhancement is an item like any other: it is "
             "delivered when the administrator starts it or puts it in a queue."
+        ),
+        "enabled": True,
+    },
+    {
+        "key": "design-a-flow",
+        "name": "Design a flow",
+        "description": "Drafting a new flow, or a change to one, when the administrator asks.",
+        "body": (
+            "A flow is what a section runs: tasks in an order, each ending with an outcome "
+            "that says which task comes next.\n"
+            "1. Read the task list (list_tasks) and the flow closest to what is asked "
+            "(list_flows, get_flow). A flow is built only from tasks that exist. If what "
+            "is asked needs a task that does not exist, say which and stop there; offer "
+            "to propose a backlog item to have it built.\n"
+            "2. Draft the document. Start from the closest flow rather than from nothing. "
+            "Word the prompts' own parts for the new purpose; leave out the parts you do "
+            "not change.\n"
+            "3. Check it (check_flow) and correct it until it breaks no rule. The rules "
+            "are not yours to work around: a change is reviewed by the other "
+            "subscription, tested, collected and decided by the administrator before "
+            "anything is published.\n"
+            "4. Propose it (propose_flow) and tell the administrator, in order, what its "
+            "tasks do, what you worded, and how a run would go on paper. It waits for "
+            "them in the inbox, where they can open it as a graph.\n"
+            "5. When they ask for a change, change the document and propose it again: "
+            "that replaces the earlier proposal."
         ),
         "enabled": True,
     },

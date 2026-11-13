@@ -55,6 +55,7 @@ from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import Runs
+from engineering_control.sandbox.triggers import Triggers
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
@@ -142,6 +143,7 @@ class DashboardRepository:
         self.evaluations = Evaluations(self.sessions, self.runs)
         self.budgets = Budgets(self.sessions)
         self.queues = Queues(self.sessions, self.runs, self.budgets)
+        self.triggers = Triggers(self.sessions, self.runs, self.budgets)
         self.definitions = Definitions(self.sessions)
         self.conversation = Conversation(self.sessions, self.definitions)
         self.operations = Operations(self.sessions, self.conversation)

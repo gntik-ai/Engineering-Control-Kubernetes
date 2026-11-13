@@ -73,12 +73,20 @@ class Document:
     # is the platform's own wording.
     prompts: dict[str, dict[str, str]] = field(default_factory=dict)
     budgets: dict[str, Any] = field(default_factory=dict)
+    # For a flow that produces items: what starting an item of its section does. "deliver"
+    # has the item delivered; "request" runs this flow on what the item names, unless the
+    # item is something a run produced, which is delivered.
+    items: str = "deliver"
+    # What the console calls starting the flow for a section, when it can be.
+    action: str = ""
+    # Where the designer drew each task. It says nothing about what the flow does.
+    layout: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
+    def as_dict(self, *, layout: bool = True) -> dict[str, Any]:
+        said: dict[str, Any] = {
             "format": FORMAT,
             "key": self.key,
             "name": self.name,
@@ -90,10 +98,21 @@ class Document:
             },
             "budgets": dict(sorted(self.budgets.items())),
         }
+        # Said only when it is not the usual, so a flow that says nothing reads as before.
+        if self.items != "deliver":
+            said["items"] = self.items
+        if self.action:
+            said["action"] = self.action
+        if layout and self.layout:
+            said["layout"] = {name: dict(self.layout[name]) for name in sorted(self.layout)}
+        return said
 
     def sha256(self) -> str:
-        """The same for every document that says the same thing."""
-        text = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        """The same for every document that says the same thing, wherever its tasks are
+        drawn."""
+        text = json.dumps(
+            self.as_dict(layout=False), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -157,4 +176,23 @@ def parse(raw: Any) -> Document:
         nodes=tuple(nodes),
         prompts=prompts,
         budgets={str(name): value for name, value in budgets.items()},
+        items="request" if raw.get("items") == "request" else "deliver",
+        action=_text(raw.get("action"), 60),
+        layout=_layout(raw.get("layout"), seen),
     )
+
+
+def _layout(raw: Any, known: set[str]) -> dict[str, dict[str, int]]:
+    """Where tasks are drawn, for the tasks the flow has; anything else is dropped."""
+    found: dict[str, dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return found
+    for name, place in raw.items():
+        if name not in known or not isinstance(place, dict):
+            continue
+        try:
+            x, y = round(float(place.get("x", 0))), round(float(place.get("y", 0)))
+        except (TypeError, ValueError):
+            continue
+        found[str(name)] = {"x": max(-20_000, min(x, 20_000)), "y": max(-20_000, min(y, 20_000))}
+    return found

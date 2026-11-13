@@ -33,6 +33,7 @@ import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, 
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, RouterLink, useLocation } from '../router';
 import { minutes, tokens, versionName } from './Flows';
+import { RunGraph } from './RunGraph';
 import { useSubmit } from './ProjectDialogs';
 
 type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
@@ -75,6 +76,7 @@ const KINDS: Record<Run['kind'], string> = {
   audit_code: 'Auditing code',
   discover_enhancements: 'Looking for enhancements',
   evaluation: 'Trying a version of a flow',
+  flow: 'Running a flow',
 };
 
 const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
@@ -344,7 +346,8 @@ function Names({ title, values }: { title: string; values: string[] | undefined 
 /** What an audit or a search for enhancements ended with: each candidate and what became of it. */
 function Produced({ run, result }: { run: Run; result: RunResult }) {
   const entries = result.findings ?? result.proposals ?? [];
-  const audit = run.kind === 'audit_code';
+  // What the run produced says what kind of run it was, whatever its flow is called.
+  const audit = result.findings !== undefined;
   return (
     <Card>
       <CardHeader>
@@ -545,11 +548,12 @@ function RunDetail({ id }: { id: string }) {
                 <span className="text-muted-foreground">Asked to look at:</span> {run.data.scope.text}
               </p>
             ) : null}
+            {run.data.flow ? <RunGraph run={run} /> : null}
             {run.data.result ? <Produced run={run} result={run.data.result} /> : null}
             {run.data.change ? <Change change={run.data.change} /> : null}
             <div className="grid gap-2">
               {(run.steps ?? []).map((step) => (
-                <Step key={step.id} step={step} producer={run.kind === 'audit_code' || run.kind === 'discover_enhancements'} />
+                <Step key={step.id} step={step} producer={!run.data.issue && run.kind !== 'account_check'} />
               ))}
             </div>
             <DecideDialog
