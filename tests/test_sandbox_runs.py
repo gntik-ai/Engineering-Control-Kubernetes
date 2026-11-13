@@ -356,11 +356,30 @@ def test_how_the_cluster_describes_a_pod_becomes_one_of_four_states() -> None:
         "0/4 nodes are available: 1 node(s) had untolerated taint "
         "{node.kubernetes.io/unreachable: }, 3 node(s) didn't match Pod's node selector."
     )
+    hint = (
+        " That is the sandbox node being away, or having joined the cluster again without "
+        "its label and taint (engineering-control/sandbox=true): the guide's section "
+        '"The sandbox node" has the two commands that set them.'
+    )
     assert pod_progress({"status": {"phase": "Pending", "conditions": [unscheduled]}})[1] == (
         "Waiting for a place on the sandbox node. The cluster says: 0/4 nodes are available: "
         "1 node(s) had untolerated taint {node.kubernetes.io/unreachable: }, 3 node(s) didn't "
-        "match Pod's node selector."
+        "match Pod's node selector." + hint
     )
+    # As the cluster said it when the node had joined again without its label.
+    unscheduled["message"] = (
+        "0/3 nodes are available: 1 node(s) had untolerated taint(s), 2 node(s) didn't match "
+        "Pod's node affinity/selector."
+    )
+    told = pod_progress({"status": {"phase": "Pending", "conditions": [unscheduled]}})[1]
+    assert told is not None and told.endswith(hint)
+    # A node that is there and full is only that.
+    unscheduled["message"] = (
+        "0/4 nodes are available: 1 Insufficient memory, 3 node(s) didn't match Pod's node "
+        "affinity/selector."
+    )
+    told = pod_progress({"status": {"phase": "Pending", "conditions": [unscheduled]}})[1]
+    assert told is not None and "joined the cluster again" not in told
     assert pod_progress({}) == ("starting", None)
 
 

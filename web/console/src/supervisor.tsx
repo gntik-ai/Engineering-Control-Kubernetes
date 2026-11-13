@@ -14,7 +14,7 @@ import {
   Textarea,
   Timestamp,
 } from '@gntik-ai/ui';
-import { Check, CircleStop, Send, Sparkles, X } from '@gntik-ai/icons';
+import { Check, CircleStop, Send, SlidersHorizontal, Sparkles, X } from '@gntik-ai/icons';
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   CHANGED,
@@ -24,7 +24,9 @@ import {
   type InboxEntry,
   type SupervisorConversation,
   type SupervisorMessage,
+  type SupervisorSettings,
 } from './api';
+import { ModelChoice, PROVIDER_NAMES, chosenAs, type Chosen } from './modelChoice';
 import { BASE, RouterLink } from './router';
 
 /** Bold and code inside one line of the supervisor's reply. Nothing else is interpreted. */
@@ -203,6 +205,69 @@ export function Proposal({ entry, onDecided }: { entry: InboxEntry; onDecided: (
   );
 }
 
+/**
+ * Which model answers, and how hard it reasons, chosen where the conversation is. A choice
+ * is in force from the supervisor's next answer; it changes nothing of what it may do.
+ */
+function Models() {
+  const settings = useResource<SupervisorSettings>(apiUrl('supervisor/settings'), null);
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const data = settings.data;
+  if (!data) return null;
+  const { definition, choices } = data;
+  const chosen = (provider: string): Chosen => ({
+    model: definition.models[provider] ?? null,
+    effort: definition.efforts[provider] ?? null,
+  });
+  const choose = (provider: string, next: Chosen) => {
+    setSaving(provider);
+    setProblem(null);
+    postJson('supervisor/model', { provider, model: next.model, effort: next.effort })
+      .then(settings.reload)
+      .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The request failed.'))
+      .finally(() => setSaving(null));
+  };
+  return (
+    <div className="grid gap-2 text-[12px] text-muted-foreground">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate">
+          {definition.providers
+            .map((provider) => `${PROVIDER_NAMES[provider] ?? provider}: ${chosenAs(choices[provider], chosen(provider))}`)
+            .join(' · ')}
+        </span>
+        <Button variant="ghost" size="sm" icon={SlidersHorizontal} onClick={() => setOpen(!open)}>
+          {open ? 'Done' : 'Model and reasoning'}
+        </Button>
+      </div>
+      {open ? (
+        <div className="grid gap-2 rounded-md border border-border p-3">
+          {definition.providers.map((provider) => (
+            <div key={provider} className="grid gap-1">
+              <span className="font-medium text-foreground">{PROVIDER_NAMES[provider] ?? provider}</span>
+              <ModelChoice
+                provider={provider}
+                choices={choices[provider]}
+                value={chosen(provider)}
+                disabled={saving !== null}
+                allowOther={false}
+                onChange={(next) => choose(provider, next)}
+              />
+            </div>
+          ))}
+          <span>
+            In force from the supervisor’s next answer. It works on{' '}
+            {definition.providers.map((provider) => PROVIDER_NAMES[provider] ?? provider).join(', then on ')}; a name
+            that is not listed can be written on the settings page.
+          </span>
+        </div>
+      ) : null}
+      {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
+    </div>
+  );
+}
+
 function Conversation() {
   const [busy, setBusy] = useState(false);
   // While the supervisor answers, look again every two seconds; otherwise now and then.
@@ -283,6 +348,7 @@ function Conversation() {
       </DrawerBody>
       <DrawerFooter className="block space-y-2">
         {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
+        <Models />
         <form
           className="flex w-full items-end gap-2"
           onSubmit={(event) => {

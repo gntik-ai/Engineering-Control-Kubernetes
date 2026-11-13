@@ -29,7 +29,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0038 (a stored test identity) follows 0037 (triggers, where an application runs),
+    # 0039 (how hard the supervisor's model reasons) follows 0038 (a stored test
+    # identity), 0037 (triggers, where an application runs),
     # 0036 (flows as documents, usage, evaluations), 0035 (paused projects),
     # 0034 (items with their own text, incidents, cut-over), 0033 (the chat
     # channel's memory), 0032 (queues and budgets), 0031 (the
@@ -40,7 +41,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0038", "0037")
+    assert (head, parent) == ("0039", "0038")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -94,6 +95,13 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0039: how hard the supervisor's model reasons, by provider.
+    assert "efforts" in {c["name"] for c in inspect(engine).get_columns("supervisor_definitions")}
+    command.downgrade(config, parent)
+    assert "efforts" not in {
+        c["name"] for c in inspect(engine).get_columns("supervisor_definitions")
+    }
+    parent = "0037"
     # 0038: the other hosts of a project's application, and whether a test identity is
     # stored for it.
     assert {"application_identity_at", "application_hosts"} <= {

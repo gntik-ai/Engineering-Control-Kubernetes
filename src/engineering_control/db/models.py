@@ -1317,6 +1317,8 @@ class SupervisorDefinition(UUIDPrimaryKey, Timestamps, Base):
     # When set, the account above is the supervisor's alone: no other work is given it.
     exclusive: Mapped[bool] = mapped_column(Boolean, default=False)
     models: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # How hard the model reasons, by provider (migration 0039). Not set: the client's own.
+    efforts: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     note: Mapped[str | None] = mapped_column(String(300))
     # Whether it looks at failed and stuck work by itself, and how often within an hour
     # (migration 0034). Not set: the platform's defaults.

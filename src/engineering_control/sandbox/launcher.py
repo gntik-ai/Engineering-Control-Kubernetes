@@ -98,7 +98,21 @@ def pod_progress(pod: dict[str, Any]) -> tuple[str, str | None]:
             # one that is away, cordoned or missing its label.
             why = " ".join(str(condition.get("message") or "").split())[:400]
             waiting = "Waiting for a place on the sandbox node."
-            return "starting", f"{waiting} The cluster says: {why}" if why else waiting
+            if not why:
+                return "starting", waiting
+            said = f"{waiting} The cluster says: {why}"
+            # No node is short of anything and none is cordoned: every node was passed
+            # over for its label or a taint, so the sandbox node is not there to be used.
+            passed_over = "didn't match Pod's node" in why or "untolerated taint" in why
+            if passed_over and not any(
+                sign in why for sign in ("Insufficient", "unschedulable", "Too many pods")
+            ):
+                said += (
+                    " That is the sandbox node being away, or having joined the cluster "
+                    f"again without its label and taint ({pods.NODE_LABEL}=true): the "
+                    'guide\'s section "The sandbox node" has the two commands that set them.'
+                )
+            return "starting", said
     return "starting", None
 
 

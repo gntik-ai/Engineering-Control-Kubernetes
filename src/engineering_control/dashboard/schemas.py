@@ -211,6 +211,16 @@ class SupervisorDecisionInput(DashboardModel):
     accept: bool
 
 
+class SupervisorModelInput(DashboardModel):
+    """The model and the reasoning level of the supervisor on one provider. Empty means
+    the client's own."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    provider: str = Field(min_length=1, max_length=16)
+    model: str | None = Field(default=None, max_length=60)
+    effort: str | None = Field(default=None, max_length=16)
+
+
 class SupervisorDefinitionInput(DashboardModel):
     """A new version of the supervisor's definition. It decides what the supervisor does
     without asking, so saving it needs the password again."""
@@ -224,6 +234,8 @@ class SupervisorDefinitionInput(DashboardModel):
     account_id: UUID | None = None
     exclusive: bool = False
     models: dict[str, str] = Field(default_factory=dict)
+    # How hard the model reasons, by provider. Left out: the client's own default.
+    efforts: dict[str, str] = Field(default_factory=dict)
     note: str | None = Field(default=None, max_length=300)
     # Whether the supervisor looks at failed and stuck work by itself, and how often
     # within an hour. Left out: the platform's default.

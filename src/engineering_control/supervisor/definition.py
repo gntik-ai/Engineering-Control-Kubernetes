@@ -30,6 +30,86 @@ MAX_SKILL_BODY: Final = 8_000
 SKILL_KEY: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+){0,5}$")
 MODEL_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,59}$")
 
+# The models and the reasoning levels the administrator chooses among, by provider. They
+# are what the clients pinned in the sandbox image take (images/sandbox/node-tools): for
+# Claude the names its client resolves to the latest model of a family, for ChatGPT the
+# catalogue built into the Codex client, with the levels each model has. Another name can
+# always be written; the client then says whether it knows it.
+_LEVELS: Final = ("low", "medium", "high", "xhigh", "max")
+EFFORTS: Final[dict[str, tuple[str, ...]]] = {
+    "claude": _LEVELS,
+    "chatgpt": (*_LEVELS, "ultra"),
+}
+MODELS: Final[dict[str, tuple[dict[str, Any], ...]]] = {
+    "claude": (
+        {"name": "fable", "title": "Fable", "summary": "The latest Fable model."},
+        {"name": "opus", "title": "Opus", "summary": "The latest Opus model."},
+        {"name": "sonnet", "title": "Sonnet", "summary": "The latest Sonnet model."},
+        {"name": "haiku", "title": "Haiku", "summary": "The latest Haiku model: the fastest."},
+    ),
+    "chatgpt": (
+        {
+            "name": "gpt-6-astra",
+            "title": "GPT-6-Astra",
+            "summary": "Frontier intelligence for the most demanding work.",
+        },
+        {
+            "name": "gpt-6.1-sol",
+            "title": "GPT-6.1-Sol",
+            "summary": "Latest workhorse model for coding and everyday work.",
+        },
+        {"name": "gpt-6.1-terra", "title": "GPT-6.1 Terra", "summary": "A balanced model."},
+        {
+            "name": "gpt-6-sol",
+            "title": "GPT-6-Sol",
+            "summary": "Previous generation workhorse model.",
+        },
+        {
+            "name": "gpt-6-luna",
+            "title": "GPT-6-Luna",
+            "summary": "Fast and affordable model for easier tasks.",
+            "efforts": _LEVELS,
+        },
+        {
+            "name": "gpt-5.6-sol",
+            "title": "GPT-5.6-Sol",
+            "summary": "Older generation workhorse model.",
+        },
+        {
+            "name": "gpt-5.6-terra",
+            "title": "GPT-5.6-Terra",
+            "summary": "Older balanced model for straightforward work.",
+        },
+        {
+            "name": "gpt-5.6-luna",
+            "title": "GPT-5.6-Luna",
+            "summary": "Older fast and efficient model.",
+            "efforts": _LEVELS,
+        },
+        {
+            "name": "gpt-5.5",
+            "title": "GPT-5.5",
+            "summary": "Legacy coding model.",
+            "efforts": ("low", "medium", "high", "xhigh"),
+        },
+    ),
+}
+
+
+def choices() -> dict[str, Any]:
+    """What the console offers for each provider: its models and its reasoning levels."""
+    return {
+        provider: {
+            "models": [
+                {**model, "efforts": list(model.get("efforts") or EFFORTS[provider])}
+                for model in MODELS[provider]
+            ],
+            "efforts": list(EFFORTS[provider]),
+        }
+        for provider in PROVIDERS
+    }
+
+
 _OBJECT: Final[dict[str, Any]] = {"type": "object", "additionalProperties": False}
 
 
@@ -808,6 +888,31 @@ def clean_models(models: Any) -> dict[str, str]:
     return cleaned
 
 
+def clean_efforts(efforts: Any, models: dict[str, str]) -> dict[str, str]:
+    """The reasoning level by provider: one its client has, and one the chosen model has
+    where the platform knows the model."""
+    if efforts is None:
+        return {}
+    if not isinstance(efforts, dict):
+        raise ProjectInvalid("The reasoning levels are given by provider")
+    cleaned: dict[str, str] = {}
+    for provider, level in efforts.items():
+        if provider not in PROVIDERS:
+            raise ProjectInvalid(f"There is no provider {provider}")
+        text = str(level or "").strip()
+        if not text:
+            continue
+        if text not in EFFORTS[provider]:
+            raise ProjectInvalid(f"{text} is not a reasoning level of {provider}")
+        known = next(
+            (model for model in MODELS[provider] if model["name"] == models.get(provider)), None
+        )
+        if known is not None and text not in (known.get("efforts") or EFFORTS[provider]):
+            raise ProjectInvalid(f"{known['title']} has no reasoning level {text}")
+        cleaned[provider] = text
+    return cleaned
+
+
 def _when(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -826,6 +931,7 @@ def _row(definition: SupervisorDefinition | None) -> dict[str, Any]:
             "account_id": None,
             "exclusive": False,
             "models": {},
+            "efforts": {},
             "operations": dict(OPERATIONS),
             "note": "The platform's own definition",
             "saved_at": None,
@@ -840,6 +946,7 @@ def _row(definition: SupervisorDefinition | None) -> dict[str, Any]:
         "account_id": str(definition.account_id) if definition.account_id else None,
         "exclusive": bool(definition.exclusive),
         "models": dict(definition.models or {}),
+        "efforts": dict(definition.efforts or {}),
         "operations": {**OPERATIONS, **(definition.operations or {})},
         "note": definition.note,
         "saved_at": _when(definition.created_at),
@@ -917,6 +1024,7 @@ class Definitions:
         models: Any,
         note: str | None,
         operations: Any = None,
+        efforts: Any = None,
     ) -> dict[str, Any]:
         text = prompt.strip()
         if not 1 <= len(text) <= MAX_PROMPT:
@@ -925,6 +1033,7 @@ class Definitions:
         cleaned_tools = clean_tools(tools)
         cleaned_providers = clean_providers(providers)
         cleaned_models = clean_models(models)
+        cleaned_efforts = clean_efforts(efforts, cleaned_models)
         cleaned_operations = clean_operations(operations)
         with self.sessions.begin() as session:
             if account_id is not None:
@@ -948,8 +1057,49 @@ class Definitions:
                 account_id=account_id,
                 exclusive=bool(exclusive and account_id is not None),
                 models=cleaned_models,
+                efforts=cleaned_efforts,
                 operations=cleaned_operations,
                 note=" ".join((note or "").split())[:300] or None,
+            )
+            session.add(definition)
+            session.flush()
+            return _row(definition)
+
+    def choose(self, provider: str, *, model: str | None, effort: str | None) -> dict[str, Any]:
+        """Another model or reasoning level for one provider, and nothing else changed.
+
+        It is a new version like any save, so the record says when the supervisor was on
+        which model. What the supervisor may do stays exactly what the version before said,
+        which is why this does not ask for the password.
+        """
+        if provider not in PROVIDERS:
+            raise ProjectInvalid(f"There is no provider {provider}")
+        with self.sessions.begin() as session:
+            latest = self._latest(session)
+            before = _row(latest)
+            models = clean_models({**before["models"], provider: model or ""})
+            efforts = clean_efforts({**before["efforts"], provider: effort or ""}, models)
+            said = ", ".join(
+                part
+                for part in (
+                    models.get(provider),
+                    efforts.get(provider) and f"{efforts[provider]} reasoning",
+                )
+                if part
+            )
+            last = latest.version if latest is not None else 0
+            definition = SupervisorDefinition(
+                version=last + 1,
+                prompt=before["prompt"],
+                skills=before["skills"],
+                tools=before["tools"] if latest is None else dict(latest.tools or {}),
+                providers=before["providers"],
+                account_id=latest.account_id if latest is not None else None,
+                exclusive=bool(latest.exclusive) if latest is not None else False,
+                models=models,
+                efforts=efforts,
+                operations=dict(latest.operations) if latest and latest.operations else None,
+                note=f"Model on {provider}: {said or "the client's own"}"[:300],
             )
             session.add(definition)
             session.flush()

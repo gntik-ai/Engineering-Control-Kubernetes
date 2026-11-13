@@ -37,6 +37,7 @@ from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
+from engineering_control.supervisor.definition import choices as model_choices
 
 
 class DashboardService:
@@ -346,6 +347,7 @@ class DashboardService:
                 "catalogue": tool_catalogue(),
                 "providers": list(SUPERVISOR_PROVIDERS),
                 "accounts": accounts,
+                "choices": model_choices(),
             }
 
         return await asyncio.to_thread(read)
@@ -359,6 +361,15 @@ class DashboardService:
             return {**saved, "definition": f"version {saved['version']}"}
 
         return await asyncio.to_thread(save)
+
+    async def choose_supervisor_model(
+        self, provider: str, *, model: str | None, effort: str | None
+    ) -> dict[str, object]:
+        def choose() -> dict[str, Any]:
+            saved = self.repository.definitions.choose(provider, model=model, effort=effort)
+            return {**saved, "definition": f"version {saved['version']}"}
+
+        return await asyncio.to_thread(choose)
 
     async def decide_action(self, action_id: UUID, accept: bool) -> dict[str, object]:
         return await asyncio.to_thread(

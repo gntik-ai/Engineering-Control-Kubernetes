@@ -612,6 +612,8 @@ export interface SupervisorDefinition {
   account_id: string | null;
   exclusive: boolean;
   models: Record<string, string>;
+  /** How hard the model reasons, by provider. Not named: the model's own level. */
+  efforts: Record<string, string>;
   /** Whether it looks at failed and stuck work by itself, and how often within an hour. */
   operations: { enabled: boolean; per_hour: number };
   note: string | null;
@@ -654,6 +656,14 @@ export interface SupervisorSettings {
   catalogue: SupervisorTool[];
   providers: string[];
   accounts: { id: string; name: string; provider: string; state: string }[];
+  /** The models and reasoning levels to choose among, by provider. */
+  choices: Record<string, ModelChoices>;
+}
+
+/** What one provider's client takes: its models, each with the levels it has. */
+export interface ModelChoices {
+  models: { name: string; title: string; summary: string; efforts: string[] }[];
+  efforts: string[];
 }
 
 /** One thing the supervisor did, or proposed, and what became of it. */

@@ -93,6 +93,7 @@ from engineering_control.dashboard.schemas import (
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
     SupervisorMessageInput,
+    SupervisorModelInput,
     TriggerInput,
     TriggerUpdateInput,
 )
@@ -1070,9 +1071,24 @@ def create_app(
                 models=body.models,
                 note=body.note,
                 operations=body.operations,
+                efforts=body.efforts,
             ),
             event="dashboard.supervisor_defined",
             password=True,
+            entity="definition",
+        )
+
+    @app.post("/api/dashboard/supervisor/model")
+    async def supervisor_model_api(request: Request) -> Response:
+        """Another model or reasoning level for the supervisor on one provider. It changes
+        nothing of what the supervisor may do, so it does not ask for the password."""
+        return await project_change(
+            request,
+            SupervisorModelInput,
+            lambda body: service(request).choose_supervisor_model(
+                body.provider, model=body.model, effort=body.effort
+            ),
+            event="dashboard.supervisor_model_chosen",
             entity="definition",
         )
 

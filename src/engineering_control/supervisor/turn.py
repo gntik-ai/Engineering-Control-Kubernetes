@@ -135,6 +135,7 @@ def turn_job(
     token: str,
     tools: list[str],
     model: str | None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """The client of the leased account, with the platform's tool server and no other tool
     of its own where the client allows that."""
@@ -169,6 +170,8 @@ def turn_job(
         argv += ["--disable-slash-commands", "--system-prompt", SYSTEM]
         if model:
             argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
         commands = [
             {
                 "name": "agent",
@@ -203,6 +206,8 @@ def turn_job(
             environment[TOKEN_VARIABLE] = token
         if model:
             argv += ["-m", model]
+        if effort:
+            argv += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
         argv += ["--output-last-message", ANSWER_FILE, "-"]
         commands = [
             {
@@ -305,6 +310,7 @@ class SupervisorTurn:
             token=token,
             tools=enabled,
             model=(definition.get("models") or {}).get(lease.provider),
+            effort=(definition.get("efforts") or {}).get(lease.provider),
         )
         return Plan(
             job,

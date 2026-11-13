@@ -263,6 +263,67 @@ def test_the_definition_starts_as_the_platforms_own_and_every_save_is_a_version(
     assert saved["exclusive"] is True and world.definitions.reserved_account() == claude
 
 
+def test_the_model_and_how_hard_it_reasons_are_chosen_by_provider(world: Any) -> None:
+    from engineering_control.supervisor.definition import EFFORTS, choices
+
+    offered = choices()
+    assert set(offered) == {"claude", "chatgpt"}
+    assert [model["name"] for model in offered["claude"]["models"]][:2] == ["fable", "opus"]
+    assert offered["claude"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    luna = next(m for m in offered["chatgpt"]["models"] if m["name"] == "gpt-6-luna")
+    assert "ultra" in offered["chatgpt"]["efforts"] and "ultra" not in luna["efforts"]
+    assert world.definitions.current()["efforts"] == {}
+
+    # A choice is a version of its own and leaves everything else as it was.
+    first = world.definitions.choose("claude", model="opus", effort="high")
+    assert (first["version"], first["models"], first["efforts"]) == (
+        1,
+        {"claude": "opus"},
+        {"claude": "high"},
+    )
+    assert first["prompt"] == DEFAULT_PROMPT and first["providers"] == ["claude", "chatgpt"]
+    assert first["note"] == "Model on claude: opus, high reasoning"
+    saved = world.definitions.save(
+        prompt="You plan work.",
+        skills=first["skills"],
+        tools={"start_item": {"enabled": True, "mode": "automatic"}},
+        providers=["chatgpt", "claude"],
+        account_id=None,
+        exclusive=False,
+        models=first["models"],
+        efforts=first["efforts"],
+        note="Starts work without asking",
+        operations={"enabled": False, "per_hour": 2},
+    )
+    second = world.definitions.choose("chatgpt", model="gpt-6-astra", effort="ultra")
+    assert second["version"] == saved["version"] + 1
+    assert second["models"] == {"claude": "opus", "chatgpt": "gpt-6-astra"}
+    assert second["efforts"] == {"claude": "high", "chatgpt": "ultra"}
+    # What the supervisor may do is exactly what the version before said.
+    for kept in ("prompt", "skills", "tools", "providers", "account_id", "exclusive", "operations"):
+        assert second[kept] == saved[kept], kept
+    # Back to what the client chooses by itself.
+    third = world.definitions.choose("claude", model=None, effort=None)
+    assert third["models"] == {"chatgpt": "gpt-6-astra"}
+    assert third["efforts"] == {"chatgpt": "ultra"}
+    assert third["note"] == "Model on claude: the client's own"
+    # A name the platform does not know can be written; a level the client has not, cannot.
+    other = world.definitions.choose("chatgpt", model="gpt-7-preview", effort="max")
+    assert other["models"]["chatgpt"] == "gpt-7-preview"
+    for provider, model, effort in (
+        ("claude", "opus", "ultra"),
+        ("chatgpt", "gpt-6-luna", "ultra"),
+        ("chatgpt", "gpt-5.5", "max"),
+        ("claude", "not a model", None),
+        ("deepseek", None, None),
+        ("claude", None, "extreme"),
+    ):
+        with pytest.raises(ProjectInvalid):
+            world.definitions.choose(provider, model=model, effort=effort)
+    assert world.definitions.current()["version"] == other["version"]
+    assert set(EFFORTS) == {"claude", "chatgpt"}
+
+
 def test_stored_choices_never_name_a_mode_the_tool_does_not_have() -> None:
     merged = merged_tools(
         {"list_items": {"enabled": False, "mode": "confirm"}, "gone": {"enabled": True}}
@@ -343,6 +404,18 @@ def test_the_clients_get_the_platforms_tool_server_and_the_turns_token(world: An
     assert (
         "s3cr3t" not in json.dumps(alone) and "--allowed-tools" not in alone["commands"][0]["argv"]
     )
+    # How hard the model reasons is said the way each client takes it; unsaid, not at all.
+    assert "--effort" not in claude["commands"][0]["argv"]
+    assert not any("model_reasoning_effort" in part for part in codex["commands"][0]["argv"])
+    hard = turn_job(
+        "claude", 1, "p", tools_url=None, token="t", tools=[], model="opus", effort="xhigh"
+    )["commands"][0]["argv"]
+    assert hard[hard.index("--effort") + 1] == "xhigh"
+    deep = turn_job(
+        "chatgpt", 1, "p", tools_url=None, token="t", tools=[], model="gpt-6-astra", effort="ultra"
+    )["commands"][0]["argv"]
+    assert deep[deep.index("-m") + 1] == "gpt-6-astra"
+    assert deep[deep.index('model_reasoning_effort="ultra"') - 1] == "-c"
     assert turn_answer("claude", [_ran("agent", _claude_said("Three items."))]) == "Three items."
     assert turn_answer("claude", [_ran("agent", _claude_said("Nope", error=True))]) is None
     assert turn_answer("chatgpt", [_ran("agent"), _ran("answer", " Two.\n")]) == "Two."

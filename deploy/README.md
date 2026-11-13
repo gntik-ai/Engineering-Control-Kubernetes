@@ -64,8 +64,22 @@ they restart; one with data on the node's disk cannot come back afterwards, so m
 
 A node that joins the cluster again as a new node comes back without the label and the
 taint. Runs then wait with "Waiting for a place on the sandbox node" and the scheduler's
-words "didn't match Pod's node affinity/selector". Set both again with the two commands
+words "didn't match Pod's node affinity/selector"; the platform adds that this is the
+sandbox node being away or having lost its label. Set both again with the two commands
 above.
+
+To have the node bring both along whenever it joins, tell its k3s agent, on the node
+itself, and restart it. The agent applies them when the node registers:
+
+```bash
+sudo tee -a /etc/rancher/k3s/config.yaml <<'CONFIG'
+node-label:
+  - engineering-control/sandbox=true
+node-taint:
+  - engineering-control/sandbox=true:NoSchedule
+CONFIG
+sudo systemctl restart k3s-agent
+```
 
 ## The GitHub App
 
@@ -233,6 +247,18 @@ bar of every page, and in chat. It is defined like any agent, and the definition
 on the Supervisor page: its instructions, its skills, which tools it has and whether what
 each does is carried out at once or waits for the administrator, and the subscription it
 works on. Every save is a new version and needs the password.
+
+Which model answers, and how hard it reasons before it does, is chosen by provider: in
+the supervisor's panel ("Model and reasoning", in force from the next answer and without
+the password, because it changes nothing of what the supervisor may do) or on the
+Supervisor page with the rest of the definition. The models offered are the ones the
+clients pinned in the sandbox image take (`supervisor/definition.py`, `MODELS`): the
+families of Claude, and the catalogue built into the Codex client with the reasoning
+levels each model has. Another name can be written on the Supervisor page. The choice is
+handed to the client as it takes it (`--model` and `--effort` for Claude, `-m` and
+`model_reasoning_effort` for Codex); nothing chosen leaves both to the client. Every
+choice is a version of the definition, so the record says when the supervisor was on
+which model. When the pinned clients are replaced, the list is brought in step with them.
 
 A message is answered by a turn: a run of kind `supervisor_turn` with one step, in a
 sandbox like any other, on a subscription account (the first provider named in the

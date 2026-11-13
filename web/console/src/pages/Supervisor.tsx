@@ -54,12 +54,9 @@ import {
 } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When } from '../parts';
 import { BASE } from '../router';
+import { ModelChoice, PROVIDER_NAMES } from '../modelChoice';
 import { useSubmit } from './ProjectDialogs';
 
-const PROVIDER_NAMES: Record<string, string> = {
-  claude: 'Claude',
-  chatgpt: 'ChatGPT',
-};
 const KINDS: Record<SupervisorTool['kind'], { title: string; description: string }> = {
   read: {
     title: 'Read',
@@ -80,7 +77,7 @@ const NO_ACCOUNT = '__none__';
 
 type Draft = Pick<
   SupervisorDefinition,
-  'prompt' | 'skills' | 'tools' | 'providers' | 'account_id' | 'exclusive' | 'models' | 'operations'
+  'prompt' | 'skills' | 'tools' | 'providers' | 'account_id' | 'exclusive' | 'models' | 'efforts' | 'operations'
 >;
 
 const draftOf = (definition: SupervisorDefinition): Draft => ({
@@ -91,6 +88,7 @@ const draftOf = (definition: SupervisorDefinition): Draft => ({
   account_id: definition.account_id,
   exclusive: definition.exclusive,
   models: { ...definition.models },
+  efforts: { ...definition.efforts },
   operations: { ...definition.operations },
 });
 
@@ -296,6 +294,7 @@ function Subscription({
   change: (next: Partial<Draft>) => void;
 }) {
   const first = draft.providers[0] ?? settings.providers[0] ?? 'claude';
+  const choices = settings.choices ?? {};
   const others = settings.providers.filter((name) => name !== first);
   const fallback = draft.providers.length > 1;
   const accounts = settings.accounts.filter((account) => draft.providers.includes(account.provider));
@@ -369,19 +368,34 @@ function Subscription({
         No run of work is then given this account, so the supervisor answers even while every other account is busy or
         limited. Work that needs two providers still needs an account of each among the others.
       </p>
-      {draft.providers.map((name) => (
-        <Field key={name}>
-          <FieldLabel>Model on {PROVIDER_NAMES[name] ?? name}</FieldLabel>
-          <Input
-            className="w-64"
-            maxLength={60}
-            placeholder="The client's default"
-            value={draft.models[name] ?? ''}
-            onValueChange={(value) => change({ models: { ...draft.models, [name]: value } })}
-          />
-          <FieldDescription>Leave empty to use the model the provider's client chooses by itself.</FieldDescription>
-        </Field>
-      ))}
+      {draft.providers.map((name) => {
+        const model = draft.models[name]?.trim() || null;
+        const summary = choices[name]?.models.find((item) => item.name === model)?.summary;
+        return (
+          <div key={name} className="grid gap-1.5">
+            <span className="text-sm font-medium">Model and reasoning on {PROVIDER_NAMES[name] ?? name}</span>
+            <ModelChoice
+              provider={name}
+              choices={choices[name]}
+              value={{ model, effort: draft.efforts[name] ?? null }}
+              onChange={(next) => {
+                const models = { ...draft.models };
+                const efforts = { ...draft.efforts };
+                if (next.model) models[name] = next.model;
+                else delete models[name];
+                if (next.effort) efforts[name] = next.effort;
+                else delete efforts[name];
+                change({ models, efforts });
+              }}
+            />
+            <p className="text-[13px] text-muted-foreground">
+              {summary ? `${summary} ` : ''}Which model answers when the supervisor works on this provider, and how hard
+              it reasons before it does. More reasoning is slower and uses more of the subscription. The same can be
+              chosen in the supervisor’s panel, without saving a whole definition.
+            </p>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -673,6 +687,7 @@ function SaveDialog({
       postJson('supervisor/settings', {
         ...draft,
         models: Object.fromEntries(Object.entries(draft.models).filter(([, value]) => value.trim())),
+        efforts: Object.fromEntries(Object.entries(draft.efforts).filter(([, value]) => value)),
         note: note.trim() || null,
         current_password: password,
       }),

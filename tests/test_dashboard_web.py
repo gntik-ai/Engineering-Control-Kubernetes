@@ -193,6 +193,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/pause",
         "/api/dashboard/projects/{name}/resume",
         "/api/dashboard/supervisor/incidents/{incident_id}/dismiss",
+        "/api/dashboard/supervisor/model",
         "/api/dashboard/projects/{name}/sections/{key}/run",
         "/api/dashboard/projects/{name}/queues",
         "/api/dashboard/queues/{queue_id}/add",

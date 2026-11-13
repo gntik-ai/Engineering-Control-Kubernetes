@@ -83,6 +83,17 @@ if sandbox claude auth status >/dev/null 2>&1; then
   fail "Claude Code reports a signed-in account"
 fi
 
+# The supervisor's model and how hard it reasons are chosen in the console and handed to
+# the clients as they take them: the pinned clients have to know both.
+claude_help="$(sandbox claude --help 2>&1 || true)"
+codex_help="$(sandbox codex --help 2>&1 || true; sandbox codex exec --help 2>&1 || true)"
+for flag in --model --effort; do
+  grep --quiet -- "${flag}" <<<"${claude_help}" || fail "the pinned Claude client has no ${flag}"
+done
+for flag in --model --config; do
+  grep --quiet -- "${flag}" <<<"${codex_help}" || fail "the pinned Codex client has no ${flag}"
+done
+
 # --- the tools work, offline, as the run's user ----------------------------------------
 # A scanner that passes over a planted token is worse than no scanner.
 set +e

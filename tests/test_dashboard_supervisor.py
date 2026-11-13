@@ -101,6 +101,29 @@ def test_the_definition_is_saved_with_the_password_as_a_new_version(tmp_path: Pa
     assert again["versions"][0]["note"] == "Starts work without asking"
     assert client.get(f"{BASE}/versions/1").json()["providers"] == ["chatgpt", "claude"]
     assert client.get(f"{BASE}/versions/0").json()["version"] == 0
+    # The model and how hard it reasons are offered by provider and chosen without the
+    # password: the choice changes nothing of what the supervisor may do.
+    assert [m["name"] for m in again["choices"]["claude"]["models"]][:2] == ["fable", "opus"]
+    assert "ultra" in again["choices"]["chatgpt"]["efforts"]
+    chosen = _post(client, "/model", provider="chatgpt", model="gpt-6.1-sol", effort="high")
+    assert chosen.status_code == 200, chosen.text
+    assert chosen.json()["version"] == 2
+    assert chosen.json()["models"] == {"claude": "claude-opus-5-5", "chatgpt": "gpt-6.1-sol"}
+    assert chosen.json()["efforts"] == {"chatgpt": "high"}
+    assert chosen.json()["tools"]["start_item"]["mode"] == "automatic"
+    refused = _post(client, "/model", provider="chatgpt", model="gpt-6-luna", effort="ultra")
+    assert refused.status_code == 422 and "GPT-6-Luna" in refused.json()["detail"]
+    assert _post(client, "/model", provider="mistral").status_code == 422
+    # A whole definition carries the levels too.
+    whole = _post(
+        client,
+        "/settings",
+        current_password=PASSWORD,
+        **{**fields, "efforts": {"claude": "max"}},
+    )
+    assert whole.status_code == 200 and whole.json()["efforts"] == {"claude": "max"}
+    listed = client.get(f"{BASE}/settings").json()["versions"]
+    assert listed[1]["note"] == "Model on chatgpt: gpt-6.1-sol, high reasoning"
 
 
 def test_what_the_supervisor_proposed_is_decided_in_the_console(tmp_path: Path) -> None:
