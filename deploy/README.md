@@ -56,6 +56,11 @@ kubectl taint node aibot engineering-control/sandbox=true:NoSchedule
 The taint keeps every other workload off the node. Pods already there keep running until
 they restart; one with data on the node's disk cannot come back afterwards, so move it first.
 
+A node that joins the cluster again as a new node comes back without the label and the
+taint. Runs then wait with "Waiting for a place on the sandbox node" and the scheduler's
+words "didn't match Pod's node affinity/selector". Set both again with the two commands
+above.
+
 ## The GitHub App
 
 The platform acts on GitHub through the organisation's GitHub App "Engineering Control". Its

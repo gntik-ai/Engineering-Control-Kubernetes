@@ -379,6 +379,8 @@ async def test_a_message_is_answered_by_a_turn_in_a_sandbox(world: Any) -> None:
     token = servers["platform"]["headers"]["Authorization"].removeprefix("Bearer ")
     # The platform keeps the token's digest only.
     assert run.data["tools_token"] == token_digest(token) and token not in json.dumps(run.data)
+    # Not even the digest leaves the platform with the run.
+    assert "tools_token" not in world.runs.get(run.id)["data"]
 
     world.fake.finish(_log([_ran("agent", _claude_said("Three items are open."))]))
     # One pass reads the result, the next ends the run, the third starts what waited.

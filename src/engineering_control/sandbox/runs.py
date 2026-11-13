@@ -135,7 +135,12 @@ def _run_row(run: SandboxRun) -> dict[str, Any]:
 
 
 def _shown_data(data: dict[str, Any]) -> dict[str, Any]:
-    """A run's data as the console may have it: the issue without its whole text."""
+    """A run's data as the console may have it: the issue without its whole text.
+
+    The digest of a supervisor turn's tool token is for the tool service alone.
+    """
+    if "tools_token" in data:
+        data = {key: value for key, value in data.items() if key != "tools_token"}
     issue = data.get("issue")
     if isinstance(issue, dict) and "body" in issue:
         data = {**data, "issue": {key: value for key, value in issue.items() if key != "body"}}
