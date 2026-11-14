@@ -15,6 +15,8 @@ form, so that two documents that say the same thing have the same hash.
       "tasks": [
         {"id": "prepare", "task": "workspace.checkout", "with": {"baseline": true},
          "next": {"ok": "implement"}},
+        {"id": "plan", "task": "agent.report", "with": {"instruction": "..."},
+         "next": {"done": "implement"}, "saved": "<the id of a task of the library>"},
         ...
       ],
       "prompts": {"implementer": {"role": "You are the implementer ..."}},
@@ -36,6 +38,7 @@ from typing import Any, Final
 FORMAT: Final = "engineering-control-flow/1"
 KEY: Final = re.compile(r"^[a-z][a-z0-9-]{1,62}[a-z0-9]$")
 NODE_ID: Final = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
+SAVED: Final = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 MAX_TASKS: Final = 60
 MAX_BYTES: Final = 256 * 1024
 
@@ -52,14 +55,20 @@ class Node:
     task: str
     params: dict[str, Any] = field(default_factory=dict)
     next: dict[str, str | None] = field(default_factory=dict)
+    # The task of the administrator's own it was made from, when it was. Like where a
+    # task is drawn, it says nothing about what the flow does.
+    saved: str | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
+    def as_dict(self, *, origin: bool = True) -> dict[str, Any]:
+        said: dict[str, Any] = {
             "id": self.id,
             "task": self.task,
             "with": dict(sorted(self.params.items())),
             "next": dict(sorted(self.next.items())),
         }
+        if origin and self.saved:
+            said["saved"] = self.saved
+        return said
 
 
 @dataclass(frozen=True)
@@ -92,7 +101,7 @@ class Document:
             "name": self.name,
             "summary": self.summary,
             "start": self.start,
-            "tasks": [node.as_dict() for node in self.nodes],
+            "tasks": [node.as_dict(origin=layout) for node in self.nodes],
             "prompts": {
                 name: dict(sorted(parts.items())) for name, parts in sorted(self.prompts.items())
             },
@@ -155,6 +164,9 @@ def parse(raw: Any) -> Document:
                     str(outcome): (str(target) if target is not None else None)
                     for outcome, target in leads.items()
                 },
+                saved=str(entry["saved"])
+                if SAVED.fullmatch(str(entry.get("saved") or ""))
+                else None,
             )
         )
     prompts_raw = {} if raw.get("prompts") is None else raw["prompts"]

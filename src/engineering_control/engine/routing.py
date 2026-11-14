@@ -19,6 +19,16 @@ from engineering_control.sandbox import deliver
 # How many tasks that only choose a way may follow one another before following stops: a
 # flow that passes validation never comes near it.
 MAX_HOPS: Final = 30
+# Under this name a run keeps the subscription that first wrote in it.
+WRITER: Final = "@writer"
+
+
+def ran_on(ran: dict[str, Any], node: Node, provider: str) -> dict[str, Any]:
+    """Which subscription each task last worked on, with this one added."""
+    said = {**ran, node.id: provider}
+    if TASKS[node.task].writes and said.get(WRITER) not in deliver.PROVIDERS:
+        said[WRITER] = provider
+    return said
 
 
 def rounds_allowed(document: Document, run_data: dict[str, Any]) -> int:
@@ -37,6 +47,10 @@ def provider_for(node: Node, ran: dict[str, Any], *, again: bool) -> str | None:
     task = TASKS[node.task]
     if not task.account:
         return None
+    if task.writes and ran.get(WRITER) in deliver.PROVIDERS:
+        # Whatever writes in a run writes on one subscription, so that the reviewer,
+        # who is on the other than a writer, never judges its own subscription's work.
+        return str(ran[WRITER])
     other = node.params.get("other_than")
     if other and ran.get(str(other)) in deliver.PROVIDERS:
         # The other subscription than the one whose work is judged.

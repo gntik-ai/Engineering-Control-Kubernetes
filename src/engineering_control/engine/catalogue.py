@@ -42,7 +42,7 @@ class Param:
     """One setting of a task."""
 
     name: str
-    kind: str  # "bool", "int", "providers", "task", "choice", "models", "condition"
+    kind: str  # "bool", "int", "providers", "task", "choice", "models", "condition", "text"
     default: Any
     doc: str
     low: int | None = None
@@ -127,6 +127,15 @@ _MINUTES: Final = Param(
     low=5,
     high=AGENT_MINUTES_CEILING,
 )
+INSTRUCTION_CHARACTERS: Final = 8_000
+_INSTRUCTION: Final = Param(
+    "instruction",
+    "text",
+    "",
+    "What the agent is to do, in your words. It is given to the agent as its task, "
+    "between the platform's own rules, which it cannot change.",
+    high=INSTRUCTION_CHARACTERS,
+)
 _OTHER: Final = Param(
     "other_than",
     "task",
@@ -177,6 +186,53 @@ _TASKS: Final = (
         outcomes=("pass", "changes"),
         params=(_OTHER, _MODELS, _MINUTES),
         prompt="reviewer",
+    ),
+    TaskType(
+        "agent.change",
+        "Your own",
+        "Agent: change the code",
+        "An agent does what your instruction says and may change the code. The platform "
+        "commits what it changed. It counts as writing: the review, the tests, the "
+        "collection and your decision have to follow before anything is published. It "
+        "works on the subscription that first wrote in the run.",
+        "sandbox",
+        account=True,
+        writes=True,
+        needs=("checkout",),
+        produces=("change",),
+        outcomes=("done",),
+        params=(_INSTRUCTION, _PROVIDERS, _MODELS, _MINUTES),
+        prompt="own_change",
+    ),
+    TaskType(
+        "agent.check",
+        "Your own",
+        "Agent: check",
+        "An agent checks what your instruction says and passes it or asks for changes, "
+        "with findings the next task is given. It only reads: whatever it changes is "
+        "thrown away. It does not stand in for Review the change.",
+        "sandbox",
+        account=True,
+        needs=("checkout",),
+        produces=("check",),
+        outcomes=("pass", "changes"),
+        params=(_INSTRUCTION, _PROVIDERS, _MODELS, _MINUTES),
+        prompt="own_check",
+    ),
+    TaskType(
+        "agent.report",
+        "Your own",
+        "Agent: report",
+        "An agent looks into what your instruction says and writes a report. It only "
+        "reads. The report is shown with the run and given to the agents of the tasks "
+        "that follow, as notes.",
+        "sandbox",
+        account=True,
+        needs=("checkout",),
+        produces=("notes",),
+        outcomes=("done",),
+        params=(_INSTRUCTION, _PROVIDERS, _MODELS, _MINUTES),
+        prompt="own_report",
     ),
     TaskType(
         "check.change",

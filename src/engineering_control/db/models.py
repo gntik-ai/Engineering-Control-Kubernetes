@@ -722,14 +722,25 @@ class EvaluationCase(UUIDPrimaryKey, Timestamps, Base):
 
 
 class SavedTask(UUIDPrimaryKey, Timestamps, Base):
-    """A task as it was set in one flow, kept under a name to be used in others
-    (migration 0037): its kind, its settings and the wording of its prompt."""
+    """A task of the administrator's own, kept under a name to be used in flows
+    (migration 0037): a kind of task of the platform's, its settings and the wording of
+    its prompt."""
 
     __tablename__ = "saved_tasks"
     name: Mapped[str] = mapped_column(String(80), unique=True)
     task: Mapped[str] = mapped_column(String(64))
     params: Mapped[dict[str, Any]] = mapped_column(JSON)
     wording: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # What the task is for, in the administrator's words (migration 0040).
+    description: Mapped[str | None] = mapped_column(Text)
+
+
+class HiddenTask(UUIDPrimaryKey, Timestamps, Base):
+    """A kind of task of the platform's own that is not offered in the designer's list
+    (migration 0040). Nothing else changes for it: a flow that has one keeps it."""
+
+    __tablename__ = "hidden_tasks"
+    task: Mapped[str] = mapped_column(String(64), unique=True)
 
 
 class FlowTrigger(UUIDPrimaryKey, Timestamps, Base):

@@ -8,6 +8,16 @@ const ID = /^[a-z][a-z0-9_-]{0,39}$/;
 
 export const validId = (id: string) => ID.test(id);
 
+/** "Plan first" -> "plan-first": what a task made from a task of that name is called. */
+const nameAsId = (name: string) =>
+  name
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^[^a-z]+|-+$/g, '')
+    .slice(0, 28)
+    .replace(/-+$/, '');
+
 /** A name for a new task of that kind that no task of the flow has yet. */
 export function freshId(document: FlowDocument, type: string): string {
   const base =
@@ -44,8 +54,15 @@ export function addTask(
   type: TaskType,
   { at, saved }: { at?: { x: number; y: number }; saved?: SavedTask } = {},
 ): Added {
-  const id = freshId(document, type.key);
-  const node: FlowNode = { id, task: type.key, with: { ...(saved?.with ?? {}) }, next: {} };
+  // A task of the administrator's own is called after it, and remembers it.
+  const id = freshId(document, saved ? nameAsId(saved.name) || type.key : type.key);
+  const node: FlowNode = {
+    id,
+    task: type.key,
+    with: { ...(saved?.with ?? {}) },
+    next: {},
+    ...(saved ? { saved: saved.id } : {}),
+  };
   return {
     id,
     document: {

@@ -106,6 +106,17 @@ CHECKER_SCHEMA: Final[dict[str, Any]] = {
     },
 }
 
+# What an agent that only reports answers with.
+REPORT_SCHEMA: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary", "report"],
+    "properties": {"summary": {"type": "string"}, "report": {"type": "string"}},
+}
+# How much of a report is kept with the run for the tasks that follow, and how many.
+NOTE_CHARACTERS: Final = 20_000
+NOTES_KEPT: Final = 8
+
 
 @dataclass(frozen=True)
 class Command:

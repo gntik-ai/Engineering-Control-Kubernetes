@@ -622,6 +622,60 @@ meant.
 A run's page draws the run on the version of the flow it follows: each task with its
 state, who worked in it and how often, and the connections the run went along.
 
+### Tasks
+
+The Tasks tab of the Flows page lists every task a flow can be built from, in two
+tables, each with the flows that use a task (a flow as it stands: its draft when it has
+one, with the names the task has there).
+
+**The platform's tasks** are the kinds of task the platform has. They are code: they
+hold the rules every flow keeps and the credentials no agent is given, so they are not
+changed or removed in the console. One that is not used can be left out of the
+designer's list with its switch; a flow that has it keeps it, and it can be offered
+again at any time.
+
+**Your tasks** are tasks of the administrator's own: one of the platform's kinds with
+its settings filled in (subscriptions, model and reasoning, minutes, and for an agent's
+task the wording of its prompt), under a name and with a line on what it is for. A task
+is added from nothing ("Add a task") or from a kind ("Make my own from this"), changed,
+copied and removed there; the designer's panel still keeps the selected task of a flow
+under a name as before. They appear in the designer's list under "Your tasks", and a
+task of a flow made from one goes by its name on the canvas and remembers which task it
+was made from (`"saved"` in the document; like the drawing, it is not part of what the
+flow says).
+
+A flow holds a copy of the task. Changing a task therefore changes no flow, no version
+in force and no run: "Update the flows" writes the task as it is now into a draft of
+every flow that uses it (changing the draft that is open there, or making one), and
+each draft is looked at and put in force on the flow's page like any other change.
+Whose work a judging task judges stays what the flow says. A prompt is worded once for
+a flow, so a task's wording becomes the wording of that prompt for the flow. Removing a
+task takes it out of the list and leaves the flows as they are.
+
+Three kinds take an instruction the administrator writes, which is the agent's task.
+Around it the platform puts its own parts, which a flow cannot change: what the run is
+about and the notes of earlier tasks, fenced as material; the rules of the sandbox; and
+the shape of the answer.
+
+| Kind | What the agent does | Ends with |
+| --- | --- | --- |
+| Agent: change the code | What the instruction says, changing the code. The platform commits. | `done` |
+| Agent: check | Judges what the instruction says. It only reads. | `pass`, `changes` |
+| Agent: report | Looks into what the instruction says and writes a report. It only reads. | `done` |
+
+- A change by instruction counts as writing, exactly like Implement: after it the
+  review by the other subscription, the tests and the scan, the collection and the
+  administrator's decision have to follow before anything is published, and a flow
+  that does not have them is refused. Whatever writes in a run writes on the
+  subscription that first wrote in it, whatever the task names, so that the reviewer is
+  never on the subscription of something it reviews.
+- A check by instruction does not stand in for Review the change. When it asks for
+  changes, its findings are given to the task its `changes` outcome leads to.
+- A report is shown with its step on the run's page and is given, as notes, to the
+  agents of the tasks that follow (the implementer and the reviewer included), up to
+  eight reports of 20,000 characters each. A task that is gone back to replaces its
+  earlier report.
+
 ### Code clean, and the audits of the running application
 
 **Code clean** is the audit's tasks told to look for something else: code nothing uses,

@@ -246,7 +246,7 @@ class Engine:
         verdict = Verdict(True, done.label, done.detail)
         data = dict(done.data)
         if ctx.task.account and item.provider:
-            data["ran"] = {**(item.run_data.get("ran") or {}), node.id: item.provider}
+            data["ran"] = routing.ran_on(item.run_data.get("ran") or {}, node, item.provider)
         round_number = int(item.input.get("round") or 1)
         to = routing.follow(
             document,

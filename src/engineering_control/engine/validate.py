@@ -77,6 +77,12 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
             if wrong is not None:
                 return f"{name}: {wrong}"
         return None
+    if param.kind == "text":
+        if not isinstance(value, str) or not value.strip():
+            return f"{node.id} has no {param.name} yet: write what the agent is to do"
+        if param.high is not None and len(value) > param.high:
+            return f"{name} has more than {param.high:,} characters"
+        return None
     if param.kind == "condition":
         unread = conditions.problems(value)
         return f"{node.id}: {unread[0]}" if unread else None
@@ -270,6 +276,14 @@ def problems(document: Document) -> list[Problem]:
             if wrong:
                 found.append(_problem("setting", wrong, node.id))
         for param in task.params:
+            if param.kind == "text" and param.name not in node.params:
+                found.append(
+                    _problem(
+                        "setting",
+                        f"{node.id} has no {param.name} yet: write what the agent is to do",
+                        node.id,
+                    )
+                )
             if param.kind == "task" and not node.params.get(param.name):
                 found.append(
                     _problem(

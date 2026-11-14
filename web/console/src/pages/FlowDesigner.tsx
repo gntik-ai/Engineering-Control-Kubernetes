@@ -49,7 +49,9 @@ function TaskList({
   const [search, setSearch] = useState('');
   const wanted = search.trim().toLowerCase();
   const fits = (...texts: string[]) => !wanted || texts.some((text) => text.toLowerCase().includes(wanted));
-  const groups = [...new Set(catalogue.tasks.map((task) => task.group))];
+  // A kind of task that was left out of the list on the Tasks page is not offered here.
+  const offered = catalogue.tasks.filter((task) => !catalogue.hidden?.includes(task.key));
+  const groups = [...new Set(offered.map((task) => task.group))];
   const types = taskTypes(catalogue);
   const drag = (carried: Carried) => (event: DragEvent) => {
     event.dataTransfer.setData(DRAGGED, JSON.stringify(carried));
@@ -101,13 +103,13 @@ function TaskList({
       </p>
       {saved.length ? (
         <section>
-          <h3 className="mb-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Saved</h3>
+          <h3 className="mb-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Your tasks</h3>
           <ul className="grid gap-1.5">
             {saved.map((item) =>
               entry(
                 `saved-${item.id}`,
                 item.name,
-                `${types.get(item.task)?.title ?? item.task}, as it was set`,
+                item.description || `${types.get(item.task)?.title ?? item.task}, as you set it`,
                 { task: item.task, saved: item.id },
                 item,
               ),
@@ -116,9 +118,7 @@ function TaskList({
         </section>
       ) : null}
       {groups.map((group) => {
-        const tasks = catalogue.tasks.filter(
-          (task) => task.group === group && fits(task.title, task.summary, task.key),
-        );
+        const tasks = offered.filter((task) => task.group === group && fits(task.title, task.summary, task.key));
         if (tasks.length === 0) return null;
         return (
           <section key={group}>
@@ -154,23 +154,29 @@ function SaveTask({
   document: FlowDocument;
   nodeId: string;
   type: TaskType;
-  onSaved: () => void;
+  onSaved: (savedId: string) => void;
 }) {
   const [name, setName] = useState('');
+  const [kept, setKept] = useState('');
   const node = document.tasks.find((entry) => entry.id === nodeId);
   const save = useSubmit(
-    () =>
-      postJson('flows/saved-tasks', {
+    async () => {
+      const made = await postJson<{ id: string }>('flows/saved-tasks', {
         name,
         task: type.key,
         settings: node?.with ?? {},
         wording: type.prompt ? (document.prompts[type.prompt] ?? {}) : {},
-      }),
-    () => {
-      setName('');
-      onSaved();
+      });
+      setKept(made.id);
     },
+    () => setName(''),
   );
+  // The task of the flow is from now on one made from the task that was kept.
+  useEffect(() => {
+    if (!kept) return;
+    onSaved(kept);
+    setKept('');
+  }, [kept]);
   return (
     <Field>
       <FieldLabel>Keep it in the list as</FieldLabel>
@@ -189,7 +195,7 @@ function SaveTask({
       </div>
       <FieldDescription>
         {save.problem ??
-          'With its settings and the wording of its prompt, to drag into other flows. The same name again replaces it.'}
+          'With its settings and the wording of its prompt, to use in other flows. The same name again replaces it. Your tasks are managed on the Tasks tab of the Flows page.'}
       </FieldDescription>
     </Field>
   );
@@ -373,7 +379,18 @@ function Inspector({
         </Button>
       </div>
       {type && type.where !== 'control' ? (
-        <SaveTask document={document} nodeId={node.id} type={type} onSaved={onSaved} />
+        <SaveTask
+          document={document}
+          nodeId={node.id}
+          type={type}
+          onSaved={(savedId) => {
+            change({
+              ...document,
+              tasks: document.tasks.map((entry) => (entry.id === node.id ? { ...entry, saved: savedId } : entry)),
+            });
+            onSaved();
+          }}
+        />
       ) : null}
     </div>
   );

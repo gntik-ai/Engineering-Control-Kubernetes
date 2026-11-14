@@ -28,6 +28,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.engine.evaluations import Evaluations
 from engineering_control.engine.records import FlowRecords
+from engineering_control.engine.task_library import TaskLibrary
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import Runs
 from engineering_control.sandbox.triggers import Triggers
@@ -92,6 +93,7 @@ class DashboardRepository:
         self.accounts = Accounts(self.sessions)
         self.runs = Runs(self.sessions)
         self.flows = FlowRecords(self.sessions)
+        self.tasks = TaskLibrary(self.sessions, self.flows)
         self.evaluations = Evaluations(self.sessions, self.runs)
         self.budgets = Budgets(self.sessions)
         self.queues = Queues(self.sessions, self.runs, self.budgets)

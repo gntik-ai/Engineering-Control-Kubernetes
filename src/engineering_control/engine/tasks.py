@@ -322,6 +322,10 @@ class Checkout:
 
 
 class Implement:
+    # How the agent is called in what is said of its work.
+    who = "The implementer"
+    what = "resolve the issue"
+
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
         if lease is None:
             raise ValueError("implementing needs an account")
@@ -334,6 +338,7 @@ class Implement:
                 "toolchain": ctx.toolchain(),
                 "findings": ctx.given.get("findings"),
                 "failures": ctx.given.get("failures"),
+                "notes": data.get("notes"),
             }
         )
         job = deliver.implement_job(
@@ -358,29 +363,23 @@ class Implement:
             # it is committed, and the reviewer and the tests judge it as it is.
             why = why_no_answer(provider, commands)
             if not changed:
-                return Failed(
-                    "no_answer", f"The implementer changed nothing and gave no answer: {why}"
-                )
+                return Failed("no_answer", f"{self.who} changed nothing and gave no answer: {why}")
             answer = {
                 "decision": "COMPLETE",
-                "summary": f"The implementer ended without its closing answer ({why}). What "
+                "summary": f"{self.who} ended without its closing answer ({why}). What "
                 "it changed is committed and is reviewed as it stands.",
                 "tests": [],
                 "blocked_reason": "",
             }
         if answer.get("decision") != "COMPLETE":
             reason = str(answer.get("blocked_reason") or answer.get("summary") or "no reason given")
-            return Failed(
-                "blocked", f"The implementer could not resolve the issue: {reason}", answer
-            )
+            return Failed("blocked", f"{self.who} could not {self.what}: {reason}", answer)
         if len(head) != 40:
             return Failed(
                 "commit_failed", f"The change could not be committed: {_tail(commit or agent)}"
             )
         if not changed:
-            return Failed(
-                "no_change", "The implementer says it is done but changed nothing.", answer
-            )
+            return Failed("no_change", f"{self.who} says it is done but changed nothing.", answer)
         summary = str(answer.get("summary") or "")
         touched = deliver.touched_files(commands)
         return Done(
@@ -410,6 +409,7 @@ class Review:
                 "issue": data["issue"],
                 "toolchain": ctx.toolchain(),
                 "summary": str(ctx.given.get("summary") or ""),
+                "notes": data.get("notes"),
             }
         )
         return _reader(ctx, lease, prompt, deliver.CHECKER_SCHEMA)
@@ -432,6 +432,133 @@ class Review:
                 given={"findings": findings},
             )
         return Failed("rejected", f"The reviewer stopped the change: {summary}", answer)
+
+
+# --- the tasks whose instruction the administrator writes ---------------------------------
+
+
+def _about(data: dict[str, Any]) -> dict[str, Any]:
+    """What a run is about, as the tasks with an instruction of their own are told: the
+    item it works on, or what it was told to look at."""
+    issue = data.get("issue") or {}
+    if issue.get("title"):
+        return dict(issue)
+    scope = data.get("scope") or {}
+    return {
+        "title": str(scope.get("title") or "").strip() or "(none: the run is about the repository)",
+        "body": str(scope.get("text") or ""),
+    }
+
+
+def _instructed(ctx: Context) -> dict[str, Any]:
+    """What the prompt of a task with an instruction of its own is put together from."""
+    data = ctx.data
+    about = _about(data)
+    repository = str(data.get("repository") or "")
+    if (data.get("issue") or {}).get("title"):
+        subject = deliver.subject(about, repository)
+    else:
+        subject = f"the repository {repository}"
+    return {
+        "instruction": str(ctx.params.get("instruction") or "").strip(),
+        "subject": subject,
+        "repository": repository,
+        "base_sha": data.get("base_sha"),
+        # Whether an agent of this run has changed the code so far.
+        "changed": bool(data.get("head")) and data.get("head") != data.get("base_sha"),
+        "issue": about,
+        "toolchain": ctx.toolchain(),
+        "notes": data.get("notes"),
+        "summary": str(ctx.given.get("summary") or ""),
+        "findings": ctx.given.get("findings"),
+        "failures": ctx.given.get("failures"),
+    }
+
+
+class Change(Implement):
+    """An agent that changes the code as an instruction of the flow says. What holds
+    for the implementer holds for it: the platform commits, and nothing it wrote is
+    published without the review, the tests, the collection and the decision."""
+
+    who = "The agent"
+    what = "do its task"
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        if lease is None:
+            raise ValueError("changing the code needs an account")
+        values = _instructed(ctx)
+        about = values["issue"]
+        message = (
+            deliver.commit_message(about)
+            if (ctx.data.get("issue") or {}).get("title")
+            else f"Change made by the task {ctx.node.id}"
+        )
+        job = deliver.implement_job(
+            lease.provider,
+            lease.generation,
+            ctx.prompt(values),
+            message,
+            base_sha=ctx.data.get("base_sha"),
+        )
+        return _agent(ctx, lease, job)
+
+
+class Check:
+    """An agent that checks what an instruction of the flow says, and passes it or asks
+    for changes. It is not the review a change needs before it is published."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        return _reader(ctx, lease, ctx.prompt(_instructed(ctx)), deliver.CHECKER_SCHEMA)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        answer, instead = _answer(ctx, commands, who="The check")
+        if answer is None:
+            return instead or Failed("no_answer", "The check gave no answer.")
+        decision = answer.get("decision")
+        summary = str(answer.get("summary") or "")[:500]
+        if decision == "PASS":
+            return Done("pass", "passed", summary, output=answer)
+        if decision == "REQUEST_CHANGES":
+            findings = [f for f in answer.get("findings") or [] if isinstance(f, dict)]
+            return Done(
+                "changes",
+                "changes_requested",
+                f"The check asks for changes: {summary}",
+                output=answer,
+                given={"findings": findings},
+            )
+        return Failed("rejected", f"The check stopped the work: {summary}", answer)
+
+
+class Report:
+    """An agent that looks into what an instruction of the flow says and reports. The
+    report stays with the run, for the administrator and for the agents after it."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        return _reader(ctx, lease, ctx.prompt(_instructed(ctx)), deliver.REPORT_SCHEMA)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        answer, instead = _answer(ctx, commands, who="The agent")
+        if answer is None:
+            return instead or Failed("no_answer", "The agent gave no report.")
+        report = str(answer.get("report") or "").strip()
+        summary = _words(answer.get("summary") or report, 500)
+        if not report:
+            return Failed("no_report", "The agent answered without a report.", answer)
+        # A task that is gone back to replaces what it reported before.
+        earlier = [
+            note
+            for note in ctx.data.get("notes") or []
+            if isinstance(note, dict) and note.get("task") != ctx.node.id
+        ]
+        notes = [*earlier, {"task": ctx.node.id, "text": report[: deliver.NOTE_CHARACTERS]}]
+        return Done(
+            "done",
+            "reported",
+            summary,
+            output={"summary": summary, "report": report[: 4 * deliver.NOTE_CHARACTERS]},
+            data={"notes": notes[-deliver.NOTES_KEPT :]},
+        )
 
 
 class CheckChange:
@@ -1129,6 +1256,9 @@ SANDBOX: Final[dict[str, SandboxTask]] = {
     "workspace.checkout": Checkout(),
     "agent.implement": Implement(),
     "agent.review": Review(),
+    "agent.change": Change(),
+    "agent.check": Check(),
+    "agent.report": Report(),
     "check.change": CheckChange(),
     "change.collect": CollectChange(),
     "agent.plan_areas": PlanAreas(),

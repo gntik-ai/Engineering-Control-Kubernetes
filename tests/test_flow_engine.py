@@ -124,7 +124,7 @@ def test_every_task_of_the_catalogue_says_what_it_is() -> None:
 
 def test_every_task_an_agent_works_in_takes_a_model_and_a_reasoning_level() -> None:
     agents = [task for task in TASKS.values() if task.account]
-    assert len(agents) == 9
+    assert len(agents) == 12
     for task in agents:
         param = next((p for p in task.params if p.name == "models"), None)
         assert param is not None and param.kind == "models" and param.default == {}, task.key
@@ -259,6 +259,7 @@ def test_a_prompt_is_fixed_parts_and_editable_parts_in_order() -> None:
     assert [part["kind"] for part in shown["parts"]] == [
         "editable",
         "fixed",
+        "fixed",  # the notes of earlier tasks, when there are any
         "editable",
         "fixed",
         "fixed",
@@ -285,7 +286,11 @@ def test_a_prompt_is_fixed_parts_and_editable_parts_in_order() -> None:
         assert fixed in reworded
     assert contract.sha256(own) != contract.sha256({})
     assert contract.sha256({"judging": "  "}) == contract.sha256({}), "nothing said is no change"
-    assert contract.describe(own)["parts"][2]["changed"] is True
+    assert contract.describe(own)["parts"][3]["changed"] is True
+    # A report of an earlier task is given as material, and only when there is one.
+    assert "left these notes" not in usual
+    noted = contract.render({}, {**values, "notes": [{"task": "plan", "text": "Start in auth."}]})
+    assert "From the task plan:\nStart in auth." in noted and "<notes>" in noted
 
 
 # --- versions ----------------------------------------------------------------------------

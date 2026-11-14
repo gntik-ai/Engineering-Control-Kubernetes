@@ -59,7 +59,7 @@ export interface FlowListed extends Flow {
 /** One setting of a task. */
 export interface TaskParam {
   name: string;
-  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition';
+  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition' | 'text';
   default: unknown;
   doc: string;
   low: number | null;
@@ -99,13 +99,36 @@ export interface PromptShown {
   sha256: string;
 }
 
-/** A task as it was set in one flow, kept under a name to be used in others. */
+/** A task of the administrator's own: a kind of task with its settings, kept under a name. */
 export interface SavedTask {
   id: string;
   name: string;
+  /** What it is for, in the administrator's words. */
+  description?: string;
   task: string;
   with: Record<string, unknown>;
   wording: Record<string, string>;
+}
+
+/** Where a task is used: a flow, as it stands (its draft when it has one), and its tasks. */
+export interface TaskUse {
+  flow: string;
+  name: string;
+  tasks: string[];
+  draft: boolean;
+}
+
+/** Every task a flow can be built from, with the flows that use it. */
+export interface TaskLibrary {
+  kinds: (TaskType & { hidden: boolean; used_by: TaskUse[] })[];
+  saved: (SavedTask & { saved_at: string | null; used_by: TaskUse[] })[];
+}
+
+/** What writing a task into the flows that use it did. */
+export interface TaskApplied {
+  name: string;
+  flows: { flow: string; name: string; tasks: string[]; version: number; errors: number }[];
+  unchanged: string[];
 }
 
 export interface FlowCatalogue {
@@ -119,6 +142,8 @@ export interface FlowCatalogue {
   /** What an If can ask about, and the ways each is compared. */
   conditions?: ConditionCatalogue;
   saved: SavedTask[];
+  /** The platform's kinds of task that are not offered in the designer's list. */
+  hidden?: string[];
 }
 
 /** Something the platform knows about a run, that an If of a flow can ask about. */
@@ -160,6 +185,8 @@ export interface FlowNode {
   task: string;
   with: Record<string, unknown>;
   next: Record<string, string | null>;
+  /** The task of the administrator's own it was made from, when it was. */
+  saved?: string;
 }
 
 /** A flow as a document: tasks, where each outcome leads, wording of prompts, budgets. */
@@ -745,6 +772,8 @@ export interface RunStep {
     /** The Ifs the flow passed after the step: which way each went, and what it asked. */
     chose?: { task: string; way: string; asked: string }[];
   } | null;
+  /** What the step produced; for an agent that reports, its report. */
+  output?: { report?: string; [key: string]: unknown } | null;
   log?: string;
 }
 

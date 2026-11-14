@@ -27,6 +27,10 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Tabs,
+  TabsList,
+  TabsPanel,
+  TabsTab,
 } from '@gntik-ai/ui';
 import { Plus, Upload } from '@gntik-ai/icons';
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
@@ -41,8 +45,9 @@ import {
   type UsageRow,
 } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
-import { BASE, navigate } from '../router';
+import { BASE, navigate, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
+import { TasksTab } from './Tasks';
 
 export const versionName = (version: number | null) =>
   version === null ? 'Not in force yet' : version === 0 ? 'The platform’s own' : `Version ${version}`;
@@ -341,6 +346,7 @@ export function FlowsPage() {
   const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const tab = useLocation().query.get('tab') === 'tasks' ? 'tasks' : 'flows';
   return (
     <Page
       title="Flows"
@@ -355,84 +361,95 @@ export function FlowsPage() {
         </div>
       }
     >
-      <div className="grid gap-6">
-        <LoadError resource={flows} />
-        {problem ? (
-          <Alert
-            tone="destructive"
-            title="The flow was not brought in"
-            description={problem}
-            onDismiss={() => setProblem(null)}
-          />
-        ) : null}
-        <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
-        <TableFrame>
-          <Table>
-            <TableCaption className="sr-only">Flows</TableCaption>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Flow</TableHead>
-                <TableHead>In force</TableHead>
-                <TableHead>Tasks</TableHead>
-                <TableHead>Rounds</TableHead>
-                <TableHead>Changed here</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <Rows resource={flows} columns={5} empty="There are no flows">
-                {(items) =>
-                  items.map((flow) => (
-                    <TableRow key={flow.key}>
-                      <TableCell className="max-w-xl">
-                        {flow.engine ? (
-                          <Link href={`${BASE}/flow?key=${flow.key}`} className="font-medium">
-                            {flow.name}
-                          </Link>
-                        ) : (
-                          <span className="font-medium text-muted-foreground">{flow.name}</span>
-                        )}
-                        <div className="text-[12px] text-muted-foreground">{flow.summary}</div>
-                      </TableCell>
-                      {flow.engine ? (
-                        <>
-                          <TableCell>
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-[13px]">{versionName(flow.engine.version)}</span>
-                              {flow.engine.draft ? (
-                                <Badge tone="info" size="sm">
-                                  A draft is open
-                                </Badge>
-                              ) : null}
-                            </div>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'tasks' ? 'tasks' : null })}>
+        <TabsList aria-label="Flows and the tasks they are built from">
+          <TabsTab value="flows">Flows</TabsTab>
+          <TabsTab value="tasks">Tasks</TabsTab>
+        </TabsList>
+        <TabsPanel value="tasks" className="pt-4">
+          {tab === 'tasks' ? <TasksTab /> : null}
+        </TabsPanel>
+        <TabsPanel value="flows" className="pt-4">
+          <div className="grid gap-6">
+            <LoadError resource={flows} />
+            {problem ? (
+              <Alert
+                tone="destructive"
+                title="The flow was not brought in"
+                description={problem}
+                onDismiss={() => setProblem(null)}
+              />
+            ) : null}
+            <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
+            <TableFrame>
+              <Table>
+                <TableCaption className="sr-only">Flows</TableCaption>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Flow</TableHead>
+                    <TableHead>In force</TableHead>
+                    <TableHead>Tasks</TableHead>
+                    <TableHead>Rounds</TableHead>
+                    <TableHead>Changed here</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <Rows resource={flows} columns={5} empty="There are no flows">
+                    {(items) =>
+                      items.map((flow) => (
+                        <TableRow key={flow.key}>
+                          <TableCell className="max-w-xl">
+                            {flow.engine ? (
+                              <Link href={`${BASE}/flow?key=${flow.key}`} className="font-medium">
+                                {flow.name}
+                              </Link>
+                            ) : (
+                              <span className="font-medium text-muted-foreground">{flow.name}</span>
+                            )}
+                            <div className="text-[12px] text-muted-foreground">{flow.summary}</div>
                           </TableCell>
-                          <TableCell className={mono}>
-                            {flow.engine.tasks}, {flow.engine.agents} with an agent
-                          </TableCell>
-                          <TableCell className={mono}>{flow.engine.budgets.rounds ?? '—'}</TableCell>
-                          <TableCell className="text-[13px]">
-                            {flow.engine.version === null
-                              ? 'Made here'
-                              : flow.engine.version === 0
-                                ? 'Nothing'
-                                : flow.engine.prompts_changed.length
-                                  ? `Wording: ${flow.engine.prompts_changed.join(', ')}`
-                                  : 'Settings'}
-                          </TableCell>
-                        </>
-                      ) : (
-                        <TableCell colSpan={4} className="text-[13px] text-muted-foreground">
-                          Does not run on this platform yet.
-                        </TableCell>
-                      )}
-                    </TableRow>
-                  ))
-                }
-              </Rows>
-            </TableBody>
-          </Table>
-        </TableFrame>
-        <UsageCard />
-      </div>
+                          {flow.engine ? (
+                            <>
+                              <TableCell>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-[13px]">{versionName(flow.engine.version)}</span>
+                                  {flow.engine.draft ? (
+                                    <Badge tone="info" size="sm">
+                                      A draft is open
+                                    </Badge>
+                                  ) : null}
+                                </div>
+                              </TableCell>
+                              <TableCell className={mono}>
+                                {flow.engine.tasks}, {flow.engine.agents} with an agent
+                              </TableCell>
+                              <TableCell className={mono}>{flow.engine.budgets.rounds ?? '—'}</TableCell>
+                              <TableCell className="text-[13px]">
+                                {flow.engine.version === null
+                                  ? 'Made here'
+                                  : flow.engine.version === 0
+                                    ? 'Nothing'
+                                    : flow.engine.prompts_changed.length
+                                      ? `Wording: ${flow.engine.prompts_changed.join(', ')}`
+                                      : 'Settings'}
+                              </TableCell>
+                            </>
+                          ) : (
+                            <TableCell colSpan={4} className="text-[13px] text-muted-foreground">
+                              Does not run on this platform yet.
+                            </TableCell>
+                          )}
+                        </TableRow>
+                      ))
+                    }
+                  </Rows>
+                </TableBody>
+              </Table>
+            </TableFrame>
+            <UsageCard />
+          </div>
+        </TabsPanel>
+      </Tabs>
     </Page>
   );
 }

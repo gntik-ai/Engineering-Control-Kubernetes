@@ -94,6 +94,8 @@ from engineering_control.dashboard.schemas import (
     SupervisorDefinitionInput,
     SupervisorMessageInput,
     SupervisorModelInput,
+    TaskHiddenInput,
+    TaskInput,
     TriggerInput,
     TriggerUpdateInput,
 )
@@ -1264,6 +1266,80 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse(await service(request).flow_catalogue())
+
+    @app.get("/api/dashboard/tasks")
+    async def tasks_api(request: Request) -> Response:
+        """Every task a flow can be built from, with the flows that use it."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).tasks())
+
+    @app.post("/api/dashboard/tasks")
+    async def task_create_api(request: Request) -> Response:
+        """A task of the administrator's own: a kind of task with its settings, named."""
+        return await project_change(
+            request,
+            TaskInput,
+            lambda body: service(request).create_task(
+                name=body.name,
+                task=body.task,
+                description=body.description,
+                settings=body.settings,
+                wording=body.wording,
+            ),
+            event="dashboard.task_created",
+            status_code=201,
+            entity="saved",
+        )
+
+    @app.post("/api/dashboard/tasks/{saved_id}")
+    async def task_update_api(saved_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            TaskInput,
+            lambda body: service(request).update_task(
+                saved_id,
+                name=body.name,
+                description=body.description,
+                settings=body.settings,
+                wording=body.wording,
+            ),
+            event="dashboard.task_changed",
+            entity="saved",
+        )
+
+    @app.post("/api/dashboard/tasks/{saved_id}/remove")
+    async def task_remove_api(saved_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_task(saved_id),
+            event="dashboard.task_removed",
+            entity="saved",
+        )
+
+    @app.post("/api/dashboard/tasks/{saved_id}/apply")
+    async def task_apply_api(saved_id: UUID, request: Request) -> Response:
+        """Write the task as it is now into a draft of every flow that uses it."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).apply_task(saved_id),
+            event="dashboard.task_applied",
+            entity="saved",
+        )
+
+    @app.post("/api/dashboard/task-kinds/{task}/hidden")
+    async def task_hidden_api(task: str, request: Request) -> Response:
+        """Leave a kind of task out of the designer's list, or offer it again."""
+        return await project_change(
+            request,
+            TaskHiddenInput,
+            lambda body: service(request).hide_task(task, hidden=body.hidden),
+            event="dashboard.task_kind_hidden",
+            entity="saved",
+        )
 
     @app.get("/api/dashboard/flows/{key}")
     async def flow_api(key: str, request: Request) -> Response:

@@ -157,7 +157,8 @@ export function graphOf(
       width: WIDTH,
       selected: node.id === selected,
       data: {
-        title: task?.title ?? node.task,
+        // A task made from one of the administrator's own goes by that one's name.
+        title: catalogue.saved.find((item) => item.id === node.saved)?.name ?? task?.title ?? node.task,
         subtitle: node.id === document.start ? `${node.id} · the flow starts here` : node.id,
         meta:
           metas[node.id] ??

@@ -465,8 +465,58 @@ class DashboardService:
             "models": model_choices(),
             # What an If can ask about, and the ways each is compared.
             "conditions": condition_catalogue(),
-            "saved": await asyncio.to_thread(self.repository.flows.saved_tasks),
+            "saved": await asyncio.to_thread(self.repository.tasks.saved),
+            # The platform's kinds of task that are not offered in the designer's list.
+            "hidden": await asyncio.to_thread(self.repository.tasks.hidden),
         }
+
+    # --- the tasks themselves ------------------------------------------------------------
+
+    async def tasks(self) -> dict[str, object]:
+        """Every task a flow can be built from, with the flows that use it."""
+        return await asyncio.to_thread(self.repository.tasks.listing)
+
+    async def create_task(
+        self,
+        *,
+        name: str,
+        task: str | None,
+        description: str | None,
+        settings: dict[str, Any],
+        wording: dict[str, str],
+    ) -> dict[str, object]:
+        if not task:
+            raise ProjectInvalid("Say which kind of task it is")
+        return await asyncio.to_thread(
+            lambda: self.repository.tasks.create(
+                name=name, task=task, description=description, params=settings, wording=wording
+            )
+        )
+
+    async def update_task(
+        self,
+        saved_id: UUID,
+        *,
+        name: str,
+        description: str | None,
+        settings: dict[str, Any],
+        wording: dict[str, str],
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.tasks.update(
+                saved_id, name=name, description=description, params=settings, wording=wording
+            )
+        )
+
+    async def remove_task(self, saved_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.tasks.remove, saved_id)
+
+    async def apply_task(self, saved_id: UUID) -> dict[str, object]:
+        """Write a task as it is now into a draft of every flow that uses it."""
+        return await asyncio.to_thread(self.repository.tasks.apply, saved_id)
+
+    async def hide_task(self, task: str, *, hidden: bool) -> dict[str, object]:
+        return await asyncio.to_thread(lambda: self.repository.tasks.hide(task, hidden=hidden))
 
     async def check_flow(self, document: dict[str, Any]) -> dict[str, object]:
         """What the rules say about a flow as it is in the editor. Nothing is stored."""

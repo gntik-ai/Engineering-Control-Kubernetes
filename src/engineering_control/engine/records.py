@@ -93,6 +93,7 @@ class FlowRecords:
                     "id": str(row.id),
                     "name": row.name,
                     "task": row.task,
+                    "description": row.description or "",
                     "with": dict(row.params or {}),
                     "wording": dict(row.wording or {}),
                 }

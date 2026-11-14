@@ -1,4 +1,4 @@
-import { Field, FieldDescription, FieldLabel, Input, SimpleSelect, Switch } from '@gntik-ai/ui';
+import { Field, FieldDescription, FieldLabel, Input, SimpleSelect, Switch, Textarea } from '@gntik-ai/ui';
 import type { FlowCatalogue, FlowDocument, FlowNode, TaskParam, TaskType } from '../api';
 import { ModelChoice } from '../modelChoice';
 import { ConditionEditor } from './FlowCondition';
@@ -22,6 +22,7 @@ const SETTING_NAMES: Record<string, string> = {
   baseline: 'Run the tests before any change',
   rounds: 'Rounds',
   condition: 'What is asked',
+  instruction: 'Your instruction',
   over: 'The list it goes through',
   max: 'Entries at most',
   tokens: 'Tokens',
@@ -108,6 +109,27 @@ export function Setting({
         <FieldDescription>
           {param.doc}
           {param.low !== null && param.high !== null ? ` Between ${param.low} and ${param.high}.` : ''}
+        </FieldDescription>
+      </Field>
+    );
+  }
+  if (param.kind === 'text') {
+    const text = typeof value === 'string' ? value : '';
+    return (
+      <Field className="max-w-2xl">
+        <FieldLabel>{label}</FieldLabel>
+        <Textarea
+          autosize
+          minRows={4}
+          maxRows={24}
+          maxLength={param.high ?? undefined}
+          placeholder="What the agent is to do, as you would tell a colleague."
+          value={text}
+          onValueChange={(next) => onChange(next)}
+        />
+        <FieldDescription>
+          {param.doc}
+          {param.high ? ` ${text.length.toLocaleString('en')} of ${param.high.toLocaleString('en')} characters.` : ''}
         </FieldDescription>
       </Field>
     );

@@ -266,6 +266,14 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
           </span>
         </div>
         {step.detail ? <p className="text-[13px] text-muted-foreground">{step.detail}</p> : null}
+        {typeof step.output?.report === 'string' && step.output.report ? (
+          <div>
+            <div className="text-[12px] font-medium text-muted-foreground">What it reported</div>
+            <pre className="mt-1 max-h-96 overflow-auto rounded-md border border-border bg-muted/40 p-3 text-[13px] leading-relaxed whitespace-pre-wrap break-words">
+              {step.output.report}
+            </pre>
+          </div>
+        ) : null}
         {step.input?.chose?.map((chosen, index) => (
           <p key={index} className="text-[13px] text-muted-foreground">
             Then the flow asked (<span className="font-mono text-[12px]">{chosen.task}</span>): {chosen.asked}?{' '}

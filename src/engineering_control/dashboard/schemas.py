@@ -310,6 +310,25 @@ class SavedTaskInput(DashboardModel):
     wording: dict[str, str] = Field(default_factory=dict)
 
 
+class TaskInput(DashboardModel):
+    """A task of the administrator's own: a kind of task of the platform's with its
+    settings, kept under a name. ``task`` is read when one is made and not after."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=80)
+    task: str | None = Field(default=None, max_length=64)
+    description: str | None = Field(default=None, max_length=600)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    wording: dict[str, str] = Field(default_factory=dict)
+
+
+class TaskHiddenInput(DashboardModel):
+    """Whether a kind of task is left out of the designer's list."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    hidden: bool
+
+
 class FlowCreateInput(DashboardModel):
     """A new flow of the library: brought in as a document, copied from a flow that
     exists, or empty."""

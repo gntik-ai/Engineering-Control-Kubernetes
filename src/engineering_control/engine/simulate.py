@@ -68,7 +68,7 @@ def simulate(
     # simulation itself goes through.
     known = {name: value for name, value in (known or {}).items() if name != "went"}
     known["scope"] = {"text": "given"} if scope else {}
-    ran: dict[str, str] = {}
+    ran: dict[str, Any] = {}
     steps: list[dict[str, Any]] = []
     seen: list[str] = []
     each: dict[str, int] = {}
@@ -135,7 +135,7 @@ def simulate(
         offered = routing.provider_for(node, ran, again=again)
         provider = offered.split(",")[0] if offered else None
         if provider:
-            ran[node.id] = provider
+            ran = routing.ran_on(ran, node, provider)
         outcome, assumed = outcome_of(node)
         times = int(node.params.get("rounds") or task.defaults().get("rounds") or 1)
         step(
