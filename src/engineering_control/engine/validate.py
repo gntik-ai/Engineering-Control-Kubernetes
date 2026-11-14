@@ -7,8 +7,10 @@ whoever wrote it (the study's section 11.2): these rules are stated in terms of 
 tasks are, so no arrangement of tasks gets around them.
 
 - Nothing an agent wrote is published unless, after the last change, an agent of the
-  other subscription reviewed it, the tests and the scan passed it, it was collected, and
-  the administrator decided.
+  other subscription passed it in review, the tests passed it (or left it no worse), it
+  was scanned for secrets, it was collected, and the administrator decided. Each counts
+  only by the outcome that says so: no way that leads on from a reviewer's "changes" or
+  from the tests' "regression" publishes.
 - A task that judges another's work runs on the other subscription.
 - Loops are bounded: by the flow's rounds, which have a ceiling, and by the fixed size of
   a list that is gone through.
@@ -111,13 +113,32 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
     return f"{name} cannot be read"
 
 
-def _asks(node: Node, nodes: dict[str, Node], before: set[str], made: set[str]) -> list[Problem]:
+def _unwritten(document: Document, nodes: dict[str, Node]) -> set[str]:
+    """The tasks that can run before any agent has changed the code."""
+    seen: set[str] = set()
+    todo = [document.start]
+    while todo:
+        current = todo.pop()
+        if current in seen or current not in nodes:
+            continue
+        seen.add(current)
+        task = TASKS.get(nodes[current].task)
+        if task is None or task.writes:
+            continue  # what follows a task that writes comes after a change
+        todo += [target for target in nodes[current].next.values() if target]
+    return seen
+
+
+def _asks(
+    node: Node, nodes: dict[str, Node], before: set[str], made: set[str], unwritten: set[str]
+) -> list[Problem]:
     """What an If asks about that the run cannot know where the If stands."""
     found: list[Problem] = []
     if conditions.problems(node.params.get("condition")):
         return found  # said already, as a setting that cannot be read
+    # What failed before any change is known from a task that ran the tests then.
     baseline = any(
-        nodes[earlier].task == "check.tests"
+        (nodes[earlier].task == "check.tests" and earlier in unwritten)
         or (nodes[earlier].task == "workspace.checkout" and nodes[earlier].params.get("baseline"))
         for earlier in before
     )
@@ -187,10 +208,15 @@ def _ancestors(nodes: dict[str, Node], reached: set[str]) -> dict[str, set[str]]
 
 def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]) -> None:
     """Walk every way through the flow, remembering what has happened to the change
-    since an agent last wrote it, and look at each task that publishes."""
-    # (task, changed since reviewed, since tested, since collected, decided)
-    State = tuple[str, bool, bool, bool, bool]
-    start: State = (document.start, False, False, False, True)
+    since an agent last wrote it, and look at each task that publishes.
+
+    A change passes a review, the tests or the scan by the outcome that says so, and by
+    no other: the way a reviewer's "changes" or the tests' "regression" leads is a way
+    on which the change was not passed."""
+    # (task, since last written: not reviewed, not tested, not scanned, not collected,
+    #  not decided)
+    State = tuple[str, bool, bool, bool, bool, bool]
+    start: State = (document.start, False, False, False, False, True)
     seen: set[State] = set()
     todo: list[State] = [start]
     said: set[tuple[str, str]] = set()
@@ -205,43 +231,48 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
         if state in seen:
             continue
         seen.add(state)
-        node_id, unreviewed, untested, uncollected, undecided = state
+        node_id, unreviewed, untested, unscanned, uncollected, undecided = state
         node = nodes.get(node_id)
         task = TASKS.get(node.task) if node is not None else None
         if node is None or task is None:
             continue
         if task.writes:
-            unreviewed = untested = uncollected = undecided = True
-        if node.task == "agent.review":
-            unreviewed = False
-        if task.gate:
-            untested = False
+            unreviewed = untested = unscanned = uncollected = undecided = True
         if node.task == "change.collect":
             if untested:
                 say(
                     "collect_after_tests",
                     node.id,
-                    f"{node.id} collects a change that the tests and the scan have not "
-                    "passed since an agent last wrote it. Put Test and scan before it.",
+                    f"{node.id} collects a change that the tests have not passed since an "
+                    "agent last wrote it. Put Run the tests before it, and lead to it by "
+                    "passed or failed, not by regression.",
                 )
             uncollected = False
         if task.approval:
             # A decision counts for the change as it is at that moment, and no further.
-            undecided = unreviewed or untested or uncollected
+            undecided = unreviewed or untested or unscanned or uncollected
         if task.publishes:
             if unreviewed:
                 say(
                     "publish_reviewed",
                     node.id,
                     f"{node.id} could publish a change no agent of the other subscription "
-                    "has reviewed since it was last written.",
+                    "has passed in review since it was last written.",
                 )
             if untested:
                 say(
                     "publish_tested",
                     node.id,
-                    f"{node.id} could publish a change that the tests and the scan have "
-                    "not passed since it was last written.",
+                    f"{node.id} could publish a change that the tests have not passed "
+                    "since it was last written.",
+                )
+            if unscanned:
+                say(
+                    "publish_scanned",
+                    node.id,
+                    f"{node.id} could publish a change that was not scanned for secrets "
+                    "since it was last written. Put Scan for secrets before the "
+                    "administrator's decision.",
                 )
             if uncollected:
                 say(
@@ -256,11 +287,20 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
                     node.id,
                     f"{node.id} could publish without the administrator's decision on the "
                     "change as it is. Put Wait for the administrator before it, after the "
-                    "review, the tests and the collection.",
+                    "review, the tests, the scan and the collection.",
                 )
-        for target in node.next.values():
+        for outcome, target in node.next.items():
             if target:
-                todo.append((target, unreviewed, untested, uncollected, undecided))
+                todo.append(
+                    (
+                        target,
+                        unreviewed and outcome not in task.reviewed,
+                        untested and outcome not in task.tested,
+                        unscanned and outcome not in task.scanned,
+                        uncollected,
+                        undecided,
+                    )
+                )
 
 
 def problems(document: Document) -> list[Problem]:
@@ -344,6 +384,7 @@ def problems(document: Document) -> list[Problem]:
         if node.id not in reached:
             found.append(_problem("unreached", f"{node.id} is never reached", node.id, "warning"))
     before = _ancestors(nodes, reached)
+    unwritten = _unwritten(document, nodes)
     for node_id in sorted(reached):
         node = nodes[node_id]
         task = TASKS[node.task]
@@ -358,7 +399,7 @@ def problems(document: Document) -> list[Problem]:
                     )
                 )
         if node.task == "control.when":
-            found += _asks(node, nodes, before[node_id], made)
+            found += _asks(node, nodes, before[node_id], made, unwritten)
         other = node.params.get("other_than")
         if other and other in nodes and other not in before[node_id]:
             found.append(

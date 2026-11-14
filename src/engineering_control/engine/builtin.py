@@ -49,10 +49,13 @@ _DELIVER: Final[dict[str, Any]] = {
             "next": {"pass": "verify", "changes": "implement"},
         },
         {
+            # The same tests again, compared with before the change. What failed before
+            # as well does not hold a change back; what the change broke sends it back.
             "id": "verify",
-            "task": "check.change",
-            "next": {"ok": "bundle", "regression": "implement"},
+            "task": "check.tests",
+            "next": {"passed": "scan", "failed": "scan", "regression": "implement"},
         },
+        {"id": "scan", "task": "check.secrets", "next": {"ok": "bundle"}},
         {"id": "bundle", "task": "change.collect", "next": {"ok": "approve"}},
         {"id": "approve", "task": "people.approval", "next": {"publish": "publish"}},
         {"id": "publish", "task": "github.pull_request"},

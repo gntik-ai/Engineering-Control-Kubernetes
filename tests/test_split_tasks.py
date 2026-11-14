@@ -81,11 +81,13 @@ def test_three_tasks_stand_where_one_stood_and_no_agent_is_in_any() -> None:
     )
     for task in (clone, install, tests):
         assert task.where == "sandbox" and task.prompt is None
-        assert not (task.account or task.writes or task.publishes or task.approval or task.gate)
+        assert not (task.account or task.writes or task.publishes or task.approval)
         assert "No agent takes part" in task.summary
+    assert not clone.gate and not install.gate
     assert clone.produces == ("checkout",) and [p.kind for p in clone.params] == ["line"]
     assert install.needs == ("checkout",) and [p.kind for p in install.params] == ["commands"]
-    assert tests.outcomes == ("passed", "failed") and tests.produces == ("baseline",)
+    assert tests.outcomes == ("passed", "failed", "regression")
+    assert tests.produces == ("baseline",)
     # The task they took the place of is kept for the flows that have it.
     old = TASKS["workspace.checkout"]
     assert old.retired == "Clone the repository, Install the project and Run the tests"
@@ -239,13 +241,7 @@ async def test_the_commands_of_a_task_are_run_in_place_of_the_projects(world: An
     )
     await world.step("review", _reviewed(PASSED, provider="chatgpt"))
     job = await _job(world, "verify")
-    assert [c["name"] for c in job["commands"]] == [
-        "note",
-        "test 1",
-        "test 2",
-        "restore",
-        "secrets",
-    ]
+    assert [c["name"] for c in job["commands"]] == ["note", "test 1", "test 2", "restore"]
     assert [c["argv"] for c in job["commands"][1:3]] == [
         ["npm", "run", "lint"],
         ["npm", "test", "--", "--run"],
@@ -338,6 +334,170 @@ async def test_a_flow_that_still_has_the_one_task_runs_as_before(world: Any) -> 
     )
     await _job(world, "implement")
     assert world.run(run["id"])["data"]["baseline"] == {"1": 0, "2": 0}
+    await world.github.aclose()
+
+
+# --- the tests after a change, and the scan ---------------------------------------------------
+
+
+def test_running_the_tests_and_scanning_for_secrets_are_two_tasks_without_an_agent() -> None:
+    tests, scan, old = (TASKS[key] for key in ("check.tests", "check.secrets", "check.change"))
+    assert (scan.title, scan.outcomes, scan.where) == ("Scan for secrets", ("ok",), "sandbox")
+    assert not (scan.account or scan.writes or scan.publishes) and scan.needs == (
+        "checkout",
+        "change",
+    )
+    # Which outcomes say a change passed: the tests when it is no worse, the scan's only one.
+    assert (tests.tested, tests.scanned) == (("passed", "failed"), ())
+    assert (scan.tested, scan.scanned) == ((), ("ok",))
+    assert TASKS["agent.review"].reviewed == ("pass",)
+    # The task that did both is kept for the flows that have it, and counts by "ok" alone.
+    assert old.retired == "Run the tests and Scan for secrets"
+    assert (old.tested, old.scanned) == (("ok",), ("ok",))
+    deliver_issue = {node.id: node for node in BUILTIN["deliver-issue"].nodes}
+    assert deliver_issue["verify"].task == "check.tests"
+    assert deliver_issue["verify"].next == {
+        "passed": "scan",
+        "failed": "scan",
+        "regression": "implement",
+    }
+    assert deliver_issue["scan"].task == "check.secrets"
+    assert not any(node.task == "check.change" for flow in BUILTIN.values() for node in flow.nodes)
+
+
+def test_a_change_is_published_only_by_the_outcomes_that_pass_it() -> None:
+    assert _rules(_raw()) == set()
+
+    def led(node: str, outcome: str, target: str) -> set[str]:
+        raw = _raw()
+        _task(raw, node)["next"][outcome] = target
+        return _rules(raw)
+
+    # The tests' regression is no way to the collection, and no way to publishing.
+    assert {"collect_after_tests", "publish_tested"} <= led("verify", "regression", "bundle")
+    assert "publish_tested" in led("verify", "regression", "scan")
+    # A reviewer who asks for changes has not passed the change.
+    assert "publish_reviewed" in led("review", "changes", "verify")
+    # Without the scan nothing is published, and the administrator is not asked.
+    without = led("verify", "passed", "bundle") | led("verify", "failed", "bundle")
+    assert {"publish_scanned", "publish_decided"} <= without
+    raw = _raw()
+    raw["tasks"] = [task for task in raw["tasks"] if task["id"] != "scan"]
+    _task(raw, "verify")["next"] = {
+        "passed": "bundle",
+        "failed": "bundle",
+        "regression": "implement",
+    }
+    assert "publish_scanned" in _rules(raw)
+    # The scan may come before the tests: what counts is that both passed the change.
+    raw = _raw()
+    _task(raw, "review")["next"] = {"pass": "scan", "changes": "implement"}
+    _task(raw, "scan")["next"] = {"ok": "verify"}
+    _task(raw, "verify")["next"] = {
+        "passed": "bundle",
+        "failed": "bundle",
+        "regression": "implement",
+    }
+    assert _rules(raw) == set()
+    # A change written after the scan is not scanned.
+    raw = _raw()
+    raw["tasks"].append(
+        {
+            "id": "polish",
+            "task": "agent.change",
+            "with": {"instruction": "Tidy."},
+            "next": {"done": "bundle"},
+        }
+    )
+    _task(raw, "scan")["next"] = {"ok": "polish"}
+    assert {"publish_scanned", "publish_tested", "publish_reviewed"} <= _rules(raw)
+
+    # A flow that still has the one task: its "ok" passes both, its "regression" neither.
+    raw = _raw()
+    raw["tasks"] = [task for task in raw["tasks"] if task["id"] != "scan"]
+    _task(raw, "verify").update(
+        task="check.change", next={"ok": "bundle", "regression": "implement"}
+    )
+    assert _rules(raw) == set()
+    _task(raw, "verify")["next"]["regression"] = "bundle"
+    assert {"publish_tested", "publish_scanned"} <= _rules(raw)
+
+
+@pytest.mark.asyncio
+async def test_tests_run_only_after_the_change_have_nothing_to_compare_with(
+    world: Any,  # noqa: F811
+) -> None:
+    world.account("ChatGPT one", "chatgpt")
+    world.account("Claude one", "claude")
+    raw = _raw()
+    raw["tasks"] = [task for task in raw["tasks"] if task["id"] != "tests"]
+    _task(raw, "install")["next"] = {"ok": "implement"}
+    _task(raw, "implement")["with"]["providers"] = ["claude"]
+    assert _rules(raw) == set()
+    _in_force(world, raw)
+    run = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
+    await _job(world, "prepare")
+    await _end(world, CLONED)
+    await _job(world, "install")
+    await _end(world, _log([_ran("install 1")]))
+    await _job(world, "implement")
+    await _end(
+        world,
+        _log(
+            [
+                _ran("agent", _claude(MAKER_DONE)),
+                _ran("commit", f"{HEAD}\n"),
+                _ran("touched", "1\na\n"),
+            ]
+        ),
+    )
+    await world.step("review", _reviewed(PASSED, provider="chatgpt"))
+    job = await _job(world, "verify")
+    assert [c["name"] for c in job["commands"]] == ["note", "test 1", "test 2", "restore"]
+    await _end(world, _log([_ran("test 1", exit_code=1, stderr="boom"), _ran("test 2")]))
+    after = world.run(run["id"])
+    verified = next(s for s in after["steps"] if s["name"] == "verify")
+    # A failure that cannot be compared is not called a regression, and is said as it is.
+    assert (verified["outcome"], after["data"]["went"]["verify"]) == ("tests_no_worse", "failed")
+    assert verified["detail"] == (
+        "1 of 2 test commands fail after the change, and they were not run before the "
+        "change, so there is nothing to compare with: pnpm run typecheck"
+    )
+    assert verified["output"]["compared"] is False and verified["output"]["regressions"] == []
+    assert "baseline" not in after["data"], "what is found after a change is no baseline"
+
+    # The scan: a credential in the change ends the run, and so does a scan that did not run.
+    job = await _job(world, "scan")
+    assert [c["name"] for c in job["commands"]] == ["secrets"]
+    await _end(world, _log([_ran("secrets", exit_code=23)]))
+    ended = world.run(run["id"])
+    assert (ended["state"], ended["outcome"]) == ("failed", "secret_found")
+    assert ended["detail"] == "The change holds something that looks like a credential."
+
+    again = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
+    await _job(world, "prepare")
+    await _end(world, CLONED)
+    await _job(world, "install")
+    await _end(world, _log([_ran("install 1")]))
+    await _job(world, "implement")
+    await _end(
+        world,
+        _log(
+            [
+                _ran("agent", _claude(MAKER_DONE)),
+                _ran("commit", f"{HEAD}\n"),
+                _ran("touched", "1\na\n"),
+            ]
+        ),
+    )
+    await world.step("review", _reviewed(PASSED, provider="chatgpt"))
+    await _job(world, "verify")
+    await _end(world, _log([_ran("test 1"), _ran("test 2")]))
+    await _job(world, "scan")
+    await _end(world, _log([_ran("secrets", exit_code=1, stderr="gitleaks: no such option")]))
+    ended = world.run(again["id"])
+    assert (ended["state"], ended["outcome"]) == ("failed", "scan_failed")
+    assert "gitleaks: no such option" in ended["detail"]
     await world.github.aclose()
 
 
@@ -450,7 +610,7 @@ def test_the_console_shows_and_changes_a_projects_commands_with_the_password(
         assert post("/projects/nobody/commands/try").status_code == 404
         # The designer is given the three tasks and not the one they took the place of.
         catalogue = client.get("/api/dashboard/flows/catalogue").json()
-        assert catalogue["hidden"] == ["workspace.checkout"]
+        assert catalogue["hidden"] == ["check.change", "workspace.checkout"]
         kinds = {task["key"]: task for task in catalogue["tasks"]}
         assert kinds["workspace.clone"]["params"][0]["kind"] == "line"
         assert kinds["workspace.checkout"]["retired"]
@@ -510,7 +670,7 @@ async def test_a_projects_commands_are_tried_without_an_agent(world: Any) -> Non
 
 def test_the_task_that_was_replaced_is_listed_and_not_offered(world: Any) -> None:  # noqa: F811
     tasks = TaskLibrary(world.sessions, FlowRecords(world.sessions))
-    assert tasks.hidden() == ["workspace.checkout"]
+    assert tasks.hidden() == ["check.change", "workspace.checkout"]
     kinds = {kind["key"]: kind for kind in tasks.listing()["kinds"]}
     assert kinds["workspace.checkout"]["hidden"] is True and kinds["workspace.checkout"]["retired"]
     assert kinds["workspace.clone"]["hidden"] is False

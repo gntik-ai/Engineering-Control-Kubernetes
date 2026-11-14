@@ -437,14 +437,21 @@ class Install:
         )
 
 
+def _written(data: dict[str, Any]) -> bool:
+    """Whether an agent of the run has changed the code since the run started."""
+    head = data.get("head")
+    return bool(head) and head != data.get("base_sha")
+
+
 class RunTests:
-    """Run the project's tests before anything is changed, without network: what the
-    validation of a change is compared with, under the same conditions."""
+    """Run the project's tests, without network. Before anything is changed: what
+    already fails. After a change: the same commands under the same conditions, compared
+    with before, which is what a change has to pass to be published."""
 
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
         commands, _own = _own_commands(ctx, "tests")
         return Plan(
-            deliver.tests_job(commands),
+            deliver.tests_job(commands, after=_written(ctx.data)),
             egress="none",
             workspace=True,
             memory="6Gi",
@@ -453,25 +460,96 @@ class RunTests:
 
     async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
         ran, own = _own_commands(ctx, "tests")
-        results = {
-            str(command.get("name")).removeprefix("baseline "): command.get("exit_code")
-            for command in commands
-            if str(command.get("name")).startswith("baseline ")
-        }
         lines = [deliver.line_of(command) for command in ran]
-        failing = [
-            lines[int(index) - 1] if index.isdigit() and int(index) <= len(lines) else index
-            for index, code in results.items()
-            if code != 0
-        ]
-        data: dict[str, Any] = {"baseline": results}
+        results: dict[str, Any] = {}
+        said: dict[str, dict[str, Any]] = {}
+        for command in commands:
+            name = str(command.get("name"))
+            for word in ("baseline ", "test "):
+                if name.startswith(word):
+                    results[name.removeprefix(word)] = command.get("exit_code")
+                    said[name.removeprefix(word)] = command
+
+        def line(index: str) -> str:
+            return lines[int(index) - 1] if index.isdigit() and int(index) <= len(lines) else index
+
+        failing = [index for index, code in results.items() if code != 0]
+        data: dict[str, Any] = {}
         if own:
-            # Test and scan runs what was run here, so that the two can be compared.
+            # Whatever runs the tests later in the run runs what was run here, and the
+            # agents are told of the same commands.
             data["toolchain"] = {
                 **(ctx.data.get("toolchain") or {}),
                 "tests": [command.as_dict() for command in ran],
             }
-        output = {"commands": lines, "own": own, "baseline": results, "failing": failing}
+        output: dict[str, Any] = {
+            "commands": lines,
+            "own": own,
+            "baseline": results,
+            "failing": [line(index) for index in failing],
+        }
+        if not _written(ctx.data):
+            # Before any change: what is found now is what a change is compared with.
+            data["baseline"] = results
+            data["baseline_by_command"] = {line(index): code for index, code in results.items()}
+            if not ran:
+                return Done(
+                    "passed",
+                    "no_tests",
+                    "The project names no test commands, so nothing was run.",
+                    output=output,
+                    data=data,
+                )
+            if failing:
+                return Done(
+                    "failed",
+                    "tests_failing",
+                    f"{len(failing)} of {len(ran)} test commands fail before anything is "
+                    "changed: " + "; ".join(output["failing"])[:300],
+                    output=output,
+                    data=data,
+                )
+            return Done(
+                "passed",
+                "tests_passing",
+                f"All {len(ran)} test command{'s' if len(ran) != 1 else ''} pass before "
+                "anything is changed.",
+                output=output,
+                data=data,
+            )
+
+        # After a change: compared with before, command by command.
+        before = ctx.data.get("baseline_by_command")
+        if not isinstance(before, dict):
+            # The task that checked out and ran the tests in one step kept them by number.
+            numbered = ctx.data.get("baseline")
+            before = (
+                {line(str(index)): code for index, code in numbered.items()}
+                if isinstance(numbered, dict)
+                else None
+            )
+        regressions = [index for index in failing if before and before.get(line(index)) == 0]
+        already = [line(index) for index in failing if index not in regressions]
+        output = {
+            **output,
+            "regressions": [line(index) for index in regressions],
+            "already_failing": already,
+            "compared": before is not None,
+        }
+        if regressions:
+            return Done(
+                "regression",
+                "tests_failed",
+                f"{len(regressions)} test command(s) that passed before the change fail "
+                "after it: " + "; ".join(output["regressions"])[:300],
+                output=output,
+                data=data,
+                given={
+                    "failures": [
+                        f"{line(index)}\n{_tail(said[index], 3000)}" for index in regressions
+                    ]
+                },
+            )
         if not ran:
             return Done(
                 "passed",
@@ -480,23 +558,50 @@ class RunTests:
                 output=output,
                 data=data,
             )
-        if failing:
+        if already:
+            why = (
+                "as before the change"
+                if before is not None
+                else "and they were not run before the change, so there is nothing to compare with"
+            )
             return Done(
                 "failed",
-                "tests_failing",
-                f"{len(failing)} of {len(ran)} test commands fail before anything is "
-                "changed: " + "; ".join(failing)[:300],
+                "tests_no_worse",
+                f"{len(already)} of {len(ran)} test commands fail after the change, {why}: "
+                + "; ".join(already)[:300],
                 output=output,
                 data=data,
             )
         return Done(
             "passed",
-            "tests_passing",
-            f"All {len(ran)} test command{'s' if len(ran) != 1 else ''} pass before "
-            "anything is changed.",
+            "tests_passed",
+            f"All {len(ran)} test command{'s' if len(ran) != 1 else ''} pass after the change.",
             output=output,
             data=data,
         )
+
+
+class ScanSecrets:
+    """Scan what the change added for anything that looks like a credential. One found
+    ends the run: there is no way on from it."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        return Plan(
+            deliver.secrets_job(ctx.data["base_sha"]),
+            egress="none",
+            workspace=True,
+            deadline_seconds=900,
+        )
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        secrets = next((c for c in commands if c.get("name") == "secrets"), None)
+        if secrets is None or secrets.get("exit_code") == 23:
+            return Failed(
+                "secret_found", "The change holds something that looks like a credential."
+            )
+        if secrets.get("exit_code") != 0:
+            return Failed("scan_failed", f"The scan for secrets did not run: {_tail(secrets)}")
+        return Done("ok", "scanned", "No secret was found in the change.")
 
 
 # --- delivering a change ----------------------------------------------------------------
@@ -1437,6 +1542,7 @@ SANDBOX: Final[dict[str, SandboxTask]] = {
     "workspace.clone": Clone(),
     "workspace.install": Install(),
     "check.tests": RunTests(),
+    "check.secrets": ScanSecrets(),
     "workspace.checkout": Checkout(),
     "agent.implement": Implement(),
     "agent.review": Review(),

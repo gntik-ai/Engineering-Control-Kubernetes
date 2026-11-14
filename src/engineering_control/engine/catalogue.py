@@ -78,7 +78,12 @@ class TaskType:
     account: bool = False  # an agent of a subscription works in it
     writes: bool = False  # it may change the checkout
     publishes: bool = False  # it reaches GitHub
-    gate: bool = False  # it is the validation every change passes before it is published
+    gate: bool = False  # it is part of what every change passes before it is published
+    # The outcomes that say a change passed here: the review of the other subscription,
+    # the tests, the scan for secrets. A change is published only by way of them.
+    reviewed: tuple[str, ...] = ()
+    tested: tuple[str, ...] = ()
+    scanned: tuple[str, ...] = ()
     approval: bool = False  # the administrator decides here
     application: bool = False  # it looks at the project's running application in a browser
     needs: tuple[str, ...] = ()
@@ -100,6 +105,11 @@ class TaskType:
             "writes": self.writes,
             "publishes": self.publishes,
             "gate": self.gate,
+            "passes": {
+                "reviewed": list(self.reviewed),
+                "tested": list(self.tested),
+                "scanned": list(self.scanned),
+            },
             "approval": self.approval,
             "application": self.application,
             "needs": list(self.needs),
@@ -197,13 +207,17 @@ _TASKS: Final = (
         "check.tests",
         "Deterministic checks",
         "Run the tests",
-        "Run the project's test commands once, without network, to know what passes and "
-        "what already fails before anything is changed. Test and scan compares with it "
-        "and runs the same commands. No agent takes part.",
+        "Run the project's test commands, without network. Before anything is changed it "
+        "records what passes and what already fails. After a change it runs the same "
+        "commands and compares: passed when all pass, failed when something fails that "
+        "failed before as well (or there is nothing to compare with), regression when "
+        "something that passed before the change fails now. No agent takes part.",
         "sandbox",
+        gate=True,
+        tested=("passed", "failed"),
         needs=("checkout",),
         produces=("baseline",),
-        outcomes=("passed", "failed"),
+        outcomes=("passed", "failed", "regression"),
         params=(
             Param(
                 "commands",
@@ -252,6 +266,7 @@ _TASKS: Final = (
         "changes or stops it. Whatever it changes while looking is thrown away.",
         "sandbox",
         account=True,
+        reviewed=("pass",),
         needs=("change",),
         produces=("review",),
         outcomes=("pass", "changes"),
@@ -306,6 +321,19 @@ _TASKS: Final = (
         prompt="own_report",
     ),
     TaskType(
+        "check.secrets",
+        "Deterministic checks",
+        "Scan for secrets",
+        "Scan what the change added for anything that looks like a credential, a token "
+        "or a key. One found ends the run: nothing of it is published. No agent takes "
+        "part.",
+        "sandbox",
+        gate=True,
+        scanned=("ok",),
+        needs=("checkout", "change"),
+        produces=("scanned",),
+    ),
+    TaskType(
         "check.change",
         "Deterministic checks",
         "Test and scan",
@@ -313,6 +341,9 @@ _TASKS: Final = (
         "change, and a scan of the change for secrets. No agent takes part.",
         "sandbox",
         gate=True,
+        tested=("ok",),
+        scanned=("ok",),
+        retired="Run the tests and Scan for secrets",
         needs=("checkout", "change"),
         produces=("verified",),
         outcomes=("ok", "regression"),

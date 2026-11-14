@@ -490,15 +490,15 @@ def test_the_list_says_which_flows_use_a_task_and_a_change_is_written_into_draft
 
 def test_a_kind_of_task_can_be_left_out_of_the_designers_list(world: Any) -> None:  # noqa: F811
     tasks, _flows = _library(world)
-    # Only the kind the three tasks took the place of is left out to begin with.
-    assert tasks.hidden() == ["workspace.checkout"]
+    # Only the kinds other tasks took the place of are left out to begin with.
+    assert tasks.hidden() == ["check.change", "workspace.checkout"]
     assert tasks.hide("agent.discover", hidden=True)["hidden"] is True
     tasks.hide("agent.discover", hidden=True)  # twice is once
-    assert tasks.hidden() == ["agent.discover", "workspace.checkout"]
+    assert tasks.hidden() == ["agent.discover", "check.change", "workspace.checkout"]
     kinds = {kind["key"]: kind["hidden"] for kind in tasks.listing()["kinds"]}
     assert kinds["agent.discover"] is True and kinds["agent.implement"] is False
     tasks.hide("agent.discover", hidden=False)
-    assert tasks.hidden() == ["workspace.checkout"]
+    assert tasks.hidden() == ["check.change", "workspace.checkout"]
     with pytest.raises(ProjectNotFound):
         tasks.hide("agent.dance", hidden=True)
 
@@ -556,7 +556,7 @@ def test_the_console_manages_the_tasks(world: Any) -> None:  # noqa: F811
         # The designer is given it, and makes a task of a flow from it that remembers it.
         catalogue = client.get("/api/dashboard/flows/catalogue").json()
         assert [row["name"] for row in catalogue["saved"]] == ["Plan first"]
-        assert catalogue["hidden"] == ["workspace.checkout"]
+        assert catalogue["hidden"] == ["check.change", "workspace.checkout"]
         assert any(
             param["kind"] == "text" for task in catalogue["tasks"] for param in task["params"]
         )
@@ -585,6 +585,7 @@ def test_the_console_manages_the_tasks(world: Any) -> None:  # noqa: F811
         assert post("/task-kinds/agent.discover/hidden", hidden=True).status_code == 200
         assert client.get("/api/dashboard/flows/catalogue").json()["hidden"] == [
             "agent.discover",
+            "check.change",
             "workspace.checkout",
         ]
         assert post("/task-kinds/agent.dance/hidden", hidden=True).status_code == 404

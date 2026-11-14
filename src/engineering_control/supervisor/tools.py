@@ -440,7 +440,9 @@ class Toolbox:
                 },
                 "rules": [
                     "After the last task that can change the checkout, a change is reviewed "
-                    "by the other subscription (agent.review), tested (check.change), "
+                    "by the other subscription (agent.review, by its outcome pass), tested "
+                    "(check.tests, by passed or failed, never by regression), scanned for "
+                    "secrets (check.secrets), "
                     "collected (change.collect) and decided by the administrator "
                     "(people.approval), in that order, before github.pull_request.",
                     "A task that judges another's work names it in other_than and is given "

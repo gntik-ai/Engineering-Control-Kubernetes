@@ -396,7 +396,8 @@ a checkout in a volume of its own (`run-<id>`, deleted when the run ends or wait
 | Run the tests | no network, no account | The project's test commands once, every one of them, to know what already fails before anything is changed |
 | Implement | network, one account | An agent of one subscription (ChatGPT first, Claude when no ChatGPT account is free) changes the code. The platform commits |
 | Review | network, an account of the other subscription | Passes the change, asks for changes (back to Implement, three rounds at most) or stops the run |
-| Test and scan | no network, no account | The project's test commands; a command that passed before the change and fails after it sends the work back. A scan for secrets in the change; a finding ends the run |
+| Run the tests (again) | no network, no account | The same test commands, compared with before the change: a command that passed before and fails now sends the work back; one that failed before as well does not hold the change back |
+| Scan for secrets | no network, no account | What the change added, for anything that looks like a credential; a finding ends the run |
 | Collect the change | no network, no account | The change file by file, with its diff, handed back to the platform |
 
 Then the run waits (Inbox, and the run's page): the administrator reads the change and,
@@ -407,8 +408,8 @@ pull request. No sandbox ever holds a token that can write, nothing a sandbox pr
 executed by the platform, nothing is merged, and no existing branch is moved. A change that
 touches `.github/`, `.claude/`, `.codex/`, `.mcp.json`, `CLAUDE.md` or `AGENTS.md` is refused.
 
-The first three steps, Test and scan and Collect the change are commands and nothing
-else: no agent, no model and no subscription takes part in them, and the same input
+The first three steps, the tests after the change, the scan and Collect the change are
+commands and nothing else: no agent, no model and no subscription takes part in them, and the same input
 gives the same result. The issue's text reaches the agents marked as material from
 outside, with the rule not to follow instructions in it that go beyond the repository.
 
@@ -447,13 +448,29 @@ Three tasks run them, each a step of its own:
   the task, with the package registries in reach and without the clone's token.
 - **Run the tests** runs the project's test commands, or the ones written in the task,
   without network (the sandbox's own loopback works, so tests that start a local server
-  run), and ends with `passed` or `failed`; both usually lead on, since what
-  matters is what a change breaks. Test and scan later runs the same commands under the
-  same conditions and compares: a command that passed here and fails there is a
-  regression, one that failed here already is only noted. When the task names its own
-  commands, they are the run's test commands from then on: the agents are told of them
-  and Test and scan runs them. A flow without Run the tests has nothing to compare
-  with, so failing tests do not send the work back in it.
+  run). It is one task for both places a flow has it. Before any agent has changed the
+  code it records what passes and what already fails, and ends with `passed` or
+  `failed`; both usually lead on, since what matters is what a change breaks. After a
+  change it runs the same commands under the same conditions and compares, command by
+  command, with what was recorded:
+
+  | Ends with | When |
+  | --- | --- |
+  | `passed` | Every command passes |
+  | `failed` | Something fails that failed before the change as well, or the tests were not run before the change, so there is nothing to compare with |
+  | `regression` | A command that passed before the change fails now; its output is given to the task the outcome leads to |
+
+  When the task names its own commands, they are the run's test commands from then on:
+  the agents are told of them and a later Run the tests runs them. `failed` does not
+  hold a change back in the platform's own delivery, as before; a flow that wants every
+  test green before anything is published leads `failed` somewhere else, or nowhere,
+  which ends the run.
+- **Scan for secrets** scans what the change added for anything that looks like a
+  credential, a token or a key. It has one outcome; a finding, or a scan that could not
+  run, ends the run.
+
+Run the tests and Scan for secrets took the place of the single task "Test and scan",
+which is kept for the flows that have it and is no longer offered.
 
 What tests leave in the checkout is thrown away, by Run the tests and by Test and scan
 alike: the files that were not there before the tests and that the repository does not
@@ -551,9 +568,13 @@ as before.
 while a run goes (`engine/validate.py`, `engine/routing.py`), whoever wrote the flow:
 
 - After the last task that can change the checkout, a change has to pass a review by the
-  other subscription, the tests and the scan, be collected, and be decided on by the
-  administrator, in that order, before a task that reaches GitHub. A flow in which any
-  way round leads past one of them cannot be put in force.
+  other subscription, the tests and the scan for secrets, be collected, and be decided
+  on by the administrator, before a task that reaches GitHub. A flow in which any way
+  round leads past one of them cannot be put in force. Each counts by the outcome that
+  says the change passed, and by no other: the review by `pass`, Run the tests by
+  `passed` or `failed` (no worse than before the change), Scan for secrets by `ok`. A
+  flow that leads on from a reviewer's `changes` or from the tests' `regression` to the
+  collection or to GitHub is refused, however the rest of it is drawn.
 - A task that judges another's work is given to the other subscription than the one that
   did the work. A task that is gone back to keeps its subscription.
 - Going back to a task is a round. A run has as many as its flow says, five at most.

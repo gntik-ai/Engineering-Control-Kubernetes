@@ -79,6 +79,7 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
         "implement",
         "review",
         "verify",
+        "scan",
         "bundle",
         "approve",
         "publish",
@@ -211,7 +212,7 @@ def test_a_flow_has_to_hold_together() -> None:
     _task(raw, "review")["next"]["maybe"] = "verify"
     assert "outcome" in _rules(raw)
     raw = _raw("deliver-issue")
-    _task(raw, "verify")["next"]["ok"] = "nowhere"
+    _task(raw, "verify")["next"]["passed"] = "nowhere"
     assert _rules(raw) == {"target"}
     raw = _raw("deliver-issue")
     raw["tasks"][0]["task"] = "magic.wand"
@@ -461,7 +462,7 @@ async def test_a_flow_that_ends_without_publishing_ends_well(world: Any) -> None
     await world.step("verify", _verified())
     await world.launcher.tick()
     ended = world.run(run["id"])
-    assert (ended["state"], ended["outcome"]) == ("succeeded", "verified")
+    assert (ended["state"], ended["outcome"]) == ("succeeded", "tests_passed")
     assert [step["name"] for step in ended["steps"]] == [
         "prepare",
         "install",

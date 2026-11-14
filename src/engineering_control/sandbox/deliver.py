@@ -421,14 +421,40 @@ def install_job(commands: tuple[Command, ...]) -> dict[str, Any]:
     return {"commands": listed or [dict(_NOTHING)]}
 
 
-def tests_job(commands: tuple[Command, ...]) -> dict[str, Any]:
-    """Run the project's tests before any change, every command whatever the one before
-    it did, to know what already fails."""
+def tests_job(commands: tuple[Command, ...], *, after: bool = False) -> dict[str, Any]:
+    """Run the project's tests, every command whatever the one before it did: before any
+    change to know what already fails, ``after`` one to know what it broke."""
+    word = "test" if after else "baseline"
     listed = [
-        _in_repo(command, f"baseline {index}", allow_failure=True)
+        _in_repo(command, f"{word} {index}", allow_failure=True)
         for index, command in enumerate(commands, 1)
     ]
     return {"commands": _around_tests(listed) or [dict(_NOTHING)]}
+
+
+def _secrets(base_sha: str) -> dict[str, Any]:
+    """The scan of what a change added for anything that looks like a credential."""
+    return {
+        "name": "secrets",
+        "argv": [
+            "gitleaks",
+            "git",
+            "--no-banner",
+            "--redact=100",
+            "--exit-code",
+            "23",
+            "--log-opts",
+            f"{base_sha}..HEAD",
+            ".",
+        ],
+        "cwd": REPO,
+        "timeout": 600,
+        "allow_failure": True,
+    }
+
+
+def secrets_job(base_sha: str) -> dict[str, Any]:
+    return {"commands": [_secrets(base_sha)]}
 
 
 def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -574,31 +600,13 @@ def review_job(
 
 
 def verify_job(base_sha: str, toolchain: Toolchain) -> dict[str, Any]:
+    """The tests and the scan in one sandbox: what the task that did both runs, for the
+    flows that still have it."""
     commands = [
         _in_repo(command, f"test {index}", allow_failure=True)
         for index, command in enumerate(toolchain.tests, start=1)
     ]
-    commands = _around_tests(commands)
-    commands.append(
-        {
-            "name": "secrets",
-            "argv": [
-                "gitleaks",
-                "git",
-                "--no-banner",
-                "--redact=100",
-                "--exit-code",
-                "23",
-                "--log-opts",
-                f"{base_sha}..HEAD",
-                ".",
-            ],
-            "cwd": REPO,
-            "timeout": 600,
-            "allow_failure": True,
-        }
-    )
-    return {"commands": commands}
+    return {"commands": [*_around_tests(commands), _secrets(base_sha)]}
 
 
 def bundle_job(base_sha: str) -> dict[str, Any]:

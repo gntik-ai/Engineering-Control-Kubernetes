@@ -72,7 +72,8 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
         "tests:passed",
         "implement:done",
         "review:pass",
-        "verify:ok",
+        "verify:passed",
+        "scan:ok",
         "bundle:ok",
         "approve:publish",
         "publish:ok",
@@ -90,7 +91,7 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
     assert by_task["implement"]["prompt"]["changed"] is False
     assert all(step["assumed"] for step in usual["steps"])
     assert usual["totals"] == {
-        "sandboxes": 7,
+        "sandboxes": 8,
         "agents": {"chatgpt": 1, "claude": 1},
         "rounds": 1,
         "of_rounds": 3,
@@ -161,7 +162,8 @@ async def test_a_run_that_happened_says_how_a_changed_flow_would_have_gone(world
         "tests": ["passed"],
         "implement": ["done", "done"],
         "review": ["changes", "pass"],
-        "verify": ["ok"],
+        "verify": ["passed"],
+        "scan": ["ok"],
         "bundle": ["ok"],
     }
     # The flow as it is: the same way the run went.

@@ -342,7 +342,7 @@ def test_the_console_makes_copies_and_brings_flows_in(world: Any) -> None:  # no
         )
         assert made.status_code == 201 and made.json()["state"] == "draft"
         assert made.json()["document"]["summary"] == "Deliver with more care."
-        assert len(made.json()["document"]["tasks"]) == 9
+        assert len(made.json()["document"]["tasks"]) == 10
         assert post("/flows", key="careful-delivery", name="Twice").status_code == 409
         assert post("/flows", key="nope", name="Nope", copy_of="nothing").status_code == 404
         # A flow with nothing in it yet: one task, to build on.

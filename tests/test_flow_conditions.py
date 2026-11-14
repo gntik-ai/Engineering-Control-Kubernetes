@@ -299,7 +299,7 @@ def test_no_if_leads_a_change_past_the_review_the_tests_or_the_administrator() -
         tasks = {task["id"]: task for task in raw["tasks"]}
         # The yes way goes round the task; the no way still passes it.
         tasks["docs"]["next"] = {
-            "yes": tasks[skipped]["next"]["pass" if skipped == "review" else "ok"],
+            "yes": tasks[skipped]["next"]["pass" if skipped == "review" else "passed"],
             "no": "review",
         }
         assert rule in _rules(raw) or "collect_after_tests" in _rules(raw), skipped

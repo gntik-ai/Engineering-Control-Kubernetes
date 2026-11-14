@@ -244,20 +244,18 @@ def world(tmp_path: Path) -> Any:
             assert pod["metadata"]["labels"]["engineering-control/step"] == name
             fake.finish(log)
             await self.launcher.tick()
-            if name == "prepare":
-                # What used to be one step is three: the clone, the installation and the
-                # tests before any change. One log says how all three went.
-                for _following in ("install", "tests"):
-                    await self.launcher.tick()
-                    started = list(fake.pods.values())
-                    label = "engineering-control/step"
-                    if len(started) != 1 or started[0]["metadata"]["labels"][label] not in (
-                        "install",
-                        "tests",
-                    ):
-                        break
-                    fake.finish(log)
-                    await self.launcher.tick()
+            # What used to be one step is several: the clone, the installation and the
+            # tests before any change; the tests after a change and the scan for secrets.
+            # One log says how each group went.
+            following = {"prepare": ("install", "tests"), "verify": ("scan",)}.get(name, ())
+            for _step in following:
+                await self.launcher.tick()
+                started = list(fake.pods.values())
+                label = "engineering-control/step"
+                if len(started) != 1 or started[0]["metadata"]["labels"][label] not in following:
+                    break
+                fake.finish(log)
+                await self.launcher.tick()
             return pod
 
         def run(self, run_id: str) -> dict[str, Any]:
@@ -409,15 +407,26 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     pod = world.fake.only_pod()
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "none"
     assert "engineering-control/account" not in pod["metadata"]["labels"]
-    assert [c["name"] for c in world.job()["commands"]] == [
-        "note",
-        "test 1",
-        "test 2",
-        "restore",
-        "secrets",
-    ]
+    assert [c["name"] for c in world.job()["commands"]] == ["note", "test 1", "test 2", "restore"]
     world.fake.finish(_verified())
     await world.launcher.tick()
+    tested = next(s for s in world.run(run["id"])["steps"] if s["name"] == "verify")
+    assert (tested["name"], tested["outcome"]) == ("verify", "tests_passed")
+    assert tested["detail"] == "All 2 test commands pass after the change."
+
+    # scan: what the change added, for anything that looks like a credential.
+    await world.launcher.tick()
+    pod = world.fake.only_pod()
+    assert pod["metadata"]["labels"]["engineering-control/step"] == "scan"
+    assert pod["metadata"]["labels"]["engineering-control/egress"] == "none"
+    assert "engineering-control/account" not in pod["metadata"]["labels"]
+    (scan,) = world.job()["commands"]
+    assert scan["name"] == "secrets" and scan["argv"][0] == "gitleaks"
+    assert f"{BASE}..HEAD" in scan["argv"]
+    world.fake.finish(_verified())
+    await world.launcher.tick()
+    scanned = next(s for s in world.run(run["id"])["steps"] if s["name"] == "scan")
+    assert scanned["detail"] == "No secret was found in the change."
 
     await world.step("bundle", _log([_ran("bundle", "2 files")], artifact=BUNDLE))
     waiting = world.run(run["id"])
@@ -429,6 +438,7 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
         "implement",
         "review",
         "verify",
+        "scan",
         "bundle",
     ]
     assert waiting["data"]["change"]["files"] == [
@@ -536,10 +546,12 @@ async def test_tests_that_passed_before_and_fail_after_go_back_and_old_failures_
     await world.step("verify", _verified(1, 1))
     steps_now = world.run(run["id"])["steps"]
     assert steps_now[-2]["outcome"] == "tests_failed"
-    assert steps_now[-2]["output"] == {
-        "regressions": ["pnpm run typecheck"],
-        "already_failing": ["pnpm run test"],
-    }
+    said = steps_now[-2]["output"]
+    assert (said["regressions"], said["already_failing"], said["compared"]) == (
+        ["pnpm run typecheck"],
+        ["pnpm run test"],
+        True,
+    )
     await world.launcher.tick()
     prompt = world.job()["commands"][0]["stdin"]
     assert "<failures>" in prompt and "pnpm run typecheck" in prompt and "boom" in prompt
@@ -547,8 +559,13 @@ async def test_tests_that_passed_before_and_fail_after_go_back_and_old_failures_
     await world.launcher.tick()
     await world.step("review", _reviewed())
     await world.step("verify", _verified(0, 1))
-    assert world.run(run["id"])["steps"][-2]["outcome"] == "verified"
-    assert "failed before the change as well" in world.run(run["id"])["steps"][-2]["detail"]
+    # What failed before the change as well does not hold it back, and is said.
+    again = [s for s in world.run(run["id"])["steps"] if s["name"] == "verify"][-1]
+    assert again["outcome"] == "tests_no_worse"
+    assert again["detail"] == (
+        "1 of 2 test commands fail after the change, as before the change: pnpm run test"
+    )
+    assert world.run(run["id"])["steps"][-2]["outcome"] == "scanned"
 
     # A credential in the change ends the run, whatever the tests say.
     await world.step("bundle", _log([_ran("bundle")], artifact=BUNDLE))
