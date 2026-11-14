@@ -58,8 +58,49 @@ TOOLS: Final = {
     "npm_config_cache": f"{CACHE}/npm",
     "npm_config_store_dir": f"{CACHE}/pnpm-store",
     "UV_CACHE_DIR": f"{CACHE}/uv",
+    # Go's modules and build results, kept for the steps that have no network.
+    "GOPATH": f"{CACHE}/go",
+    "GOMODCACHE": f"{CACHE}/go/mod",
+    "GOCACHE": f"{CACHE}/go/build",
+    "GOFLAGS": "-modcacherw",
     "CI": "true",
 }
+# What running tests left in the checkout is thrown away, and nothing else: the files
+# that were not there before the tests and that the repository does not ignore, and the
+# changes to files that were unchanged before them. Otherwise they would be committed
+# with the next change an agent makes. What was there before (installed dependencies, a
+# virtual environment) stays, ignored or not.
+_MARK: Final = f"{RUN_DIR}/before-tests"
+_NOTE_STATE: Final = (
+    'git ls-files -z --others --exclude-standard | sort -z > "$MARK.untracked" && '
+    'git diff -z --name-only | sort -z > "$MARK.modified"'
+)
+_RESTORE_STATE: Final = (
+    'git ls-files -z --others --exclude-standard | sort -z | comm -z -13 "$MARK.untracked" - '
+    "| xargs -0 -r rm -f -- && "
+    'git diff -z --name-only | sort -z | comm -z -13 "$MARK.modified" - '
+    "| xargs -0 -r git checkout --quiet --"
+)
+
+
+def _around_tests(tests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The test commands between a note of how the checkout stands and its restoring."""
+    if not tests:
+        return []
+
+    def step(name: str, script: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "argv": ["bash", "-euo", "pipefail", "-c", script],
+            "cwd": REPO,
+            "env": {"MARK": _MARK},
+            "timeout": 300,
+            "allow_failure": True,
+        }
+
+    return [step("note", _NOTE_STATE), *tests, step("restore", _RESTORE_STATE)]
+
+
 GIT: Final = ["git", "-c", "core.hooksPath=/dev/null"]
 
 MAKER_SCHEMA: Final[dict[str, Any]] = {
@@ -387,7 +428,7 @@ def tests_job(commands: tuple[Command, ...]) -> dict[str, Any]:
         _in_repo(command, f"baseline {index}", allow_failure=True)
         for index, command in enumerate(commands, 1)
     ]
-    return {"commands": listed or [dict(_NOTHING)]}
+    return {"commands": _around_tests(listed) or [dict(_NOTHING)]}
 
 
 def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -537,6 +578,7 @@ def verify_job(base_sha: str, toolchain: Toolchain) -> dict[str, Any]:
         _in_repo(command, f"test {index}", allow_failure=True)
         for index, command in enumerate(toolchain.tests, start=1)
     ]
+    commands = _around_tests(commands)
     commands.append(
         {
             "name": "secrets",

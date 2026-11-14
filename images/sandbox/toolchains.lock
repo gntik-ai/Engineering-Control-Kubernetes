@@ -1,0 +1,8 @@
+# Toolchains installed into the sandbox image as whole trees.
+#
+# One line each: name, version, SHA-256 of the archive, URL of the archive. The archive
+# must unpack into one directory with the toolchain's name. install-toolchains.sh
+# refuses an archive whose checksum differs, so changing a version means changing its
+# checksum here too. The checksums are the ones the Go project publishes with its
+# releases (https://go.dev/dl/).
+go  1.26.11  9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec  https://go.dev/dl/go1.26.11.linux-amd64.tar.gz

@@ -433,13 +433,33 @@ Three tasks run them, each a step of its own:
 - **Install the project** runs the project's install commands, or the ones written in
   the task, with the package registries in reach and without the clone's token.
 - **Run the tests** runs the project's test commands, or the ones written in the task,
-  without network, and ends with `passed` or `failed`; both usually lead on, since what
+  without network (the sandbox's own loopback works, so tests that start a local server
+  run), and ends with `passed` or `failed`; both usually lead on, since what
   matters is what a change breaks. Test and scan later runs the same commands under the
   same conditions and compares: a command that passed here and fails there is a
   regression, one that failed here already is only noted. When the task names its own
   commands, they are the run's test commands from then on: the agents are told of them
   and Test and scan runs them. A flow without Run the tests has nothing to compare
   with, so failing tests do not send the work back in it.
+
+What tests leave in the checkout is thrown away, by Run the tests and by Test and scan
+alike: the files that were not there before the tests and that the repository does not
+ignore, and changes to files that were unchanged before them. Without that, a cache or a
+report a test wrote would be committed with the next change an agent makes. What was
+there before the tests stays, ignored or not: installed dependencies, a virtual
+environment. A project should still install outside its checkout what its repository
+does not ignore (`../.cache/…` is on the run's volume), as `llmwiki` does with its
+Python environment.
+
+The platform's own files name, for each project, what its repository's CI runs and a
+sandbox can: `falcone-workflow` and `gntik-ui` (pnpm), `falcone` (pnpm; its tests read
+the charts repository, which the installation fetches beside the checkout at the commit
+the repository's own CI names), `llmwiki` (pnpm, and Python 3.12 for its worker),
+`musematic` (uv with Python 3.12, pnpm, Go), `falcone-serverless` (Rust and Go: not
+runnable until the image has Rust). Two things the original ran for `musematic` are not
+among its commands: the vulnerability scan, whose database comes from a container
+registry a sandbox may not reach, and the regeneration of its OpenAPI file, which
+writes a file and judges nothing.
 
 A task's own commands are for a flow that is one project's; a flow shared by several
 projects leaves them empty and each project's own are run. The earlier single task
@@ -1096,7 +1116,8 @@ they are what "Moving a project's work here" filled, and nothing else writes the
 ## The sandbox image
 
 A run works in `images/sandbox`: the two agent clients (Claude Code and Codex), git, a
-compiler, Node.js 22 with pnpm, Python with uv, the scanners (gitleaks, trivy, semgrep,
+compiler, Node.js 22 with pnpm, Python (the base image's 3.11, and 3.12 as `python3.12`)
+with uv, Go, the scanners (gitleaks, trivy, semgrep,
 syft, kubeconform), and a browser for the flows that look at a running application
 (the base image's Chromium, driven by the pinned Playwright driver through
 `require('sandbox-browser')`, which sets it up for a sandbox). CI builds it, runs `images/sandbox/smoke-test.sh` against it and pushes
@@ -1105,7 +1126,10 @@ The launcher starts every step of every run from it.
 
 - **Pinned.** The base image by digest; the Node packages by the integrity hashes of
   `node-tools/package-lock.json`; the Python packages by the hashes of `semgrep.lock`; the
-  single binaries by the checksums of `tools.lock`. To change a version, change it there:
+  single binaries by the checksums of `tools.lock`; the Go toolchain by the checksum of
+  `toolchains.lock` (the one the Go project publishes with the release); Python 3.12 by
+  the digest of the image it is copied from (`PYTHON_IMAGE` in the Dockerfile, on the
+  base image's Debian release). To change a version, change it there:
   `npm install --package-lock-only --ignore-scripts` in `node-tools/`,
   `uv pip compile --generate-hashes --python-version 3.11 --python-platform
   x86_64-unknown-linux-gnu` for semgrep, or a new version, checksum and URL in
@@ -1115,8 +1139,14 @@ The launcher starts every step of every run from it.
   bit. Publishing is the platform's, through the GitHub App.
 - **Run as it is tested.** User 10002, read-only root filesystem, no capabilities; the
   workspace, the home directory and `/tmp` are volumes of the run.
-- **Not in it yet.** The Rust and Go toolchains that `falcone-serverless` needs; they
-  are added when a flow needs them.
+- **Nothing fetched while a run works.** Go does not download another toolchain
+  (`GOTOOLCHAIN=local`) and uv does not download another Python
+  (`UV_PYTHON_DOWNLOADS=never`): a project that asks for a version the image does not
+  have fails at its installation and says so. Go's modules and build results, like
+  pnpm's store and uv's cache, are kept on the run's volume, so the steps without
+  network find them.
+- **Not in it yet.** The Rust toolchain that `falcone-serverless` needs; it is added
+  when that project is moved here.
 
 `docker run <image>` prints the version of every tool. `sandbox-step` is what a step runs: it
 carries out the job the launcher wrote into `SANDBOX_JOB` (commands, in order) and ends

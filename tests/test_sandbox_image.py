@@ -40,7 +40,9 @@ def _ci_job(name: str) -> dict[str, Any]:
 def test_the_base_image_is_pinned_by_digest() -> None:
     sources = [line.split()[1] for line in _instructions() if line.startswith("FROM ")]
     assert sources, "no FROM instruction"
-    assert set(sources) == {"${NODE_IMAGE}"}
+    # The base image, and the image Python 3.12 is copied from: both by digest.
+    assert set(sources) == {"${NODE_IMAGE}", "${PYTHON_IMAGE}"}
+    assert sources[-1] == "${NODE_IMAGE}", "the image itself is built on the base image"
     default = re.search(r"^ARG NODE_IMAGE=(\S+)$", DOCKERFILE, re.MULTILINE)
     assert default is not None
     assert re.fullmatch(r"node:22-bookworm-slim@sha256:[0-9a-f]{64}", default.group(1))
@@ -80,6 +82,37 @@ def test_nothing_is_downloaded_without_a_pinned_hash() -> None:
     script = (SANDBOX / "install-tools.sh").read_text()
     assert "sha256sum --check --strict" in script
     assert "--proto '=https' --proto-redir '=https'" in script
+
+
+def test_toolchains_are_pinned_by_checksum_or_by_digest() -> None:
+    # Go: a whole tree, from the Go project's own downloads, verified like the binaries.
+    rows = [
+        line.split()
+        for line in (SANDBOX / "toolchains.lock").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert [row[0] for row in rows] == ["go"]
+    name, version, checksum, url = rows[0]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version) and re.fullmatch(r"[0-9a-f]{64}", checksum)
+    assert url == f"https://go.dev/dl/go{version}.linux-amd64.tar.gz"
+    script = (SANDBOX / "install-toolchains.sh").read_text()
+    assert "sha256sum --check --strict" in script
+    assert "--proto '=https' --proto-redir '=https'" in script
+    assert "chmod -R go-w,a-s" in script
+    assert "RUN /build/install-toolchains.sh /build/toolchains.lock /toolchains" in DOCKERFILE
+    assert "COPY --from=tools /toolchains/go /usr/local/go" in DOCKERFILE
+    # Python 3.12: copied from an image named by its digest, on the base image's Debian.
+    assert re.search(
+        r"^ARG PYTHON_IMAGE=python:3\.12\.\d+-slim-bookworm@sha256:[0-9a-f]{64}$",
+        DOCKERFILE,
+        re.MULTILINE,
+    )
+    assert "bookworm" in re.search(r"^ARG NODE_IMAGE=(\S+)", DOCKERFILE, re.MULTILINE).group(1)  # type: ignore[union-attr]
+    copied = re.findall(r"^COPY --from=python312 (\S+) (\S+)$", DOCKERFILE, re.MULTILINE)
+    assert copied and all(source == target for source, target in copied)
+    assert all("python3.12" in source for source, _target in copied)
+    # Neither fetches anything while a run works: no other toolchain, no other Python.
+    assert "GOTOOLCHAIN=local" in DOCKERFILE and "UV_PYTHON_DOWNLOADS=never" in DOCKERFILE
 
 
 def test_single_binary_tools_carry_a_version_a_checksum_and_an_https_url() -> None:
@@ -151,6 +184,9 @@ def test_the_version_report_names_every_pinned_tool() -> None:
         "node",
         "git",
         "python",
+        # The toolchains projects are built and tested with, beside Node.js.
+        "go",
+        "python312",
     }
     assert 'CMD ["sandbox-versions"]' in DOCKERFILE
     assert 'ENTRYPOINT ["/usr/bin/tini", "--"]' in DOCKERFILE
@@ -170,6 +206,7 @@ def test_the_image_does_not_update_itself_or_report_home() -> None:
 def test_scripts_are_executable() -> None:
     for name in (
         "install-tools.sh",
+        "install-toolchains.sh",
         "smoke-test.sh",
         "sandbox-versions",
         "sandbox-step",

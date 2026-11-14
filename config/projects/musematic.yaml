@@ -72,13 +72,15 @@ toolchain:
   enabled: true
   prepare:
     - cwd: apps/control-plane
-      argv: [uv, sync, --frozen, --extra, dev, --python, "{python312}"]
+      # The sandbox image has Python 3.12 beside its own; uv finds it by its version.
+      argv: [uv, sync, --frozen, --extra, dev, --python, "3.12"]
       timeout_seconds: 1200
     - cwd: "."
       argv: [pnpm, install, --frozen-lockfile]
       timeout_seconds: 1200
-    # NEW-79a: prefill the read-only Go module cache and the offline Trivy DB that the
-    # makers and the checker use without network.
+    # NEW-79a: prefill the Go module cache that the steps without network use. The
+    # offline Trivy database is not fetched here: it comes from a container registry,
+    # which is not among the hosts a sandbox may reach.
     - cwd: services/reasoning-engine
       argv: [go, mod, download]
       timeout_seconds: 300
@@ -94,9 +96,6 @@ toolchain:
     - cwd: services/shared/secrets
       argv: [go, mod, download]
       timeout_seconds: 300
-    - cwd: "."
-      argv: [trivy, image, --download-db-only, --quiet]
-      timeout_seconds: 600
   test_commands:
     - cwd: apps/control-plane
       # NEW-46: in the maker's no-network sandbox this suite has hung for 75+ min
@@ -118,10 +117,8 @@ toolchain:
       # NEW-64: PR CI "Lint Frontend" runs eslint; the maker must see lint failures too.
       argv: [timeout, --kill-after=30, "600", pnpm, lint]
       description: web lint (same as CI "Lint Frontend"; fix every error reported in files you changed)
-    - cwd: "."
-      # NEW-64: CI fails on OpenAPI snapshot drift when API routes change.
-      argv: [timeout, --kill-after=30, "600", apps/control-plane/.venv/bin/python, scripts/export-openapi.py]
-      description: regenerate docs/api-reference/openapi.json; if it changed, commit it (CI fails on OpenAPI drift)
+    # Regenerating docs/api-reference/openapi.json (NEW-64) is not among these: it
+    # writes a file and judges nothing, and what tests write is thrown away.
     - cwd: services/reasoning-engine
       argv: [timeout, --kill-after=30, "900", go, test, ./...]
       description: Go build + unit tests for services/reasoning-engine (offline module cache; NEW-79a)
@@ -137,9 +134,6 @@ toolchain:
     - cwd: services/shared/secrets
       argv: [timeout, --kill-after=30, "900", go, test, ./...]
       description: Go build + unit tests for services/shared/secrets (offline module cache; NEW-79a)
-    - cwd: "."
-      argv: [timeout, --kill-after=30, "900", trivy, fs, --scanners, vuln, --severity, "HIGH,CRITICAL", --skip-dirs, node_modules, --skip-dirs, .venv, "."]
-      description: offline dependency vulnerability scan (NEW-79a); main already has findings, so only findings your change introduces matter
   cleanup_paths_ignored_only: true
 deployment_test_commands:
   - [python3, scripts/verify_argocd_release_drift.py, --help]

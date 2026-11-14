@@ -39,10 +39,12 @@ expected="$(
       | sed -e 's|^@anthropic-ai/claude-code |claude |' -e 's|^@openai/codex |codex |' \
         -e 's|^playwright-core |playwright |'
     awk '$1 !~ /^#/ && NF { print $1, $2 }' "${here}/tools.lock"
+    awk '$1 !~ /^#/ && NF { print $1, $2 }' "${here}/toolchains.lock"
+    sed -n 's/^ARG PYTHON_IMAGE=python:\(3\.12\.[0-9]*\)-.*/python312 \1/p' "${here}/Dockerfile"
     sed -n 's/^semgrep==\([0-9.]*\).*/semgrep \1/p' "${here}/semgrep.lock"
   } | sort
 )"
-[[ "$(wc -l <<<"${expected}")" -eq 10 ]] || fail "expected ten pinned tools, got: ${expected}"
+[[ "$(wc -l <<<"${expected}")" -eq 12 ]] || fail "expected twelve pinned tools, got: ${expected}"
 reported="$(sandbox sandbox-versions)"
 echo "${reported}"
 actual="$(grep --invert-match --extended-regexp '^(node|git|python|chromium) ' <<<"${reported}" | sort)"
@@ -113,6 +115,18 @@ sandbox bash -euc '
   cc -o main main.c && ./main
   node --eval "if (1 + 1 !== 2) process.exit(1)"
   python3 -c "import json, sqlite3, ssl, venv"
+  # Python 3.12 beside it: its library loads, and a virtual environment of it works.
+  python3.12 -c "import bz2, ctypes, hashlib, json, lzma, sqlite3, ssl, uuid, venv, zlib"
+  uv venv --quiet --python 3.12 /tmp/venv312
+  [[ "$(/tmp/venv312/bin/python -c "import sys; print(sys.version_info[:2])")" == "(3, 12)" ]]
+  # Go builds and tests a module without the network, and does not fetch another toolchain.
+  mkdir gomod && cd gomod
+  printf "module smoke\n\ngo 1.25.0\n" >go.mod
+  printf "package smoke\n\nfunc Two() int { return 2 }\n" >smoke.go
+  printf "package smoke\n\nimport \"testing\"\n\nfunc TestTwo(t *testing.T) {\n\tif Two() != 2 {\n\t\tt.Fatal()\n\t}\n}\n" >smoke_test.go
+  GOCACHE=/tmp/gocache GOPATH=/tmp/gopath go test ./... >/dev/null
+  [[ -z "$(gofmt -l .)" ]]
+  cd /workspace && rm -rf gomod
   git add main.c
   git -c user.name=smoke -c user.email=smoke@example.invalid commit --quiet --message smoke
   [[ "$(git rev-list --count HEAD)" == 1 ]]
@@ -129,7 +143,7 @@ sandbox bash -euc '
   printf "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: smoke\n" >object.yaml
   rg --quiet ConfigMap object.yaml
   jq --null-input --exit-status "true" >/dev/null
-' || fail "git, the compiler, Node.js or Python do not work in the workspace"
+' || fail "git, the compiler, Node.js, Python or Go do not work in the workspace"
 
 # The browser starts as the run's user, on a read-only image, without Chromium's own
 # sandbox (the pod is the sandbox), and reads a page by its roles.

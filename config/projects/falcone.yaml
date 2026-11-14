@@ -230,6 +230,56 @@ toolchain:
     - cwd: "."
       argv: [pnpm, install, --frozen-lockfile]
       timeout_seconds: 1800
+    # The tests read the charts repository beside the checkout (../falcone-charts), as
+    # the repository's CI sets it up: at the commit its ci.yml names (FALCONE_CHARTS_REF).
+    # It is a public repository, fetched without a token, outside the checkout.
+    - cwd: "."
+      argv:
+        - bash
+        - -euc
+        - >-
+          ref=$(sed -n "s/^ *FALCONE_CHARTS_REF: *'\([0-9a-f]*\)'.*/\1/p" .github/workflows/ci.yml);
+          test -n "$ref";
+          rm -rf ../falcone-charts;
+          git init --quiet ../falcone-charts;
+          git -C ../falcone-charts -c core.hooksPath=/dev/null fetch --quiet --depth 1
+          https://github.com/gntik-ai/falcone-charts.git "$ref";
+          git -C ../falcone-charts -c core.hooksPath=/dev/null checkout --quiet FETCH_HEAD
+      timeout_seconds: 600
+  # Each suite of the repository's CI that needs no service is a command of its own, so
+  # that one that fails on the default branch does not hide the others. All of them pass
+  # without network with the charts beside the checkout (tried on 2cb8214).
+  test_commands:
+    - cwd: "."
+      argv: [pnpm, lint]
+      description: repository validators, markdown lint and the OpenAPI check (CI "Lint")
+    - cwd: "."
+      argv: [pnpm, "test:unit"]
+      description: unit tests (node --test tests/unit; about four minutes)
+    - cwd: "."
+      argv: [pnpm, "test:adapters"]
+      description: adapter tests
+    - cwd: "."
+      argv: [pnpm, "test:contracts"]
+      description: contract tests
+    - cwd: "."
+      argv: [pnpm, "test:e2e:console"]
+      description: console end-to-end tests that run in process
+    - cwd: "."
+      argv: [pnpm, "test:e2e:deployment"]
+      description: deployment end-to-end tests that run in process (they read the charts)
+    - cwd: "."
+      argv: [pnpm, "test:e2e:observability"]
+      description: observability end-to-end tests that run in process
+    - cwd: "."
+      argv: [pnpm, "test:resilience"]
+      description: resilience tests
+    - cwd: "."
+      argv: [pnpm, "test:e2e:workflows"]
+      description: workflow end-to-end tests that run in process
+    - cwd: "."
+      argv: [pnpm, --dir, apps/web-console, test]
+      description: web console unit tests (vitest)
 maker_rules:
   source:
     - >-

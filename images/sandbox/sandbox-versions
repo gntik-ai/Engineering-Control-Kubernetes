@@ -26,6 +26,8 @@ version syft syft version
 version kubeconform kubeconform -v
 version semgrep semgrep --version
 version uv uv --version
+version go go version
+version python312 python3.12 --version
 version chromium chromium --version
 version node node --version
 version git git --version

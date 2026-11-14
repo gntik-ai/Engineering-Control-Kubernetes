@@ -202,10 +202,11 @@ async def test_the_commands_of_a_task_are_run_in_place_of_the_projects(world: An
 
     # The tests before any change: every command is run, and one already fails.
     job = await _job(world, "tests")
-    assert [(c["name"], c["argv"]) for c in job["commands"]] == [
+    assert [(c["name"], c["argv"]) for c in job["commands"][1:-1]] == [
         ("baseline 1", ["npm", "run", "lint"]),
         ("baseline 2", ["npm", "test", "--", "--run"]),
     ]
+    assert [job["commands"][0]["name"], job["commands"][-1]["name"]] == ["note", "restore"]
     assert world.fake.only_pod()["metadata"]["labels"]["engineering-control/egress"] == "none"
     await _end(world, _log([_ran("baseline 1", exit_code=1, stderr="lint"), _ran("baseline 2")]))
     after = world.run(run["id"])
@@ -233,7 +234,14 @@ async def test_the_commands_of_a_task_are_run_in_place_of_the_projects(world: An
     )
     await world.step("review", _reviewed(PASSED, provider="chatgpt"))
     job = await _job(world, "verify")
-    assert [c["argv"] for c in job["commands"][:2]] == [
+    assert [c["name"] for c in job["commands"]] == [
+        "note",
+        "test 1",
+        "test 2",
+        "restore",
+        "secrets",
+    ]
+    assert [c["argv"] for c in job["commands"][1:3]] == [
         ["npm", "run", "lint"],
         ["npm", "test", "--", "--run"],
     ]

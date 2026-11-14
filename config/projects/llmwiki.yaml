@@ -103,3 +103,37 @@ classification:
   product: true
   falcone_validation_consumer: true
   intensive_falcone_validator: true
+toolchain:
+  # As the repository's CI (.github/workflows/ci.yml): Node 22 with pnpm for the
+  # packages, and Python 3.12 with pytest and ruff for the analysis worker, which has no
+  # other dependency. The worker's tools go into a virtual environment beside the
+  # checkout and not in it: the repository ignores node_modules and nothing else, so
+  # anything else left in it would be committed with a change. For the same reason the
+  # Python checks are told to leave no cache behind.
+  enabled: true
+  prepare:
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1200
+    - cwd: "."
+      argv: [uv, venv, --allow-existing, --python, "3.12", ../.cache/venv]
+      timeout_seconds: 300
+    - cwd: "."
+      argv: [uv, pip, install, --python, ../.cache/venv/bin/python, "pytest>=8.3,<9", "ruff>=0.15,<0.16"]
+      timeout_seconds: 600
+  test_commands:
+    - cwd: "."
+      argv: [pnpm, "lint:node"]
+      description: eslint, prettier and the type check of every Node package (CI "Lint and typecheck Node packages")
+    - cwd: "."
+      argv: [pnpm, "test:node"]
+      description: unit tests of every Node package (CI "Test Node packages")
+    - cwd: "."
+      argv: [../.cache/venv/bin/ruff, check, --no-cache, services/analysis-worker]
+      description: ruff lint of the analysis worker (CI "Lint worker")
+    - cwd: "."
+      argv: [../.cache/venv/bin/ruff, format, --check, --no-cache, services/analysis-worker]
+      description: ruff format check of the analysis worker (run ruff format to fix)
+    - cwd: "."
+      argv: [env, PYTHONDONTWRITEBYTECODE=1, ../.cache/venv/bin/python, -m, pytest, -p, "no:cacheprovider", services/analysis-worker]
+      description: unit tests of the analysis worker (CI "Test worker")

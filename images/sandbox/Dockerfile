@@ -1,5 +1,6 @@
 # Sandbox image: what one run works in. It holds the two agent clients (Claude Code and
-# Codex), git, a compiler, Node.js with pnpm, Python with uv, and the scanners.
+# Codex), git, a compiler, Node.js with pnpm, Python (the base image's, and 3.12) with uv,
+# Go, and the scanners.
 #
 # It holds no credentials and nothing that reaches the cluster or GitHub: no kubectl, helm,
 # argocd, gh or ssh. A run's subscription sign-in is mounted for that run only, and
@@ -7,17 +8,25 @@
 #
 # Everything is pinned: the base image by digest, the Node packages by the integrity
 # hashes of node-tools/package-lock.json, the Python packages by the hashes of
-# semgrep.lock, and the single-binary tools by the checksums of tools.lock.
+# semgrep.lock, the single-binary tools by the checksums of tools.lock, the Go toolchain
+# by the checksum of toolchains.lock, and Python 3.12 by the digest of the image it is
+# copied from.
 #
 # node:22-bookworm-slim, pinned by digest (resolved 2026-11-12).
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
+# python:3.12.16-slim-bookworm, pinned by digest (resolved 2026-11-14). It is built on the
+# same Debian release as the base image, so the interpreter runs on the libraries here.
+ARG PYTHON_IMAGE=python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+
+FROM ${PYTHON_IMAGE} AS python312
 
 FROM ${NODE_IMAGE} AS tools
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-COPY tools.lock install-tools.sh /build/
+COPY tools.lock install-tools.sh toolchains.lock install-toolchains.sh /build/
 RUN /build/install-tools.sh /build/tools.lock /out
+RUN /build/install-toolchains.sh /build/toolchains.lock /toolchains
 
 FROM ${NODE_IMAGE} AS node-tools
 WORKDIR /opt/sandbox/node
@@ -46,12 +55,23 @@ RUN apt-get update \
     && install --directory --owner agent --group agent /workspace \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} +
 COPY --from=tools /out/ /usr/local/bin/
+# The Go toolchain, for the projects that have Go services.
+COPY --from=tools /toolchains/go /usr/local/go
+# Python 3.12 beside the base image's own: the interpreter, its library and its headers.
+# Projects that ask for 3.12 get it by name (python3.12, or uv's --python 3.12).
+COPY --from=python312 /usr/local/bin/python3.12 /usr/local/bin/python3.12
+COPY --from=python312 /usr/local/lib/libpython3.12.so.1.0 /usr/local/lib/libpython3.12.so.1.0
+COPY --from=python312 /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=python312 /usr/local/include/python3.12 /usr/local/include/python3.12
 COPY --from=node-tools /opt/sandbox/node /opt/sandbox/node
 # The browser of a step that looks at a project's running application: the base image's
 # Chromium, driven by the pinned driver through a helper that sets it up for a sandbox.
 COPY sandbox-browser/index.js /opt/sandbox/node/node_modules/sandbox-browser/index.js
 COPY semgrep.lock /opt/sandbox/semgrep.lock
-RUN python3 -m venv /opt/sandbox/semgrep \
+RUN ldconfig \
+    && ln --symbolic /usr/local/go/bin/go /usr/local/bin/go \
+    && ln --symbolic /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+    && python3 -m venv /opt/sandbox/semgrep \
     && uv pip install --python /opt/sandbox/semgrep/bin/python --no-cache \
         --require-hashes --only-binary :all: --requirement /opt/sandbox/semgrep.lock \
     && ln --symbolic /opt/sandbox/semgrep/bin/semgrep /usr/local/bin/semgrep \
@@ -66,7 +86,9 @@ ENV HOME=/home/agent \
     DISABLE_AUTOUPDATER=1 \
     SEMGREP_ENABLE_VERSION_CHECK=0 \
     SEMGREP_SEND_METRICS=off \
-    npm_config_update_notifier=false
+    npm_config_update_notifier=false \
+    GOTOOLCHAIN=local \
+    UV_PYTHON_DOWNLOADS=never
 USER 10002:10002
 WORKDIR /workspace
 # tini reaps the processes an agent leaves behind and passes signals on, so a cancelled

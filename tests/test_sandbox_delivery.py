@@ -362,7 +362,8 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     pod = world.fake.only_pod()
     job = world.job()
     assert pod["metadata"]["labels"]["engineering-control/step"] == "tests"
-    assert [c["name"] for c in job["commands"]] == ["baseline 1", "baseline 2"]
+    # Around the tests: how the checkout stood is noted, and what they left is removed.
+    assert [c["name"] for c in job["commands"]] == ["note", "baseline 1", "baseline 2", "restore"]
     assert all(command["allow_failure"] is True for command in job["commands"])
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "none"
     world.fake.finish(_prepared())
@@ -408,7 +409,13 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     pod = world.fake.only_pod()
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "none"
     assert "engineering-control/account" not in pod["metadata"]["labels"]
-    assert [c["name"] for c in world.job()["commands"]] == ["test 1", "test 2", "secrets"]
+    assert [c["name"] for c in world.job()["commands"]] == [
+        "note",
+        "test 1",
+        "test 2",
+        "restore",
+        "secrets",
+    ]
     world.fake.finish(_verified())
     await world.launcher.tick()
 
@@ -697,14 +704,50 @@ def test_only_an_open_item_in_a_section_with_a_flow_that_runs_can_be_started(wor
 # --- the pieces --------------------------------------------------------------------------
 
 
-def test_a_projects_toolchain_comes_from_its_manifest_when_the_sandbox_can_run_it() -> None:
+def test_a_projects_toolchain_comes_from_its_manifest_when_the_sandbox_can_run_it(
+    tmp_path: Path,
+) -> None:
     workflow = deliver.toolchain_for("falcone-workflow")
     assert [c.argv for c in workflow.prepare] == [("pnpm", "install", "--frozen-lockfile")]
     assert [c.text for c in workflow.tests] == ["pnpm run typecheck", "pnpm run test"]
     assert workflow.rules and workflow.note is None
-    # A manifest that names tools the image does not have is not used in part.
+    # musematic is installed with Python 3.12 and Go, which the image has by name.
     musematic = deliver.toolchain_for("musematic")
-    assert musematic.prepare == () and musematic.tests == () and musematic.note
+    assert musematic.note is None and len(musematic.tests) == 10
+    assert deliver.line_of(musematic.prepare[0]) == (
+        "[apps/control-plane] uv sync --frozen --extra dev --python 3.12"
+    )
+    assert [c.argv[-3:] for c in musematic.tests[-5:]] == [("go", "test", "./...")] * 5
+    assert not any("trivy" in c.argv for c in (*musematic.prepare, *musematic.tests))
+    # falcone's tests read its charts repository, fetched beside the checkout at the
+    # commit the repository's own CI names; each suite is a command of its own.
+    falcone = deliver.toolchain_for("falcone")
+    assert falcone.note is None and len(falcone.prepare) == 2 and len(falcone.tests) == 10
+    charts = falcone.prepare[1].argv[-1]
+    assert "FALCONE_CHARTS_REF" in charts and "../falcone-charts" in charts
+    assert "https://github.com/gntik-ai/falcone-charts.git" in charts
+    assert [c.text for c in falcone.tests[:2]] == ["pnpm lint", "pnpm test:unit"]
+    # llmwiki's repository ignores node_modules and nothing else: its Python tools are
+    # installed beside the checkout, and its checks leave no cache in it.
+    llmwiki = deliver.toolchain_for("llmwiki")
+    assert llmwiki.note is None and len(llmwiki.tests) == 5
+    assert all("../.cache/venv" in " ".join(c.argv) for c in llmwiki.prepare[1:])
+    assert not any(part.startswith(".venv") for c in llmwiki.tests for part in c.argv)
+    assert "--no-cache" in llmwiki.tests[2].argv and "no:cacheprovider" in llmwiki.tests[4].argv
+    # Every command of every project's file is one the sandbox can be given as a line.
+    for project in ("falcone", "falcone-workflow", "gntik-ui", "llmwiki", "musematic"):
+        chain = deliver.toolchain_for(project)
+        for command in (*chain.prepare, *chain.tests):
+            assert deliver.command_of(deliver.line_of(command)).argv == command.argv, project
+    # A manifest that names a tool by a placeholder the sandbox cannot fill is not used
+    # in part: nothing is installed, and the run is told so.
+    (tmp_path / "elsewhere.yaml").write_text(
+        "toolchain:\n  enabled: true\n  prepare:\n"
+        "    - {cwd: ., argv: [uv, sync, --python, '{python311}']}\n"
+        "  test_commands:\n    - {cwd: ., argv: [pytest]}\n"
+    )
+    elsewhere = deliver.toolchain_for("elsewhere", roots=(tmp_path,))
+    assert elsewhere.prepare == () and elsewhere.tests == () and elsewhere.note
     assert deliver.toolchain_for("made-in-the-console") == deliver.Toolchain()
     assert deliver.Toolchain.from_dict(workflow.as_dict()) == workflow
     assert deliver._safe({"argv": ["make"], "cwd": "../outside"}) is None
