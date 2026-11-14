@@ -90,6 +90,9 @@ class Settings(BaseSettings):
         "index.crates.io",
         "proxy.golang.org",
         "sum.golang.org",
+        # Where Go's module proxy hands out the modules it does not serve itself (it
+        # answers a request for a large module with a redirect there).
+        "storage.googleapis.com",
     )
     # The supervisor's tools: the listener of the service that serves them, and where the
     # launcher tells a turn of the supervisor to find it.

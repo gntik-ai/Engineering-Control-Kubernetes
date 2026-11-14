@@ -224,7 +224,12 @@ The list is the setting `ENGINEERING_SANDBOX_EGRESS_HOSTS` (a JSON list; a leadi
 names every host under a domain). Its default, in `src/engineering_control/config.py`,
 holds the two subscriptions' hosts (`api.anthropic.com`; `chatgpt.com`, `auth.openai.com`,
 `api.openai.com`), GitHub's hosts for checking out, and the npm, PyPI, crates.io and Go
-module registries. When a project needs another host, the proxy's log says which:
+module registries. For Go that is three hosts: the module proxy, the checksum database,
+and `storage.googleapis.com`, where the module proxy sends a request for a large module
+(without it `go mod download` fails with "Proxy Authentication Required" on such a
+module, as `musematic`'s did). It is a host anything can be stored on, like GitHub's;
+taking it off the list is taking Go projects with large modules out. When a project
+needs another host, the proxy's log says which:
 
     kubectl -n engineering-control logs deploy/engineering-control-egress | grep egress_refused
 
