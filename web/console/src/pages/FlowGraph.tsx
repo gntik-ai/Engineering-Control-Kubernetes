@@ -12,6 +12,7 @@ import { Bot, GitBranch, Hand, ListChecks, Split } from '@gntik-ai/icons';
 import type { ReactNode } from 'react';
 import type { FlowCatalogue, FlowDocument, FlowProblem, TaskType } from '../api';
 import { layoutOf } from '../flowEdit';
+import { conditionWords } from './FlowCondition';
 
 /** What a flow drawn as a graph is made of: used by the designer and by a run's page. */
 
@@ -106,6 +107,9 @@ export function renderersOf(catalogue: FlowCatalogue): FlowNodeRenderer[] {
   ];
 }
 
+/** A sentence cut to what fits under a task's name. */
+const short = (text: string) => (text.length > 90 ? `${text.slice(0, 88)}…` : text);
+
 export interface Drawn {
   /** What validation says, shown on the task it is about. */
   problems?: FlowProblem[];
@@ -155,7 +159,14 @@ export function graphOf(
       data: {
         title: task?.title ?? node.task,
         subtitle: node.id === document.start ? `${node.id} · the flow starts here` : node.id,
-        meta: metas[node.id] ?? who ?? (task ? WHERE[task.where] : 'Not a task of this platform'),
+        meta:
+          metas[node.id] ??
+          who ??
+          (node.task === 'control.when' && catalogue.conditions
+            ? short(conditionWords(node.with.condition, catalogue.conditions))
+            : task
+              ? WHERE[task.where]
+              : 'Not a task of this platform'),
         tone: tones[node.id],
         decoration: issues.length ? { issues } : undefined,
       },

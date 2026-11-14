@@ -25,6 +25,7 @@ from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.engine.builtin import BUILTIN as BUILTIN_FLOWS
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
+from engineering_control.engine.conditions import catalogue as condition_catalogue
 from engineering_control.engine.document import FORMAT as FLOW_FORMAT
 from engineering_control.engine.document import FlowInvalid
 from engineering_control.engine.document import parse as parse_flow
@@ -462,6 +463,8 @@ class DashboardService:
             "providers": list(AGENT_PROVIDERS),
             # The models an agent's task can be set to, and the levels each has.
             "models": model_choices(),
+            # What an If can ask about, and the ways each is compared.
+            "conditions": condition_catalogue(),
             "saved": await asyncio.to_thread(self.repository.flows.saved_tasks),
         }
 
@@ -596,6 +599,7 @@ class DashboardService:
             told = dict(outcomes)
             of_run = None
             given, listed = scope, entries
+            knew: dict[str, Any] = {}
             if run_id is not None:
                 run = self.repository.runs.get(run_id)
                 told = {**recorded(run["steps"], run["data"]), **told}
@@ -613,12 +617,15 @@ class DashboardService:
                 areas = run["data"].get("areas")
                 if isinstance(areas, list):
                     listed = len(areas)
+                # What the Ifs of the flow ask about, as that run knew it in the end.
+                knew = dict(run["data"])
             result = simulate(
                 flow,
                 outcomes=told,
                 scope=given,
                 entries=listed,
                 max_rounds=max_rounds,
+                known=knew,
             )
             return {**result, "flow": key, "sha256": flow.sha256(), "of_run": of_run}
 

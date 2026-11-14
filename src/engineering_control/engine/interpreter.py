@@ -29,7 +29,7 @@ from typing import Any, Final
 import structlog
 
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.engine import catalogue, routing
+from engineering_control.engine import catalogue, conditions, routing
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, Node, parse
@@ -258,6 +258,21 @@ class Engine:
             known={**item.run_data, **data},
             rounds=routing.rounds_allowed(document, item.run_data),
         )
+        # How each task ended so far: what an If further on may ask about.
+        data["went"] = to.went(item.run_data.get("went"), node.id, done.outcome)
+        if to.passed:
+            # Which way each If went, and what it asked: shown with the step it followed.
+            chose = [
+                {
+                    "task": passed,
+                    "way": way,
+                    "asked": conditions.words(chooser.params.get("condition")),
+                }
+                for passed, way in to.passed
+                if (chooser := document.node(passed)) is not None and chooser.task == "control.when"
+            ]
+            if chose:
+                await asyncio.to_thread(self.runs.note_step, item.step_id, {"chose": chose})
         if to.kind == "loop":
             return _failed("loop", "The flow went round without reaching a task.", done.output)
         if to.kind == "end":

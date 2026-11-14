@@ -575,6 +575,50 @@ judging task to the other. The choice is part of what the flow says, so it is sa
 a draft, tried and put in force like any other change, and a run's step records the
 model it was started with.
 
+An **If** (in the list under Control) asks something about the run and leads on by
+`yes` or by `no`. Nothing runs in it and no agent is asked: the platform answers from
+what it knows itself. What can be asked is a fixed list (`engine/conditions.py`), each
+thing compared in the ways its kind has:
+
+| About | What | Compared |
+| --- | --- | --- |
+| The run | Whether it was told where to look | yes, no |
+| The run | The round of correction it is in | is, is not, at least, at most, more than, less than |
+| The run | How an earlier task of the flow ended | ended with, did not end with |
+| The run | How many areas were planned | as the round |
+| The item | Whether it is an issue on GitHub | yes, no |
+| The item | Its title; its title and text | contains, does not contain, is, is not |
+| The item | The issue's labels | include, do not include, are none, are not none |
+| The item | Where it comes from; what a run made it as | is, is not |
+| The item | A finding's severity | is, is not, at least, at most |
+| The project | Its name | as a title |
+| The project | Whether it names test commands; whether tests failed before any change | yes, no |
+| The change | How many files it touches | as the round |
+| The change | The files it touches | have one that matches, all match, have none that matches |
+| The change | The subscription that wrote it | is, is not |
+
+An If holds up to six tests, which count together as "all of these" or "any of these";
+anything more is two Ifs one after the other. Texts are compared without regard to
+capital letters. Files are compared with patterns separated by commas: `*` stands for
+anything within a folder, `**` for any folders, a pattern without a slash for a file
+name in any folder, a pattern that ends in a slash for everything under that folder
+(`docs/**, *.md`). Something the run does not know reads as empty: no text, no entries,
+nought, no. The files a change touches are known from the implementation on (its
+sandbox lists them after the commit), so an If can stand right after Implement.
+
+An If changes nothing about the rules: every way out of it is walked when a flow is
+checked, so a way that would publish a change past the review, the tests, the
+collection or the administrator is refused whatever the If asks. An If that asks about
+something no task before it can have produced (the change before anything is
+implemented, the tests before any change when the checkout does not run them, the
+outcome of a task that does not run before it) is refused as well, since it would
+always read as empty. On paper an If is answered from what the simulation knows, which
+without a past run is little; the page lets it be told to go by yes or by no instead,
+and going by a run that happened answers it from what that run knew. A run's page
+says, under the step an If followed, what was asked and which way it went. A flow
+written before conditions had this shape (`"condition": "scope_given"`) means what it
+meant.
+
 A run's page draws the run on the version of the flow it follows: each task with its
 state, who worked in it and how often, and the connections the run went along.
 

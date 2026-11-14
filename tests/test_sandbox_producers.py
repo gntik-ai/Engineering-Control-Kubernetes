@@ -91,7 +91,7 @@ async def test_an_item_of_the_platforms_own_is_delivered_without_an_issue(site: 
     prompt = _prompt(site)
     assert f"You are the implementer for a backlog item of {REPOSITORY}." in prompt
     assert "It downloads what the table shows." in prompt and "issue #" not in prompt
-    commit = site.job()["commands"][-1]
+    commit = next(c for c in site.job()["commands"] if c["name"] == "commit")
     assert commit["env"]["MESSAGE"] == "Export the report as CSV"
     site.fake.finish(_implemented())
     await site.launcher.tick()

@@ -11,7 +11,7 @@ export const validId = (id: string) => ID.test(id);
 /** A name for a new task of that kind that no task of the flow has yet. */
 export function freshId(document: FlowDocument, type: string): string {
   const base =
-    (type.split('.').pop() ?? 'task')
+    (type === 'control.when' ? 'if' : (type.split('.').pop() ?? 'task'))
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, '')
       .replace(/^[^a-z]+/, '')

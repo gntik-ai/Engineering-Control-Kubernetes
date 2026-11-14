@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final
 
+from engineering_control.engine.conditions import LEGACY
 from engineering_control.sandbox.deliver import MAX_ROUNDS, PROVIDERS, ROUNDS_CEILING
 
 # The most a run may be granted, whatever its flow says.
@@ -41,7 +42,7 @@ class Param:
     """One setting of a task."""
 
     name: str
-    kind: str  # "bool", "int", "providers", "task", "choice", "models"
+    kind: str  # "bool", "int", "providers", "task", "choice", "models", "condition"
     default: Any
     doc: str
     low: int | None = None
@@ -225,17 +226,19 @@ _TASKS: Final = (
     TaskType(
         "control.when",
         "Control",
-        "Choose a way",
-        "Go one way or the other by something the run already knows.",
+        "If",
+        "Ask something about the run and go on by yes or by no: about the item, the "
+        "project, the round, the files the change touches, or how an earlier task ended. "
+        "Nothing runs here and no agent is asked.",
         "control",
         outcomes=("yes", "no"),
         params=(
             Param(
                 "condition",
-                "choice",
-                "scope_given",
-                "What decides. scope_given: the run was told where to look.",
-                choices=("scope_given",),
+                "condition",
+                LEGACY,
+                "What is asked. The flow goes on by yes when it holds and by no when it "
+                "does not. Something the run does not know reads as empty.",
             ),
         ),
     ),

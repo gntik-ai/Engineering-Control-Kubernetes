@@ -128,6 +128,18 @@ def _shown(output: dict[str, Any] | None) -> dict[str, Any] | None:
     return {**{key: value for key, value in output.items() if key != "diff"}, "files": files}
 
 
+def item_facts(item: BacklogItem) -> dict[str, Any]:
+    """What a run carries about the item it works on beyond its text: its labels, where
+    it comes from, and what a run made it as."""
+    facts = item.facts or {}
+    return {
+        "labels": [str(label)[:100] for label in (item.issue_labels or [])[:50]],
+        "by": "github" if item.source == "github" else (item.proposed_by or "administrator"),
+        **({"kind": str(facts["kind"])} if facts.get("kind") else {}),
+        **({"severity": str(facts["severity"])} if facts.get("severity") else {}),
+    }
+
+
 def _run_row(run: SandboxRun) -> dict[str, Any]:
     return {
         "id": str(run.id),
@@ -292,6 +304,8 @@ class Runs:
                 "repository": repository,
                 "base_branch": project.default_branch or "main",
                 "toolchain": toolchain,
+                # What the item is, for an If of the flow to ask about.
+                "item": item_facts(item),
             }
             if traits(document)["browses"] and not project.application_url:
                 raise ProjectInvalid(

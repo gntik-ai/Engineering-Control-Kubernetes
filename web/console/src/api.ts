@@ -59,7 +59,7 @@ export interface FlowListed extends Flow {
 /** One setting of a task. */
 export interface TaskParam {
   name: string;
-  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models';
+  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition';
   default: unknown;
   doc: string;
   low: number | null;
@@ -116,7 +116,43 @@ export interface FlowCatalogue {
   providers: string[];
   /** The models an agent's task can be set to, by subscription, with the levels each has. */
   models: Record<string, ModelChoices>;
+  /** What an If can ask about, and the ways each is compared. */
+  conditions?: ConditionCatalogue;
   saved: SavedTask[];
+}
+
+/** Something the platform knows about a run, that an If of a flow can ask about. */
+export interface ConditionFact {
+  key: string;
+  group: string;
+  title: string;
+  kind: 'flag' | 'number' | 'text' | 'list' | 'choice' | 'level' | 'paths' | 'outcome';
+  doc: string;
+  /** For a flag: how it reads when it does not hold. */
+  negative: string;
+  needs: string[];
+  choices: string[];
+}
+
+/** One test of a condition: a fact, how it is compared, and with what. */
+export interface ConditionTest {
+  fact: string;
+  is: string;
+  value?: string | number;
+  /** For how a task ended: which task. */
+  of?: string;
+}
+
+export interface FlowCondition {
+  match: 'all' | 'any';
+  tests: ConditionTest[];
+}
+
+export interface ConditionCatalogue {
+  facts: ConditionFact[];
+  operators: Record<string, { key: string; words: string; value: boolean }[]>;
+  max_tests: number;
+  default: FlowCondition;
 }
 
 export interface FlowNode {
@@ -706,6 +742,8 @@ export interface RunStep {
     prompt?: { name: string; sha256: string };
     /** The model the flow chose for the step's agent, when it chose one. */
     model?: { provider: string; model?: string; effort?: string };
+    /** The Ifs the flow passed after the step: which way each went, and what it asked. */
+    chose?: { task: string; way: string; asked: string }[];
   } | null;
   log?: string;
 }

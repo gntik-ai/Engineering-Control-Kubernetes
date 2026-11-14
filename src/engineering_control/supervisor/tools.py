@@ -40,6 +40,7 @@ from engineering_control.db.models import ProjectRecord, SupervisorAction
 from engineering_control.engine import validate
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
+from engineering_control.engine.conditions import catalogue as condition_catalogue
 from engineering_control.engine.document import FORMAT as FLOW_FORMAT
 from engineering_control.engine.document import Document, FlowInvalid
 from engineering_control.engine.document import parse as parse_flow
@@ -375,6 +376,7 @@ class Toolbox:
 
     def _read_records(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "list_tasks":
+            condition_facts = condition_catalogue()
             return {
                 "format": FLOW_FORMAT,
                 "tasks": [
@@ -412,6 +414,29 @@ class Toolbox:
                 "budgets": {
                     param.name: f"{param.doc} Between {param.low} and {param.high}."
                     for param in BUDGETS.values()
+                },
+                # What an If (control.when) can ask, for its setting ``condition``.
+                "conditions": {
+                    "shape": {
+                        "match": "all or any",
+                        "tests": [{"fact": "change.paths", "is": "all_match", "value": "docs/**"}],
+                    },
+                    "facts": {
+                        fact["key"]: {
+                            "is": f"{fact['title']}. {fact['doc']}",
+                            "compared": [
+                                way["key"] for way in condition_facts["operators"][fact["kind"]]
+                            ],
+                            **({"values": fact["choices"]} if fact["choices"] else {}),
+                            **(
+                                {"also": "of: the task whose outcome is asked about"}
+                                if fact["kind"] == "outcome"
+                                else {}
+                            ),
+                        }
+                        for fact in condition_facts["facts"]
+                    },
+                    "at_most_tests": condition_facts["max_tests"],
                 },
                 "rules": [
                     "After the last task that can change the checkout, a change is reviewed "

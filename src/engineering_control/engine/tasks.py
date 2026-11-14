@@ -337,7 +337,11 @@ class Implement:
             }
         )
         job = deliver.implement_job(
-            lease.provider, lease.generation, prompt, deliver.commit_message(data["issue"])
+            lease.provider,
+            lease.generation,
+            prompt,
+            deliver.commit_message(data["issue"]),
+            base_sha=data.get("base_sha"),
         )
         return _agent(ctx, lease, job)
 
@@ -378,12 +382,19 @@ class Implement:
                 "no_change", "The implementer says it is done but changed nothing.", answer
             )
         summary = str(answer.get("summary") or "")
+        touched = deliver.touched_files(commands)
         return Done(
             "done",
             "implemented",
             summary[:500],
             output=answer,
-            data={"maker": provider, "head": head, "round": int(ctx.given.get("round") or 1)},
+            data={
+                "maker": provider,
+                "head": head,
+                "round": int(ctx.given.get("round") or 1),
+                # Which files differ from where the run started, for an If to ask about.
+                **({"touched": touched} if touched is not None else {}),
+            },
             given={"summary": summary},
         )
 

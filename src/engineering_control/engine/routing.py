@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from engineering_control.engine import catalogue
+from engineering_control.engine import catalogue, conditions
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, Node
 from engineering_control.sandbox import deliver
@@ -19,11 +19,6 @@ from engineering_control.sandbox import deliver
 # How many tasks that only choose a way may follow one another before following stops: a
 # flow that passes validation never comes near it.
 MAX_HOPS: Final = 30
-
-
-def scope_given(data: dict[str, Any]) -> bool:
-    scope = data.get("scope") or {}
-    return bool(str(scope.get("title") or "").strip() or str(scope.get("text") or "").strip())
 
 
 def rounds_allowed(document: Document, run_data: dict[str, Any]) -> int:
@@ -74,6 +69,10 @@ class Next:
     # The tasks that only choose a way that were passed, each with the way it chose.
     passed: tuple[tuple[str, str], ...] = ()
 
+    def went(self, before: dict[str, Any] | None, node: str, outcome: str) -> dict[str, str]:
+        """How each task of the run last ended, this one and the ones passed included."""
+        return {**(before or {}), node: outcome, **dict(self.passed)}
+
 
 def follow(
     document: Document,
@@ -85,12 +84,18 @@ def follow(
     round_number: int,
     known: dict[str, Any],
     rounds: int,
+    told: dict[str, list[str]] | None = None,
 ) -> Next:
+    """``known`` is what the run knows, which an If asks about. ``told`` is for a
+    simulation alone: the ways an If is to go, in the order it is come to, whatever it
+    asks."""
     seen = [*seen]
     if node.id not in seen:
         seen.append(node.id)
     each = dict(each)
     passed: list[tuple[str, str]] = []
+    # How the tasks before ended: an If may ask about it.
+    went = {**(known.get("went") or {}), node.id: outcome}
 
     # Follow the document, passing the tasks that only choose a way.
     target = node.next.get(outcome)
@@ -99,9 +104,17 @@ def follow(
         if following is None or TASKS[following.task].where != "control":
             break
         if following.task == "control.when":
-            condition = following.params.get("condition") or "scope_given"
-            holds = scope_given(known) if condition == "scope_given" else False
-            way = "yes" if holds else "no"
+            waiting = (told or {}).get(following.id) or []
+            if waiting and waiting[0] in ("yes", "no"):
+                way = waiting.pop(0)
+            else:
+                holds = conditions.holds(
+                    following.params.get("condition"),
+                    {**known, "went": went},
+                    round_number=round_number,
+                )
+                way = "yes" if holds else "no"
+            went[following.id] = way
             passed.append((following.id, way))
             target = following.next.get(way)
             continue
@@ -114,10 +127,12 @@ def follow(
             # An entry is gone through from the start: its rounds are its own.
             seen = [following.id]
             round_number = 1
+            went[following.id] = "item"
             passed.append((following.id, "item"))
             target = following.next.get("item")
         else:
             each.pop(following.id, None)
+            went[following.id] = "done"
             passed.append((following.id, "done"))
             target = following.next.get("done")
     else:

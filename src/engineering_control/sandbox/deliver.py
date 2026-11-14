@@ -17,6 +17,7 @@ the files the sandbox finds its credentials in.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -33,6 +34,9 @@ BUNDLE: Final = f"{RUN_DIR}/bundle.json"
 MAX_ROUNDS: Final = 3
 # The most rounds of correction a run can be granted: the platform's ceiling.
 ROUNDS_CEILING: Final = 5
+# How many of the paths a change touches are kept with the run, and what a commit is.
+TOUCHED_KEPT: Final = 3000
+COMMIT: Final = re.compile(r"[0-9a-f]{40}")
 PROVIDERS: Final = ("chatgpt", "claude")
 # Files an agent may not change: continuous integration and the agents' own configuration.
 PROTECTED: Final = (".github/", ".claude/", ".codex/", ".mcp.json", "CLAUDE.md", "AGENTS.md")
@@ -377,7 +381,9 @@ def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) 
     return {**account_setup(provider, generation), "files": files, "commands": commands}
 
 
-def implement_job(provider: str, generation: int, prompt: str, message: str) -> dict[str, Any]:
+def implement_job(
+    provider: str, generation: int, prompt: str, message: str, base_sha: str | None = None
+) -> dict[str, Any]:
     job = _agent(provider, generation, prompt, MAKER_SCHEMA)
     commit = (
         "git add -A -- . ':!.run' && "
@@ -392,7 +398,37 @@ def implement_job(provider: str, generation: int, prompt: str, message: str) -> 
             "timeout": 120,
         }
     )
+    if base_sha and COMMIT.fullmatch(base_sha):
+        # Which files the change touches now: what an If of the flow may ask about.
+        listing = (
+            'list=$(git -c core.quotePath=false diff --name-only "$BASE" HEAD); '
+            'printf "%s\\n" "$list" | grep -c . || true; '
+            f'printf "%s\\n" "$list" | sed -n "1,{TOUCHED_KEPT}p"'
+        )
+        job["commands"].append(
+            {
+                "name": "touched",
+                "argv": ["bash", "-euc", listing],
+                "cwd": REPO,
+                "env": {"BASE": base_sha},
+                "timeout": 120,
+                "allow_failure": True,
+                "echo": 20_000,
+            }
+        )
     return job
+
+
+def touched_files(commands: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The files the change touches, as the implementation's sandbox listed them."""
+    listed = next((c for c in commands if c.get("name") == "touched"), None)
+    if listed is None or listed.get("exit_code") != 0:
+        return None
+    lines = [line.strip() for line in str(listed.get("stdout") or "").splitlines() if line.strip()]
+    if not lines or not lines[0].isdigit():
+        return None
+    paths = [path[:400] for path in lines[1 : TOUCHED_KEPT + 1]]
+    return {"count": max(int(lines[0]), len(paths)), "paths": paths}
 
 
 def review_job(

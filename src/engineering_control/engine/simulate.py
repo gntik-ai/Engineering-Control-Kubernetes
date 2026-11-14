@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from engineering_control.engine import routing, validate
+from engineering_control.engine import conditions, routing, validate
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
@@ -43,11 +43,14 @@ def simulate(
     scope: bool = True,
     entries: int = 2,
     max_rounds: int | None = None,
+    known: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Go through the flow. ``outcomes`` says, by task, how its steps end, in the order
-    they come; a task with none left ends with its usual outcome. ``scope`` says whether
-    the run is told where to look, ``entries`` how many entries a list has that the flow
-    goes through, ``max_rounds`` what a run granted more rounds would have."""
+    they come; a task with none left ends with its usual outcome, and an If with none
+    left is answered from what the simulation knows. ``scope`` says whether the run is
+    told where to look, ``entries`` how many entries a list has that the flow goes
+    through, ``max_rounds`` what a run granted more rounds would have, ``known`` what a
+    run that happened knew, for the Ifs to ask about."""
     wrong = validate.errors(document)
     if wrong:
         return {
@@ -61,7 +64,10 @@ def simulate(
     told = {name: [*ways] for name, ways in (outcomes or {}).items()}
     run_data: dict[str, Any] = {"max_rounds": max_rounds} if max_rounds else {}
     rounds = routing.rounds_allowed(document, run_data)
-    known: dict[str, Any] = {"scope": {"text": "given"} if scope else {}}
+    # What a run that happened knew, without how its tasks ended: that is what the
+    # simulation itself goes through.
+    known = {name: value for name, value in (known or {}).items() if name != "went"}
+    known["scope"] = {"text": "given"} if scope else {}
     ran: dict[str, str] = {}
     steps: list[dict[str, Any]] = []
     seen: list[str] = []
@@ -151,11 +157,19 @@ def simulate(
             round_number=round_number,
             known=known,
             rounds=rounds,
+            told=told,
         )
+        known["went"] = to.went(known.get("went"), node.id, outcome)
         for passed, way in to.passed:
             chooser = document.node(passed)
             if chooser is not None:
-                step(chooser, way, False)
+                asks = chooser.task == "control.when"
+                step(
+                    chooser,
+                    way,
+                    False,
+                    note=conditions.words(chooser.params.get("condition")) if asks else None,
+                )
         if to.kind == "loop":
             return ends("failed", "The flow went round without reaching a task.")
         if to.kind == "end":

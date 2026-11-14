@@ -37,6 +37,7 @@ import {
 import { LoadError, TableFrame, When, mono } from '../parts';
 import { BASE } from '../router';
 import { minutes, tokens, versionName } from './Flows';
+import { conditionOf } from './FlowCondition';
 import { useSubmit } from './ProjectDialogs';
 
 type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
@@ -73,7 +74,12 @@ export function TryOnPaper({
   const [runId, setRunId] = useState<string | null>(null);
   const [result, setResult] = useState<Simulation | null>(null);
   const chooses = document.tasks.filter((node) => (types.get(node.task)?.outcomes.length ?? 0) > 1);
-  const branches = document.tasks.some((node) => node.task === 'control.when');
+  // Whether an If of the flow asks if the run was told where to look.
+  const branches = document.tasks.some(
+    (node) =>
+      node.task === 'control.when' &&
+      conditionOf(node.with.condition, catalogue.conditions).tests.some((test) => test.fact === 'scope'),
+  );
   const loops = document.tasks.some((node) => node.task === 'control.each');
   const go = useSubmit(
     async () => {
@@ -136,13 +142,21 @@ export function TryOnPaper({
                       {type?.title ?? node.task} <span className="font-mono text-[12px]">{node.id}</span>
                     </FieldLabel>
                     <SimpleSelect
-                      items={[
-                        { value: USUAL, label: `Ends with ${first}` },
-                        ...others.flatMap((outcome) => [
-                          { value: `${outcome}:once`, label: `Ends with ${outcome} once, then ${first}` },
-                          { value: `${outcome}:always`, label: `Ends with ${outcome} every time` },
-                        ]),
-                      ]}
+                      items={
+                        node.task === 'control.when'
+                          ? [
+                              { value: USUAL, label: 'Answered from what the run knows' },
+                              { value: 'yes:always', label: 'Goes by yes every time' },
+                              { value: 'no:always', label: 'Goes by no every time' },
+                            ]
+                          : [
+                              { value: USUAL, label: `Ends with ${first}` },
+                              ...others.flatMap((outcome) => [
+                                { value: `${outcome}:once`, label: `Ends with ${outcome} once, then ${first}` },
+                                { value: `${outcome}:always`, label: `Ends with ${outcome} every time` },
+                              ]),
+                            ]
+                      }
                       value={ways[node.id] ?? USUAL}
                       onValueChange={(next) => setWays({ ...ways, [node.id]: next ?? USUAL })}
                     />

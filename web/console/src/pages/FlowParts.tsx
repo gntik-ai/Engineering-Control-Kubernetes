@@ -1,6 +1,7 @@
 import { Field, FieldDescription, FieldLabel, Input, SimpleSelect, Switch } from '@gntik-ai/ui';
 import type { FlowCatalogue, FlowDocument, FlowNode, TaskParam, TaskType } from '../api';
 import { ModelChoice } from '../modelChoice';
+import { ConditionEditor } from './FlowCondition';
 
 /** What the flow pages share: names, and the editor of one setting of a task. */
 
@@ -20,7 +21,7 @@ const SETTING_NAMES: Record<string, string> = {
   install: 'Install what the project needs',
   baseline: 'Run the tests before any change',
   rounds: 'Rounds',
-  condition: 'What decides',
+  condition: 'What is asked',
   over: 'The list it goes through',
   max: 'Entries at most',
   tokens: 'Tokens',
@@ -109,6 +110,18 @@ export function Setting({
           {param.low !== null && param.high !== null ? ` Between ${param.low} and ${param.high}.` : ''}
         </FieldDescription>
       </Field>
+    );
+  }
+  if (param.kind === 'condition') {
+    return (
+      <ConditionEditor
+        value={node.with[param.name]}
+        node={node}
+        document={document}
+        catalogue={catalogue}
+        doc={param.doc}
+        onChange={onChange}
+      />
     );
   }
   if (param.kind === 'models') {

@@ -266,6 +266,12 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
           </span>
         </div>
         {step.detail ? <p className="text-[13px] text-muted-foreground">{step.detail}</p> : null}
+        {step.input?.chose?.map((chosen, index) => (
+          <p key={index} className="text-[13px] text-muted-foreground">
+            Then the flow asked (<span className="font-mono text-[12px]">{chosen.task}</span>): {chosen.asked}?{' '}
+            <span className="font-medium text-foreground">{chosen.way === 'yes' ? 'Yes' : 'No'}</span>.
+          </p>
+        ))}
         {step.log ? (
           <div>
             <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(!open)}>

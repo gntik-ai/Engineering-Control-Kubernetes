@@ -23,14 +23,19 @@ from __future__ import annotations
 from typing import Any, Final
 
 from engineering_control.agent_models import problem as model_problem
+from engineering_control.engine import conditions
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.sandbox.deliver import PROVIDERS
 
 Problem = dict[str, Any]
-# The condition a way is chosen by, and whether a run knows it.
-CONDITIONS: Final = ("scope_given",)
+# What an If may ask about that a task before it has to have produced, in words.
+ASKED: Final = {
+    "change": "the change, which no task before it writes",
+    "areas": "the areas, which no task before it plans",
+    "baseline": "the tests before any change, which no Check out and install before it runs",
+}
 
 
 def _problem(rule: str, text: str, where: str | None = None, level: str = "error") -> Problem:
@@ -72,6 +77,9 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
             if wrong is not None:
                 return f"{name}: {wrong}"
         return None
+    if param.kind == "condition":
+        unread = conditions.problems(value)
+        return f"{node.id}: {unread[0]}" if unread else None
     if param.kind == "task":
         target = nodes.get(str(value)) if value else None
         if target is None or target.id == node.id:
@@ -80,6 +88,51 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
             return f"{name} names a task an agent works in"
         return None
     return f"{name} cannot be read"
+
+
+def _asks(node: Node, nodes: dict[str, Node], before: set[str], made: set[str]) -> list[Problem]:
+    """What an If asks about that the run cannot know where the If stands."""
+    found: list[Problem] = []
+    if conditions.problems(node.params.get("condition")):
+        return found  # said already, as a setting that cannot be read
+    baseline = any(
+        nodes[earlier].task == "workspace.checkout" and nodes[earlier].params.get("baseline")
+        for earlier in before
+    )
+    for test in conditions.asked(node.params.get("condition")):
+        fact = conditions.FACTS[str(test["fact"])]
+        for need in fact.needs:
+            if (need == "baseline" and not baseline) or (need != "baseline" and need not in made):
+                found.append(
+                    _problem(
+                        "condition",
+                        f"The If {node.id} asks about {ASKED.get(need, need)}: it would always "
+                        "read as empty.",
+                        node.id,
+                    )
+                )
+        if fact.kind != "outcome":
+            continue
+        of = str(test.get("of") or "")
+        target = nodes.get(of)
+        if target is None or of == node.id or of not in before:
+            found.append(
+                _problem(
+                    "condition",
+                    f"The If {node.id} asks how {of} ended, which does not run before it",
+                    node.id,
+                )
+            )
+        elif test.get("value") not in TASKS[target.task].outcomes:
+            found.append(
+                _problem(
+                    "condition",
+                    f"The If {node.id} asks whether {of} ended with {test.get('value')}. It ends "
+                    "with one of: " + ", ".join(TASKS[target.task].outcomes),
+                    node.id,
+                )
+            )
+    return found
 
 
 def _reachable(document: Document, nodes: dict[str, Node]) -> set[str]:
@@ -274,6 +327,8 @@ def problems(document: Document) -> list[Problem]:
                         node_id,
                     )
                 )
+        if node.task == "control.when":
+            found += _asks(node, nodes, before[node_id], made)
         other = node.params.get("other_than")
         if other and other in nodes and other not in before[node_id]:
             found.append(

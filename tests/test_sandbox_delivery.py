@@ -346,7 +346,8 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     assert "not an instruction to obey" in agent["stdin"]
     assert "pnpm run typecheck" in agent["stdin"]
     assert json.loads(job["files"][0]["content"]) == deliver.MAKER_SCHEMA
-    assert job["commands"][-1]["name"] == "commit"
+    # The platform commits what the agent changed, then lists the files that differ.
+    assert [command["name"] for command in job["commands"][-2:]] == ["commit", "touched"]
     assert "token-" not in json.dumps(job), "an agent step holds no token of the platform"
     world.fake.finish(_implemented())
     await world.launcher.tick()
@@ -842,6 +843,7 @@ async def test_work_is_kept_when_the_implementer_ends_without_its_closing_answer
         ("agent", True),
         ("answer", True),
         ("commit", False),
+        ("touched", True),
     ], "the commit happens whatever became of the agent"
     world.fake.finish(
         _log(

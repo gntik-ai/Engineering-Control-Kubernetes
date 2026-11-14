@@ -16,7 +16,13 @@ const STEP_TONES: Record<RunStep['state'], FlowTone | undefined> = {
 };
 
 /** The connections that lead from one task to another, through tasks that only choose the way. */
-function between(document: FlowDocument, catalogue: FlowCatalogue, from: string, to: string): string[] {
+function between(
+  document: FlowDocument,
+  catalogue: FlowCatalogue,
+  from: string,
+  to: string,
+  chose: Record<string, string> = {},
+): string[] {
   const control = new Set(
     document.tasks
       .filter((node) => catalogue.tasks.find((task) => task.key === node.task)?.where === 'control')
@@ -25,6 +31,8 @@ function between(document: FlowDocument, catalogue: FlowCatalogue, from: string,
   const search = (at: string, depth: number): string[] | null => {
     const node = document.tasks.find((entry) => entry.id === at);
     for (const [outcome, target] of Object.entries(node?.next ?? {})) {
+      // An If the run passed went one way: the other is not looked along.
+      if (depth > 0 && chose[at] && chose[at] !== outcome) continue;
       if (target === to) return [edgeId(at, outcome)];
       if (target && control.has(target) && depth < 6) {
         const onward = search(target, depth + 1);
@@ -54,7 +62,12 @@ function drawn(run: Run, document: FlowDocument, catalogue: FlowCatalogue) {
     metas[step.name] =
       [who, times > 1 ? `${times} times` : null, step.outcome].filter(Boolean).join(' · ') || undefined;
     const next = steps[index + 1];
-    if (next) for (const edge of between(document, catalogue, step.name, next.name)) taken.add(edge);
+    const chose = Object.fromEntries((step.input?.chose ?? []).map((chosen) => [chosen.task, chosen.way]));
+    for (const chosen of step.input?.chose ?? []) {
+      tones[chosen.task] = 'done';
+      metas[chosen.task] = chosen.way === 'yes' ? 'Yes' : 'No';
+    }
+    if (next) for (const edge of between(document, catalogue, step.name, next.name, chose)) taken.add(edge);
   });
   // What the platform does itself has no step: it is told from where the run stands.
   const at = run.data.at;
