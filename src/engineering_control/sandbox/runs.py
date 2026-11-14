@@ -34,7 +34,7 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
-from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND, kind_of
+from engineering_control.engine.builtin import BUILTIN, COMMANDS_CHECK, FLOW_OF_KIND, kind_of
 from engineering_control.engine.library import (
     document_in_force,
     plan_for_item,
@@ -367,6 +367,60 @@ class Runs:
             # Starting work on an item is deciding that it is wanted.
             if item.state == "proposed":
                 item.state = "accepted"
+            session.flush()
+            return _run_row(run)
+
+    def start_commands_check(self, project: str, *, toolchain: dict[str, Any]) -> dict[str, Any]:
+        """Try a project's commands: clone its repository, install it and run its tests,
+        as the next run of any flow would, without an agent."""
+        with self.sessions.begin() as session:
+            record = session.scalar(
+                select(ProjectRecord)
+                .where(ProjectRecord.name == project, ProjectRecord.archived_at.is_(None))
+                .with_for_update()
+            )
+            if record is None:
+                raise ProjectNotFound(project)
+            if refusal := paused_refusal(record):
+                raise ProjectConflict(refusal)
+            if not record.source_repository:
+                raise ProjectInvalid("Connect a repository to the project first")
+            document = COMMANDS_CHECK
+            under_way = session.scalars(
+                select(SandboxRun.data).where(
+                    SandboxRun.project_id == record.id,
+                    SandboxRun.kind == FLOW,
+                    SandboxRun.state.in_(ACTIVE),
+                )
+            )
+            if any(
+                ((data or {}).get("flow") or {}).get("key") == document.key for data in under_way
+            ):
+                raise ProjectConflict("The commands of this project are being tried already")
+            run = SandboxRun(
+                kind=FLOW,
+                state="queued",
+                title=f"Trying the commands of {record.display_name}"[:300],
+                project_id=record.id,
+                cancel_requested=False,
+                data={
+                    "flow": {"key": document.key, "version": 0, "sha256": document.sha256()},
+                    # The run carries what it follows: it is no flow of the library.
+                    "flow_document": document.as_dict(),
+                    "project": record.name,
+                    "project_name": record.display_name,
+                    "repository": record.source_repository,
+                    "base_branch": record.default_branch or "main",
+                    "toolchain": commands_of_project(record, toolchain),
+                },
+            )
+            session.add(run)
+            session.flush()
+            session.add(
+                SandboxStep(
+                    run_id=run.id, position=1, name=document.start, state="pending", attempt=0
+                )
+            )
             session.flush()
             return _run_row(run)
 

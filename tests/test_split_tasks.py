@@ -10,7 +10,12 @@ from uuid import UUID
 import httpx
 import pytest
 
-from engineering_control.dashboard.project_records import ProjectInvalid, ProjectRecords
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectNotFound,
+    ProjectRecords,
+)
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS
@@ -438,6 +443,11 @@ def test_the_console_shows_and_changes_a_projects_commands_with_the_password(
         }
         back = post(path, platform=True, current_password=password)
         assert back.status_code == 200 and back.json()["own"] is False
+        # Trying them starts a run of the three steps, and one at a time.
+        tried = post(f"{path}/try")
+        assert tried.status_code == 201 and tried.json()["title"].startswith("Trying the commands")
+        assert post(f"{path}/try").status_code == 409
+        assert post("/projects/nobody/commands/try").status_code == 404
         # The designer is given the three tasks and not the one they took the place of.
         catalogue = client.get("/api/dashboard/flows/catalogue").json()
         assert catalogue["hidden"] == ["workspace.checkout"]
@@ -452,6 +462,50 @@ def test_the_console_shows_and_changes_a_projects_commands_with_the_password(
             ).status_code
             == 422
         )
+
+
+@pytest.mark.asyncio
+async def test_a_projects_commands_are_tried_without_an_agent(world: Any) -> None:  # noqa: F811
+    from engineering_control.engine.builtin import COMMANDS_CHECK
+    from engineering_control.engine.catalogue import TASKS as kinds
+
+    # What is run is the three tasks and nothing else, and no agent works in any.
+    assert [node.task for node in COMMANDS_CHECK.nodes] == [
+        "workspace.clone",
+        "workspace.install",
+        "check.tests",
+    ]
+    assert not any(kinds[node.task].account for node in COMMANDS_CHECK.nodes)
+    assert validate.errors(COMMANDS_CHECK) == [] and COMMANDS_CHECK.key not in BUILTIN
+    ProjectRecords(world.sessions).set_commands(
+        "falcone-workflow", install=["npm ci"], tests=["npm test", "npm run lint"]
+    )
+    run = world.runs.start_commands_check("falcone-workflow", toolchain=world.toolchain)
+    assert (run["kind"], run["title"]) == ("flow", "Trying the commands of Falcone workflow")
+    assert run["item_id"] is None and run["data"]["flow"]["key"] == "check-commands"
+    assert "flow_document" not in run["data"], "what it follows is not shown as the run's data"
+    with pytest.raises(ProjectConflict, match="being tried already"):
+        world.runs.start_commands_check("falcone-workflow", toolchain=world.toolchain)
+    await _job(world, "prepare")
+    await _end(world, CLONED)
+    job = await _job(world, "install")
+    assert [c["argv"] for c in job["commands"]] == [["npm", "ci"]]
+    await _end(world, _log([_ran("install 1")]))
+    job = await _job(world, "tests")
+    assert [c["argv"] for c in job["commands"][1:-1]] == [["npm", "test"], ["npm", "run", "lint"]]
+    await _end(world, _log([_ran("baseline 1"), _ran("baseline 2", exit_code=2, stderr="lint")]))
+    await world.launcher.tick()
+    ended = world.run(run["id"])
+    # The run did what it is for, and says which commands fail.
+    assert (ended["state"], ended["outcome"]) == ("succeeded", "tests_failing")
+    assert ended["detail"] == ("1 of 2 test commands fail before anything is changed: npm run lint")
+    assert [step["provider"] for step in ended["steps"]] == [None, None, None]
+    assert not world.accounts.listing()["items"], "no account was needed"
+    # It can be tried again once it has ended; a project that is not there cannot.
+    world.runs.start_commands_check("falcone-workflow", toolchain=world.toolchain)
+    with pytest.raises(ProjectNotFound):
+        world.runs.start_commands_check("nobody", toolchain={})
+    await world.github.aclose()
 
 
 def test_the_task_that_was_replaced_is_listed_and_not_offered(world: Any) -> None:  # noqa: F811

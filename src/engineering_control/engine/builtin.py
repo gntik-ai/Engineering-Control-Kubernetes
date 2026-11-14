@@ -321,6 +321,26 @@ FLOW_OF_KIND: Final = {kind: key for key, kind in KIND_OF.items()}
 # The kind of run of every other flow: which flow it is, the run says itself.
 FLOW: Final = "flow"
 
+# What trying a project's commands runs: the clone, the installation and the tests, and
+# nothing else. No agent works in it. It is not a flow of the library: nothing is
+# assigned to it and nothing can change it; a run that tries commands carries it.
+COMMANDS_CHECK: Final = parse(
+    {
+        "format": FORMAT,
+        "key": "check-commands",
+        "name": "Try a project's commands",
+        "summary": "Clone the repository, install the project and run its tests, without "
+        "an agent: what to run after a project's commands were changed.",
+        "start": "prepare",
+        "tasks": [
+            {"id": "prepare", "task": "workspace.clone", "next": {"ok": "install"}},
+            {"id": "install", "task": "workspace.install", "next": {"ok": "tests"}},
+            {"id": "tests", "task": "check.tests", "next": {}},
+        ],
+        "budgets": {"minutes": 120},
+    }
+)
+
 
 def kind_of(key: str) -> str:
     return KIND_OF.get(key, FLOW)

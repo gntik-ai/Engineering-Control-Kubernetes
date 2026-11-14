@@ -418,6 +418,14 @@ the tools it names; "Use the platform's own again" goes back to that file. Writi
 command is a choice too: nothing is installed, or no tests are run, and then only the
 scan for secrets guards a change.
 
+"Try them now" on the same card starts a run that clones the repository, installs the
+project and runs its tests once, exactly as the next run of any flow would, and ends
+there. No agent and no account take part in it, so it uses nothing of a subscription;
+it is how commands are checked after they were changed, or before a project's first
+delivery. What it follows is not a flow of the library: nothing is assigned to it and
+nothing can change it. The run says which commands pass and which fail; one that fails
+to install fails the run.
+
 A command is one line, split into words the way a shell splits them and run without a
 shell, in the repository's folder: `pnpm install --frozen-lockfile`. A folder in
 brackets before it runs it in that folder of the repository: `[web] npm test`. A pipe

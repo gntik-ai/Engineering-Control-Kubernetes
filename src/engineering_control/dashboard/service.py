@@ -89,6 +89,14 @@ class DashboardService:
             lambda: projects.set_commands(project, install=install, tests=tests)
         )
 
+    async def try_project_commands(self, project: str) -> dict[str, object]:
+        """Run the project's installation and its tests once, without an agent."""
+        return await asyncio.to_thread(
+            lambda: self.repository.runs.start_commands_check(
+                project, toolchain=toolchain_for(project).as_dict()
+            )
+        )
+
     async def set_application(
         self,
         project: str,

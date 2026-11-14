@@ -1770,6 +1770,18 @@ def create_app(
             password=True,
         )
 
+    @app.post("/api/dashboard/projects/{name}/commands/try")
+    async def project_commands_try_api(name: str, request: Request) -> Response:
+        """Clone, install and run the tests for the project once, without an agent."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).try_project_commands(name),
+            event="dashboard.project_commands_tried",
+            subject=name,
+            status_code=201,
+        )
+
     @app.post("/api/dashboard/projects/{name}/application")
     async def project_application_api(name: str, request: Request) -> Response:
         """Where the project's application runs, and the test identity a step that looks

@@ -9,12 +9,14 @@ import {
   Field,
   FieldDescription,
   FieldLabel,
+  Link,
   PasswordInput,
   Textarea,
 } from '@gntik-ai/ui';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type ProjectCommands } from '../api';
 import { LoadError } from '../parts';
+import { BASE } from '../router';
 import { useSubmit } from './ProjectDialogs';
 
 /** Command lines as they are typed, one a line, and as the list that is stored. */
@@ -92,6 +94,11 @@ export function CommandsCard({ project }: { project: string }) {
     () => postJson(`projects/${project}/commands`, { platform: true, current_password: password }),
     done,
   );
+  const [tried, setTried] = useState<string | null>(null);
+  const attempt = useSubmit(
+    async () => setTried((await postJson<{ id: string }>(`projects/${project}/commands/try`)).id),
+    () => undefined,
+  );
   const changed =
     Boolean(stored) &&
     (install.join('\n') !== stored?.install.join('\n') || tests.join('\n') !== stored?.tests.join('\n'));
@@ -115,7 +122,22 @@ export function CommandsCard({ project }: { project: string }) {
         </p>
         <LoadError resource={commands} />
         {stored?.note ? <Alert tone="warning" title={stored.note} /> : null}
-        {save.problem || back.problem ? <Alert tone="destructive" title={save.problem ?? back.problem ?? ''} /> : null}
+        {save.problem || back.problem || attempt.problem ? (
+          <Alert tone="destructive" title={save.problem ?? back.problem ?? attempt.problem ?? ''} />
+        ) : null}
+        {tried ? (
+          <Alert
+            tone="info"
+            title="The commands are being tried"
+            description={
+              <span>
+                A run clones the repository, installs the project and runs its tests, without an agent.{' '}
+                <Link href={`${BASE}/run?id=${tried}`}>See how it goes</Link>.
+              </span>
+            }
+            onDismiss={() => setTried(null)}
+          />
+        ) : null}
         <CommandLines
           label="To install"
           value={install}
@@ -144,6 +166,15 @@ export function CommandsCard({ project }: { project: string }) {
         <div className="flex flex-wrap gap-2">
           <Button loading={save.pending} disabled={!password || !changed} onClick={() => void save.submit()}>
             Save the commands
+          </Button>
+          <Button
+            variant="secondary"
+            loading={attempt.pending}
+            disabled={!stored || changed}
+            title={changed ? 'Save the commands first: what is tried is what is saved' : undefined}
+            onClick={() => void attempt.submit()}
+          >
+            Try them now
           </Button>
           {stored?.own ? (
             <Button variant="secondary" loading={back.pending} disabled={!password} onClick={() => void back.submit()}>
