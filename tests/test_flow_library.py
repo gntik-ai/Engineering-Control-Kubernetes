@@ -265,7 +265,11 @@ async def test_code_clean_proposes_what_can_be_taken_out_as_clean_up_items(world
     )
     assert (run["kind"], run["title"]) == ("flow", "Code clean: The helpers")
     await world.launcher.tick()
-    assert [c["name"] for c in world.job()["commands"]] == ["checkout", "install 1"]
+    assert [c["name"] for c in world.job()["commands"]] == ["checkout"]
+    world.fake.finish(_checked_out())
+    await world.launcher.tick()
+    await world.launcher.tick()
+    assert [c["name"] for c in world.job()["commands"]] == ["install 1"]
     world.fake.finish(_checked_out())
     await world.launcher.tick()
     await world.launcher.tick()
@@ -289,7 +293,7 @@ async def test_code_clean_proposes_what_can_be_taken_out_as_clean_up_items(world
     await world.launcher.tick()
     ended = world.run(run["id"])
     assert (ended["state"], ended["outcome"]) == ("succeeded", "findings")
-    assert [step["name"] for step in ended["steps"]] == ["prepare", "audit", "verify"]
+    assert [step["name"] for step in ended["steps"]] == ["prepare", "install", "audit", "verify"]
     (found,) = ended["data"]["result"]["findings"]
     item = backlog.get(UUID(found["item_id"]))
     assert item["facts"]["kind"] == "clean-up" and item["facts"]["lens"] == "maintainability"
@@ -338,14 +342,12 @@ def test_the_console_makes_copies_and_brings_flows_in(world: Any) -> None:  # no
         )
         assert made.status_code == 201 and made.json()["state"] == "draft"
         assert made.json()["document"]["summary"] == "Deliver with more care."
-        assert len(made.json()["document"]["tasks"]) == 7
+        assert len(made.json()["document"]["tasks"]) == 9
         assert post("/flows", key="careful-delivery", name="Twice").status_code == 409
         assert post("/flows", key="nope", name="Nope", copy_of="nothing").status_code == 404
         # A flow with nothing in it yet: one task, to build on.
         empty = post("/flows", key="my-flow", name="My flow")
-        assert [task["task"] for task in empty.json()["document"]["tasks"]] == [
-            "workspace.checkout"
-        ]
+        assert [task["task"] for task in empty.json()["document"]["tasks"]] == ["workspace.clone"]
 
         detail = client.get("/api/dashboard/flows/careful-delivery").json()
         assert detail["in_force"] is None and detail["draft"]["version"] == 1

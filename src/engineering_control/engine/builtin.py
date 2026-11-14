@@ -25,9 +25,16 @@ _DELIVER: Final[dict[str, Any]] = {
     "tasks": [
         {
             "id": "prepare",
-            "task": "workspace.checkout",
-            "with": {"install": True, "baseline": True},
-            "next": {"ok": "implement"},
+            "task": "workspace.clone",
+            "next": {"ok": "install"},
+        },
+        {"id": "install", "task": "workspace.install", "next": {"ok": "tests"}},
+        {
+            # What already fails is known before anything is changed, whichever way it
+            # ends: the tests after the change are compared with it.
+            "id": "tests",
+            "task": "check.tests",
+            "next": {"passed": "implement", "failed": "implement"},
         },
         {
             "id": "implement",
@@ -66,10 +73,10 @@ _AUDIT: Final[dict[str, Any]] = {
     "tasks": [
         {
             "id": "prepare",
-            "task": "workspace.checkout",
-            "with": {"install": True, "baseline": False},
-            "next": {"ok": "scope"},
+            "task": "workspace.clone",
+            "next": {"ok": "install"},
         },
+        {"id": "install", "task": "workspace.install", "next": {"ok": "scope"}},
         {
             "id": "scope",
             "task": "control.when",
@@ -116,10 +123,10 @@ _DISCOVER: Final[dict[str, Any]] = {
     "tasks": [
         {
             "id": "prepare",
-            "task": "workspace.checkout",
-            "with": {"install": True, "baseline": False},
-            "next": {"ok": "discover"},
+            "task": "workspace.clone",
+            "next": {"ok": "install"},
         },
+        {"id": "install", "task": "workspace.install", "next": {"ok": "discover"}},
         {
             "id": "discover",
             "task": "agent.discover",
@@ -151,10 +158,10 @@ _CLEAN: Final[dict[str, Any]] = {
     "tasks": [
         {
             "id": "prepare",
-            "task": "workspace.checkout",
-            "with": {"install": True, "baseline": False},
-            "next": {"ok": "audit"},
+            "task": "workspace.clone",
+            "next": {"ok": "install"},
         },
+        {"id": "install", "task": "workspace.install", "next": {"ok": "audit"}},
         {
             "id": "audit",
             "task": "agent.audit",
@@ -231,8 +238,8 @@ def _application_audit(
         "tasks": [
             {
                 "id": "prepare",
-                "task": "workspace.checkout",
-                "with": {"install": False, "baseline": False},
+                # Looking at the running application needs nothing installed.
+                "task": "workspace.clone",
                 "next": {"ok": "audit"},
             },
             {

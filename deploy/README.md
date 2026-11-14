@@ -386,7 +386,9 @@ a checkout in a volume of its own (`run-<id>`, deleted when the run ends or wait
 
 | Step | Sandbox | What happens |
 | --- | --- | --- |
-| Check out and install | network, no account | The repository at its default branch, cloned with a token for that repository's contents only, read-only, revoked when the step ends and never written into the checkout. The project's install commands; its test commands once, to know what already fails |
+| Clone the repository | network, no account | The repository at the project's default branch (or the branch the task names), cloned with a token for that repository's contents only, read-only, revoked when the step ends and never written into the checkout |
+| Install the project | network, no account, no token | The project's install commands, in order; the first that fails ends the run |
+| Run the tests | no network, no account | The project's test commands once, every one of them, to know what already fails before anything is changed |
 | Implement | network, one account | An agent of one subscription (ChatGPT first, Claude when no ChatGPT account is free) changes the code. The platform commits |
 | Review | network, an account of the other subscription | Passes the change, asks for changes (back to Implement, three rounds at most) or stops the run |
 | Test and scan | no network, no account | The project's test commands; a command that passed before the change and fails after it sends the work back. A scan for secrets in the change; a finding ends the run |
@@ -400,10 +402,50 @@ pull request. No sandbox ever holds a token that can write, nothing a sandbox pr
 executed by the platform, nothing is merged, and no existing branch is moved. A change that
 touches `.github/`, `.claude/`, `.codex/`, `.mcp.json`, `CLAUDE.md` or `AGENTS.md` is refused.
 
-What to install and how to test comes from the project's manifest (`config/projects`) when
-the sandbox image has the tools it names; otherwise the run says so and the agents work
-without prepared tools. The issue's text reaches the agents marked as material from
+The first three steps, Test and scan and Collect the change are commands and nothing
+else: no agent, no model and no subscription takes part in them, and the same input
+gives the same result. The issue's text reaches the agents marked as material from
 outside, with the rule not to follow instructions in it that go beyond the repository.
+
+### What is installed and how a project is tested
+
+The commands that install a project and that run its tests are the project's. They are
+shown and changed on the project's page ("Installing and testing"), with the password,
+and are run from the next run on; runs under way keep theirs. Until the administrator
+writes them there they are the ones of the platform's own file for the project
+(`config/projects/<project>.yaml`, block `toolchain`), used when the sandbox image has
+the tools it names; "Use the platform's own again" goes back to that file. Writing no
+command is a choice too: nothing is installed, or no tests are run, and then only the
+scan for secrets guards a change.
+
+A command is one line, split into words the way a shell splits them and run without a
+shell, in the repository's folder: `pnpm install --frozen-lockfile`. A folder in
+brackets before it runs it in that folder of the repository: `[web] npm test`. A pipe
+or `&&` needs a shell, which is asked for by name: `bash -c "npm run lint && npm test"`.
+At most twelve commands of 600 characters each; a command has 30 minutes and a step an
+hour.
+
+Three tasks run them, each a step of its own:
+
+- **Clone the repository** takes a branch. Empty, it is the project's default branch;
+  named, that branch is cloned and is the one a pull request of the run is opened
+  against. A branch that is not there ends the run at the clone.
+- **Install the project** runs the project's install commands, or the ones written in
+  the task, with the package registries in reach and without the clone's token.
+- **Run the tests** runs the project's test commands, or the ones written in the task,
+  without network, and ends with `passed` or `failed`; both usually lead on, since what
+  matters is what a change breaks. Test and scan later runs the same commands under the
+  same conditions and compares: a command that passed here and fails there is a
+  regression, one that failed here already is only noted. When the task names its own
+  commands, they are the run's test commands from then on: the agents are told of them
+  and Test and scan runs them. A flow without Run the tests has nothing to compare
+  with, so failing tests do not send the work back in it.
+
+A task's own commands are for a flow that is one project's; a flow shared by several
+projects leaves them empty and each project's own are run. The earlier single task
+"Check out and install" did all three in one sandbox with the network open, so a test
+that needed the network passed there and failed in Test and scan. It is kept for the
+flows that have it, runs as before, and is no longer offered in the designer's list.
 
 A subscription that refuses (a limit, a sign-in that is no longer accepted) is recorded on
 the account, and the step is given to another account, three times at most.

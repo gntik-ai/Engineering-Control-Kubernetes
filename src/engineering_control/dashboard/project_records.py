@@ -228,6 +228,56 @@ class ProjectRecords:
             session.commit()
             return serialize(record)
 
+    def commands(self, name: str) -> dict[str, Any]:
+        """How the project is installed and how its tests are run, as command lines: the
+        administrator's own when they wrote any, or else the platform's file's."""
+        from engineering_control.sandbox import deliver
+
+        with self.sessions() as session:
+            record = self._active(session, name)
+            own = record.toolchain if isinstance(record.toolchain, dict) else None
+        if own is not None:
+            return {
+                "install": [str(line) for line in own.get("install") or []],
+                "tests": [str(line) for line in own.get("tests") or []],
+                "own": True,
+                "note": None,
+            }
+        usual = deliver.toolchain_for(name)
+        return {
+            "install": [deliver.line_of(command) for command in usual.prepare],
+            "tests": [deliver.line_of(command) for command in usual.tests],
+            "own": False,
+            "note": usual.note,
+        }
+
+    def set_commands(self, name: str, *, install: Any, tests: Any) -> dict[str, Any]:
+        """Write the project's own commands. They are run from the next run on."""
+        from engineering_control.sandbox import deliver
+
+        lines: dict[str, list[str]] = {}
+        for part, given in (("install", install), ("tests", tests)):
+            listed = [str(line).strip() for line in given or [] if str(line).strip()]
+            try:
+                deliver.commands_of(listed)
+            except ValueError as error:
+                where = "To install" if part == "install" else "To test"
+                raise ProjectInvalid(f"{where}: {error}") from error
+            lines[part] = listed
+        with self.sessions() as session:
+            record = self._active(session, name)
+            record.toolchain = lines
+            session.commit()
+        return {"project": name, **self.commands(name)}
+
+    def forget_commands(self, name: str) -> dict[str, Any]:
+        """Go back to the commands of the platform's own file for the project."""
+        with self.sessions() as session:
+            record = self._active(session, name)
+            record.toolchain = None
+            session.commit()
+        return {"project": name, **self.commands(name)}
+
     def application(self, name: str) -> dict[str, Any] | None:
         """Where the project's application runs and whether an identity is stored."""
         with self.sessions() as session:

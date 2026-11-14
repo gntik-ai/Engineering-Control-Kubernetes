@@ -59,7 +59,7 @@ export interface FlowListed extends Flow {
 /** One setting of a task. */
 export interface TaskParam {
   name: string;
-  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition' | 'text';
+  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition' | 'text' | 'line' | 'commands';
   default: unknown;
   doc: string;
   low: number | null;
@@ -84,6 +84,8 @@ export interface TaskType {
   outcomes: string[];
   params: TaskParam[];
   prompt: string | null;
+  /** For a kind kept only for the flows that have it: what took its place. */
+  retired?: string;
 }
 
 export type PromptPart =
@@ -108,6 +110,15 @@ export interface SavedTask {
   task: string;
   with: Record<string, unknown>;
   wording: Record<string, string>;
+}
+
+/** How a project is installed and how its tests are run, as command lines. */
+export interface ProjectCommands {
+  install: string[];
+  tests: string[];
+  /** Whether the administrator wrote them; else they are the platform's own file's. */
+  own: boolean;
+  note: string | null;
 }
 
 /** Where a task is used: a flow, as it stands (its draft when it has one), and its tasks. */

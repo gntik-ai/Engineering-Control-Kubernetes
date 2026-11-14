@@ -75,6 +75,20 @@ class DashboardService:
                 }
         return None
 
+    async def project_commands(self, project: str) -> dict[str, object]:
+        """How the project is installed and tested, as the next run would be told."""
+        return await asyncio.to_thread(self.repository.projects.commands, project)
+
+    async def set_project_commands(
+        self, project: str, *, install: list[str], tests: list[str], platform: bool
+    ) -> dict[str, object]:
+        projects = self.repository.projects
+        if platform:
+            return await asyncio.to_thread(projects.forget_commands, project)
+        return await asyncio.to_thread(
+            lambda: projects.set_commands(project, install=install, tests=tests)
+        )
+
     async def set_application(
         self,
         project: str,
@@ -604,7 +618,7 @@ class DashboardService:
                     "name": name,
                     "summary": summary,
                     "start": "prepare",
-                    "tasks": [{"id": "prepare", "task": "workspace.checkout"}],
+                    "tasks": [{"id": "prepare", "task": "workspace.clone"}],
                 }
             made = flows.create(raw, note="Brought in" if document is not None else None)
             flow_key = str(raw.get("key"))

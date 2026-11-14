@@ -74,6 +74,8 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
     deliver = BUILTIN["deliver-issue"]
     assert [node.id for node in deliver.nodes] == [
         "prepare",
+        "install",
+        "tests",
         "implement",
         "review",
         "verify",
@@ -444,7 +446,9 @@ async def test_a_flow_that_ends_without_publishing_ends_well(world: Any) -> None
     flows = FlowRecords(world.sessions)
     short = _raw("deliver-issue")
     short["tasks"] = [
-        task for task in short["tasks"] if task["id"] in ("prepare", "implement", "verify")
+        task
+        for task in short["tasks"]
+        if task["id"] in ("prepare", "install", "tests", "implement", "verify")
     ]
     _task(short, "implement")["next"] = {"done": "verify"}
     _task(short, "verify")["next"] = {}
@@ -458,7 +462,13 @@ async def test_a_flow_that_ends_without_publishing_ends_well(world: Any) -> None
     await world.launcher.tick()
     ended = world.run(run["id"])
     assert (ended["state"], ended["outcome"]) == ("succeeded", "verified")
-    assert [step["name"] for step in ended["steps"]] == ["prepare", "implement", "verify"]
+    assert [step["name"] for step in ended["steps"]] == [
+        "prepare",
+        "install",
+        "tests",
+        "implement",
+        "verify",
+    ]
     assert world.hub.created == {}, "nothing reached GitHub"
     await world.github.aclose()
 
@@ -497,5 +507,5 @@ async def test_an_audit_with_one_round_of_verification_decides_by_that_round(wor
         "findings",
         "1 candidate finding(s): 1 confirmed.",
     )
-    assert [step["name"] for step in ended["steps"]] == ["prepare", "audit", "verify"]
+    assert [step["name"] for step in ended["steps"]] == ["prepare", "install", "audit", "verify"]
     await world.github.aclose()

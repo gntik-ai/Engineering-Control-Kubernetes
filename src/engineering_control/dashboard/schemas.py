@@ -117,6 +117,18 @@ class ProjectApplicationInput(DashboardModel):
     forget_identity: bool = False
 
 
+class ProjectCommandsInput(DashboardModel):
+    """How a project is installed and how its tests are run, as command lines; or, with
+    ``platform``, the commands of the platform's own file again. Confirmed with the
+    password: the commands are run from the next run on."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    install: list[str] = Field(default_factory=list, max_length=12)
+    tests: list[str] = Field(default_factory=list, max_length=12)
+    platform: bool = False
+
+
 class ProjectPauseInput(DashboardModel):
     """Start no further work on a project, with an optional word on why."""
 

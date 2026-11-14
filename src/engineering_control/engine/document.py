@@ -13,7 +13,7 @@ form, so that two documents that say the same thing have the same hash.
       "summary": "...",
       "start": "prepare",
       "tasks": [
-        {"id": "prepare", "task": "workspace.checkout", "with": {"baseline": true},
+        {"id": "prepare", "task": "workspace.clone", "with": {"branch": ""},
          "next": {"ok": "implement"}},
         {"id": "plan", "task": "agent.report", "with": {"instruction": "..."},
          "next": {"done": "implement"}, "saved": "<the id of a task of the library>"},

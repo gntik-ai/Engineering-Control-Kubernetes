@@ -1,6 +1,7 @@
 import { Field, FieldDescription, FieldLabel, Input, SimpleSelect, Switch, Textarea } from '@gntik-ai/ui';
 import type { FlowCatalogue, FlowDocument, FlowNode, TaskParam, TaskType } from '../api';
 import { ModelChoice } from '../modelChoice';
+import { CommandLines } from './Commands';
 import { ConditionEditor } from './FlowCondition';
 
 /** What the flow pages share: names, and the editor of one setting of a task. */
@@ -23,6 +24,8 @@ const SETTING_NAMES: Record<string, string> = {
   rounds: 'Rounds',
   condition: 'What is asked',
   instruction: 'Your instruction',
+  branch: 'Branch',
+  commands: 'Commands',
   over: 'The list it goes through',
   max: 'Entries at most',
   tokens: 'Tokens',
@@ -111,6 +114,33 @@ export function Setting({
           {param.low !== null && param.high !== null ? ` Between ${param.low} and ${param.high}.` : ''}
         </FieldDescription>
       </Field>
+    );
+  }
+  if (param.kind === 'line') {
+    return (
+      <Field className="max-w-sm">
+        <FieldLabel>{label}</FieldLabel>
+        <Input
+          className="font-mono text-[13px]"
+          maxLength={param.high ?? undefined}
+          placeholder={param.name === 'branch' ? 'The project’s default branch' : undefined}
+          value={typeof value === 'string' ? value : ''}
+          onValueChange={(next) => onChange(next.trim())}
+        />
+        <FieldDescription>{param.doc}</FieldDescription>
+      </Field>
+    );
+  }
+  if (param.kind === 'commands') {
+    return (
+      <CommandLines
+        key={node.id}
+        label={label}
+        value={Array.isArray(value) ? value.map(String) : []}
+        placeholder="The project’s own commands"
+        description={`${param.doc} A folder in brackets before a command runs it there: [web] npm test. For a pipe or &&, write bash -c "…".`}
+        onChange={onChange}
+      />
     );
   }
   if (param.kind === 'text') {

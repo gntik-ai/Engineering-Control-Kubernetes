@@ -29,7 +29,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # 0040 (tasks managed from the console) follows 0039 (how hard the supervisor's
+    # 0041 (a project's own commands) follows
+    # 0040 (tasks managed from the console), 0039 (how hard the supervisor's
     # model reasons), 0038 (a stored test identity), 0037 (triggers, where an
     # application runs),
     # 0036 (flows as documents, usage, evaluations), 0035 (paused projects),
@@ -42,7 +43,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0040", "0039")
+    assert (head, parent) == ("0041", "0040")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -96,6 +97,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0041: a project's own commands.
+    assert "toolchain" in {c["name"] for c in inspect(engine).get_columns("projects")}
+    command.downgrade(config, parent)
+    assert "toolchain" not in {c["name"] for c in inspect(engine).get_columns("projects")}
+    parent = "0039"
     # 0040: what a saved task is for, and the kinds of task that are not offered.
     assert "description" in {c["name"] for c in inspect(engine).get_columns("saved_tasks")}
     assert "hidden_tasks" in inspect(engine).get_table_names()

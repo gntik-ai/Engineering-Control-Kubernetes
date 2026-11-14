@@ -71,7 +71,13 @@ def _rules(raw: dict[str, Any]) -> set[str]:
 
 
 def _path(result: dict[str, Any]) -> list[str]:
-    return [f"{step['task']}:{step['outcome']}" for step in result["steps"]]
+    """The way a simulation went, from the clone on, without the installation and the
+    tests before any change, which every one of these goes through."""
+    return [
+        f"{step['task']}:{step['outcome']}"
+        for step in result["steps"]
+        if step["task"] not in ("install", "tests")
+    ]
 
 
 # --- what is asked ------------------------------------------------------------------------
@@ -259,13 +265,25 @@ def test_an_if_may_ask_only_what_the_run_can_know_where_it_stands() -> None:
 
     assert "condition" in with_condition(_if(_test("change.files", "at_most", 3)), after="prepare")
     assert "condition" in with_condition(_if(_test("areas", "at_least", 1)))
-    # The tests before any change are known when the checkout runs them, as it does here.
+    # The tests before any change are known when a task before the If runs them, as
+    # one does here.
     assert with_condition(_if(_test("tests.failed_before", "yes"))) == set()
     raw = _docs_first()
     tasks = {task["id"]: task for task in raw["tasks"]}
-    tasks["prepare"]["with"]["baseline"] = False
+    tasks["install"]["next"] = {"ok": "implement"}
+    raw["tasks"] = [task for task in raw["tasks"] if task["id"] != "tests"]
     tasks["docs"]["with"]["condition"] = _if(_test("tests.failed_before", "yes"))
     assert "condition" in _rules(raw)
+    # The task that was there before the three still says it, when it runs the tests.
+    old = _docs_first()
+    old["tasks"] = [task for task in old["tasks"] if task["id"] not in ("install", "tests")]
+    kept = {task["id"]: task for task in old["tasks"]}
+    kept["prepare"].update(task="workspace.checkout", next={"ok": "implement"})
+    kept["docs"]["with"]["condition"] = _if(_test("tests.failed_before", "yes"))
+    kept["prepare"]["with"] = {"baseline": False}
+    assert "condition" in _rules(old)
+    kept["prepare"]["with"] = {"baseline": True}
+    assert _rules(old) == set()
     # How a task ended: one that runs before, and an outcome it has.
     assert with_condition(_if(_test("outcome", "is", "done", of="implement"))) == set()
     assert "condition" in with_condition(_if(_test("outcome", "is", "pass", of="publish")))
@@ -362,7 +380,13 @@ async def test_a_run_goes_by_what_the_change_touches(world: Any) -> None:  # noq
     after = world.run(run["id"])
     # Documentation alone: straight to review, and the step says what was asked.
     assert after["data"]["touched"] == {"count": 2, "paths": ["docs/guide.md", "README.md"]}
-    assert after["data"]["went"] == {"prepare": "ok", "implement": "done", "docs": "yes"}
+    assert after["data"]["went"] == {
+        "prepare": "ok",
+        "install": "ok",
+        "tests": "passed",
+        "implement": "done",
+        "docs": "yes",
+    }
     implemented = next(step for step in after["steps"] if step["name"] == "implement")
     assert implemented["input"]["chose"] == [
         {

@@ -244,6 +244,20 @@ def world(tmp_path: Path) -> Any:
             assert pod["metadata"]["labels"]["engineering-control/step"] == name
             fake.finish(log)
             await self.launcher.tick()
+            if name == "prepare":
+                # What used to be one step is three: the clone, the installation and the
+                # tests before any change. One log says how all three went.
+                for _following in ("install", "tests"):
+                    await self.launcher.tick()
+                    started = list(fake.pods.values())
+                    label = "engineering-control/step"
+                    if len(started) != 1 or started[0]["metadata"]["labels"][label] not in (
+                        "install",
+                        "tests",
+                    ):
+                        break
+                    fake.finish(log)
+                    await self.launcher.tick()
             return pod
 
         def run(self, run_id: str) -> dict[str, Any]:
@@ -298,7 +312,8 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     with pytest.raises(ProjectConflict, match="already under way"):
         world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
 
-    # prepare: a checkout with a token for this repository's contents only, read-only.
+    # prepare: a clone with a token for this repository's contents only, read-only, and
+    # nothing else. No agent and no account take part in it or in the two steps after it.
     await world.launcher.tick()
     pod = world.fake.only_pod()
     job = world.job()
@@ -310,18 +325,7 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
         "repositories": ["falcone-workflow"],
         "permissions": {"contents": "read"},
     }
-    assert [c["name"] for c in job["commands"]] == [
-        "checkout",
-        "install 1",
-        "baseline 1",
-        "baseline 2",
-    ]
-    assert job["commands"][1]["argv"] == ["pnpm", "install", "--frozen-lockfile"]
-    # What a step installs, the package manager's own pinned version included, is kept on
-    # the run's volume for the steps that follow, which may have no network.
-    for name in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "PNPM_HOME", "npm_config_store_dir"):
-        assert job["commands"][1]["env"][name].startswith("/workspace/.cache"), name
-    assert job["commands"][2]["allow_failure"] is True
+    assert [c["name"] for c in job["commands"]] == ["checkout"]
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "internet"
     workspace = pods.workspace_claim(UUID(run["id"]))
     assert workspace in world.fake.claims
@@ -329,7 +333,42 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     assert "account" not in {v["name"] for v in pod["spec"]["volumes"]}
     world.fake.finish(_prepared())
     await world.launcher.tick()
-    assert world.hub.revoked == ["token-2"], "the checkout's token ends with the step"
+    assert world.hub.revoked == ["token-2"], "the clone's token ends with the step"
+    cloned = world.run(run["id"])
+    assert cloned["steps"][0]["detail"] == f"Cloned {REPOSITORY} at main ({BASE[:12]})."
+    assert cloned["data"]["base_branch"] == "main"
+
+    # install: the project's commands, with the registries in reach and no token.
+    await world.launcher.tick()
+    pod = world.fake.only_pod()
+    job = world.job()
+    assert pod["metadata"]["labels"]["engineering-control/step"] == "install"
+    assert [c["name"] for c in job["commands"]] == ["install 1"]
+    assert job["commands"][0]["argv"] == ["pnpm", "install", "--frozen-lockfile"]
+    assert "AUTHORIZATION" not in job["commands"][0]["env"]
+    # What a step installs, the package manager's own pinned version included, is kept on
+    # the run's volume for the steps that follow, which may have no network.
+    for name in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "PNPM_HOME", "npm_config_store_dir"):
+        assert job["commands"][0]["env"][name].startswith("/workspace/.cache"), name
+    assert pod["metadata"]["labels"]["engineering-control/egress"] == "internet"
+    assert "account" not in {v["name"] for v in pod["spec"]["volumes"]}
+    world.fake.finish(_prepared())
+    await world.launcher.tick()
+    installed = world.run(run["id"])["steps"][1]
+    assert installed["detail"] == "Installed with 1 command of the project's."
+
+    # tests: what already fails, learnt without network, as the change's tests will run.
+    await world.launcher.tick()
+    pod = world.fake.only_pod()
+    job = world.job()
+    assert pod["metadata"]["labels"]["engineering-control/step"] == "tests"
+    assert [c["name"] for c in job["commands"]] == ["baseline 1", "baseline 2"]
+    assert all(command["allow_failure"] is True for command in job["commands"])
+    assert pod["metadata"]["labels"]["engineering-control/egress"] == "none"
+    world.fake.finish(_prepared())
+    await world.launcher.tick()
+    tested = world.run(run["id"])["steps"][2]
+    assert tested["detail"] == "All 2 test commands pass before anything is changed."
     data = world.run(run["id"])["data"]
     assert data["base_sha"] == BASE and data["baseline"] == {"1": 0, "2": 0}
     assert "body" not in data["issue"], "the console gets the issue without its whole text"
@@ -378,6 +417,8 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     assert (waiting["state"], waiting["outcome"]) == ("waiting", "ready")
     assert [s["name"] for s in waiting["steps"]] == [
         "prepare",
+        "install",
+        "tests",
         "implement",
         "review",
         "verify",
@@ -456,7 +497,10 @@ async def test_a_reviewer_who_asks_for_changes_sends_the_work_back_a_limited_num
     failed = world.run(run["id"])
     assert (failed["state"], failed["outcome"]) == ("failed", "changes_requested")
     assert "round 3, the last one" in failed["detail"]
-    assert [s["name"] for s in failed["steps"]] == ["prepare"] + ["implement", "review"] * 3
+    assert [s["name"] for s in failed["steps"]] == ["prepare", "install", "tests"] + [
+        "implement",
+        "review",
+    ] * 3
     assert world.fake.claims.keys() == {next(k for k in world.fake.claims if k.endswith("-home"))}
     await world.github.aclose()
 
@@ -855,7 +899,7 @@ async def test_work_is_kept_when_the_implementer_ends_without_its_closing_answer
         )
     )
     await world.launcher.tick()
-    step = world.run(run["id"])["steps"][1]
+    step = next(s for s in world.run(run["id"])["steps"] if s["name"] == "implement")
     assert (step["state"], step["outcome"]) == ("succeeded", "implemented")
     assert "without its closing answer" in step["detail"] and "max_output_tokens" in step["detail"]
     # What the repository's own output said about tokens and limits is not about the account.

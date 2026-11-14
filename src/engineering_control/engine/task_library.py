@@ -125,8 +125,11 @@ class TaskLibrary:
     # --- what there is -------------------------------------------------------------------
 
     def hidden(self) -> list[str]:
+        """The kinds that are not offered in the designer's list: the ones the
+        administrator left out, and the ones that are kept only for flows that have them."""
         with self.sessions() as session:
-            return sorted(key for key in session.scalars(select(HiddenTask.task)) if key in TASKS)
+            left_out = {key for key in session.scalars(select(HiddenTask.task)) if key in TASKS}
+        return sorted(left_out | {task.key for task in TASKS.values() if task.retired})
 
     def saved(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -281,6 +284,11 @@ class TaskLibrary:
         """Leave a kind of task out of the designer's list, or offer it again."""
         if task not in TASKS:
             raise ProjectNotFound(task)
+        if TASKS[task].retired:
+            raise ProjectInvalid(
+                f"{TASKS[task].title} is kept for the flows that have it and is not offered "
+                f"any more: {TASKS[task].retired} took its place"
+            )
         with self.sessions.begin() as session:
             row = session.scalar(select(HiddenTask).where(HiddenTask.task == task))
             if hidden and row is None:

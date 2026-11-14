@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from engineering_control.engine.conditions import LEGACY
-from engineering_control.sandbox.deliver import MAX_ROUNDS, PROVIDERS, ROUNDS_CEILING
+from engineering_control.sandbox.deliver import BRANCH, MAX_ROUNDS, PROVIDERS, ROUNDS_CEILING
 
 # The most a run may be granted, whatever its flow says.
 MINUTES_CEILING: Final = 24 * 60
@@ -42,12 +42,17 @@ class Param:
     """One setting of a task."""
 
     name: str
-    kind: str  # "bool", "int", "providers", "task", "choice", "models", "condition", "text"
+    # "bool", "int", "providers", "task", "choice", "models", "condition", "text" (long, has
+    # to be written), "line" (short, may be empty) or "commands" (a list of command lines).
+    kind: str
     default: Any
     doc: str
     low: int | None = None
     high: int | None = None
     choices: tuple[str, ...] = ()
+    # For a line: what it has to look like, and how that is said.
+    pattern: str | None = None
+    shape: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +86,8 @@ class TaskType:
     outcomes: tuple[str, ...] = ("ok",)
     params: tuple[Param, ...] = ()
     prompt: str | None = None
+    # For a kind that is kept only for the flows that have it: what took its place.
+    retired: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +107,7 @@ class TaskType:
             "outcomes": list(self.outcomes),
             "params": [param.as_dict() for param in self.params],
             "prompt": self.prompt,
+            "retired": self.retired,
         }
 
     def defaults(self) -> dict[str, Any]:
@@ -145,6 +153,68 @@ _OTHER: Final = Param(
 
 _TASKS: Final = (
     TaskType(
+        "workspace.clone",
+        "Workspace",
+        "Clone the repository",
+        "Clone the project's repository from GitHub at a branch, with a token for that "
+        "one clone, and start the run's own branch there. No agent takes part.",
+        "sandbox",
+        produces=("checkout",),
+        params=(
+            Param(
+                "branch",
+                "line",
+                "",
+                "The branch that is cloned, and that a pull request of the run is opened "
+                "against. Empty: the project's default branch.",
+                high=100,
+                pattern=BRANCH,
+                shape="a branch name: letters, digits, dots, hyphens, underscores and slashes",
+            ),
+        ),
+    ),
+    TaskType(
+        "workspace.install",
+        "Workspace",
+        "Install the project",
+        "Run the commands that install what the project needs, in order, with the "
+        "network open to package registries. The first command that fails ends the run. "
+        "No agent takes part.",
+        "sandbox",
+        needs=("checkout",),
+        produces=("installed",),
+        params=(
+            Param(
+                "commands",
+                "commands",
+                [],
+                "The commands that install the project, one a line, run in the "
+                "repository's folder. None: the project's own, from the project's page.",
+            ),
+        ),
+    ),
+    TaskType(
+        "check.tests",
+        "Deterministic checks",
+        "Run the tests",
+        "Run the project's test commands once, without network, to know what passes and "
+        "what already fails before anything is changed. Test and scan compares with it "
+        "and runs the same commands. No agent takes part.",
+        "sandbox",
+        needs=("checkout",),
+        produces=("baseline",),
+        outcomes=("passed", "failed"),
+        params=(
+            Param(
+                "commands",
+                "commands",
+                [],
+                "The commands that run the tests, one a line, run in the repository's "
+                "folder. None: the project's own, from the project's page.",
+            ),
+        ),
+    ),
+    TaskType(
         "workspace.checkout",
         "Workspace",
         "Check out and install",
@@ -153,6 +223,7 @@ _TASKS: Final = (
         "once to know what already fails.",
         "sandbox",
         produces=("checkout",),
+        retired="Clone the repository, Install the project and Run the tests",
         params=(
             Param("install", "bool", True, "Install what the project's manifest names."),
             Param("baseline", "bool", False, "Run the project's tests once, before any change."),

@@ -68,6 +68,8 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
     usual = simulate(BUILTIN["deliver-issue"])
     assert _path(usual) == [
         "prepare:ok",
+        "install:ok",
+        "tests:passed",
         "implement:done",
         "review:pass",
         "verify:ok",
@@ -88,7 +90,7 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
     assert by_task["implement"]["prompt"]["changed"] is False
     assert all(step["assumed"] for step in usual["steps"])
     assert usual["totals"] == {
-        "sandboxes": 5,
+        "sandboxes": 7,
         "agents": {"chatgpt": 1, "claude": 1},
         "rounds": 1,
         "of_rounds": 3,
@@ -108,8 +110,8 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
 
     # Tests that fail send the work back to the implementer; a discarded change ends there.
     back = simulate(BUILTIN["deliver-issue"], outcomes={"verify": ["regression"]})
-    assert _path(back)[3:6] == ["verify:regression", "implement:done", "review:pass"]
-    assert not back["steps"][3]["assumed"] and back["totals"]["rounds"] == 2
+    assert _path(back)[5:8] == ["verify:regression", "implement:done", "review:pass"]
+    assert not back["steps"][5]["assumed"] and back["totals"]["rounds"] == 2
     gone = simulate(BUILTIN["deliver-issue"], outcomes={"approve": ["discard"]})
     assert gone["ends"]["how"] == "discarded" and _path(gone)[-1] == "approve:discard"
 
@@ -117,11 +119,11 @@ def test_a_flow_is_gone_through_on_paper_the_way_a_run_would_go() -> None:
     # goes straight to the audit.
     whole = simulate(BUILTIN["audit-code"], scope=False, entries=3)
     assert [s["entry"] for s in whole["steps"] if s["task"] == "audit"] == [1, 2, 3]
-    assert _path(whole)[1:4] == ["scope:no", "plan:areas", "areas:item"]
+    assert _path(whole)[1:5] == ["install:ok", "scope:no", "plan:areas", "areas:item"]
     assert next(s for s in whole["steps"] if s["task"] == "verify")["times"] == 2
     scoped = simulate(BUILTIN["audit-code"], scope=True)
-    assert _path(scoped) == ["prepare:ok", "scope:yes", "audit:candidates", "verify:done",
-                             "areas:done", "decide:ok"]  # fmt: skip
+    assert _path(scoped) == ["prepare:ok", "install:ok", "scope:yes", "audit:candidates",
+                             "verify:done", "areas:done", "decide:ok"]  # fmt: skip
     assert scoped["ends"]["text"] == "Confirmed findings are proposed to the backlog."
 
     # A flow that breaks a rule is not gone through: it could not run.
@@ -155,6 +157,8 @@ async def test_a_run_that_happened_says_how_a_changed_flow_would_have_gone(world
     told = recorded(past["steps"], past["data"])
     assert told == {
         "prepare": ["ok"],
+        "install": ["ok"],
+        "tests": ["passed"],
         "implement": ["done", "done"],
         "review": ["changes", "pass"],
         "verify": ["ok"],
@@ -241,13 +245,14 @@ async def test_a_run_counts_what_it_uses_and_stops_at_its_flows_budget(world: An
     await world.step("prepare", _prepared())
     await world.step("implement", _spent(30_000))
     shown = world.run(run["id"])
-    assert shown["steps"][1]["usage"] == {
+    assert next(s for s in shown["steps"] if s["name"] == "implement")["usage"] == {
         "tokens": 30_000,
         "input": 30_000,
         "output": 0,
         "cached": 0,
     }
-    assert shown["usage"]["tokens"] == 30_000 and shown["usage"]["sandboxes"] == 2
+    # Four sandboxes so far: the clone, the installation, the tests and the implementer.
+    assert shown["usage"]["tokens"] == 30_000 and shown["usage"]["sandboxes"] == 4
     await world.step("review", _reviewed(CHANGES))
     # Within the budget: the work goes back for a second round, which uses it up.
     await world.step("implement", _spent(40_000))
@@ -333,6 +338,8 @@ async def test_past_work_is_gone_through_again_on_a_changed_flow_and_nothing_lea
     assert len(world.hub.tokens) == tokens_before + 1, "the checkout's token, and no issue read"
     world.fake.finish(_prepared())
     await world.launcher.tick()
+    await world.step("install", _prepared())
+    await world.step("tests", _prepared())
     await world.launcher.tick()
     job = world.job()
     assert job["commands"][0]["argv"][0] == "claude"

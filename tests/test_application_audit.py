@@ -82,7 +82,7 @@ def test_the_tasks_that_look_at_the_application_say_so() -> None:
     for key in ("ui-audit", "ux-audit"):
         flow = BUILTIN[key]
         assert [node.task for node in flow.nodes] == [
-            "workspace.checkout",
+            "workspace.clone",
             "agent.audit_application",
             "agent.verify_application",
             "findings.propose",

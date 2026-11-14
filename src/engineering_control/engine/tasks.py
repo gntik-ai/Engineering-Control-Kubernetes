@@ -318,6 +318,187 @@ class Checkout:
         )
 
 
+async def _item_as_it_reads_now(ctx: Context) -> None:
+    """The issue as it reads on GitHub now, for the agents. An item of the platform's own
+    carries its text already, and so does past work that is gone through again."""
+    data = ctx.data
+    issue = data.get("issue") or {}
+    github = ctx.services.github
+    if not issue.get("number") or ctx.dry or github is None:
+        return
+    fresh = await github.issue(data["repository"], int(issue["number"]))
+    await asyncio.to_thread(
+        ctx.services.runs.merge_data,
+        ctx.item.run_id,
+        {
+            "issue": {
+                "number": fresh.number,
+                "title": fresh.title or issue["title"],
+                "url": fresh.url or issue.get("url"),
+                "body": fresh.body,
+            }
+        },
+    )
+
+
+def _own_commands(ctx: Context, part: str) -> tuple[tuple[deliver.Command, ...], bool]:
+    """The commands a task runs: the ones it names, or the project's. With whether they
+    are the task's own."""
+    named = ctx.params.get("commands")
+    if isinstance(named, list) and named:
+        return deliver.commands_of(named), True
+    toolchain = ctx.toolchain()
+    return (toolchain.prepare if part == "prepare" else toolchain.tests), False
+
+
+def _failed_command(commands: list[dict[str, Any]], prefix: str) -> dict[str, Any] | None:
+    return next(
+        (
+            command
+            for command in commands
+            if str(command.get("name")).startswith(prefix) and command.get("exit_code") != 0
+        ),
+        None,
+    )
+
+
+class Clone:
+    """Clone the repository at a branch and start the run's own branch there."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        data = ctx.data
+        if ctx.services.github is None:
+            raise GitHubAppError("The GitHub App is not configured, so nothing can be checked out")
+        await _item_as_it_reads_now(ctx)
+        word = _BRANCH_WORDS.get(ctx.document.key, ctx.document.key)
+        branch = data.get("branch") or f"engineering-control/{word}-{ctx.item.run_id.hex[:8]}"
+        return await ctx.services.checkouts.plan(
+            ctx.item,
+            branch=branch,
+            toolchain=deliver.Toolchain(),
+            commit=data.get("at_commit"),
+            base_branch=self._from(ctx),
+        )
+
+    @staticmethod
+    def _from(ctx: Context) -> str:
+        """The branch that is cloned: the one the task names, or the project's own."""
+        return str(ctx.params.get("branch") or "").strip() or str(ctx.data["base_branch"])
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        base_sha, failure = Checkouts.read(commands)
+        if failure is not None or base_sha is None:
+            verdict = failure.verdict if failure is not None else None
+            return Failed(
+                verdict.outcome if verdict else "checkout_failed",
+                (verdict.detail if verdict else None) or "The checkout gave no commit.",
+            )
+        base = self._from(ctx)
+        return Done(
+            "ok",
+            "cloned",
+            f"Cloned {ctx.data['repository']} at {base} ({base_sha[:12]}).",
+            output={"base_sha": base_sha, "branch": base},
+            # What a pull request of the run is opened against is what was cloned.
+            data={"base_sha": base_sha, "base_branch": base},
+        )
+
+
+class Install:
+    """Run the commands that install what the project needs."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        commands, _own = _own_commands(ctx, "prepare")
+        return Plan(deliver.install_job(commands), workspace=True, deadline_seconds=3600)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        ran, own = _own_commands(ctx, "prepare")
+        failed = _failed_command(commands, "install ")
+        if failed is not None:
+            return Failed("install_failed", f"Installing the project failed: {_tail(failed)}")
+        lines = [deliver.line_of(command) for command in ran]
+        if not ran:
+            note = ctx.toolchain().note
+            return Done("ok", "nothing_to_install", note or "The project names nothing to install.")
+        data: dict[str, Any] = {}
+        if own:
+            # What was installed with is what the run's agents are told of.
+            data["toolchain"] = {
+                **(ctx.data.get("toolchain") or {}),
+                "prepare": [command.as_dict() for command in ran],
+            }
+        return Done(
+            "ok",
+            "installed",
+            f"Installed with {len(ran)} command{'s' if len(ran) != 1 else ''}"
+            + (" of the flow's own." if own else " of the project's."),
+            output={"commands": lines, "own": own},
+            data=data,
+        )
+
+
+class RunTests:
+    """Run the project's tests before anything is changed, without network: what the
+    validation of a change is compared with, under the same conditions."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        commands, _own = _own_commands(ctx, "tests")
+        return Plan(
+            deliver.tests_job(commands),
+            egress="none",
+            workspace=True,
+            memory="6Gi",
+            deadline_seconds=3600,
+        )
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        ran, own = _own_commands(ctx, "tests")
+        results = {
+            str(command.get("name")).removeprefix("baseline "): command.get("exit_code")
+            for command in commands
+            if str(command.get("name")).startswith("baseline ")
+        }
+        lines = [deliver.line_of(command) for command in ran]
+        failing = [
+            lines[int(index) - 1] if index.isdigit() and int(index) <= len(lines) else index
+            for index, code in results.items()
+            if code != 0
+        ]
+        data: dict[str, Any] = {"baseline": results}
+        if own:
+            # Test and scan runs what was run here, so that the two can be compared.
+            data["toolchain"] = {
+                **(ctx.data.get("toolchain") or {}),
+                "tests": [command.as_dict() for command in ran],
+            }
+        output = {"commands": lines, "own": own, "baseline": results, "failing": failing}
+        if not ran:
+            return Done(
+                "passed",
+                "no_tests",
+                "The project names no test commands, so nothing was run.",
+                output=output,
+                data=data,
+            )
+        if failing:
+            return Done(
+                "failed",
+                "tests_failing",
+                f"{len(failing)} of {len(ran)} test commands fail before anything is "
+                "changed: " + "; ".join(failing)[:300],
+                output=output,
+                data=data,
+            )
+        return Done(
+            "passed",
+            "tests_passing",
+            f"All {len(ran)} test command{'s' if len(ran) != 1 else ''} pass before "
+            "anything is changed.",
+            output=output,
+            data=data,
+        )
+
+
 # --- delivering a change ----------------------------------------------------------------
 
 
@@ -1253,6 +1434,9 @@ class ProposeEnhancements:
 
 
 SANDBOX: Final[dict[str, SandboxTask]] = {
+    "workspace.clone": Clone(),
+    "workspace.install": Install(),
+    "check.tests": RunTests(),
     "workspace.checkout": Checkout(),
     "agent.implement": Implement(),
     "agent.review": Review(),

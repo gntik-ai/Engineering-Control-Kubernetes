@@ -457,6 +457,9 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     # Since when a test identity for that application is stored (migration 0038). The
     # identity itself is a Secret of the sandbox namespace, never a record.
     application_identity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The project's own commands, as lines: ``install`` and ``tests`` (migration 0041).
+    # Not set: the commands of the platform's own file for the project.
+    toolchain: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
 
 

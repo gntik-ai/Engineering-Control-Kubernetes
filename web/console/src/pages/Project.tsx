@@ -51,6 +51,7 @@ import { LoadError, RefreshButton } from '../parts';
 import { BASE, RouterLink, navigate, useLocation } from '../router';
 import { BringOverDialog } from './BringOverDialog';
 import { ApplicationCard } from './Application';
+import { CommandsCard } from './Commands';
 import { TriggersCard } from './Triggers';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
@@ -589,6 +590,7 @@ function Detail({ name }: { name: string }) {
             onChanged={detail.reload}
           />
         ) : null}
+        {sections ? <CommandsCard project={name} /> : null}
         {sections ? <TriggersCard project={name} sections={sections} /> : null}
       </div>
       <SectionDialog

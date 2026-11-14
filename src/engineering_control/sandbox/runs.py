@@ -44,6 +44,7 @@ from engineering_control.engine.library import (
 )
 from engineering_control.engine.records import in_force
 from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
+from engineering_control.sandbox import deliver
 from engineering_control.sandbox.pods import identity_secret
 
 ACTIVE: Final = ("queued", "running", "waiting")
@@ -126,6 +127,29 @@ def _shown(output: dict[str, Any] | None) -> dict[str, Any] | None:
         if isinstance(file, dict)
     ]
     return {**{key: value for key, value in output.items() if key != "diff"}, "files": files}
+
+
+def commands_of_project(project: ProjectRecord, toolchain: dict[str, Any]) -> dict[str, Any]:
+    """What a run is told of how its project is installed and tested: the commands the
+    administrator wrote on the project's page when there are any, in place of the ones
+    of the platform's file that the caller read."""
+    own = project.toolchain
+    if not isinstance(own, dict):
+        return toolchain
+    try:
+        prepare = deliver.commands_of([str(line) for line in own.get("install") or []])
+        tests = deliver.commands_of([str(line) for line in own.get("tests") or []])
+    except ValueError:
+        # What was written is checked when it is written; a record that cannot be read
+        # any more leaves the run with the platform's file.
+        return toolchain
+    return {
+        **toolchain,
+        "prepare": [command.as_dict() for command in prepare],
+        "tests": [command.as_dict() for command in tests],
+        # The file's word on tools the sandbox lacks is about the file's commands.
+        "note": None,
+    }
 
 
 def item_facts(item: BacklogItem) -> dict[str, Any]:
@@ -303,7 +327,7 @@ class Runs:
                 "project_name": project.display_name,
                 "repository": repository,
                 "base_branch": project.default_branch or "main",
-                "toolchain": toolchain,
+                "toolchain": commands_of_project(project, toolchain),
                 # What the item is, for an If of the flow to ask about.
                 "item": item_facts(item),
             }
@@ -433,7 +457,7 @@ class Runs:
                     "project_name": record.display_name,
                     "repository": record.source_repository,
                     "base_branch": record.default_branch or "main",
-                    "toolchain": toolchain,
+                    "toolchain": commands_of_project(record, toolchain),
                     "section": found.key,
                     "scope": {"title": "", "text": narrowed},
                     **(

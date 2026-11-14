@@ -194,6 +194,7 @@ class Checkouts:
         branch: str,
         toolchain: deliver.Toolchain,
         commit: str | None = None,
+        base_branch: str | None = None,
     ) -> Plan:
         if self.github is None:
             raise GitHubAppError("The GitHub App is not configured, so nothing can be checked out")
@@ -204,7 +205,7 @@ class Checkouts:
         return Plan(
             deliver.prepare_job(
                 repository=data["repository"],
-                base_branch=data["base_branch"],
+                base_branch=base_branch or data["base_branch"],
                 branch=branch,
                 authorization=f"Basic {basic}",
                 toolchain=toolchain,

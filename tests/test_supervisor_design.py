@@ -86,7 +86,10 @@ async def test_the_supervisor_reads_what_flows_are_built_from_and_checks_a_draft
     assert world.call(run_id, token, "check_flow", document={"format": "x"})[1] is True
     good = json.loads(world.call(run_id, token, "check_flow", document=_sweep())[0])
     assert good["problems"] == []
-    assert good["on_paper"]["tasks"][1] == "audit (chatgpt) ends with candidates"
+    assert good["on_paper"]["tasks"][1:3] == [
+        "install ends with ok",
+        "audit (chatgpt) ends with candidates",
+    ]
     assert good["on_paper"]["ends"] == "Confirmed findings are proposed to the backlog."
     assert FlowRecords(world.sessions).exists("dead-code-sweep") is False, "checking keeps nothing"
 
@@ -108,7 +111,8 @@ async def test_a_proposed_flow_waits_and_is_in_force_once_accepted(world: Any) -
         "A flow takes effect only when you accept it."
     )
     assert entry["summary"].startswith(
-        "A new flow, Dead code sweep (dead-code-sweep): prepare → audit → verify → decide. "
+        "A new flow, Dead code sweep (dead-code-sweep): prepare → install → audit → verify → "
+        "decide. "
         "On paper: Confirmed findings are proposed to the backlog. Accepting puts it in force."
     )
     shown = world.toolbox.proposed_flow(UUID(entry["action_id"]))

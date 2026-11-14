@@ -74,7 +74,7 @@ interface Editing {
 }
 
 /** The kinds a task of one's own can be: all but the ones that only choose the way. */
-const canBeOwn = (kind: TaskType) => kind.where !== 'control';
+const canBeOwn = (kind: TaskType) => kind.where !== 'control' && !kind.retired;
 
 function UsedBy({ uses }: { uses: TaskUse[] }) {
   if (uses.length === 0) return <span className="text-[13px] text-muted-foreground">No flow</span>;
@@ -558,12 +558,19 @@ export function TasksTab() {
                           <UsedBy uses={kind.used_by} />
                         </TableCell>
                         <TableCell>
-                          <Switch
-                            label={kind.hidden ? 'Left out' : 'Offered'}
-                            aria-label={`${kind.title} is offered in the designer’s list`}
-                            checked={!kind.hidden}
-                            onCheckedChange={(offered) => hide(kind, !offered)}
-                          />
+                          {kind.retired ? (
+                            <span className="text-[12px] text-muted-foreground">
+                              Not offered any more: {kind.retired} took its place. It is kept for the flows that have
+                              it.
+                            </span>
+                          ) : (
+                            <Switch
+                              label={kind.hidden ? 'Left out' : 'Offered'}
+                              aria-label={`${kind.title} is offered in the designer’s list`}
+                              checked={!kind.hidden}
+                              onCheckedChange={(offered) => hide(kind, !offered)}
+                            />
+                          )}
                         </TableCell>
                       </TableRow>
                     )),

@@ -58,7 +58,9 @@ const STEP_STATES: Record<RunStep['state'], { label: string; tone: Tone }> = {
 
 const STEP_NAMES: Record<string, string> = {
   check: 'Ask the account',
-  prepare: 'Check out and install',
+  prepare: 'Check out the repository',
+  install: 'Install the project',
+  tests: 'Run the tests',
   implement: 'Implement',
   review: 'Review',
   verify: 'Test and scan',

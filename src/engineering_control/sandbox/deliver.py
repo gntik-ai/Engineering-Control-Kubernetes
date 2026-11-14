@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -137,6 +138,57 @@ class Command:
     def text(self) -> str:
         line = " ".join(self.argv)
         return line if self.cwd in (".", "") else f"(in {self.cwd}) {line}"
+
+
+# A command as an administrator writes it: one line, split into words the way a shell
+# splits them and run without a shell, in the repository's folder or, with the folder in
+# brackets before it, in a folder of the repository.
+MAX_COMMANDS: Final = 12
+MAX_COMMAND_LINE: Final = 600
+COMMAND_SECONDS: Final = 1800
+_IN_FOLDER: Final = re.compile(r"^\[([^\]\n]{1,200})\]\s+(.+)$")
+BRANCH: Final = r"(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,100}"
+
+
+def command_of(line: Any) -> Command:
+    """The command a line says. Raises ValueError with what is wrong with it."""
+    text = str(line or "").strip()
+    if not isinstance(line, str) or not text:
+        raise ValueError("is empty")
+    if len(text) > MAX_COMMAND_LINE or "\n" in text or "\x00" in text:
+        raise ValueError(f"is one line of at most {MAX_COMMAND_LINE} characters")
+    cwd = "."
+    folder = _IN_FOLDER.match(text)
+    if folder is not None:
+        cwd, text = folder.group(1).strip(), folder.group(2)
+        if cwd.startswith("/") or ".." in Path(cwd).parts:
+            raise ValueError("names a folder that is not inside the repository")
+    try:
+        argv = tuple(shlex.split(text))
+    except ValueError as error:
+        raise ValueError("has a quote that is not closed") from error
+    if not argv:
+        raise ValueError("is empty")
+    return Command(argv, cwd or ".", COMMAND_SECONDS)
+
+
+def commands_of(lines: Any) -> tuple[Command, ...]:
+    """The commands a list of lines says, in order."""
+    if not isinstance(lines, list) or len(lines) > MAX_COMMANDS:
+        raise ValueError(f"The commands are a list of at most {MAX_COMMANDS} lines")
+    found = []
+    for number, line in enumerate(lines, start=1):
+        try:
+            found.append(command_of(line))
+        except ValueError as error:
+            raise ValueError(f"Command {number} {error}") from error
+    return tuple(found)
+
+
+def line_of(command: Command) -> str:
+    """A command as the line that says it."""
+    line = shlex.join(command.argv)
+    return line if command.cwd in (".", "") else f"[{command.cwd}] {line}"
 
 
 @dataclass(frozen=True)
@@ -317,6 +369,25 @@ def prepare_job(
         for index, command in enumerate(toolchain.tests, start=1)
     ]
     return {"commands": commands}
+
+
+_NOTHING: Final = {"name": "nothing", "argv": ["true"], "cwd": WORKSPACE, "timeout": 30}
+
+
+def install_job(commands: tuple[Command, ...]) -> dict[str, Any]:
+    """Install what the project needs, command by command; the first that fails ends it."""
+    listed = [_in_repo(command, f"install {index}") for index, command in enumerate(commands, 1)]
+    return {"commands": listed or [dict(_NOTHING)]}
+
+
+def tests_job(commands: tuple[Command, ...]) -> dict[str, Any]:
+    """Run the project's tests before any change, every command whatever the one before
+    it did, to know what already fails."""
+    listed = [
+        _in_repo(command, f"baseline {index}", allow_failure=True)
+        for index, command in enumerate(commands, 1)
+    ]
+    return {"commands": listed or [dict(_NOTHING)]}
 
 
 def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:

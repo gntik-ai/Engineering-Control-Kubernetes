@@ -74,6 +74,7 @@ from engineering_control.dashboard.schemas import (
     PlainChangeInput,
     ProjectApplicationInput,
     ProjectArchiveInput,
+    ProjectCommandsInput,
     ProjectCreateInput,
     ProjectPauseInput,
     ProjectRenameInput,
@@ -1742,6 +1743,31 @@ def create_app(
             lambda body: service(request).set_item_state(item_id, body.state),
             event="dashboard.item_state_changed",
             subject=str(item_id),
+        )
+
+    @app.get("/api/dashboard/projects/{name}/commands")
+    async def project_commands_api(name: str, request: Request) -> Response:
+        """How the project is installed and how its tests are run."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).project_commands(name))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/commands")
+    async def project_commands_set_api(name: str, request: Request) -> Response:
+        """The project's own commands, run from the next run on: with the password."""
+        return await project_change(
+            request,
+            ProjectCommandsInput,
+            lambda body: service(request).set_project_commands(
+                name, install=body.install, tests=body.tests, platform=body.platform
+            ),
+            event="dashboard.project_commands_set",
+            subject=name,
+            password=True,
         )
 
     @app.post("/api/dashboard/projects/{name}/application")

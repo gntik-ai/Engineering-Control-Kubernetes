@@ -173,6 +173,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/flows/check",
         "/api/dashboard/flows/saved-tasks",
         "/api/dashboard/flows/saved-tasks/{saved_id}/remove",
+        "/api/dashboard/projects/{name}/commands",
         "/api/dashboard/tasks",
         "/api/dashboard/tasks/{saved_id}",
         "/api/dashboard/tasks/{saved_id}/remove",

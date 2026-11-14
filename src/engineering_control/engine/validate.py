@@ -20,6 +20,7 @@ The same rules are enforced again while a flow runs (``interpreter``).
 
 from __future__ import annotations
 
+import re
 from typing import Any, Final
 
 from engineering_control.agent_models import problem as model_problem
@@ -27,14 +28,14 @@ from engineering_control.engine import conditions
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
-from engineering_control.sandbox.deliver import PROVIDERS
+from engineering_control.sandbox.deliver import PROVIDERS, commands_of
 
 Problem = dict[str, Any]
 # What an If may ask about that a task before it has to have produced, in words.
 ASKED: Final = {
     "change": "the change, which no task before it writes",
     "areas": "the areas, which no task before it plans",
-    "baseline": "the tests before any change, which no Check out and install before it runs",
+    "baseline": "the tests before any change, which no Run the tests before it runs",
 }
 
 
@@ -77,6 +78,20 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
             if wrong is not None:
                 return f"{name}: {wrong}"
         return None
+    if param.kind == "line":
+        if not isinstance(value, str) or "\n" in value:
+            return f"{name} is one line of text"
+        if param.high is not None and len(value) > param.high:
+            return f"{name} has more than {param.high} characters"
+        if value.strip() and param.pattern and not re.fullmatch(param.pattern, value.strip()):
+            return f"{name} is {param.shape}"
+        return None
+    if param.kind == "commands":
+        try:
+            commands_of(value)
+        except ValueError as error:
+            return f"{name}: {error}"
+        return None
     if param.kind == "text":
         if not isinstance(value, str) or not value.strip():
             return f"{node.id} has no {param.name} yet: write what the agent is to do"
@@ -102,7 +117,8 @@ def _asks(node: Node, nodes: dict[str, Node], before: set[str], made: set[str]) 
     if conditions.problems(node.params.get("condition")):
         return found  # said already, as a setting that cannot be read
     baseline = any(
-        nodes[earlier].task == "workspace.checkout" and nodes[earlier].params.get("baseline")
+        nodes[earlier].task == "check.tests"
+        or (nodes[earlier].task == "workspace.checkout" and nodes[earlier].params.get("baseline"))
         for earlier in before
     )
     for test in conditions.asked(node.params.get("condition")):
