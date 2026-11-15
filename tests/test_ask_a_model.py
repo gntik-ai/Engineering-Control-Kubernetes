@@ -238,6 +238,8 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
             "with_files",
             "tokens",
             "minutes",
+            # Which of the administrator's agents is asked: tests/test_agents.py.
+            "agent",
         ]
     assert judge.outcomes == ("pass", "changes") and report.outcomes == ("done",)
     # The third, the one that writes a change as edits, is in tests/test_model_edits.py.

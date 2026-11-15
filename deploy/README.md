@@ -918,6 +918,21 @@ installation. A flow made here is a draft until it is put in force; only then ca
 section have it. The four other names of the list (change request and the rest) are
 names only until someone builds them.
 
+"New flow" also offers two starters: flows to begin from in which a model asked over an
+API does the work an agent in a sandbox does in Deliver issue. They are not flows of the
+library and nothing runs them as they are.
+
+| Starter | How the change comes about |
+| --- | --- |
+| Deliver issue, written by a model | Find the files, read them, a model writes the change as edits, the platform applies them. For small changes. |
+| Deliver issue, worked out by a model in a loop | A model chooses step by step: search, read, have edits written and applied, run a check, until it says done. |
+
+Both keep everything Deliver issue has after the change: the review on a subscription
+(not of the company whose model wrote the change), the tests, the scan, the collection
+and the administrator's decision. A flow made from a starter is a draft with one thing
+missing, which the page says: its tasks that ask a model name no model. Give each a
+model, or an agent that has one, and it can be put in force.
+
 What a flow means for its section is read from its document (`engine/library.py`):
 
 - A flow with a task that changes code works on items: starting an item runs it.
@@ -1060,6 +1075,66 @@ the shape of the answer.
   agents of the tasks that follow (the implementer and the reviewer included), up to
   eight reports of 20,000 characters each. A task that is gone back to replaces its
   earlier report.
+
+### Agents and skills
+
+The Agents tab of the Flows page holds who does the work, defined once and named by the
+tasks that use it: a Maker, a Reviewer, or any other the administrator thinks of.
+
+**A skill** is a named piece of instructions (up to 12,000 characters): how tests are
+written here, the naming conventions, how a migration is made. It is written once and
+given to as many agents as need it.
+
+**An agent** has a name, standing instructions (up to 8,000 characters), up to eight
+skills, and how it works:
+
+- in a sandbox, with a subscription: which subscriptions and in which order, the model
+  and the reasoning on each, and how many minutes it may work;
+- asked over an API: the provider and the model, a second provider to ask when the
+  first cannot, and the reasoning.
+
+Every part of "how it works" may be left empty. "Add Maker and Reviewer to start with"
+makes two agents to change from.
+
+**A task names an agent** with its setting Agent. Every task an agent works in (the
+ones in a sandbox) and every task that asks a model over an API has it; the tasks of the
+platform itself (clone, install, run the tests, apply the edits and the rest) do not,
+since no model works in them. A task that names an agent:
+
+- is told, before everything the task itself says, who it is: the agent's standing
+  instructions and then each of its skills, whole. The platform's own parts of a
+  prompt (the fenced material, the rules of the sandbox, the shape of the answer) stay
+  as they are and come after;
+- takes from its agent what it leaves open itself. What the task sets comes first: a
+  task that says its subscriptions, its model or its minutes keeps them. In the
+  designer a task that names an agent can therefore set Subscriptions to "As its agent
+  says", leave Minutes empty, and leave Model and reasoning unchosen; a task that asks
+  a model can leave Provider's model empty, and then its agent's provider and model are
+  asked. A task that names no model, with an agent that names none either, fails its
+  run there (`not_asked`).
+
+What holds for every flow holds for agents as well. Whatever writes in a run writes on
+the subscription that first wrote in it, and the review is on the other subscription
+than the work it judges (for a change a model wrote over an API: not on the
+subscription of the same company), whatever the reviewer's agent prefers. An agent
+gets no credential, no host and no command a task would not have without it.
+
+With each step the run keeps which agent it was and a hash of what the agent was told
+(the run's page shows the agent's name on the step). Agents and skills have no
+versions: a flow holds the name of an agent, not a copy, so changing an agent or one of
+its skills changes what its tasks are told from the next step that starts, in every
+flow, without a new version of any flow. That is what defining it once is for; to try
+a change first, make a second agent and name it in a draft.
+
+The Agents tab lists with each agent the flows and tasks that name it, and with each
+skill the agents that have it. Removing a skill takes it from its agents. Removing an
+agent that flows still name is allowed and said: a run that comes to a task whose agent
+is gone fails there (`not_started`, "names an agent that is not there any more"), until
+the flow names another or none.
+
+Not there yet: the supervisor does not see the agents when it drafts a flow; and a flow
+cannot call another flow, so a harness (the loop with its tools) is copied into a flow
+from a starter (see the library) and not shared by reference.
 
 ### Code clean, and the audits of the running application
 

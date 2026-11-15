@@ -339,6 +339,27 @@ class TaskInput(DashboardModel):
     wording: dict[str, str] = Field(default_factory=dict)
 
 
+class AgentInput(DashboardModel):
+    """One who does work: standing instructions, how it works in a sandbox and over an
+    API, and the skills it has."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=600)
+    instructions: str = Field(default="", max_length=8000)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    skills: list[str] = Field(default_factory=list, max_length=8)
+
+
+class SkillInput(DashboardModel):
+    """Named instructions an agent can be given."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    name: str = Field(min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=600)
+    text: str = Field(default="", max_length=12000)
+
+
 class TaskHiddenInput(DashboardModel):
     """Whether a kind of task is left out of the designer's list."""
 

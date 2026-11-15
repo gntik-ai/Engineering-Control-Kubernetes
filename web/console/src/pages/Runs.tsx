@@ -296,6 +296,11 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
               {step.usage.account ? ' · ' + step.usage.account : ''}
             </Badge>
           ) : null}
+          {step.input?.prompt?.agent ? (
+            <Badge tone="neutral" size="sm" title="The agent this task named: its instructions and skills went with the task">
+              Agent: {step.input.prompt.agent}
+            </Badge>
+          ) : null}
           {step.input?.model ? (
             <Badge tone="neutral" size="sm">
               {[step.input.model.model, step.input.model.effort ? `${step.input.model.effort} reasoning` : null]

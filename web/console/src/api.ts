@@ -59,7 +59,18 @@ export interface FlowListed extends Flow {
 /** One setting of a task. */
 export interface TaskParam {
   name: string;
-  kind: 'bool' | 'int' | 'providers' | 'task' | 'choice' | 'models' | 'condition' | 'text' | 'line' | 'commands';
+  kind:
+    | 'bool'
+    | 'int'
+    | 'providers'
+    | 'task'
+    | 'choice'
+    | 'models'
+    | 'condition'
+    | 'text'
+    | 'line'
+    | 'commands'
+    | 'agent';
   default: unknown;
   doc: string;
   low: number | null;
@@ -155,6 +166,44 @@ export interface FlowCatalogue {
   saved: SavedTask[];
   /** The platform's kinds of task that are not offered in the designer's list. */
   hidden?: string[];
+  /** The agents a task can name. */
+  agents?: { id: string; name: string }[];
+  /** Flows a new flow can be started from. */
+  starters?: { key: string; name: string; summary: string }[];
+}
+
+/** How an agent works: in a sandbox on a subscription, and when it is asked over an API. */
+export interface AgentSettings {
+  providers?: string[];
+  models?: Record<string, { model?: string; effort?: string }>;
+  minutes?: number;
+  api?: { provider?: string; model?: string; then_provider?: string; then_model?: string; effort?: string };
+}
+
+/** One who does a task, as the administrator defined it. */
+export interface AgentShown {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  settings: AgentSettings;
+  skills: string[];
+  skill_names: string[];
+  used_by: { flow: string; name: string; tasks: string[]; draft: boolean }[];
+}
+
+/** Named instructions an agent can be given. */
+export interface SkillShown {
+  id: string;
+  name: string;
+  description: string;
+  text: string;
+  agents: string[];
+}
+
+export interface AgentsListing {
+  agents: AgentShown[];
+  skills: SkillShown[];
 }
 
 /** Something the platform knows about a run, that an If of a flow can ask about. */
@@ -791,7 +840,8 @@ export interface RunStep {
   /** What the step was given: the round, which wording of which prompt, which model. */
   input?: {
     round?: number;
-    prompt?: { name: string; sha256: string };
+    /** Which wording, and the agent the task named with a hash of what it was told. */
+    prompt?: { name?: string; sha256?: string; agent?: string; agent_sha256?: string };
     /** The model the flow chose for the step's agent, when it chose one. */
     model?: { provider: string; model?: string; effort?: string };
     /** The Ifs the flow passed after the step: which way each went, and what it asked. */

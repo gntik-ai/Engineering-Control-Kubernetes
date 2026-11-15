@@ -102,8 +102,15 @@ async def _asked(
 ) -> Question:
     params, data = ctx.params, ctx.data
     where = choices(params)
+    api = (ctx.agent["settings"].get("api") or {}) if ctx.agent is not None else {}
+    if not where and api:
+        # The task names no model: its agent says where it is asked.
+        where = choices(api)
     if not where:
-        raise ValueError(f"{ctx.node.id} names no model to ask")
+        raise ValueError(
+            f"{ctx.node.id} names no model to ask"
+            + (", and neither does its agent" if ctx.agent is not None else "")
+        )
     about = _about(data)
     repository = str(data.get("repository") or "")
     parts = [
@@ -172,12 +179,12 @@ async def _asked(
             "These files were read earlier and are no longer in hand, to make room. They "
             "can be read again: " + ", ".join(let_go[:60])
         )
-    effort = str(params.get("effort") or "default")
+    effort = str(ctx.node.params.get("effort") or api.get("effort") or "default")
     ctx.model_used = {"provider": where[0][0], "model": where[0][1]}
     return Question(
         choices=where,
         system=SYSTEM,
-        prompt="\n\n".join(part for part in parts if part),
+        prompt=ctx.as_agent("\n\n".join(part for part in parts if part)),
         schema=schema,
         max_tokens=int(params.get("tokens") or ASK_TOKENS),
         seconds=int(params.get("minutes") or ASK_MINUTES) * 60,

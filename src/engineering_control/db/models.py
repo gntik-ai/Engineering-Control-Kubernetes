@@ -747,6 +747,30 @@ class SavedTask(UUIDPrimaryKey, Timestamps, Base):
     description: Mapped[str | None] = mapped_column(Text)
 
 
+class Skill(UUIDPrimaryKey, Timestamps, Base):
+    """Named instructions an agent can be given (migration 0043): how something is done
+    here, written once and handed to every agent that has the skill."""
+
+    __tablename__ = "skills"
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+
+
+class AgentRecord(UUIDPrimaryKey, Timestamps, Base):
+    """One who does work, as the administrator defined it (migration 0043): standing
+    instructions, how it works in a sandbox and over an API (``settings``), and the
+    skills it has, by their ids. A task of a flow names an agent; what the task is, and
+    what holds for it, stays the task's."""
+
+    __tablename__ = "agents"
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    instructions: Mapped[str] = mapped_column(Text)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON)
+    skills: Mapped[list[str]] = mapped_column(JSON)
+
+
 class HiddenTask(UUIDPrimaryKey, Timestamps, Base):
     """A kind of task of the platform's own that is not offered in the designer's list
     (migration 0040). Nothing else changes for it: a flow that has one keeps it."""

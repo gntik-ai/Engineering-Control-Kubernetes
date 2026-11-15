@@ -345,5 +345,122 @@ COMMANDS_CHECK: Final = parse(
 )
 
 
+# --- starters ------------------------------------------------------------------------------
+#
+# Flows to begin from, in which a model asked over an API does the work an agent in a
+# sandbox does in Deliver issue. They are not flows of the library: nothing runs them as
+# they are. A new flow is made as a copy of one, and its tasks are then told which
+# provider and model to ask (or which agent), which a starter cannot know.
+
+_ASK: Final[dict[str, Any]] = {"provider": "deepseek", "model": ""}
+
+
+def _without_the_agent(extra: list[dict[str, Any]], *, back_to: str) -> list[dict[str, Any]]:
+    """Deliver issue's tasks with the agent that implements taken out: what leads to it
+    leads to ``back_to``, and the review judges what Apply the edits changed."""
+    tasks = [
+        dict(task)
+        for task in BUILTIN["deliver-issue"].as_dict()["tasks"]
+        if task["id"] != "implement"
+    ]
+    for task in tasks:
+        task["next"] = {
+            way: back_to if target == "implement" else target
+            for way, target in (task.get("next") or {}).items()
+        }
+        if task["id"] == "review":
+            task["with"] = {**(task.get("with") or {}), "other_than": "apply"}
+    return [*tasks, *extra]
+
+
+def _starter(key: str, name: str, summary: str, tasks: list[dict[str, Any]]) -> Document:
+    return parse(
+        {
+            "format": FORMAT,
+            "key": key,
+            "name": name,
+            "summary": summary,
+            "start": "prepare",
+            "tasks": tasks,
+            "budgets": {**BUILTIN["deliver-issue"].as_dict().get("budgets", {})},
+        }
+    )
+
+
+STARTERS: Final[dict[str, Document]] = {
+    "starter-model-pipeline": _starter(
+        "starter-model-pipeline",
+        "Deliver issue, written by a model",
+        "For small changes. The files the issue is about are found and read, a model "
+        "asked over an API writes the change as edits, and the platform applies them. "
+        "Then the review, the tests, the scan and your decision, as in Deliver issue.",
+        _without_the_agent(
+            [
+                {"id": "find", "task": "code.find", "next": {"found": "read", "none": "write"}},
+                {"id": "read", "task": "code.read", "next": {"ok": "write"}},
+                {
+                    "id": "write",
+                    "task": "model.edit",
+                    "with": {**_ASK, "instruction": "Make the change the issue asks for."},
+                    "next": {"edits": "apply"},
+                },
+                {
+                    "id": "apply",
+                    "task": "code.apply",
+                    "next": {"applied": "review", "refused": "write"},
+                },
+            ],
+            back_to="find",
+        ),
+    ),
+    "starter-model-loop": _starter(
+        "starter-model-loop",
+        "Deliver issue, worked out by a model in a loop",
+        "A model asked over an API chooses step by step what to do: search, read, have "
+        "edits written and applied, run a check, until it says done. Then the review, "
+        "the tests, the scan and your decision, as in Deliver issue.",
+        _without_the_agent(
+            [
+                {
+                    "id": "decide",
+                    "task": "model.choose",
+                    "with": {
+                        **_ASK,
+                        "instruction": "Resolve the issue: find the code it is about, "
+                        "change it, and check the change.",
+                    },
+                    "next": {
+                        "search": "find",
+                        "read": "read",
+                        "edit": "write",
+                        "check": "look",
+                        "done": "review",
+                    },
+                },
+                {"id": "find", "task": "code.find", "next": {"found": "decide", "none": "decide"}},
+                {"id": "read", "task": "code.read", "next": {"ok": "decide"}},
+                {
+                    "id": "write",
+                    "task": "model.edit",
+                    "with": {**_ASK, "instruction": "Write the change as it is asked for."},
+                    "next": {"edits": "apply", "nothing": "decide"},
+                },
+                {
+                    "id": "apply",
+                    "task": "code.apply",
+                    "next": {"applied": "decide", "refused": "decide"},
+                },
+                {
+                    "id": "look",
+                    "task": "code.run",
+                    "next": {"passed": "decide", "failed": "decide"},
+                },
+            ],
+            back_to="decide",
+        ),
+    ),
+}
+
+
 def kind_of(key: str) -> str:
     return KIND_OF.get(key, FLOW)

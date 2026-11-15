@@ -42,9 +42,17 @@ def rounds_allowed(document: Document, run_data: dict[str, Any]) -> int:
     return min(rounds, deliver.ROUNDS_CEILING)
 
 
-def provider_for(node: Node, ran: dict[str, Any], *, again: bool) -> str | None:
+def provider_for(
+    node: Node,
+    ran: dict[str, Any],
+    *,
+    again: bool,
+    agents: dict[str, dict[str, Any]] | None = None,
+) -> str | None:
     """The subscriptions a task may be given to. ``ran`` says which subscription each
-    task of the run last worked on; ``again`` that the task is gone back to."""
+    task of the run last worked on; ``again`` that the task is gone back to; ``agents``
+    holds the agents the flow's tasks name, for the ones that say which subscriptions
+    they work on."""
     task = TASKS[node.task]
     if not task.account:
         return None
@@ -62,7 +70,13 @@ def provider_for(node: Node, ran: dict[str, Any], *, again: bool) -> str | None:
     if again and ran.get(node.id) in deliver.PROVIDERS:
         # A task that is gone back to stays with the subscription it had.
         return str(ran[node.id])
-    providers = node.params.get("providers") or task.defaults().get("providers")
+    providers = node.params.get("providers")
+    if not providers:
+        # What the task leaves open comes from its agent, and else from the platform.
+        agent = (agents or {}).get(str(node.params.get("agent") or "")) or {}
+        providers = (agent.get("settings") or {}).get("providers") or task.defaults().get(
+            "providers"
+        )
     if isinstance(providers, list) and providers:
         return ",".join(str(name) for name in providers if name in deliver.PROVIDERS)
     return ",".join(deliver.PROVIDERS)

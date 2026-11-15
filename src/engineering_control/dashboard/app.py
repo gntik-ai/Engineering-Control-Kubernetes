@@ -58,6 +58,7 @@ from engineering_control.dashboard.schemas import (
     AccountSignInInput,
     AccountUpdateInput,
     ActivityEventInput,
+    AgentInput,
     BacklogSyncInput,
     BudgetInput,
     EvaluationInput,
@@ -91,6 +92,7 @@ from engineering_control.dashboard.schemas import (
     SectionRemoveInput,
     SectionRunInput,
     SectionUpdateInput,
+    SkillInput,
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
     SupervisorMessageInput,
@@ -1367,6 +1369,91 @@ def create_app(
             lambda _body: service(request).apply_task(saved_id),
             event="dashboard.task_applied",
             entity="saved",
+        )
+
+    # --- agents and skills -----------------------------------------------------------------
+
+    @app.get("/api/dashboard/agents")
+    async def agents_api(request: Request) -> Response:
+        """The agents and the skills the administrator defined."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).agents())
+
+    def agent_fields(body: AgentInput) -> dict[str, Any]:
+        return {
+            "name": body.name,
+            "description": body.description,
+            "instructions": body.instructions,
+            "settings": body.settings,
+            "skills": body.skills,
+        }
+
+    @app.post("/api/dashboard/agents")
+    async def agent_create_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            AgentInput,
+            lambda body: service(request).save_agent(None, **agent_fields(body)),
+            event="dashboard.agent_created",
+            status_code=201,
+            entity="agent",
+        )
+
+    @app.post("/api/dashboard/agents/{agent_id}")
+    async def agent_update_api(agent_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            AgentInput,
+            lambda body: service(request).save_agent(agent_id, **agent_fields(body)),
+            event="dashboard.agent_changed",
+            entity="agent",
+        )
+
+    @app.post("/api/dashboard/agents/{agent_id}/remove")
+    async def agent_remove_api(agent_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_agent(agent_id),
+            event="dashboard.agent_removed",
+            entity="agent",
+        )
+
+    @app.post("/api/dashboard/skills")
+    async def skill_create_api(request: Request) -> Response:
+        return await project_change(
+            request,
+            SkillInput,
+            lambda body: service(request).save_skill(
+                None, name=body.name, description=body.description, text=body.text
+            ),
+            event="dashboard.skill_created",
+            status_code=201,
+            entity="skill",
+        )
+
+    @app.post("/api/dashboard/skills/{skill_id}")
+    async def skill_update_api(skill_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            SkillInput,
+            lambda body: service(request).save_skill(
+                skill_id, name=body.name, description=body.description, text=body.text
+            ),
+            event="dashboard.skill_changed",
+            entity="skill",
+        )
+
+    @app.post("/api/dashboard/skills/{skill_id}/remove")
+    async def skill_remove_api(skill_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_skill(skill_id),
+            event="dashboard.skill_removed",
+            entity="skill",
         )
 
     @app.post("/api/dashboard/task-kinds/{task}/hidden")

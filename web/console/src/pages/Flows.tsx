@@ -38,6 +38,7 @@ import {
   apiUrl,
   postJson,
   useResource,
+  type FlowCatalogue,
   type FlowListed,
   type FlowVersionShown,
   type Listing,
@@ -47,6 +48,7 @@ import {
 import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
 import { BASE, navigate, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
+import { AgentsTab } from './Agents';
 import { TasksTab } from './Tasks';
 
 export const versionName = (version: number | null) =>
@@ -79,6 +81,7 @@ function NewFlowDialog({
   const [keyEdited, setKeyEdited] = useState(false);
   const [summary, setSummary] = useState('');
   const [from, setFrom] = useState(NOTHING);
+  const catalogue = useResource<FlowCatalogue>(apiUrl('flows/catalogue'));
   const finalKey = keyEdited ? key : suggestKey(name);
   const { pending, problem, submit, reset } = useSubmit(
     () =>
@@ -155,6 +158,11 @@ function NewFlowDialog({
                   ...flows
                     .filter((flow) => flow.engine)
                     .map((flow) => ({ value: flow.key, label: `A copy of ${flow.name}` })),
+                  // Flows to begin from, in which a model asked over an API does the work.
+                  ...(catalogue.data?.starters ?? []).map((starter) => ({
+                    value: starter.key,
+                    label: `A starter: ${starter.name}`,
+                  })),
                 ]}
                 value={from}
                 onValueChange={(value) => setFrom(value ?? NOTHING)}
@@ -346,7 +354,8 @@ export function FlowsPage() {
   const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
-  const tab = useLocation().query.get('tab') === 'tasks' ? 'tasks' : 'flows';
+  const wanted = useLocation().query.get('tab');
+  const tab = wanted === 'tasks' || wanted === 'agents' ? wanted : 'flows';
   return (
     <Page
       title="Flows"
@@ -361,13 +370,20 @@ export function FlowsPage() {
         </div>
       }
     >
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'tasks' ? 'tasks' : null })}>
-        <TabsList aria-label="Flows and the tasks they are built from">
+      <Tabs
+        value={tab}
+        onValueChange={(value) => setQuery({ tab: value === 'tasks' || value === 'agents' ? value : null })}
+      >
+        <TabsList aria-label="Flows, the tasks they are built from, and who does them">
           <TabsTab value="flows">Flows</TabsTab>
           <TabsTab value="tasks">Tasks</TabsTab>
+          <TabsTab value="agents">Agents</TabsTab>
         </TabsList>
         <TabsPanel value="tasks" className="pt-4">
           {tab === 'tasks' ? <TasksTab /> : null}
+        </TabsPanel>
+        <TabsPanel value="agents" className="pt-4">
+          {tab === 'agents' ? <AgentsTab /> : null}
         </TabsPanel>
         <TabsPanel value="flows" className="pt-4">
           <div className="grid gap-6">

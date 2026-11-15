@@ -69,6 +69,9 @@ class Context:
     prompt_used: dict[str, str] | None = None
     # Which model the step's agent was started with, when the flow chose one.
     model_used: dict[str, str] | None = None
+    # The agent the task names, as the administrator defined it: what it is told and how
+    # it works. None when the task names none.
+    agent: dict[str, Any] | None = None
 
     @property
     def data(self) -> dict[str, Any]:
@@ -85,7 +88,10 @@ class Context:
     def model(self, provider: str) -> dict[str, str]:
         """The model and the reasoning level the flow chose for this task on that
         subscription: only what was chosen."""
-        chosen = (self.params.get("models") or {}).get(provider) or {}
+        chosen = (self.node.params.get("models") or {}).get(provider) or {}
+        if not chosen and self.agent is not None:
+            # What the task leaves open comes from its agent.
+            chosen = ((self.agent["settings"].get("models")) or {}).get(provider) or {}
         return {
             key: str(chosen[key]).strip()
             for key in ("model", "effort")
@@ -105,7 +111,20 @@ class Context:
         contract = CONTRACTS[str(self.task.prompt)]
         overrides = self.document.prompts.get(contract.name) or {}
         self.prompt_used = {"name": contract.name, "sha256": contract.sha256(overrides)}
-        return contract.render(overrides, values)
+        return self.as_agent(contract.render(overrides, values))
+
+    def as_agent(self, prompt: str) -> str:
+        """The prompt with what the task's agent is told put before it, when the task
+        names an agent. Which agent, and a hash of what it was told, is kept with the
+        step."""
+        if self.agent is None:
+            return prompt
+        self.prompt_used = {
+            **(self.prompt_used or {}),
+            "agent": str(self.agent["name"]),
+            "agent_sha256": str(self.agent["sha256"]),
+        }
+        return f"{self.agent['told']}\n\n{prompt}"
 
     async def outputs(self, task: str | tuple[str, ...]) -> list[dict[str, Any]]:
         """What the run's steps of that kind of task produced, in the order they ran."""
@@ -133,8 +152,11 @@ class Context:
         return deliver.Toolchain.from_dict(self.data.get("toolchain"))
 
     def minutes(self) -> int:
+        wanted = self.node.params.get("minutes")
+        if wanted is None and self.agent is not None:
+            wanted = self.agent["settings"].get("minutes")
         try:
-            return max(5, min(int(self.params.get("minutes") or 50), 55))
+            return max(5, min(int(wanted or self.params.get("minutes") or 50), 55))
         except (TypeError, ValueError):
             return 50
 

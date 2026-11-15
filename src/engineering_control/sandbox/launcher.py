@@ -30,6 +30,7 @@ from sqlalchemy.orm import sessionmaker
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.backlog_items import BacklogItems
+from engineering_control.engine.agents import Agents
 from engineering_control.engine.evaluations import Evaluations
 from engineering_control.engine.interpreter import Engine
 from engineering_control.engine.records import FlowRecords
@@ -174,7 +175,13 @@ class Launcher:
         self.triggers = Triggers(sessions, runs, queues.budgets) if sessions and queues else None
         self.github = github
         self._triggered = self._looked = float("-inf")
-        engine = Engine(runs, github, backlog, FlowRecords(sessions).document if sessions else None)
+        engine = Engine(
+            runs,
+            github,
+            backlog,
+            FlowRecords(sessions).document if sessions else None,
+            Agents(sessions) if sessions else None,
+        )
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),
             **{kind: engine for kind in (*WORK_KINDS, EVALUATION)},
@@ -551,7 +558,13 @@ class Launcher:
                         labels={"engineering-control/account": str(lease.account_id)},
                     )
                 )
-        plan = await self.flows[item.run_kind].plan(item, lease)
+        try:
+            plan = await self.flows[item.run_kind].plan(item, lease)
+        except ValueError as error:
+            # What the step needs is not there (the agent it names, say): the run says
+            # so and ends, instead of being tried again for ever.
+            await self._fail_step(item, "not_started", str(error))
+            return
         workspace = None
         if plan.workspace:
             # The run's own volume, made with its first step and kept until the run ends.

@@ -30,6 +30,7 @@ import structlog
 
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.engine import catalogue, conditions, routing
+from engineering_control.engine.agents import Agents
 from engineering_control.engine.asking import MODEL
 from engineering_control.engine.bench_tasks import BENCH
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
@@ -77,7 +78,10 @@ class Engine:
         github: GitHubApp | None,
         backlog: BacklogItems | None,
         documents: Documents | None = None,
+        agents: Agents | None = None,
     ) -> None:
+        # The agents the administrator defined, for the tasks that name one.
+        self.agents = agents
         self.runs = runs
         self.services = Services(runs, github, backlog, Checkouts(github))
         # Where a version of a flow other than the platform's own is read from.
@@ -121,8 +125,29 @@ class Engine:
 
     # --- the launcher's three questions --------------------------------------------------
 
+    async def _agent(self, ctx: Context) -> None:
+        """Give the step its agent, when its task names one."""
+        named = str(ctx.node.params.get("agent") or "")
+        if not named:
+            return
+        found = await asyncio.to_thread(self.agents.get, named) if self.agents else None
+        if found is None:
+            raise ValueError(
+                f"{ctx.node.id} names an agent that is not there any more: choose another "
+                "in the flow, or none"
+            )
+        ctx.agent = found
+
+    async def _agents(self, document: Document) -> dict[str, dict[str, Any]]:
+        """The agents the flow's tasks name, for choosing who a task is given to."""
+        named = [str(node.params.get("agent") or "") for node in document.nodes]
+        if self.agents is None or not any(named):
+            return {}
+        return await asyncio.to_thread(self.agents.of, named)
+
     async def plan(self, item: StepWork, lease: Lease | None) -> Plan:
         ctx = self._context(item)
+        await self._agent(ctx)
         plan = await STEPS[ctx.node.task].plan(ctx, lease)
         noted: dict[str, Any] = {}
         if ctx.prompt_used is not None:
@@ -185,9 +210,15 @@ class Engine:
 
     async def question(self, item: StepWork) -> Question:
         ctx = self._context(item)
+        await self._agent(ctx)
         asked = await MODEL[ctx.node.task].question(ctx)
+        noted: dict[str, Any] = {}
         if ctx.model_used is not None:
-            await asyncio.to_thread(self.runs.note_step, item.step_id, {"model": ctx.model_used})
+            noted["model"] = ctx.model_used
+        if ctx.prompt_used is not None:
+            noted["prompt"] = ctx.prompt_used
+        if noted:
+            await asyncio.to_thread(self.runs.note_step, item.step_id, noted)
         return asked
 
     async def answered(self, item: StepWork, reply: Reply) -> Result:
@@ -376,7 +407,9 @@ class Engine:
         if to.each:
             given["each"] = to.each
         ran = {**(item.run_data.get("ran") or {}), **(data.get("ran") or {})}
-        provider = self._provider(following, ran, again=to.again)
+        provider = routing.provider_for(
+            following, ran, again=to.again, agents=await self._agents(document)
+        )
         return Result(
             verdict,
             output=done.output,

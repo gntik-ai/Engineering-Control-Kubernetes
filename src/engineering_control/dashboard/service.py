@@ -23,6 +23,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.engine.builtin import BUILTIN as BUILTIN_FLOWS
+from engineering_control.engine.builtin import STARTERS
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
 from engineering_control.engine.conditions import catalogue as condition_catalogue
@@ -497,6 +498,12 @@ class DashboardService:
             # What an If can ask about, and the ways each is compared.
             "conditions": condition_catalogue(),
             "saved": await asyncio.to_thread(self.repository.tasks.saved),
+            # The agents a task can name, and the flows a new flow can be started from.
+            "agents": await asyncio.to_thread(self.repository.agents.names),
+            "starters": [
+                {"key": key, "name": flow.name, "summary": flow.summary}
+                for key, flow in STARTERS.items()
+            ],
             # The platform's kinds of task that are not offered in the designer's list.
             "hidden": await asyncio.to_thread(self.repository.tasks.hidden),
         }
@@ -545,6 +552,28 @@ class DashboardService:
     async def apply_task(self, saved_id: UUID) -> dict[str, object]:
         """Write a task as it is now into a draft of every flow that uses it."""
         return await asyncio.to_thread(self.repository.tasks.apply, saved_id)
+
+    # --- agents and skills ---------------------------------------------------------------
+
+    async def agents(self) -> dict[str, object]:
+        """The agents and the skills, with the flows that name each agent."""
+        return await asyncio.to_thread(self.repository.agents.listing)
+
+    async def save_agent(self, agent_id: UUID | None, **fields: Any) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.agents.save_agent(agent_id, **fields)
+        )
+
+    async def remove_agent(self, agent_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.agents.remove_agent, agent_id)
+
+    async def save_skill(self, skill_id: UUID | None, **fields: Any) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.agents.save_skill(skill_id, **fields)
+        )
+
+    async def remove_skill(self, skill_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.agents.remove_skill, skill_id)
 
     async def hide_task(self, task: str, *, hidden: bool) -> dict[str, object]:
         return await asyncio.to_thread(lambda: self.repository.tasks.hide(task, hidden=hidden))
@@ -620,6 +649,9 @@ class DashboardService:
                     # A document of a flow that is here already becomes its draft.
                     saved = flows.save_draft(str(raw["key"]), raw, note="Brought in")
                     return {**flows.shown(str(raw["key"]), saved["version"]), "flow": raw["key"]}
+            elif copy_of is not None and copy_of in STARTERS:
+                # A flow to begin from: its tasks, to be told which model or agent to ask.
+                raw = {**STARTERS[copy_of].as_dict(), "key": key, "name": name, "summary": summary}
             elif copy_of is not None:
                 wanted = flows.version_in_force(copy_of) if version is None else version
                 found = flows.document(

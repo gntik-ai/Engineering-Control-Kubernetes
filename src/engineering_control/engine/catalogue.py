@@ -14,7 +14,7 @@ that can write.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from engineering_control.engine.conditions import LEGACY
@@ -49,7 +49,8 @@ class Param:
 
     name: str
     # "bool", "int", "providers", "task", "choice", "models", "condition", "text" (long, has
-    # to be written), "line" (short, may be empty) or "commands" (a list of command lines).
+    # to be written), "line" (short, may be empty), "commands" (a list of command lines)
+    # or "agent" (one of the administrator's agents, by its id; empty for none).
     kind: str
     default: Any
     doc: str
@@ -913,7 +914,22 @@ _TASKS: Final = (
         produces=("items",),
     ),
 )
-TASKS: Final = {task.key: task for task in _TASKS}
+# Who does it: every task an agent works in, and every task that asks a model, can
+# name one of the administrator's agents.
+AGENT: Final = Param(
+    "agent",
+    "agent",
+    "",
+    "Which of your agents does this task. Its standing instructions and its skills go "
+    "with the task, and what the task leaves open (the subscriptions, the model, the "
+    "time) comes from it. None: the task as it is set here.",
+)
+TASKS: Final = {
+    task.key: replace(task, params=(*task.params, AGENT))
+    if task.account or task.where == "model"
+    else task
+    for task in _TASKS
+}
 
 # What a run may be granted beyond one task: rounds of correction, minutes and tokens.
 BUDGETS: Final = {
@@ -964,7 +980,7 @@ def loop_steps(params: dict[str, Any]) -> int:
 
 def catalogue() -> list[dict[str, Any]]:
     """The tasks as the console shows them."""
-    return [task.as_dict() for task in _TASKS]
+    return [task.as_dict() for task in TASKS.values()]
 
 
 def budget(name: str, budgets: dict[str, Any]) -> int | None:

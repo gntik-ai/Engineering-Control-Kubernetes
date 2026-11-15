@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Final
+from uuid import UUID
 
 from engineering_control.agent_models import problem as model_problem
 from engineering_control.engine import conditions
@@ -101,6 +102,14 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
             return f"{node.id} has no {param.name} yet: write what the agent is to do"
         if param.high is not None and len(value) > param.high:
             return f"{name} has more than {param.high:,} characters"
+        return None
+    if param.kind == "agent":
+        if value in (None, ""):
+            return None
+        try:
+            UUID(str(value))
+        except ValueError:
+            return f"{name} names one of your agents"
         return None
     if param.kind == "condition":
         unread = conditions.problems(value)
@@ -359,8 +368,10 @@ def problems(document: Document) -> list[Problem]:
             if task.where == "model" and param.name in ("model", "then_model"):
                 # A model is asked by name: the first always, the second when a second
                 # provider is chosen.
-                wanted = param.name == "model" or (
-                    str(node.params.get("then_provider") or "none") != "none"
+                # An agent that is asked over an API brings its model with it.
+                wanted = not node.params.get("agent") and (
+                    param.name == "model"
+                    or str(node.params.get("then_provider") or "none") != "none"
                 )
                 if wanted and not str(node.params.get(param.name) or "").strip():
                     which = "the model" if param.name == "model" else "the second model"

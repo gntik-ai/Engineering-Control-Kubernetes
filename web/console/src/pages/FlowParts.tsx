@@ -44,6 +44,7 @@ const SETTING_NAMES: Record<string, string> = {
   effort: 'Reasoning',
   with_change: 'Give it the collected change',
   with_files: 'Give it the files read',
+  agent: 'Agent',
   steps: 'Steps of the loop at most',
   dollars: 'US dollars for models asked over an API',
   words: 'More words to look for',
@@ -100,6 +101,9 @@ const namesOf = (providers: string[]) => providers.map((name) => PROVIDER_NAMES[
 
 type Chosen = Record<string, { model?: string; effort?: string }>;
 
+/** The choice that stands for nothing chosen, since a choice needs a value. */
+const OPEN = '-';
+
 export function Setting({
   param,
   node,
@@ -115,6 +119,9 @@ export function Setting({
 }) {
   const value = node.with[param.name] ?? param.default;
   const label = settingName(param.name);
+  // A task that names an agent may leave some settings open: they are then its agent's.
+  const itsAgent = param.name !== 'agent' && Boolean(node.with.agent);
+  const leftOpen = itsAgent && (node.with[param.name] === undefined || node.with[param.name] === null);
   if (param.kind === 'bool') {
     return (
       <div className="grid gap-1">
@@ -131,15 +138,20 @@ export function Setting({
           type="number"
           min={param.low ?? undefined}
           max={param.high ?? undefined}
-          value={value === null || value === undefined ? '' : String(value)}
+          placeholder={itsAgent && param.name === 'minutes' ? 'As its agent says' : undefined}
+          value={
+            value === null || value === undefined || (leftOpen && param.name === 'minutes') ? '' : String(value)
+          }
           onValueChange={(text) => {
             const number = Math.round(Number(text));
             if (text.trim() && Number.isFinite(number)) onChange(number);
+            else if (!text.trim() && itsAgent && param.name === 'minutes') onChange(undefined);
           }}
         />
         <FieldDescription>
           {param.doc}
           {param.low !== null && param.high !== null ? ` Between ${param.low} and ${param.high}.` : ''}
+          {itsAgent && param.name === 'minutes' ? ' Empty: as its agent says, or else the usual time.' : ''}
         </FieldDescription>
       </Field>
     );
@@ -234,6 +246,7 @@ export function Setting({
         ))}
         <span className="text-[12px] text-muted-foreground">
           {param.doc} More reasoning is slower and uses more of the subscription.
+          {itsAgent ? ' Where nothing is chosen here, it is as its agent says.' : ''}
         </span>
       </div>
     );
@@ -241,8 +254,22 @@ export function Setting({
   let items: { value: string; label: string }[];
   let chosen: string;
   if (param.kind === 'providers') {
-    items = providerChoices(catalogue.providers);
-    chosen = Array.isArray(value) ? value.join(',') : String(value ?? '');
+    items = [
+      ...(itsAgent ? [{ value: OPEN, label: 'As its agent says, or else the usual order' }] : []),
+      ...providerChoices(catalogue.providers),
+    ];
+    chosen = leftOpen ? OPEN : Array.isArray(value) ? value.join(',') : String(value ?? '');
+  } else if (param.kind === 'agent') {
+    // One of the administrator's agents, or none: the task as it is set here.
+    const known = catalogue.agents ?? [];
+    items = [
+      { value: OPEN, label: 'None: as set here' },
+      ...known.map((agent) => ({ value: agent.id, label: agent.name })),
+      ...(value && !known.some((agent) => agent.id === value)
+        ? [{ value: String(value), label: 'An agent that is not there any more' }]
+        : []),
+    ];
+    chosen = String(value ?? '') || OPEN;
   } else if (param.kind === 'task') {
     // The tasks an agent works in, other than this one: whose work this task judges.
     items = document.tasks
@@ -264,7 +291,10 @@ export function Setting({
         value={chosen || null}
         onValueChange={(next) => {
           if (!next) return;
-          onChange(param.kind === 'providers' ? next.split(',') : next);
+          // None is chosen like any other agent; a setting left to the agent is taken out.
+          if (param.kind === 'agent') onChange(next === OPEN ? '' : next);
+          else if (param.kind === 'providers') onChange(next === OPEN ? undefined : next.split(','));
+          else onChange(next);
         }}
       />
       <FieldDescription>
