@@ -19,6 +19,7 @@ from typing import Any, Final
 
 from engineering_control.engine.conditions import LEGACY
 from engineering_control.github_app import MERGE_METHODS
+from engineering_control.models.providers import API_KEYS, MODEL_NAME
 from engineering_control.sandbox.deliver import BRANCH, MAX_ROUNDS, PROVIDERS, ROUNDS_CEILING
 
 # The most a run may be granted, whatever its flow says.
@@ -76,8 +77,10 @@ class TaskType:
     group: str
     title: str
     summary: str
-    # "sandbox": a pod runs it. "platform": the platform performs it itself, with its own
-    # credentials. "control": it only decides where the flow goes on.
+    # "sandbox": a pod runs it. "model": the platform asks a model over a provider's API,
+    # without a sandbox, and the task is a step of the run like a sandbox's. "platform":
+    # the platform performs it itself, with its own credentials, after the steps.
+    # "control": it only decides where the flow goes on.
     where: str
     account: bool = False  # an agent of a subscription works in it
     writes: bool = False  # it may change the checkout
@@ -163,6 +166,86 @@ _INSTRUCTION: Final = Param(
     "What the agent is to do, in your words. It is given to the agent as its task, "
     "between the platform's own rules, which it cannot change.",
     high=INSTRUCTION_CHARACTERS,
+)
+# What a task that asks a model over an API is set with.
+ASK_TOKENS: Final = 8000
+ASK_TOKENS_CEILING: Final = 32000
+ASK_MINUTES: Final = 5
+ASK_MINUTES_CEILING: Final = 30
+ASK_EFFORTS: Final = ("default", "low", "medium", "high", "xhigh", "max")
+_NAME_OF_A_MODEL: Final = "the name of a model as its provider writes it, without spaces"
+_ASKED: Final = (
+    Param(
+        "instruction",
+        "text",
+        "",
+        "What the model is asked, in your words. It is given to the model between the "
+        "platform's own rules, which it cannot change.",
+        high=INSTRUCTION_CHARACTERS,
+    ),
+    Param(
+        "provider",
+        "choice",
+        API_KEYS[0],
+        "The provider whose API the model is asked at. An account of that provider with "
+        "a key has to be there.",
+        choices=API_KEYS,
+    ),
+    Param(
+        "model",
+        "line",
+        "",
+        "The model, as the provider names it.",
+        high=100,
+        pattern=MODEL_NAME.pattern,
+        shape=_NAME_OF_A_MODEL,
+    ),
+    Param(
+        "then_provider",
+        "choice",
+        "none",
+        "A second provider, asked when no account of the first can answer.",
+        choices=("none", *API_KEYS),
+    ),
+    Param(
+        "then_model",
+        "line",
+        "",
+        "The model at the second provider.",
+        high=100,
+        pattern=MODEL_NAME.pattern,
+        shape=_NAME_OF_A_MODEL,
+    ),
+    Param(
+        "effort",
+        "choice",
+        "default",
+        "How hard the model reasons, where the provider lets that be said (Anthropic, "
+        "OpenAI). Default leaves it to the model.",
+        choices=ASK_EFFORTS,
+    ),
+    Param(
+        "with_change",
+        "bool",
+        True,
+        "Give the model the change the run has collected, file by file, when there is one.",
+    ),
+    Param(
+        "tokens",
+        "int",
+        ASK_TOKENS,
+        "The longest answer the model may give, in tokens.",
+        low=500,
+        high=ASK_TOKENS_CEILING,
+    ),
+    Param(
+        "minutes",
+        "int",
+        ASK_MINUTES,
+        "How long one answer is waited for.",
+        low=1,
+        high=ASK_MINUTES_CEILING,
+    ),
 )
 _OTHER: Final = Param(
     "other_than",
@@ -329,6 +412,32 @@ _TASKS: Final = (
         outcomes=("done",),
         params=(_INSTRUCTION, _PROVIDERS, _MODELS, _MINUTES),
         prompt="own_report",
+    ),
+    TaskType(
+        "model.judge",
+        "Models",
+        "Ask a model: judge",
+        "The platform asks a model over a provider's API to judge what your instruction "
+        "says, and the model passes it or asks for changes, with findings the next task "
+        "is given. No sandbox runs and no tools are used: the model goes by what the "
+        "platform puts before it (what the run is about, the notes of earlier tasks, the "
+        "collected change). It does not stand in for Review the change.",
+        "model",
+        produces=("check",),
+        outcomes=("pass", "changes"),
+        params=_ASKED,
+    ),
+    TaskType(
+        "model.report",
+        "Models",
+        "Ask a model: report",
+        "The platform asks a model over a provider's API what your instruction says, and "
+        "the model writes a report. No sandbox runs and no tools are used. The report is "
+        "shown with the run and given to the tasks that follow, as notes.",
+        "model",
+        produces=("notes",),
+        outcomes=("done",),
+        params=_ASKED,
     ),
     TaskType(
         "check.secrets",

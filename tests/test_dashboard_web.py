@@ -168,6 +168,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/accounts/{account_id}/sign-in",
         "/api/dashboard/accounts/{account_id}/remove",
         "/api/dashboard/accounts/{account_id}/try",
+        "/api/dashboard/accounts/{account_id}/check",
         "/api/dashboard/runs/{run_id}/cancel",
         "/api/dashboard/flows",
         "/api/dashboard/flows/check",

@@ -34,6 +34,9 @@ from engineering_control.engine.records import described
 from engineering_control.engine.simulate import recorded, simulate
 from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.models.providers import check_key, is_api
+from engineering_control.models.sealing import seal
+from engineering_control.models.service import Models
 from engineering_control.sandbox.deliver import PROVIDERS as AGENT_PROVIDERS
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
@@ -432,6 +435,12 @@ class DashboardService:
         return {**await asyncio.to_thread(read), "providers": provider_catalogue()}
 
     async def try_account(self, account_id: UUID) -> dict[str, object]:
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if is_api(str(account["provider"])):
+            raise ProjectInvalid(
+                "An account with an API key is tried by asking its provider which models "
+                "the key reaches, not with a run"
+            )
         return await asyncio.to_thread(self.repository.runs.start_account_check, account_id)
 
     # --- triggers --------------------------------------------------------------------------
@@ -751,9 +760,11 @@ class DashboardService:
     async def cancel_run(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.request_cancel, run_id)
 
-    async def create_account(self, *, name: str, provider: str) -> dict[str, object]:
+    async def create_account(
+        self, *, name: str, provider: str, endpoint: str | None = None
+    ) -> dict[str, object]:
         return await asyncio.to_thread(
-            lambda: self.repository.accounts.create(name=name, provider=provider)
+            lambda: self.repository.accounts.create(name=name, provider=provider, endpoint=endpoint)
         )
 
     async def update_account(self, account_id: UUID, **changes: Any) -> dict[str, object]:
@@ -762,10 +773,27 @@ class DashboardService:
         )
 
     async def sign_in_account(
-        self, account_id: UUID, pasted: str, cluster: Cluster | None
+        self,
+        account_id: UUID,
+        pasted: str,
+        cluster: Cluster | None,
+        models: Models | None = None,
     ) -> dict[str, object]:
-        """Check what was pasted, hand it to the cluster, then record that it is there."""
+        """Check what was pasted, hand it to the cluster, then record that it is there.
+        An API key is sealed into the account's record instead, and tried at once."""
         account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if is_api(str(account["provider"])):
+            try:
+                key = check_key(str(account["provider"]), pasted)
+            except ValueError as error:
+                raise ProjectInvalid(str(error)) from error
+            if models is None or models.sealing_key is None:
+                raise ProjectInvalid(
+                    "This installation has no key to seal API keys with, so one cannot be stored"
+                )
+            sealed = seal(models.sealing_key, account_id, key)
+            await asyncio.to_thread(self.repository.accounts.key_stored, account_id, sealed)
+            return await self.check_account(account_id, models)
         credential = check_credential(str(account["provider"]), pasted)
         if cluster is None:
             raise ProjectInvalid(
@@ -784,6 +812,17 @@ class DashboardService:
             self.repository.accounts.signed_in, account_id, credential.identity
         )
 
+    async def check_account(self, account_id: UUID, models: Models | None) -> dict[str, object]:
+        """Ask the provider which models the account's key reaches: whether the key is
+        accepted, at no cost."""
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if not is_api(str(account["provider"])):
+            raise ProjectInvalid("That account is tried with a run, not asked for its models")
+        if models is None:
+            raise ProjectInvalid("This installation cannot ask a provider")
+        await models.check(account_id)
+        return await asyncio.to_thread(self.repository.accounts.get, account_id)
+
     async def remove_account(self, account_id: UUID, cluster: Cluster | None) -> dict[str, object]:
         """The sign-in leaves the cluster first; the record is removed only when it is gone."""
         account = await asyncio.to_thread(self.repository.accounts.get, account_id)
@@ -791,7 +830,7 @@ class DashboardService:
             raise ProjectConflict(
                 f"{account['name']} is in use by a run. Stop the run or wait for it to end."
             )
-        if cluster is not None:
+        if cluster is not None and not is_api(str(account["provider"])):
             await cluster.delete_secret(secret_name(account_id))
         return await asyncio.to_thread(self.repository.accounts.archive, account_id)
 

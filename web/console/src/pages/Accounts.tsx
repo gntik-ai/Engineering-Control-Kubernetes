@@ -36,7 +36,15 @@ import {
 } from '@gntik-ai/ui';
 import { FlaskConical, KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
-import { apiUrl, postJson, useResource, type Account, type Accounts, type ProviderType } from '../api';
+import {
+  apiUrl,
+  postJson,
+  useResource,
+  type Account,
+  type Accounts,
+  type ModelPrice,
+  type ProviderType,
+} from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { useSubmit, type DialogProps } from './ProjectDialogs';
 
@@ -44,11 +52,22 @@ type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
 
 /** What the platform last learned about an account, in the administrator's words. */
 function state(account: Account): { label: string; tone: Tone; detail: string | null } {
+  const api = account.kind === 'api';
   switch (account.state) {
     case 'signed_out':
-      return { label: 'Sign-in needed', tone: 'warning', detail: 'Nothing is stored for this account yet.' };
+      return {
+        label: api ? 'Key needed' : 'Sign-in needed',
+        tone: 'warning',
+        detail: api ? 'No key is stored for this account yet.' : 'Nothing is stored for this account yet.',
+      };
     case 'unchecked':
-      return { label: 'Signed in', tone: 'info', detail: 'Not tried yet. Try it to see whether the sign-in works.' };
+      return api
+        ? {
+            label: 'Key stored',
+            tone: 'info',
+            detail: account.state_reason ?? 'Not tried yet. Ask for its models to see whether the key works.',
+          }
+        : { label: 'Signed in', tone: 'info', detail: 'Not tried yet. Try it to see whether the sign-in works.' };
     case 'ready':
       return { label: 'Ready', tone: 'success', detail: null };
     case 'limited':
@@ -59,9 +78,11 @@ function state(account: Account): { label: string; tone: Tone; detail: string | 
       };
     case 'sign_in_required':
       return {
-        label: 'Sign in again',
+        label: api ? 'New key needed' : 'Sign in again',
         tone: 'destructive',
-        detail: account.state_reason ?? 'The provider no longer accepts the stored sign-in.',
+        detail:
+          account.state_reason ??
+          (api ? 'The provider no longer accepts the stored key.' : 'The provider no longer accepts the stored sign-in.'),
       };
   }
 }
@@ -76,8 +97,9 @@ function AddAccountDialog({
   const later = providers.filter((provider) => !provider.available);
   const [name, setName] = useState('');
   const [provider, setProvider] = useState('');
+  const [endpoint, setEndpoint] = useState('');
   const { pending, problem, submit, reset } = useSubmit(
-    () => postJson<Account>('accounts', { name, provider }),
+    () => postJson<Account>('accounts', { name, provider, ...(endpoint ? { endpoint } : {}) }),
     () => {
       onSaved();
       onOpenChange(false);
@@ -87,10 +109,12 @@ function AddAccountDialog({
     if (!open) return;
     setName('');
     setProvider(available[0]?.key ?? '');
+    setEndpoint('');
     reset();
     // Only when it opens: the form starts empty.
   }, [open]);
   const chosen = available.find((item) => item.key === provider);
+  const addresses = chosen?.endpoints ?? [];
   const send = (event: FormEvent) => {
     event.preventDefault();
     void submit();
@@ -102,24 +126,42 @@ function AddAccountDialog({
           <DialogHeader>
             <DialogTitle>Add an account</DialogTitle>
             <DialogDescription>
-              One account is one subscription. Add as many as you have: the more accounts, the more work can run at
-              the same time.
+              One account is one subscription that agents work with in sandboxes, or one API key that models are
+              asked with directly. Add as many as you have.
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
             {problem ? <Alert tone="destructive" title={problem} /> : null}
             <Field>
-              <FieldLabel required>Subscription</FieldLabel>
+              <FieldLabel required>Kind</FieldLabel>
               <SimpleSelect
-                aria-label="Subscription"
-                items={available.map((item) => ({ value: item.key, label: item.name }))}
+                aria-label="Kind"
+                items={available.map((item) => ({
+                  value: item.key,
+                  label: `${item.name} (${item.kind === 'api' ? 'API key' : 'subscription'})`,
+                }))}
                 value={provider}
-                onValueChange={(value) => setProvider(value ?? '')}
+                onValueChange={(value) => {
+                  setProvider(value ?? '');
+                  setEndpoint('');
+                }}
               />
               <FieldDescription>
-                {chosen ? `Works through ${chosen.client}. ${chosen.note}` : null}
+                {chosen ? (chosen.kind === 'api' ? chosen.note : `Works through ${chosen.client}. ${chosen.note}`) : null}
               </FieldDescription>
             </Field>
+            {addresses.length > 1 ? (
+              <Field>
+                <FieldLabel>Address</FieldLabel>
+                <SimpleSelect
+                  aria-label="Address"
+                  items={addresses.map((item) => ({ value: item.key, label: `${item.name}: ${item.host}` }))}
+                  value={endpoint || (addresses[0]?.key ?? '')}
+                  onValueChange={(value) => setEndpoint(value ?? '')}
+                />
+                <FieldDescription>A key works at the address it was made for, and is sent nowhere else.</FieldDescription>
+              </Field>
+            ) : null}
             <Field>
               <FieldLabel required>Name</FieldLabel>
               <Input
@@ -130,7 +172,7 @@ function AddAccountDialog({
                 placeholder={chosen ? `${chosen.name} one` : 'A name of your own'}
                 autoFocus
               />
-              <FieldDescription>How you tell this subscription from the others.</FieldDescription>
+              <FieldDescription>How you tell this account from the others.</FieldDescription>
             </Field>
             {later.length ? (
               <p className="text-[13px] text-muted-foreground">
@@ -179,15 +221,17 @@ function SignInDialog({
     void submit();
   };
   const file = provider?.credential === 'auth_file';
+  const api = account.kind === 'api';
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <form onSubmit={send} className="contents">
           <DialogHeader>
-            <DialogTitle>Sign {account.name} in</DialogTitle>
+            <DialogTitle>{api ? `Give ${account.name} its key` : `Sign ${account.name} in`}</DialogTitle>
             <DialogDescription>
-              The sign-in is made with {provider?.client ?? 'the client'} on your own computer and handed over
-              here. It is stored in the cluster, never in the database, and is not shown again.
+              {api
+                ? `The key is made at ${account.provider_name} and handed over here. It is kept sealed, is never given to a sandbox, and is not shown again. It is used at ${account.host ?? 'the provider'} only.`
+                : `The sign-in is made with ${provider?.client ?? 'the client'} on your own computer and handed over here. It is stored in the cluster, never in the database, and is not shown again.`}
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
@@ -198,7 +242,7 @@ function SignInDialog({
               ))}
             </ol>
             <Field>
-              <FieldLabel required>{file ? 'Content of auth.json' : 'Token'}</FieldLabel>
+              <FieldLabel required>{api ? 'API key' : file ? 'Content of auth.json' : 'Token'}</FieldLabel>
               {file ? (
                 <Textarea
                   name="credential"
@@ -222,7 +266,9 @@ function SignInDialog({
                 />
               )}
               <FieldDescription>
-                An API key is refused: accounts work with a subscription sign-in only.
+                {api
+                  ? 'It is tried at once by asking the provider which models it reaches. That costs nothing.'
+                  : 'An API key is refused here: it belongs to an account of the kind API key.'}
               </FieldDescription>
             </Field>
           </DialogBody>
@@ -231,7 +277,7 @@ function SignInDialog({
               Cancel
             </Button>
             <Button type="submit" icon={KeyRound} loading={pending} disabled={!pasted.trim()}>
-              Store the sign-in
+              {api ? 'Store the key' : 'Store the sign-in'}
             </Button>
           </DialogFooter>
         </form>
@@ -242,11 +288,52 @@ function SignInDialog({
 
 const AT_ONCE = Array.from({ length: 8 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }));
 
-function EditAccountDialog({ account, open, onOpenChange, onSaved }: DialogProps & { account: Account }) {
+/** Prices as lines: a model's name, then what a million tokens cost read, written and, if
+ * the provider prices it apart, read again from its cache. */
+function priceLines(prices: Record<string, ModelPrice> | undefined): string {
+  return Object.entries(prices ?? {})
+    .map(([model, price]) => [model, price.input, price.output, ...(price.cached === undefined ? [] : [price.cached])].join('  '))
+    .join('\n');
+}
+
+function readPrices(text: string): { prices: Record<string, ModelPrice>; problem: string | null } {
+  const prices: Record<string, ModelPrice> = {};
+  for (const line of text.split('\n')) {
+    const words = line.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) continue;
+    const [model = '', ...amounts] = words;
+    const numbers = amounts.map((word) => Number(word.replace(',', '.')));
+    if (numbers.length < 2 || numbers.length > 3 || numbers.some((value) => !Number.isFinite(value) || value < 0)) {
+      return { prices, problem: `${model}: write the price read and the price written, as numbers.` };
+    }
+    const [input = 0, output = 0, cached] = numbers;
+    prices[model] = { input, output, ...(cached === undefined ? {} : { cached }) };
+  }
+  return { prices, problem: null };
+}
+
+function EditAccountDialog({
+  account,
+  provider,
+  open,
+  onOpenChange,
+  onSaved,
+}: DialogProps & { account: Account; provider: ProviderType | undefined }) {
+  const api = account.kind === 'api';
+  const addresses = provider?.endpoints ?? [];
   const [name, setName] = useState(account.name);
   const [atOnce, setAtOnce] = useState(String(account.max_concurrent));
+  const [endpoint, setEndpoint] = useState(account.endpoint ?? '');
+  const [prices, setPrices] = useState(priceLines(account.prices));
+  const read = readPrices(prices);
   const { pending, problem, submit, reset } = useSubmit(
-    () => postJson<Account>(`accounts/${account.id}/update`, { name, max_concurrent: Number(atOnce) }),
+    () =>
+      postJson<Account>(
+        `accounts/${account.id}/update`,
+        api
+          ? { name, prices: read.prices, ...(endpoint && endpoint !== account.endpoint ? { endpoint } : {}) }
+          : { name, max_concurrent: Number(atOnce) },
+      ),
     () => {
       onSaved();
       onOpenChange(false);
@@ -256,6 +343,8 @@ function EditAccountDialog({ account, open, onOpenChange, onSaved }: DialogProps
     if (!open) return;
     setName(account.name);
     setAtOnce(String(account.max_concurrent));
+    setEndpoint(account.endpoint ?? '');
+    setPrices(priceLines(account.prices));
     reset();
     // Only when it opens: the form shows the account as it is.
   }, [open]);
@@ -269,7 +358,11 @@ function EditAccountDialog({ account, open, onOpenChange, onSaved }: DialogProps
         <form onSubmit={send} className="contents">
           <DialogHeader>
             <DialogTitle>Change {account.name}</DialogTitle>
-            <DialogDescription>Its name, and how many sandboxes may work with it at the same time.</DialogDescription>
+            <DialogDescription>
+              {api
+                ? 'Its name, the address its key is used at, and what its models cost.'
+                : 'Its name, and how many sandboxes may work with it at the same time.'}
+            </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
             {problem ? <Alert tone="destructive" title={problem} /> : null}
@@ -277,26 +370,65 @@ function EditAccountDialog({ account, open, onOpenChange, onSaved }: DialogProps
               <FieldLabel required>Name</FieldLabel>
               <Input name="name" value={name} onValueChange={setName} maxLength={60} autoFocus />
             </Field>
-            <Field>
-              <FieldLabel>Sandboxes at once</FieldLabel>
-              <SimpleSelect
-                aria-label="Sandboxes at once"
-                className="w-24"
-                items={AT_ONCE}
-                value={atOnce}
-                onValueChange={(value) => setAtOnce(value ?? atOnce)}
-              />
-              <FieldDescription>
-                Two is what the subscriptions have tolerated so far. More gets work done sooner and reaches the
-                provider's limit sooner.
-              </FieldDescription>
-            </Field>
+            {api ? (
+              <>
+                {addresses.length > 1 ? (
+                  <Field>
+                    <FieldLabel>Address</FieldLabel>
+                    <SimpleSelect
+                      aria-label="Address"
+                      items={addresses.map((item) => ({ value: item.key, label: `${item.name}: ${item.host}` }))}
+                      value={endpoint || (addresses[0]?.key ?? '')}
+                      onValueChange={(value) => setEndpoint(value ?? endpoint)}
+                    />
+                    <FieldDescription>
+                      A key works at the address it was made for. After a change the key is tried again.
+                    </FieldDescription>
+                  </Field>
+                ) : null}
+                <Field>
+                  <FieldLabel>What its models cost</FieldLabel>
+                  <Textarea
+                    name="prices"
+                    className="font-mono text-[12px]"
+                    value={prices}
+                    onValueChange={setPrices}
+                    rows={4}
+                    maxRows={10}
+                    spellCheck={false}
+                    placeholder={'model-name  0.50  2.00\nanother-model  3  15  0.30'}
+                  />
+                  <FieldDescription>
+                    One model per line: its name, then US dollars per million tokens read and written and, if the
+                    provider prices it apart, read again from its cache. A call on a model without a price is
+                    counted in tokens only.
+                    {account.models?.length ? ` The key reaches: ${account.models.slice(0, 30).join(', ')}.` : ''}
+                  </FieldDescription>
+                  {read.problem ? <p className="text-[12px] text-destructive">{read.problem}</p> : null}
+                </Field>
+              </>
+            ) : (
+              <Field>
+                <FieldLabel>Sandboxes at once</FieldLabel>
+                <SimpleSelect
+                  aria-label="Sandboxes at once"
+                  className="w-24"
+                  items={AT_ONCE}
+                  value={atOnce}
+                  onValueChange={(value) => setAtOnce(value ?? atOnce)}
+                />
+                <FieldDescription>
+                  Two is what the subscriptions have tolerated so far. More gets work done sooner and reaches the
+                  provider's limit sooner.
+                </FieldDescription>
+              </Field>
+            )}
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" loading={pending} disabled={!name.trim()}>
+            <Button type="submit" loading={pending} disabled={!name.trim() || (api && read.problem !== null)}>
               Save
             </Button>
           </DialogFooter>
@@ -327,8 +459,9 @@ function RemoveAccountDialog({ account, open, onOpenChange, onSaved }: DialogPro
         <AlertDialogHeader tone="destructive">
           <AlertDialogTitle>Remove {account.name}?</AlertDialogTitle>
           <AlertDialogDescription>
-            Its stored sign-in is deleted from the cluster and no sandbox can work with it any more. The subscription
-            itself is not touched: cancel it with {account.provider_name} if you no longer want it.
+            {account.kind === 'api'
+              ? `Its stored key is deleted and no model can be asked with it any more. The key itself is not touched: revoke it at ${account.provider_name} if you no longer want it.`
+              : `Its stored sign-in is deleted from the cluster and no sandbox can work with it any more. The subscription itself is not touched: cancel it with ${account.provider_name} if you no longer want it.`}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {problem ? <Alert tone="destructive" title={problem} /> : null}
@@ -369,6 +502,7 @@ function AccountRow({
   const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | null>(null);
   const shown = state(account);
   const signedIn = account.state !== 'signed_out';
+  const api = account.kind === 'api';
   const change = (path: string, body: Record<string, unknown> = {}) => () => {
     postJson<unknown>(`accounts/${account.id}/${path}`, body)
       .then(onChanged)
@@ -378,18 +512,19 @@ function AccountRow({
       });
   };
   const pause = change('update', { paused: !account.paused });
-  const tryIt = change('try');
+  const tryIt = change(api ? 'check' : 'try');
   return (
     <TableRow>
       <TableCell>
         <div className="font-medium">{account.name}</div>
         <div className="text-[12px] text-muted-foreground">
-          {account.identity ?? (signedIn ? 'Sign-in stored' : 'No sign-in stored')}
+          {account.identity ??
+            (api ? (signedIn ? 'Key stored' : 'No key stored') : signedIn ? 'Sign-in stored' : 'No sign-in stored')}
         </div>
       </TableCell>
       <TableCell>
         <div>{account.provider_name}</div>
-        <div className="text-[12px] text-muted-foreground">{account.client}</div>
+        <div className="text-[12px] text-muted-foreground">{api ? `API key · ${account.host}` : account.client}</div>
       </TableCell>
       <TableCell>
         <div className="flex flex-wrap items-center gap-1.5">
@@ -414,15 +549,15 @@ function AccountRow({
           </div>
         ) : null}
       </TableCell>
-      <TableCell className={mono}>{account.max_concurrent}</TableCell>
+      <TableCell className={mono}>{api ? '' : account.max_concurrent}</TableCell>
       <TableCell>
         <When value={account.last_used_at} />
       </TableCell>
       <TableCell className="text-right">
         <div className="flex items-center justify-end gap-2">
           {!signedIn || account.state === 'sign_in_required' ? (
-            <Button size="sm" icon={LogIn} disabled={!canSignIn} onClick={() => setDialog('sign-in')}>
-              Sign in
+            <Button size="sm" icon={api ? KeyRound : LogIn} disabled={!canSignIn} onClick={() => setDialog('sign-in')}>
+              {api ? 'Enter key' : 'Sign in'}
             </Button>
           ) : null}
           <MoreMenu
@@ -431,10 +566,16 @@ function AccountRow({
             align="end"
             items={[
               ...(signedIn && !account.being_tried
-                ? [{ label: 'Try it', icon: FlaskConical, onSelect: tryIt }]
+                ? [{ label: api ? 'Ask for its models' : 'Try it', icon: FlaskConical, onSelect: tryIt }]
                 : []),
               ...(signedIn && canSignIn
-                ? [{ label: 'Sign in again', icon: LogIn, onSelect: () => setDialog('sign-in') }]
+                ? [
+                    {
+                      label: api ? 'Enter a new key' : 'Sign in again',
+                      icon: api ? KeyRound : LogIn,
+                      onSelect: () => setDialog('sign-in'),
+                    },
+                  ]
                 : []),
               account.paused
                 ? { label: 'Resume', icon: Play, onSelect: pause }
@@ -453,6 +594,7 @@ function AccountRow({
         />
         <EditAccountDialog
           account={account}
+          provider={provider}
           open={dialog === 'edit'}
           onOpenChange={(open) => setDialog(open ? 'edit' : null)}
           onSaved={onChanged}
@@ -478,11 +620,12 @@ export function AccountsPage() {
   const [problem, setProblem] = useState<string | null>(null);
   const providers = accounts.data?.providers ?? [];
   const canSignIn = accounts.data?.sign_in_available ?? false;
+  const canKeepKeys = accounts.data?.keys_available ?? false;
   const empty = accounts.data?.items.length === 0;
   return (
     <Page
       title="Accounts"
-      description="The subscriptions the agents work with. No API keys: every account is a subscription sign-in of its provider."
+      description="The subscriptions agents work with in sandboxes, and the API keys models are asked with directly."
       actions={
         <div className="flex items-center gap-2">
           <RefreshButton resource={accounts} />
@@ -508,16 +651,16 @@ export function AccountsPage() {
           <EmptyState
             icon={KeyRound}
             title="No accounts yet"
-            description="Add one account for each subscription the agents may work with. Nothing can run without at least one."
+            description="Add one account for each subscription the agents may work with, and one for each API key a model may be asked with. Nothing can run without at least one."
           />
         ) : (
           <TableFrame>
             <Table>
-              <TableCaption className="sr-only">Subscription accounts</TableCaption>
+              <TableCaption className="sr-only">Accounts</TableCaption>
               <TableHeader>
                 <TableRow>
                   <TableHead>Account</TableHead>
-                  <TableHead>Subscription</TableHead>
+                  <TableHead>Provider</TableHead>
                   <TableHead>State</TableHead>
                   <TableHead>At once</TableHead>
                   <TableHead>Last used</TableHead>
@@ -534,7 +677,7 @@ export function AccountsPage() {
                         key={account.id}
                         account={account}
                         provider={providers.find((item) => item.key === account.provider)}
-                        canSignIn={canSignIn}
+                        canSignIn={account.kind === 'api' ? canKeepKeys : canSignIn}
                         onChanged={accounts.reload}
                         onProblem={setProblem}
                       />

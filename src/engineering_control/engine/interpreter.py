@@ -30,6 +30,7 @@ import structlog
 
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.engine import catalogue, conditions, routing
+from engineering_control.engine.asking import MODEL
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, Node, parse
@@ -45,6 +46,7 @@ from engineering_control.engine.tasks import (
     merges_after,
 )
 from engineering_control.github_app import GitHubApp
+from engineering_control.models.service import Question, Reply
 from engineering_control.sandbox.flows import (
     Checkouts,
     End,
@@ -163,6 +165,37 @@ class Engine:
                 output=concluded.output,
                 follow=(Follow(item.name, item.provider, concluded.given),),
             )
+        return await self._route(ctx, concluded)
+
+    # --- a step that asks a model --------------------------------------------------------
+
+    def asks(self, item: StepWork) -> bool:
+        """Whether the step asks a model over an API instead of running in a sandbox."""
+        try:
+            node = self.document(item).node(item.name)
+        except ValueError:
+            return False
+        return node is not None and node.task in MODEL
+
+    async def question(self, item: StepWork) -> Question:
+        ctx = self._context(item)
+        asked = await MODEL[ctx.node.task].question(ctx)
+        if ctx.model_used is not None:
+            await asyncio.to_thread(self.runs.note_step, item.step_id, {"model": ctx.model_used})
+        return asked
+
+    async def answered(self, item: StepWork, reply: Reply) -> Result:
+        try:
+            ctx = self._context(item)
+        except ValueError as error:
+            return _failed("unknown", str(error))
+        concluded = await MODEL[ctx.node.task].answered(ctx, reply)
+        if isinstance(concluded, Done):
+            await asyncio.to_thread(self.runs.note_step, item.step_id, {"went": concluded.outcome})
+        if isinstance(concluded, Failed):
+            return _failed(concluded.label, concluded.detail, concluded.output)
+        if isinstance(concluded, Again):  # no task that asks a model asks for itself again
+            return _failed(concluded.label, concluded.detail, concluded.output)
         return await self._route(ctx, concluded)
 
     async def done(self, item: StepWork) -> End:

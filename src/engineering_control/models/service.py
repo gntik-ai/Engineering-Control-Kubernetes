@@ -1,0 +1,382 @@
+"""Asking a model: which account, which provider, how often, and what it cost.
+
+One question gets one answer of the shape the platform states, or a reason why not. The
+question names the providers and models it may be asked at, most wanted first. Here an
+account of the provider is taken (the one unused longest that has a key and is not
+paused), the provider is asked, and what it answers is checked:
+
+- an answer that does not have the shape is asked for once more, saying what was wrong;
+- a provider that is over its limit or does not answer is tried again after a moment,
+  then the account rests for a few minutes and the next account or provider is tried;
+- a provider that does not accept the key marks the account as needing a new key.
+
+The key is opened here, for the call, and goes nowhere else.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
+from uuid import UUID
+
+import httpx
+import structlog
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from engineering_control.db.models import ProviderAccount
+from engineering_control.models import anthropic_api, openai_style, shape
+from engineering_control.models.providers import BY_KEY, ApiProvider, cost_of
+from engineering_control.models.sealing import SealError, unseal
+from engineering_control.models.wire import Wire, WireError
+
+LOG = structlog.get_logger(__name__)
+# How long a provider that is busy is waited for before it is asked again, and how long
+# an account rests once those tries are used up.
+BUSY_WAITS: Final = (3.0, 15.0)
+REST_MINUTES: Final = 5
+MAX_WAIT: Final = 60.0
+
+
+@dataclass(frozen=True)
+class Question:
+    # Where it may be asked, most wanted first: (provider, model).
+    choices: tuple[tuple[str, str], ...]
+    system: str
+    prompt: str
+    schema: dict[str, Any]
+    max_tokens: int = 8000
+    seconds: int = 300
+    effort: str | None = None
+
+
+@dataclass(frozen=True)
+class Reply:
+    data: dict[str, Any]
+    text: str
+    provider: str
+    model: str
+    account_id: UUID
+    account: str
+    # Tokens read, written and read again from the provider's cache, and what that
+    # cost when the account says what its model costs.
+    usage: dict[str, Any]
+    seconds: float
+    # How often the model was asked: twice when its first answer could not be used.
+    asked: int
+
+
+class ModelError(Exception):
+    """No answer. ``later`` says whether asking again later can help: no account is
+    ready right now, or every provider was busy."""
+
+    def __init__(self, label: str, detail: str, *, later: bool = False) -> None:
+        super().__init__(detail)
+        self.label = label
+        self.detail = detail
+        self.later = later
+
+
+@dataclass(frozen=True)
+class _Held:
+    id: UUID
+    name: str
+    provider: ApiProvider
+    url: str
+    key: str
+    prices: dict[str, Any]
+
+
+def names(choices: tuple[tuple[str, str], ...]) -> str:
+    said = [f"{BY_KEY[p].name if p in BY_KEY else p} ({m})" for p, m in choices]
+    return " or ".join(said)
+
+
+class Models:
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        sealing_key: bytes | None,
+        *,
+        http: httpx.AsyncClient | None = None,
+        anthropic_http: anthropic_api.HttpFactory | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.sessions = sessions
+        self.sealing_key = sealing_key
+        self._http = http
+        self._anthropic_http = anthropic_http
+        self._sleep = sleep
+
+    @property
+    def http(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(follow_redirects=False)
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+
+    # --- accounts ------------------------------------------------------------------------
+
+    def _held(self, provider: str, besides: set[UUID]) -> _Held | None:
+        """The account of that provider to ask with: the one unused longest that has a
+        key, is not paused and is not resting."""
+        kind = BY_KEY.get(provider)
+        if kind is None or self.sealing_key is None:
+            return None
+        now = datetime.now(UTC)
+        with self.sessions() as session:
+            accounts = session.scalars(
+                select(ProviderAccount).where(
+                    ProviderAccount.provider == provider,
+                    ProviderAccount.archived_at.is_(None),
+                    ProviderAccount.paused.is_(False),
+                    ProviderAccount.sealed_key.is_not(None),
+                    ProviderAccount.state.in_(("ready", "unchecked", "limited")),
+                )
+            ).all()
+            ready = [
+                account
+                for account in accounts
+                if account.id not in besides
+                and not (
+                    account.state == "limited"
+                    and account.limited_until is not None
+                    and _aware(account.limited_until) > now
+                )
+            ]
+            ready.sort(key=lambda a: _aware(a.last_used_at) if a.last_used_at else _EPOCH)
+            for account in ready:
+                try:
+                    key = unseal(self.sealing_key, account.id, str(account.sealed_key))
+                except SealError as error:
+                    self._learn(account.id, state="sign_in_required", reason=str(error))
+                    continue
+                return _Held(
+                    id=account.id,
+                    name=account.name,
+                    provider=kind,
+                    url=kind.endpoint(account.endpoint).url,
+                    key=key,
+                    prices=dict(account.prices or {}),
+                )
+        return None
+
+    def _learn(
+        self,
+        account_id: UUID,
+        *,
+        state: str,
+        reason: str | None = None,
+        rest: bool = False,
+        used: bool = False,
+        models: list[str] | None = None,
+    ) -> None:
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            account = session.get(ProviderAccount, account_id)
+            if account is None:
+                return
+            account.state = state
+            account.state_reason = reason[:300] if reason else None
+            account.checked_at = now
+            account.limited_until = now + timedelta(minutes=REST_MINUTES) if rest else None
+            if used:
+                account.last_used_at = now
+            if models is not None:
+                account.models = models
+                account.identity = f"{len(models)} models" if models else None
+
+    # --- one call ------------------------------------------------------------------------
+
+    async def _call(self, held: _Held, model: str, question: Question, prompt: str) -> Wire:
+        if held.provider.style == "anthropic":
+            return await anthropic_api.complete(
+                key=held.key,
+                base_url=held.url,
+                model=model,
+                system=question.system,
+                prompt=prompt,
+                schema=question.schema,
+                max_tokens=question.max_tokens,
+                seconds=question.seconds,
+                effort=question.effort,
+                http=self._anthropic_http,
+            )
+        return await openai_style.complete(
+            http=self.http,
+            name=held.provider.name,
+            key=held.key,
+            base_url=held.url,
+            model=model,
+            system=question.system,
+            prompt=prompt,
+            schema=question.schema,
+            max_tokens=question.max_tokens,
+            seconds=question.seconds,
+            limit_name=held.provider.limit_name,
+            strict=held.provider.key == "openai",
+            effort=question.effort,
+        )
+
+    async def _patient(self, held: _Held, model: str, question: Question, prompt: str) -> Wire:
+        """One call, waiting and asking again while the provider is only busy."""
+        for wait in (*BUSY_WAITS, None):
+            try:
+                return await self._call(held, model, question, prompt)
+            except WireError as error:
+                if error.kind != "busy" or wait is None:
+                    raise
+                await self._sleep(min(MAX_WAIT, max(wait, error.retry_after or 0.0)))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    # --- a question ----------------------------------------------------------------------
+
+    async def ask(self, question: Question) -> Reply:
+        if self.sealing_key is None:
+            raise ModelError(
+                "no_key",
+                "This installation has no key to open API keys with, so no model can be asked.",
+            )
+        base = (
+            f"{question.prompt}\n\nAnswer with one JSON object of exactly this shape and "
+            f"nothing else, no text before or after it:\n{shape.words(question.schema)}"
+        )
+        busy: list[str] = []
+        had_account = False
+        for provider, model in question.choices:
+            tried: set[UUID] = set()
+            while True:
+                held = await asyncio.to_thread(self._held, provider, tried)
+                if held is None:
+                    break
+                tried.add(held.id)
+                had_account = True
+                started = time.monotonic()
+                used = {"input": 0, "output": 0, "cached": 0}
+                prompt, why = base, ""
+                try:
+                    for asked in (1, 2):
+                        wire = await self._patient(held, model, question, prompt)
+                        used["input"] += wire.read
+                        used["output"] += wire.written
+                        used["cached"] += wire.cached
+                        data = shape.read_object(wire.text)
+                        why = (
+                            "it was not a JSON object"
+                            if data is None
+                            else shape.problem(question.schema, data) or ""
+                        )
+                        if not why and data is not None:
+                            await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+                            cost = cost_of(held.prices, model, used)
+                            return Reply(
+                                data=data,
+                                text=wire.text,
+                                provider=provider,
+                                model=wire.model,
+                                account_id=held.id,
+                                account=held.name,
+                                usage={
+                                    "tokens": used["input"] + used["output"],
+                                    **used,
+                                    **({"cost": cost} if cost is not None else {}),
+                                    "provider": provider,
+                                    "model": wire.model,
+                                    "account": held.name,
+                                },
+                                seconds=round(time.monotonic() - started, 1),
+                                asked=asked,
+                            )
+                        prompt = (
+                            f"{base}\n\nAn earlier answer could not be used: {why}. Answer "
+                            "again with only the JSON object."
+                        )
+                except WireError as error:
+                    if error.kind == "refused":
+                        await asyncio.to_thread(
+                            self._learn, held.id, state="sign_in_required", reason=error.detail
+                        )
+                        LOG.warning("model_key_refused", account=held.name)
+                        continue
+                    if error.kind == "busy":
+                        await asyncio.to_thread(
+                            self._learn, held.id, state="limited", reason=error.detail, rest=True
+                        )
+                        busy.append(error.detail)
+                        continue
+                    # The request itself is wrong, the model declined, or its answer was
+                    # cut: another account would be told the same.
+                    await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+                    raise ModelError(error.kind, error.detail) from error
+                await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+                raise ModelError(
+                    "no_answer",
+                    f"{held.provider.name} ({model}) gave no answer of the asked shape "
+                    f"twice: {why}.",
+                )
+        if busy:
+            raise ModelError("busy", busy[-1], later=True)
+        if had_account:
+            raise ModelError(
+                "no_account",
+                f"No account of {names(question.choices)} accepts its key any more.",
+                later=True,
+            )
+        raise ModelError(
+            "no_account",
+            f"Waiting for an account of {names(question.choices)} that has a key and is ready.",
+            later=True,
+        )
+
+    # --- trying an account ----------------------------------------------------------------
+
+    async def check(self, account_id: UUID) -> tuple[str, str | None]:
+        """Ask the provider which models the account's key reaches. That costs nothing,
+        and says whether the key is accepted. Returns the state and the reason."""
+
+        def read() -> tuple[ProviderAccount | None, bytes | None]:
+            with self.sessions() as session:
+                account = session.get(ProviderAccount, account_id)
+                if account is not None:
+                    session.expunge(account)
+                return account, self.sealing_key
+
+        account, sealing_key = await asyncio.to_thread(read)
+        kind = BY_KEY.get(account.provider) if account is not None else None
+        if account is None or kind is None or not account.sealed_key:
+            return "signed_out", "The account has no key yet."
+        if sealing_key is None:
+            return "unchecked", "This installation has no key to open API keys with."
+        try:
+            key = unseal(sealing_key, account.id, account.sealed_key)
+            url = kind.endpoint(account.endpoint).url
+            if kind.style == "anthropic":
+                found = await anthropic_api.models(key=key, base_url=url, http=self._anthropic_http)
+            else:
+                found = await openai_style.models(
+                    http=self.http, name=kind.name, key=key, base_url=url
+                )
+        except SealError as error:
+            state, reason = "sign_in_required", str(error)
+        except WireError as error:
+            state = "sign_in_required" if error.kind == "refused" else "unchecked"
+            reason = error.detail
+        else:
+            await asyncio.to_thread(self._learn, account_id, state="ready", models=found)
+            return "ready", None
+        await asyncio.to_thread(self._learn, account_id, state=state, reason=reason)
+        return state, reason
+
+
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=UTC)

@@ -32,6 +32,7 @@ import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
 import { LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, RouterLink, setQuery, useLocation } from '../router';
+import { API_PROVIDER_NAMES } from './FlowParts';
 import { minutes, tokens, versionName } from './Flows';
 import { RunGraph } from './RunGraph';
 import { useSubmit } from './ProjectDialogs';
@@ -121,7 +122,9 @@ const KINDS: Record<Run['kind'], string> = {
   flow: 'Running a flow',
 };
 
-const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
+const PROVIDERS: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT', ...API_PROVIDER_NAMES };
+/** What a call cost, in US dollars: small sums keep the fractions of a cent. */
+const dollars = (amount: number) => '$' + (amount < 1 ? amount.toFixed(4) : amount.toFixed(2));
 
 export function RunState({ run }: { run: Pick<Run, 'state'> }) {
   const shown = RUN_STATES[run.state];
@@ -287,6 +290,12 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
                 .join(' or ')}
             </Badge>
           ) : null}
+          {step.usage?.provider ? (
+            <Badge tone="neutral" size="sm">
+              {PROVIDERS[step.usage.provider] ?? step.usage.provider}
+              {step.usage.account ? ' · ' + step.usage.account : ''}
+            </Badge>
+          ) : null}
           {step.input?.model ? (
             <Badge tone="neutral" size="sm">
               {[step.input.model.model, step.input.model.effort ? `${step.input.model.effort} reasoning` : null]
@@ -299,6 +308,7 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
             {step.usage ? (
               <span title={`${step.usage.input.toLocaleString('en')} read, ${step.usage.output.toLocaleString('en')} written, ${step.usage.cached.toLocaleString('en')} read again from cache`}>
                 {tokens(step.usage.tokens)} tokens
+                {step.usage.cost !== undefined ? ', ' + dollars(step.usage.cost) : ''}
               </span>
             ) : null}
             {step.started_at ? <When value={step.started_at} /> : null}
@@ -322,7 +332,13 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
         {step.log ? (
           <div>
             <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(!open)}>
-              {open ? 'Hide what it printed' : 'Show what it printed'}
+              {step.usage?.provider
+                ? open
+                  ? 'Hide what was asked and answered'
+                  : 'Show what was asked and answered'
+                : open
+                  ? 'Hide what it printed'
+                  : 'Show what it printed'}
             </Button>
             {open ? (
               <pre
@@ -586,6 +602,13 @@ function RunDetail({ id }: { id: string }) {
                 {versionName(run.data.flow.version).toLowerCase()}
                 {run.usage?.sandboxes
                   ? `. Used so far: ${tokens(run.usage.tokens)} tokens, ${minutes(run.usage.minutes)} in ${run.usage.sandboxes} ${run.usage.sandboxes === 1 ? 'sandbox' : 'sandboxes'}`
+                  : ''}
+                {run.usage?.asked
+                  ? (run.usage.sandboxes ? ', ' : '. Used so far: ') +
+                    run.usage.asked +
+                    (run.usage.asked === 1 ? ' question' : ' questions') +
+                    ' to a model over an API' +
+                    (run.usage.cost ? ' for ' + dollars(run.usage.cost) : '')
                   : ''}
                 .
               </p>

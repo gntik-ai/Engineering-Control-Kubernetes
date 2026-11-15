@@ -1,12 +1,16 @@
-"""Subscription accounts: the sign-ins the agents work with.
+"""Accounts: the sign-ins the agents work with, and the keys models are asked with.
 
-An account is one subscription sign-in of one provider. The administrator adds as many as
-they want, signs each in, pauses it or removes it. No agent ever works with an API key:
-what is stored for an account is what the provider's own client produces when someone
-signs in to a subscription, and anything that looks like an API key is refused.
+An account is of one of two kinds. A subscription account is one sign-in of Claude or
+ChatGPT: what the provider's own command-line client produces when someone signs in to a
+subscription. An agent in a sandbox works with it, and anything that looks like an API
+key is refused for it. An API account is a key of a provider that is paid by use
+(Anthropic, OpenAI, DeepSeek, Qwen, GLM, Kimi): the platform asks a model with it
+directly, and no sandbox ever holds it.
 
-The credential is not kept here. It is checked, described (which address, which plan, as
-far as it says so itself) and handed to the cluster as a Secret named after the account.
+A subscription's credential is not kept here. It is checked, described (which address,
+which plan, as far as it says so itself) and handed to the cluster as a Secret named
+after the account. An API key is kept sealed in the account's record
+(``models/sealing.py``).
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.db.models import ProviderAccount
+from engineering_control.models.providers import API_PROVIDERS, clean_prices, host_of
+from engineering_control.models.providers import BY_KEY as API_BY_KEY
 
 NAME_MAX = 60
 MAX_ACCOUNTS = 200
@@ -58,9 +64,11 @@ class ProviderType:
     # How to get the credential, step by step, or why the provider is not available yet.
     steps: tuple[str, ...]
     note: str
+    # "subscription": an agent's client is signed in with it. "api": a key, paid by use.
+    kind: str = "subscription"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        found: dict[str, Any] = {
             "key": self.key,
             "name": self.name,
             "client": self.client,
@@ -68,13 +76,33 @@ class ProviderType:
             "available": self.available,
             "steps": list(self.steps),
             "note": self.note,
+            "kind": self.kind,
         }
+        api = API_BY_KEY.get(self.key)
+        if api is not None:
+            found["endpoints"] = api.as_dict()["endpoints"]
+        return found
 
 
-_LATER = (
-    "Not available yet: how a subscription of this provider signs a coding client in is "
-    "checked when it is added."
-)
+def _api(provider: Any) -> ProviderType:
+    return ProviderType(
+        key=provider.key,
+        name=provider.name,
+        client=None,
+        credential="api_key",
+        available=True,
+        steps=(
+            f"Make an API key at {provider.keys_at}.",
+            "Paste the key below. It is kept sealed and is never given to a sandbox.",
+        ),
+        note=(
+            "An API key, paid by use. A model is asked with it directly by the platform; "
+            "what a call cost is shown when the account says what its models cost."
+        ),
+        kind="api",
+    )
+
+
 PROVIDERS: Final = (
     ProviderType(
         key="claude",
@@ -107,10 +135,7 @@ PROVIDERS: Final = (
         ),
         note="The sign-in file of the subscription. Codex renews it by itself while it is used.",
     ),
-    ProviderType("deepseek", "DeepSeek", None, None, False, (), _LATER),
-    ProviderType("glm", "GLM", None, None, False, (), _LATER),
-    ProviderType("kimi", "Kimi", None, None, False, (), _LATER),
-    ProviderType("qwen", "Qwen", None, None, False, (), _LATER),
+    *(_api(provider) for provider in API_PROVIDERS),
 )
 _BY_KEY: Final = {provider.key: provider for provider in PROVIDERS}
 
@@ -169,6 +194,8 @@ def check_credential(provider: str, pasted: str) -> Credential:
     kind = _BY_KEY[provider]
     if not kind.available:
         raise ProjectInvalid(f"{kind.name} accounts cannot be signed in yet")
+    if kind.kind == "api":
+        raise ProjectInvalid(f"{kind.name} takes an API key, not a subscription sign-in")
     text = (pasted or "").strip()
     if not text:
         raise ProjectInvalid("Nothing was pasted")
@@ -224,7 +251,20 @@ def _when(value: datetime | None) -> str | None:
 
 def _row(account: ProviderAccount) -> dict[str, Any]:
     kind = _BY_KEY.get(account.provider)
+    api = API_BY_KEY.get(account.provider)
+    of_api: dict[str, Any] = {}
+    if api is not None:
+        endpoint = api.endpoint(account.endpoint)
+        of_api = {
+            "endpoint": endpoint.key,
+            "endpoint_name": endpoint.name,
+            "host": host_of(endpoint.url),
+            "models": list(account.models or []),
+            "prices": dict(account.prices or {}),
+        }
     return {
+        **of_api,
+        "kind": kind.kind if kind else "subscription",
         "id": str(account.id),
         "name": account.name,
         "provider": account.provider,
@@ -283,13 +323,15 @@ class Accounts:
         with self.sessions() as session:
             return _row(self._one(session, account_id))
 
-    def create(self, *, name: str, provider: str) -> dict[str, Any]:
+    def create(self, *, name: str, provider: str, endpoint: str | None = None) -> dict[str, Any]:
         kind = _BY_KEY.get(provider)
         if kind is None:
             raise ProjectInvalid("That provider is not known")
         if not kind.available:
             raise ProjectInvalid(f"{kind.name} accounts cannot be added yet")
         cleaned = clean_name(name)
+        api = API_BY_KEY.get(provider)
+        at = self._endpoint(provider, endpoint) if api is not None else None
         with self.sessions.begin() as session:
             self._name_free(session, cleaned)
             total = session.scalar(
@@ -307,6 +349,7 @@ class Accounts:
                 paused=False,
                 max_concurrent=2,
                 credential_generation=0,
+                endpoint=at,
             )
             session.add(account)
             session.flush()
@@ -319,9 +362,26 @@ class Accounts:
         name: str | None = None,
         max_concurrent: int | None = None,
         paused: bool | None = None,
+        endpoint: str | None = None,
+        prices: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
             account = self._one(session, account_id, lock=True)
+            if endpoint is not None or prices is not None:
+                if account.provider not in API_BY_KEY:
+                    raise ProjectInvalid("Only an account with an API key has an address or prices")
+                if endpoint is not None:
+                    at = self._endpoint(account.provider, endpoint)
+                    if at != account.endpoint and account.sealed_key:
+                        # A key belongs to the address it was made for.
+                        account.state, account.state_reason = "unchecked", None
+                        account.models = None
+                    account.endpoint = at
+                if prices is not None:
+                    try:
+                        account.prices = clean_prices(prices) or None
+                    except ValueError as error:
+                        raise ProjectInvalid(str(error)) from error
             if name is not None:
                 cleaned = clean_name(name)
                 self._name_free(session, cleaned, besides=account.id)
@@ -348,12 +408,59 @@ class Accounts:
             session.flush()
             return _row(account)
 
+    @staticmethod
+    def _endpoint(provider: str, endpoint: str | None) -> str:
+        api = API_BY_KEY[provider]
+        if endpoint in (None, ""):
+            return api.endpoints[0].key
+        if endpoint not in {entry.key for entry in api.endpoints}:
+            raise ProjectInvalid(f"{api.name} has no address {endpoint}")
+        return str(endpoint)
+
+    def key_stored(self, account_id: UUID, sealed: str) -> dict[str, Any]:
+        """An API key was entered for the account; it has not been tried yet."""
+        with self.sessions.begin() as session:
+            account = self._one(session, account_id, lock=True)
+            if account.provider not in API_BY_KEY:
+                raise ProjectInvalid("That account is signed in to a subscription, not given a key")
+            account.sealed_key = sealed
+            account.state, account.state_reason = "unchecked", None
+            account.identity = None
+            account.limited_until = None
+            account.signed_in_at = datetime.now(UTC)
+            account.credential_generation += 1
+            session.flush()
+            return _row(account)
+
+    def checked(
+        self,
+        account_id: UUID,
+        *,
+        state: str,
+        reason: str | None,
+        models: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """What asking the provider with the account's key showed."""
+        with self.sessions.begin() as session:
+            account = self._one(session, account_id, lock=True)
+            account.state = state
+            account.state_reason = reason[:300] if reason else None
+            account.checked_at = datetime.now(UTC)
+            if state == "ready":
+                account.limited_until = None
+            if models is not None:
+                account.models = models
+                account.identity = f"{len(models)} models" if models else None
+            session.flush()
+            return _row(account)
+
     def archive(self, account_id: UUID) -> dict[str, Any]:
         with self.sessions.begin() as session:
             account = self._one(session, account_id, lock=True)
             account.archived_at = datetime.now(UTC)
             account.state = "signed_out"
             account.identity = None
+            account.sealed_key = None
             session.flush()
             return _row(account)
 

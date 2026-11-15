@@ -70,7 +70,7 @@ FAILURES_TO_PAUSE: Final = 3
 # Changes carried out without asking, per turn and per hour. Past either, the next waits.
 AUTOMATIC_PER_TURN: Final = 40
 AUTOMATIC_PER_HOUR: Final = 200
-MAX_ANSWER: Final = 24_000
+MAX_ANSWER: Final = 40_000
 ISSUE_CHARACTERS: Final = 6_000
 LOG_CHARACTERS: Final = 6_000
 REFUSALS: Final = (ProjectInvalid, ProjectConflict, ProjectNotFound)
@@ -385,6 +385,8 @@ class Toolbox:
                         "does": f"{task['title']}. {task['summary']}",
                         "runs": {
                             "sandbox": "in a sandbox",
+                            "model": "by a model asked over a provider's API, without a "
+                            "sandbox and without tools",
                             "platform": "by the platform itself, after the sandboxes' tasks",
                             "control": "nowhere: it only chooses the way",
                         }[task["where"]],
@@ -399,6 +401,9 @@ class Toolbox:
                         "prompt": task["prompt"],
                     }
                     for task in task_catalogue()
+                    # A kind that is kept only for the flows that have it is not one to
+                    # build a new flow from.
+                    if not task["retired"]
                 ],
                 "prompts": {
                     contract.name: {

@@ -48,7 +48,7 @@ function icon(task: TaskType | undefined): ReactNode {
   if (task.where === 'control') return <Split size={16} aria-hidden />;
   if (task.approval) return <Hand size={16} aria-hidden />;
   if (task.publishes) return <GitBranch size={16} aria-hidden />;
-  if (task.account) return <Bot size={16} aria-hidden />;
+  if (task.account || task.where === 'model') return <Bot size={16} aria-hidden />;
   if (task.where === 'platform') return <ListChecks size={16} aria-hidden />;
   return undefined;
 }
@@ -124,6 +124,7 @@ export interface Drawn {
 
 const WHERE: Record<TaskType['where'], string> = {
   sandbox: 'In a sandbox',
+  model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',
 };

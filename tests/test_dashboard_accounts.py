@@ -191,14 +191,23 @@ def test_an_unreadable_identity_does_not_stop_a_sign_in() -> None:
 
 def test_the_catalogue_names_the_providers_asked_for() -> None:
     catalogue = {provider["key"]: provider for provider in provider_catalogue()}
-    assert set(catalogue) == {"claude", "chatgpt", "deepseek", "glm", "kimi", "qwen"}
-    assert {key for key, provider in catalogue.items() if provider["available"]} == {
+    assert set(catalogue) == {
         "claude",
         "chatgpt",
+        "anthropic",
+        "openai",
+        "deepseek",
+        "glm",
+        "kimi",
+        "qwen",
     }
-    for provider in catalogue.values():
-        assert provider["steps"] if provider["available"] else provider["note"]
-    with pytest.raises(ProjectInvalid, match="cannot be signed in yet"):
+    assert all(provider["available"] and provider["steps"] for provider in catalogue.values())
+    # Two are signed in to a subscription; six are given an API key.
+    kinds = {key: provider["kind"] for key, provider in catalogue.items()}
+    assert {key for key, kind in kinds.items() if kind == "subscription"} == {"claude", "chatgpt"}
+    assert all(catalogue[key]["credential"] == "api_key" for key in kinds if kinds[key] == "api")
+    assert [e["key"] for e in catalogue["qwen"]["endpoints"]] == ["international", "china"]
+    with pytest.raises(ProjectInvalid, match="takes an API key, not a subscription sign-in"):
         check_credential("glm", "anything")
 
 
@@ -325,8 +334,8 @@ def test_what_cannot_be_an_account_is_refused_with_the_reason(tmp_path: Path) ->
     try:
         _add(client, "Claude one", "claude")
         assert _post(client, "", name="claude ONE", provider="chatgpt").status_code == 409
-        later = _post(client, "", name="GLM one", provider="glm")
-        assert later.status_code == 422 and "cannot be added yet" in later.json()["detail"]
+        elsewhere = _post(client, "", name="GLM one", provider="glm", endpoint="mars")
+        assert elsewhere.status_code == 422 and "no address mars" in elsewhere.json()["detail"]
         assert _post(client, "", name="X", provider="unknown").status_code == 422
         assert _post(client, "", name="   ", provider="claude").status_code == 422
         other = _add(client, "Claude two", "claude")

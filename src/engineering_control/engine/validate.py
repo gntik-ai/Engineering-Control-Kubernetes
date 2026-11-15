@@ -353,6 +353,22 @@ def problems(document: Document) -> list[Problem]:
                         node.id,
                     )
                 )
+            if task.where == "model" and param.name in ("model", "then_model"):
+                # A model is asked by name: the first always, the second when a second
+                # provider is chosen.
+                wanted = param.name == "model" or (
+                    str(node.params.get("then_provider") or "none") != "none"
+                )
+                if wanted and not str(node.params.get(param.name) or "").strip():
+                    which = "the model" if param.name == "model" else "the second model"
+                    found.append(
+                        _problem(
+                            "setting",
+                            f"{node.id} does not name {which} it asks: write the name the "
+                            "provider gives it",
+                            node.id,
+                        )
+                    )
             if param.kind == "task" and not node.params.get(param.name):
                 found.append(
                     _problem(

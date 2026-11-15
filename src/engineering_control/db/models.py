@@ -550,13 +550,16 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
 
 
 class ProviderAccount(UUIDPrimaryKey, Timestamps, Base):
-    """One subscription sign-in the agents work with (migration 0028).
+    """One account the platform works with: a subscription sign-in for the agents in
+    sandboxes (migration 0028), or an API key a model is asked with (migration 0042).
 
-    The record holds no credential: that is a Secret of the sandbox namespace, named after
-    the account, written when the administrator signs the account in and replaced when they
-    do so again (``credential_generation`` counts how often). ``state`` is what the platform
-    last learned: nothing stored yet, stored and not tried, working, refused for now
-    (``limited_until``), or the provider wants a new sign-in.
+    A subscription's record holds no credential: that is a Secret of the sandbox
+    namespace, named after the account, written when the administrator signs the account
+    in and replaced when they do so again (``credential_generation`` counts how often).
+    An API key is kept here, sealed with the platform's own key (``sealed_key``): it is
+    never given to a sandbox. ``state`` is what the platform last learned: nothing stored
+    yet, stored and not tried, working, refused for now (``limited_until``), or the
+    provider wants a new sign-in or key.
     """
 
     __tablename__ = "provider_accounts"
@@ -574,6 +577,12 @@ class ProviderAccount(UUIDPrimaryKey, Timestamps, Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     limited_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # For an account with an API key: the key, sealed; which of the provider's addresses
+    # it is used at; the models the provider listed; what each costs per million tokens.
+    sealed_key: Mapped[str | None] = mapped_column(Text)
+    endpoint: Mapped[str | None] = mapped_column(String(20))
+    models: Mapped[list[str] | None] = mapped_column(JSON)
+    prices: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     __table_args__ = (
         CheckConstraint(
             "state IN ('signed_out', 'unchecked', 'ready', 'limited', 'sign_in_required')",

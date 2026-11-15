@@ -19,7 +19,8 @@ import ipaddress
 import signal
 import socket
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, cast
+from uuid import UUID
 
 import structlog
 from sqlalchemy import create_engine
@@ -35,10 +36,12 @@ from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
+from engineering_control.models.sealing import read_sealing_key
+from engineering_control.models.service import ModelError, Models, Question, Reply
 from engineering_control.platform_metrics import platform_metrics, unavailable
 from engineering_control.sandbox import deliver, pods, steps
 from engineering_control.sandbox.egress import grant, read_grant_key
-from engineering_control.sandbox.flows import AccountCheck, Flow, Follow
+from engineering_control.sandbox.flows import AccountCheck, Flow, Follow, Result
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
 from engineering_control.sandbox.triggers import PUSH_LOOK_EVERY, Triggers
@@ -63,6 +66,10 @@ RESULT_LINES: Final = 20_000
 SHOWN_CHARACTERS: Final = 300_000
 # How long a pod may wait for its node or its image before the step is given up.
 START_SECONDS: Final = 600
+# How often a step that asks a model puts its question again when the providers were
+# busy or the launcher started anew, before the run gives up. Waiting for an account
+# with a key is not counted.
+MODEL_TRIES: Final = 5
 # Reasons a container cannot start that waiting does not cure.
 _STUCK: Final = {
     "ErrImagePull": "The sandbox image could not be pulled.",
@@ -130,7 +137,13 @@ class Launcher:
         queues: Queues | None = None,
         backlog: BacklogItems | None = None,
         grant_key: bytes | None = None,
+        models: Models | None = None,
     ) -> None:
+        # Who asks a model over a provider's API, and the questions that are out: a step
+        # that asks one is not a sandbox, so it is followed here and not in the cluster.
+        self.models = models
+        self._calls: dict[UUID, asyncio.Task[Reply]] = {}
+        self._questions: dict[UUID, Question] = {}
         # What a step's grant to reach a project's own application is signed with.
         self.grant_key = grant_key
         self.runs = runs
@@ -184,7 +197,7 @@ class Launcher:
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
-        self._running = sum(1 for item in work if item.state == "running")
+        self._running = sum(1 for item in work if item.state == "running" and item.pod_name)
         for item in work:
             try:
                 await self._advance(item)
@@ -258,9 +271,98 @@ class Launcher:
             else:
                 await self._finish(item, state=end.state, outcome=end.outcome, detail=end.detail)
         elif item.state == "pending":
-            await self._start(item)
+            if self._asks(flow, item):
+                await self._ask(item)
+            else:
+                await self._start(item)
+        elif item.pod_name is None and self._asks(flow, item):
+            await self._asked(item)
         else:
             await self._watch(item)
+
+    # --- asking a model ------------------------------------------------------------------
+
+    @staticmethod
+    def _asks(flow: Flow, item: StepWork) -> bool:
+        asks = getattr(flow, "asks", None)
+        return bool(asks(item)) if asks is not None else False
+
+    async def _ask(self, item: StepWork) -> None:
+        """Put the step's question to a model. The answer is waited for in the
+        background: the other runs go on meanwhile."""
+        if self.models is None:
+            await self._fail_step(item, "no_models", "This installation cannot ask a model.")
+            return
+        if item.attempt >= MODEL_TRIES:
+            await self._fail_step(
+                item,
+                "model_unavailable",
+                f"The model could not be asked in {MODEL_TRIES} tries: its providers "
+                "were busy or did not answer each time.",
+            )
+            return
+        engine = cast(Engine, self.flows[item.run_kind])
+        try:
+            question = await engine.question(item)
+        except ValueError as error:
+            await self._fail_step(item, "not_asked", str(error))
+            return
+        # Whatever happens to the provider, the step does not wait for ever.
+        limit = question.seconds * 4 + 300
+        self._calls[item.step_id] = asyncio.create_task(
+            asyncio.wait_for(self.models.ask(question), timeout=limit)
+        )
+        self._questions[item.step_id] = question
+        await asyncio.to_thread(self.runs.step_started, item.step_id, None)
+        LOG.info("model_asked", run=str(item.run_id), step=item.name)
+
+    async def _asked(self, item: StepWork) -> None:
+        call = self._calls.get(item.step_id)
+        if call is None:
+            # The launcher started again while the model was being asked: ask again.
+            await asyncio.to_thread(
+                lambda: self.runs.step_again(
+                    item.step_id, "The question is put again.", forgiven=False
+                )
+            )
+            return
+        if not call.done():
+            waited = (datetime.now(UTC) - _aware(item.started_at or datetime.now(UTC))).seconds
+            await asyncio.to_thread(
+                self.runs.step_waiting,
+                item.step_id,
+                f"The model is being asked ({waited // 15 * 15} seconds so far).",
+            )
+            return
+        del self._calls[item.step_id]
+        question = self._questions.pop(item.step_id, None)
+        try:
+            reply = call.result()
+        except ModelError as error:
+            if error.later:
+                detail, forgiven = error.detail, error.label == "no_account"
+                await asyncio.to_thread(
+                    lambda: self.runs.step_again(item.step_id, detail, forgiven=forgiven)
+                )
+            else:
+                await self._fail_step(item, error.label, error.detail)
+            return
+        except TimeoutError:
+            await self._fail_step(item, "model_timeout", "The model did not answer in time.")
+            return
+        except asyncio.CancelledError:
+            await self._fail_step(item, "cancelled", "The question was withdrawn.")
+            return
+        await asyncio.to_thread(self.runs.note_usage, item.step_id, reply.usage)
+        result = await cast(Engine, self.flows[item.run_kind]).answered(item, reply)
+        said = (
+            f"--- asked {reply.provider} ({reply.model}) with the account {reply.account}"
+            f"{', twice' if reply.asked > 1 else ''}; answered in {reply.seconds} seconds ---\n"
+            f"{question.system if question else ''}\n\n{question.prompt if question else ''}"
+            f"\n\n--- answered ---\n{reply.text}"
+        )
+        await self._settle(item, result, result.verdict, log=said, exit_code=None)
+        LOG.info("model_answered", run=str(item.run_id), step=item.name, model=reply.model)
 
     # --- starting ------------------------------------------------------------------------
 
@@ -404,13 +506,33 @@ class Launcher:
         if commands is None and said:
             verdict = steps.Verdict(False, "failed", said)
         last = commands[-1] if commands else {}
+        await self._settle(
+            item,
+            result,
+            verdict,
+            log=log,
+            exit_code=last.get("exit_code") if isinstance(last.get("exit_code"), int) else None,
+        )
+        LOG.info("sandbox_finished", run=str(item.run_id), step=item.name, outcome=verdict.outcome)
+
+    async def _settle(
+        self,
+        item: StepWork,
+        result: Result,
+        verdict: steps.Verdict,
+        *,
+        log: str,
+        exit_code: int | None,
+    ) -> None:
+        """Record how a step ended and go on as its result says: the next step, the
+        administrator's decision, or the end of the run."""
         await asyncio.to_thread(
             lambda: self.runs.step_finished(
                 item.step_id,
                 state="succeeded" if verdict.succeeded else "failed",
                 outcome=verdict.outcome,
                 detail=verdict.detail,
-                exit_code=last.get("exit_code") if isinstance(last.get("exit_code"), int) else None,
+                exit_code=exit_code,
                 output=result.output,
                 log=log[-SHOWN_CHARACTERS:],
             )
@@ -438,7 +560,6 @@ class Launcher:
         else:
             for follow in result.follow:
                 await asyncio.to_thread(self._add, item, follow)
-        LOG.info("sandbox_finished", run=str(item.run_id), step=item.name, outcome=verdict.outcome)
 
     def _add(self, item: StepWork, follow: Follow) -> None:
         self.runs.add_step(
@@ -454,6 +575,11 @@ class Launcher:
         await self._finish(item, state="failed", outcome=outcome, detail=detail)
 
     async def _cancel(self, item: StepWork) -> None:
+        call = self._calls.pop(item.step_id, None)
+        if call is not None:
+            # A question that is out is withdrawn: its answer is not waited for.
+            self._questions.pop(item.step_id, None)
+            call.cancel()
         if item.state == "running" and item.pod_name is not None:
             await self.cluster.delete_pod(item.pod_name, grace_seconds=0)
             await self.flows[item.run_kind].ended(item)
@@ -523,6 +649,7 @@ async def serve(settings: Settings | None = None) -> None:
         queues=Queues(sessions, runs, Budgets(sessions)),
         backlog=BacklogItems(sessions),
         grant_key=read_grant_key(resolved.sandbox_egress_grant_key_file),
+        models=Models(sessions, read_sealing_key(resolved.model_keys_key_file)),
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -554,6 +681,8 @@ async def serve(settings: Settings | None = None) -> None:
     finally:
         told.close()
         await cluster.aclose()
+        if launcher.models is not None:
+            await launcher.models.aclose()
         if github is not None:
             await github.aclose()
         engine.dispose()

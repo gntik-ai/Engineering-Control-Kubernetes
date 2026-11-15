@@ -818,7 +818,9 @@ class Runs:
                 return Lease(account.id, account.provider, account.credential_generation)
         return None
 
-    def step_started(self, step_id: UUID, pod_name: str) -> None:
+    def step_started(self, step_id: UUID, pod_name: str | None) -> None:
+        """The step is under way: in the sandbox of that name, or, for a step that asks
+        a model, without one."""
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
             step = session.get(SandboxStep, step_id)
@@ -833,6 +835,18 @@ class Runs:
             if run is not None and run.state == "queued":
                 run.state = "running"
                 run.started_at = now
+
+    def step_again(self, step_id: UUID, detail: str, *, forgiven: bool) -> None:
+        """A step that asks a model goes back to waiting: it is asked again on a later
+        pass. A wait for an account is not counted as a try."""
+        with self.sessions.begin() as session:
+            step = session.get(SandboxStep, step_id)
+            if step is None or step.state != "running":
+                return
+            step.state = "pending"
+            step.detail = detail[:600]
+            if forgiven and step.attempt > 0:
+                step.attempt -= 1
 
     def step_waiting(self, step_id: UUID, detail: str) -> None:
         with self.sessions.begin() as session:
@@ -1045,6 +1059,7 @@ class Runs:
                 total["failed"] += run.state == "failed"
                 for name in ("tokens", "cached", "minutes", "sandboxes"):
                     total[name] += int(spent.get(name) or 0)
+                total["cost"] = round(total["cost"] + float(spent.get("cost") or 0), 6)
 
             def empty(**named: Any) -> dict[str, Any]:
                 return {
@@ -1056,6 +1071,7 @@ class Runs:
                     "cached": 0,
                     "minutes": 0,
                     "sandboxes": 0,
+                    "cost": 0.0,
                 }
 
             for run in runs:
@@ -1201,27 +1217,48 @@ def _aware(value: datetime) -> datetime:
 
 
 def usage_of(session: Session, run_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
-    """What each of the runs used: tokens its agents reported, and minutes in sandboxes."""
+    """What each of the runs used: tokens its agents and the models it asked reported,
+    minutes in sandboxes, and what its calls over an API cost where their price is known."""
     found: dict[UUID, dict[str, Any]] = {}
     if not run_ids:
         return found
     rows = session.execute(
         select(
-            SandboxStep.run_id, SandboxStep.usage, SandboxStep.started_at, SandboxStep.finished_at
+            SandboxStep.run_id,
+            SandboxStep.usage,
+            SandboxStep.started_at,
+            SandboxStep.finished_at,
+            SandboxStep.pod_name,
         ).where(SandboxStep.run_id.in_(run_ids))
     ).all()
     seconds: dict[UUID, float] = {}
-    for run_id, usage, started, finished in rows:
+    for run_id, usage, started, finished, pod_name in rows:
         total = found.setdefault(
             run_id,
-            {"tokens": 0, "input": 0, "output": 0, "cached": 0, "minutes": 0, "sandboxes": 0},
+            {
+                "tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cached": 0,
+                "minutes": 0,
+                "sandboxes": 0,
+                "cost": 0.0,
+                "asked": 0,
+            },
         )
+        try:
+            total["cost"] = round(total["cost"] + float((usage or {}).get("cost") or 0), 6)
+        except (TypeError, ValueError):
+            pass
+        # A step that asked a model over an API: no sandbox ran for it.
+        asked = started is not None and pod_name is None and bool((usage or {}).get("model"))
+        total["asked"] += asked
         for name in ("tokens", "input", "output", "cached"):
             try:
                 total[name] += int((usage or {}).get(name) or 0)
             except (TypeError, ValueError):
                 continue
-        if started is not None:
+        if started is not None and not asked:
             total["sandboxes"] += 1
             if finished is not None:
                 took = (_aware(finished) - _aware(started)).total_seconds()

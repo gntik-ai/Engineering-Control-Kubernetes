@@ -73,7 +73,7 @@ export interface TaskType {
   group: string;
   title: string;
   summary: string;
-  where: 'sandbox' | 'platform' | 'control';
+  where: 'sandbox' | 'model' | 'platform' | 'control';
   account: boolean;
   writes: boolean;
   publishes: boolean;
@@ -293,7 +293,7 @@ export interface SimulatedStep {
   task: string;
   type: string;
   title: string;
-  where: 'sandbox' | 'platform' | 'control';
+  where: 'sandbox' | 'model' | 'platform' | 'control';
   provider: string | null;
   round: number | null;
   entry: number | null;
@@ -416,6 +416,10 @@ export interface RunUsage {
   cached: number;
   minutes: number;
   sandboxes: number;
+  /** What the run's calls over an API cost, where the accounts say what their models cost. */
+  cost?: number;
+  /** How many of its steps asked a model over an API. */
+  asked?: number;
 }
 
 /**
@@ -773,7 +777,17 @@ export interface RunStep {
   started_at: string | null;
   finished_at: string | null;
   /** What the step's agent reported using, when an agent worked in it. */
-  usage?: { tokens: number; input: number; output: number; cached: number } | null;
+  usage?: {
+    tokens: number;
+    input: number;
+    output: number;
+    cached: number;
+    /** For a step that asked a model over an API: where, and what it cost if known. */
+    cost?: number;
+    provider?: string;
+    model?: string;
+    account?: string;
+  } | null;
   /** What the step was given: the round, which wording of which prompt, which model. */
   input?: {
     round?: number;
@@ -880,23 +894,43 @@ export interface Account {
   limited_until: string | null;
   /** A sandbox is asking the account's client a question right now. */
   being_tried: boolean;
+  /** A subscription sign-in for agents in sandboxes, or an API key a model is asked with. */
+  kind: 'subscription' | 'api';
+  /** For an account with an API key: which of the provider's addresses it is used at. */
+  endpoint?: string;
+  endpoint_name?: string;
+  host?: string;
+  /** The models the provider listed for the key when it was last asked. */
+  models?: string[];
+  /** US dollars per million tokens, by model. */
+  prices?: Record<string, ModelPrice>;
 }
 
-/** A kind of subscription, and how the administrator signs one in. */
+export interface ModelPrice {
+  input: number;
+  output: number;
+  cached?: number;
+}
+
+/** A kind of account, and how the administrator signs one in or gives it its key. */
 export interface ProviderType {
   key: string;
   name: string;
   client: string | null;
-  credential: 'token' | 'auth_file' | null;
+  credential: 'token' | 'auth_file' | 'api_key' | null;
   available: boolean;
   steps: string[];
   note: string;
+  kind: 'subscription' | 'api';
+  endpoints?: { key: string; name: string; host: string }[];
 }
 
 export interface Accounts extends Listing<Account> {
   providers: ProviderType[];
   /** False when this installation has nowhere to store a sign-in. */
   sign_in_available: boolean;
+  /** False when this installation has no key to seal API keys with. */
+  keys_available: boolean;
 }
 
 /** A repository the GitHub App is installed on. */

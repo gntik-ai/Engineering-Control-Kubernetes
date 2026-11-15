@@ -153,6 +153,9 @@ def test_valid_invalid_login_csrf_cookie_and_tamper(tmp_path: Path) -> None:
         assert client.get("/console").status_code == 200
         session_cookie = client.cookies.get("engineering_dashboard_session")
         assert session_cookie is not None
+        # Replaced, not added beside the good one: which of two cookies of one name is
+        # sent first is the HTTP library's to say.
+        client.cookies.delete("engineering_dashboard_session")
         client.cookies.set("engineering_dashboard_session", session_cookie + "x")
         assert client.get("/console", follow_redirects=False).status_code == 303
 

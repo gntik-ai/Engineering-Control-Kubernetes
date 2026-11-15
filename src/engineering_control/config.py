@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     sandbox_egress_grant_key_file: Path | None = Path(
         "/etc/engineering-control/env/egress-grant.key"
     )
+    # The key API keys are sealed with in the database: the console seals, the launcher
+    # opens. Without the file no API key can be stored and no model asked over an API.
+    model_keys_key_file: Path | None = Path("/etc/engineering-control/env/model-keys.key")
     sandbox_egress_hosts: tuple[str, ...] = (
         # The subscriptions' clients.
         "api.anthropic.com",

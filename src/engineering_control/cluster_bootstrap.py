@@ -48,6 +48,9 @@ def service_secret_generators() -> dict[str, Callable[[], bytes]]:
         # (sandbox/egress.py): the launcher signs, the proxy checks.
         "egress-grant.key": _token,
         "session.key": lambda: secrets.token_bytes(64),
+        # What the API keys of accounts are sealed with in the database
+        # (models/sealing.py): the console seals, the launcher opens.
+        "model-keys.key": _token,
     }
 
 

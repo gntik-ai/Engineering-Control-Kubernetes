@@ -22,6 +22,9 @@ data:
   # What a step's grant to reach a project's own application is signed with: the
   # launcher signs, the sandboxes' proxy checks.
   ENGINEERING_SANDBOX_EGRESS_GRANT_KEY_FILE: /var/run/secrets/engineering-control/egress-grant.key
+  # What the API keys of accounts are sealed with in the database: the console seals a
+  # key the administrator enters, the launcher opens it to ask a model. No sandbox has it.
+  ENGINEERING_MODEL_KEYS_KEY_FILE: /var/run/secrets/engineering-control/model-keys.key
   # The GitHub App "Engineering Control" of the organisation, installed on the repositories
   # the platform works on. Identifiers only; the private key and the client secret are in
   # the Secret engineering-control-github-app, created by the administrator.

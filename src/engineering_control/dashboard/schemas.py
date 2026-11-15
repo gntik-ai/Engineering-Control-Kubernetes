@@ -258,6 +258,8 @@ class AccountCreateInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     name: str = Field(min_length=1, max_length=200)
     provider: str = Field(pattern=r"^[a-z]{2,16}$")
+    # For an account with an API key: which of the provider's addresses it is used at.
+    endpoint: str | None = Field(default=None, pattern=r"^[a-z]{2,20}$")
 
 
 class AccountUpdateInput(DashboardModel):
@@ -267,6 +269,9 @@ class AccountUpdateInput(DashboardModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     max_concurrent: int | None = Field(default=None, ge=1, le=8)
     paused: bool | None = None
+    endpoint: str | None = Field(default=None, pattern=r"^[a-z]{2,20}$")
+    # What a million tokens cost on each model: read, written, read again from the cache.
+    prices: dict[str, dict[str, float | None]] | None = None
 
 
 class AccountSignInInput(DashboardModel):

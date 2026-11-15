@@ -7,8 +7,18 @@ import { ConditionEditor } from './FlowCondition';
 /** What the flow pages share: names, and the editor of one setting of a task. */
 
 export const PROVIDER_NAMES: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
+/** The providers a model is asked at over an API, as a setting names them. */
+export const API_PROVIDER_NAMES: Record<string, string> = {
+  anthropic: 'Anthropic API',
+  openai: 'OpenAI API',
+  deepseek: 'DeepSeek',
+  qwen: 'Qwen',
+  glm: 'GLM',
+  kimi: 'Kimi',
+};
 export const WHERE: Record<TaskType['where'], string> = {
   sandbox: 'In a sandbox',
+  model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',
 };
@@ -26,6 +36,12 @@ const SETTING_NAMES: Record<string, string> = {
   instruction: 'Your instruction',
   branch: 'Branch',
   method: 'How it is merged',
+  provider: 'Provider',
+  model: 'Model',
+  then_provider: 'Second provider',
+  then_model: 'Model at the second provider',
+  effort: 'Reasoning',
+  with_change: 'Give it the collected change',
   allow_none: 'A pull request without checks counts as passed',
   commands: 'Commands',
   over: 'The list it goes through',
@@ -224,7 +240,10 @@ export function Setting({
       .map((other) => ({ value: other.id, label: other.id }));
     chosen = String(value ?? '');
   } else {
-    items = param.choices.map((choice) => ({ value: choice, label: choice.replace(/_/g, ' ') }));
+    items = param.choices.map((choice) => ({
+      value: choice,
+      label: API_PROVIDER_NAMES[choice] ?? choice.replace(/_/g, ' '),
+    }));
     chosen = String(value ?? '');
   }
   return (

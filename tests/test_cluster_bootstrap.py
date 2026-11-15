@@ -64,7 +64,7 @@ def test_service_secret_is_created_once_with_every_key() -> None:
     cluster = FakeCluster()
     store = cluster.store()
     added = bootstrap_service_secrets(store)
-    expected = {"egress-grant.key", "session.key"}
+    expected = {"egress-grant.key", "model-keys.key", "session.key"}
     assert set(added) == expected == set(service_secret_generators())
     values = {
         key: base64.b64decode(value) for key, value in cluster.secrets[SERVICE_SECRET].items()

@@ -1804,5 +1804,8 @@ PLATFORM: Final[dict[str, PlatformTask]] = {
     "proposals.propose": ProposeEnhancements(),
 }
 assert set(SANDBOX) | set(PLATFORM) == {  # noqa: S101 - the catalogue and the code agree
-    key for key, task in TASKS.items() if task.where != "control"
+    # The tasks that ask a model over an API are in ``asking``.
+    key
+    for key, task in TASKS.items()
+    if task.where not in ("control", "model")
 }

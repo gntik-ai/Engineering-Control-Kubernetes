@@ -155,12 +155,52 @@ provider's client and pastes the result in the console (Accounts → Sign in):
 | Claude | Claude Code | the token `claude setup-token` prints | as `CLAUDE_CODE_OAUTH_TOKEN` |
 | ChatGPT | Codex | the content of `~/.codex/auth.json` after `codex login` | as the sign-in file of the account's Codex home, which Codex renews in place |
 
-Anything that looks like an API key is refused. The console's pod has an identity of its
+Anything that looks like an API key is refused for a subscription account. The console's
+pod has an identity of its
 own for this one purpose (`engineering-control-console`, a token valid for an hour, mounted
 explicitly). In the sandbox namespace it may create, replace and delete Secrets; it cannot
 read one back or list them, and in its own namespace it may do nothing. What was pasted
 goes from the browser to the console to the cluster and is not written to the database or
 to the activity record.
+
+### Accounts with an API key
+
+Beside the two subscriptions, a model can be asked over a provider's API, paid by use.
+An account of this kind holds one API key (Accounts → Add account → a kind marked "API
+key" → Enter key):
+
+| Provider | Address the key is used at |
+| --- | --- |
+| Anthropic API | `api.anthropic.com` |
+| OpenAI API | `api.openai.com` |
+| DeepSeek | `api.deepseek.com` |
+| Qwen | `dashscope-intl.aliyuncs.com` (international) or `dashscope.aliyuncs.com` (China) |
+| GLM | `api.z.ai` (international) or `open.bigmodel.cn` (China) |
+| Kimi | `api.moonshot.ai` (international) or `api.moonshot.cn` (China) |
+
+The address is chosen from that list and never typed, so a key is sent nowhere else. A
+key works at the address it was made for.
+
+Where the key is kept differs from a subscription's sign-in, because no sandbox may ever
+hold it:
+
+- The key is sealed (AES-GCM) with one of the platform's own generated secrets
+  (`model-keys.key` in the Secret `engineering-control-secrets`, made by the bootstrap
+  job) and stored in the account's record in the database. A copy of the database alone
+  opens nothing, and a key sealed for one account does not open in another's record.
+- The console seals a key when it is entered. The launcher opens it for the moment a
+  model is asked. Neither writes it to a log, the activity record or a run.
+- No pod of the sandbox namespace is given it. An agent in a sandbox still works with a
+  subscription and nothing else.
+
+When a key is entered the provider is asked at once which models the key reaches. That
+costs nothing and shows whether the key is accepted; "Ask for its models" does it again.
+An account whose key the provider refuses says "New key needed" and waits in the inbox.
+
+Prices are yours to write (Change → What its models cost): per model, US dollars per
+million tokens read, written and, if the provider prices it apart, read again from its
+cache. A call on a model with a price shows what it cost; without one it is counted in
+tokens only. The platform does not know any provider's prices by itself.
 
 ## Runs and the launcher
 
@@ -537,6 +577,56 @@ If the app may not read checks, the run waits for the administrator after the pu
 request is open and says which permission is missing. Once it is granted, "Look at the
 checks again" goes on from there; nothing is published twice. "Stop here" ends the run
 and leaves the pull request.
+
+### Asking a model over an API
+
+Two tasks, in the group Models, ask a model directly instead of starting an agent in a
+sandbox:
+
+| Task | What the model does | Outcomes |
+| --- | --- | --- |
+| Ask a model: judge | Passes what your instruction says or asks for changes, with findings the next task is given | `pass`, `changes` |
+| Ask a model: report | Writes a report, kept with the run and given to the tasks after it as notes | `done` |
+
+Each is set with your instruction, the provider and the model's name as the provider
+writes it, optionally a second provider and model for when no account of the first can
+answer, how hard the model reasons (Anthropic and OpenAI only), whether it is given the
+collected change, the longest answer in tokens, and how long one answer is waited for.
+
+Such a task is a step of the run like a sandbox's, but no sandbox runs: the launcher
+asks the provider and goes on with the other runs while it waits. What holds for it:
+
+- **The model has no tools.** It cannot read the repository, run a command or look
+  anything up. It goes by what the platform puts before it: your instruction, what the
+  run is about, the notes of earlier tasks, an earlier task's findings and, when the run
+  has collected one, the change (the files it touches and its diff). To judge a change,
+  put the task after Collect the change.
+- **What comes from outside is marked as material** (the issue's text, the diff, notes),
+  with the rule not to follow instructions in it.
+- **The answer has a fixed shape**, stated in the question and checked by the platform
+  whatever the provider promises. An answer of another shape is asked for once more,
+  saying what was wrong; a second one fails the step.
+- **A change too long for one question is not cut to fit** (600,000 characters): the
+  step fails and says so.
+- **A provider that is over its limit or does not answer** is tried again after a moment,
+  twice; then the account rests for five minutes and the next account, or the second
+  provider, is asked. A step that finds no account ready waits and says for what, as a
+  step waits for a free subscription. After five rounds of busy providers the run fails.
+- **A request the provider rejects** (a model it does not have) fails the run with the
+  provider's own words.
+- **It does not stand in for Review the change.** Passing it is not the review, the
+  tests or the scan a change needs before it is published; the rules are unchanged.
+
+Anthropic is asked through its own library, with the answer's shape given to the API
+itself and the request streamed. On the models that can decline a request for safety
+reasons (Fable, Opus 5 and 5.5, Sonnet 5.5) the API's own fallback is asked for, so such
+a request is answered by the model Anthropic names for that case instead of failing. The
+five other providers are asked for a chat completion as a JSON object.
+
+Every question and answer is kept with its step on the run's page ("Show what was asked
+and answered"), with the provider, the account, the model, the tokens read and written,
+and the cost when the account has a price for the model. Tokens count against a flow's
+token budget like an agent's.
 
 ## Items that are not issues
 

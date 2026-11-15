@@ -35,7 +35,9 @@ and any the administrator adds), each with a flow. An item of the backlog is rou
 section; starting it starts a run of the section's flow. A run is a record in the
 database; each of its steps is a pod in a namespace of its own, on a node of its own, with
 no way out but a proxy that opens tunnels to named hosts. The agents work with
-subscription accounts the administrator signs in on the console; no API key is used.
+subscription accounts the administrator signs in on the console. A flow can also ask a
+model directly over a provider's API, with an API key kept sealed and never given to a
+sandbox.
 What a run changes becomes a pull request only after the administrator agrees, with the
 password.
 

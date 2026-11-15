@@ -105,6 +105,8 @@ from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
+from engineering_control.models.sealing import read_sealing_key
+from engineering_control.models.service import Models
 from engineering_control.projects import PROJECT_SET
 
 PACKAGE_ROOT = Path(__file__).parent
@@ -174,6 +176,7 @@ def create_app(
     limiter: LoginFailureLimiter | None = None,
     github_app: GitHubApp | None = None,
     cluster: Cluster | None = None,
+    models: Models | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     key = session_key
@@ -314,6 +317,10 @@ def create_app(
         if resolved_cluster is None and repository is None:
             resolved_cluster = Cluster.from_settings(resolved)
         app.state.cluster = resolved_cluster
+        # The accounts with an API key: sealed here, and asked which models they reach.
+        app.state.models = models or Models(
+            resolved_repository.sessions, read_sealing_key(resolved.model_keys_key_file)
+        )
         keepers: list[asyncio.Task[None]] = []
         # Keep every project's backlog in step with GitHub, unless a fixture supplied the
         # app (a test drives the import itself) or the interval is zero.
@@ -348,6 +355,8 @@ def create_app(
             await resolved_github.aclose()
         if cluster is None and resolved_cluster is not None:
             await resolved_cluster.aclose()
+        if models is None:
+            await app.state.models.aclose()
         if repository is None:
             resolved_repository.engine.dispose()
 
@@ -725,6 +734,9 @@ def create_app(
 
     def cluster_of(request: Request) -> Cluster | None:
         return cast(Cluster | None, request.app.state.cluster)
+
+    def models_of(request: Request) -> Models | None:
+        return cast(Models | None, getattr(request.app.state, "models", None))
 
     @app.get("/api/dashboard/github/repositories")
     async def github_repositories_api(request: Request) -> Response:
@@ -1157,14 +1169,24 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         listing = await service(request).accounts()
-        return JSONResponse({**listing, "sign_in_available": cluster_of(request) is not None})
+        models = models_of(request)
+        return JSONResponse(
+            {
+                **listing,
+                "sign_in_available": cluster_of(request) is not None,
+                # Whether an API key can be stored here at all.
+                "keys_available": models is not None and models.sealing_key is not None,
+            }
+        )
 
     @app.post("/api/dashboard/accounts")
     async def create_account_api(request: Request) -> Response:
         return await project_change(
             request,
             AccountCreateInput,
-            lambda body: service(request).create_account(name=body.name, provider=body.provider),
+            lambda body: service(request).create_account(
+                name=body.name, provider=body.provider, endpoint=body.endpoint
+            ),
             event="dashboard.account_added",
             status_code=201,
             entity="account",
@@ -1176,7 +1198,12 @@ def create_app(
             request,
             AccountUpdateInput,
             lambda body: service(request).update_account(
-                account_id, name=body.name, max_concurrent=body.max_concurrent, paused=body.paused
+                account_id,
+                name=body.name,
+                max_concurrent=body.max_concurrent,
+                paused=body.paused,
+                endpoint=body.endpoint,
+                prices=body.prices,
             ),
             event="dashboard.account_changed",
             entity="account",
@@ -1188,9 +1215,20 @@ def create_app(
             request,
             AccountSignInInput,
             lambda body: service(request).sign_in_account(
-                account_id, body.credential, cluster_of(request)
+                account_id, body.credential, cluster_of(request), models_of(request)
             ),
             event="dashboard.account_signed_in",
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/check")
+    async def check_account_api(account_id: UUID, request: Request) -> Response:
+        """Ask the provider of an account with an API key which models the key reaches."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).check_account(account_id, models_of(request)),
+            event="dashboard.account_checked",
             entity="account",
         )
 
