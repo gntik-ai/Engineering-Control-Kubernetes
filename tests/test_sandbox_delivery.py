@@ -100,6 +100,11 @@ class FakeGitHub:
         self.created: dict[str, Any] = {}
         self.fail_pulls = False
         self.denied: set[str] = set()
+        # What GitHub's checks say of the published commit, and what becomes of a merge.
+        self.check_runs: list[dict[str, Any]] = []
+        self.statuses: list[dict[str, Any]] = []
+        self.merge_refused: tuple[int, str] | None = None
+        self.merged: list[dict[str, Any]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -143,6 +148,18 @@ class FakeGitHub:
         if path.endswith("/git/refs"):
             self.created["ref"] = body
             return httpx.Response(201, json={})
+        if path.endswith("/check-runs"):
+            return httpx.Response(
+                200, json={"total_count": len(self.check_runs), "check_runs": self.check_runs}
+            )
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"state": "pending", "statuses": self.statuses})
+        if path.endswith("/pulls/77/merge"):
+            if self.merge_refused is not None:
+                code, said = self.merge_refused
+                return httpx.Response(code, json={"message": said})
+            self.merged.append(body)
+            return httpx.Response(200, json={"sha": "f" * 40, "merged": True, "message": "ok"})
         if path.endswith("/pulls"):
             if self.fail_pulls:
                 return httpx.Response(500, json={})
@@ -465,7 +482,10 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
     assert done["data"]["pull_request"] == {
         "number": 77,
         "url": f"https://github.com/{REPOSITORY}/pull/77",
+        "sha": "e" * 40,
     }
+    # This flow does not go on to merge, and the decision said so.
+    assert done["data"]["merges"] is False and world.hub.merged == []
     created = world.hub.created
     assert created["blobs"] == [b"new\n"]
     assert created["tree"]["base_tree"] == "t" * 40

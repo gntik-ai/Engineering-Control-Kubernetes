@@ -92,6 +92,14 @@ administrator creates and which is not in this repository:
 kubectl -n engineering-control create secret generic engineering-control-github-app --from-file=private-key.pem=/path/to/key.pem --from-literal=client-secret='...'
 ```
 
+The app needs these permissions on the repositories: Contents (read and write), Pull
+requests (read and write), Issues (read), Metadata (read), and, for the tasks
+that wait for GitHub's checks and merge, Checks (read) and Commit statuses (read). A
+permission added later has to be accepted for the organisation before it counts
+(GitHub → the organisation's Settings → GitHub Apps → Engineering Control → Review
+request). Every token the platform asks for names only what that one action needs and is
+revoked when the action ends.
+
 The console, the launcher and the supervisor's tools mount it, and only the private key.
 With it the console lists the repositories the app is installed on and reads their open
 issues for the backlog, using a token limited to reading metadata and issues; the launcher
@@ -405,7 +413,9 @@ with the password, publishes it or discards it. Publishing is done by the launch
 GitHub's API with a token for that repository (contents and pull requests, revoked
 afterwards): one commit on a new branch `engineering-control/issue-<number>-<run>`, and a
 pull request. No sandbox ever holds a token that can write, nothing a sandbox produced is
-executed by the platform, nothing is merged, and no existing branch is moved. A change that
+executed by the platform, and no existing branch is moved. The flow "Deliver issue" as it
+is shipped merges nothing; a flow merges only when it has the two tasks described under
+"Waiting for GitHub's checks and merging". A change that
 touches `.github/`, `.claude/`, `.codex/`, `.mcp.json`, `CLAUDE.md` or `AGENTS.md` is refused.
 
 The first three steps, the tests after the change, the scan and Collect the change are
@@ -500,6 +510,34 @@ flows that have it, runs as before, and is no longer offered in the designer's l
 A subscription that refuses (a limit, a sign-in that is no longer accepted) is recorded on
 the account, and the step is given to another account, three times at most.
 
+### Waiting for GitHub's checks and merging
+
+Two tasks of the platform's own, in the group GitHub, for a flow that should go on after
+the pull request. Neither uses an agent, a sandbox or a subscription: the launcher asks
+GitHub. The shipped flows do not have them; they are added in the designer after Open
+the pull request.
+
+| Task | What it does | Settings | Outcomes |
+| --- | --- | --- | --- |
+| Wait for GitHub's checks | Reads what GitHub's workflows (check runs) and other services (commit statuses) say of the commit the pull request was opened with, every thirty seconds, until all have ended | How long to wait, 5 to 180 minutes (30); whether a pull request on which nothing runs counts as passed (no) | `passed`: every check ended well, skipped or neutral. `failed`: one ended badly, they did not finish in time, or nothing ran and that does not count |
+| Merge the pull request | Merges it, naming the commit the checks passed, so a pull request that changed since is refused by GitHub | Squash (default), merge commit or rebase | `ok` |
+
+While the checks run the run stays "running" with what it waits for ("3 of 5 done"), holds
+no sandbox and no account, and counts against no queue of agents. Checks that fail end the
+run as failed and leave the pull request open; with no way drawn from `failed` that is
+where it ends. A merge GitHub refuses (a protected branch that wants a review, a conflict)
+ends the run as failed with GitHub's own words; the pull request stays open and can be
+merged by hand.
+
+The decision before the pull request says what it decides: in a flow that goes on to
+merge, the run's page reads "Publish and merge" and names the branch the change is merged
+into once GitHub's checks pass. There is one decision, not two.
+
+If the app may not read checks, the run waits for the administrator after the pull
+request is open and says which permission is missing. Once it is granted, "Look at the
+checks again" goes on from there; nothing is published twice. "Stop here" ends the run
+and leaves the pull request.
+
 ## Items that are not issues
 
 A backlog item need not be an issue on GitHub. One written in the console, proposed by the
@@ -575,6 +613,10 @@ while a run goes (`engine/validate.py`, `engine/routing.py`), whoever wrote the 
   `passed` or `failed` (no worse than before the change), Scan for secrets by `ok`. A
   flow that leads on from a reviewer's `changes` or from the tests' `regression` to the
   collection or to GitHub is refused, however the rest of it is drawn.
+- A pull request is merged only by way of the outcome `passed` of Wait for GitHub's
+  checks, read after that pull request was opened. A flow that reaches Merge the pull
+  request any other way cannot be put in force, and the task itself refuses a pull
+  request whose commit is not the one the checks passed.
 - A task that judges another's work is given to the other subscription than the one that
   did the work. A task that is gone back to keeps its subscription.
 - Going back to a task is a round. A run has as many as its flow says, five at most.

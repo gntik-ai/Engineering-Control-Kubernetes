@@ -242,7 +242,15 @@ class Launcher:
             end = await flow.done(item)
             if end.data:
                 await asyncio.to_thread(self.runs.merge_data, item.run_id, end.data)
-            if end.wait is not None:
+            if end.again:
+                # The platform waits for something outside; it is asked again next pass.
+                if end.data:
+                    await asyncio.to_thread(
+                        lambda: self.runs.run_progress(
+                            item.run_id, outcome=end.outcome, detail=end.detail
+                        )
+                    )
+            elif end.wait is not None:
                 outcome, detail = end.wait
                 await asyncio.to_thread(
                     lambda: self.runs.run_waiting(item.run_id, outcome=outcome, detail=detail)

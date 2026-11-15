@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -106,6 +106,33 @@ class ChangedFile:
 class PullRequest:
     number: int
     url: str
+    # The commit the pull request is for: what GitHub's checks run on, and what is merged.
+    sha: str = ""
+
+
+# How GitHub says a check ended, and which of those ends count against a change.
+CHECK_FAILED: Final = (
+    "failure",
+    "cancelled",
+    "timed_out",
+    "action_required",
+    "startup_failure",
+    "stale",
+)
+MERGE_METHODS: Final = ("squash", "merge", "rebase")
+
+
+@dataclass(frozen=True)
+class Checks:
+    """What GitHub's checks say of one commit: its workflows' jobs and the statuses
+    other services report. ``state`` is "none" (nothing was run), "pending", "failed"
+    (at least one ended badly, whatever the others do) or "passed"."""
+
+    state: str
+    total: int
+    done: int
+    failed: tuple[str, ...] = ()
+    pending: tuple[str, ...] = ()
 
 
 def load_private_key(path: Path) -> rsa.RSAPrivateKey:
@@ -425,7 +452,88 @@ class GitHubApp:
         number, url = pull.get("number"), pull.get("html_url")
         if not isinstance(number, int) or not isinstance(url, str):
             raise GitHubAppError("GitHub did not say where the pull request is")
-        return PullRequest(number=number, url=url)
+        return PullRequest(number=number, url=url, sha=str(commit.get("sha") or ""))
+
+    async def checks(self, full_name: str, sha: str) -> Checks:
+        """What GitHub's checks say of a commit, read with a token that may read checks
+        and statuses of that repository and nothing else."""
+        if not COMMIT.fullmatch(sha):
+            raise GitHubAppError("That is not a commit")
+        token = await self.repository_token(full_name, {"checks": "read", "statuses": "read"})
+        missing = f"{full_name} does not have the commit {sha[:12]}"
+        try:
+            runs = await self._request(
+                "GET",
+                f"/repos/{full_name}/commits/{sha}/check-runs",
+                token=token,
+                not_found=missing,
+                params={"per_page": 100},
+            )
+            status = await self._request(
+                "GET", f"/repos/{full_name}/commits/{sha}/status", token=token, not_found=missing
+            )
+        finally:
+            await self.revoke(token)
+        failed: list[str] = []
+        pending: list[str] = []
+        total = 0
+        listed = runs.get("check_runs") if isinstance(runs, dict) else None
+        for run in listed if isinstance(listed, list) else []:
+            if not isinstance(run, dict):
+                continue
+            total += 1
+            name = " ".join(str(run.get("name") or "a check").split())[:80]
+            if run.get("status") != "completed":
+                pending.append(name)
+            elif run.get("conclusion") in CHECK_FAILED:
+                failed.append(name)
+        reported = status.get("statuses") if isinstance(status, dict) else None
+        for entry in reported if isinstance(reported, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            total += 1
+            name = " ".join(str(entry.get("context") or "a status").split())[:80]
+            if entry.get("state") == "pending":
+                pending.append(name)
+            elif entry.get("state") in ("failure", "error"):
+                failed.append(name)
+        more = runs.get("total_count") if isinstance(runs, dict) else None
+        if isinstance(more, int) and more > total:
+            # More checks than one page holds: the ones not seen are not known to be done.
+            pending.append(f"{more - total} more")
+            total = more
+        state = "none" if total == 0 else "failed" if failed else "pending" if pending else "passed"
+        return Checks(
+            state=state,
+            total=total,
+            done=total - len(pending),
+            failed=tuple(failed[:20]),
+            pending=tuple(pending[:20]),
+        )
+
+    async def merge(self, full_name: str, number: int, *, sha: str, method: str) -> str:
+        """Merge a pull request as it stands at ``sha``, and at no other commit: GitHub
+        refuses when the branch has moved since. Returns the commit the merge made."""
+        if method not in MERGE_METHODS or not COMMIT.fullmatch(sha) or number < 1:
+            raise GitHubAppError("That is not a pull request that can be merged")
+        token = await self.repository_token(
+            full_name, {"contents": "write", "pull_requests": "write"}
+        )
+        try:
+            merged = await self._request(
+                "PUT",
+                f"/repos/{full_name}/pulls/{number}/merge",
+                token=token,
+                not_found=f"{full_name} has no pull request #{number}",
+                explain=True,
+                json={"sha": sha, "merge_method": method},
+            )
+        finally:
+            await self.revoke(token)
+        made = merged.get("sha") if isinstance(merged, dict) else None
+        if not isinstance(merged, dict) or merged.get("merged") is not True:
+            raise GitHubAppError("GitHub did not say that the pull request is merged")
+        return str(made or "")
 
     async def _request(
         self,
@@ -436,6 +544,7 @@ class GitHubApp:
         not_found: str = "GitHub does not know this installation of the app",
         gone: Any = None,
         empty: bool = False,
+        explain: bool = False,
         **options: Any,
     ) -> Any:
         try:
@@ -451,7 +560,14 @@ class GitHubApp:
         if response.status_code == 410 and gone is not None:
             return gone
         if response.status_code >= 400:
-            raise GitHubAppError(f"GitHub answered {response.status_code}")
+            said = ""
+            if explain:
+                # Why GitHub refused, in its own words: what a person has to remove.
+                with contextlib.suppress(ValueError):
+                    body = response.json()
+                    if isinstance(body, dict) and isinstance(body.get("message"), str):
+                        said = ": " + " ".join(body["message"].split())[:300]
+            raise GitHubAppError(f"GitHub answered {response.status_code}{said}")
         if empty:
             return None
         try:

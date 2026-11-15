@@ -11,6 +11,8 @@ tasks are, so no arrangement of tasks gets around them.
   was scanned for secrets, it was collected, and the administrator decided. Each counts
   only by the outcome that says so: no way that leads on from a reviewer's "changes" or
   from the tests' "regression" publishes.
+- A pull request is merged only if this run opened it and GitHub's own checks passed
+  it, by the outcome that says so.
 - A task that judges another's work runs on the other subscription.
 - Loops are bounded: by the flow's rounds, which have a ceiling, and by the fixed size of
   a list that is gone through.
@@ -214,9 +216,9 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
     no other: the way a reviewer's "changes" or the tests' "regression" leads is a way
     on which the change was not passed."""
     # (task, since last written: not reviewed, not tested, not scanned, not collected,
-    #  not decided)
-    State = tuple[str, bool, bool, bool, bool, bool]
-    start: State = (document.start, False, False, False, False, True)
+    #  not decided; and the pull request, since it was opened: not passed by GitHub's checks)
+    State = tuple[str, bool, bool, bool, bool, bool, bool]
+    start: State = (document.start, False, False, False, False, True, True)
     seen: set[State] = set()
     todo: list[State] = [start]
     said: set[tuple[str, str]] = set()
@@ -231,13 +233,20 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
         if state in seen:
             continue
         seen.add(state)
-        node_id, unreviewed, untested, unscanned, uncollected, undecided = state
+        node_id, unreviewed, untested, unscanned, uncollected, undecided, unchecked = state
         node = nodes.get(node_id)
         task = TASKS.get(node.task) if node is not None else None
         if node is None or task is None:
             continue
         if task.writes:
-            unreviewed = untested = unscanned = uncollected = undecided = True
+            unreviewed = untested = unscanned = uncollected = undecided = unchecked = True
+        if task.merges and unchecked:
+            say(
+                "merge_checked",
+                node.id,
+                f"{node.id} could merge a pull request that GitHub's checks have not "
+                "passed. Put Wait for GitHub's checks before it, and lead to it by passed.",
+            )
         if node.task == "change.collect":
             if untested:
                 say(
@@ -289,6 +298,9 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
                     "change as it is. Put Wait for the administrator before it, after the "
                     "review, the tests, the scan and the collection.",
                 )
+        if task.publishes and not task.merges:
+            # A pull request that was just opened has not been checked by anything yet.
+            unchecked = True
         for outcome, target in node.next.items():
             if target:
                 todo.append(
@@ -299,6 +311,7 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
                         unscanned and outcome not in task.scanned,
                         uncollected,
                         undecided,
+                        unchecked and outcome not in task.checked,
                     )
                 )
 

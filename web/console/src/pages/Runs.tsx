@@ -73,6 +73,45 @@ const STEP_NAMES: Record<string, string> = {
 // In a run that produces items, these steps mean something else than in a delivery.
 const PRODUCER_STEP_NAMES: Record<string, string> = { verify: 'Verify the findings', review: 'Review the proposals' };
 
+/**
+ * What the two answers to a run that waits are called and what each does: publishing a
+ * change, publishing and merging it when the flow goes on to merge, or, when GitHub's
+ * checks could not be read, looking at them again.
+ */
+function decisionWords(run: Run) {
+  const repository = run.data.repository ?? 'the repository';
+  const branch = run.data.base_branch ?? 'the branch it was opened against';
+  if (run.outcome === 'checks_unreadable')
+    return {
+      publish: 'Look at the checks again',
+      publishTitle: 'Look at GitHub’s checks again?',
+      publishAbout:
+        'The pull request is open already. GitHub’s checks on it are read again; nothing else is published. Do this once the GitHub App may read checks.',
+      discard: 'Stop here',
+      discardTitle: 'Stop the run here?',
+      discardAbout: 'The run ends. The pull request stays open on GitHub and nothing is merged.',
+    };
+  const discard = {
+    discard: 'Discard the change',
+    discardTitle: 'Discard this change?',
+    discardAbout:
+      'The change is thrown away and nothing reaches GitHub. The issue stays in the backlog and can be delivered again.',
+  };
+  if (run.data.merges)
+    return {
+      ...discard,
+      publish: 'Publish and merge',
+      publishTitle: 'Publish and merge this change?',
+      publishAbout: `A new branch with one commit is created on ${repository} and a pull request is opened for it. Once GitHub’s checks pass on it, the platform merges it into ${branch} without asking again. If the checks fail, the pull request stays open and nothing is merged.`,
+    };
+  return {
+    ...discard,
+    publish: 'Publish as pull request',
+    publishTitle: 'Publish this change?',
+    publishAbout: `A new branch with one commit is created on ${repository} and a pull request is opened for it. Nothing is merged: that stays yours, on GitHub.`,
+  };
+}
+
 const KINDS: Record<Run['kind'], string> = {
   account_check: 'Trying an account',
   deliver_issue: 'Delivering an item',
@@ -190,16 +229,13 @@ function DecideDialog({
     // Only when it opens: the password field and the last error are cleared.
   }, [decision]);
   const publish = decision === 'publish';
+  const words = decisionWords(run);
   return (
     <AlertDialog open={decision !== null} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader tone={publish ? undefined : 'destructive'}>
-          <AlertDialogTitle>{publish ? 'Publish this change?' : 'Discard this change?'}</AlertDialogTitle>
-          <AlertDialogDescription>
-            {publish
-              ? `A new branch with one commit is created on ${run.data.repository ?? 'the repository'} and a pull request is opened for it. Nothing is merged: that stays yours, on GitHub.`
-              : 'The change is thrown away and nothing reaches GitHub. The issue stays in the backlog and can be delivered again.'}
-          </AlertDialogDescription>
+          <AlertDialogTitle>{publish ? words.publishTitle : words.discardTitle}</AlertDialogTitle>
+          <AlertDialogDescription>{publish ? words.publishAbout : words.discardAbout}</AlertDialogDescription>
         </AlertDialogHeader>
         {problem ? <Alert tone="destructive" title={problem} /> : null}
         <Field>
@@ -220,7 +256,7 @@ function DecideDialog({
             disabled={!password}
             onClick={() => void submit()}
           >
-            {publish ? 'Publish as pull request' : 'Discard the change'}
+            {publish ? words.publish : words.discard}
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -493,10 +529,10 @@ function RunDetail({ id }: { id: string }) {
           {run?.state === 'waiting' ? (
             <>
               <Button variant="secondary" size="sm" icon={Trash2} onClick={() => setDecision('discard')}>
-                Discard
+                {run.outcome === 'checks_unreadable' ? 'Stop here' : 'Discard'}
               </Button>
               <Button size="sm" icon={GitBranch} onClick={() => setDecision('publish')}>
-                Publish as pull request
+                {decisionWords(run).publish}
               </Button>
             </>
           ) : null}
@@ -522,7 +558,7 @@ function RunDetail({ id }: { id: string }) {
             {pull ? (
               <Alert
                 tone="success"
-                title={`Pull request #${pull.number} is open`}
+                title={`Pull request #${pull.number} is ${pull.merged ? 'merged' : 'open'}`}
                 description={
                   <Link href={pull.url} target="_blank" rel="noreferrer">
                     {pull.url}

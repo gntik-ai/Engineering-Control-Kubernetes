@@ -199,8 +199,24 @@ def simulate(
                 step(node, outcome, assumed, note=note)
                 return ends("discarded", "The administrator discards the change.")
             last = "The administrator lets the change through."
+        elif task.merges:
+            last = "The pull request is merged."
         elif task.publishes:
             last = "The change is published as a pull request."
+        elif node.task == "github.checks":
+            note = "The run waits here until GitHub's checks have finished."
+            if outcome == "failed" and not node.next.get("failed"):
+                step(node, outcome, assumed, note=note)
+                return ends(
+                    "failed",
+                    "GitHub's checks fail on the pull request. It stays open and nothing "
+                    "is merged.",
+                )
+            last = (
+                "GitHub's checks pass on the pull request."
+                if outcome == "passed"
+                else "GitHub's checks fail on the pull request."
+            )
         elif node.task == "findings.propose":
             last = "Confirmed findings are proposed to the backlog."
         elif node.task == "proposals.propose":

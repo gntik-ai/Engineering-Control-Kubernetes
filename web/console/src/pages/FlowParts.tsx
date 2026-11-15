@@ -25,6 +25,8 @@ const SETTING_NAMES: Record<string, string> = {
   condition: 'What is asked',
   instruction: 'Your instruction',
   branch: 'Branch',
+  method: 'How it is merged',
+  allow_none: 'A pull request without checks counts as passed',
   commands: 'Commands',
   over: 'The list it goes through',
   max: 'Entries at most',

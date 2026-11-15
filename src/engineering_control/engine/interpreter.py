@@ -42,6 +42,7 @@ from engineering_control.engine.tasks import (
     Done,
     Failed,
     Services,
+    merges_after,
 )
 from engineering_control.github_app import GitHubApp
 from engineering_control.sandbox.flows import (
@@ -195,11 +196,19 @@ class Engine:
             performed = await PLATFORM[node.task].perform(ctx)
             gathered.update(performed.data)
             last = performed.end
+            if last is not None:
+                # What a task leaves is there for the ones after it: the pull request
+                # for the checks, the checks for the merge.
+                gathered.update(last.data)
             if performed.outcome is None:
                 break
             target = node.next.get(performed.outcome)
             if not target:
                 break
+            if ctx.task.publishes:
+                # What reached GitHub is not done twice: from here the run goes on at the
+                # task after it, also when it is asked again later.
+                gathered["at"] = target
             node = document.node(target)
         if last is None:
             return End("succeeded", "done", None, data=gathered)
@@ -210,6 +219,7 @@ class Engine:
                 last.detail,
                 wait=last.wait,
                 data={**gathered, **last.data},
+                again=last.again,
             )
         return last
 
@@ -285,8 +295,13 @@ class Engine:
             return _failed("unknown", f"The flow has no task {to.target}.", done.output)
         if to.kind == "platform":
             data["at"] = following.id
+            # Whether deciding to publish is deciding to merge as well: said with the
+            # decision, wherever it is asked for.
+            data["merges"] = merges_after(document, following)
             if TASKS[following.task].approval and not ctx.dry:
-                return Result(verdict, output=done.output, data=data, wait=Approval.WAIT)
+                return Result(
+                    verdict, output=done.output, data=data, wait=Approval.wait(document, following)
+                )
             return Result(verdict, output=done.output, data=data)
         if to.kind == "last_round":
             return _failed(

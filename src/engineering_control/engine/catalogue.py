@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from engineering_control.engine.conditions import LEGACY
+from engineering_control.github_app import MERGE_METHODS
 from engineering_control.sandbox.deliver import BRANCH, MAX_ROUNDS, PROVIDERS, ROUNDS_CEILING
 
 # The most a run may be granted, whatever its flow says.
@@ -30,6 +31,9 @@ AREAS_CEILING: Final = 6
 FINDINGS_CEILING: Final = 8
 PROPOSALS_CEILING: Final = 5
 VERIFY_ROUNDS_CEILING: Final = 3
+# How long GitHub's checks on a pull request are waited for: usually, and at most.
+CHECKS_MINUTES: Final = 30
+CHECKS_MINUTES_CEILING: Final = 180
 # What an item a flow produces can be, for the backlog to show and to sort by.
 ITEM_KINDS: Final = ("finding", "clean-up", "ui-finding", "ux-finding")
 # The tasks that report candidate findings, and the tasks that verify them.
@@ -84,6 +88,10 @@ class TaskType:
     reviewed: tuple[str, ...] = ()
     tested: tuple[str, ...] = ()
     scanned: tuple[str, ...] = ()
+    # The outcomes that say GitHub's own checks passed the pull request, and whether the
+    # task merges one: a pull request is merged only by way of the first.
+    checked: tuple[str, ...] = ()
+    merges: bool = False
     approval: bool = False  # the administrator decides here
     application: bool = False  # it looks at the project's running application in a browser
     needs: tuple[str, ...] = ()
@@ -109,7 +117,9 @@ class TaskType:
                 "reviewed": list(self.reviewed),
                 "tested": list(self.tested),
                 "scanned": list(self.scanned),
+                "checked": list(self.checked),
             },
+            "merges": self.merges,
             "approval": self.approval,
             "application": self.application,
             "needs": list(self.needs),
@@ -380,6 +390,60 @@ _TASKS: Final = (
         publishes=True,
         needs=("bundle", "decision"),
         produces=("pull_request",),
+    ),
+    TaskType(
+        "github.checks",
+        "GitHub",
+        "Wait for GitHub's checks",
+        "Wait until GitHub has finished the checks it runs on the pull request the run "
+        "opened (the repository's GitHub Actions, and what other services report), and "
+        "go on by how they ended. No sandbox runs meanwhile and no agent takes part.",
+        "platform",
+        checked=("passed",),
+        needs=("pull_request",),
+        produces=("checks",),
+        outcomes=("passed", "failed"),
+        params=(
+            Param(
+                "minutes",
+                "int",
+                CHECKS_MINUTES,
+                "How long the checks may take. Checks that have not finished by then "
+                "count as failed.",
+                low=5,
+                high=CHECKS_MINUTES_CEILING,
+            ),
+            Param(
+                "allow_none",
+                "bool",
+                False,
+                "Count a pull request GitHub runs no checks on as passed. Off: it counts "
+                "as failed, so nothing is merged that nothing checked.",
+            ),
+        ),
+    ),
+    TaskType(
+        "github.merge",
+        "GitHub",
+        "Merge the pull request",
+        "The platform merges the pull request the run opened into the branch it was "
+        "opened against, as it stood when GitHub's checks passed it. A pull request "
+        "GitHub refuses to merge stays open and the run says why.",
+        "platform",
+        publishes=True,
+        merges=True,
+        needs=("pull_request", "checks"),
+        produces=("merge",),
+        params=(
+            Param(
+                "method",
+                "choice",
+                "squash",
+                "How it is merged: squash puts the change on the branch as one commit, "
+                "merge adds a merge commit, rebase puts the pull request's commits on top.",
+                choices=MERGE_METHODS,
+            ),
+        ),
     ),
     TaskType(
         "control.when",

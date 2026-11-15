@@ -850,7 +850,11 @@ export interface Run {
       diff: string;
       diff_complete: boolean;
     };
-    pull_request?: { number: number; url: string };
+    /** The pull request the run opened; `merged` once the run merged it. */
+    pull_request?: { number: number; url: string; sha?: string; merged?: string | boolean };
+    /** Whether the flow goes on to merge what it publishes, once GitHub's checks pass. */
+    merges?: boolean;
+    base_branch?: string;
   };
   created_at: string | null;
   started_at: string | null;

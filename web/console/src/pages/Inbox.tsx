@@ -35,9 +35,17 @@ function shown(entry: InboxEntry): Shown {
     case 'run_waiting':
       return {
         icon: Bot,
-        tone: entry.outcome === 'publish_failed' ? 'destructive' : 'warning',
-        label: entry.outcome === 'publish_failed' ? 'Could not publish' : 'Your decision',
-        title: `A change is ready: ${entry.run ?? ''}`,
+        tone: entry.outcome === 'publish_failed' || entry.outcome === 'checks_unreadable' ? 'destructive' : 'warning',
+        label:
+          entry.outcome === 'publish_failed'
+            ? 'Could not publish'
+            : entry.outcome === 'checks_unreadable'
+              ? 'Checks cannot be read'
+              : 'Your decision',
+        title:
+          entry.outcome === 'checks_unreadable'
+            ? `GitHub’s checks cannot be read: ${entry.run ?? ''}`
+            : `A change is ready: ${entry.run ?? ''}`,
         detail: entry.detail ?? 'Publish it as a pull request, or discard it.',
         action: 'Open the run',
         href: `${BASE}/run?id=${entry.run_id}`,

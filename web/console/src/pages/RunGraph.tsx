@@ -73,10 +73,30 @@ function drawn(run: Run, document: FlowDocument, catalogue: FlowCatalogue) {
   const at = run.data.at;
   const last = steps[steps.length - 1];
   if (at) {
-    if (last) for (const edge of between(document, catalogue, last.name, at)) taken.add(edge);
+    // The platform's tasks the run has passed on its way to where it stands: once a
+    // change has reached GitHub, the run stands at the task after that.
+    const isPlatform = (id: string) =>
+      catalogue.tasks.find((task) => task.key === document.tasks.find((node) => node.id === id)?.task)?.where ===
+      'platform';
+    let first = at;
+    for (let hop = 0; hop < 8; hop += 1) {
+      const before = document.tasks.find(
+        (node) => node.id !== first && isPlatform(node.id) && Object.values(node.next).includes(first),
+      );
+      if (!before) break;
+      const outcome = Object.entries(before.next).find(([, target]) => target === first)?.[0];
+      tones[before.id] = 'done';
+      if (outcome) taken.add(edgeId(before.id, outcome));
+      first = before.id;
+    }
+    if (last) for (const edge of between(document, catalogue, last.name, first)) taken.add(edge);
     if (run.state === 'waiting') {
       tones[at] = 'review';
       metas[at] = 'Waits for you';
+    } else if (run.state === 'running' || run.state === 'queued') {
+      // The platform itself is at work there, or waits for GitHub.
+      tones[at] = 'running';
+      metas[at] = run.outcome === 'checking' ? 'Waits for GitHub' : undefined;
     } else if (run.state === 'failed') tones[at] = 'failed';
     else if (run.state === 'cancelled') tones[at] = 'paused';
     else if (run.state === 'succeeded') {

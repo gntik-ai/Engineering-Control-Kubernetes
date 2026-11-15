@@ -17,6 +17,7 @@ import base64
 import binascii
 import dataclasses
 import functools
+import time
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
@@ -25,6 +26,8 @@ from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.project_records import ProjectNotFound, application_host
 from engineering_control.engine.catalogue import (
     AUDITING,
+    CHECKS_MINUTES,
+    CHECKS_MINUTES_CEILING,
     ITEM_KINDS,
     TASKS,
     VERIFYING,
@@ -946,6 +949,18 @@ class Approval:
     """The administrator's decision. The run waits here; nothing is decided by waiting."""
 
     WAIT: Final = ("ready", "A change is ready. Publish it as a pull request, or discard it.")
+    # What the administrator is asked when the flow goes on to merge what it publishes.
+    WAIT_MERGES: Final = (
+        "ready",
+        "A change is ready. Publish it as a pull request, which is merged once GitHub's "
+        "checks pass, or discard it.",
+    )
+
+    @classmethod
+    def wait(cls, document: Document, node: Node) -> tuple[str, str]:
+        """What the run waits with at this decision: whether deciding to publish is
+        deciding to merge as well."""
+        return cls.WAIT_MERGES if merges_after(document, node) else cls.WAIT
 
     async def perform(self, ctx: Context) -> Performed:
         if ctx.dry:
@@ -1023,7 +1038,7 @@ class PullRequest:
                     wait=("publish_failed", f"Publishing failed: {error}"),
                 )
             )
-        opened = {"number": pull.number, "url": pull.url}
+        opened = {"number": pull.number, "url": pull.url, "sha": pull.sha}
         item_id = await asyncio.to_thread(services.runs.item_of, ctx.item.run_id)
         if services.backlog is not None and item_id is not None:
             # An issue of the repository is closed by GitHub when the pull request is
@@ -1044,6 +1059,225 @@ class PullRequest:
                 data={"pull_request": opened},
             ),
         )
+
+
+def _pull_request(data: dict[str, Any]) -> tuple[int, str] | None:
+    """The pull request the run opened, as its number and the commit it is for."""
+    pull = data.get("pull_request") or {}
+    number, sha = pull.get("number"), str(pull.get("sha") or "")
+    if isinstance(number, int) and number > 0 and len(sha) == 40:
+        return number, sha
+    return None
+
+
+class Checks:
+    """Wait for what GitHub runs on the pull request the run opened. The platform asks
+    GitHub from time to time; no sandbox runs meanwhile."""
+
+    # How often GitHub is asked, and how long checks that have not appeared are waited for
+    # before it is said that there are none.
+    POLL_SECONDS: Final = 30
+    APPEAR_SECONDS: Final = 120
+
+    async def perform(self, ctx: Context) -> Performed:
+        data = ctx.data
+        found = _pull_request(data)
+        github = ctx.services.github
+        if found is None or github is None:
+            return Performed(
+                end=End("failed", "no_pull_request", "The run opened no pull request to check.")
+            )
+        number, sha = found
+        if data.get("decision") == "discard":
+            # Asked after the checks could not be read: the administrator stops here.
+            return Performed(
+                end=End("cancelled", "stopped", f"Stopped. Pull request #{number} stays open.")
+            )
+        kept = dict(data.get("checks") or {})
+        if kept.get("sha") != sha:
+            kept = {"sha": sha}
+        now = time.time()
+        since = float(kept.get("since") or now)
+        if kept.get("result") in ("passed", "failed"):
+            # Asked again after the checks ended (the launcher started anew): as it was.
+            return self._ended(ctx, number, kept)
+        if kept.get("asked") and now - float(kept["asked"]) < self.POLL_SECONDS:
+            return Performed(end=End("running", "checking", kept.get("said"), again=True))
+        try:
+            checks = await github.checks(str(data["repository"]), sha)
+        except GitHubAppError as error:
+            if "not allowed" in str(error):
+                # Nothing a later try cures: the app has to be given the permission.
+                return Performed(
+                    end=End(
+                        "waiting",
+                        "checks_unreadable",
+                        wait=(
+                            "checks_unreadable",
+                            f"Pull request #{number} is open, but GitHub's checks cannot be "
+                            f"read: {error} Then decide to publish again, which only looks at "
+                            "the checks again; discarding stops here and leaves the pull "
+                            "request open.",
+                        ),
+                    )
+                )
+            said = f"GitHub's checks on pull request #{number} could not be read just now: {error}"
+            return Performed(
+                end=End(
+                    "running",
+                    "checking",
+                    said,
+                    again=True,
+                    data={"checks": {**kept, "since": since, "asked": now, "said": said}},
+                )
+            )
+        minutes = max(
+            5, min(int(ctx.params.get("minutes") or CHECKS_MINUTES), CHECKS_MINUTES_CEILING)
+        )
+        waited = now - since
+        seen = {"sha": sha, "since": since, "asked": now, "total": checks.total}
+        if checks.state == "failed":
+            names = ", ".join(checks.failed)
+            return self._ended(
+                ctx,
+                number,
+                {
+                    **seen,
+                    "result": "failed",
+                    "said": f"{len(checks.failed)} of {checks.total} checks of GitHub's failed "
+                    f"on pull request #{number}: {names}.",
+                    "failed": list(checks.failed),
+                },
+            )
+        if checks.state == "passed":
+            return self._ended(
+                ctx,
+                number,
+                {
+                    **seen,
+                    "result": "passed",
+                    "said": f"All {checks.total} checks of GitHub's passed on pull request "
+                    f"#{number}.",
+                },
+            )
+        if checks.state == "none" and waited >= self.APPEAR_SECONDS:
+            allowed = bool(ctx.params.get("allow_none"))
+            return self._ended(
+                ctx,
+                number,
+                {
+                    **seen,
+                    "result": "passed" if allowed else "failed",
+                    "said": f"GitHub runs no checks on pull request #{number}."
+                    + ("" if allowed else " Nothing checked it, so it does not count as passed."),
+                },
+            )
+        if waited >= minutes * 60:
+            names = ", ".join(checks.pending) or "none has appeared"
+            return self._ended(
+                ctx,
+                number,
+                {
+                    **seen,
+                    "result": "failed",
+                    "said": f"GitHub's checks on pull request #{number} did not finish within "
+                    f"{minutes} minutes: {names}.",
+                    "failed": list(checks.pending),
+                },
+            )
+        said = (
+            f"Waiting for GitHub's checks on pull request #{number}: {checks.done} of "
+            f"{checks.total} done."
+            if checks.total
+            else f"Waiting for GitHub's checks on pull request #{number} to appear."
+        )
+        return Performed(
+            end=End(
+                "running", "checking", said, again=True, data={"checks": {**seen, "said": said}}
+            )
+        )
+
+    @staticmethod
+    def _ended(ctx: Context, number: int, kept: dict[str, Any]) -> Performed:
+        passed = kept.get("result") == "passed"
+        return Performed(
+            outcome="passed" if passed else "failed",
+            end=End(
+                "succeeded" if passed else "failed",
+                "checks_passed" if passed else "checks_failed",
+                str(kept.get("said") or "")
+                + ("" if passed else f" Pull request #{number} stays open; nothing is merged."),
+                data={"checks": kept},
+            ),
+        )
+
+
+class Merge:
+    """Merge the pull request the run opened, as it stood when GitHub's checks passed it."""
+
+    async def perform(self, ctx: Context) -> Performed:
+        data = ctx.data
+        found = _pull_request(data)
+        github = ctx.services.github
+        if found is None or github is None:
+            return Performed(
+                end=End("failed", "no_pull_request", "The run opened no pull request to merge.")
+            )
+        number, sha = found
+        checks = data.get("checks") or {}
+        if checks.get("result") != "passed" or checks.get("sha") != sha:
+            # The rules of a flow see to it; this holds whatever a flow says.
+            return Performed(
+                end=End(
+                    "failed",
+                    "not_checked",
+                    f"GitHub's checks have not passed pull request #{number}: it is not merged.",
+                )
+            )
+        method = str(ctx.params.get("method") or "squash")
+        try:
+            made = await github.merge(str(data["repository"]), number, sha=sha, method=method)
+        except GitHubAppError as error:
+            return Performed(
+                end=End(
+                    "failed",
+                    "merge_refused",
+                    f"Pull request #{number} was not merged: {error}. It stays open.",
+                )
+            )
+        merged = {**(data.get("pull_request") or {}), "merged": made or True}
+        item_id = await asyncio.to_thread(ctx.services.runs.item_of, ctx.item.run_id)
+        if ctx.services.backlog is not None and item_id is not None:
+            await asyncio.to_thread(
+                functools.partial(
+                    ctx.services.backlog.note_facts, item_id, {"pull_request": merged}, state="done"
+                )
+            )
+        return Performed(
+            outcome="ok",
+            end=End(
+                "succeeded",
+                "merged",
+                f"Pull request #{number} is merged into {data.get('base_branch')}.",
+                data={"pull_request": merged},
+            ),
+        )
+
+
+def merges_after(document: Document, node: Node) -> bool:
+    """Whether the flow, going on from this task by the platform's own tasks, comes to
+    one that merges."""
+    seen: set[str] = set()
+    todo = [target for target in node.next.values() if target]
+    while todo:
+        current = document.node(todo.pop())
+        if current is None or current.id in seen or current.task not in TASKS:
+            continue
+        seen.add(current.id)
+        if TASKS[current.task].merges:
+            return True
+        todo += [target for target in current.next.values() if target]
+    return False
 
 
 # --- auditing ---------------------------------------------------------------------------
@@ -1564,6 +1798,8 @@ SANDBOX: Final[dict[str, SandboxTask]] = {
 PLATFORM: Final[dict[str, PlatformTask]] = {
     "people.approval": Approval(),
     "github.pull_request": PullRequest(),
+    "github.checks": Checks(),
+    "github.merge": Merge(),
     "findings.propose": ProposeFindings(),
     "proposals.propose": ProposeEnhancements(),
 }

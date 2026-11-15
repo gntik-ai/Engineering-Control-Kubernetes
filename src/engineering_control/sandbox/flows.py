@@ -68,6 +68,9 @@ class End:
     # Set instead of an end when the run goes back to waiting (publishing failed).
     wait: tuple[str, str] | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    # Not an end: the platform waits for something outside (GitHub's checks) and is to be
+    # asked again at the launcher's next pass. ``outcome`` and ``detail`` say what for.
+    again: bool = False
 
 
 class Flow(Protocol):

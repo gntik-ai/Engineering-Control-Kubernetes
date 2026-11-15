@@ -919,6 +919,15 @@ class Runs:
             if run is not None and updates:
                 run.data = {**(run.data or {}), **updates}
 
+    def run_progress(self, run_id: UUID, *, outcome: str, detail: str | None) -> None:
+        """What a run that goes on by itself is doing now, for whoever looks at it."""
+        with self.sessions.begin() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is not None and run.state not in FINISHED and run.state != "waiting":
+                run.state = "running"
+                run.outcome = outcome[:40]
+                run.detail = (detail or "")[:600] or None
+
     def run_waiting(self, run_id: UUID, *, outcome: str, detail: str) -> None:
         """The run can go no further by itself: it waits for the administrator."""
         with self.sessions.begin() as session:
