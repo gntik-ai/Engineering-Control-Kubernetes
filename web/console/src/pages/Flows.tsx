@@ -370,6 +370,16 @@ export function FlowsPage() {
         </div>
       }
     >
+      {/* Outside the tabs: New flow and Bring in a flow work whichever tab is open. */}
+      {problem ? (
+        <Alert
+          tone="destructive"
+          title="The flow was not brought in"
+          description={problem}
+          onDismiss={() => setProblem(null)}
+        />
+      ) : null}
+      <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
       <Tabs
         value={tab}
         onValueChange={(value) => setQuery({ tab: value === 'tasks' || value === 'agents' ? value : null })}
@@ -388,15 +398,6 @@ export function FlowsPage() {
         <TabsPanel value="flows" className="pt-4">
           <div className="grid gap-6">
             <LoadError resource={flows} />
-            {problem ? (
-              <Alert
-                tone="destructive"
-                title="The flow was not brought in"
-                description={problem}
-                onDismiss={() => setProblem(null)}
-              />
-            ) : null}
-            <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
             <TableFrame>
               <Table>
                 <TableCaption className="sr-only">Flows</TableCaption>
