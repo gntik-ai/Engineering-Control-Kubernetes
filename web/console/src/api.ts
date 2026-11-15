@@ -73,7 +73,7 @@ export interface TaskType {
   group: string;
   title: string;
   summary: string;
-  where: 'sandbox' | 'model' | 'platform' | 'control';
+  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control';
   account: boolean;
   writes: boolean;
   publishes: boolean;
@@ -293,7 +293,7 @@ export interface SimulatedStep {
   task: string;
   type: string;
   title: string;
-  where: 'sandbox' | 'model' | 'platform' | 'control';
+  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control';
   provider: string | null;
   round: number | null;
   entry: number | null;

@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any, Final, cast
 from uuid import UUID
 
+import httpx
 import structlog
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -45,6 +46,7 @@ from engineering_control.sandbox.flows import AccountCheck, Flow, Follow, Result
 from engineering_control.sandbox.queues import Budgets, Queues
 from engineering_control.sandbox.runs import CONVERSATION, Lease, Runs, StepWork
 from engineering_control.sandbox.triggers import PUSH_LOOK_EVERY, Triggers
+from engineering_control.sandbox.workbench import Workbench, WorkbenchError, WorkbenchLost
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import Definitions
 from engineering_control.supervisor.operations import Operations
@@ -70,6 +72,12 @@ START_SECONDS: Final = 600
 # busy or the launcher started anew, before the run gives up. Waiting for an account
 # with a key is not counted.
 MODEL_TRIES: Final = 5
+# How often a step is handed to a new workbench when the one it ran in was lost.
+BENCH_TRIES: Final = 5
+# How many steps that need no sandbox of their own a run may get through in one pass, and
+# how long a job of the workbench is waited for before the pass goes on to other runs.
+QUICK_STEPS: Final = 12
+QUICK_SECONDS: Final = 2.0
 # Reasons a container cannot start that waiting does not cure.
 _STUCK: Final = {
     "ErrImagePull": "The sandbox image could not be pulled.",
@@ -138,7 +146,12 @@ class Launcher:
         backlog: BacklogItems | None = None,
         grant_key: bytes | None = None,
         models: Models | None = None,
+        bench_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        # The sandbox a run keeps for its small jobs.
+        self.workbench: Workbench | None = Workbench(
+            cluster, self._sandboxes, grant_key, transport=bench_transport
+        )
         # Who asks a model over a provider's API, and the questions that are out: a step
         # that asks one is not a sandbox, so it is followed here and not in the cluster.
         self.models = models
@@ -197,16 +210,37 @@ class Launcher:
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
-        self._running = sum(1 for item in work if item.state == "running" and item.pod_name)
-        for item in work:
-            try:
-                await self._advance(item)
-            except (ClusterError, GitHubAppError, OSError) as error:
-                # Something outside refused or did not answer: say so and try again.
-                LOG.warning("launcher_outside_error", run=str(item.run_id), error=str(error))
-                await asyncio.to_thread(self.runs.step_waiting, item.step_id, str(error))
-            except Exception as error:  # noqa: BLE001 - one run must not stop the loop
-                LOG.error("launcher_step_error", run=str(item.run_id), error=repr(error)[:300])
+        self._running = sum(
+            1
+            for item in work
+            if item.state == "running"
+            and item.pod_name
+            and not item.pod_name.startswith(pods.BENCH_PREFIX)
+        )
+        for first in work:
+            item: StepWork | None = first
+            # A step that needs no sandbox of its own (the workbench's, a model's) ends
+            # within the pass, and the run's next step is taken up at once: several such
+            # steps go by in one pass instead of one every few seconds.
+            for _quick in range(QUICK_STEPS):
+                if item is None:
+                    break
+                try:
+                    quick = await self._advance(item)
+                except (ClusterError, GitHubAppError, OSError) as error:
+                    # Something outside refused or did not answer: say so and try again.
+                    LOG.warning("launcher_outside_error", run=str(item.run_id), error=str(error))
+                    await asyncio.to_thread(self.runs.step_waiting, item.step_id, str(error))
+                    break
+                except Exception as error:  # noqa: BLE001 - one run must not stop the loop
+                    LOG.error("launcher_step_error", run=str(item.run_id), error=repr(error)[:300])
+                    break
+                if not quick:
+                    break
+                item = await asyncio.to_thread(self.runs.work_of, item.run_id)
+        if self.workbench is not None:
+            with contextlib.suppress(ClusterError):
+                await self.workbench.tidy()
         return len(work)
 
     async def _trigger(self) -> None:
@@ -243,7 +277,9 @@ class Launcher:
 
         await asyncio.to_thread(look)
 
-    async def _advance(self, item: StepWork) -> None:
+    async def _advance(self, item: StepWork) -> bool:
+        """Move a run's step forward. True when the step ended in this pass without a
+        sandbox of its own: the run's next step can be taken up at once."""
         flow = self.flows.get(item.run_kind)
         if flow is None:
             await self._finish(
@@ -271,21 +307,111 @@ class Launcher:
             else:
                 await self._finish(item, state=end.state, outcome=end.outcome, detail=end.detail)
         elif item.state == "pending":
-            if self._asks(flow, item):
+            where = self._where(flow, item)
+            if where == "model":
                 await self._ask(item)
+            elif where == "bench":
+                return await self._bench(item)
             else:
                 await self._start(item)
-        elif item.pod_name is None and self._asks(flow, item):
-            await self._asked(item)
+        elif item.pod_name is None and self._where(flow, item) == "model":
+            return await self._asked(item)
+        elif item.pod_name is not None and item.pod_name.startswith(pods.BENCH_PREFIX):
+            return await self._bench_watch(item)
         else:
             await self._watch(item)
-
-    # --- asking a model ------------------------------------------------------------------
+        return False
 
     @staticmethod
-    def _asks(flow: Flow, item: StepWork) -> bool:
-        asks = getattr(flow, "asks", None)
-        return bool(asks(item)) if asks is not None else False
+    def _where(flow: Flow, item: StepWork) -> str:
+        where = getattr(flow, "where", None)
+        return str(where(item)) if where is not None else "sandbox"
+
+    # --- the workbench -------------------------------------------------------------------
+
+    async def _bench(self, item: StepWork) -> bool:
+        """Hand a step's job to the run's workbench, starting the workbench when the
+        run has none. A job that ends at once is concluded in the same pass."""
+        if self.workbench is None:
+            await self._fail_step(item, "no_workbench", "This installation has no workbench.")
+            return False
+        if item.attempt >= BENCH_TRIES:
+            await self._fail_step(
+                item,
+                "workbench_lost",
+                f"The workbench was lost {BENCH_TRIES} times over this step.",
+            )
+            return False
+        try:
+            address, said = await self.workbench.ready(item.run_id)
+        except WorkbenchError as error:
+            await self._fail_step(item, "no_workbench", str(error))
+            return False
+        if address is None:
+            await asyncio.to_thread(self.runs.step_waiting, item.step_id, said)
+            return False
+        try:
+            plan = await self.flows[item.run_kind].plan(item, None)
+        except ValueError as error:
+            await self._fail_step(item, "not_started", str(error))
+            return False
+        try:
+            taken = await self.workbench.hand(address, item.run_id, str(item.step_id), plan.job)
+        except WorkbenchLost as error:
+            await asyncio.to_thread(self.runs.step_waiting, item.step_id, f"Waiting: {error}.")
+            return False
+        except WorkbenchError as error:
+            await self._fail_step(item, "no_workbench", str(error))
+            return False
+        if not taken:
+            await asyncio.to_thread(
+                self.runs.step_waiting, item.step_id, "The workbench is busy with another job."
+            )
+            return False
+        await asyncio.to_thread(self.runs.step_started, item.step_id, pods.bench_name(item.run_id))
+        return await self._bench_result(item, address, wait=QUICK_SECONDS)
+
+    async def _bench_watch(self, item: StepWork) -> bool:
+        if self.workbench is None:
+            await self._fail_step(item, "no_workbench", "This installation has no workbench.")
+            return False
+        try:
+            address, _said = await self.workbench.ready(item.run_id)
+        except WorkbenchError as error:
+            await self._fail_step(item, "no_workbench", str(error))
+            return False
+        if address is None:
+            # The workbench is gone, and what it was doing with it: the step is run again
+            # in the one that is started now.
+            await asyncio.to_thread(
+                lambda: self.runs.step_again(
+                    item.step_id, "The workbench was lost; the step is run again.", forgiven=False
+                )
+            )
+            return False
+        return await self._bench_result(item, address, wait=1.0)
+
+    async def _bench_result(self, item: StepWork, address: str, *, wait: float) -> bool:
+        try:
+            log = await self.workbench.result(  # type: ignore[union-attr]
+                address, item.run_id, str(item.step_id), wait=wait
+            )
+        except WorkbenchLost:
+            await asyncio.to_thread(
+                lambda: self.runs.step_again(
+                    item.step_id, "The workbench was lost; the step is run again.", forgiven=False
+                )
+            )
+            return False
+        except WorkbenchError as error:
+            await self._fail_step(item, "no_workbench", str(error))
+            return False
+        if log is None:
+            return False
+        await self._conclude(item, log, None)
+        return True
+
+    # --- asking a model ------------------------------------------------------------------
 
     async def _ask(self, item: StepWork) -> None:
         """Put the step's question to a model. The answer is waited for in the
@@ -316,7 +442,7 @@ class Launcher:
         await asyncio.to_thread(self.runs.step_started, item.step_id, None)
         LOG.info("model_asked", run=str(item.run_id), step=item.name)
 
-    async def _asked(self, item: StepWork) -> None:
+    async def _asked(self, item: StepWork) -> bool:
         call = self._calls.get(item.step_id)
         if call is None:
             # The launcher started again while the model was being asked: ask again.
@@ -325,7 +451,7 @@ class Launcher:
                     item.step_id, "The question is put again.", forgiven=False
                 )
             )
-            return
+            return False
         if not call.done():
             waited = (datetime.now(UTC) - _aware(item.started_at or datetime.now(UTC))).seconds
             await asyncio.to_thread(
@@ -333,7 +459,7 @@ class Launcher:
                 item.step_id,
                 f"The model is being asked ({waited // 15 * 15} seconds so far).",
             )
-            return
+            return False
         del self._calls[item.step_id]
         question = self._questions.pop(item.step_id, None)
         try:
@@ -346,13 +472,13 @@ class Launcher:
                 )
             else:
                 await self._fail_step(item, error.label, error.detail)
-            return
+            return False
         except TimeoutError:
             await self._fail_step(item, "model_timeout", "The model did not answer in time.")
-            return
+            return False
         except asyncio.CancelledError:
             await self._fail_step(item, "cancelled", "The question was withdrawn.")
-            return
+            return False
         await asyncio.to_thread(self.runs.note_usage, item.step_id, reply.usage)
         result = await cast(Engine, self.flows[item.run_kind]).answered(item, reply)
         said = (
@@ -363,6 +489,7 @@ class Launcher:
         )
         await self._settle(item, result, result.verdict, log=said, exit_code=None)
         LOG.info("model_answered", run=str(item.run_id), step=item.name, model=reply.model)
+        return True
 
     # --- starting ------------------------------------------------------------------------
 
@@ -599,6 +726,10 @@ class Launcher:
         """A run that has ended, or waits with its change collected, keeps nothing in the
         cluster. One that never had a volume has none to delete, which is fine; one whose
         volume cannot be deleted right now is not held up by it."""
+        if self.workbench is not None:
+            # The workbench first: a volume a pod still has is not let go.
+            with contextlib.suppress(ClusterError):
+                await self.workbench.release(item.run_id)
         try:
             await self.cluster.delete_claim(pods.workspace_claim(item.run_id))
         except ClusterError as error:
@@ -683,6 +814,8 @@ async def serve(settings: Settings | None = None) -> None:
         await cluster.aclose()
         if launcher.models is not None:
             await launcher.models.aclose()
+        if launcher.workbench is not None:
+            await launcher.workbench.aclose()
         if github is not None:
             await github.aclose()
         engine.dispose()

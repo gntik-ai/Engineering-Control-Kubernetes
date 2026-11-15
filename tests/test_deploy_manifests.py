@@ -163,7 +163,9 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
         if document["kind"] != "Namespace":
             assert document["metadata"]["namespace"] == SANDBOX_NAMESPACE, document["kind"]
     policies = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "NetworkPolicy"}
-    assert set(policies) == {"deny-everything", "egress-internet", "supervisor-tools"}
+    # The fourth, the way in to a run's workbench for the launcher alone, is looked at in
+    # tests/test_workbench.py.
+    assert set(policies) == {"deny-everything", "egress-internet", "supervisor-tools", "workbench"}
     assert policies["deny-everything"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
     # A step that may reach out reaches the platform's proxy and nothing else: no name
     # server, no public address, nothing of the cluster. Nothing is ever let in.
@@ -200,7 +202,8 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
             "ports": [{"protocol": "TCP", "port": 8790}],
         }
     ]
-    assert not any("ingress" in spec for spec in policies.values())
+    # Nothing reaches a sandbox from outside, except the launcher a run's workbench.
+    assert [name for name, spec in policies.items() if "ingress" in spec] == ["workbench"]
     settings = next(
         d for d in _documents() if d["metadata"]["name"] == "engineering-control-settings"
     )

@@ -31,6 +31,7 @@ import structlog
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.engine import catalogue, conditions, routing
 from engineering_control.engine.asking import MODEL
+from engineering_control.engine.bench_tasks import BENCH
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, Node, parse
@@ -60,6 +61,8 @@ from engineering_control.sandbox.steps import Verdict
 
 LOG = structlog.get_logger(__name__)
 MAX_HOPS: Final = routing.MAX_HOPS
+# Every task that is a step in a sandbox: one of its own, or the one the run keeps.
+STEPS: Final = {**SANDBOX, **BENCH}
 Documents = Callable[[str, int], Document | None]
 
 
@@ -120,7 +123,7 @@ class Engine:
 
     async def plan(self, item: StepWork, lease: Lease | None) -> Plan:
         ctx = self._context(item)
-        plan = await SANDBOX[ctx.node.task].plan(ctx, lease)
+        plan = await STEPS[ctx.node.task].plan(ctx, lease)
         noted: dict[str, Any] = {}
         if ctx.prompt_used is not None:
             # Which wording the agent was given: traceable to a version of the flow.
@@ -152,7 +155,7 @@ class Engine:
             )
             if trouble is not None:
                 return trouble
-        concluded = await SANDBOX[ctx.node.task].conclude(ctx, commands, log)
+        concluded = await STEPS[ctx.node.task].conclude(ctx, commands, log)
         if isinstance(concluded, Done):
             # How the task ended, in the flow's own words: what a simulation of a changed
             # flow goes by when it is asked how this run would have gone on.
@@ -169,13 +172,16 @@ class Engine:
 
     # --- a step that asks a model --------------------------------------------------------
 
-    def asks(self, item: StepWork) -> bool:
-        """Whether the step asks a model over an API instead of running in a sandbox."""
+    def where(self, item: StepWork) -> str:
+        """Where the step is carried out: in a sandbox of its own ("sandbox"), in the
+        sandbox the run keeps ("bench"), or by a model asked over an API ("model")."""
         try:
             node = self.document(item).node(item.name)
         except ValueError:
-            return False
-        return node is not None and node.task in MODEL
+            return "sandbox"
+        if node is None or node.task not in TASKS:
+            return "sandbox"
+        return "model" if node.task in MODEL else "bench" if node.task in BENCH else "sandbox"
 
     async def question(self, item: StepWork) -> Question:
         ctx = self._context(item)

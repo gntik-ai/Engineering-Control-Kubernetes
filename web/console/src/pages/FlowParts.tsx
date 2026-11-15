@@ -18,6 +18,7 @@ export const API_PROVIDER_NAMES: Record<string, string> = {
 };
 export const WHERE: Record<TaskType['where'], string> = {
   sandbox: 'In a sandbox',
+  bench: 'In the run’s workbench',
   model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',
@@ -42,6 +43,13 @@ const SETTING_NAMES: Record<string, string> = {
   then_model: 'Model at the second provider',
   effort: 'Reasoning',
   with_change: 'Give it the collected change',
+  with_files: 'Give it the files read',
+  words: 'More words to look for',
+  limit: 'Files at most',
+  neighbours: 'Add the neighbours of the best files',
+  paths: 'Files to read',
+  lines: 'Lines of each file',
+  characters: 'Characters in all',
   allow_none: 'A pull request without checks counts as passed',
   commands: 'Commands',
   over: 'The list it goes through',

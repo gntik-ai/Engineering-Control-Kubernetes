@@ -578,6 +578,61 @@ request is open and says which permission is missing. Once it is granted, "Look 
 checks again" goes on from there; nothing is published twice. "Stop here" ends the run
 and leaves the pull request.
 
+### The workbench, and looking at code without an agent
+
+A step in a sandbox of its own takes seconds to start. The tasks that find, read and
+run something small are many, so a run that has them gets one sandbox that stays: its
+workbench. Three tasks, in the group Code, are carried out there:
+
+| Task | What it does | Outcomes |
+| --- | --- | --- |
+| Find the files | Finds the files the run is about on a map of the code, with why each is there | `found`, `none` |
+| Read the files | Reads the files found (or the ones it names) for the tasks that follow | `ok` |
+| Run a command | Runs the commands it names, or the project's test commands, and says whether they passed | `passed`, `failed` |
+
+No agent and no model takes part in any of them: each is a program with the same answer
+for the same input.
+
+**The map of the code** is read from the code itself and kept on the run's volume; only
+files that changed are read again. For every tracked file it holds what the file
+defines and which files of the repository it imports, and from that who imports a file
+and which tests cover it. Python is read with Python's own parser. JavaScript,
+TypeScript and Go are read by their import and declaration lines: that is exact for
+imports and names, and knows nothing of which function calls which. On the two large
+repositories the first map takes 3 seconds (falcone, 3,164 files of code) and 9 seconds
+(musematic, 4,668); after that, a fraction of a second.
+
+**Find the files** scores files against the words of the run's item, of what an earlier
+task found and of what failed. A word in a file's path or in a name it defines counts
+most, a word in its text less, and a word that is in a fifth of the code counts for
+nothing. The best files are joined by what they import, what imports them and the tests
+that cover them.
+
+**Read the files** hands the files to the tasks after it; a model that is asked
+afterwards is given them. A file longer than allowed is read from its start and says so.
+A file outside the repository, or one named like a secret (`.env`, `*.pem`, `*.key` and
+the like), is never read.
+
+**Run a command** is a quick look while the work goes on, without the network. It does
+not stand in for Run the tests, which a change has to pass before it is published.
+
+What holds for the workbench:
+
+- It is a sandbox like any step's: unprivileged, on the sandbox node, with the run's
+  volume, no account and no way out. One way in is open, on port 8791, to the launcher
+  alone (the network policy `workbench` of the sandbox namespace), and it asks for a
+  token made from the run and a key only the platform holds.
+- It is started when the first such task of a run comes up, and deleted when the run
+  ends or waits for the administrator, or after ten minutes with nothing to do. A run
+  that needs one again gets a new one: what counts is on its volume. While it is there
+  it counts as one pod of the sandbox namespace's quota.
+- One job runs at a time, and when a job ends every process it left behind is ended
+  with it.
+- A step that needs no sandbox of its own (the workbench's, a model's) ends within the
+  launcher's pass, and the run's next step is taken up at once: up to twelve in a pass.
+- A workbench that is lost (its pod is gone, or it was started anew) is replaced and the
+  step is run again, five times at most.
+
 ### Asking a model over an API
 
 Two tasks, in the group Models, ask a model directly instead of starting an agent in a

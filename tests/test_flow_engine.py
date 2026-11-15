@@ -109,7 +109,8 @@ def test_every_task_of_the_catalogue_says_what_it_is() -> None:
     listed = {task["key"]: task for task in catalogue()}
     assert set(listed) == set(TASKS)
     for task in TASKS.values():
-        assert task.where in ("sandbox", "model", "platform", "control") and task.outcomes
+        assert task.where in ("sandbox", "bench", "model", "platform", "control")
+        assert task.outcomes
         # A task that asks a model over an API has no agent of a subscription in it,
         # changes nothing and reaches nothing.
         if task.where == "model":

@@ -57,7 +57,7 @@ def choices(params: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     return tuple((provider, model) for provider, model in found if provider in BY_KEY and model)
 
 
-def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
+async def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
     params, data = ctx.params, ctx.data
     where = choices(params)
     if not where:
@@ -102,6 +102,29 @@ def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
         parts.append(_material(f"The change as a diff.{whole}", diff))
     elif params.get("with_change", True):
         parts.append("No change has been collected in this run so far.")
+    if params.get("with_files", True):
+        # What Read the files read last: the model sees the code it is asked about.
+        reads = await ctx.outputs("code.read")
+        sources = [
+            f for f in (reads[-1].get("files") or [] if reads else []) if isinstance(f, dict)
+        ]
+        size = sum(len(str(source.get("text") or "")) for source in sources)
+        if size > CHANGE_CHARACTERS:
+            raise ValueError(
+                f"The files read are {size:,} characters long, more than one question "
+                f"carries ({CHANGE_CHARACTERS:,}). They are not cut to fit: read fewer "
+                "files, or fewer lines of each."
+            )
+        for source in sources:
+            whole = (
+                f" (its first {source.get('shown')} of {source.get('lines')} lines: the rest "
+                "was not read)"
+                if source.get("cut")
+                else ""
+            )
+            parts.append(
+                _material(f"The file {source.get('path')}{whole}", str(source.get("text") or ""))
+            )
     effort = str(params.get("effort") or "default")
     ctx.model_used = {"provider": where[0][0], "model": where[0][1]}
     return Question(
@@ -126,7 +149,7 @@ class Judge:
     changes. It is not the review a change needs before it is published."""
 
     async def question(self, ctx: Context) -> Question:
-        return _asked(
+        return await _asked(
             ctx,
             "Judge what is asked below. Pass it (PASS), ask for changes "
             "(REQUEST_CHANGES) with a finding for each thing that has to change, or stop "
@@ -157,7 +180,7 @@ class Report:
     stays with the run, for the administrator and for the tasks after it."""
 
     async def question(self, ctx: Context) -> Question:
-        return _asked(
+        return await _asked(
             ctx,
             "Answer what is asked below as a report: a summary of a sentence or two, and "
             "the report itself.",

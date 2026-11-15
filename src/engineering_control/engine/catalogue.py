@@ -77,7 +77,8 @@ class TaskType:
     group: str
     title: str
     summary: str
-    # "sandbox": a pod runs it. "model": the platform asks a model over a provider's API,
+    # "sandbox": a pod runs it. "bench": the sandbox the run keeps carries it out, in
+    # well under a second. "model": the platform asks a model over a provider's API,
     # without a sandbox, and the task is a step of the run like a sandbox's. "platform":
     # the platform performs it itself, with its own credentials, after the steps.
     # "control": it only decides where the flow goes on.
@@ -167,6 +168,8 @@ _INSTRUCTION: Final = Param(
     "between the platform's own rules, which it cannot change.",
     high=INSTRUCTION_CHARACTERS,
 )
+# How many files Find the files hands on at most.
+FOUND_CEILING: Final = 80
 # What a task that asks a model over an API is set with.
 ASK_TOKENS: Final = 8000
 ASK_TOKENS_CEILING: Final = 32000
@@ -229,6 +232,12 @@ _ASKED: Final = (
         "bool",
         True,
         "Give the model the change the run has collected, file by file, when there is one.",
+    ),
+    Param(
+        "with_files",
+        "bool",
+        True,
+        "Give the model the files Read the files read last, when a task before it read any.",
     ),
     Param(
         "tokens",
@@ -412,6 +421,89 @@ _TASKS: Final = (
         outcomes=("done",),
         params=(_INSTRUCTION, _PROVIDERS, _MODELS, _MINUTES),
         prompt="own_report",
+    ),
+    TaskType(
+        "code.find",
+        "Code",
+        "Find the files",
+        "Finds the files of the repository the run is about, on a map of the code that "
+        "the platform reads from the code itself: what each file defines, what it "
+        "imports, and which tests cover it. It goes by the words of the run's item (and "
+        "of what an earlier task found or what failed), and adds the neighbours of the "
+        "best files. Each file comes with why. No agent and no model takes part.",
+        "bench",
+        needs=("checkout",),
+        produces=("found",),
+        outcomes=("found", "none"),
+        params=(
+            Param(
+                "words",
+                "line",
+                "",
+                "Words to look for beside the ones of the run's item.",
+                high=300,
+            ),
+            Param("limit", "int", 20, "How many files at most.", low=1, high=FOUND_CEILING),
+            Param(
+                "neighbours",
+                "bool",
+                True,
+                "Add what the best files import, what imports them, and their tests.",
+            ),
+        ),
+    ),
+    TaskType(
+        "code.read",
+        "Code",
+        "Read the files",
+        "Reads files of the repository for the tasks that follow: the ones it names, or "
+        "the ones Find the files found. A model that is asked afterwards is given them. "
+        "A file that is longer than allowed is read from its start and says so; a file "
+        "outside the repository, or one named like a secret, is never read.",
+        "bench",
+        needs=("checkout",),
+        produces=("sources",),
+        params=(
+            Param(
+                "paths",
+                "line",
+                "",
+                "The files to read, as paths in the repository separated by spaces. "
+                "Empty: the files found.",
+                high=2000,
+            ),
+            Param("lines", "int", 600, "The lines read of each file at most.", low=20, high=5000),
+            Param(
+                "characters",
+                "int",
+                200_000,
+                "The characters read in all at most.",
+                low=1000,
+                high=600_000,
+            ),
+        ),
+    ),
+    TaskType(
+        "code.run",
+        "Code",
+        "Run a command",
+        "Runs commands in the run's workbench and says whether they passed: the ones it "
+        "names, or the project's test commands. What failed is given to the task that "
+        "follows. It is a quick look while the work goes on, without the network; it "
+        "does not stand in for Run the tests, which a change has to pass before it is "
+        "published.",
+        "bench",
+        needs=("checkout",),
+        produces=("checked",),
+        outcomes=("passed", "failed"),
+        params=(
+            Param(
+                "commands",
+                "commands",
+                [],
+                "The commands, one on each line. None: the project's test commands.",
+            ),
+        ),
     ),
     TaskType(
         "model.judge",

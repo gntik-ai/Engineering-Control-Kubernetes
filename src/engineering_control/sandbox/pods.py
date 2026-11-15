@@ -77,6 +77,18 @@ def workspace_claim(run_id: UUID) -> str:
     return f"run-{run_id.hex[:16]}"
 
 
+# The door of a run's workbench: the one port a sandbox listens on, open to the launcher.
+BENCH_PORT: Final = 8791
+BENCH_LABEL: Final = "engineering-control/bench"
+
+
+BENCH_PREFIX: Final = "bench-"
+
+
+def bench_name(run_id: UUID) -> str:
+    return f"{BENCH_PREFIX}{run_id.hex[:16]}"
+
+
 def claim(name: str, *, namespace: str, gibibytes: int, labels: dict[str, str]) -> dict[str, Any]:
     """A volume of the node's own disk. No storage class is named: the cluster's default
     decides, and the volume is made where its first pod runs, which is the sandbox node."""
@@ -231,3 +243,45 @@ def step_pod(
             "volumes": volumes,
         },
     }
+
+
+def bench_pod(
+    sandboxes: Sandboxes,
+    *,
+    run_id: UUID,
+    workspace: str,
+    server: str,
+    token: str,
+    deadline_seconds: int,
+) -> dict[str, Any]:
+    """The pod of a run's workbench: a sandbox like any step's, with no way out and no
+    account, that stays and carries out the jobs the launcher hands it (``server`` is
+    the program that does). Its label is what lets the launcher, and nothing else, in."""
+    job = {
+        "files": [{"path": "/tmp/workbench.py", "content": server}],  # noqa: S108 - the pod's own
+        "commands": [
+            {
+                "name": "workbench",
+                "argv": ["python3", "/tmp/workbench.py"],  # noqa: S108
+                "env": {"BENCH_TOKEN": token, "BENCH_SWEEP": "1", "BENCH_PORT": str(BENCH_PORT)},
+                "timeout": deadline_seconds,
+                "echo": 20_000,
+            }
+        ],
+    }
+    pod = step_pod(
+        sandboxes,
+        run_id=run_id,
+        step="workbench",
+        position=0,
+        attempt=0,
+        job=job,
+        egress="none",
+        workspace=workspace,
+        cpu="2",
+        memory="4Gi",
+        deadline_seconds=deadline_seconds,
+        labels={BENCH_LABEL: "true"},
+    )
+    pod["metadata"]["name"] = bench_name(run_id)
+    return pod

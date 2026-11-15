@@ -385,6 +385,7 @@ class Toolbox:
                         "does": f"{task['title']}. {task['summary']}",
                         "runs": {
                             "sandbox": "in a sandbox",
+                            "bench": "in the sandbox the run keeps, in under a second",
                             "model": "by a model asked over a provider's API, without a "
                             "sandbox and without tools",
                             "platform": "by the platform itself, after the sandboxes' tasks",

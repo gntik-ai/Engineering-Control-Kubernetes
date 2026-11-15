@@ -30,6 +30,8 @@ class Plan:
     job: dict[str, Any]
     egress: Egress = "internet"
     workspace: bool = False
+    # Carried out in the run's workbench, the sandbox it keeps, instead of one of its own.
+    bench: bool = False
     cpu: str = "2"
     memory: str = "4Gi"
     deadline_seconds: int = 1800

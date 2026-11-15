@@ -124,6 +124,7 @@ export interface Drawn {
 
 const WHERE: Record<TaskType['where'], string> = {
   sandbox: 'In a sandbox',
+  bench: 'In the run’s workbench',
   model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',

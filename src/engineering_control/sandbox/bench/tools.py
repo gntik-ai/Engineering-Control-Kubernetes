@@ -1,0 +1,574 @@
+"""The tools of the workbench: a map of the code, finding the files a piece of work is
+about, and reading them.
+
+This file runs inside the sandbox, with nothing but Python's own library and git. It is
+deterministic: no model takes part, and the same repository and the same question give
+the same answer.
+
+The map (``index``) is read from the code itself. For every tracked file it holds what
+the file defines and which other files of the repository it imports; from that follow
+who imports a file and which tests cover it. Python is read with Python's own parser.
+JavaScript, TypeScript and Go are read by their import and declaration lines, which is
+exact for imports and names and knows nothing of what a function calls. The map is kept
+on the run's volume and only the files that changed are read again.
+
+``find`` scores files against the words of a question: a word in a file's path or in a
+name it defines counts most, a word in its text less, and a word that is everywhere
+counts for nothing. The best files are joined by their neighbours on the map: what they
+import, what imports them, and the tests that cover them. Every file comes with why.
+
+``read`` hands back files as text, whole or up to a number of lines, and says which
+were cut and which were left out. A file that looks like it holds a secret, and a file
+outside the repository, is never read.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from typing import Any
+
+REPO = os.environ.get("BENCH_REPO", "/workspace/repo")
+INDEX = os.environ.get("BENCH_INDEX", "/workspace/.cache/code-index.json")
+VERSION = 2
+MAX_PARSED = 400_000
+MAX_DEFS = 200
+SKIPPED_DIRS = ("node_modules/", "vendor/", "dist/", "build/", ".git/", "third_party/")
+LANGUAGES = {
+    ".py": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".go": "go",
+}
+JS_ENDINGS = (".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs", ".cjs", ".cts", ".json")
+JS_IMPORT = re.compile(
+    r"""(?:import|export)\s[^'"`;]*?from\s*['"]([^'"\n]+)['"]"""
+    r"""|import\s*['"]([^'"\n]+)['"]"""
+    r"""|(?:require|import)\s*\(\s*['"]([^'"\n]+)['"]\s*\)"""
+)
+JS_DEF = re.compile(
+    r"^[ \t]*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?"
+    r"(?:function\*?|class|const|let|var|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+    re.M,
+)
+GO_IMPORTS = re.compile(r"^import\s*\(([^)]*)\)", re.M | re.S)
+GO_IMPORT = re.compile(r'^import\s+(?:[\w.]+\s+)?"([^"]+)"', re.M)
+GO_DEF = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)|^type\s+([A-Za-z_]\w*)", re.M)
+TEST_NAME = re.compile(r"(^test_.*\.py$)|(_test\.(py|go)$)|(\.(test|spec)\.[a-z]+$)")
+TEST_DIRS = {"tests", "test", "__tests__", "e2e", "spec", "specs"}
+SECRET_NAME = re.compile(
+    r"(^|/)(\.env(\..*)?|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_[rd]sa|id_ed25519|"
+    r"\.npmrc|\.netrc|\.pypirc|credentials(\.json)?|secrets?\.(json|ya?ml|toml))$",
+    re.I,
+)
+STOP = frozenset(
+    """the and for with that this from have has not are was were will can could should
+    would when then than into out over under about after before where which while what
+    who how why does did done use used using make made get set add new all any some one
+    two also only more most very just but its their there here our your you they them
+    been being each other such per via onto upon between within without through issue bug fix
+    fixed fails failing failed error errors expected actual steps please need needs
+    want wants like see must may might instead still already again page file files code
+    test tests true false null none undefined return function class const let var""".split()
+)
+
+
+def git(*args: str) -> str:
+    done = subprocess.run(  # noqa: S603 - git, with arguments this file wrote
+        ["git", *args],  # noqa: S607
+        cwd=REPO,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return done.stdout.decode("utf-8", errors="replace")
+
+
+# --- the map ---------------------------------------------------------------------------------
+
+
+def tracked() -> dict[str, str]:
+    """Every tracked file with the name git has for its content. Links and other
+    repositories inside this one are left out."""
+    found: dict[str, str] = {}
+    for entry in git("ls-files", "-s", "-z").split("\0"):
+        head, _, path = entry.partition("\t")
+        parts = head.split()
+        if len(parts) < 2 or not path or parts[0] in ("120000", "160000"):
+            continue
+        found[path] = parts[1]
+    return found
+
+
+def is_test(path: str) -> bool:
+    parts = path.split("/")
+    return bool(TEST_NAME.search(parts[-1])) or bool(TEST_DIRS & set(parts[:-1]))
+
+
+def _python(text: str) -> tuple[list[str], list[str]]:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return [], []
+    defs: list[str] = []
+    raw: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            defs.append(node.name)
+        elif isinstance(node, ast.ClassDef):
+            defs.append(node.name)
+            defs += [
+                inner.name
+                for inner in node.body
+                if isinstance(inner, ast.FunctionDef | ast.AsyncFunctionDef)
+                and not inner.name.startswith("__")
+            ]
+    for part in ast.walk(tree):
+        if isinstance(part, ast.Import):
+            raw += [alias.name for alias in part.names]
+        elif isinstance(part, ast.ImportFrom):
+            base = "." * part.level + (part.module or "")
+            raw.append(base)
+            # ``from package import module`` names a file as often as a name in one.
+            joint = base if base.endswith(".") or not base else base + "."
+            raw += [joint + alias.name for alias in part.names if alias.name != "*"]
+    return defs, raw
+
+
+def _script(text: str) -> tuple[list[str], list[str]]:
+    raw = [next(part for part in found if part) for found in JS_IMPORT.findall(text)]
+    return JS_DEF.findall(text), raw
+
+
+def _go(text: str) -> tuple[list[str], list[str]]:
+    raw = GO_IMPORT.findall(text)
+    for block in GO_IMPORTS.findall(text):
+        raw += re.findall(r'"([^"]+)"', block)
+    return [first or second for first, second in GO_DEF.findall(text)], raw
+
+
+def facts(path: str, language: str) -> dict[str, Any]:
+    """What one file defines and what it names as imported, as it says so itself."""
+    try:
+        with open(os.path.join(REPO, path), "rb") as handle:
+            data = handle.read(MAX_PARSED + 1)
+    except OSError:
+        return {"lines": 0, "defs": [], "raw": []}
+    if b"\0" in data[:8000]:
+        return {"lines": 0, "defs": [], "raw": [], "binary": True}
+    text = data[:MAX_PARSED].decode("utf-8", errors="replace")
+    reader = {"python": _python, "go": _go}.get(language, _script)
+    defs, raw = reader(text) if language and len(data) <= MAX_PARSED else ([], [])
+    unique_defs = list(dict.fromkeys(defs))[:MAX_DEFS]
+    return {"lines": text.count("\n") + 1, "defs": unique_defs, "raw": list(dict.fromkeys(raw))}
+
+
+class Resolver:
+    """Which file of the repository an import names."""
+
+    def __init__(self, files: dict[str, dict[str, Any]]) -> None:
+        self.files = files
+        self.modules: dict[str, list[str]] = {}
+        self.packages: dict[str, tuple[str, dict[str, Any]]] = {}
+        self.go_modules: dict[str, str] = {}
+        self.go_dirs: dict[str, list[str]] = {}
+        for path, entry in files.items():
+            if entry["lang"] == "python":
+                parts = path[:-3].split("/")
+                if parts[-1] == "__init__":
+                    parts = parts[:-1]
+                for start in range(len(parts)):
+                    self.modules.setdefault(".".join(parts[start:]), []).append(path)
+            elif entry["lang"] == "go" and not path.endswith("_test.go"):
+                self.go_dirs.setdefault(os.path.dirname(path), []).append(path)
+            name = os.path.basename(path)
+            if name == "package.json":
+                manifest = _json(path)
+                if isinstance(manifest.get("name"), str):
+                    self.packages[manifest["name"]] = (os.path.dirname(path), manifest)
+            elif name == "go.mod":
+                found = re.search(r"^module\s+(\S+)", _text(path), re.M)
+                if found:
+                    self.go_modules[found.group(1)] = os.path.dirname(path)
+
+    def _first(self, candidates: list[str]) -> str | None:
+        for candidate in candidates:
+            normal = os.path.normpath(candidate)
+            if normal in self.files:
+                return normal
+        return None
+
+    def _script_file(self, base: str) -> str | None:
+        stem, ending = os.path.splitext(base)
+        swapped = [stem + other for other in JS_ENDINGS] if ending in JS_ENDINGS else []
+        return self._first(
+            [
+                base,
+                *(base + ending for ending in JS_ENDINGS),
+                *swapped,
+                *(os.path.join(base, "index" + ending) for ending in JS_ENDINGS),
+            ]
+        )
+
+    def script(self, path: str, spec: str) -> str | None:
+        if spec.startswith("."):
+            return self._script_file(os.path.join(os.path.dirname(path), spec))
+        name = max(
+            (n for n in self.packages if spec == n or spec.startswith(n + "/")), key=len, default=""
+        )
+        if not name:
+            return None
+        folder, manifest = self.packages[name]
+        rest = spec[len(name) :].lstrip("/")
+        if rest:
+            for root in (folder, os.path.join(folder, "src")):
+                found = self._script_file(os.path.join(root, rest))
+                if found:
+                    return found
+            return None
+        entries = [manifest.get(key) for key in ("source", "module", "main", "types")]
+        exports = manifest.get("exports")
+        dot = exports.get(".") if isinstance(exports, dict) else exports
+        entries += list(dot.values()) if isinstance(dot, dict) else [dot]
+        for entry in [e for e in entries if isinstance(e, str)]:
+            for candidate in (entry, re.sub(r"(^|/)(dist|build|lib)/", r"\1src/", entry)):
+                found = self._script_file(os.path.join(folder, candidate))
+                if found:
+                    return found
+        return self._script_file(os.path.join(folder, "src", "index")) or self._script_file(
+            os.path.join(folder, "index")
+        )
+
+    def python(self, path: str, spec: str) -> str | None:
+        if spec.startswith("."):
+            level = len(spec) - len(spec.lstrip("."))
+            folder = os.path.dirname(path)
+            for _up in range(level - 1):
+                folder = os.path.dirname(folder)
+            target = (
+                os.path.join(folder, *spec.lstrip(".").split(".")) if spec.strip(".") else folder
+            )
+            return self._first([target + ".py", os.path.join(target, "__init__.py")])
+        options = [option for option in self.modules.get(spec, []) if option != path]
+        if not options:
+            return None
+        here = path.split("/")
+
+        def shared(option: str) -> int:
+            count = 0
+            for mine, theirs in zip(here, option.split("/"), strict=False):
+                if mine != theirs:
+                    break
+                count += 1
+            return count
+
+        best = max(options, key=lambda option: (shared(option), -len(option)))
+        # A single word that matches a file somewhere else is a library, not that file.
+        return best if "." in spec or shared(best) > 0 else None
+
+    def go(self, spec: str) -> list[str]:
+        module = max(
+            (m for m in self.go_modules if spec == m or spec.startswith(m + "/")),
+            key=len,
+            default="",
+        )
+        if not module:
+            return []
+        folder = os.path.normpath(
+            os.path.join(self.go_modules[module], spec[len(module) :].lstrip("/"))
+        )
+        return self.go_dirs.get("" if folder == "." else folder, [])[:30]
+
+    def resolve(self, path: str, entry: dict[str, Any]) -> list[str]:
+        found: list[str] = []
+        for spec in entry.get("raw", []):
+            if entry["lang"] == "python":
+                target = self.python(path, spec)
+                found += [target] if target else []
+            elif entry["lang"] == "go":
+                found += self.go(spec)
+            elif entry["lang"]:
+                target = self.script(path, spec)
+                found += [target] if target else []
+        return [target for target in dict.fromkeys(found) if target != path]
+
+
+def _text(path: str) -> str:
+    try:
+        with open(os.path.join(REPO, path), encoding="utf-8", errors="replace") as handle:
+            return handle.read(MAX_PARSED)
+    except OSError:
+        return ""
+
+
+def _json(path: str) -> dict[str, Any]:
+    try:
+        found = json.loads(_text(path))
+    except ValueError:
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def index() -> dict[str, Any]:
+    """The map of the repository as it stands, reading again only what changed."""
+    started = time.monotonic()
+    try:
+        with open(INDEX, encoding="utf-8") as handle:
+            old = json.load(handle)
+        before = old["files"] if old.get("version") == VERSION else {}
+    except (OSError, ValueError, KeyError):
+        before = {}
+    files: dict[str, dict[str, Any]] = {}
+    reused = 0
+    for path, blob in tracked().items():
+        if path.startswith(SKIPPED_DIRS) or any(f"/{part}" in f"/{path}" for part in SKIPPED_DIRS):
+            continue
+        language = LANGUAGES.get(os.path.splitext(path)[1].lower(), "")
+        known = before.get(path)
+        if isinstance(known, dict) and known.get("hash") == blob:
+            entry = {key: known[key] for key in ("lines", "defs", "raw") if key in known}
+            reused += 1
+        else:
+            entry = facts(path, language)
+        files[path] = {**entry, "hash": blob, "lang": language, "test": is_test(path)}
+    resolver = Resolver(files)
+    edges = 0
+    for path, entry in files.items():
+        entry["imports"] = resolver.resolve(path, entry)
+        edges += len(entry["imports"])
+    document = {
+        "version": VERSION,
+        "files": files,
+        "summary": {
+            "files": len(files),
+            "code": sum(1 for entry in files.values() if entry["lang"]),
+            "tests": sum(1 for entry in files.values() if entry["test"] and entry["lang"]),
+            "imports": edges,
+            "reused": reused,
+            "seconds": round(time.monotonic() - started, 2),
+        },
+    }
+    os.makedirs(os.path.dirname(INDEX), exist_ok=True)
+    staged = INDEX + ".new"
+    with open(staged, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+    os.replace(staged, INDEX)
+    return document
+
+
+# --- finding ---------------------------------------------------------------------------------
+
+
+def terms_of(text: str, limit: int = 40) -> list[str]:
+    """The words of a question worth looking for: names as they are written, and the
+    words a name is made of."""
+    found: list[str] = []
+    for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text):
+        pieces = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", word.replace("_", " "))
+        found.append(word)
+        found += [piece for piece in pieces if len(piece) >= 3] if len(pieces) > 1 else []
+    kept = dict.fromkeys(word.lower() for word in found)
+    return [word for word in kept if word not in STOP and not word.isdigit()][:limit]
+
+
+def named_paths(text: str, files: dict[str, Any]) -> list[str]:
+    """Files the question names itself, by their path or by the end of it."""
+    found: list[str] = []
+    for token in re.findall(r"[\w@.-]+(?:/[\w@.-]+)+|[\w-]+\.[A-Za-z]{1,5}\b", text):
+        token = token.strip("./")
+        if token in files:
+            found.append(token)
+        elif "/" in token or "." in token:
+            ends = [path for path in files if path.endswith("/" + token)]
+            found += ends if len(ends) <= 3 else []
+    return list(dict.fromkeys(found))
+
+
+def find(question: dict[str, Any]) -> dict[str, Any]:
+    document = index()
+    files: dict[str, dict[str, Any]] = document["files"]
+    text = str(question.get("text") or "")
+    limit = max(1, min(int(question.get("limit") or 20), 80))
+    code = {path for path, entry in files.items() if entry["lang"]}
+    total = max(1, len(code))
+    scores: dict[str, float] = {}
+    why: dict[str, list[str]] = {}
+
+    def add(path: str, amount: float, reason: str) -> None:
+        scores[path] = scores.get(path, 0.0) + amount
+        reasons = why.setdefault(path, [])
+        if reason not in reasons and len(reasons) < 6:
+            reasons.append(reason)
+
+    for path in named_paths(text, files):
+        add(path, 50.0, "the question names it")
+    used: list[dict[str, Any]] = []
+    for term in terms_of(text):
+        counts: dict[str, int] = {}
+        for line in git("grep", "-I", "-i", "-c", "-F", "-e", term, "--", ".").splitlines():
+            where, _, number = line.rpartition(":")
+            if where in files and number.isdigit():
+                counts[where] = int(number)
+        in_code = sum(1 for path in counts if path in code)
+        # A word that is in a fifth of the code says nothing about where to look.
+        common = in_code > max(40, total // 5)
+        weight = math.log(1 + total / max(1, in_code))
+        used.append({"term": term, "files": len(counts), "common": common})
+        for path, entry in files.items():
+            if not entry["lang"]:
+                continue
+            lower = path.lower()
+            if term in lower:
+                add(path, 2.0 * max(weight, 1.0), f"its path has {term}")
+            names = [name.lower() for name in entry.get("defs", [])]
+            if term in names:
+                add(path, 3.0 * max(weight, 1.0), f"it defines {term}")
+            elif not common and any(term in name for name in names):
+                add(path, 1.5 * weight, f"a name in it has {term}")
+        if common:
+            continue
+        for where, times in counts.items():
+            if where in code:
+                add(where, weight * min(times, 5) / 5, f"it mentions {term} ({times})")
+    importers: dict[str, list[str]] = {}
+    for path, entry in files.items():
+        for target in entry.get("imports", []):
+            importers.setdefault(target, []).append(path)
+    # Tests are found through what they test: by themselves they rank below the code.
+    ranked = sorted(scores, key=lambda p: (-scores[p] * (0.6 if files[p]["test"] else 1.0), p))
+    seeds = ranked[: max(1, math.ceil(limit * 0.6))]
+    chosen: list[str] = list(seeds)
+
+    def join(path: str, reason: str) -> None:
+        if path not in files:
+            return
+        if path not in chosen:
+            if len(chosen) >= limit:
+                return
+            chosen.append(path)
+        # How it hangs together with the best files is said also of a file that was
+        # found by its own words.
+        reasons = why.setdefault(path, [])
+        if reason not in reasons:
+            reasons.insert(0, reason)
+
+    if question.get("neighbours", True):
+        for seed in seeds:
+            around = importers.get(seed, [])
+            for test in sorted(
+                (p for p in around if files[p]["test"]), key=lambda p: -scores.get(p, 0)
+            )[:2]:
+                join(test, f"it tests {seed}")
+            mine = [p for p in files[seed].get("imports", []) if not files[p]["test"]]
+            for target in sorted(mine, key=lambda p: -scores.get(p, 0))[:3]:
+                join(target, f"{seed} imports it")
+            users = sorted(
+                (p for p in around if not files[p]["test"]), key=lambda p: -scores.get(p, 0)
+            )
+            for user in users[:2]:
+                join(user, f"it imports {seed}")
+    for path in ranked:
+        if len(chosen) >= limit:
+            break
+        if path not in chosen:
+            chosen.append(path)
+    return {
+        "files": [
+            {
+                "path": path,
+                "score": round(scores.get(path, 0.0), 2),
+                "lines": files[path].get("lines", 0),
+                "test": files[path]["test"],
+                "why": why.get(path, []),
+            }
+            for path in chosen
+        ],
+        "terms": used,
+        "indexed": document["summary"],
+    }
+
+
+# --- reading ---------------------------------------------------------------------------------
+
+
+def read(question: dict[str, Any]) -> dict[str, Any]:
+    lines = max(20, min(int(question.get("lines") or 600), 5000))
+    room = max(1000, min(int(question.get("characters") or 200_000), 600_000))
+    known = tracked()
+    root = os.path.realpath(REPO)
+    given: list[dict[str, Any]] = []
+    left: list[dict[str, str]] = []
+    for wanted in list(dict.fromkeys(str(path) for path in question.get("paths") or []))[:200]:
+        path = os.path.normpath(wanted.strip().lstrip("/"))
+        full = os.path.realpath(os.path.join(root, path))
+        if path.startswith("..") or not full.startswith(root + os.sep):
+            left.append({"path": wanted, "why": "it is not in the repository"})
+        elif SECRET_NAME.search(path):
+            left.append({"path": wanted, "why": "its name is one a secret is kept under"})
+        elif path not in known and not os.path.isfile(full):
+            left.append({"path": wanted, "why": "there is no such file"})
+        elif room <= 0:
+            left.append(
+                {"path": wanted, "why": "no room left: read fewer files, or fewer lines of each"}
+            )
+        else:
+            try:
+                with open(full, "rb") as handle:
+                    data = handle.read(2_000_000)
+            except OSError:
+                left.append({"path": wanted, "why": "it cannot be read"})
+                continue
+            if b"\0" in data[:8000]:
+                left.append({"path": wanted, "why": "it is not text"})
+                continue
+            every = data.decode("utf-8", errors="replace").splitlines()
+            text = "\n".join(every[:lines])[:room]
+            room -= len(text)
+            shown = text.count("\n") + 1 if text else 0
+            given.append(
+                {
+                    "path": path,
+                    "text": text,
+                    "lines": len(every),
+                    "shown": shown,
+                    # Said, never silent: a file that is not whole says how much is there.
+                    "cut": shown < len(every),
+                }
+            )
+    return {"files": given, "left_out": left}
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index"):
+        print("usage: tools.py find|read|index <question.json> <answer.json>", file=sys.stderr)
+        return 2
+    with open(arguments[1], encoding="utf-8") as handle:
+        question = json.load(handle)
+    if arguments[0] == "find":
+        answer = find(question)
+    elif arguments[0] == "read":
+        answer = read(question)
+    else:
+        answer = {"indexed": index()["summary"]}
+    os.makedirs(os.path.dirname(arguments[2]), exist_ok=True)
+    with open(arguments[2], "w", encoding="utf-8") as handle:
+        json.dump(answer, handle, separators=(",", ":"))
+    said = {key: value for key, value in answer.items() if key != "files"}
+    print(json.dumps({**said, "files": len(answer.get("files", []))})[:4000])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

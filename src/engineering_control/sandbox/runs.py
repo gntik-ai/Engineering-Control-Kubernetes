@@ -688,16 +688,31 @@ class Runs:
 
     # --- the launcher --------------------------------------------------------------------
 
+    def work_of(self, run_id: UUID) -> StepWork | None:
+        """The same for one run: where it stands now, or None when it is finished or
+        waits for the administrator."""
+        with self.sessions() as session:
+            run = session.get(SandboxRun, run_id)
+            if run is None or run.state not in ("queued", "running"):
+                return None
+            found = self._work(session, [run])
+        return found[0] if found else None
+
     def work(self) -> list[StepWork]:
         """For every run that is not finished, its first step that is not finished either,
         oldest run first. A run with no such step is returned with state ``done``."""
-        found: list[StepWork] = []
         with self.sessions() as session:
             runs = session.scalars(
                 select(SandboxRun)
                 .where(SandboxRun.state.in_(("queued", "running")))
                 .order_by(SandboxRun.created_at)
             ).all()
+            return self._work(session, list(runs))
+
+    @staticmethod
+    def _work(session: Session, runs: list[SandboxRun]) -> list[StepWork]:
+        found: list[StepWork] = []
+        if True:
             for run in runs:
                 step = session.scalar(
                     select(SandboxStep)

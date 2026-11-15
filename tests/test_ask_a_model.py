@@ -235,6 +235,7 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
             "then_model",
             "effort",
             "with_change",
+            "with_files",
             "tokens",
             "minutes",
         ]
@@ -317,6 +318,8 @@ async def _collected(world: Any, raw: dict[str, Any]) -> dict[str, Any]:  # noqa
             world.runs.run_finished(
                 UUID(earlier["id"]), state="cancelled", outcome="cancelled", detail=None
             )
+    # And the sandboxes it had running with it.
+    world.fake.pods.clear()
     run: dict[str, Any] = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
     for name, log in (
         ("prepare", _prepared()),
@@ -422,7 +425,8 @@ async def test_a_model_that_asks_for_changes_sends_the_work_back_with_its_findin
     assert (judged["state"], judged["outcome"]) == ("succeeded", "changes_requested")
     assert judged["detail"] == "The model asks for changes: The expiry is not tested."
     again = world.run(run["id"])["steps"][-1]
-    assert (again["name"], again["state"]) == ("implement", "pending")
+    # The step that follows is taken up in the same pass.
+    assert (again["name"], again["state"]) == ("implement", "running")
     assert again["input"]["round"] == 2 and again["input"]["findings"] == CHANGES["findings"]
     assert again["provider"] == "chatgpt", "the work stays with the subscription that wrote it"
 
@@ -584,5 +588,103 @@ async def test_a_models_report_stays_with_the_run_for_the_tasks_after_it(
     prompt = world.job()["commands"][-3]["stdin"] if "stdin" in world.job()["commands"][-3] else ""
     stdin = [command.get("stdin", "") for command in world.job()["commands"]]
     assert any("An expired cookie signs out." in text for text in stdin), prompt[:200]
+    await world.http.aclose()
+    await world.github.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_model_is_given_the_files_a_task_before_it_read(
+    world: Any,  # noqa: F811
+    provider: Provider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _api_account(world)
+    provider.answers = [said(PASSED), said(PASSED)]
+    run = await _collected(world, _judging())
+    # What Read the files left with its step, as the workbench hands it back.
+    position = max(step["position"] for step in world.run(run["id"])["steps"])
+    with world.sessions.begin() as session:
+        from engineering_control.db.models import SandboxStep
+
+        session.add(
+            SandboxStep(
+                run_id=UUID(run["id"]),
+                position=position + 100,
+                name="read",
+                state="succeeded",
+                output={
+                    "files": [
+                        {
+                            "path": "src/session.ts",
+                            "text": "export const ttl = 60;",
+                            "lines": 1,
+                            "shown": 1,
+                            "cut": False,
+                        },
+                        {
+                            "path": "src/long.ts",
+                            "text": "// start",
+                            "lines": 900,
+                            "shown": 600,
+                            "cut": True,
+                        },
+                    ]
+                },
+            )
+        )
+    raw = _judging()
+    raw["tasks"].append(
+        {"id": "read", "task": "code.read", "with": {"paths": "src/session.ts"}, "next": {}}
+    )
+    flows = FlowRecords(world.sessions)
+    with world.sessions.begin() as session:
+        from engineering_control.db.models import SandboxRun
+
+        record = session.get(SandboxRun, UUID(run["id"]))
+        record.data = {**record.data, "flow_document": raw}
+    await world.launcher.tick()
+    await _answered(world)
+    question = provider.asked[-1][2]["messages"][1]["content"]
+    assert "The file src/session.ts:\n<<<material\nexport const ttl = 60;\nmaterial>>>" in question
+    # A file that was not read whole says so to the model.
+    assert "The file src/long.ts (its first 600 of 900 lines: the rest was not read):" in question
+    assert _step(world, run["id"], "judge")["outcome"] == "passed"
+
+    # Files too long for one question are not cut to fit, and the model can be left
+    # without them.
+    monkeypatch.setattr(asking, "CHANGE_CHARACTERS", 20)
+    del flows
+    again = await _collected(world, _judging())
+    with world.sessions.begin() as session:
+        session.add(
+            SandboxStep(
+                run_id=UUID(again["id"]),
+                position=900,
+                name="read",
+                state="succeeded",
+                output={
+                    "files": [
+                        {"path": "a.ts", "text": "x" * 500, "lines": 1, "shown": 1, "cut": False}
+                    ]
+                },
+            )
+        )
+        record = session.get(SandboxRun, UUID(again["id"]))
+        record.data = {
+            **record.data,
+            "flow_document": {
+                **raw,
+                "tasks": [
+                    {**task, "with": {**task["with"], "with_change": False}}
+                    if task["id"] == "judge"
+                    else task
+                    for task in raw["tasks"]
+                ],
+            },
+        }
+    await world.launcher.tick()
+    ended = world.run(again["id"])
+    assert (ended["state"], ended["outcome"]) == ("failed", "not_asked")
+    assert "read fewer files" in ended["detail"]
     await world.http.aclose()
     await world.github.aclose()

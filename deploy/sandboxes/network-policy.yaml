@@ -66,3 +66,29 @@ spec:
       ports:
         - protocol: TCP
           port: 8790
+---
+# The workbench of a run: the one sandbox that is reached from outside, and only by the
+# launcher, which hands it its jobs on this port. It still reaches nothing itself.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workbench
+  namespace: engineering-control-sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      engineering-control/bench: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: engineering-control
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: engineering-control
+              app.kubernetes.io/component: launcher
+      ports:
+        - protocol: TCP
+          port: 8791
