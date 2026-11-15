@@ -72,6 +72,7 @@ def simulate(
     steps: list[dict[str, Any]] = []
     seen: list[str] = []
     each: dict[str, int] = {}
+    loops: dict[str, int] = {}
     round_number = 1
     again = False
 
@@ -158,6 +159,7 @@ def simulate(
             known=known,
             rounds=rounds,
             told=told,
+            loops=loops,
         )
         known["went"] = to.went(known.get("went"), node.id, outcome)
         for passed, way in to.passed:
@@ -180,7 +182,14 @@ def simulate(
                 f"{to.target} would be gone back to once more, and round {to.round} of "
                 f"{rounds} was the last one: the run fails here.",
             )
+        if to.kind == "loop_limit":
+            return ends(
+                "failed",
+                f"{to.target} would be asked for the next step once more than its loop "
+                "allows: the run fails here.",
+            )
         seen, each, round_number, again = list(to.seen), dict(to.each), to.round, to.again
+        loops = dict(to.loops)
         node = document.node(str(to.target))
 
     # The platform's own tasks, after the sandboxes'.

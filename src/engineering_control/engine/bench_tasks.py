@@ -76,6 +76,10 @@ def _answer(commands: list[dict[str, Any]], log: str, name: str) -> dict[str, An
 def question_of(ctx: Context) -> str:
     """What a run is about, as words to look for: its item, what the task adds, and what
     an earlier task found or what failed."""
+    asked = str((ctx.given.get("asked") or {}).get("words") or "").strip()
+    if asked:
+        # In a loop, the model says what to look for: that, and nothing it did not ask.
+        return f"{ctx.params.get('words') or ''}\n{asked}".strip()[:QUESTION_CHARACTERS]
     about = _about(ctx.data)
     parts = [
         str(ctx.params.get("words") or ""),
@@ -138,8 +142,10 @@ class Read:
     """Read files for the tasks that follow: the ones the task names, or the ones found."""
 
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        asked = [str(path) for path in (ctx.given.get("asked") or {}).get("paths") or []]
         named = paths_of(ctx.params.get("paths"))
-        paths = named or [str(path) for path in ctx.data.get("found") or []]
+        # What the model of a loop asks for, or else what the task names, or what was found.
+        paths = asked or named or [str(path) for path in ctx.data.get("found") or []]
         if not paths:
             raise ValueError(
                 f"{ctx.node.id} has no files to read: it names none, and no task before it "
@@ -188,8 +194,19 @@ class Run:
     """Run commands of the project's in the workbench and say whether they passed. It is
     a quick look, not the tests a change has to pass before it is published."""
 
-    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+    @staticmethod
+    def _chosen(ctx: Context) -> tuple[deliver.Command, ...]:
+        """The commands to run: all the task has, or the one a loop's model asked for
+        by its number. A number the task has no command for means all of them."""
         commands, _own = _own_commands(ctx, "tests")
+        try:
+            number = int((ctx.given.get("asked") or {}).get("command") or 0)
+        except (TypeError, ValueError):
+            number = 0
+        return (commands[number - 1],) if 1 <= number <= len(commands) else commands
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        commands = self._chosen(ctx)
         if not commands:
             raise ValueError(f"{ctx.node.id} has no command to run, and the project names no tests")
         job = {
@@ -202,8 +219,7 @@ class Run:
         return _bench(job, seconds=seconds)
 
     async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
-        named, _own = _own_commands(ctx, "tests")
-        lines = [deliver.line_of(command) for command in named]
+        lines = [deliver.line_of(command) for command in self._chosen(ctx)]
 
         def line(index: int) -> str:
             return lines[index] if index < len(lines) else f"command {index + 1}"

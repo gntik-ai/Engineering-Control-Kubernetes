@@ -676,6 +676,8 @@ def apply(question: dict[str, Any]) -> dict[str, Any]:
         # Nothing is written unless everything fits.
         return {"applied": [], "refused": refused, "edits": len(edits)}
     applied: list[dict[str, str]] = []
+    now: list[dict[str, Any]] = []
+    room = 300_000
     for path, text in staged.items():
         full = os.path.join(root, path)
         if text is None:
@@ -687,7 +689,22 @@ def apply(question: dict[str, Any]) -> dict[str, Any]:
         with open(full, "wb") as handle:
             handle.write(text.encode("utf-8", errors="surrogateescape"))
         applied.append({"path": path, "action": "changed" if existed else "added"})
-    return {"applied": applied, "refused": [], "edits": len(edits)}
+        # What the file holds now, for whoever has it in hand: what was read before the
+        # change is no longer what is there.
+        every = text.encode("utf-8", errors="replace").decode("utf-8").splitlines()
+        shown = "\n".join(every)[: max(0, room)]
+        room -= len(shown)
+        kept = shown.count("\n") + 1 if shown else 0
+        now.append(
+            {
+                "path": path,
+                "text": shown,
+                "lines": len(every),
+                "shown": kept,
+                "cut": kept < len(every),
+            }
+        )
+    return {"applied": applied, "refused": [], "edits": len(edits), "files": now}
 
 
 def main(arguments: list[str]) -> int:

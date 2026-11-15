@@ -74,8 +74,9 @@ class Next:
 
     ``kind`` is "sandbox" (the task ``target`` runs in a sandbox), "platform" (the
     platform's own tasks follow, starting at ``target``), "end" (the flow ends here),
-    "last_round" (going back to ``target`` would be one round too many) or "loop" (the
-    flow went round without reaching a task).
+    "last_round" (going back to ``target`` would be one round too many), "loop" (the
+    flow went round without reaching a task) or "loop_limit" (the task ``target``, which
+    a loop goes round, was asked as often as it may be).
     """
 
     kind: str
@@ -86,6 +87,8 @@ class Next:
     again: bool = False
     # The tasks that only choose a way that were passed, each with the way it chose.
     passed: tuple[tuple[str, str], ...] = ()
+    # How often each task a loop goes round has been come to.
+    loops: dict[str, int] = field(default_factory=dict)
 
     def went(self, before: dict[str, Any] | None, node: str, outcome: str) -> dict[str, str]:
         """How each task of the run last ended, this one and the ones passed included."""
@@ -103,10 +106,12 @@ def follow(
     known: dict[str, Any],
     rounds: int,
     told: dict[str, list[str]] | None = None,
+    loops: dict[str, int] | None = None,
 ) -> Next:
     """``known`` is what the run knows, which an If asks about. ``told`` is for a
     simulation alone: the ways an If is to go, in the order it is come to, whatever it
-    asks."""
+    asks. ``loops`` says how often each task a loop goes round was come to so far."""
+    loops = dict(loops or {})
     seen = [*seen]
     if node.id not in seen:
         seen.append(node.id)
@@ -158,9 +163,41 @@ def follow(
 
     following = document.node(target) if target else None
     if following is None:
-        return Next("end", None, tuple(seen), each, round_number, passed=tuple(passed))
+        return Next("end", None, tuple(seen), each, round_number, passed=tuple(passed), loops=loops)
     if TASKS[following.task].where == "platform":
-        return Next("platform", following.id, tuple(seen), each, round_number, passed=tuple(passed))
+        return Next(
+            "platform",
+            following.id,
+            tuple(seen),
+            each,
+            round_number,
+            passed=tuple(passed),
+            loops=loops,
+        )
+
+    if TASKS[following.task].loops:
+        # A task a loop goes round: coming back to it is the loop's next step, not a
+        # round, and what the loop holds is gone through afresh every time. How often
+        # it may be come to is its own to say.
+        count = int(loops.get(following.id, 0)) + 1
+        if following.id in seen:
+            seen = seen[: seen.index(following.id)]
+        limit = catalogue.loop_steps(following.params)
+        if count > limit:
+            return Next(
+                "loop_limit",
+                following.id,
+                tuple(seen),
+                each,
+                round_number,
+                False,
+                tuple(passed),
+                loops,
+            )
+        loops[following.id] = count
+        return Next(
+            "sandbox", following.id, tuple(seen), each, round_number, False, tuple(passed), loops
+        )
 
     # A task in a sandbox follows.
     again = following.id in seen
@@ -168,9 +205,18 @@ def follow(
         # Going back to a task is a round, and rounds are counted.
         if round_number >= rounds:
             return Next(
-                "last_round", following.id, tuple(seen), each, round_number, True, tuple(passed)
+                "last_round",
+                following.id,
+                tuple(seen),
+                each,
+                round_number,
+                True,
+                tuple(passed),
+                loops,
             )
         round_number += 1
         # The tasks after it are gone through afresh in the new round.
         seen = seen[: seen.index(following.id)]
-    return Next("sandbox", following.id, tuple(seen), each, round_number, again, tuple(passed))
+    return Next(
+        "sandbox", following.id, tuple(seen), each, round_number, again, tuple(passed), loops
+    )

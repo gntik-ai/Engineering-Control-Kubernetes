@@ -288,6 +288,14 @@ class Engine:
                     f"The run's agents have used {used:,} tokens; its flow allows "
                     f"{tokens:,}. No further task is started."
                 )
+        dollars = catalogue.budget("dollars", document.budgets)
+        if dollars is not None:
+            cost = self.runs.cost_of(item.run_id)
+            if cost > dollars:
+                return (
+                    f"The run's questions to models have cost ${cost:,.2f}; its flow "
+                    f"allows ${dollars:,}. No further task is started."
+                )
         return None
 
     async def _route(self, ctx: Context, done: Done) -> Result:
@@ -306,6 +314,7 @@ class Engine:
             round_number=round_number,
             known={**item.run_data, **data},
             rounds=routing.rounds_allowed(document, item.run_data),
+            loops=dict(item.input.get("loops") or {}),
         )
         # How each task ended so far: what an If further on may ask about.
         data["went"] = to.went(item.run_data.get("went"), node.id, done.outcome)
@@ -348,11 +357,22 @@ class Engine:
                 f"{done.detail} That was round {round_number}, the last one.",
                 done.output,
             )
+        if to.kind == "loop_limit":
+            head = document.node(str(to.target))
+            limit = catalogue.loop_steps(head.params if head is not None else {})
+            return _failed(
+                "loop_limit",
+                f"{to.target} was asked for the next step {limit} times, which is as often "
+                "as its flow allows, and the work was not done.",
+                done.output,
+            )
         # A task in a sandbox follows.
         spent = await asyncio.to_thread(self._spent, item, document)
         if spent is not None:
             return _failed("over_budget", spent, done.output)
         given = {**done.given, "round": to.round, "seen": list(to.seen)}
+        if to.loops:
+            given["loops"] = to.loops
         if to.each:
             given["each"] = to.each
         ran = {**(item.run_data.get("ran") or {}), **(data.get("ran") or {})}

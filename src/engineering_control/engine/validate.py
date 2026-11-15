@@ -381,6 +381,18 @@ def problems(document: Document) -> list[Problem]:
                         node.id,
                     )
                 )
+        if task.loops and not any(
+            target for way, target in node.next.items() if way != "done" and target in nodes
+        ):
+            found.append(
+                _problem(
+                    "loop_ways",
+                    f"{node.id} offers its model nothing to do: lead at least one of its "
+                    "ways (search, read, edit, check, other) to a task, and that task "
+                    "back to it",
+                    node.id,
+                )
+            )
         for outcome, target in node.next.items():
             if outcome not in task.outcomes:
                 found.append(

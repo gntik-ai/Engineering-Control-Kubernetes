@@ -15,15 +15,28 @@ platform's rules.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import dataclasses
 from typing import Any, Final, Protocol
 
-from engineering_control.engine.catalogue import ASK_MINUTES, ASK_TOKENS, TASKS
+from engineering_control.engine.catalogue import (
+    ASK_MINUTES,
+    ASK_TOKENS,
+    TASKS,
+    WAYS,
+    loop_steps,
+)
 from engineering_control.engine.tasks import Concluded, Context, Done, Failed, _about, _words
 from engineering_control.models.providers import BY_KEY
 from engineering_control.models.service import Question, Reply
 from engineering_control.sandbox import deliver
 
+# How much of the files a run has read is given with a question. Beyond that, the files
+# seen longest ago are let go, and the model is told which.
+HAND_CHARACTERS: Final = 300_000
+# How many lines of what happened so far a loop's model is told.
+LOG_LINES: Final = 40
 # The most of a collected change one question carries. A change beyond that is not cut
 # to fit: the task says so and fails, since half a change cannot be judged.
 CHANGE_CHARACTERS: Final = 600_000
@@ -58,7 +71,35 @@ def choices(params: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     return tuple((provider, model) for provider, model in found if provider in BY_KEY and model)
 
 
-async def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
+def in_hand(happened: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """The files a run has in hand: every file a task read or changed, as it was last
+    seen, the ones seen longest ago first. When they are more than a question carries,
+    the ones seen longest ago are let go, and which they were is said."""
+    held: dict[str, dict[str, Any]] = {}
+    for step in happened:
+        if step.get("state") != "succeeded":
+            continue
+        output = step.get("output") or {}
+        for entry in output.get("files") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                path = str(entry.get("path"))
+                held.pop(path, None)
+                held[path] = entry
+        for entry in output.get("applied") or []:
+            if isinstance(entry, dict) and entry.get("action") == "deleted":
+                held.pop(str(entry.get("path")), None)
+    let_go: list[str] = []
+    size = sum(len(entry["text"]) for entry in held.values())
+    while size > HAND_CHARACTERS and len(held) > 1:
+        oldest = next(iter(held))
+        size -= len(held.pop(oldest)["text"])
+        let_go.append(oldest)
+    return list(held.values()), let_go
+
+
+async def _asked(
+    ctx: Context, what: str, schema: dict[str, Any], *, change: bool | None = None
+) -> Question:
     params, data = ctx.params, ctx.data
     where = choices(params)
     if not where:
@@ -81,34 +122,34 @@ async def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
     if findings:
         listed = "\n".join(f"- {_words(finding, 600)}" for finding in findings[:40])
         parts.append(_material("What an earlier task found", listed))
-    change = data.get("change") if params.get("with_change", True) else None
-    if isinstance(change, dict) and change.get("files"):
-        diff = str(change.get("diff") or "")
+    with_change = params.get("with_change", True) if change is None else change
+    collected = data.get("change") if with_change else None
+    if isinstance(collected, dict) and collected.get("files"):
+        diff = str(collected.get("diff") or "")
         if len(diff) > CHANGE_CHARACTERS:
             raise ValueError(
                 f"The change is {len(diff):,} characters long, more than one question "
                 f"carries ({CHANGE_CHARACTERS:,}). It is not cut to fit: ask about a "
                 "smaller change, or without the change."
             )
-        files = "\n".join(f"{f.get('status')} {f.get('path')}" for f in change["files"])
+        files = "\n".join(f"{f.get('status')} {f.get('path')}" for f in collected["files"])
         parts.append(_material("The files the change touches", files))
         whole = (
             ""
-            if change.get("diff_complete", True)
+            if collected.get("diff_complete", True)
             else (
                 " The diff is not complete: it was cut when it was collected, so there is "
                 "more to the change than you see."
             )
         )
         parts.append(_material(f"The change as a diff.{whole}", diff))
-    elif params.get("with_change", True):
+    elif with_change:
         parts.append("No change has been collected in this run so far.")
+    let_go: list[str] = []
     if params.get("with_files", True):
-        # What Read the files read last: the model sees the code it is asked about.
-        reads = await ctx.outputs("code.read")
-        sources = [
-            f for f in (reads[-1].get("files") or [] if reads else []) if isinstance(f, dict)
-        ]
+        # The files in hand: what the run read, and what it changed, as last seen.
+        happened = await asyncio.to_thread(ctx.services.runs.happened, ctx.item.run_id)
+        sources, let_go = in_hand(happened)
         size = sum(len(str(source.get("text") or "")) for source in sources)
         if size > CHANGE_CHARACTERS:
             raise ValueError(
@@ -126,6 +167,11 @@ async def _asked(ctx: Context, what: str, schema: dict[str, Any]) -> Question:
             parts.append(
                 _material(f"The file {source.get('path')}{whole}", str(source.get("text") or ""))
             )
+    if let_go:
+        parts.append(
+            "These files were read earlier and are no longer in hand, to make room. They "
+            "can be read again: " + ", ".join(let_go[:60])
+        )
     effort = str(params.get("effort") or "default")
     ctx.model_used = {"provider": where[0][0], "model": where[0][1]}
     return Question(
@@ -252,6 +298,12 @@ class Edit:
                     "\n\n".join(map(str, failures))[:30_000],
                 )
             )
+        brief = str(ctx.given.get("brief") or "").strip()
+        if brief:
+            # In a loop, the model that chose this step says what the change is to be.
+            said.append(
+                _material("What is to be changed, as the one who chose this step put it", brief)
+            )
         if not said:
             return asked
         return dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(said))
@@ -278,10 +330,228 @@ class Edit:
         )
 
 
+CHOOSING: Final = (
+    "You are doing a piece of work step by step. You have no tools of your own: each "
+    "time you are asked, you choose one way to go from the ones listed, the platform "
+    "carries it out, and you are asked again with what came of it. That goes on until "
+    "you choose done.\n"
+    "Work the way a careful engineer does. Find the code the work is about before you "
+    "change it; read what you are going to change, and what uses it; make the change; "
+    "check it; and look at what the check says before you say done. Do not read what "
+    "you already have in hand, and do not repeat a step that told you nothing.\n"
+    "You keep two things from one step to the next, and nothing else: a plan (the "
+    "steps of the work, each todo, doing or done) and notes (what you have learned "
+    "that you will need: where things are, what you decided and why). Give both in "
+    "full every time, brought up to date; what you leave out is forgotten. What "
+    "happened in each step so far is told to you below, shortly.\n"
+    "Your answer names the way, says why in a sentence, and gives what that way needs: "
+    "words for a search, paths for reading, the number of a command for a check. Leave "
+    "the others empty."
+)
+CHOICE_SCHEMA: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["way", "why", "plan", "notes", "words", "paths", "command"],
+    "properties": {
+        "way": {"type": "string", "enum": list(WAYS)},
+        "why": {"type": "string"},
+        "plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["step", "state"],
+                "properties": {
+                    "step": {"type": "string"},
+                    "state": {"type": "string", "enum": ["todo", "doing", "done"]},
+                },
+            },
+        },
+        "notes": {"type": "string"},
+        "words": {"type": "string"},
+        "paths": {"type": "array", "items": {"type": "string"}},
+        "command": {"type": "integer"},
+    },
+}
+PLAN_STEPS: Final = 30
+NOTES_CHARACTERS: Final = 6000
+
+
+def ways_of(ctx: Context) -> list[tuple[str, Any]]:
+    """The ways a loop's model is offered: the ones the flow leads somewhere, and done,
+    which ends the run when it leads nowhere."""
+    found = []
+    for way in WAYS:
+        target = ctx.document.node(str(ctx.node.next.get(way) or ""))
+        if target is not None or way == "done":
+            found.append((way, target))
+    return found
+
+
+def _way(ctx: Context, way: str, target: Any) -> str:
+    """One way, as the model is told of it: what happens when it is chosen, and what it
+    is to give."""
+    if target is None:
+        return "done: the work that was asked for is finished. Choose it only when it is."
+    kind = TASKS.get(target.task)
+    title = kind.title if kind is not None else target.id
+    if way == "done":
+        return (
+            f"done: the work that was asked for is finished, and goes on to {title}. Choose "
+            "it only when it is."
+        )
+    if target.task == "code.find":
+        return (
+            f"{way}: look for files of the repository by words. Give the words in words: "
+            "names as the code writes them, and what the code is about."
+        )
+    if target.task == "code.read":
+        return (
+            f"{way}: read files, to have their text in hand. Give their paths in paths, as "
+            "paths in the repository."
+        )
+    if target.task == "code.run":
+        named = target.params.get("commands")
+        commands = (
+            deliver.commands_of(named)
+            if isinstance(named, list) and named
+            else ctx.toolchain().tests
+        )
+        listed = "; ".join(
+            f"{number}. {deliver.line_of(command)}" for number, command in enumerate(commands, 1)
+        )
+        return (
+            f"{way}: run a command of the project's and learn whether it passed, and what "
+            f"it printed if it failed. Give its number in command, or 0 for all: {listed}."
+        )
+    if target.task == "model.edit":
+        return (
+            f"{way}: have the change written as edits and applied to the files. Say in why "
+            "exactly what is to be changed and where. Whoever writes the edits sees the "
+            "files in hand and nothing else, so read what is to be changed first."
+        )
+    summary = kind.summary.split(". ")[0] if kind is not None else ""
+    return f"{way}: {title}. {summary}."
+
+
+def _so_far(ctx: Context, happened: list[dict[str, Any]]) -> str:
+    """What happened in the loop so far, a line a step, the latest last."""
+    first = next(
+        (index for index, step in enumerate(happened) if step.get("name") == ctx.node.id), None
+    )
+    if first is None:
+        return "Nothing yet: this is the first step."
+    lines = [
+        f"{number}. {step.get('name')}"
+        + (" chose " if step.get("name") == ctx.node.id else f" ({step.get('outcome')}): ")
+        + _words(step.get("detail"), 400)
+        for number, step in enumerate(happened[first:], start=1)
+    ]
+    earlier = len(lines) - LOG_LINES
+    if earlier > 0:
+        lines = [f"({earlier} earlier steps are not shown.)", *lines[-LOG_LINES:]]
+    return "\n".join(lines)
+
+
+class Choose:
+    """A model chooses the next step of a loop. What it chose is where the flow goes;
+    its plan and notes are kept for the next time it is asked."""
+
+    async def question(self, ctx: Context) -> Question:
+        ways = ways_of(ctx)
+        if len(ways) < 2:
+            raise ValueError(
+                f"{ctx.node.id} offers the model nothing to do: none of its ways but done "
+                "leads to a task"
+            )
+        schema = copy.deepcopy(CHOICE_SCHEMA)
+        schema["properties"]["way"]["enum"] = [way for way, _target in ways]
+        asked = await _asked(ctx, CHOOSING, schema, change=False)
+        happened = await asyncio.to_thread(ctx.services.runs.happened, ctx.item.run_id)
+        count = int((ctx.given.get("loops") or {}).get(ctx.node.id) or 1)
+        limit = loop_steps(ctx.params)
+        kept = (ctx.data.get("loop") or {}).get(ctx.node.id) or {}
+        plan = [step for step in kept.get("plan") or [] if isinstance(step, dict)]
+        said = [
+            "The ways you can go:\n"
+            + "\n".join(f"- {_way(ctx, way, target)}" for way, target in ways),
+            f"This is step {count} of at most {limit}."
+            + (
+                " It is the last time you are asked: say done if the work can stand as it "
+                "is, since after this the run ends without it."
+                if count >= limit
+                else ""
+            ),
+            "Your plan:\n"
+            + (
+                "\n".join(
+                    f"- [{step.get('state')}] {_words(step.get('step'), 300)}" for step in plan
+                )
+                if plan
+                else "(none yet: make one)"
+            ),
+            _material("Your notes", str(kept.get("notes") or "(none yet)")),
+            "What happened so far:\n" + _so_far(ctx, happened),
+        ]
+        refused = ctx.given.get("refused")
+        if refused:
+            said.append(
+                "The edits could not be applied, and nothing was changed. Why:\n"
+                + "\n".join(f"- {_words(reason, 500)}" for reason in refused[:40])
+            )
+        failures = ctx.given.get("failures")
+        if failures:
+            said.append(
+                _material("What the last check printed", "\n\n".join(map(str, failures))[:30_000])
+            )
+        return dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(said))
+
+    async def answered(self, ctx: Context, reply: Reply) -> Concluded:
+        answer = reply.data
+        way = str(answer.get("way") or "")
+        if way not in [name for name, _target in ways_of(ctx)]:
+            return Failed(
+                "no_way", f"The model chose {way or 'nothing'}, which is not offered.", answer
+            )
+        why = _words(answer.get("why"), 1500)
+        plan = [
+            {"step": _words(step.get("step"), 300), "state": str(step.get("state"))}
+            for step in answer.get("plan") or []
+            if isinstance(step, dict)
+        ][:PLAN_STEPS]
+        notes = str(answer.get("notes") or "")[:NOTES_CHARACTERS]
+        try:
+            command = int(answer.get("command") or 0)
+        except (TypeError, ValueError):
+            command = 0
+        asked = {
+            "words": _words(answer.get("words"), 300),
+            "paths": [str(path) for path in answer.get("paths") or []][:40],
+            "command": command,
+        }
+        # What was learned on the way here goes on with the choice: why edits did not
+        # fit, what a check printed.
+        carried = {
+            name: ctx.given[name]
+            for name in ("refused", "failures", "findings")
+            if name in ctx.given
+        }
+        kept = {**(ctx.data.get("loop") or {}), ctx.node.id: {"plan": plan, "notes": notes}}
+        return Done(
+            way,
+            f"chose_{way}",
+            f"{way}: {why}"[:500],
+            output={"way": way, "why": why, "plan": plan, "notes": notes, **asked},
+            data={"loop": kept},
+            given={**carried, "asked": asked, "brief": why},
+        )
+
+
 MODEL: Final[dict[str, ModelTask]] = {
     "model.judge": Judge(),
     "model.report": Report(),
     "model.edit": Edit(),
+    "model.choose": Choose(),
 }
 assert set(MODEL) == {  # noqa: S101 - the catalogue and the code agree
     key for key, task in TASKS.items() if task.where == "model"

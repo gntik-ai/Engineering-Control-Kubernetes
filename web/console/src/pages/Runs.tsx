@@ -323,6 +323,24 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
             </pre>
           </div>
         ) : null}
+        {Array.isArray(step.output?.plan) && step.output.plan.length ? (
+          <div>
+            <div className="text-[12px] font-medium text-muted-foreground">Its plan at this step</div>
+            <ul className="mt-1 grid gap-0.5 text-[13px]">
+              {(step.output.plan as { step?: string; state?: string }[]).map((entry, index) => (
+                <li key={index} className={entry.state === 'done' ? 'text-muted-foreground line-through' : ''}>
+                  {entry.state === 'doing' ? '→ ' : ''}
+                  {entry.step}
+                </li>
+              ))}
+            </ul>
+            {typeof step.output.notes === 'string' && step.output.notes ? (
+              <p className="mt-1 text-[12px] text-muted-foreground whitespace-pre-wrap">
+                Its notes: {step.output.notes}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         {step.input?.chose?.map((chosen, index) => (
           <p key={index} className="text-[13px] text-muted-foreground">
             Then the flow asked (<span className="font-mono text-[12px]">{chosen.task}</span>): {chosen.asked}?{' '}

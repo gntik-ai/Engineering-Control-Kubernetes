@@ -1208,6 +1208,48 @@ class Runs:
             ).all()
             return [dict(step.output) for step in steps if step.output]
 
+    def happened(self, run_id: UUID) -> list[dict[str, Any]]:
+        """The run's steps that have ended, in the order they ran: which task, how it
+        ended and what was said of it, and what it produced. What a loop's model is
+        told of the work so far, and where the files it has in hand come from."""
+        with self.sessions() as session:
+            steps = session.scalars(
+                select(SandboxStep)
+                .where(
+                    SandboxStep.run_id == run_id,
+                    SandboxStep.state.in_(("succeeded", "failed")),
+                )
+                .order_by(SandboxStep.position)
+            ).all()
+            return [
+                {
+                    "position": step.position,
+                    "name": step.name,
+                    "state": step.state,
+                    "outcome": step.outcome,
+                    "detail": step.detail,
+                    "output": dict(step.output) if step.output else {},
+                }
+                for step in steps
+            ]
+
+    def cost_of(self, run_id: UUID) -> float:
+        """What the run's questions to models over an API cost so far, in US dollars,
+        where their accounts say what their models cost."""
+        with self.sessions() as session:
+            used = session.scalars(
+                select(SandboxStep.usage).where(
+                    SandboxStep.run_id == run_id, SandboxStep.usage.is_not(None)
+                )
+            ).all()
+        total = 0.0
+        for entry in used:
+            try:
+                total += float((entry or {}).get("cost") or 0)
+            except (TypeError, ValueError):
+                continue
+        return round(total, 6)
+
     def account_learned(
         self,
         account_id: UUID,

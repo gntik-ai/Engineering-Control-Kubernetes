@@ -26,6 +26,7 @@ from engineering_control.sandbox.deliver import BRANCH, MAX_ROUNDS, PROVIDERS, R
 MINUTES_CEILING: Final = 24 * 60
 MINUTES_DEFAULT: Final = 8 * 60
 TOKENS_CEILING: Final = 500_000_000
+DOLLARS_CEILING: Final = 1000
 AGENT_MINUTES: Final = 50
 AGENT_MINUTES_CEILING: Final = 55
 AREAS_CEILING: Final = 6
@@ -96,6 +97,8 @@ class TaskType:
     # task merges one: a pull request is merged only by way of the first.
     checked: tuple[str, ...] = ()
     merges: bool = False
+    # A loop goes round it: coming back to it is the loop's next step, not a round.
+    loops: bool = False
     approval: bool = False  # the administrator decides here
     application: bool = False  # it looks at the project's running application in a browser
     needs: tuple[str, ...] = ()
@@ -124,6 +127,7 @@ class TaskType:
                 "checked": list(self.checked),
             },
             "merges": self.merges,
+            "loops": self.loops,
             "approval": self.approval,
             "application": self.application,
             "needs": list(self.needs),
@@ -168,6 +172,12 @@ _INSTRUCTION: Final = Param(
     "between the platform's own rules, which it cannot change.",
     high=INSTRUCTION_CHARACTERS,
 )
+# How often a loop may ask its model for the next step: usually, and at most.
+LOOP_STEPS: Final = 40
+LOOP_STEPS_CEILING: Final = 200
+# The ways a model that chooses the next step can go. Each leads where the flow says; a
+# way that leads nowhere is not offered, except done, which then ends the run.
+WAYS: Final = ("done", "search", "read", "edit", "check", "other")
 # How many files Find the files hands on at most.
 FOUND_CEILING: Final = 80
 # What a task that asks a model over an API is set with.
@@ -537,6 +547,34 @@ _TASKS: Final = (
         params=_ASKED,
     ),
     TaskType(
+        "model.choose",
+        "Models",
+        "Ask a model: choose the next step",
+        "The heart of a loop. The platform asks a model what to do next and goes the "
+        "way it chooses: search (lead it to Find the files), read (Read the files), "
+        "edit (Ask a model: write the change, then Apply the edits), check (Run a "
+        "command), other (any task of yours) or done. Lead each of those tasks back "
+        "here, and the model is asked again with what came of it, until it says done. "
+        "It keeps a plan and notes from one step to the next, is told what happened so "
+        "far, and has the files in hand that were read. A way that leads nowhere is not "
+        "offered. Coming back here is not a round: the loop has its own limit of steps.",
+        "model",
+        loops=True,
+        produces=("plan",),
+        outcomes=WAYS,
+        params=(
+            *(param for param in _ASKED if param.name not in ("with_change",)),
+            Param(
+                "steps",
+                "int",
+                LOOP_STEPS,
+                "How often the model may be asked in a run before the loop gives up.",
+                low=2,
+                high=LOOP_STEPS_CEILING,
+            ),
+        ),
+    ),
+    TaskType(
         "model.judge",
         "Models",
         "Ask a model: judge",
@@ -903,7 +941,25 @@ BUDGETS: Final = {
         low=10_000,
         high=TOKENS_CEILING,
     ),
+    "dollars": Param(
+        "dollars",
+        "int",
+        None,
+        "What a run's questions to models over an API may cost in all, in US dollars; "
+        "empty for no limit. It counts the models whose account says what they cost.",
+        low=1,
+        high=DOLLARS_CEILING,
+    ),
 }
+
+
+def loop_steps(params: dict[str, Any]) -> int:
+    """How often a task a loop goes round may be come to, within the platform's ceiling."""
+    try:
+        wanted = int(params.get("steps") or LOOP_STEPS)
+    except (TypeError, ValueError):
+        wanted = LOOP_STEPS
+    return max(2, min(wanted, LOOP_STEPS_CEILING))
 
 
 def catalogue() -> list[dict[str, Any]]:

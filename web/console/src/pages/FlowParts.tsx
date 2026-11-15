@@ -44,6 +44,8 @@ const SETTING_NAMES: Record<string, string> = {
   effort: 'Reasoning',
   with_change: 'Give it the collected change',
   with_files: 'Give it the files read',
+  steps: 'Steps of the loop at most',
+  dollars: 'US dollars for models asked over an API',
   words: 'More words to look for',
   limit: 'Files at most',
   neighbours: 'Add the neighbours of the best files',

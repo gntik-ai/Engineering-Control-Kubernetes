@@ -670,10 +670,74 @@ pull request. It suits small changes in files that can be found from the item's 
 For a change that needs looking around a large repository, an agent in a sandbox does
 better.
 
+### The loop: a model that chooses the next step
+
+**Ask a model: choose the next step** (group Models) is the heart of a loop. The
+platform asks a model what to do next and goes the way it chooses; the task that way
+leads to is carried out, leads back, and the model is asked again with what came of it,
+until it says done. The model has no tools: the tasks of the flow are its tools, and
+the flow says which there are.
+
+The task has six ways, and each leads where you draw it:
+
+| Way | Meant for | What the model gives with it |
+| --- | --- | --- |
+| `search` | Find the files | the words to look for |
+| `read` | Read the files | the paths to read |
+| `edit` | Ask a model: write the change, then Apply the edits | in a sentence, what is to be changed |
+| `check` | Run a command | the number of one of the task's commands, or 0 for all |
+| `other` | any task of yours | nothing |
+| `done` | what comes after the loop (the review) | nothing |
+
+A way that leads nowhere is not offered to the model, except `done`, which then ends
+the run. Lead every task of the loop back to the choosing task, whichever way it ended:
+found or not, applied or refused, passed or failed. The model is told how it ended.
+
+What the model is given each time, by fixed rules, and nothing else:
+
+- **Your instruction and what the run is about**, as with every task that asks a model.
+- **The ways it can go**, each in a sentence, with the commands a check can run.
+- **Its plan and its notes.** These are all it keeps from one step to the next. It gives
+  both in full with every answer; the platform stores them and gives them back (a plan
+  of 30 steps and 6,000 characters of notes at most). Both are shown with each step on
+  the run's page.
+- **What happened so far**: one line for every step of the loop, the latest last, the
+  last 40 at most, with how many earlier ones are not shown.
+- **The files in hand**: every file a task read, and every file Apply the edits
+  changed, as it is now. Beyond 300,000 characters, the files seen longest ago are let
+  go and the model is told which, so that it can read them again.
+- **What the last check printed, and why edits were refused**, once, right after it
+  happened. Both also go on to the model that writes the edits.
+
+The limits:
+
+- Coming back to the choosing task is not a round: the loop has its own limit, the
+  task's setting "Steps of the loop at most" (40 unless you say otherwise, 200 at most).
+  On its last step the model is told so. A loop that reaches the limit without done
+  fails the run.
+- A flow's budgets hold for the loop like for everything else: minutes, tokens, and a
+  new one, US dollars for models asked over an API. It counts the models whose account
+  says what they cost, and once it is used up no further task is started.
+- Nothing the loop changes is published without the review, the tests, the scan, the
+  collection and your decision. A review that asks for changes, or tests that got worse,
+  can lead back into the loop.
+
+The model that chooses and the model that writes the edits are set separately, so a
+cheap model can find and decide and a strong one can write.
+
+A loop reads: … → Run the tests → **Ask a model: choose the next step** → (`search` →
+Find the files → back) (`read` → Read the files → back) (`edit` → Ask a model: write
+the change → Apply the edits → back) (`check` → Run a command → back) (`done` → Review
+the change → Run the tests → Scan for secrets → Collect the change → Wait for the
+administrator → Open a pull request).
+
+Every step of a loop that needs no sandbox of its own ends within the launcher's pass,
+so what takes time is the model's answers.
+
 ### Asking a model over an API
 
-Three tasks, in the group Models, ask a model directly instead of starting an agent in
-a sandbox:
+Beside the one that chooses the next step of a loop, three tasks in the group Models
+ask a model directly instead of starting an agent in a sandbox:
 
 | Task | What the model does | Outcomes |
 | --- | --- | --- |
