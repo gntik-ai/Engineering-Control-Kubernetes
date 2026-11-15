@@ -633,15 +633,53 @@ What holds for the workbench:
 - A workbench that is lost (its pod is gone, or it was started anew) is replaced and the
   step is run again, five times at most.
 
+### A change written by a model
+
+A model asked over an API has no tools, so it cannot change a file. It can write the
+change down, and the platform can carry it out. Two tasks do that together:
+
+1. **Ask a model: write the change** gives the model your instruction, what the run is
+   about and the files Read the files read, and gets back edits in a fixed shape. An
+   edit replaces a text that is in a file exactly once, writes a file whole, or deletes
+   a file.
+2. **Apply the edits** (group Code, in the workbench) applies them to the checkout and
+   the platform commits, as "Engineering Control", like after an agent. It ends with
+   `applied` or `refused`.
+
+All edits are applied or none is. An edit is refused, with why, when its text is not in
+the file as it is now, is there more than once, or is there with other spacing; when
+the file is outside the repository, is one that may not be changed (`.github/`,
+`.claude/`, `.codex/`, `.mcp.json`, `CLAUDE.md`, `AGENTS.md`), or is named like a
+secret; and when a Python or JSON file would no longer parse. The usual way from
+`refused` leads back to the model, which is then told what did not fit and writes the
+whole change again. Going back is a round, of which a run has as many as its flow says.
+
+A change made this way is a change like an agent's. Nothing of it is published before
+it has passed Review the change, Run the tests and Scan for secrets, has been collected
+and has been decided on by the administrator: the rules do not ask who wrote it.
+
+The review is still an agent of a subscription, who reads the code, and it is never of
+the family that wrote the change. The reviewer's setting "other than" names the task
+Apply the edits. What an Anthropic model wrote is reviewed on ChatGPT, what an OpenAI
+model wrote on Claude; what DeepSeek, Qwen, GLM or Kimi wrote, on either.
+
+A flow of this kind reads: Clone → Install → Run the tests → Find the files → Read the
+files → Ask a model: write the change → Apply the edits → Review the change → Run the
+tests → Scan for secrets → Collect the change → Wait for the administrator → Open a
+pull request. It suits small changes in files that can be found from the item's words.
+For a change that needs looking around a large repository, an agent in a sandbox does
+better.
+
 ### Asking a model over an API
 
-Two tasks, in the group Models, ask a model directly instead of starting an agent in a
-sandbox:
+Three tasks, in the group Models, ask a model directly instead of starting an agent in
+a sandbox:
 
 | Task | What the model does | Outcomes |
 | --- | --- | --- |
 | Ask a model: judge | Passes what your instruction says or asks for changes, with findings the next task is given | `pass`, `changes` |
 | Ask a model: report | Writes a report, kept with the run and given to the tasks after it as notes | `done` |
+| Ask a model: write the change | Writes the change as edits, which Apply the edits carries out | `edits`, `nothing` |
 
 Each is set with your instruction, the provider and the model's name as the provider
 writes it, optionally a second provider and model for when no account of the first can

@@ -20,6 +20,10 @@ import, what imports them, and the tests that cover them. Every file comes with 
 ``read`` hands back files as text, whole or up to a number of lines, and says which
 were cut and which were left out. A file that looks like it holds a secret, and a file
 outside the repository, is never read.
+
+``apply`` carries out edits that were written elsewhere: replace a text that is in a
+file exactly once, write a file whole, delete a file. All of them are applied or none
+is, and an edit that does not fit says why in words the one who wrote it can act on.
 """
 
 from __future__ import annotations
@@ -513,7 +517,11 @@ def read(question: dict[str, Any]) -> dict[str, Any]:
     for wanted in list(dict.fromkeys(str(path) for path in question.get("paths") or []))[:200]:
         path = os.path.normpath(wanted.strip().lstrip("/"))
         full = os.path.realpath(os.path.join(root, path))
-        if path.startswith("..") or not full.startswith(root + os.sep):
+        if (
+            wanted.strip().startswith("/")
+            or path.startswith("..")
+            or not full.startswith(root + os.sep)
+        ):
             left.append({"path": wanted, "why": "it is not in the repository"})
         elif SECRET_NAME.search(path):
             left.append({"path": wanted, "why": "its name is one a secret is kept under"})
@@ -550,9 +558,143 @@ def read(question: dict[str, Any]) -> dict[str, Any]:
     return {"files": given, "left_out": left}
 
 
+# --- changing --------------------------------------------------------------------------------
+
+
+def _syntax(path: str, text: str) -> str | None:
+    """Why the file would no longer be what its name says it is, where that can be
+    told without the project's own tools."""
+    ending = os.path.splitext(path)[1].lower()
+    if ending == ".py":
+        try:
+            compile(text, path, "exec", dont_inherit=True)
+        except SyntaxError as error:
+            return f"it would not be Python any more (line {error.lineno}: {error.msg})"
+        except ValueError as error:
+            return f"it would not be Python any more ({error})"
+    elif ending == ".json":
+        try:
+            json.loads(text)
+        except ValueError as error:
+            return f"it would not be JSON any more ({error})"
+    return None
+
+
+def apply(question: dict[str, Any]) -> dict[str, Any]:
+    """Apply edits to the checkout: all of them, or none.
+
+    An edit replaces a text that is in a file exactly once, writes a file whole, or
+    deletes one. Every edit is tried on what the edits before it left; only when all
+    of them fit, and every file is still what its name says, is anything written.
+    """
+    edits = [edit for edit in question.get("edits") or [] if isinstance(edit, dict)]
+    protected = tuple(str(name) for name in question.get("protected") or [])
+    root = os.path.realpath(REPO)
+    staged: dict[str, str | None] = {}
+    refused: list[dict[str, Any]] = []
+
+    def current(path: str) -> str | None:
+        if path in staged:
+            return staged[path]
+        try:
+            with open(os.path.join(root, path), "rb") as handle:
+                data = handle.read(2_000_001)
+        except OSError:
+            return None
+        if len(data) > 2_000_000 or b"\0" in data[:8000]:
+            raise ValueError("it is not a text file that can be edited here")
+        return data.decode("utf-8", errors="surrogateescape")
+
+    for number, edit in enumerate(edits[:400], start=1):
+        wanted = str(edit.get("path") or "")
+        action = str(edit.get("action") or "")
+        path = os.path.normpath(wanted.strip().lstrip("/")) if wanted.strip() else ""
+        find, replace = str(edit.get("find") or ""), str(edit.get("replace") or "")
+
+        def refuse(
+            why: str, number: int = number, wanted: str = wanted, action: str = action
+        ) -> None:
+            refused.append({"edit": number, "path": wanted, "action": action, "why": why})
+
+        full = os.path.realpath(os.path.join(root, path)) if path else ""
+        outside = wanted.strip().startswith("/") or path.startswith("..")
+        if not path or outside or not full.startswith(root + os.sep):
+            refuse("it is not a file of the repository")
+            continue
+        if path == ".git" or path.startswith(".git/") or path.startswith(".run/"):
+            refuse("it is not a file of the repository's own")
+            continue
+        if any(
+            path == name or (name.endswith("/") and path.startswith(name)) for name in protected
+        ):
+            refuse("it is a file that may not be changed here")
+            continue
+        if SECRET_NAME.search(path):
+            refuse("its name is one a secret is kept under")
+            continue
+        if os.path.islink(os.path.join(root, path)) or os.path.isdir(full):
+            refuse("it is not a plain file")
+            continue
+        try:
+            before = current(path)
+        except ValueError as error:
+            refuse(str(error))
+            continue
+        if action == "write":
+            staged[path] = replace
+        elif action == "delete":
+            if before is None:
+                refuse("there is no such file to delete")
+            else:
+                staged[path] = None
+        elif action == "replace":
+            if before is None:
+                refuse("there is no such file: write it whole instead")
+            elif not find:
+                refuse("it does not say which text to replace")
+            elif before.count(find) == 1:
+                staged[path] = before.replace(find, replace, 1)
+            elif before.count(find) > 1:
+                refuse(
+                    f"the text to replace is in the file {before.count(find)} times: give "
+                    "more of the lines around it, so that it is there once"
+                )
+            elif " ".join(find.split()) in " ".join(before.split()):
+                refuse(
+                    "the text to replace is in the file with other spacing or line breaks: "
+                    "copy it exactly as the file has it"
+                )
+            else:
+                refuse("the text to replace is not in the file as it is now")
+        else:
+            refuse("it says neither replace, write nor delete")
+    for path, text in staged.items():
+        wrong = _syntax(path, text) if text is not None else None
+        if wrong:
+            refused.append({"edit": 0, "path": path, "action": "", "why": wrong})
+    if refused or not staged:
+        # Nothing is written unless everything fits.
+        return {"applied": [], "refused": refused, "edits": len(edits)}
+    applied: list[dict[str, str]] = []
+    for path, text in staged.items():
+        full = os.path.join(root, path)
+        if text is None:
+            os.remove(full)
+            applied.append({"path": path, "action": "deleted"})
+            continue
+        existed = os.path.exists(full)
+        os.makedirs(os.path.dirname(full) or root, exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(text.encode("utf-8", errors="surrogateescape"))
+        applied.append({"path": path, "action": "changed" if existed else "added"})
+    return {"applied": applied, "refused": [], "edits": len(edits)}
+
+
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index"):
-        print("usage: tools.py find|read|index <question.json> <answer.json>", file=sys.stderr)
+    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index", "apply"):
+        print(
+            "usage: tools.py find|read|index|apply <question.json> <answer.json>", file=sys.stderr
+        )
         return 2
     with open(arguments[1], encoding="utf-8") as handle:
         question = json.load(handle)
@@ -560,6 +702,8 @@ def main(arguments: list[str]) -> int:
         answer = find(question)
     elif arguments[0] == "read":
         answer = read(question)
+    elif arguments[0] == "apply":
+        answer = apply(question)
     else:
         answer = {"indexed": index()["summary"]}
     os.makedirs(os.path.dirname(arguments[2]), exist_ok=True)

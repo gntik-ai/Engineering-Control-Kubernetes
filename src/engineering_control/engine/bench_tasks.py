@@ -20,6 +20,7 @@ from engineering_control.engine.tasks import (
     Failed,
     SandboxTask,
     _about,
+    _last_line,
     _own_commands,
     _tail,
     _words,
@@ -232,10 +233,91 @@ class Run:
         )
 
 
+class Apply:
+    """Apply the edits a model wrote, and commit. What is changed this way is a change
+    like an agent's, and is held to the same rules before it is published."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        written = await ctx.outputs("model.edit")
+        edits = written[-1].get("edits") if written else None
+        if not edits:
+            raise ValueError(f"{ctx.node.id} has no edits to apply: no task before it wrote any")
+        issue = ctx.data.get("issue") or {}
+        message = (
+            deliver.commit_message(issue)
+            if issue.get("title")
+            else f"Change made by the task {ctx.node.id}"
+        )
+        job = tool_job(
+            "apply", {"edits": edits, "protected": list(deliver.PROTECTED)}, max_bytes=1_000_000
+        )
+        job["commands"] += deliver.commit_commands(message, ctx.data.get("base_sha"))
+        return _bench(job)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        tool = next((c for c in commands if c.get("name") == "apply"), commands[0])
+        answer = _answer([tool], log, "apply")
+        if isinstance(answer, str):
+            return Failed("apply_failed", f"The edits could not be applied: {answer}")
+        refused = [entry for entry in answer.get("refused") or [] if isinstance(entry, dict)]
+        if refused:
+            reasons = [
+                f"{entry.get('path')}"
+                + (
+                    f" (edit {entry.get('edit')}, {entry.get('action')})"
+                    if entry.get("edit")
+                    else ""
+                )
+                + f": {entry.get('why')}"
+                for entry in refused
+            ]
+            return Done(
+                "refused",
+                "refused",
+                _words(
+                    f"{len(refused)} of {answer.get('edits')} edits do not fit, so nothing "
+                    "was changed: " + "; ".join(reasons),
+                    600,
+                ),
+                output=answer,
+                given={"refused": reasons},
+            )
+        commit = next((c for c in commands if c.get("name") == "commit"), None)
+        head = _last_line(commit) if commit and commit.get("exit_code") == 0 else ""
+        if len(head) != 40:
+            return Failed(
+                "commit_failed", f"The change could not be committed: {_tail(commit or tool)}"
+            )
+        applied = [entry for entry in answer.get("applied") or [] if isinstance(entry, dict)]
+        if not applied or head == ctx.data.get("base_sha"):
+            return Failed("no_change", "The edits were applied and changed nothing.", answer)
+        written = await ctx.outputs("model.edit")
+        last = written[-1] if written else {}
+        provider = str(last.get("provider") or "")
+        touched = deliver.touched_files(commands)
+        paths = [str(entry.get("path")) for entry in applied]
+        return Done(
+            "applied",
+            "applied",
+            _words(f"{len(applied)} files changed: " + ", ".join(paths), 500),
+            output=answer,
+            data={
+                "maker": provider,
+                "head": head,
+                "round": int(ctx.given.get("round") or 1),
+                # Whose model wrote the change: the review is by another family's.
+                "ran": {**(ctx.data.get("ran") or {}), ctx.node.id: provider},
+                **({"touched": touched} if touched is not None else {}),
+            },
+            given={"summary": str(last.get("summary") or "")},
+        )
+
+
 BENCH: Final[dict[str, SandboxTask]] = {
     "code.find": Find(),
     "code.read": Read(),
     "code.run": Run(),
+    "code.apply": Apply(),
 }
 assert set(BENCH) == {  # noqa: S101 - the catalogue and the code agree
     key for key, task in TASKS.items() if task.where == "bench"

@@ -14,6 +14,7 @@ from typing import Any, Final
 from engineering_control.engine import catalogue, conditions
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, Node
+from engineering_control.models.providers import FAMILY_OF
 from engineering_control.sandbox import deliver
 
 # How many tasks that only choose a way may follow one another before following stops: a
@@ -52,9 +53,12 @@ def provider_for(node: Node, ran: dict[str, Any], *, again: bool) -> str | None:
         # who is on the other than a writer, never judges its own subscription's work.
         return str(ran[WRITER])
     other = node.params.get("other_than")
-    if other and ran.get(str(other)) in deliver.PROVIDERS:
-        # The other subscription than the one whose work is judged.
-        return next(name for name in deliver.PROVIDERS if name != ran[str(other)])
+    # Whose work is judged: a subscription's, or a model's asked over an API. An API
+    # and the subscription of the same company are one family (Anthropic's and Claude,
+    # OpenAI's and ChatGPT): the judge is never of the family that did the work.
+    judged = FAMILY_OF.get(str(ran.get(str(other)))) if other else None
+    if judged in deliver.PROVIDERS:
+        return next(name for name in deliver.PROVIDERS if name != judged)
     if again and ran.get(node.id) in deliver.PROVIDERS:
         # A task that is gone back to stays with the subscription it had.
         return str(ran[node.id])

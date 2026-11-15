@@ -534,11 +534,19 @@ def implement_job(
     provider: str, generation: int, prompt: str, message: str, base_sha: str | None = None
 ) -> dict[str, Any]:
     job = _agent(provider, generation, prompt, MAKER_SCHEMA)
+    job["commands"] += commit_commands(message, base_sha)
+    return job
+
+
+def commit_commands(message: str, base_sha: str | None = None) -> list[dict[str, Any]]:
+    """Commit what was changed in the checkout, as the platform, and list the files the
+    change touches now. Whoever changed the code, an agent or the platform applying a
+    model's edits, it is the platform that commits."""
     commit = (
         "git add -A -- . ':!.run' && "
         '(git diff --cached --quiet || git commit --quiet -m "$MESSAGE") && git rev-parse HEAD'
     )
-    job["commands"].append(
+    commands: list[dict[str, Any]] = [
         {
             "name": "commit",
             "argv": ["bash", "-euc", f"git config core.hooksPath /dev/null && {commit}"],
@@ -546,7 +554,7 @@ def implement_job(
             "env": {**IDENTITY, "MESSAGE": message},
             "timeout": 120,
         }
-    )
+    ]
     if base_sha and COMMIT.fullmatch(base_sha):
         # Which files the change touches now: what an If of the flow may ask about.
         listing = (
@@ -554,7 +562,7 @@ def implement_job(
             'printf "%s\\n" "$list" | grep -c . || true; '
             f'printf "%s\\n" "$list" | sed -n "1,{TOUCHED_KEPT}p"'
         )
-        job["commands"].append(
+        commands.append(
             {
                 "name": "touched",
                 "argv": ["bash", "-euc", listing],
@@ -565,7 +573,32 @@ def implement_job(
                 "echo": 20_000,
             }
         )
-    return job
+    return commands
+
+
+# The shape a model's edits come in: what is replaced where, written whole, or deleted.
+EDITS_SCHEMA: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary", "edits"],
+    "properties": {
+        "summary": {"type": "string"},
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "action", "find", "replace"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "action": {"type": "string", "enum": ["replace", "write", "delete"]},
+                    "find": {"type": "string"},
+                    "replace": {"type": "string"},
+                },
+            },
+        },
+    },
+}
 
 
 def touched_files(commands: list[dict[str, Any]]) -> dict[str, Any] | None:

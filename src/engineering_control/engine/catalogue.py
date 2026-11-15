@@ -506,6 +506,37 @@ _TASKS: Final = (
         ),
     ),
     TaskType(
+        "code.apply",
+        "Code",
+        "Apply the edits",
+        "Applies the edits a model wrote to the checkout, and the platform commits them. "
+        "All of them are applied or none is: an edit whose text is not in the file "
+        "exactly once, that touches a file that may not be changed, or that leaves a "
+        "file that is no longer what its name says, is refused, with why, for the model "
+        "to do better. A change made this way is a change like an agent's: it is "
+        "reviewed, tested, scanned, collected and decided on before it is published.",
+        "bench",
+        writes=True,
+        needs=("checkout", "edits"),
+        produces=("change",),
+        outcomes=("applied", "refused"),
+    ),
+    TaskType(
+        "model.edit",
+        "Models",
+        "Ask a model: write the change",
+        "The platform asks a model over a provider's API to write the change your "
+        "instruction and the run's item ask for, as edits: replace this text in that "
+        "file, write this file, delete that one. The model changes nothing itself and "
+        "has no tools: it goes by the files a task before it read, and Apply the edits "
+        "carries its edits out. When they could not be applied, or tests failed, it is "
+        "asked again with why.",
+        "model",
+        produces=("edits",),
+        outcomes=("edits", "nothing"),
+        params=_ASKED,
+    ),
+    TaskType(
         "model.judge",
         "Models",
         "Ask a model: judge",

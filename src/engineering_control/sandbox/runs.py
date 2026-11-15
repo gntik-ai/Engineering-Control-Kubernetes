@@ -45,7 +45,7 @@ from engineering_control.engine.library import (
 from engineering_control.engine.records import in_force
 from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
 from engineering_control.sandbox import deliver
-from engineering_control.sandbox.pods import identity_secret
+from engineering_control.sandbox.pods import BENCH_PREFIX, identity_secret
 
 ACTIVE: Final = ("queued", "running", "waiting")
 # The kind of run that is a turn of the supervisor's conversation.
@@ -1273,7 +1273,10 @@ def usage_of(session: Session, run_ids: list[UUID]) -> dict[UUID, dict[str, Any]
                 total[name] += int((usage or {}).get(name) or 0)
             except (TypeError, ValueError):
                 continue
-        if started is not None and not asked:
+        # A step the run's workbench carried out started no sandbox either, and took
+        # no time worth counting.
+        on_bench = bool(pod_name) and str(pod_name).startswith(BENCH_PREFIX)
+        if started is not None and not asked and not on_bench:
             total["sandboxes"] += 1
             if finished is not None:
                 took = (_aware(finished) - _aware(started)).total_seconds()

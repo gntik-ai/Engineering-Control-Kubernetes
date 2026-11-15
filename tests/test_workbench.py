@@ -271,7 +271,7 @@ def test_files_are_read_as_text_and_what_is_cut_or_left_out_is_said(tools: Any, 
     left = {entry["path"]: entry["why"] for entry in answer["left_out"]}
     assert left == {
         "../outside.txt": "it is not in the repository",
-        "/etc/passwd": "there is no such file",
+        "/etc/passwd": "it is not in the repository",
         ".env": "its name is one a secret is kept under",
         "config/server.pem": "its name is one a secret is kept under",
         "logo.bin": "it is not text",
@@ -579,7 +579,7 @@ def test_three_tasks_look_at_code_in_the_workbench_without_an_agent() -> None:
         assert task.needs == ("checkout",)
     assert TASKS["code.find"].outcomes == ("found", "none")
     assert TASKS["code.run"].outcomes == ("passed", "failed")
-    assert set(bench_tasks.BENCH) == {"code.find", "code.read", "code.run"}
+    assert set(bench_tasks.BENCH) == {"code.find", "code.read", "code.run", "code.apply"}
 
     assert _rules(_looking()) == []
     for wrong, why in (

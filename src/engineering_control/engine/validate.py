@@ -109,8 +109,11 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
         target = nodes.get(str(value)) if value else None
         if target is None or target.id == node.id:
             return f"{name} names another task of the flow"
-        if not TASKS[target.task].account if target.task in TASKS else True:
-            return f"{name} names a task an agent works in"
+        judged = TASKS.get(target.task)
+        # Work that can be judged: an agent's, or a change the platform applied for a
+        # model.
+        if judged is None or not (judged.account or judged.writes):
+            return f"{name} names a task an agent works in, or one that changes the code"
         return None
     return f"{name} cannot be read"
 

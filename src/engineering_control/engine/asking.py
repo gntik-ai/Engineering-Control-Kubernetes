@@ -15,6 +15,7 @@ platform's rules.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Final, Protocol
 
 from engineering_control.engine.catalogue import ASK_MINUTES, ASK_TOKENS, TASKS
@@ -209,7 +210,79 @@ class Report:
         )
 
 
-MODEL: Final[dict[str, ModelTask]] = {"model.judge": Judge(), "model.report": Report()}
+EDITING: Final = (
+    "Write the change that is asked for below, as edits to the files you are given. You "
+    "change nothing yourself: the platform applies your edits, all of them or none.\n"
+    "An edit has a path, an action, and two texts, find and replace:\n"
+    "- action replace: find is a text that is in the file exactly once, copied from "
+    "the file character for character, spaces and line breaks included; it is "
+    "replaced by replace. Give enough of the lines around the place for find to be "
+    "there once and no more. Several edits to one file are applied in the order you "
+    "give them, each to what the one before left.\n"
+    "- action write: the file is written whole with replace as its content, whether it "
+    "exists or not; find is empty. Use it for a new file, or a short one.\n"
+    "- action delete: the file is deleted; find and replace are empty.\n"
+    "Change only what the work needs, in the style of the code around it, and add or "
+    "change tests where the repository tests the code you touch. Edit only files you "
+    "were given, or new ones: you have not seen the others. If what you were given is "
+    "not enough to make the change, give no edits and say in the summary what is "
+    "missing. The summary says in a sentence or two what the change does."
+)
+
+
+class Edit:
+    """A model writes a change as edits. Nothing is changed here: Apply the edits
+    carries them out, under the rules every change is held to."""
+
+    async def question(self, ctx: Context) -> Question:
+        asked = await _asked(ctx, EDITING, deliver.EDITS_SCHEMA)
+        said: list[str] = []
+        refused = ctx.given.get("refused")
+        if refused:
+            said.append(
+                "Your edits could not be applied, and nothing was changed. Why:\n"
+                + "\n".join(f"- {_words(reason, 500)}" for reason in refused[:40])
+                + "\nWrite the whole change again, with these put right."
+            )
+        failures = ctx.given.get("failures")
+        if failures:
+            said.append(
+                _material(
+                    "What failed when the change was tried",
+                    "\n\n".join(map(str, failures))[:30_000],
+                )
+            )
+        if not said:
+            return asked
+        return dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(said))
+
+    async def answered(self, ctx: Context, reply: Reply) -> Concluded:
+        answer = reply.data
+        edits = [edit for edit in answer.get("edits") or [] if isinstance(edit, dict)]
+        summary = _words(answer.get("summary"), 500)
+        if not edits:
+            return Done(
+                "nothing",
+                "no_edits",
+                f"The model wrote no edits: {summary}" if summary else "The model wrote no edits.",
+                output={"summary": summary, "edits": []},
+            )
+        paths = list(dict.fromkeys(str(edit.get("path")) for edit in edits))
+        return Done(
+            "edits",
+            "edits_written",
+            f"{len(edits)} edits to {len(paths)} files: {summary}"[:500],
+            # The edits stay with the step: Apply the edits reads them there.
+            output={"summary": summary, "edits": edits, "provider": reply.provider},
+            given={"summary": summary},
+        )
+
+
+MODEL: Final[dict[str, ModelTask]] = {
+    "model.judge": Judge(),
+    "model.report": Report(),
+    "model.edit": Edit(),
+}
 assert set(MODEL) == {  # noqa: S101 - the catalogue and the code agree
     key for key, task in TASKS.items() if task.where == "model"
 }
