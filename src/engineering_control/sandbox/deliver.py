@@ -576,6 +576,57 @@ def _agent(provider: str, generation: int, prompt: str, schema: dict[str, Any]) 
     return {**account_setup(provider, generation), "files": files, "commands": commands}
 
 
+GATEWAY_GRANT: Final = "ENGINEERING_GATEWAY_GRANT"
+# Codex reads its set-up from here instead of from the account's volume: a folder that is
+# there in every sandbox, with no sign-in in it.
+CODEX_API_HOME: Final = "/tmp"  # noqa: S108 - the pod's own empty volume
+
+
+def through_gateway(job: dict[str, Any], provider: str, gateway: dict[str, str]) -> dict[str, Any]:
+    """The job of an agent whose client is paid by an API key: the client is given no
+    sign-in but the address of the platform's gateway and a grant for this step. The key
+    itself stays with the platform."""
+    url, grant = gateway["url"], gateway["grant"]
+    host = url.removeprefix("http://").rsplit(":", 1)[0]
+    # The gateway is a neighbour, not the internet: not by way of the sandboxes' proxy.
+    direct = {"NO_PROXY": host, "no_proxy": host}
+    said = {key: value for key, value in job.items() if key not in ("env_files", "seed")}
+    files = list(said.get("files") or [])
+    if provider == "claude":
+        environment = {
+            **direct,
+            "ANTHROPIC_BASE_URL": f"{url}/anthropic",
+            # Sent as Authorization: Bearer, which takes the place of a sign-in at once.
+            "ANTHROPIC_AUTH_TOKEN": grant,
+        }
+    else:
+        environment = {**direct, "CODEX_HOME": CODEX_API_HOME, GATEWAY_GRANT: grant}
+        files.append(
+            {
+                "path": f"{CODEX_API_HOME}/config.toml",
+                "content": "\n".join(
+                    [
+                        'model_provider = "gateway"',
+                        "",
+                        "[model_providers.gateway]",
+                        'name = "OpenAI, through the platform\'s gateway"',
+                        f'base_url = "{url}/openai/v1"',
+                        f'env_key = "{GATEWAY_GRANT}"',
+                        'wire_api = "responses"',
+                        "",
+                    ]
+                ),
+            }
+        )
+    commands = [
+        {**command, "env": {**(command.get("env") or {}), **environment}}
+        if command.get("name") == "agent"
+        else command
+        for command in said.get("commands") or []
+    ]
+    return {**said, "files": files, "commands": commands}
+
+
 def implement_job(
     provider: str, generation: int, prompt: str, message: str, base_sha: str | None = None
 ) -> dict[str, Any]:
@@ -806,6 +857,7 @@ def agent_usage(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any]
     """
     read = written = cached = 0
     reported = False
+    cost: float | None = None
     for command in commands:
         for line in str(command.get("stdout") or "").splitlines():
             if not line.startswith("{") or '"usage"' not in line:
@@ -827,6 +879,12 @@ def agent_usage(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any]
                 cached = count("cache_read_input_tokens")
                 written = count("output_tokens")
                 reported = True
+                # What the client works out the conversation cost at its provider's
+                # prices: a price only where the account is paid by the token.
+                try:
+                    cost = float(event["total_cost_usd"])
+                except (KeyError, TypeError, ValueError):
+                    cost = None
             elif event.get("type") == "turn.completed":
                 again = count("cached_input_tokens")
                 read += max(0, count("input_tokens") - again)
@@ -835,7 +893,15 @@ def agent_usage(provider: str, commands: list[dict[str, Any]]) -> dict[str, Any]
                 reported = True
     if not reported:
         return None
-    return {"tokens": read + written, "input": read, "output": written, "cached": cached}
+    used: dict[str, Any] = {
+        "tokens": read + written,
+        "input": read,
+        "output": written,
+        "cached": cached,
+    }
+    if cost is not None and cost >= 0:
+        used["client_cost"] = round(cost, 6)
+    return used
 
 
 def agent_errors(provider: str, commands: list[dict[str, Any]]) -> str:

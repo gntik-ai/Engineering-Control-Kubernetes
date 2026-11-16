@@ -4,7 +4,7 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 
 | Path | What it is |
 | --- | --- |
-| `base/` | Kustomize manifests for the platform: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, console, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel |
+| `base/` | Kustomize manifests for the platform: namespace, PostgreSQL (CloudNativePG), bootstrap Jobs, console, launcher, the sandboxes' proxy, the supervisor's tools, the gateway, the chat channel |
 | `sandboxes/` | The namespace the sandboxes run in: its rules, its quota, what may act in it |
 | `monitoring/` | For a cluster with the Prometheus operator: what reads the platform's numbers, and the alert rules |
 | `registry/` | A one-template Helm chart that creates the image pull Secret from parameters held in Argo CD |
@@ -18,10 +18,10 @@ Engineering Control is deployed to the cluster by Argo CD from this directory.
 | 0 | The PostgreSQL cluster; Job `bootstrap-secrets` | The platform's database; the Secret with the console's session key and the key of the sandboxes' grants, generated in the cluster |
 | 1 | Job `migrate-database` | `alembic upgrade head` |
 | 2 | Job `bootstrap-admin-password` | First console password, stored in the Secret `engineering-control-admin` |
-| 3 | Console, launcher, the sandboxes' proxy, the supervisor's tools, the chat channel | The platform's five processes |
+| 3 | Console, launcher, the sandboxes' proxy, the supervisor's tools, the gateway, the chat channel | The platform's six processes |
 | 5 | Certificate and Ingress for `ade.musematic.ai` | The console over HTTPS; the only route from outside the cluster |
 
-The five processes, and what each is for:
+The six processes, and what each is for:
 
 | Process | What it does | Holds |
 | --- | --- | --- |
@@ -29,6 +29,7 @@ The five processes, and what each is for:
 | Launcher (`engineering-launcher`) | Drives every run: starts each step as a pod in the sandbox namespace, reads what it did, decides what comes next by the run's flow | The GitHub App's key, the grant key, an identity that may act on pods in the sandbox namespace |
 | Proxy (`engineering-egress`) | The sandboxes' only way out: opens tunnels to named hosts | The grant key |
 | Tools (`engineering-tools`) | What the supervisor may read and do, called from the sandbox of its turn | The GitHub App's key |
+| Gateway (`engineering-gateway`) | Sends on to Anthropic or OpenAI what the client of an agent asks, when the step is paid by an API key | The key that opens API keys, the grant key |
 | Chat (`engineering-chat`) | The administrator's way in from Telegram | The bot's token |
 
 A run's state is the run's record in the database, and nothing else holds a copy of it:
@@ -40,9 +41,10 @@ engine beside the launcher and nothing to reconcile.
 Only the console is reachable from outside. The ingress controller runs on a node's own
 network, so a network policy lets the cluster's nodes, by address, reach the console's HTTP
 port; no pod outside the namespace can. Every other port and every other pod accepts
-connections from its own namespace only, with two exceptions that `base/network-policy.yaml`
-spells out: a sandbox whose step may reach out reaches the proxy, and the sandbox of a
-turn of the supervisor reaches the tools. The node addresses are listed in
+connections from its own namespace only, with three exceptions that `base/network-policy.yaml`
+spells out: a sandbox whose step may reach out reaches the proxy, the sandbox of a
+turn of the supervisor reaches the tools, and the sandbox of a step that is paid by an
+API key reaches the gateway. The node addresses are listed in
 `base/network-policy.yaml` and, for the sign-in counter, in `base/configuration.yaml`; both
 change if a node is added or renumbered.
 
@@ -198,8 +200,9 @@ hold it:
   opens nothing, and a key sealed for one account does not open in another's record.
 - The console seals a key when it is entered. The launcher opens it for the moment a
   model is asked. Neither writes it to a log, the activity record or a run.
-- No pod of the sandbox namespace is given it. An agent in a sandbox still works with a
-  subscription and nothing else.
+- No pod of the sandbox namespace is given it. An agent in a sandbox works with a
+  subscription, or, where its task says so, is paid by a key it never sees ("An agent
+  paid by an API key", below).
 
 When a key is entered the provider is asked at once which models the key reaches. That
 costs nothing and shows whether the key is accepted; "Ask for its models" does it again.
@@ -209,6 +212,70 @@ Prices are yours to write (Change → What its models cost): per model, US dolla
 million tokens read, written and, if the provider prices it apart, read again from its
 cache. A call on a model with a price shows what it cost; without one it is counted in
 tokens only. The platform does not know any provider's prices by itself.
+
+### An agent paid by an API key
+
+An agent works in a sandbox through its client: Claude Code or Codex. By default the
+client is signed in to a subscription. Every task an agent works in has the setting
+**Paid by**, with two choices:
+
+- **The subscription** (the default): as before.
+- **An API key, through the gateway**: the same client, the same sandbox, the same
+  prompt, but what it asks its provider is paid by the token, by an account with an API
+  key. Anthropic's key pays for Claude, OpenAI's for ChatGPT, and no other pairing
+  exists: neither client is supported by its maker with another company's models.
+
+So the subscription and the key stand side by side, per task: the agent that implements
+may be paid by a key while the one that reviews stays on its subscription, and a flow can
+be tried both ways in the lab.
+
+The key never enters the sandbox. What happens instead:
+
+1. The launcher gives the step an account with a key of the right company, as it would
+   give it a subscription: ready, not paused, not over its limit of sandboxes. With none
+   free the step waits and says what it waits for.
+2. The sandbox gets no sign-in and no volume of an account. Its client is told the
+   address of the gateway (`base/gateway.yaml`) and given a **grant**: a signed line that
+   names that account and that step. Claude Code takes them as `ANTHROPIC_BASE_URL` and
+   `ANTHROPIC_AUTH_TOKEN`; Codex as a provider of its own configuration whose key is read
+   from the environment.
+3. For every request the gateway checks the grant's signature, that the step is running
+   and that the account is the step's, opens the sealed key, and sends the request on to
+   `api.anthropic.com` or `api.openai.com` with the key in place of the grant. The answer
+   goes back as it comes, streamed, with the provider's own status and headers. No other
+   address can be reached through it, whatever the request says.
+4. When the step ends the grant is worth nothing, whatever time is left on it (four
+   hours at most). A grant for one step opens nothing for another.
+
+A sandbox can reach the gateway only if its step is paid by a key (the label
+`engineering-control/gateway: client`, and the two network policies named `gateway` and
+`gateway-client`), and each request still needs the grant. The gateway writes nothing to
+the database and logs no header and no body: one line per request with the provider and
+the status.
+
+What such a step used is shown with the account's name. Its cost is what Claude Code
+itself works out for the conversation, at Anthropic's prices; for Codex, which says no
+cost, it is the tokens at the prices written on the account, when the task names its
+model and the account has a price for it. A step on a subscription shows tokens only, as
+before.
+
+Three things to know:
+
+- **Limits.** A key has its own limits at the provider (requests and tokens a minute).
+  The client waits and tries again as the provider tells it; if it gives up, the step
+  fails like any other and the account is marked as limited for a while.
+- **A key that is refused.** The account says "New key needed" and waits in the inbox,
+  as when a model is asked directly.
+- **Without the gateway.** An installation with no `ENGINEERING_GATEWAY_URL` fails such
+  a step at once and says so, instead of leaving it waiting.
+
+```bash
+kubectl -n engineering-control logs deploy/engineering-control-gateway --tail=50
+```
+
+`gateway_refused` with status 401 is a grant that is not valid or whose step has ended;
+403 is a grant used for the other provider; `gateway_unreachable` is the provider not
+answering.
 
 ## Runs and the launcher
 
@@ -1533,7 +1600,8 @@ for the cluster alone: the port is in no Service and behind no route
 - `/healthz` answers 200 while every loop the process has named turned within its time,
   and 503 with the names of the ones that did not. The launcher's pass over the work and
   the chat channel's two loops are watched this way, and the kubelet restarts a process
-  whose loop stands. The console, the proxy and the tools are probed on their own ports.
+  whose loop stands. The console, the proxy, the tools and the gateway are probed on
+  their own ports.
 - `/metrics` gives the same and what the process counts, in the text format Prometheus
   reads. The launcher adds the state of the work, read from the records at that moment
   (`platform_metrics.py`): runs by state, how long the oldest queued run has waited, runs
@@ -1567,7 +1635,7 @@ each (see "The chat channel" and "Trouble with the work").
 
 Each alert rule in `deploy/monitoring/rules.yaml` names one of the sections below. The
 commands assume `kubectl` for the cluster; `<process>` is one of `console`, `launcher`,
-`egress`, `tools`, `chat`.
+`egress`, `tools`, `gateway`, `chat`.
 
 ### A process is down or restarts
 
@@ -1604,7 +1672,7 @@ kubectl -n engineering-control logs engineering-control-postgres-1 --tail=50
 - The pod is not running: the operator (CloudNativePG, in its own namespace) brings it
   back; its events say why it cannot (most often the node or the volume).
 - The pod runs and the platform still cannot connect: the password changed because the
-  cluster was created again. Restart the five deployments ("Replacing a database").
+  cluster was created again. Restart the six deployments ("Replacing a database").
 - Runs under way are not lost while the database is away: the launcher's passes fail and
   go on when it is back, and the sandboxes' pods keep running meanwhile.
 

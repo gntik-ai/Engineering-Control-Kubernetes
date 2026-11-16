@@ -49,6 +49,7 @@ const SETTING_NAMES: Record<string, string> = {
   with_change: 'Give it the collected change',
   with_files: 'Give it the files read',
   agent: 'Agent',
+  paid: 'Paid by',
   part: 'Part',
   steps: 'Steps of the loop at most',
   dollars: 'US dollars for models asked over an API',
@@ -63,6 +64,11 @@ const SETTING_NAMES: Record<string, string> = {
   over: 'The list it goes through',
   max: 'Entries at most',
   tokens: 'Tokens',
+};
+/** What a choice of a setting is called, where its own word would not say enough. */
+const CHOICE_NAMES: Record<string, string> = {
+  'paid:subscription': 'The subscription',
+  'paid:api': 'An API key, through the gateway',
 };
 export const settingName = (name: string) =>
   SETTING_NAMES[name] ?? name.replace(/_/g, ' ').replace(/^./, (first) => first.toUpperCase());
@@ -294,7 +300,7 @@ export function Setting({
   } else {
     items = param.choices.map((choice) => ({
       value: choice,
-      label: API_PROVIDER_NAMES[choice] ?? choice.replace(/_/g, ' '),
+      label: CHOICE_NAMES[`${param.name}:${choice}`] ?? API_PROVIDER_NAMES[choice] ?? choice.replace(/_/g, ' '),
     }));
     chosen = String(value ?? '');
   }

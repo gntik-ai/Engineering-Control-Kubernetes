@@ -1,5 +1,5 @@
 # Every process of the platform says how it is doing on its port "health" (health.py).
-# The supervisor's tools have no such port and are left out by it.
+# The supervisor's tools and the gateway have no such port and are left out by it.
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:

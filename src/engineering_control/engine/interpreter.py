@@ -413,6 +413,9 @@ class Engine:
             given["loops"] = to.loops
         if to.each:
             given["each"] = to.each
+        if TASKS[following.task].account and following.params.get("paid") == "api":
+            # The step's client is paid by an API key: it is given an account with one.
+            given["paid"] = "api"
         ran = {**(item.run_data.get("ran") or {}), **(data.get("ran") or {})}
         provider = routing.provider_for(
             following, ran, again=to.again, agents=await self._agents(document)

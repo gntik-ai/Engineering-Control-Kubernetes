@@ -46,6 +46,7 @@ from engineering_control.engine.library import (
 )
 from engineering_control.engine.records import in_force
 from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
+from engineering_control.models.providers import API_KEYS, FAMILY_OF, cost_of
 from engineering_control.sandbox import deliver
 from engineering_control.sandbox.pods import BENCH_PREFIX, identity_secret
 
@@ -56,6 +57,8 @@ FINISHED: Final = ("succeeded", "failed", "cancelled")
 MAX_LOG_CHARACTERS: Final = 400_000
 # Clients that renew their sign-in in place need a volume of the account's own.
 KEEPS_HOME: Final = frozenset({"chatgpt"})
+# Whose API key pays for which client.
+API_OF: Final = {"claude": "anthropic", "chatgpt": "openai"}
 
 
 @dataclass(frozen=True)
@@ -81,12 +84,17 @@ class StepWork:
 @dataclass(frozen=True)
 class Lease:
     account_id: UUID
+    # The client that works in the sandbox: claude or chatgpt.
     provider: str
     generation: int
+    # For an account with an API key: the provider whose key it is. The client is then
+    # not given a sign-in but the gateway's address and a grant for the step.
+    api: str | None = None
+    gateway: dict[str, str] | None = None
 
     @property
     def keeps_home(self) -> bool:
-        return self.provider in KEEPS_HOME
+        return self.api is None and self.provider in KEEPS_HOME
 
 
 def _when(value: datetime | None) -> str | None:
@@ -832,6 +840,12 @@ class Runs:
             # it would rather have.
             wanted = [name for name in step.provider.split(",") if name]
             preferred = str((step.input or {}).get("prefer_account") or "")
+            # A step that is paid by an API key takes an account with a key of the
+            # company whose client works: Anthropic's for Claude, OpenAI's for ChatGPT.
+            paid_by_key = (step.input or {}).get("paid") == "api"
+            accounts = (
+                [API_OF[name] for name in wanted if name in API_OF] if paid_by_key else wanted
+            )
             # An account that is the supervisor's own is given to no other work.
             run = session.get(SandboxRun, step.run_id)
             latest = session.scalar(
@@ -855,7 +869,6 @@ class Runs:
                 .outerjoin(using, using.c.account_id == ProviderAccount.id)
                 .where(
                     ProviderAccount.archived_at.is_(None),
-                    ProviderAccount.provider.in_(wanted),
                     ProviderAccount.credential_generation > 0,
                 )
                 .order_by(ProviderAccount.last_used_at.is_not(None), ProviderAccount.last_used_at)
@@ -863,9 +876,14 @@ class Runs:
             )
             if step.account_id is not None:
                 query = query.where(ProviderAccount.id == step.account_id)
+            else:
+                query = query.where(ProviderAccount.provider.in_(accounts))
             candidates = sorted(
                 session.execute(query).all(),
-                key=lambda row: (str(row[0].id) != preferred, wanted.index(row[0].provider)),
+                key=lambda row: (
+                    str(row[0].id) != preferred,
+                    accounts.index(row[0].provider) if row[0].provider in accounts else 0,
+                ),
             )
             spent = _spent_accounts(session, now)
             for account, running in candidates:
@@ -888,11 +906,43 @@ class Runs:
                 if running >= account.max_concurrent:
                     continue
                 step.account_id = account.id
-                step.provider = account.provider
+                # The step is the client's, whoever pays: what works in the sandbox is
+                # Claude Code or Codex, and the rules go by whose model that is.
+                client = FAMILY_OF.get(account.provider, account.provider)
+                step.provider = client
                 account.last_used_at = now
                 session.flush()
-                return Lease(account.id, account.provider, account.credential_generation)
+                return Lease(
+                    account.id,
+                    client,
+                    account.credential_generation,
+                    api=account.provider if account.provider in API_KEYS else None,
+                )
         return None
+
+    def paid_by_key(
+        self, step_id: UUID, used: dict[str, Any], client_cost: float | None = None
+    ) -> dict[str, Any]:
+        """What a step's client used, with whose key paid for it and what that cost: what
+        the client itself worked out, or else the account's prices for the model the
+        step named. Unchanged for a step on a subscription, which is not paid by the token."""
+        with self.sessions() as session:
+            step = session.get(SandboxStep, step_id)
+            account = (
+                session.get(ProviderAccount, step.account_id)
+                if step is not None and step.account_id is not None
+                else None
+            )
+            if step is None or account is None or account.provider not in API_KEYS:
+                return used
+            paid = {**used, "provider": account.provider, "account": account.name}
+            cost = client_cost
+            if cost is None:
+                model = str(((step.input or {}).get("model") or {}).get("model") or "")
+                cost = cost_of(account.prices, model, used) if model else None
+            if cost is not None:
+                paid["cost"] = cost
+            return paid
 
     def step_started(self, step_id: UUID, pod_name: str | None) -> None:
         """The step is under way: in the sandbox of that name, or, for a step that asks

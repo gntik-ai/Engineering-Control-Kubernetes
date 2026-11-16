@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     supervisor_tools_url: str | None = Field(
         default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
     )
+    # The gateway (deploy/base/gateway.yaml): where it listens, and where the launcher
+    # tells a client that is paid by an API key to find it, by address.
+    gateway_host: str = "127.0.0.1"
+    gateway_port: int = Field(default=8794, ge=1024, le=65535)
+    gateway_url: str | None = Field(
+        default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
+    )
     # How many steps may run in sandboxes at the same time, over all runs.
     sandbox_parallel_steps: int = Field(default=4, ge=1, le=32)
     sandbox_pull_secret: str = Field(
@@ -165,6 +172,8 @@ class Settings(BaseSettings):
             raise ValueError("the sandboxes' proxy cannot bind to every interface")
         if self.supervisor_tools_host in every_interface:
             raise ValueError("the supervisor's tool service cannot bind to every interface")
+        if self.gateway_host in every_interface:
+            raise ValueError("the gateway cannot bind to every interface")
         if self.health_host in every_interface:
             raise ValueError("the health listener cannot bind to every interface")
         return self

@@ -67,6 +67,32 @@ spec:
         - protocol: TCP
           port: 8790
 ---
+# The sandbox of a step whose client is paid by an API key may also reach the platform's
+# gateway, which holds the key and sends the client's requests on to its provider.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-client
+  namespace: engineering-control-sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      engineering-control/gateway: client
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: engineering-control
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: engineering-control
+              app.kubernetes.io/component: gateway
+      ports:
+        - protocol: TCP
+          port: 8794
+---
 # The workbench of a run: the one sandbox that is reached from outside, and only by the
 # launcher, which hands it its jobs on this port. It still reaches nothing itself.
 apiVersion: networking.k8s.io/v1

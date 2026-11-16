@@ -55,3 +55,7 @@ data:
   # the launcher tells a turn of the supervisor to find it, again by address.
   ENGINEERING_SUPERVISOR_TOOLS_HOST: 0.0.0.0
   ENGINEERING_SUPERVISOR_TOOLS_URL: http://engineering-control-tools:8790
+  # The gateway (deploy/base/gateway.yaml): where it listens, and where the launcher tells
+  # the client of a step that is paid by an API key to find it, again by address.
+  ENGINEERING_GATEWAY_HOST: 0.0.0.0
+  ENGINEERING_GATEWAY_URL: http://engineering-control-gateway:8794

@@ -42,6 +42,7 @@ engineering-launcher = "engineering_control.sandbox.launcher:run"
 engineering-egress = "engineering_control.sandbox.egress:run"
 engineering-tools = "engineering_control.supervisor.service:run"
 engineering-chat = "engineering_control.chat.service:run"
+engineering-gateway = "engineering_control.gateway.service:run"
 engineering-ctl = "engineering_control.cli:main"
 
 [tool.hatch.build.targets.wheel]

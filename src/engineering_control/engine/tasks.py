@@ -40,6 +40,7 @@ from engineering_control.engine.summaries import Summaries
 from engineering_control.github_app import ChangedFile, GitHubApp, GitHubAppError
 from engineering_control.sandbox import audit, deliver, discover, steps
 from engineering_control.sandbox.flows import Checkouts, End, Plan, why_no_answer
+from engineering_control.sandbox.pods import GATEWAY_LABEL
 from engineering_control.sandbox.runs import Lease, Runs, StepWork
 
 # What the branch of a run that publishes nothing is called after.
@@ -250,7 +251,12 @@ def _agent(ctx: Context, lease: Lease | None, job: dict[str, Any]) -> Plan:
     if lease is not None and (chosen.get("model") or chosen.get("effort")):
         # Which model the agent was started with: traceable like the prompt's wording.
         ctx.model_used = {"provider": lease.provider, **chosen}
-    return Plan(job, workspace=True, memory="6Gi", deadline_seconds=seconds + 600)
+    labels: dict[str, str] = {}
+    if lease is not None and lease.gateway is not None:
+        # Paid by an API key: the client reaches its provider through the gateway.
+        job = deliver.through_gateway(job, lease.provider, lease.gateway)
+        labels = dict(GATEWAY_LABEL)
+    return Plan(job, workspace=True, memory="6Gi", deadline_seconds=seconds + 600, labels=labels)
 
 
 def _reader(ctx: Context, lease: Lease | None, prompt: str, schema: dict[str, Any]) -> Plan:

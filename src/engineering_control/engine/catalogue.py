@@ -1056,8 +1056,18 @@ AGENT: Final = Param(
     "with the task, and what the task leaves open (the subscriptions, the model, the "
     "time) comes from it. None: the task as it is set here.",
 )
+PAID: Final = Param(
+    "paid",
+    "choice",
+    "subscription",
+    "What the agent's work is paid by: the subscription its client is signed in to, or "
+    "an API key, by the token. With a key the client reaches its provider through the "
+    "platform's gateway and is never given the key: Anthropic's for Claude, OpenAI's "
+    "for ChatGPT.",
+    choices=("subscription", "api"),
+)
 TASKS: Final = {
-    task.key: replace(task, params=(*task.params, AGENT))
+    task.key: replace(task, params=(*task.params, *((PAID,) if task.account else ()), AGENT))
     if task.account or task.where == "model"
     else task
     for task in _TASKS

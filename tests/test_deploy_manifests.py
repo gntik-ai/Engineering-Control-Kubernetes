@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from engineering_control.config import Settings
+from engineering_control.sandbox.pods import GATEWAY_LABEL
 
 BASE = Path(__file__).parents[1] / "deploy" / "base"
 IMAGE = "engineering-control"  # the placeholder kustomization.yaml pins to a commit
@@ -165,7 +166,13 @@ def test_the_sandbox_namespace_refuses_privileged_pods_and_all_traffic() -> None
     policies = {d["metadata"]["name"]: d["spec"] for d in documents if d["kind"] == "NetworkPolicy"}
     # The fourth, the way in to a run's workbench for the launcher alone, is looked at in
     # tests/test_workbench.py.
-    assert set(policies) == {"deny-everything", "egress-internet", "supervisor-tools", "workbench"}
+    assert set(policies) == {
+        "deny-everything",
+        "egress-internet",
+        "supervisor-tools",
+        "gateway-client",
+        "workbench",
+    }
     assert policies["deny-everything"] == {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
     # A step that may reach out reaches the platform's proxy and nothing else: no name
     # server, no public address, nothing of the cluster. Nothing is ever let in.
@@ -483,6 +490,91 @@ def test_only_a_turn_of_the_supervisor_reaches_the_tool_service_from_outside() -
         Settings(supervisor_tools_host="0.0.0.0")  # noqa: S104 - refused outside a cluster
 
 
+def test_only_a_step_paid_by_a_key_reaches_the_gateway_which_holds_two_keys_and_no_more() -> None:
+    documents = _documents()
+    labels = {
+        "app.kubernetes.io/name": "engineering-control",
+        "app.kubernetes.io/component": "gateway",
+    }
+    client = {"matchLabels": {"engineering-control/gateway": "client"}}
+    [policy] = [
+        d["spec"]
+        for d in documents
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "gateway"
+    ]
+    assert policy["podSelector"] == {"matchLabels": labels}
+    assert policy["policyTypes"] == ["Ingress"]
+    assert policy["ingress"] == [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": SANDBOX_NAMESPACE}
+                    },
+                    "podSelector": client,
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 8794}],
+        }
+    ]
+    # From the sandbox's side: the same door, for the same label, and nothing wider.
+    [way] = [
+        d["spec"]
+        for d in _sandbox_documents()
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "gateway-client"
+    ]
+    assert way["podSelector"] == client and way["policyTypes"] == ["Egress"]
+    assert way["egress"] == [
+        {
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": "engineering-control"}
+                    },
+                    "podSelector": {"matchLabels": labels},
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 8794}],
+        }
+    ]
+    assert GATEWAY_LABEL == client["matchLabels"]
+    # The service: the platform's image, the database, no identity towards the cluster,
+    # and of the platform's keys the two it works with.
+    [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-gateway")]
+    assert name == "Deployment/engineering-control-gateway"
+    assert spec["automountServiceAccountToken"] is False
+    [container] = spec["containers"]
+    assert container["command"] == ["engineering-gateway"]
+    assert container["ports"] == [{"name": "gateway", "containerPort": 8794}]
+    assert {entry["name"] for entry in container["env"]} == {
+        "DATABASE_USER",
+        "DATABASE_PASSWORD",
+        "ENGINEERING_DATABASE_URL",
+    }
+    [secret] = [volume["secret"] for volume in spec["volumes"] if "secret" in volume]
+    assert secret["secretName"] == "engineering-control-secrets"
+    assert [item["key"] for item in secret["items"]] == ["egress-grant.key", "model-keys.key"]
+    service = next(
+        d
+        for d in documents
+        if d["kind"] == "Service" and d["metadata"]["name"] == "engineering-control-gateway"
+    )
+    assert service["spec"]["selector"] == labels
+    assert service["spec"]["ports"] == [{"name": "gateway", "port": 8794, "targetPort": "gateway"}]
+    data = next(
+        d["data"]
+        for d in documents
+        if d["kind"] == "ConfigMap" and "ENGINEERING_DASHBOARD_HOST" in d["data"]
+    )
+    settings = Settings(
+        network_boundary="cluster",
+        gateway_host=data["ENGINEERING_GATEWAY_HOST"],
+        gateway_url=data["ENGINEERING_GATEWAY_URL"],
+    )
+    assert settings.gateway_url == "http://engineering-control-gateway:8794"
+    assert settings.gateway_port == 8794
+
+
 def test_the_chat_channel_reads_alone_holds_the_bots_token_and_has_no_listener() -> None:
     documents = _documents()
     [(name, spec)] = [(n, s) for n, s in _pod_specs() if n.endswith("-chat")]
@@ -542,7 +634,7 @@ def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
         for d in documents
         if d["kind"] == "NetworkPolicy"
         # The two a sandbox may reach have tests of their own.
-        and d["metadata"]["name"] not in {"egress-proxy", "supervisor-tools"}
+        and d["metadata"]["name"] not in {"egress-proxy", "supervisor-tools", "gateway"}
     ]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]

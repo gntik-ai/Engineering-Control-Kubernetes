@@ -133,3 +133,30 @@ spec:
       ports:
         - protocol: TCP
           port: 8790
+---
+# The gateway is reached, from outside the namespace, only by the sandbox of a step whose
+# client is paid by an API key (the label engineering-control/gateway: client), and each
+# request still needs that step's grant.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: engineering-control-sandboxes
+          podSelector:
+            matchLabels:
+              engineering-control/gateway: client
+      ports:
+        - protocol: TCP
+          port: 8794

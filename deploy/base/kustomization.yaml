@@ -15,6 +15,7 @@ resources:
   - launcher.yaml
   - egress.yaml
   - tools.yaml
+  - gateway.yaml
   - chat.yaml
   - ingress.yaml
 labels:

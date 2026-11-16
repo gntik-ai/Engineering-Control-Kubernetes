@@ -52,6 +52,11 @@ class Sandboxes:
     proxy: str | None = None
 
 
+# What the sandbox of a step that is paid by an API key carries: it may reach the
+# platform's gateway, and nothing else of the control plane.
+GATEWAY_LABEL: Final = {"engineering-control/gateway": "client"}
+
+
 @dataclass(frozen=True)
 class AccountMount:
     """The account leased to a step: its sign-in, and for a client that renews its sign-in

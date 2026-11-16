@@ -1,0 +1,138 @@
+# The gateway: how the client of an agent (Claude Code, Codex) in a sandbox is paid by an
+# API key without ever holding it. A step that is set to be paid by a key gets the
+# gateway's address and a grant for that one step; the gateway checks the grant, checks
+# that the step still runs, opens the account's sealed key and sends the request on to the
+# provider (api.anthropic.com or api.openai.com, and no other address) with the key in
+# place of the grant (src/engineering_control/gateway/service.py).
+#
+# It has the platform's database, which it only reads, the key that opens API keys and the
+# key that signs grants. It has no identity towards the cluster. From outside the control
+# plane only the sandbox of a step that is paid by a key can reach it (network-policy.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineering-control-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
+      containers:
+        - name: gateway
+          image: engineering-control
+          command: ["engineering-gateway"]
+          ports:
+            - name: gateway
+              containerPort: 8794
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 160Mi
+            limits:
+              memory: 384Mi
+          volumeMounts:
+            - name: secrets
+              mountPath: /var/run/secrets/engineering-control
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Of the platform's keys, only the two the gateway works with.
+        - name: secrets
+          secret:
+            secretName: engineering-control-secrets
+            defaultMode: 0440
+            items:
+              - key: egress-grant.key
+                path: egress-grant.key
+              - key: model-keys.key
+                path: model-keys.key
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: engineering-control-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: gateway
+      port: 8794
+      targetPort: gateway

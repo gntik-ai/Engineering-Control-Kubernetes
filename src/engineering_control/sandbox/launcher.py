@@ -36,6 +36,7 @@ from engineering_control.engine.interpreter import Engine
 from engineering_control.engine.records import FlowRecords
 from engineering_control.engine.summaries import Summaries
 from engineering_control.flow_library import EVALUATION, WORK_KINDS
+from engineering_control.gateway.grants import issue as issue_grant
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
@@ -144,6 +145,7 @@ class Launcher:
         parallel_steps: int = 4,
         conversation: Conversation | None = None,
         tools_url: str | None = None,
+        gateway_url: str | None = None,
         queues: Queues | None = None,
         backlog: BacklogItems | None = None,
         grant_key: bytes | None = None,
@@ -161,6 +163,7 @@ class Launcher:
         self._questions: dict[UUID, Question] = {}
         # What a step's grant to reach a project's own application is signed with.
         self.grant_key = grant_key
+        self.gateway_url = gateway_url
         self.runs = runs
         self.cluster = cluster
         self.sandboxes = sandboxes
@@ -542,14 +545,39 @@ class Launcher:
         if item.provider is not None:
             lease = await asyncio.to_thread(self.runs.lease, item.step_id)
             if lease is None:
+                by_key = (item.input or {}).get("paid") == "api"
                 await asyncio.to_thread(
                     self.runs.step_waiting,
                     item.step_id,
-                    "Waiting for an account that is signed in and free.",
+                    "Waiting for an account with an API key of the client's own provider "
+                    "(Anthropic's for Claude, OpenAI's for ChatGPT) that is ready and free."
+                    if by_key
+                    else "Waiting for an account that is signed in and free.",
                 )
                 return
         account = None
-        if lease is not None:
+        if lease is not None and lease.api is not None:
+            # An account with an API key has no sign-in to mount. The client is told
+            # where the gateway is and given a grant for this step; the key stays here.
+            address = await self._address(self.gateway_url)
+            if address is None or self.grant_key is None:
+                await self._fail_step(
+                    item,
+                    "not_started",
+                    "This installation has no gateway for clients that are paid by an API "
+                    "key: set the task to be paid by the subscription.",
+                )
+                return
+            lease = dataclasses.replace(
+                lease,
+                gateway={
+                    "url": address,
+                    "grant": issue_grant(
+                        self.grant_key, account_id=lease.account_id, step_id=item.step_id
+                    ),
+                },
+            )
+        elif lease is not None:
             account = pods.AccountMount(lease.account_id, lease.keeps_home)
             if account.keeps_home:
                 await self.cluster.create_claim(
@@ -642,6 +670,12 @@ class Launcher:
         if item.provider and commands:
             used = deliver.agent_usage(item.provider, commands)
             if used is not None:
+                # What the client worked its conversation out to cost is a price only
+                # for an account that is paid by the token.
+                client_cost = used.pop("client_cost", None)
+                used = await asyncio.to_thread(
+                    self.runs.paid_by_key, item.step_id, used, client_cost
+                )
                 await asyncio.to_thread(self.runs.note_usage, item.step_id, used)
         result = await self.flows[item.run_kind].conclude(item, commands, log)
         verdict = result.verdict
@@ -792,6 +826,7 @@ async def serve(settings: Settings | None = None) -> None:
         parallel_steps=resolved.sandbox_parallel_steps,
         conversation=Conversation(sessions, Definitions(sessions)),
         tools_url=resolved.supervisor_tools_url,
+        gateway_url=resolved.gateway_url,
         queues=Queues(sessions, runs, Budgets(sessions)),
         backlog=BacklogItems(sessions),
         grant_key=read_grant_key(resolved.sandbox_egress_grant_key_file),
