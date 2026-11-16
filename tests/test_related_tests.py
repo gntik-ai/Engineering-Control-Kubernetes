@@ -224,6 +224,54 @@ def test_the_related_tests_run_and_say_what_failed(shop: dict[str, Any]) -> None
     assert slow["passed"] is False
 
 
+def test_a_flow_can_say_how_the_related_tests_are_run(shop: dict[str, Any]) -> None:
+    tools, root = shop["tools"], shop["root"]
+    python = str(root / "svc" / ".venv" / "bin" / "python")
+    asked = {
+        "paths": ["svc/app/price.py", "web/src/cart.mjs"],
+        "seconds": 120,
+        "commands": [
+            # Something to do first, whatever the tests are.
+            {"argv": ["sh", "-c", "echo built > built.txt"], "cwd": "."},
+            # A command in a folder is given the tests of that folder, as it names them.
+            {
+                "argv": [python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "{files}"],
+                "cwd": "svc",
+            },
+            {"argv": ["sh", "-c", "node --test {files} && echo ran {files}"], "cwd": "web"},
+            # No related test is in this folder: the command is left out.
+            {"argv": ["false", "{files}"], "cwd": "ui"},
+        ],
+    }
+    answer = tools.tests(asked)
+    assert (root / "built.txt").read_text() == "built\n"
+    assert answer["passed"] is True and answer["unrunnable"] == []
+    assert [(run["folder"], run["files"], run["exit_code"]) for run in answer["ran"]] == [
+        ("", 0, 0),
+        ("svc", 2, 0),
+        ("web", 1, 0),
+    ]
+    assert (
+        answer["ran"][1]["line"] == f"[svc] {python} -m pytest -q -p no:cacheprovider '{{files}}'"
+    )
+    assert "2 passed" in answer["ran"][1]["said"]
+    assert answer["ran"][2]["said"].rstrip().endswith("ran src/cart.test.mjs")
+    assert {run["runner"] for run in answer["ran"]} == {"the flow's own command"}
+
+    # The first command that fails ends it: a build that fails leaves nothing to test.
+    asked["commands"] = [
+        {"argv": ["sh", "-c", "echo no build; exit 3"], "cwd": "."},
+        *asked["commands"],
+    ]
+    failed = tools.tests(asked)
+    (only,) = failed["ran"]
+    assert only["exit_code"] == 3 and "no build" in only["said"] and failed["passed"] is False
+    # With nothing to test, nothing is run, a build included.
+    (root / "built.txt").unlink()
+    nothing = tools.tests({**asked, "paths": ["README.md"]})
+    assert nothing["ran"] == [] and nothing["passed"] is None and not (root / "built.txt").exists()
+
+
 @pytest.mark.skipif(shutil.which("go") is None, reason="Go is not installed here")
 def test_a_go_test_runs_for_its_package(shop: dict[str, Any]) -> None:
     answer = shop["tools"].tests({"paths": ["go/pkg/price/price.go"], "seconds": 120})
@@ -257,7 +305,7 @@ def test_the_task_and_where_it_stands_in_a_flow() -> None:
     kind = TASKS["code.tests"]
     assert (kind.where, kind.account, kind.writes) == ("bench", False, False)
     assert kind.outcomes == ("passed", "failed", "none")
-    assert [param.name for param in kind.params] == ["paths", "limit", "minutes"]
+    assert [param.name for param in kind.params] == ["paths", "limit", "commands", "minutes"]
     assert validate.errors(parse(_checking())) == []
     # It is not the tests a change has to pass: a flow that has only these is refused.
     raw = _checking()

@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -742,14 +743,66 @@ def _run(argv: list[str], folder: str, seconds: float) -> dict[str, Any]:
     }
 
 
+def _own(commands: list[dict[str, Any]], found: list[str], deadline: float) -> list[dict[str, Any]]:
+    """Run the related tests with the commands a flow names for them, in order, up to the
+    first that fails. ``{files}`` in a command stands for the test files; a command in a
+    folder is given the ones in that folder, and is left out when there are none."""
+    ran: list[dict[str, Any]] = []
+    for command in commands:
+        folder = str(command.get("cwd") or "").strip("/")
+        folder = "" if folder == "." else folder
+        argv = [str(part) for part in command.get("argv") or []]
+        wants = any("{files}" in part for part in argv)
+        inside = [
+            os.path.relpath(test, folder) if folder else test
+            for test in found
+            if not folder or test.startswith(folder + "/")
+        ]
+        if not argv or (wants and not inside):
+            continue
+        filled: list[str] = []
+        for part in argv:
+            if part == "{files}":
+                filled += inside
+            else:
+                filled.append(part.replace("{files}", shlex.join(inside)))
+        line = shlex.join(argv)
+        group: dict[str, Any] = {
+            "runner": "the flow's own command",
+            "folder": folder,
+            "files": len(inside) if wants else 0,
+            "line": (f"[{folder}] {line}" if folder else line)[:600],
+        }
+        left = deadline - time.monotonic()
+        if left < 5:
+            ran.append({**group, "exit_code": None, "seconds": 0.0, "timed_out": True, "said": ""})
+            break
+        allowed = min(left, float(command.get("timeout") or left))
+        ran.append({**group, **_run(filled, folder, allowed)})
+        if ran[-1]["exit_code"] != 0:
+            break
+    return ran
+
+
 def tests(question: dict[str, Any]) -> dict[str, Any]:
-    """Find the tests that cover what was changed and run them, each kind by the
-    repository's own runner."""
+    """Find the tests that cover what was changed and run them: with the commands the
+    flow names for it, or each kind by the repository's own runner."""
     files: dict[str, dict[str, Any]] = index()["files"]
     named = [str(path) for path in question.get("paths") or []]
     changed = named or changed_since(str(question.get("base") or ""))
     limit = max(1, min(int(question.get("limit") or 20), 60))
     related = related_tests(changed, files, limit)
+    deadline = time.monotonic() + max(5, int(question.get("seconds") or 600))
+    own = [command for command in question.get("commands") or [] if isinstance(command, dict)]
+    if own:
+        ran_own = _own(own, [entry["path"] for entry in related], deadline) if related else []
+        return {
+            "changed": changed[:200],
+            "tests": related,
+            "ran": ran_own,
+            "unrunnable": [],
+            "passed": all(run["exit_code"] == 0 for run in ran_own) if ran_own else None,
+        }
     groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
     unrunnable: list[dict[str, str]] = []
     for entry in related:
@@ -761,7 +814,6 @@ def tests(question: dict[str, Any]) -> dict[str, Any]:
         listed = groups.setdefault((runner, folder, tuple(argv)), [])
         if given not in listed:
             listed.append(given)
-    deadline = time.monotonic() + max(5, int(question.get("seconds") or 600))
     ran: list[dict[str, Any]] = []
     for (name, where, command), listed in groups.items():
         left = deadline - time.monotonic()

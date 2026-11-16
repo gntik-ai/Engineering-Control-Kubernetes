@@ -553,6 +553,15 @@ _TASKS: Final = (
             ),
             Param("limit", "int", 20, "How many test files are run at most.", low=1, high=60),
             Param(
+                "commands",
+                "commands",
+                [],
+                "How the related tests are run, when the repository's own runner is not "
+                "enough: commands, one on each line, run in order up to the first that "
+                "fails. {files} stands for the test files. None: the runner is found "
+                "from the repository.",
+            ),
+            Param(
                 "minutes",
                 "int",
                 10,

@@ -273,6 +273,14 @@ class RelatedTests:
             "limit": int(ctx.params.get("limit") or 20),
             "seconds": minutes * 60,
         }
+        named = ctx.params.get("commands")
+        if isinstance(named, list) and named:
+            # The flow says how the related tests are run: a build first, a runner the
+            # repository does not name.
+            question["commands"] = [
+                {"argv": list(command.argv), "cwd": command.cwd, "timeout": command.timeout}
+                for command in deliver.commands_of(named)
+            ]
         job = tool_job(
             "tests", question, max_bytes=600_000, seconds=minutes * 60 + 60, env=deliver.TOOLS
         )
@@ -301,7 +309,7 @@ class RelatedTests:
                 else f"None of the {len(related)} related tests can be run here."
             )
             return Done("none", "no_tests", _words(why + said_left, 600), output=found)
-        files = sum(int(entry.get("files") or 0) for entry in ran)
+        files = len(related) - len(left)
         failed = [entry for entry in ran if entry.get("exit_code") != 0]
         if not failed:
             return Done(

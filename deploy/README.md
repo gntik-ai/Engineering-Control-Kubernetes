@@ -659,6 +659,15 @@ configured:
 | `*.mjs`, `*.js`, `*.cjs` otherwise | `node --test` | the repository |
 | `*_test.go` | `go test` on the test's package | the folder of its `go.mod` |
 
+Where that is not enough (tests that need a build first, a runner the repository does
+not name), the task's setting Commands says how they are run: commands, one on each
+line, run in order up to the first that fails, with `{files}` where the test files go.
+A command in a folder (`[apps/web] npx vitest run {files}`) is given the tests of that
+folder, named from there, and is left out when none of the related tests is in it. A
+command without `{files}` is run as it is, whatever the tests: `pnpm run build`, then
+`node --test {files}`. The setting is the flow's; a project has no setting of its own
+for this yet.
+
 A test whose runner is not installed, or of a kind the task does not know (a
 TypeScript test in a package that names no runner, Playwright, a shell test), is not
 run and is named with the reason. The task ends `passed`, `failed` (what the failing
