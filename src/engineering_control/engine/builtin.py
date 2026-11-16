@@ -345,6 +345,55 @@ COMMANDS_CHECK: Final = parse(
 )
 
 
+def summarise_code(
+    *,
+    provider: str,
+    model: str,
+    agent: str = "",
+    steps: int = 20,
+    dollars: int = 5,
+    tests: bool = False,
+) -> Document:
+    """What summarising a project's code runs: the clone, then batch after batch picked
+    and summarised by the model that is named, until none is left, the run has been
+    round as often as it may, or it has cost what it may. It is no flow of the library:
+    a run that summarises carries it."""
+    asked: dict[str, Any] = {"provider": provider, "model": model}
+    if agent:
+        asked["agent"] = agent
+    return parse(
+        {
+            "format": FORMAT,
+            "key": "summarise-code",
+            "name": "Summarise the code",
+            "summary": "Ask a model what each file of the project's code is for, and keep "
+            "the answers with the project for the runs that look for files.",
+            "start": "prepare",
+            "tasks": [
+                {
+                    "id": "prepare",
+                    "task": "workspace.clone",
+                    "with": {"history": 0},
+                    "next": {"ok": "pick"},
+                },
+                {
+                    "id": "pick",
+                    "task": "code.digest",
+                    "with": {"steps": steps, "tests": tests},
+                    "next": {"files": "summarise"},
+                },
+                {
+                    "id": "summarise",
+                    "task": "model.summarise",
+                    "with": asked,
+                    "next": {"written": "pick", "nothing": "pick"},
+                },
+            ],
+            "budgets": {"minutes": 240, "dollars": dollars},
+        }
+    )
+
+
 # --- starters ------------------------------------------------------------------------------
 #
 # Flows to begin from, in which a model asked over an API does the work an agent in a

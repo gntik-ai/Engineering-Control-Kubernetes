@@ -455,6 +455,18 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
 
     for path in named_paths(text, files):
         add(path, 50.0, "the question names it")
+    # What the summaries of the files say, where the platform has summaries: a file whose
+    # summary speaks of what is asked counts, whatever its own words are.
+    for hint in question.get("hints") or []:
+        if not isinstance(hint, dict) or hint.get("path") not in files:
+            continue
+        said = ", ".join(str(term) for term in (hint.get("terms") or [])[:3])
+        try:
+            amount = max(0.0, min(float(hint.get("score") or 0), 12.0))
+        except (TypeError, ValueError):
+            continue
+        if amount and files[str(hint["path"])]["lang"]:
+            add(str(hint["path"]), amount, f"its summary speaks of {said}")
     used: list[dict[str, Any]] = []
     for term in terms_of(text):
         counts: dict[str, int] = {}
@@ -543,6 +555,7 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
         "files": [
             {
                 "path": path,
+                "hash": files[path]["hash"],
                 "score": round(scores.get(path, 0.0), 2),
                 "lines": files[path].get("lines", 0),
                 "test": files[path]["test"],
@@ -554,6 +567,64 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
         "indexed": document["summary"],
         # How many commits said which files change together; none when the clone read none.
         "history": commits,
+    }
+
+
+# --- what is left to summarise ----------------------------------------------------------------
+
+
+def digest(question: dict[str, Any]) -> dict[str, Any]:
+    """Pick the next files to summarise: code that has no summary of what it now says,
+    the files most of the code imports first. ``known`` says which content each file's
+    summary was written from. With ``stop``, nothing is picked and only the count is said."""
+    files: dict[str, dict[str, Any]] = index()["files"]
+    said = question.get("known")
+    known: dict[str, Any] = said if isinstance(said, dict) else {}
+    with_tests = bool(question.get("tests"))
+    wanted = {
+        path: entry
+        for path, entry in files.items()
+        if entry["lang"] and (with_tests or not entry["test"]) and entry.get("lines", 0) >= 3
+    }
+    users: dict[str, int] = {}
+    for entry in files.values():
+        for target in entry.get("imports", []):
+            users[target] = users.get(target, 0) + 1
+    waiting = sorted(
+        (path for path, entry in wanted.items() if known.get(path) != entry["hash"]),
+        key=lambda path: (-users.get(path, 0), path),
+    )
+    picked: list[dict[str, Any]] = []
+    if not question.get("stop"):
+        limit = max(1, min(int(question.get("limit") or 12), 40))
+        lines = max(20, min(int(question.get("lines") or 300), 2000))
+        budget = max(2000, min(int(question.get("characters") or 60_000), 400_000))
+        used = 0
+        for path in waiting:
+            if len(picked) >= limit:
+                break
+            rows = _text(path).splitlines()
+            shown = "\n".join(rows[:lines])[:budget]
+            if picked and used + len(shown) > budget:
+                continue
+            used += len(shown)
+            picked.append(
+                {
+                    "path": path,
+                    "hash": wanted[path]["hash"],
+                    "lines": len(rows),
+                    "shown": min(len(rows), lines),
+                    "cut": len(rows) > lines or len(shown) < len("\n".join(rows[:lines])),
+                    "text": shown,
+                }
+            )
+    return {
+        "files": picked,
+        "left": len(waiting) - len(picked),
+        "total": len(wanted),
+        "fresh": len(wanted) - len(waiting),
+        # Summarised files that are not in the repository, or are no code, any more.
+        "gone": sorted(path for path in known if path not in wanted)[:2000],
     }
 
 
@@ -1043,9 +1114,10 @@ def apply(question: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index", "apply", "tests"):
+    known = ("find", "read", "index", "apply", "tests", "digest")
+    if len(arguments) != 3 or arguments[0] not in known:
         print(
-            "usage: tools.py find|read|index|apply|tests <question.json> <answer.json>",
+            "usage: tools.py find|read|index|apply|tests|digest <question.json> <answer.json>",
             file=sys.stderr,
         )
         return 2
@@ -1059,12 +1131,14 @@ def main(arguments: list[str]) -> int:
         answer = apply(question)
     elif arguments[0] == "tests":
         answer = tests(question)
+    elif arguments[0] == "digest":
+        answer = digest(question)
     else:
         answer = {"indexed": index()["summary"]}
     os.makedirs(os.path.dirname(arguments[2]), exist_ok=True)
     with open(arguments[2], "w", encoding="utf-8") as handle:
         json.dump(answer, handle, separators=(",", ":"))
-    said = {key: value for key, value in answer.items() if key not in ("files", "ran")}
+    said = {key: value for key, value in answer.items() if key not in ("files", "ran", "gone")}
     print(json.dumps({**said, "files": len(answer.get("files", []))})[:4000])
     return 0
 

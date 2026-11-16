@@ -458,6 +458,17 @@ export interface EvaluationLab {
   candidates: ReplayCandidate[];
 }
 
+/** How much of a project's code is summarised, and which accounts could be asked for more. */
+export interface ProjectSummaries {
+  files: number;
+  /** Files that were asked about and got no summary. */
+  without: number;
+  latest: string | null;
+  models: string[];
+  accounts: { provider: string; name: string; models: string[] }[];
+  agents: { id: string; name: string }[];
+}
+
 /** What runs used: tokens their agents reported, and minutes in sandboxes. */
 export interface UsageRow {
   runs: number;

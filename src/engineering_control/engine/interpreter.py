@@ -36,6 +36,7 @@ from engineering_control.engine.bench_tasks import BENCH
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, Node, parse
+from engineering_control.engine.summaries import Summaries
 from engineering_control.engine.tasks import (
     PLATFORM,
     SANDBOX,
@@ -79,11 +80,12 @@ class Engine:
         backlog: BacklogItems | None,
         documents: Documents | None = None,
         agents: Agents | None = None,
+        summaries: Summaries | None = None,
     ) -> None:
         # The agents the administrator defined, for the tasks that name one.
         self.agents = agents
         self.runs = runs
-        self.services = Services(runs, github, backlog, Checkouts(github))
+        self.services = Services(runs, github, backlog, Checkouts(github), summaries)
         # Where a version of a flow other than the platform's own is read from.
         self.documents = documents
 

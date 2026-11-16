@@ -584,6 +584,7 @@ def test_three_tasks_look_at_code_in_the_workbench_without_an_agent() -> None:
         "code.read",
         "code.run",
         "code.tests",
+        "code.digest",
         "code.apply",
     }
 

@@ -9,10 +9,11 @@ takes part in them: each is a program with the same answer for the same input.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Final
 
-from engineering_control.engine.catalogue import TASKS
+from engineering_control.engine.catalogue import TASKS, loop_steps
 from engineering_control.engine.tasks import (
     Concluded,
     Context,
@@ -104,11 +105,17 @@ class Find:
     """Find the files the run is about, on the map of the code."""
 
     async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
-        question = {
+        question: dict[str, Any] = {
             "text": question_of(ctx),
             "limit": int(ctx.params.get("limit") or 20),
             "neighbours": bool(ctx.params.get("neighbours", True)),
         }
+        summaries = ctx.services.summaries
+        if summaries is not None and ctx.data.get("project"):
+            # What the summaries of the project's files say of what is asked.
+            question["hints"] = await asyncio.to_thread(
+                summaries.hints, str(ctx.data["project"]), question["text"]
+            )
         return _bench(tool_job("find", question, max_bytes=2_000_000))
 
     async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
@@ -117,6 +124,17 @@ class Find:
             return Failed("find_failed", f"The files could not be looked for: {found}")
         files = [entry for entry in found.get("files") or [] if isinstance(entry, dict)]
         paths = [str(entry.get("path")) for entry in files][:FOUND_KEPT]
+        summaries = ctx.services.summaries
+        if summaries is not None and ctx.data.get("project") and paths:
+            # Each file found is shown with what its summary says, so that what to read
+            # can be chosen without reading it.
+            known = await asyncio.to_thread(summaries.of, str(ctx.data["project"]), paths)
+            for entry in files:
+                has = known.get(str(entry.get("path")))
+                if has:
+                    entry["summary"] = has["summary"]
+                    if has["blob"] != entry.get("hash"):
+                        entry["summary_of"] = "an earlier version of the file"
         indexed = found.get("indexed") or {}
         mapped = (
             f" The map has {indexed.get('code', 0):,} files of code and "
@@ -256,6 +274,63 @@ class Run:
             given={
                 "failures": [f"{line(index)}\n{_tail(commands[index], 3000)}" for index in failed]
             },
+        )
+
+
+class Digest:
+    """Pick the next files to summarise: the code that has no summary of what it now
+    says. A loop goes round it: every time it is come to, it picks the next batch."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        summaries = ctx.services.summaries
+        if summaries is None or not ctx.data.get("project"):
+            raise ValueError(f"{ctx.node.id} has no project to keep summaries for")
+        count = int((ctx.given.get("loops") or {}).get(ctx.node.id) or 1)
+        question = {
+            "known": await asyncio.to_thread(summaries.known, str(ctx.data["project"])),
+            "limit": int(ctx.params.get("limit") or 12),
+            "lines": int(ctx.params.get("lines") or 300),
+            "characters": int(ctx.params.get("characters") or 60_000),
+            "tests": bool(ctx.params.get("tests", False)),
+            # The last time it may be come to, it picks nothing and says what is left.
+            "stop": count >= loop_steps(ctx.params),
+        }
+        return _bench(tool_job("digest", question, max_bytes=1_500_000))
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        found = _answer(commands, log, "digest")
+        if isinstance(found, str):
+            return Failed("digest_failed", f"The files could not be picked: {found}")
+        summaries = ctx.services.summaries
+        gone = [str(path) for path in found.get("gone") or []]
+        if summaries is not None and gone:
+            await asyncio.to_thread(summaries.forget, str(ctx.data["project"]), gone)
+        files = [entry for entry in found.get("files") or [] if isinstance(entry, dict)]
+        left, total = int(found.get("left") or 0), int(found.get("total") or 0)
+        fresh = int(found.get("fresh") or 0)
+        counted = {"left": left, "total": total, "fresh": fresh, "gone": len(gone)}
+        if not files:
+            if left == 0:
+                return Done(
+                    "none",
+                    "all_summarised",
+                    f"Every one of the {total:,} files of code has a summary of what it now says.",
+                    output=counted,
+                )
+            return Done(
+                "none",
+                "enough",
+                f"Enough for this run: {fresh:,} of {total:,} files have a summary of what "
+                f"they now say, {left:,} are still to be summarised.",
+                output=counted,
+            )
+        paths = [str(entry.get("path")) for entry in files]
+        first = ", ".join(paths[:3]) + (" and others" if len(paths) > 3 else "")
+        return Done(
+            "files",
+            "picked",
+            _words(f"{len(files)} files to summarise: {first}. {left:,} more wait.", 500),
+            output={**counted, "files": files},
         )
 
 
@@ -424,6 +499,7 @@ BENCH: Final[dict[str, SandboxTask]] = {
     "code.read": Read(),
     "code.run": Run(),
     "code.tests": RelatedTests(),
+    "code.digest": Digest(),
     "code.apply": Apply(),
 }
 assert set(BENCH) == {  # noqa: S101 - the catalogue and the code agree

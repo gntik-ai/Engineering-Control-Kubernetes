@@ -750,6 +750,28 @@ class SavedTask(UUIDPrimaryKey, Timestamps, Base):
     description: Mapped[str | None] = mapped_column(Text)
 
 
+class CodeSummary(UUIDPrimaryKey, Timestamps, Base):
+    """What a model said a file of a project's repository is for (migration 0045), with
+    the name git has for the content it read. One row a file; a file whose content has
+    another name by now is summarised again."""
+
+    __tablename__ = "code_summaries"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    path: Mapped[str] = mapped_column(String(1000))
+    blob: Mapped[str] = mapped_column(String(64))
+    # Empty when the model was asked and gave none: the file is not asked about again
+    # for the same content.
+    summary: Mapped[str] = mapped_column(Text)
+    provider: Mapped[str | None] = mapped_column(String(40))
+    model: Mapped[str | None] = mapped_column(String(120))
+    run_id: Mapped[UUID | None] = mapped_column(Uuid)
+    __table_args__ = (
+        UniqueConstraint("project_id", "path", name="uq_code_summaries_project_path"),
+    )
+
+
 class Skill(UUIDPrimaryKey, Timestamps, Base):
     """Named instructions an agent can be given (migration 0043): how something is done
     here, written once and handed to every agent that has the skill."""

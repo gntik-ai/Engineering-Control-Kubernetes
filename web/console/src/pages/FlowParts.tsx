@@ -38,6 +38,7 @@ const SETTING_NAMES: Record<string, string> = {
   instruction: 'Your instruction',
   branch: 'Branch',
   history: 'Commits of history looked at',
+  tests: 'Summarise test files as well',
   method: 'How it is merged',
   provider: 'Provider',
   model: 'Model',

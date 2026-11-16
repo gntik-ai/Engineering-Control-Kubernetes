@@ -22,8 +22,9 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import Guide
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.engine import validate as validate_flow
 from engineering_control.engine.builtin import BUILTIN as BUILTIN_FLOWS
-from engineering_control.engine.builtin import STARTERS
+from engineering_control.engine.builtin import STARTERS, summarise_code
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
 from engineering_control.engine.conditions import catalogue as condition_catalogue
@@ -92,6 +93,71 @@ class DashboardService:
         return await asyncio.to_thread(
             lambda: projects.set_commands(project, install=install, tests=tests)
         )
+
+    async def project_summaries(self, project: str) -> dict[str, object]:
+        """How much of a project's code is summarised, and which accounts could be asked."""
+
+        def read() -> dict[str, Any]:
+            if not any(record.name == project for record in self.repository.projects.active()):
+                raise ProjectNotFound(project)
+            accounts = [
+                {
+                    "provider": account["provider"],
+                    "name": account["name"],
+                    "models": account.get("models") or [],
+                }
+                for account in self.repository.accounts.listing()["items"]
+                if account.get("kind") == "api" and account.get("state") == "ready"
+            ]
+            return {
+                **self.repository.summaries.state(project),
+                "accounts": accounts,
+                "agents": self.repository.agents.names(),
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def summarise_project(
+        self,
+        project: str,
+        *,
+        provider: str,
+        model: str,
+        agent: str,
+        batches: int,
+        dollars: int,
+        tests: bool,
+    ) -> dict[str, object]:
+        """Start a run that asks a model what the project's files are for."""
+
+        def start() -> dict[str, Any]:
+            try:
+                document = summarise_code(
+                    provider=provider,
+                    model=model.strip(),
+                    agent=agent.strip(),
+                    # The last time the picking task is come to, it only says what is left.
+                    steps=batches + 1,
+                    dollars=dollars,
+                    tests=tests,
+                )
+            except FlowInvalid as error:
+                raise ProjectInvalid(str(error)) from error
+            wrong = validate_flow.errors(document)
+            if wrong:
+                raise ProjectInvalid(wrong[0]["text"])
+            if agent.strip() and self.repository.agents.get(agent.strip()) is None:
+                raise ProjectInvalid("That agent is not there any more")
+            return self.repository.runs.start_summaries(
+                project, document=document, toolchain=toolchain_for(project).as_dict()
+            )
+
+        return await asyncio.to_thread(start)
+
+    async def forget_project_summaries(self, project: str) -> dict[str, object]:
+        """Drop every summary of a project's code."""
+        dropped = await asyncio.to_thread(self.repository.summaries.clear, project)
+        return {"project": project, "dropped": dropped}
 
     async def try_project_commands(self, project: str) -> dict[str, object]:
         """Run the project's installation and its tests once, without an agent."""

@@ -694,6 +694,58 @@ What holds for the workbench:
 - A workbench that is lost (its pod is gone, or it was started anew) is replaced and the
   step is run again, five times at most.
 
+### Summaries of the code
+
+The map of the code knows what a file defines and imports, not what it is for. Summaries
+add that: for each file of code, two to four sentences a model wrote on what the file is
+for. They are kept with the project in the platform's database (`code_summaries`), each
+with the name git has for the content it was written from. A file whose content still
+has that name is what its summary says; a file that changed is asked about again, and
+only that file.
+
+**Making them.** On a project's page, "Summaries of the code" starts a run that asks a
+model over an API: choose the provider and the model (or one of your agents that has
+one), how many batches the run may do and what its questions may cost in US dollars. A
+small, cheap model is enough. The run clones the repository and then goes round two
+tasks:
+
+| Task | What it does | Outcomes |
+| --- | --- | --- |
+| Pick the files to summarise | In the workbench: the next files of code with no summary of what they now say, the files most of the code imports first, up to twelve files and 60,000 characters a batch | `files`, `none` |
+| Ask a model: summarise files | Asks the model what each file of the batch is for and keeps the answers | `written`, `nothing` |
+
+It ends when no file is left, when the picking task has been come to as often as it may
+(the last time it only says how many files still wait), or when the run's questions
+have cost what they may. What is left is taken up by the next run: nothing is asked
+twice. Test files are left out unless asked for. A file the model says nothing of is
+kept as asked about, without a summary, so that the same content is not sent again.
+Summaries of files that are gone from the repository are dropped. "Forget the
+summaries" drops them all.
+
+The two tasks are tasks like any other (groups Code and Models): a flow of your own can
+have them, and a trigger can run it on a schedule to keep the summaries current.
+
+**Using them.** Find the files uses the summaries of the run's project when there are
+any:
+
+- A word of what the run is about that a file's summary has counts for that file ("its
+  summary speaks of …"), beside its path, its names and its text. A word most summaries
+  have counts for nothing.
+- Each file found comes with its summary, and with a note when the file has changed
+  since the summary was written. In a loop, the model that chooses the next step is
+  shown what the last search found, a line a file: why it is there and what it is for.
+  It can then choose what to read without reading it.
+
+What to know:
+
+- Summaries cost money to make (questions over an API) and nothing to use. The run's
+  limit in dollars works only where the cost is known, which is where the account says
+  what its models cost: write the prices first. The limit of batches holds either way.
+- A summary says what a model read in the file's first 300 lines. It can be wrong or
+  out of date for a file that changed; the note says when it is of an earlier version.
+  Nothing is decided by a summary: it only helps to choose what to read.
+- A project without summaries works as before.
+
 ### A change written by a model
 
 A model asked over an API has no tools, so it cannot change a file. It can write the

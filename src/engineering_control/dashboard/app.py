@@ -93,6 +93,7 @@ from engineering_control.dashboard.schemas import (
     SectionRunInput,
     SectionUpdateInput,
     SkillInput,
+    SummariesInput,
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
     SupervisorMessageInput,
@@ -1895,6 +1896,49 @@ def create_app(
             event="dashboard.project_commands_set",
             subject=name,
             password=True,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/summaries")
+    async def project_summaries_api(name: str, request: Request) -> Response:
+        """How much of the project's code is summarised."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).project_summaries(name))
+        except ProjectNotFound:
+            return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/summaries")
+    async def project_summarise_api(name: str, request: Request) -> Response:
+        """Start a run that asks a model what the project's files are for. The questions
+        are paid by use, up to the dollars the request allows."""
+        return await project_change(
+            request,
+            SummariesInput,
+            lambda body: service(request).summarise_project(
+                name,
+                provider=body.provider,
+                model=body.model,
+                agent=body.agent,
+                batches=body.batches,
+                dollars=body.dollars,
+                tests=body.tests,
+            ),
+            event="dashboard.project_summaries_started",
+            subject=name,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/summaries/forget")
+    async def project_summaries_forget_api(name: str, request: Request) -> Response:
+        """Drop every summary of the project's code."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).forget_project_summaries(name),
+            event="dashboard.project_summaries_forgotten",
+            subject=name,
         )
 
     @app.post("/api/dashboard/projects/{name}/commands/try")

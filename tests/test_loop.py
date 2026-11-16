@@ -111,7 +111,8 @@ def test_a_task_lets_a_model_choose_the_way_and_coming_back_to_it_is_no_round() 
     assert not (choose.account or choose.writes or choose.publishes or choose.approval)
     names = [param.name for param in choose.params]
     assert "steps" in names and "with_change" not in names and "instruction" in names
-    assert [key for key, task in TASKS.items() if task.loops] == ["model.choose"]
+    # The model that chooses, and the task that picks batch after batch to summarise.
+    assert [key for key, task in TASKS.items() if task.loops] == ["code.digest", "model.choose"]
     assert (
         loop_steps({}),
         loop_steps({"steps": 7}),

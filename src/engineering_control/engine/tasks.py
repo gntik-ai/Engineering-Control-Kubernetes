@@ -36,6 +36,7 @@ from engineering_control.engine.catalogue import (
 )
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
+from engineering_control.engine.summaries import Summaries
 from engineering_control.github_app import ChangedFile, GitHubApp, GitHubAppError
 from engineering_control.sandbox import audit, deliver, discover, steps
 from engineering_control.sandbox.flows import Checkouts, End, Plan, why_no_answer
@@ -53,6 +54,8 @@ class Services:
     github: GitHubApp | None
     backlog: BacklogItems | None
     checkouts: Checkouts
+    # The summaries of projects' code, where the installation keeps them.
+    summaries: Summaries | None = None
 
 
 @dataclass

@@ -27,6 +27,7 @@ from engineering_control.engine.catalogue import (
     WAYS,
     loop_steps,
 )
+from engineering_control.engine.summaries import SUMMARY_CHARACTERS
 from engineering_control.engine.tasks import Concluded, Context, Done, Failed, _about, _words
 from engineering_control.models.providers import BY_KEY
 from engineering_control.models.service import Question, Reply
@@ -37,6 +38,8 @@ from engineering_control.sandbox import deliver
 HAND_CHARACTERS: Final = 300_000
 # How many lines of what happened so far a loop's model is told.
 LOG_LINES: Final = 40
+# How many of the files a search found a loop's model is shown.
+FOUND_SHOWN: Final = 30
 # The most of a collected change one question carries. A change beyond that is not cut
 # to fit: the task says so and fails, since half a change cannot be judged.
 CHANGE_CHARACTERS: Final = 600_000
@@ -98,7 +101,12 @@ def in_hand(happened: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[
 
 
 async def _asked(
-    ctx: Context, what: str, schema: dict[str, Any], *, change: bool | None = None
+    ctx: Context,
+    what: str,
+    schema: dict[str, Any],
+    *,
+    change: bool | None = None,
+    hand: bool | None = None,
 ) -> Question:
     params, data = ctx.params, ctx.data
     where = choices(params)
@@ -114,7 +122,12 @@ async def _asked(
     about = _about(data)
     repository = str(data.get("repository") or "")
     parts = [
-        f"{what}\n\nWhat you are asked:\n{str(params.get('instruction') or '').strip()}",
+        what
+        + (
+            f"\n\nWhat you are asked:\n{str(params.get('instruction') or '').strip()}"
+            if str(params.get("instruction") or "").strip()
+            else ""
+        ),
         f"The repository is {repository}." if repository else "",
         _material(
             "What the run is about", f"{about.get('title') or ''}\n\n{about.get('body') or ''}"
@@ -153,7 +166,7 @@ async def _asked(
     elif with_change:
         parts.append("No change has been collected in this run so far.")
     let_go: list[str] = []
-    if params.get("with_files", True):
+    if params.get("with_files", True) if hand is None else hand:
         # The files in hand: what the run read, and what it changed, as last seen.
         happened = await asyncio.to_thread(ctx.services.runs.happened, ctx.item.run_id)
         sources, let_go = in_hand(happened)
@@ -467,6 +480,137 @@ def _so_far(ctx: Context, happened: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _found(happened: list[dict[str, Any]]) -> str:
+    """The files the latest search found, a line a file: why it is there and, where the
+    project has summaries, what the file is for. What to read is chosen from this."""
+    for step in reversed(happened):
+        output = step.get("output") or {}
+        files = [
+            entry
+            for entry in output.get("files") or []
+            if isinstance(entry, dict) and "why" in entry and "text" not in entry
+        ]
+        if step.get("state") != "succeeded" or not files:
+            continue
+        lines = []
+        for entry in files[:FOUND_SHOWN]:
+            line = f"- {entry.get('path')} ({entry.get('lines') or 0} lines"
+            line += ", a test)" if entry.get("test") else ")"
+            reasons = "; ".join(str(reason) for reason in (entry.get("why") or [])[:3])
+            if reasons:
+                line += f": {reasons}"
+            if entry.get("summary"):
+                line += ". What it is for"
+                if entry.get("summary_of"):
+                    line += f" (said of {entry['summary_of']})"
+                line += f": {_words(entry['summary'], 400)}"
+            lines.append(line)
+        if len(files) > FOUND_SHOWN:
+            lines.append(f"({len(files) - FOUND_SHOWN} more are not shown.)")
+        return "\n".join(lines)
+    return ""
+
+
+SUMMARISING: Final = (
+    "Summarise each of the files below, for someone who has to find the right file later "
+    "without opening it. For each file say in two to four plain sentences what it is "
+    "for, the main things it defines, by the names the code gives them, and what it "
+    "works with. Say what is there, not what could be better, and nothing you cannot "
+    "see in the file. Give one summary for each file, with the file's path exactly as "
+    "it is given."
+)
+SUMMARIES_SCHEMA: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summaries"],
+    "properties": {
+        "summaries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "summary"],
+                "properties": {"path": {"type": "string"}, "summary": {"type": "string"}},
+            },
+        }
+    },
+}
+
+
+class Summarise:
+    """A model says what each of the files that were picked is for. What it says is
+    kept with the project, each summary with the content it was written from."""
+
+    @staticmethod
+    async def _batch(ctx: Context) -> list[dict[str, Any]]:
+        picked = await ctx.outputs("code.digest")
+        files = picked[-1].get("files") if picked else None
+        return [entry for entry in files or [] if isinstance(entry, dict) and entry.get("path")]
+
+    async def question(self, ctx: Context) -> Question:
+        batch = await self._batch(ctx)
+        if not batch:
+            raise ValueError(
+                f"{ctx.node.id} has no files to summarise: no task before it picked any"
+            )
+        asked = await _asked(ctx, SUMMARISING, SUMMARIES_SCHEMA, change=False, hand=False)
+        parts = []
+        for entry in batch:
+            whole = (
+                f" (its first {entry.get('shown')} of {entry.get('lines')} lines: say only "
+                "what these show)"
+                if entry.get("cut")
+                else ""
+            )
+            parts.append(
+                _material(f"The file {entry.get('path')}{whole}", str(entry.get("text") or ""))
+            )
+        return dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(parts))
+
+    async def answered(self, ctx: Context, reply: Reply) -> Concluded:
+        summaries = ctx.services.summaries
+        if summaries is None or not ctx.data.get("project"):
+            return Failed("no_project", "There is no project to keep the summaries with.")
+        batch = {str(entry["path"]): entry for entry in await self._batch(ctx)}
+        written: dict[str, str] = {}
+        for entry in reply.data.get("summaries") or []:
+            path = str((entry or {}).get("path") or "")
+            text = _words((entry or {}).get("summary"), SUMMARY_CHARACTERS)
+            if path in batch and path not in written and text:
+                written[path] = text
+        skipped = [path for path in batch if path not in written]
+        # A file the model said nothing of is kept as asked about, without a summary, so
+        # that the same content is not asked about again.
+        entries = [
+            {"path": path, "blob": str(batch[path].get("hash") or ""), "summary": text}
+            for path, text in [*written.items(), *((path, "") for path in skipped)]
+        ]
+        await asyncio.to_thread(
+            lambda: summaries.store(
+                str(ctx.data["project"]),
+                entries,
+                provider=reply.provider,
+                model=reply.model,
+                run_id=ctx.item.run_id,
+            )
+        )
+        output = {"stored": len(written), "paths": list(written)[:60], "skipped": skipped[:60]}
+        if not written:
+            return Done(
+                "nothing",
+                "nothing_written",
+                f"The model gave no summary for any of the {len(batch)} files.",
+                output=output,
+            )
+        return Done(
+            "written",
+            "summarised",
+            f"Summaries of {len(written)} files were written."
+            + (f" {len(skipped)} got none." if skipped else ""),
+            output=output,
+        )
+
+
 class Choose:
     """A model chooses the next step of a loop. What it chose is where the flow goes;
     its plan and notes are kept for the next time it is asked."""
@@ -507,6 +651,9 @@ class Choose:
             _material("Your notes", str(kept.get("notes") or "(none yet)")),
             "What happened so far:\n" + _so_far(ctx, happened),
         ]
+        found = _found(happened)
+        if found:
+            said.append(_material("What the last search found", found))
         refused = ctx.given.get("refused")
         if refused:
             said.append(
@@ -566,6 +713,7 @@ MODEL: Final[dict[str, ModelTask]] = {
     "model.report": Report(),
     "model.edit": Edit(),
     "model.choose": Choose(),
+    "model.summarise": Summarise(),
 }
 assert set(MODEL) == {  # noqa: S101 - the catalogue and the code agree
     key for key, task in TASKS.items() if task.where == "model"

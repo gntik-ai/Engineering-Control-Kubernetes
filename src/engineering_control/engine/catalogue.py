@@ -572,6 +572,43 @@ _TASKS: Final = (
         ),
     ),
     TaskType(
+        "code.digest",
+        "Code",
+        "Pick the files to summarise",
+        "Picks the next files of code that have no summary of what they now say, the "
+        "files most of the code imports first, and reads them for the task that "
+        "summarises. A loop goes round it: led back to, it picks the next batch, until "
+        "none is left or it has been come to as often as it may. Summaries are kept "
+        "with the project and are what Find the files looks in beside the code.",
+        "bench",
+        needs=("checkout",),
+        produces=("batch",),
+        outcomes=("files", "none"),
+        loops=True,
+        params=(
+            Param(
+                "steps",
+                "int",
+                20,
+                "How many times it is come to in one run at most. The last time it picks "
+                "nothing and says how many files still wait.",
+                low=2,
+                high=LOOP_STEPS_CEILING,
+            ),
+            Param("limit", "int", 12, "How many files one batch has at most.", low=1, high=40),
+            Param("lines", "int", 300, "The lines read of each file at most.", low=20, high=2000),
+            Param(
+                "characters",
+                "int",
+                60_000,
+                "How long the files of one batch may be in all.",
+                low=2000,
+                high=400_000,
+            ),
+            Param("tests", "bool", False, "Summarise test files as well."),
+        ),
+    ),
+    TaskType(
         "code.apply",
         "Code",
         "Apply the edits",
@@ -655,6 +692,25 @@ _TASKS: Final = (
         produces=("notes",),
         outcomes=("done",),
         params=_ASKED,
+    ),
+    TaskType(
+        "model.summarise",
+        "Models",
+        "Ask a model: summarise files",
+        "The platform asks a model over a provider's API what each of the files that "
+        "were picked is for, and keeps the answers with the project, each with the "
+        "content it was written from. A file is asked about again only when it has "
+        "changed. No sandbox runs and no tools are used.",
+        "model",
+        needs=("batch",),
+        produces=("summaries",),
+        outcomes=("written", "nothing"),
+        params=tuple(
+            param
+            for param in _ASKED
+            if param.name
+            in ("provider", "model", "then_provider", "then_model", "effort", "tokens", "minutes")
+        ),
     ),
     TaskType(
         "check.secrets",

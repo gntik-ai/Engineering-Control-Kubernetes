@@ -34,6 +34,7 @@ from engineering_control.engine.agents import Agents
 from engineering_control.engine.evaluations import Evaluations
 from engineering_control.engine.interpreter import Engine
 from engineering_control.engine.records import FlowRecords
+from engineering_control.engine.summaries import Summaries
 from engineering_control.flow_library import EVALUATION, WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
@@ -181,6 +182,7 @@ class Launcher:
             backlog,
             FlowRecords(sessions).document if sessions else None,
             Agents(sessions) if sessions else None,
+            Summaries(sessions) if sessions else None,
         )
         self.flows: dict[str, Flow] = {
             "account_check": AccountCheck(),

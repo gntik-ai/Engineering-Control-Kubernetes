@@ -244,7 +244,13 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
         ]
     assert judge.outcomes == ("pass", "changes") and report.outcomes == ("done",)
     # The third, the one that writes a change as edits, is in tests/test_model_edits.py.
-    assert set(asking.MODEL) == {"model.judge", "model.report", "model.edit", "model.choose"}
+    assert set(asking.MODEL) == {
+        "model.judge",
+        "model.report",
+        "model.edit",
+        "model.choose",
+        "model.summarise",
+    }
 
     assert _rules(_judging()) == []
     assert (

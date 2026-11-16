@@ -45,7 +45,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    assert (head, parent) == ("0044", "0043")
+    # 0045 (summaries of a project's code) follows 0044.
+    assert (head, parent) == ("0045", "0044")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -99,6 +100,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0045: summaries of a project's code.
+    assert "code_summaries" in inspect(engine).get_table_names()
+    command.downgrade(config, parent)
+    assert "code_summaries" not in inspect(engine).get_table_names()
+    parent = "0043"
     # 0044: the flow whose past runs an evaluation goes through.
     assert "of_flow" in {c["name"] for c in inspect(engine).get_columns("evaluations")}
     command.downgrade(config, parent)

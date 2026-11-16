@@ -281,6 +281,20 @@ class AccountSignInInput(DashboardModel):
     credential: str = Field(min_length=1, max_length=70000)
 
 
+class SummariesInput(DashboardModel):
+    """Summarise a project's code: which model is asked, and how much the run may do."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    provider: str = Field(min_length=1, max_length=40)
+    model: str = Field(default="", max_length=100)
+    # One of the administrator's agents, in place of a model named here.
+    agent: str = Field(default="", max_length=64)
+    # How many batches of files at most, and what the questions may cost in US dollars.
+    batches: int = Field(default=20, ge=1, le=199)
+    dollars: int = Field(default=5, ge=1, le=1000)
+    tests: bool = False
+
+
 class PlainChangeInput(DashboardModel):
     """A change that needs nothing but the session's token."""
 

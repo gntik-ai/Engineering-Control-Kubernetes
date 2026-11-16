@@ -400,7 +400,10 @@ def problems(document: Document) -> list[Problem]:
                     "loop_ways",
                     f"{node.id} offers its model nothing to do: lead at least one of its "
                     "ways (search, read, edit, check, other) to a task, and that task "
-                    "back to it",
+                    "back to it"
+                    if task.where == "model"
+                    else f"{node.id} leads nowhere: lead what it ends with to a task, and "
+                    "that task back to it",
                     node.id,
                 )
             )
