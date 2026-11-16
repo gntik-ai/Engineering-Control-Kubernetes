@@ -33,11 +33,17 @@ from engineering_control.sandbox.workbench import tools_source
 _FOLDER: Final = "/tmp/bench"  # noqa: S108 - the pod's own empty volume
 _ANSWERS: Final = "/workspace/.run"
 QUESTION_CHARACTERS: Final = 20_000
+RELATED_MINUTES: Final = 10
 FOUND_KEPT: Final = 80
 
 
 def tool_job(
-    name: str, question: dict[str, Any], *, max_bytes: int, seconds: int = 600
+    name: str,
+    question: dict[str, Any],
+    *,
+    max_bytes: int,
+    seconds: int = 600,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """A job that runs one of the workbench's tools on a question and hands its answer
     back whole."""
@@ -54,6 +60,7 @@ def tool_job(
                 "cwd": deliver.REPO,
                 "timeout": seconds,
                 "echo": 20_000,
+                **({"env": env} if env else {}),
             }
         ],
         "artifacts": [{"name": name, "path": answered, "max_bytes": max_bytes}],
@@ -252,6 +259,78 @@ class Run:
         )
 
 
+class RelatedTests:
+    """Run the tests that cover what was changed, by the repository's own runner. It is a
+    quick look, not the tests a change has to pass before it is published."""
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        asked = [str(path) for path in (ctx.given.get("asked") or {}).get("paths") or []]
+        minutes = max(1, min(int(ctx.params.get("minutes") or RELATED_MINUTES), 30))
+        question = {
+            # What a loop's model names, or what the task names, or what the run changed.
+            "paths": asked or paths_of(ctx.params.get("paths")),
+            "base": str(ctx.data.get("base_sha") or ""),
+            "limit": int(ctx.params.get("limit") or 20),
+            "seconds": minutes * 60,
+        }
+        job = tool_job(
+            "tests", question, max_bytes=600_000, seconds=minutes * 60 + 60, env=deliver.TOOLS
+        )
+        return _bench(job, seconds=minutes * 60 + 360)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        found = _answer(commands, log, "tests")
+        if isinstance(found, str):
+            return Failed("tests_failed", f"The related tests could not be run: {found}")
+        related = [entry for entry in found.get("tests") or [] if isinstance(entry, dict)]
+        ran = [entry for entry in found.get("ran") or [] if isinstance(entry, dict)]
+        left = [entry for entry in found.get("unrunnable") or [] if isinstance(entry, dict)]
+        changed = found.get("changed") or []
+        said_left = (
+            f" {len(left)} could not be run: "
+            + "; ".join(f"{e.get('path')} ({e.get('why')})" for e in left[:3])
+            if left
+            else ""
+        )
+        if not ran:
+            why = (
+                "Nothing was changed, so there are no tests to run."
+                if not changed
+                else f"No test covers the {len(changed)} files that were changed."
+                if not related
+                else f"None of the {len(related)} related tests can be run here."
+            )
+            return Done("none", "no_tests", _words(why + said_left, 600), output=found)
+        files = sum(int(entry.get("files") or 0) for entry in ran)
+        failed = [entry for entry in ran if entry.get("exit_code") != 0]
+        if not failed:
+            return Done(
+                "passed",
+                "passed",
+                _words(f"{files} related test files passed." + said_left, 600),
+                output=found,
+            )
+        return Done(
+            "failed",
+            "failed",
+            _words(
+                f"{len(failed)} of {len(ran)} groups of related tests failed: "
+                + "; ".join(str(entry.get("line")) for entry in failed)
+                + said_left,
+                600,
+            ),
+            output=found,
+            given={
+                "failures": [
+                    f"{entry.get('line')}"
+                    + (" (stopped: it took too long)" if entry.get("timed_out") else "")
+                    + f"\n{str(entry.get('said') or '')[-3000:]}"
+                    for entry in failed
+                ]
+            },
+        )
+
+
 class Apply:
     """Apply the edits a model wrote, and commit. What is changed this way is a change
     like an agent's, and is held to the same rules before it is published."""
@@ -336,6 +415,7 @@ BENCH: Final[dict[str, SandboxTask]] = {
     "code.find": Find(),
     "code.read": Read(),
     "code.run": Run(),
+    "code.tests": RelatedTests(),
     "code.apply": Apply(),
 }
 assert set(BENCH) == {  # noqa: S101 - the catalogue and the code agree

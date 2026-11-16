@@ -431,6 +431,13 @@ def _way(ctx: Context, way: str, target: Any) -> str:
             f"{way}: run a command of the project's and learn whether it passed, and what "
             f"it printed if it failed. Give its number in command, or 0 for all: {listed}."
         )
+    if target.task == "code.tests":
+        return (
+            f"{way}: run the tests that cover what was changed and learn whether they "
+            "passed, and what they printed if they failed. Leave paths empty for the tests "
+            "of everything the run changed, or give the paths of the files whose tests are "
+            "to run."
+        )
     if target.task == "model.edit":
         return (
             f"{way}: have the change written as edits and applied to the files. Say in why "

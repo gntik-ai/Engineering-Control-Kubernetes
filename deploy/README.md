@@ -590,13 +590,14 @@ and leaves the pull request.
 
 A step in a sandbox of its own takes seconds to start. The tasks that find, read and
 run something small are many, so a run that has them gets one sandbox that stays: its
-workbench. Three tasks, in the group Code, are carried out there:
+workbench. Four tasks, in the group Code, are carried out there:
 
 | Task | What it does | Outcomes |
 | --- | --- | --- |
 | Find the files | Finds the files the run is about on a map of the code, with why each is there | `found`, `none` |
 | Read the files | Reads the files found (or the ones it names) for the tasks that follow | `ok` |
 | Run a command | Runs the commands it names, or the project's test commands, and says whether they passed | `passed`, `failed` |
+| Run the related tests | Finds the tests that cover what the run changed and runs only those | `passed`, `failed`, `none` |
 
 No agent and no model takes part in any of them: each is a program with the same answer
 for the same input.
@@ -635,6 +636,37 @@ the like), is never read.
 
 **Run a command** is a quick look while the work goes on, without the network. It does
 not stand in for Run the tests, which a change has to pass before it is published.
+
+**Run the related tests** is the quick look of a change: seconds where the whole suite
+takes minutes. What was changed is what differs from the commit the run started at,
+committed or not (or the files the task names). The tests are found on the map of the
+code, the surest first:
+
+1. a test that was changed itself;
+2. a test that imports a changed file;
+3. a test named after one (`price.test.ts`, `test_price.py`, `price_test.go` for
+   `price.*`), in the same language, the nearest first;
+4. for Go, the tests of the changed file's package;
+5. a test that imports a file that imports a changed one.
+
+Each kind is run by the repository's own runner, found from the repository and not
+configured:
+
+| Test file | Runner | Where it runs |
+| --- | --- | --- |
+| `*.py` | `python -m pytest`, with the `.venv` of its project when there is one | the nearest folder with a `pyproject.toml`, `pytest.ini`, `setup.cfg`, `tox.ini` or `setup.py` |
+| JavaScript or TypeScript, in a package that names vitest or jest | that runner, as installed in `node_modules` | the package's folder |
+| `*.mjs`, `*.js`, `*.cjs` otherwise | `node --test` | the repository |
+| `*_test.go` | `go test` on the test's package | the folder of its `go.mod` |
+
+A test whose runner is not installed, or of a kind the task does not know (a
+TypeScript test in a package that names no runner, Playwright, a shell test), is not
+run and is named with the reason. The task ends `passed`, `failed` (what the failing
+runner printed is given to the task that follows, as Run a command does) or `none`
+(nothing was changed, no test covers the change, or none could be run). It has no
+network, so a test that needs one fails here. It does not stand in for Run the tests:
+a change still has to pass the project's whole suite before it is published. In a
+loop it is what the way `check` best leads to; the loop to begin from has it there.
 
 What holds for the workbench:
 

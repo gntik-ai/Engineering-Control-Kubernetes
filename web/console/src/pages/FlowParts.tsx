@@ -52,7 +52,7 @@ const SETTING_NAMES: Record<string, string> = {
   words: 'More words to look for',
   limit: 'Files at most',
   neighbours: 'Add the neighbours of the best files',
-  paths: 'Files to read',
+  paths: 'Files',
   lines: 'Lines of each file',
   characters: 'Characters in all',
   allow_none: 'A pull request without checks counts as passed',

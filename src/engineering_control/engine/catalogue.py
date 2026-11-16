@@ -529,6 +529,40 @@ _TASKS: Final = (
         ),
     ),
     TaskType(
+        "code.tests",
+        "Code",
+        "Run the related tests",
+        "Finds the tests that cover what the run changed (a test that imports a changed "
+        "file, one named after it, a Go test of its package) and runs them, each kind by "
+        "the repository's own runner: pytest, vitest, jest, node --test, go test. What "
+        "failed is given to the task that follows. It takes seconds where the whole "
+        "suite takes minutes; it does not stand in for Run the tests, which a change "
+        "has to pass before it is published.",
+        "bench",
+        needs=("checkout",),
+        produces=("checked",),
+        outcomes=("passed", "failed", "none"),
+        params=(
+            Param(
+                "paths",
+                "line",
+                "",
+                "The files whose tests are run, with spaces between them. Empty: what the "
+                "run changed.",
+                high=2000,
+            ),
+            Param("limit", "int", 20, "How many test files are run at most.", low=1, high=60),
+            Param(
+                "minutes",
+                "int",
+                10,
+                "How long the tests may take in all before they are stopped.",
+                low=1,
+                high=30,
+            ),
+        ),
+    ),
+    TaskType(
         "code.apply",
         "Code",
         "Apply the edits",

@@ -452,8 +452,9 @@ STARTERS: Final[dict[str, Document]] = {
                 },
                 {
                     "id": "look",
-                    "task": "code.run",
-                    "next": {"passed": "decide", "failed": "decide"},
+                    # The tests that cover what was changed: seconds, not the whole suite.
+                    "task": "code.tests",
+                    "next": {"passed": "decide", "failed": "decide", "none": "decide"},
                 },
             ],
             back_to="decide",

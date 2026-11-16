@@ -579,7 +579,13 @@ def test_three_tasks_look_at_code_in_the_workbench_without_an_agent() -> None:
         assert task.needs == ("checkout",)
     assert TASKS["code.find"].outcomes == ("found", "none")
     assert TASKS["code.run"].outcomes == ("passed", "failed")
-    assert set(bench_tasks.BENCH) == {"code.find", "code.read", "code.run", "code.apply"}
+    assert set(bench_tasks.BENCH) == {
+        "code.find",
+        "code.read",
+        "code.run",
+        "code.tests",
+        "code.apply",
+    }
 
     assert _rules(_looking()) == []
     for wrong, why in (

@@ -556,6 +556,237 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- the tests of a change --------------------------------------------------------------------
+
+PY_ROOTS = ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "setup.py")
+JS_TESTS = (".mjs", ".js", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".jsx")
+JS_CONFIGS = ("ts", "mts", "js", "mjs", "cjs")
+TESTED = re.compile(r"^test_(.+)\.py$|^(.+)_test\.(?:py|go)$|^(.+)\.(?:test|spec)\.[a-z]+$")
+SAID = 6000
+
+
+def changed_since(base: str) -> list[str]:
+    """What differs from the commit the run started at, committed or not, and what is new."""
+    names = set(git("ls-files", "--others", "--exclude-standard").splitlines())
+    if base:
+        names |= set(git("diff", "--name-only", "--no-renames", base, "--").splitlines())
+    return sorted(name for name in names if name)
+
+
+def tested_name(path: str) -> str:
+    """What a test file is named after: price for price.test.ts, test_price.py, price_test.go."""
+    match = TESTED.match(os.path.basename(path))
+    return next((group for group in match.groups() if group), "") if match else ""
+
+
+def _family(language: str) -> str:
+    """JavaScript and TypeScript test each other; every other language tests itself."""
+    return "script" if language in ("javascript", "typescript") else language
+
+
+def _near(one: str, other: str) -> int:
+    """How many leading folders two paths share."""
+    shared = 0
+    for mine, theirs in zip(one.split("/")[:-1], other.split("/")[:-1], strict=False):
+        if mine != theirs:
+            break
+        shared += 1
+    return shared
+
+
+def related_tests(changed: list[str], files: dict[str, Any], limit: int) -> list[dict[str, str]]:
+    """The tests that cover what was changed, the surest first: a test that was changed
+    itself, a test that imports a changed file, a test named after one, a Go test of its
+    package, and a test that imports what imports it."""
+    importers: dict[str, list[str]] = {}
+    for path, entry in files.items():
+        for target in entry.get("imports", []):
+            importers.setdefault(target, []).append(path)
+    tests = [path for path, entry in files.items() if entry["test"] and entry["lang"]]
+    found: dict[str, str] = {}
+
+    def add(path: str, why: str) -> None:
+        if path in files and files[path]["test"] and files[path]["lang"] and path not in found:
+            found[path] = why
+
+    for path in changed:
+        add(path, "it was changed")
+    code = [path for path in changed if not (path in files and files[path]["test"])]
+    for path in code:
+        for user in sorted(importers.get(path, [])):
+            add(user, f"it imports {path}")
+    named: dict[str, list[str]] = {}
+    for test in tests:
+        name = tested_name(test)
+        if name:
+            named.setdefault(name, []).append(test)
+    for path in code:
+        stem = os.path.basename(path).split(".")[0]
+        # A test in the language of the file, the nearest first: price.py is not tested
+        # by a price_test.go elsewhere in the repository.
+        language = _family(LANGUAGES.get(os.path.splitext(path)[1].lower(), ""))
+        same = [test for test in named.get(stem, []) if _family(files[test]["lang"]) == language]
+        for test in sorted(same, key=lambda t: (-_near(t, path), t))[:3]:
+            add(test, f"it is named after {path}")
+        if path.endswith(".go"):
+            folder = os.path.dirname(path)
+            for test in sorted(t for t in tests if os.path.dirname(t) == folder):
+                add(test, f"it is in the package of {path}")
+    for path in code:
+        for user in sorted(importers.get(path, [])):
+            if files[user]["test"]:
+                continue
+            for test in sorted(importers.get(user, [])):
+                add(test, f"it imports {user}, which imports {path}")
+    return [{"path": path, "why": why} for path, why in list(found.items())[:limit]]
+
+
+def _above(folder: str) -> list[str]:
+    """A folder of the repository and every folder above it, the repository's own last."""
+    parts = [part for part in folder.split("/") if part]
+    return ["/".join(parts[:count]) for count in range(len(parts), -1, -1)]
+
+
+def _there(*parts: str) -> bool:
+    return os.path.exists(os.path.join(REPO, *[part for part in parts if part]))
+
+
+def _tool(name: str, folder: str) -> str | None:
+    """A program a package manager installed, in the folder's own packages or above."""
+    for where in _above(folder):
+        if _there(where, "node_modules", ".bin", name):
+            return (
+                os.path.join(REPO, where, "node_modules", ".bin", name)
+                if where
+                else (os.path.join(REPO, "node_modules", ".bin", name))
+            )
+    return None
+
+
+def runner_of(test: str) -> tuple[str, str, list[str], str] | str:
+    """How one test file is run: the runner's name, the folder it runs in, the command
+    before the files, and the file as the runner is given it. Or why it cannot be run."""
+    folder = os.path.dirname(test)
+    if test.endswith(".py"):
+        root = next((w for w in _above(folder) if any(_there(w, n) for n in PY_ROOTS)), "")
+        python = next(
+            (
+                os.path.join(REPO, where, ".venv", "bin", "python")
+                if where
+                else (os.path.join(REPO, ".venv", "bin", "python"))
+                for where in dict.fromkeys([root, ""])
+                if _there(where, ".venv", "bin", "python")
+            ),
+            "python3",
+        )
+        argv = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+        return "pytest", root, argv, os.path.relpath(test, root or ".")
+    if test.endswith("_test.go"):
+        module = next((w for w in _above(folder) if _there(w, "go.mod")), None)
+        if module is None:
+            return "there is no go.mod above it"
+        package = os.path.relpath(folder or ".", module or ".")
+        return "go test", module, ["go", "test"], "." if package == "." else f"./{package}"
+    if test.endswith(JS_TESTS):
+        for where in _above(folder):
+            if not _there(where, "package.json"):
+                continue
+            manifest = _json(os.path.join(where, "package.json") if where else "package.json")
+            wanted: set[str] = set()
+            for part in ("dependencies", "devDependencies"):
+                listed = manifest.get(part)
+                if isinstance(listed, dict):
+                    wanted |= set(listed)
+            for name, before in (("vitest", ["run"]), ("jest", [])):
+                configured = any(_there(where, f"{name}.config.{end}") for end in JS_CONFIGS)
+                if name not in wanted and not configured:
+                    continue
+                program = _tool(name, where)
+                if program is None:
+                    return f"{name} is not installed for {where or 'the repository'}"
+                return name, where, [program, *before], os.path.relpath(test, where or ".")
+        if test.endswith((".mjs", ".js", ".cjs")):
+            return "node --test", "", ["node", "--test"], test
+        return "no package.json above it names vitest or jest"
+    return "no runner is known for this kind of file"
+
+
+def _run(argv: list[str], folder: str, seconds: float) -> dict[str, Any]:
+    started = time.monotonic()
+    timed_out = False
+    try:
+        process = subprocess.Popen(  # noqa: S603 - the repository's own test runner
+            argv,
+            cwd=os.path.join(REPO, folder) if folder else REPO,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return {"exit_code": 127, "seconds": 0.0, "timed_out": False, "said": str(error)[:SAID]}
+    try:
+        output, _ = process.communicate(timeout=max(1.0, seconds))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, 9)
+        except OSError:
+            process.kill()
+        output, _ = process.communicate()
+    return {
+        "exit_code": process.returncode,
+        "seconds": round(time.monotonic() - started, 1),
+        "timed_out": timed_out,
+        "said": output.decode("utf-8", errors="replace")[-SAID:],
+    }
+
+
+def tests(question: dict[str, Any]) -> dict[str, Any]:
+    """Find the tests that cover what was changed and run them, each kind by the
+    repository's own runner."""
+    files: dict[str, dict[str, Any]] = index()["files"]
+    named = [str(path) for path in question.get("paths") or []]
+    changed = named or changed_since(str(question.get("base") or ""))
+    limit = max(1, min(int(question.get("limit") or 20), 60))
+    related = related_tests(changed, files, limit)
+    groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+    unrunnable: list[dict[str, str]] = []
+    for entry in related:
+        how = runner_of(entry["path"])
+        if isinstance(how, str):
+            unrunnable.append({"path": entry["path"], "why": how})
+            continue
+        runner, folder, argv, given = how
+        listed = groups.setdefault((runner, folder, tuple(argv)), [])
+        if given not in listed:
+            listed.append(given)
+    deadline = time.monotonic() + max(5, int(question.get("seconds") or 600))
+    ran: list[dict[str, Any]] = []
+    for (name, where, command), listed in groups.items():
+        left = deadline - time.monotonic()
+        line = " ".join([os.path.basename(command[0]), *command[1:], *listed])
+        if where:
+            line = f"[{where}] {line}"
+        group: dict[str, Any] = {
+            "runner": name,
+            "folder": where,
+            "files": len(listed),
+            "line": line[:600],
+        }
+        if left < 5:
+            ran.append({**group, "exit_code": None, "seconds": 0.0, "timed_out": True, "said": ""})
+            continue
+        ran.append({**group, **_run([*command, *listed], where, left)})
+    return {
+        "changed": changed[:200],
+        "tests": related,
+        "ran": ran,
+        "unrunnable": unrunnable,
+        "passed": all(run["exit_code"] == 0 for run in ran) if ran else None,
+    }
+
+
 # --- reading ---------------------------------------------------------------------------------
 
 
@@ -760,9 +991,10 @@ def apply(question: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index", "apply"):
+    if len(arguments) != 3 or arguments[0] not in ("find", "read", "index", "apply", "tests"):
         print(
-            "usage: tools.py find|read|index|apply <question.json> <answer.json>", file=sys.stderr
+            "usage: tools.py find|read|index|apply|tests <question.json> <answer.json>",
+            file=sys.stderr,
         )
         return 2
     with open(arguments[1], encoding="utf-8") as handle:
@@ -773,12 +1005,14 @@ def main(arguments: list[str]) -> int:
         answer = read(question)
     elif arguments[0] == "apply":
         answer = apply(question)
+    elif arguments[0] == "tests":
+        answer = tests(question)
     else:
         answer = {"indexed": index()["summary"]}
     os.makedirs(os.path.dirname(arguments[2]), exist_ok=True)
     with open(arguments[2], "w", encoding="utf-8") as handle:
         json.dump(answer, handle, separators=(",", ":"))
-    said = {key: value for key, value in answer.items() if key != "files"}
+    said = {key: value for key, value in answer.items() if key not in ("files", "ran")}
     print(json.dumps({**said, "files": len(answer.get("files", []))})[:4000])
     return 0
 
