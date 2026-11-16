@@ -1,8 +1,8 @@
 """The providers a model can be asked at over their API.
 
 Beside the two subscriptions (a command-line client signed in to Claude or ChatGPT),
-a model can be reached with an API key, paid by use. Six providers are known. Anthropic
-is spoken to with its own library; the other five accept the same kind of request
+a model can be reached with an API key, paid by use. Seven providers are known. Anthropic
+is spoken to with its own library; the other six accept the same kind of request
 (OpenAI's chat completions), each at its own address.
 
 An address is chosen from the ones listed here, never typed: a key is sent nowhere else.
@@ -40,6 +40,13 @@ class ApiProvider:
     key_shape: str = ""
     # What the limit on the answer's length is called in a request.
     limit_name: str = "max_tokens"
+    # Whether the provider holds the model to the shape of the answer itself ("schema")
+    # or only to a JSON object ("object"), the platform checking the shape either way.
+    shape: str = "object"
+    # Whether a request can say how hard the model reasons.
+    effort: bool = False
+    # What the provider puts before the name of a model when it lists or names one.
+    model_prefix: str = ""
 
     def endpoint(self, key: str | None) -> Endpoint:
         for endpoint in self.endpoints:
@@ -85,6 +92,26 @@ API_PROVIDERS: Final = (
         key_pattern=re.compile(r"^sk-[A-Za-z0-9_-]{20,400}$"),
         key_shape="it starts with sk-",
         limit_name="max_completion_tokens",
+        shape="schema",
+        effort=True,
+    ),
+    ApiProvider(
+        # The Gemini API of Google AI Studio, through the address at which it accepts
+        # chat completions. Vertex AI, which signs in with a Google Cloud account and
+        # not with a key, is not this.
+        key="google",
+        name="Google Gemini API",
+        family="gemini",
+        style="openai",
+        endpoints=(
+            Endpoint(
+                "default", "Google", "https://generativelanguage.googleapis.com/v1beta/openai"
+            ),
+        ),
+        keys_at="aistudio.google.com → API keys",
+        shape="schema",
+        effort=True,
+        model_prefix="models/",
     ),
     ApiProvider(
         key="deepseek",

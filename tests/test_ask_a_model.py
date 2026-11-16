@@ -101,6 +101,7 @@ def test_an_account_with_an_api_key_is_added_given_its_key_tried_and_removed(
         assert [key for key, kind in kinds.items() if kind == "api"] == [
             "anthropic",
             "openai",
+            "google",
             "deepseek",
             "qwen",
             "glm",
@@ -254,7 +255,10 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
         ({"model": ""}, "judge does not name the model it asks"),
         ({"model": "two words"}, "is the name of a model as its provider writes it"),
         ({"then_provider": "glm"}, "judge does not name the second model it asks"),
-        ({"provider": "claude"}, "provider of judge is one of: anthropic, openai, deepseek"),
+        (
+            {"provider": "claude"},
+            "provider of judge is one of: anthropic, openai, google, deepseek",
+        ),
         ({"instruction": "  "}, "judge has no instruction yet"),
         ({"tokens": 100}, "tokens of judge is between 500 and 32000"),
         ({"minutes": 45}, "minutes of judge is between 1 and 30"),

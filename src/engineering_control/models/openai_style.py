@@ -1,6 +1,6 @@
-"""Asking a model at a provider that accepts chat completions: OpenAI itself, DeepSeek,
-Qwen, GLM and Kimi. One request, one answer, no tools: the answer is asked for as a JSON
-object, and the platform checks its shape."""
+"""Asking a model at a provider that accepts chat completions: OpenAI itself, Google's
+Gemini API, DeepSeek, Qwen, GLM and Kimi. One request, one answer, no tools: the answer
+is asked for as a JSON object, and the platform checks its shape."""
 
 from __future__ import annotations
 
@@ -78,13 +78,15 @@ async def complete(
     limit_name: str = "max_tokens",
     strict: bool = False,
     effort: str | None = None,
+    model_prefix: str = "",
 ) -> Wire:
     body: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         limit_name: max_tokens,
         "stream": False,
-        # OpenAI holds the model to the shape itself; the others to a JSON object.
+        # OpenAI and Google hold the model to the shape itself; the others to a JSON
+        # object.
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": "answer", "strict": True, "schema": schema},
@@ -92,11 +94,20 @@ async def complete(
         if strict
         else {"type": "json_object"},
     }
-    if strict and effort in EFFORTS:
+    if effort in EFFORTS:
         body["reasoning_effort"] = effort
-    response = await _send(
-        http, name, "POST", f"{base_url}/chat/completions", key, seconds, json=body
-    )
+    url = f"{base_url}/chat/completions"
+    try:
+        response = await _send(http, name, "POST", url, key, seconds, json=body)
+    except WireError as error:
+        if not (strict and error.kind == "invalid"):
+            raise
+        # A provider that will not take the shape as it is written (a rejected request
+        # costs nothing) is asked once more for a JSON object: the shape is in the
+        # question as well, and the platform checks it. A request that is wrong for
+        # another reason, a model that does not exist, is rejected again and said.
+        loose = {**body, "response_format": {"type": "json_object"}}
+        response = await _send(http, name, "POST", url, key, seconds, json=loose)
     try:
         answer = response.json()
         choice = answer["choices"][0]
@@ -111,20 +122,32 @@ async def complete(
             "declined", f"The model declined to answer: {said(message.get('refusal'))}".rstrip(": ")
         )
     usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
+    read_in_all = _count(usage.get("prompt_tokens"))
+    # What a model thought before it answered is paid as written. A provider that
+    # leaves it out of what was written still counts it in the total.
+    written = max(
+        _count(usage.get("completion_tokens")), _count(usage.get("total_tokens")) - read_in_all
+    )
     details = usage.get("prompt_tokens_details")
     cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else 0
     cached = cached or _count(usage.get("prompt_cache_hit_tokens"))
     return Wire(
         text=str(message.get("content") or ""),
-        model=str(answer.get("model") or model),
-        read=max(0, _count(usage.get("prompt_tokens")) - cached),
-        written=_count(usage.get("completion_tokens")),
+        model=str(answer.get("model") or model).removeprefix(model_prefix),
+        read=max(0, read_in_all - cached),
+        written=written,
         cached=cached,
     )
 
 
 async def models(
-    *, http: httpx.AsyncClient, name: str, key: str, base_url: str, seconds: float = 30
+    *,
+    http: httpx.AsyncClient,
+    name: str,
+    key: str,
+    base_url: str,
+    seconds: float = 30,
+    model_prefix: str = "",
 ) -> list[str]:
     """The models the key can ask, as the provider lists them."""
     response = await _send(http, name, "GET", f"{base_url}/models", key, seconds)
@@ -133,5 +156,9 @@ async def models(
     except (ValueError, AttributeError) as error:
         raise WireError("busy", f"{name} answered something that is not a list.") from error
     return sorted(
-        {str(entry.get("id")) for entry in listed if isinstance(entry, dict) and entry.get("id")}
+        {
+            str(entry.get("id")).removeprefix(model_prefix)
+            for entry in listed
+            if isinstance(entry, dict) and entry.get("id")
+        }
     )[:200]

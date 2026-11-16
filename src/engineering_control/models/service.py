@@ -221,8 +221,9 @@ class Models:
             max_tokens=question.max_tokens,
             seconds=question.seconds,
             limit_name=held.provider.limit_name,
-            strict=held.provider.key == "openai",
-            effort=question.effort,
+            strict=held.provider.shape == "schema",
+            effort=question.effort if held.provider.effort else None,
+            model_prefix=held.provider.model_prefix,
         )
 
     async def _patient(self, held: _Held, model: str, question: Question, prompt: str) -> Wire:
@@ -361,7 +362,11 @@ class Models:
                 found = await anthropic_api.models(key=key, base_url=url, http=self._anthropic_http)
             else:
                 found = await openai_style.models(
-                    http=self.http, name=kind.name, key=key, base_url=url
+                    http=self.http,
+                    name=kind.name,
+                    key=key,
+                    base_url=url,
+                    model_prefix=kind.model_prefix,
                 )
         except SealError as error:
             state, reason = "sign_in_required", str(error)

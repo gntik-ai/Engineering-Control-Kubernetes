@@ -11,6 +11,7 @@ export const PROVIDER_NAMES: Record<string, string> = { claude: 'Claude', chatgp
 export const API_PROVIDER_NAMES: Record<string, string> = {
   anthropic: 'Anthropic API',
   openai: 'OpenAI API',
+  google: 'Google Gemini API',
   deepseek: 'DeepSeek',
   qwen: 'Qwen',
   glm: 'GLM',

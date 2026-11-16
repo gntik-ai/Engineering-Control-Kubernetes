@@ -196,6 +196,7 @@ def test_the_catalogue_names_the_providers_asked_for() -> None:
         "chatgpt",
         "anthropic",
         "openai",
+        "google",
         "deepseek",
         "glm",
         "kimi",

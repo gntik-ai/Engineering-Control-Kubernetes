@@ -173,6 +173,7 @@ key" → Enter key):
 | --- | --- |
 | Anthropic API | `api.anthropic.com` |
 | OpenAI API | `api.openai.com` |
+| Google Gemini API | `generativelanguage.googleapis.com` |
 | DeepSeek | `api.deepseek.com` |
 | Qwen | `dashscope-intl.aliyuncs.com` (international) or `dashscope.aliyuncs.com` (China) |
 | GLM | `api.z.ai` (international) or `open.bigmodel.cn` (China) |
@@ -180,6 +181,13 @@ key" → Enter key):
 
 The address is chosen from that list and never typed, so a key is sent nowhere else. A
 key works at the address it was made for.
+
+Google's is the Gemini API of Google AI Studio (a key from aistudio.google.com → API
+keys), asked at the address where it accepts the same kind of request as OpenAI. Vertex
+AI, which signs in with a Google Cloud account and not with a key, is not supported. The
+list of models a Google key reaches also holds models that do not answer questions
+(embeddings, images); a task names one that does, without the `models/` Google writes
+before a name.
 
 Where the key is kept differs from a subscription's sign-in, because no sandbox may ever
 hold it:
@@ -661,7 +669,8 @@ and has been decided on by the administrator: the rules do not ask who wrote it.
 The review is still an agent of a subscription, who reads the code, and it is never of
 the family that wrote the change. The reviewer's setting "other than" names the task
 Apply the edits. What an Anthropic model wrote is reviewed on ChatGPT, what an OpenAI
-model wrote on Claude; what DeepSeek, Qwen, GLM or Kimi wrote, on either.
+model wrote on Claude; what a model of Google, DeepSeek, Qwen, GLM or Kimi wrote, on
+either.
 
 A flow of this kind reads: Clone → Install → Run the tests → Find the files → Read the
 files → Ask a model: write the change → Apply the edits → Review the change → Run the
@@ -747,7 +756,8 @@ ask a model directly instead of starting an agent in a sandbox:
 
 Each is set with your instruction, the provider and the model's name as the provider
 writes it, optionally a second provider and model for when no account of the first can
-answer, how hard the model reasons (Anthropic and OpenAI only), whether it is given the
+answer, how hard the model reasons (Anthropic, OpenAI and Google only; of the levels,
+OpenAI and Google are told low, medium and high), whether it is given the
 collected change, the longest answer in tokens, and how long one answer is waited for.
 
 Such a task is a step of the run like a sandbox's, but no sandbox runs: the launcher
@@ -778,7 +788,15 @@ Anthropic is asked through its own library, with the answer's shape given to the
 itself and the request streamed. On the models that can decline a request for safety
 reasons (Fable, Opus 5 and 5.5, Sonnet 5.5) the API's own fallback is asked for, so such
 a request is answered by the model Anthropic names for that case instead of failing. The
-five other providers are asked for a chat completion as a JSON object.
+six other providers are asked for a chat completion: OpenAI and Google with the answer's
+shape given to the API itself, the four others for a JSON object. Should OpenAI or Google
+reject a request as it is written, it is sent once more asking for a JSON object (a
+rejected request costs nothing); the platform checks the shape either way.
+
+A Gemini model thinks before it answers, and what it thinks counts against the longest
+answer the task allows: an answer that ends as "longer than the tokens it may have" on a
+short question needs more tokens in the task's setting, or a lower level of reasoning.
+What it thought is counted with the tokens written, as Google bills it.
 
 Every question and answer is kept with its step on the run's page ("Show what was asked
 and answered"), with the provider, the account, the model, the tokens read and written,

@@ -49,12 +49,13 @@ GOOD = {"decision": "PASS", "summary": "Fine."}
 # --- the providers ---------------------------------------------------------------------------
 
 
-def test_six_providers_each_at_addresses_of_its_own() -> None:
-    assert API_KEYS == ("anthropic", "openai", "deepseek", "qwen", "glm", "kimi")
+def test_seven_providers_each_at_addresses_of_its_own() -> None:
+    assert API_KEYS == ("anthropic", "openai", "google", "deepseek", "qwen", "glm", "kimi")
     hosts = {key: [host_of(e.url) for e in BY_KEY[key].endpoints] for key in API_KEYS}
     assert hosts == {
         "anthropic": ["api.anthropic.com"],
         "openai": ["api.openai.com"],
+        "google": ["generativelanguage.googleapis.com"],
         "deepseek": ["api.deepseek.com"],
         "qwen": ["dashscope-intl.aliyuncs.com", "dashscope.aliyuncs.com"],
         "glm": ["api.z.ai", "open.bigmodel.cn"],
@@ -69,7 +70,20 @@ def test_six_providers_each_at_addresses_of_its_own() -> None:
     # An API and the subscription of the same company are one family.
     assert FAMILY_OF["anthropic"] == FAMILY_OF["claude"] != FAMILY_OF["openai"]
     assert FAMILY_OF["openai"] == FAMILY_OF["chatgpt"]
-    assert len({FAMILY_OF[key] for key in ("deepseek", "qwen", "glm", "kimi")}) == 4
+    assert len({FAMILY_OF[key] for key in ("google", "deepseek", "qwen", "glm", "kimi")}) == 5
+    # Google has no subscription here: its models are a family of their own.
+    assert FAMILY_OF["google"] not in (FAMILY_OF["claude"], FAMILY_OF["chatgpt"])
+    # OpenAI and Google hold a model to the shape of its answer and take a level of
+    # reasoning; Google names its models with a word before them.
+    assert [key for key in API_KEYS if BY_KEY[key].shape == "schema"] == ["openai", "google"]
+    assert [key for key in API_KEYS if BY_KEY[key].effort] == ["openai", "google"]
+    google = BY_KEY["google"]
+    assert google.endpoints[0].url == "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert (google.model_prefix, google.limit_name, google.key_pattern) == (
+        "models/",
+        "max_tokens",
+        None,
+    )
 
 
 def test_a_key_is_checked_for_what_it_is_and_never_repeated() -> None:
@@ -310,6 +324,82 @@ async def test_a_chat_completion_asks_for_a_json_object_and_reads_what_it_cost()
             http=http, name="Kimi", key=OTHER_KEY, base_url="https://api.moonshot.ai/v1"
         ) == ["model-a", "model-b"]
         assert provider.asked[-1][:2] == ("GET", "https://api.moonshot.ai/v1/models")
+
+        # Google: asked like OpenAI at its own address, the shape held by the provider.
+        google = BY_KEY["google"]
+        gemini: dict[str, Any] = {
+            **common,
+            "name": google.name,
+            "base_url": google.endpoints[0].url,
+            "model": "gemini-pro",
+            "limit_name": google.limit_name,
+            "strict": True,
+            "model_prefix": google.model_prefix,
+        }
+        answer = said(
+            GOOD,
+            # What the model thought is in the total and not in what it wrote.
+            usage={"prompt_tokens": 900, "completion_tokens": 60, "total_tokens": 1400},
+        )
+        provider.answers = [
+            httpx.Response(200, json={**answer.json(), "model": "models/gemini-pro"})
+        ]
+        wire = await openai_style.complete(effort="low", **gemini)
+        method, url, body, authorization = provider.asked[-1]
+        assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        assert authorization == f"Bearer {OTHER_KEY}" and body is not None
+        assert body["model"] == "gemini-pro" and body["max_tokens"] == 4000
+        assert body["response_format"]["json_schema"]["schema"] == SHAPE
+        assert body["reasoning_effort"] == "low"
+        # The model is named as the administrator writes it, and thinking is paid as written.
+        assert wire.model == "gemini-pro" and (wire.read, wire.written) == (900, 500)
+        # A level the provider is not told (the model's own) is left out.
+        await openai_style.complete(effort="default", **gemini)
+        assert "reasoning_effort" not in (provider.asked[-1][2] or {})
+
+        # A shape the provider will not take as written is asked for as a JSON object,
+        # once; a request that is wrong for another reason is rejected again and said.
+        before = len(provider.asked)
+        provider.answers = [
+            httpx.Response(400, json={"error": {"message": "Unknown name in schema"}}),
+            said(GOOD),
+        ]
+        wire = await openai_style.complete(**gemini)
+        assert json.loads(wire.text) == GOOD and len(provider.asked) == before + 2
+        first, second = provider.asked[-2][2] or {}, provider.asked[-1][2] or {}
+        assert first["response_format"]["type"] == "json_schema"
+        assert second["response_format"] == {"type": "json_object"}
+        assert {k: v for k, v in first.items() if k != "response_format"} == {
+            k: v for k, v in second.items() if k != "response_format"
+        }
+        provider.answers = [
+            httpx.Response(404, json={"error": {"message": "models/gemini-none is not found"}}),
+            httpx.Response(404, json={"error": {"message": "models/gemini-none is not found"}}),
+        ]
+        with pytest.raises(WireError, match="gemini-none is not found") as wrong:
+            await openai_style.complete(**gemini)
+        assert wrong.value.kind == "invalid" and provider.answers == []
+        # A refused key or a busy provider is not asked again here.
+        before = len(provider.asked)
+        provider.answers = [httpx.Response(401, json={"error": {"message": "API key not valid"}})]
+        with pytest.raises(WireError, match="Google Gemini API does not accept the key"):
+            await openai_style.complete(**gemini)
+        assert len(provider.asked) == before + 1
+
+        # Its list names models with a word before them, which is taken off.
+        provider.models = ["models/gemini-pro", "models/gemini-flash", "models/embedding-1"]
+        assert await openai_style.models(
+            http=http,
+            name=google.name,
+            key=OTHER_KEY,
+            base_url=google.endpoints[0].url,
+            model_prefix=google.model_prefix,
+        ) == ["embedding-1", "gemini-flash", "gemini-pro"]
+        assert (
+            provider.asked[-1][1]
+            == "https://generativelanguage.googleapis.com/v1beta/openai/models"
+        )
+        provider.models = ["model-b", "model-a"]
 
     async def unreachable(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("no route", request=request)
