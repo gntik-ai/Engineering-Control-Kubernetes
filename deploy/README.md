@@ -614,7 +614,19 @@ repositories the first map takes 3 seconds (falcone, 3,164 files of code) and 9 
 task found and of what failed. A word in a file's path or in a name it defines counts
 most, a word in its text less, and a word that is in a fifth of the code counts for
 nothing. The best files are joined by what they import, what imports them and the tests
-that cover them.
+that cover them, and by what changed together with them.
+
+**What changes together** is read from the repository's history. Clone the repository
+looks at the branch's last commits (300, the task's setting History; 0 reads none) and
+keeps the names of the files each one changed, not their content: the history is fetched
+beside the checkout without the files, read up to the commit the checkout is at, and
+removed again, so the checkout stays one commit deep. A file that changed in the same
+commits as one of the best files, at least twice and in a quarter of that file's commits,
+is added with the reason ("it changed together with … in 3 of 5 commits"). That finds
+what the code does not say belongs together: a schema and the code that reads it, a
+translation and its page. A commit that changed more than 30 files counts for nothing.
+In the evaluation lab nothing later than the commit a case works at is read. A history
+that cannot be read stops nothing; the clone says so, and the run goes by the code alone.
 
 **Read the files** hands the files to the tasks after it; a model that is asked
 afterwards is given them. A file longer than allowed is read from its start and says so.

@@ -28,6 +28,7 @@ from engineering_control.engine.catalogue import (
     AUDITING,
     CHECKS_MINUTES,
     CHECKS_MINUTES_CEILING,
+    HISTORY_COMMITS,
     ITEM_KINDS,
     TASKS,
     VERIFYING,
@@ -403,7 +404,16 @@ class Clone:
             toolchain=deliver.Toolchain(),
             commit=data.get("at_commit"),
             base_branch=self._from(ctx),
+            history=self._history(ctx),
         )
+
+    @staticmethod
+    def _history(ctx: Context) -> int:
+        """How many of the branch's last commits are read for what changes together."""
+        try:
+            return max(0, min(int(ctx.params.get("history", HISTORY_COMMITS)), 1000))
+        except (TypeError, ValueError):
+            return HISTORY_COMMITS
 
     @staticmethod
     def _from(ctx: Context) -> str:
@@ -419,11 +429,24 @@ class Clone:
                 (verdict.detail if verdict else None) or "The checkout gave no commit.",
             )
         base = self._from(ctx)
+        said = f"Cloned {ctx.data['repository']} at {base} ({base_sha[:12]})."
+        history = next((c for c in commands if c.get("name") == "history"), None)
+        read: int | None = None
+        if history is not None:
+            if history.get("exit_code") == 0:
+                counted = str(history.get("stdout") or "").strip().splitlines()[-1:]
+                read = int(counted[0]) if counted and counted[0].isdigit() else 0
+                said += f" What its last {read:,} commits changed was read, by name."
+            else:
+                said += (
+                    " Its history could not be read, so this run does not know which "
+                    "files change together."
+                )
         return Done(
             "ok",
             "cloned",
-            f"Cloned {ctx.data['repository']} at {base} ({base_sha[:12]}).",
-            output={"base_sha": base_sha, "branch": base},
+            said,
+            output={"base_sha": base_sha, "branch": base, "history": read},
             # What a pull request of the run is opened against is what was cloned.
             data={"base_sha": base_sha, "base_branch": base},
         )

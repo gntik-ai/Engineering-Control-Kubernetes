@@ -84,7 +84,7 @@ def test_three_tasks_stand_where_one_stood_and_no_agent_is_in_any() -> None:
         assert not (task.account or task.writes or task.publishes or task.approval)
         assert "No agent takes part" in task.summary
     assert not clone.gate and not install.gate
-    assert clone.produces == ("checkout",) and [p.kind for p in clone.params] == ["line"]
+    assert clone.produces == ("checkout",) and [p.kind for p in clone.params] == ["line", "int"]
     assert install.needs == ("checkout",) and [p.kind for p in install.params] == ["commands"]
     assert tests.outcomes == ("passed", "failed", "regression")
     assert tests.produces == ("baseline",)
@@ -160,7 +160,7 @@ async def test_a_branch_named_by_the_flow_is_cloned_and_is_what_a_pull_request_g
     run = world.runs.start_delivery(world.item_id, toolchain=world.toolchain)
     assert run["data"]["base_branch"] == "main", "the project's own, until the clone"
     job = await _job(world, "prepare")
-    assert [command["name"] for command in job["commands"]] == ["checkout"]
+    assert [command["name"] for command in job["commands"]] == ["checkout", "history"]
     assert job["commands"][0]["env"]["BASE"] == "develop"
     assert job["commands"][0]["env"]["BRANCH"] == run["data"]["branch"]
     await _end(world, CLONED)

@@ -115,6 +115,9 @@ class Find:
             f" The map has {indexed.get('code', 0):,} files of code and "
             f"{indexed.get('imports', 0):,} imports between them."
         )
+        history = found.get("history")
+        if isinstance(history, int) and history > 0:
+            mapped += f" What {history:,} commits changed says what changes together."
         if not paths:
             return Done(
                 "none",

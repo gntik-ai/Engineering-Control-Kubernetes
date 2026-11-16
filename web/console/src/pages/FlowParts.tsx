@@ -37,6 +37,7 @@ const SETTING_NAMES: Record<string, string> = {
   condition: 'What is asked',
   instruction: 'Your instruction',
   branch: 'Branch',
+  history: 'Commits of history looked at',
   method: 'How it is merged',
   provider: 'Provider',
   model: 'Model',

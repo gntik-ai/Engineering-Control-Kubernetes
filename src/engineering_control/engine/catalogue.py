@@ -28,6 +28,8 @@ MINUTES_DEFAULT: Final = 8 * 60
 TOKENS_CEILING: Final = 500_000_000
 DOLLARS_CEILING: Final = 1000
 AGENT_MINUTES: Final = 50
+# How many commits the clone reads the names of changed files of.
+HISTORY_COMMITS: Final = 300
 AGENT_MINUTES_CEILING: Final = 55
 AREAS_CEILING: Final = 6
 FINDINGS_CEILING: Final = 8
@@ -293,6 +295,16 @@ _TASKS: Final = (
                 high=100,
                 pattern=BRANCH,
                 shape="a branch name: letters, digits, dots, hyphens, underscores and slashes",
+            ),
+            Param(
+                "history",
+                "int",
+                HISTORY_COMMITS,
+                "How many of the branch's last commits are looked at for which files "
+                "change together: the names of what each changed, not the content. Find "
+                "the files uses it. 0 reads none.",
+                low=0,
+                high=1000,
             ),
         ),
     ),

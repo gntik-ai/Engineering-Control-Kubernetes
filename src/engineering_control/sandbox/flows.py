@@ -200,6 +200,7 @@ class Checkouts:
         toolchain: deliver.Toolchain,
         commit: str | None = None,
         base_branch: str | None = None,
+        history: int = 0,
     ) -> Plan:
         if self.github is None:
             raise GitHubAppError("The GitHub App is not configured, so nothing can be checked out")
@@ -215,6 +216,7 @@ class Checkouts:
                 authorization=f"Basic {basic}",
                 toolchain=toolchain,
                 commit=commit if commit and len(commit) == 40 else None,
+                history=history,
             ),
             workspace=True,
             deadline_seconds=3600,

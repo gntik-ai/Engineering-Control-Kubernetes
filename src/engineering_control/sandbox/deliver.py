@@ -350,6 +350,49 @@ def _in_repo(command: Command, name: str, *, allow_failure: bool = False) -> dic
     }
 
 
+# Where the names of what the branch's last commits changed are kept for a run: what
+# Find the files reads to know which files change together.
+HISTORY: Final = f"{CACHE}/history.txt"
+HISTORY_CEILING: Final = 1000
+
+
+def _history(repository: str, base_branch: str, authorization: str, commits: int) -> dict[str, Any]:
+    """Read which files the branch's last commits changed: their names, not their content.
+    The history is fetched beside the checkout, without the files themselves, read up to
+    the commit the checkout is at, and removed again; the checkout stays one commit deep.
+    A history that cannot be read stops nothing: the run then does not know what changes
+    together."""
+    script = (
+        'rm -rf "$CACHE/history.git" "$CACHE/history.txt"; '
+        'git -c core.hooksPath=/dev/null -c "http.extraHeader=Authorization: $AUTHORIZATION" '
+        'clone --quiet --bare --no-tags --filter=blob:none --depth "$COMMITS" --single-branch '
+        '--branch "$BASE" "https://github.com/$REPOSITORY.git" "$CACHE/history.git" && '
+        "AT=$(git -C repo rev-parse HEAD) && "
+        'git -C "$CACHE/history.git" log --no-merges --no-renames --name-only '
+        '--format=%x01%H -n "$COMMITS" "$AT" > "$CACHE/history.new" && '
+        'mv "$CACHE/history.new" "$CACHE/history.txt"; status=$?; '
+        'rm -rf "$CACHE/history.git" "$CACHE/history.new"; '
+        '[ "$status" = 0 ] && grep -c "^\x01" "$CACHE/history.txt"; exit "$status"'
+    )
+    return {
+        "name": "history",
+        "argv": ["bash", "-uc", script],
+        "cwd": WORKSPACE,
+        "env": {
+            "AUTHORIZATION": authorization,
+            "REPOSITORY": repository,
+            "BASE": base_branch,
+            "CACHE": CACHE,
+            "COMMITS": str(max(1, min(int(commits), HISTORY_CEILING))),
+            "GIT_TERMINAL_PROMPT": "0",
+            # A commit the fetched history does not reach is not fetched by itself.
+            "GIT_NO_LAZY_FETCH": "1",
+        },
+        "timeout": 300,
+        "allow_failure": True,
+    }
+
+
 def prepare_job(
     *,
     repository: str,
@@ -358,6 +401,7 @@ def prepare_job(
     authorization: str,
     toolchain: Toolchain,
     commit: str | None = None,
+    history: int = 0,
 ) -> dict[str, Any]:
     """Check out, install, and learn what already fails.
 
@@ -401,6 +445,8 @@ def prepare_job(
             "timeout": 900,
         }
     ]
+    if history > 0:
+        commands.append(_history(repository, base_branch, authorization, history))
     commands += [
         _in_repo(command, f"install {index}")
         for index, command in enumerate(toolchain.prepare, start=1)

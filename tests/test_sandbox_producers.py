@@ -218,7 +218,7 @@ async def test_an_audit_proposes_only_the_findings_verified_twice(site: Any) -> 
     prepare = site.job()
     # The repository is cloned, then what the project needs is installed in a step of
     # its own; its tests are not run beforehand.
-    assert [c["name"] for c in prepare["commands"]] == ["checkout"]
+    assert [c["name"] for c in prepare["commands"]] == ["checkout", "history"]
     assert prepare["commands"][0]["env"]["BRANCH"].startswith("engineering-control/audit-")
     site.fake.finish(_checked_out())
     await site.launcher.tick()

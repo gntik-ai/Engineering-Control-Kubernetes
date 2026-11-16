@@ -340,7 +340,7 @@ async def test_an_issue_is_delivered_and_published_only_after_the_decision(world
         "repositories": ["falcone-workflow"],
         "permissions": {"contents": "read"},
     }
-    assert [c["name"] for c in job["commands"]] == ["checkout"]
+    assert [c["name"] for c in job["commands"]] == ["checkout", "history"]
     assert pod["metadata"]["labels"]["engineering-control/egress"] == "internet"
     workspace = pods.workspace_claim(UUID(run["id"]))
     assert workspace in world.fake.claims

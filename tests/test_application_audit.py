@@ -253,7 +253,9 @@ async def test_a_ui_audit_looks_at_the_application_and_proposes_what_is_confirme
         "secret": f"application-{project_id}",
     }
     await world.launcher.tick()
-    assert [c["name"] for c in world.job()["commands"]] == ["checkout"], "nothing is installed"
+    assert [c["name"] for c in world.job()["commands"]] == ["checkout", "history"], (
+        "nothing is installed"
+    )
     world.fake.finish(_checked_out())
     await world.launcher.tick()
 

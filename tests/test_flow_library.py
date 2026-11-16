@@ -265,7 +265,7 @@ async def test_code_clean_proposes_what_can_be_taken_out_as_clean_up_items(world
     )
     assert (run["kind"], run["title"]) == ("flow", "Code clean: The helpers")
     await world.launcher.tick()
-    assert [c["name"] for c in world.job()["commands"]] == ["checkout"]
+    assert [c["name"] for c in world.job()["commands"]] == ["checkout", "history"]
     world.fake.finish(_checked_out())
     await world.launcher.tick()
     await world.launcher.tick()

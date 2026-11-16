@@ -40,7 +40,10 @@ from typing import Any
 
 REPO = os.environ.get("BENCH_REPO", "/workspace/repo")
 INDEX = os.environ.get("BENCH_INDEX", "/workspace/.cache/code-index.json")
+HISTORY = os.environ.get("BENCH_HISTORY", "/workspace/.cache/history.txt")
 VERSION = 2
+# A commit that changed more files than this says nothing of what belongs together.
+MAX_TOGETHER = 30
 MAX_PARSED = 400_000
 MAX_DEFS = 200
 SKIPPED_DIRS = ("node_modules/", "vendor/", "dist/", "build/", ".git/", "third_party/")
@@ -372,6 +375,39 @@ def index() -> dict[str, Any]:
     return document
 
 
+# --- what changes together -------------------------------------------------------------------
+
+
+def together(files: dict[str, Any]) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
+    """From the names of what the last commits changed, as the clone left them: in how
+    many commits each file changed, in how many each pair changed together, and how many
+    commits were read. Without that record, nothing."""
+    changed: dict[str, int] = {}
+    pairs: dict[str, dict[str, int]] = {}
+    try:
+        with open(HISTORY, encoding="utf-8", errors="replace") as handle:
+            blocks = handle.read().split("\x01")
+    except OSError:
+        return changed, pairs, 0
+    commits = 0
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines()]
+        if not lines or not lines[0]:
+            continue
+        commits += 1
+        names = sorted({line for line in lines[1:] if line in files})
+        for name in names:
+            changed[name] = changed.get(name, 0) + 1
+        if not 2 <= len(names) <= MAX_TOGETHER:
+            continue
+        for one in names:
+            for other in names:
+                if one != other:
+                    row = pairs.setdefault(one, {})
+                    row[other] = row.get(other, 0) + 1
+    return changed, pairs, commits
+
+
 # --- finding ---------------------------------------------------------------------------------
 
 
@@ -483,6 +519,20 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
             )
             for user in users[:2]:
                 join(user, f"it imports {seed}")
+        # What changed in the same commits as the best files, at least twice and in a
+        # quarter of their commits: what the code does not say hangs together.
+        changed, pairs, commits = together(files)
+        for seed in seeds:
+            seen = changed.get(seed, 0)
+            partners = [
+                (times, other)
+                for other, times in pairs.get(seed, {}).items()
+                if times >= 2 and times * 4 >= seen
+            ]
+            for times, other in sorted(partners, key=lambda pair: (-pair[0], pair[1]))[:3]:
+                join(other, f"it changed together with {seed} in {times} of {seen} commits")
+    else:
+        commits = 0
     for path in ranked:
         if len(chosen) >= limit:
             break
@@ -501,6 +551,8 @@ def find(question: dict[str, Any]) -> dict[str, Any]:
         ],
         "terms": used,
         "indexed": document["summary"],
+        # How many commits said which files change together; none when the clone read none.
+        "history": commits,
     }
 
 
