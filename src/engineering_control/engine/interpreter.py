@@ -29,7 +29,7 @@ from typing import Any, Final
 import structlog
 
 from engineering_control.dashboard.backlog_items import BacklogItems
-from engineering_control.engine import catalogue, conditions, routing
+from engineering_control.engine import catalogue, conditions, parts, routing
 from engineering_control.engine.agents import Agents
 from engineering_control.engine.asking import MODEL
 from engineering_control.engine.bench_tasks import BENCH
@@ -103,13 +103,18 @@ class Engine:
                 raise ValueError(f"the flow the run carries cannot be read: {error}") from error
         key = str(flow.get("key") or FLOW_OF_KIND.get(item.run_kind) or "")
         version = int(flow.get("version") or 0)
-        if version and self.documents is not None:
-            found = self.documents(key, version)
-            if found is not None:
-                return found
-        if key in BUILTIN:
-            return BUILTIN[key]
-        raise ValueError(f"the run follows the flow {key}, which is not there")
+        found = self.documents(key, version) if version and self.documents is not None else None
+        if found is None:
+            found = BUILTIN.get(key)
+        if found is None:
+            raise ValueError(f"the run follows the flow {key}, which is not there")
+        # The parts the flow runs, at the versions the run started with, in place of the
+        # tasks that run them.
+        pinned = flow.get("parts") if isinstance(flow.get("parts"), dict) else None
+        expanded, wrong, _origin = parts.expand(found, pinned=pinned)
+        if wrong:
+            raise ValueError(str(wrong[0]["text"]))
+        return expanded
 
     def _context(self, item: StepWork, node: Node | None = None) -> Context:
         document = self.document(item)

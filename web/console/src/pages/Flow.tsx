@@ -617,7 +617,14 @@ function Editor({
             ? `In force: ${versionName(detail.in_force.version).toLowerCase()}${
                 detail.in_force.note && detail.in_force.version ? ` (${detail.in_force.note})` : ''
               }. `
-            : 'This flow was never put in force: nothing runs by it, and no section can have it yet. '}
+            : saved.document.part
+              ? 'This part was never put in force: no flow can run it yet. '
+              : 'This flow was never put in force: nothing runs by it, and no section can have it yet. '}
+          {saved.document.part
+            ? `It is a part: it does not run by itself, and a flow runs it with the task Run a part. It is left by ${
+                (saved.exits ?? []).join(', ') || 'nothing yet'
+              }: the outcomes of its tasks that lead nowhere. `
+            : ''}
           {detail.draft
             ? `Version ${detail.draft.version} is a draft: nothing runs by it until you put it in force.`
             : 'Change something and save it: that makes a draft, which nothing runs by until you put it in force.'}

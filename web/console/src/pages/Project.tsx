@@ -467,7 +467,10 @@ function Detail({ name }: { name: string }) {
   const detail = useResource<ProjectDetail>(apiUrl(`projects/${name}`));
   const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
   // A flow made here that was never put in force cannot be given to a section.
-  const assignable = (flows.data?.items ?? []).filter((flow) => !flow.engine || flow.engine.version !== null);
+  // Nor can a part: it runs only inside the flows that run it.
+  const assignable = (flows.data?.items ?? []).filter(
+    (flow) => !flow.engine || (flow.engine.version !== null && !flow.engine.part),
+  );
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Section | null>(null);
   const [removing, setRemoving] = useState<Section | null>(null);

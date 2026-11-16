@@ -509,6 +509,50 @@ STARTERS: Final[dict[str, Document]] = {
             back_to="decide",
         ),
     ),
+    # The loop by itself, as a part: written once, run by every flow that names it.
+    "starter-loop-part": parse(
+        {
+            "format": FORMAT,
+            "key": "starter-loop-part",
+            "name": "A part: a model works in a loop",
+            "summary": "A model asked over an API chooses step by step what to do: "
+            "search, read, have edits written and applied, check them. It is left when "
+            "the model says done. A flow runs it with the task Run a part and leads on "
+            "from done to its review.",
+            "part": True,
+            "start": "decide",
+            "tasks": [
+                {
+                    "id": "decide",
+                    "task": "model.choose",
+                    "with": {
+                        **_ASK,
+                        "instruction": "Resolve what the run is about: find the code, "
+                        "change it, and check the change.",
+                    },
+                    "next": {"search": "find", "read": "read", "edit": "write", "check": "look"},
+                },
+                {"id": "find", "task": "code.find", "next": {"found": "decide", "none": "decide"}},
+                {"id": "read", "task": "code.read", "next": {"ok": "decide"}},
+                {
+                    "id": "write",
+                    "task": "model.edit",
+                    "with": {**_ASK, "instruction": "Write the change as it is asked for."},
+                    "next": {"edits": "apply", "nothing": "decide"},
+                },
+                {
+                    "id": "apply",
+                    "task": "code.apply",
+                    "next": {"applied": "decide", "refused": "decide"},
+                },
+                {
+                    "id": "look",
+                    "task": "code.tests",
+                    "next": {"passed": "decide", "failed": "decide", "none": "decide"},
+                },
+            ],
+        }
+    ),
 }
 
 

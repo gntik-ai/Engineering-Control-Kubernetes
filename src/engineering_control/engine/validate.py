@@ -30,8 +30,9 @@ from uuid import UUID
 
 from engineering_control.agent_models import problem as model_problem
 from engineering_control.engine import conditions
+from engineering_control.engine import parts as flow_parts
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
-from engineering_control.engine.document import Document, Node
+from engineering_control.engine.document import KEY, Document, Node
 from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.sandbox.deliver import PROVIDERS, commands_of
 
@@ -111,6 +112,12 @@ def _check_param(param: Param, value: Any, node: Node, nodes: dict[str, Node]) -
         except ValueError:
             return f"{name} names one of your agents"
         return None
+    if param.kind == "part":
+        return (
+            None
+            if KEY.fullmatch(str(value or ""))
+            else f"{node.id} does not say which part it runs"
+        )
     if param.kind == "condition":
         unread = conditions.problems(value)
         return f"{node.id}: {unread[0]}" if unread else None
@@ -329,7 +336,22 @@ def _publishing(document: Document, nodes: dict[str, Node], found: list[Problem]
 
 
 def problems(document: Document) -> list[Problem]:
-    """Everything that is wrong with the flow. A flow with an error cannot be published."""
+    """Everything that is wrong with the flow. A flow with an error cannot be published.
+
+    A flow that runs parts is checked as it runs: with each part's tasks in place of the
+    task that runs it. What is wrong with one of those is said of the task that runs the
+    part."""
+    document, wrong, origin = flow_parts.expand(document)
+    if wrong:
+        return wrong
+    found = _problems(document)
+    for problem in found:
+        if problem["where"] in origin:
+            problem["where"] = origin[problem["where"]]
+    return found
+
+
+def _problems(document: Document) -> list[Problem]:
     found: list[Problem] = []
     nodes = {node.id: node for node in document.nodes}
     if document.start not in nodes:
@@ -441,6 +463,11 @@ def problems(document: Document) -> list[Problem]:
     for node in document.nodes:
         if node.id not in reached:
             found.append(_problem("unreached", f"{node.id} is never reached", node.id, "warning"))
+    if document.part:
+        # A part is held to what its tasks say. What a whole flow has to have (a
+        # checkout before the code is looked at, a review before anything is published)
+        # is checked on every flow that runs it, with its tasks in place.
+        return [*found, *flow_parts.rules(document)]
     before = _ancestors(nodes, reached)
     unwritten = _unwritten(document, nodes)
     for node_id in sorted(reached):

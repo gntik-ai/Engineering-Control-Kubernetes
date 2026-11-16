@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from engineering_control.engine import conditions, routing, validate
+from engineering_control.engine import conditions, parts, routing, validate
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, Node
 from engineering_control.engine.prompts import CONTRACTS
@@ -52,6 +52,9 @@ def simulate(
     through, ``max_rounds`` what a run granted more rounds would have, ``known`` what a
     run that happened knew, for the Ifs to ask about."""
     wrong = validate.errors(document)
+    if not wrong:
+        # What is gone through is what runs: the flow with its parts in place.
+        document, _problems, _origin = parts.expand(document)
     if wrong:
         return {
             "steps": [],

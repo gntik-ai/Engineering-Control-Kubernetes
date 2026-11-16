@@ -46,7 +46,13 @@ function between(
 
 /** How a run stands on its flow: each task's state, who worked in it, and the way it went. */
 function drawn(run: Run, document: FlowDocument, catalogue: FlowCatalogue) {
-  const steps = run.steps ?? [];
+  // A step of a part's task is named after the task that runs the part (work-decide for
+  // work): it is drawn on that task, which is what the flow's drawing has.
+  const own = new Set(document.tasks.map((node) => node.id));
+  const calls = document.tasks.filter((node) => node.task === 'control.part').map((node) => node.id);
+  const drawnOn = (name: string) =>
+    own.has(name) ? name : (calls.find((id) => name.startsWith(id + '-')) ?? name);
+  const steps = (run.steps ?? []).map((step) => ({ ...step, name: drawnOn(step.name) }));
   const tones: Record<string, FlowTone | undefined> = {};
   const metas: Record<string, string | undefined> = {};
   const taken = new Set<string>();

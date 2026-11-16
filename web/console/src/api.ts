@@ -42,6 +42,8 @@ export interface FlowEngine {
   /** The version being worked on, when there is one. */
   draft: number | null;
   builtin: boolean;
+  /** A part: it runs only inside the flows that run it. */
+  part?: boolean;
   /** What starting the flow for a section is called, when a section can run it by itself. */
   section_action: string | null;
   publishes: boolean;
@@ -70,7 +72,8 @@ export interface TaskParam {
     | 'text'
     | 'line'
     | 'commands'
-    | 'agent';
+    | 'agent'
+    | 'part';
   default: unknown;
   doc: string;
   low: number | null;
@@ -84,7 +87,7 @@ export interface TaskType {
   group: string;
   title: string;
   summary: string;
-  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control';
+  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control' | 'part';
   account: boolean;
   writes: boolean;
   publishes: boolean;
@@ -169,7 +172,9 @@ export interface FlowCatalogue {
   /** The agents a task can name. */
   agents?: { id: string; name: string }[];
   /** Flows a new flow can be started from. */
-  starters?: { key: string; name: string; summary: string }[];
+  starters?: { key: string; name: string; summary: string; part?: boolean }[];
+  /** The parts a flow can run: flows marked as parts that are in force, with the ways each is left. */
+  parts?: { key: string; name: string; summary: string; exits: string[]; writes: boolean }[];
 }
 
 /** How an agent works: in a sandbox on a subscription, and when it is asked over an API. */
@@ -265,6 +270,8 @@ export interface FlowDocument {
   action?: string;
   /** Where the designer drew each task. */
   layout?: Record<string, { x: number; y: number }>;
+  /** A part: a flow other flows run with the task Run a part. It does not run by itself. */
+  part?: boolean;
 }
 
 /** What the rules say about a flow, and its prompts part by part. */
@@ -295,6 +302,8 @@ export interface FlowVersionRow {
 /** One version of a flow with its document, what validation says, and its prompts. */
 export interface FlowVersionShown extends FlowVersionRow {
   document: FlowDocument;
+  /** For a part: the ways it can be left, which the flows that run it lead on from. */
+  exits?: string[] | null;
   problems: FlowProblem[];
   prompts: PromptShown[];
 }

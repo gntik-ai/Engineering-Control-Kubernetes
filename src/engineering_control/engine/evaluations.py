@@ -35,7 +35,7 @@ from engineering_control.db.models import (
     SandboxRun,
     SandboxStep,
 )
-from engineering_control.engine import validate
+from engineering_control.engine import parts, validate
 from engineering_control.engine.builtin import FLOW_OF_KIND, kind_of
 from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.library import traits
@@ -171,12 +171,12 @@ class Evaluations:
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
         mine = self._latest(key)
-        if mine is None:
+        if mine is None or mine.part:
             return []
         listed = []
         for other in [key, *(name for name in self.flows.keys() if name != key)]:
             theirs = mine if other == key else self._in_force(other)
-            if theirs is None or sort_of(theirs) != sort_of(mine):
+            if theirs is None or theirs.part or sort_of(theirs) != sort_of(mine):
                 continue
             runs = len(self.candidates(key, of=other, limit=100))
             if other == key or runs:
@@ -254,9 +254,14 @@ class Evaluations:
         document = self.flows.document(key, version)
         if document is None:
             raise ProjectNotFound(f"{key} version {version}")
+        if document.part:
+            raise ProjectInvalid("A part does not run by itself: try a flow that runs it")
         wrong = validate.errors(document)
         if wrong:
             raise ProjectInvalid(f"That version cannot run: {wrong[0]['text']}")
+        # What the cases follow is the flow as it runs now, its parts in place: an
+        # evaluation keeps what it started with.
+        carried, _wrong, _origin = parts.expand(document)
         if source != key:
             theirs = self._in_force(source)
             if theirs is None:
@@ -302,7 +307,7 @@ class Evaluations:
                 project_id=next(iter(projects)) if len(projects) == 1 else None,
                 state="running",
                 note=" ".join((note or "").split())[:300] or None,
-                document=document.as_dict(),
+                document=carried.as_dict(),
                 sha256=document.sha256(),
                 of_flow=source if source != key else None,
             )

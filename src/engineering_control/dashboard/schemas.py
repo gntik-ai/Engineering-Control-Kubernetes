@@ -392,6 +392,8 @@ class FlowCreateInput(DashboardModel):
     copy_of: str | None = Field(default=None, max_length=64)
     version: int | None = Field(default=None, ge=0)
     document: dict[str, Any] | None = None
+    # A part: a flow that other flows run, and that does not run by itself.
+    part: bool = False
 
 
 class FlowPublishInput(DashboardModel):

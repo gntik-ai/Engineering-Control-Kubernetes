@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import FlowVersion
+from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, parse
@@ -36,16 +37,20 @@ def document_in_force(session: Session, key: str) -> tuple[Document, int] | None
     )
     if row is not None:
         try:
-            return parse(row.document), row.version
+            found = parse(row.document)
         except FlowInvalid:
             return None
+        # A part runs only inside the flows that run it: for a section it is no flow.
+        return None if found.part else (found, row.version)
     if key in BUILTIN:
         return BUILTIN[key], 0
     return None
 
 
 def traits(document: Document) -> dict[str, bool]:
-    """What kind of flow it is, from the tasks it has."""
+    """What kind of flow it is, from the tasks it has: its own and those of the parts
+    it runs."""
+    document, _wrong, _origin = parts.expand(document)
     tasks = [TASKS[node.task] for node in document.nodes if node.task in TASKS]
     return {
         "writes": any(task.writes for task in tasks),

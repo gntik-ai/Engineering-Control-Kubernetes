@@ -1074,14 +1074,16 @@ installation. A flow made here is a draft until it is put in force; only then ca
 section have it. The four other names of the list (change request and the rest) are
 names only until someone builds them.
 
-"New flow" also offers two starters: flows to begin from in which a model asked over an
-API does the work an agent in a sandbox does in Deliver issue. They are not flows of the
-library and nothing runs them as they are.
+"New flow" also offers starters: two flows to begin from in which a model asked over an
+API does the work an agent in a sandbox does in Deliver issue, and the loop by itself as
+a part (see Parts below). They are not flows of the library and nothing runs them as
+they are.
 
 | Starter | How the change comes about |
 | --- | --- |
 | Deliver issue, written by a model | Find the files, read them, a model writes the change as edits, the platform applies them. For small changes. |
 | Deliver issue, worked out by a model in a loop | A model chooses step by step: search, read, have edits written and applied, run a check, until it says done. |
+| A part: a model works in a loop | The same loop, as a part: put it in force once, and run it from any flow with Run a part. |
 
 Both keep everything Deliver issue has after the change: the review on a subscription
 (not of the company whose model wrote the change), the tests, the scan, the collection
@@ -1288,9 +1290,54 @@ agent that flows still name is allowed and said: a run that comes to a task whos
 is gone fails there (`not_started`, "names an agent that is not there any more"), until
 the flow names another or none.
 
-Not there yet: the supervisor does not see the agents when it drafts a flow; and a flow
-cannot call another flow, so a harness (the loop with its tools) is copied into a flow
-from a starter (see the library) and not shared by reference.
+Not there yet: the supervisor does not see the agents when it drafts a flow.
+
+### Parts: flows that other flows run
+
+A piece of work that several flows share is written once, as a part: the loop in which
+a model searches, reads, has edits written and checks them, for one. A part is a flow of
+the library that is marked as a part. It does not run by itself: no section can have it,
+no run can be started by it, and the lab does not try it alone. A flow runs it with the
+task **Run a part** (group Control), which names it.
+
+**Making one.** New flow → "Nothing, as a part" (one task to build on), or the starter
+"A part: a model works in a loop". It is drawn like any flow. Where a task of the part
+ends with an outcome that the part leads nowhere, the part is left by that outcome:
+those are its ways out, and the part's page names them. In the loop to begin from, the
+model's `done` (and `other`) lead nowhere, so the part is left by `done`. A part is put
+in force like any flow, and only a part in force can be run.
+
+**Running one.** In a flow, add Run a part, choose the part, and lead on from its ways
+out: the task ends the ways the part is left. A way out that is led nowhere ends the
+run there, as any outcome does. A review that judges the part's work names the task
+that runs the part ("Judges the work of": that task); it is then the part's own task
+that changes the code whose work is judged, and the rule of the other subscription
+holds for it.
+
+**What really runs.** Nothing runs a part as a part. Before a flow is checked, tried on
+paper, tried in the lab or run, each Run a part is replaced by the part's own tasks,
+named after the task that runs them (`work` running a part with `decide` has
+`work-decide`), and what led to the task leads to the part's first. So:
+
+- Every rule of a flow is checked on what really runs. A flow in which a part changes
+  the code still needs the review by another subscription, the tests, the scan, the
+  collection and the administrator's decision after it, or it is refused. What is wrong
+  with one of the part's tasks in that place is said of the task that runs the part.
+- A run's steps are the part's tasks (`work-decide`, `work-find`, …); the run's page
+  draws them on the task that runs the part.
+- A run keeps the version of each part it started with, as it keeps its flow's. A part
+  that is changed and put in force is what the next run of every flow that runs it
+  does; no flow needs a new version for that. That is the point of a part, and the
+  reason to try a changed part first: make a copy of it, and run the copy from a draft
+  of one flow in the lab.
+
+**What a part may not have**, and why: a task that waits for the administrator or
+reaches GitHub (that is for the flow that runs it); an If, a review or another task
+that asks about other tasks of its flow (a part does not know them); Run a part (a part
+does not run another). A part's own wording of prompts is not used: the flow that runs
+it words them. A flow cannot start with a part: clone the repository first. The name
+of the task that runs a part is put before the names of the part's tasks, so it has to
+be short (`work`), and a flow with its parts written out can have 60 tasks at most.
 
 ### Code clean, and the audits of the running application
 

@@ -1521,6 +1521,7 @@ def create_app(
                 copy_of=body.copy_of,
                 version=body.version,
                 document=body.document,
+                part=body.part,
             ),
             event="dashboard.flow_created",
             status_code=201,

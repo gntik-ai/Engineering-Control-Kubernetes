@@ -23,6 +23,7 @@ export const WHERE: Record<TaskType['where'], string> = {
   model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',
+  part: 'The tasks of a part',
 };
 
 /** What a setting is called on the page. */
@@ -48,6 +49,7 @@ const SETTING_NAMES: Record<string, string> = {
   with_change: 'Give it the collected change',
   with_files: 'Give it the files read',
   agent: 'Agent',
+  part: 'Part',
   steps: 'Steps of the loop at most',
   dollars: 'US dollars for models asked over an API',
   words: 'More words to look for',
@@ -273,6 +275,16 @@ export function Setting({
         : []),
     ];
     chosen = String(value ?? '') || OPEN;
+  } else if (param.kind === 'part') {
+    // One of the parts that are in force: the flows marked as parts.
+    const known = catalogue.parts ?? [];
+    items = [
+      ...known.map((part) => ({ value: part.key, label: part.name })),
+      ...(value && !known.some((part) => part.key === value)
+        ? [{ value: String(value), label: `${String(value)}: not a part that is in force` }]
+        : []),
+    ];
+    chosen = String(value ?? '');
   } else if (param.kind === 'task') {
     // The tasks an agent works in, other than this one: whose work this task judges.
     items = document.tasks

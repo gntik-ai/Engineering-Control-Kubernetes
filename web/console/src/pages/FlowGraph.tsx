@@ -10,7 +10,7 @@ import {
 import type { Edge } from '@xyflow/react';
 import { Bot, GitBranch, Hand, ListChecks, Split } from '@gntik-ai/icons';
 import type { ReactNode } from 'react';
-import type { FlowCatalogue, FlowDocument, FlowProblem, TaskType } from '../api';
+import type { FlowCatalogue, FlowDocument, FlowNode as FlowTask, FlowProblem, TaskType } from '../api';
 import { layoutOf } from '../flowEdit';
 import { conditionWords } from './FlowCondition';
 
@@ -43,8 +43,19 @@ export const edgeOf = (id: string): { source: string; outcome: string } => {
   return { source, outcome };
 };
 
+/** A task that runs a part is drawn by the part it runs: its ways out are the part's. */
+const partType = (key: string) => 'control.part:' + key;
+
+/** How a task can end: what its kind says, or for a task that runs a part, the part's ways out. */
+export function outcomesOf(node: FlowTask, catalogue: FlowCatalogue): string[] {
+  if (node.task === 'control.part')
+    return (catalogue.parts ?? []).find((part) => part.key === node.with.part)?.exits ?? [];
+  return catalogue.tasks.find((task) => task.key === node.task)?.outcomes ?? [];
+}
+
 function icon(task: TaskType | undefined): ReactNode {
   if (!task) return undefined;
+  if (task.where === 'part') return <ListChecks size={16} aria-hidden />;
   if (task.where === 'control') return <Split size={16} aria-hidden />;
   if (task.approval) return <Hand size={16} aria-hidden />;
   if (task.publishes) return <GitBranch size={16} aria-hidden />;
@@ -55,9 +66,9 @@ function icon(task: TaskType | undefined): ReactNode {
 
 /** One way of drawing per kind of task: its outcomes are the points connections start at. */
 export function renderersOf(catalogue: FlowCatalogue): FlowNodeRenderer[] {
-  const card = (task: TaskType | undefined): FlowNodeRenderer['render'] =>
+  const card = (task: TaskType | undefined, ways?: string[]): FlowNodeRenderer['render'] =>
     function TaskCard({ data, selected }) {
-      const outcomes = task?.outcomes ?? [];
+      const outcomes = ways ?? task?.outcomes ?? [];
       return (
         <>
           <NodeCard
@@ -99,6 +110,23 @@ export function renderersOf(catalogue: FlowCatalogue): FlowNodeRenderer[] {
       ],
       render: card(task),
     })),
+    // One for each part a flow can run: a task that runs it ends the ways the part is left.
+    ...(catalogue.parts ?? []).map((part) => ({
+      type: partType(part.key),
+      handles: [
+        { id: TARGET, kind: 'target' as const, position: 'top' as const, label: 'Lead here' },
+        ...part.exits.map((outcome) => ({
+          id: outcome,
+          kind: 'source' as const,
+          position: 'bottom' as const,
+          label: `When the part is left by ${outcome}`,
+        })),
+      ],
+      render: card(
+        catalogue.tasks.find((task) => task.key === 'control.part'),
+        part.exits,
+      ),
+    })),
     {
       type: UNKNOWN,
       handles: [{ id: TARGET, kind: 'target' as const, position: 'top' as const, label: 'Lead here' }],
@@ -128,6 +156,7 @@ const WHERE: Record<TaskType['where'], string> = {
   model: 'A model, asked over an API',
   platform: 'The platform itself',
   control: 'Chooses the way',
+  part: 'The tasks of a part',
 };
 
 /** The flow as the nodes and connections the canvas draws. */
@@ -152,9 +181,11 @@ export function graphOf(
           ? given.map((name) => PROVIDER_NAMES[name] ?? name).join(', then ')
           : 'An agent'
       : null;
+    const runs =
+      node.task === 'control.part' ? (catalogue.parts ?? []).find((part) => part.key === node.with.part) : undefined;
     return {
       id: node.id,
-      type: task ? node.task : UNKNOWN,
+      type: runs ? partType(runs.key) : task ? node.task : UNKNOWN,
       position: places[node.id] ?? { x: 0, y: 0 },
       width: WIDTH,
       selected: node.id === selected,
@@ -165,6 +196,11 @@ export function graphOf(
         meta:
           metas[node.id] ??
           who ??
+          (node.task === 'control.part'
+            ? runs
+              ? `Runs the part ${runs.name}`
+              : 'No part chosen, or it is not in force'
+            : null) ??
           (node.task === 'control.when' && catalogue.conditions
             ? short(conditionWords(node.with.condition, catalogue.conditions))
             : task
@@ -177,7 +213,7 @@ export function graphOf(
   });
   const edges: Edge[] = document.tasks.flatMap((node) =>
     Object.entries(node.next)
-      .filter(([outcome, target]) => target && ids.has(target) && types.get(node.task)?.outcomes.includes(outcome))
+      .filter(([outcome, target]) => target && ids.has(target) && outcomesOf(node, catalogue).includes(outcome))
       .map(([outcome, target]) => ({
         id: edgeId(node.id, outcome),
         source: node.id,

@@ -289,9 +289,10 @@ def test_every_task_an_agent_or_a_model_works_in_can_name_an_agent() -> None:
 
 
 def test_two_flows_to_begin_from_have_a_model_do_the_work_and_keep_every_rule() -> None:
-    assert list(STARTERS) == ["starter-model-pipeline", "starter-model-loop"]
+    assert list(STARTERS) == ["starter-model-pipeline", "starter-model-loop", "starter-loop-part"]
     assert not set(STARTERS) & set(BUILTIN), "they are not flows that run as they are"
-    for flow in STARTERS.values():
+    # The third is the loop by itself, as a part: see the tests of parts.
+    for flow in [flow for flow in STARTERS.values() if not flow.part]:
         problems = [problem["text"] for problem in validate.errors(flow)]
         # All that is missing is what a starter cannot know: which model to ask.
         assert problems and all("does not name the model it asks" in text for text in problems), (
@@ -569,6 +570,7 @@ def test_agents_skills_and_starters_in_the_console(tmp_path: Path) -> None:
         assert [entry["key"] for entry in catalogue["starters"]] == [
             "starter-model-pipeline",
             "starter-model-loop",
+            "starter-loop-part",
         ]
         kinds = {task["key"]: task for task in catalogue["tasks"]}
         assert kinds["agent.implement"]["params"][-1]["kind"] == "agent"

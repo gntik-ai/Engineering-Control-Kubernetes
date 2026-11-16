@@ -34,6 +34,7 @@ from engineering_control.db.models import (
     SandboxStep,
     SupervisorDefinition,
 )
+from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN, COMMANDS_CHECK, FLOW_OF_KIND, kind_of
 from engineering_control.engine.document import Document
 from engineering_control.engine.library import (
@@ -331,7 +332,7 @@ class Runs:
             start = document.start
             common = {
                 # The flow the run follows, at the version in force now: it keeps it.
-                "flow": {"key": flow, "version": flow_version, "sha256": document.sha256()},
+                "flow": _followed(session, document, flow, flow_version),
                 "project": project.name,
                 "project_name": project.display_name,
                 "repository": repository,
@@ -566,11 +567,7 @@ class Runs:
                 project_id=record.id,
                 cancel_requested=False,
                 data={
-                    "flow": {
-                        "key": document.key,
-                        "version": flow_version,
-                        "sha256": document.sha256(),
-                    },
+                    "flow": _followed(session, document, document.key, flow_version),
                     "project": record.name,
                     "project_name": record.display_name,
                     "repository": record.source_repository,
@@ -1403,6 +1400,20 @@ def first_task(session: Session, key: str, version: int) -> str:
         if isinstance(row, dict) and row.get("start"):
             return str(row["start"])
     return BUILTIN[key].start if key in BUILTIN else "prepare"
+
+
+def _followed(session: Session, document: Document, key: str, version: int) -> dict[str, Any]:
+    """The flow a run follows, as the run records it: its version, and the version in
+    force of every part it runs. The run keeps them all."""
+    said: dict[str, Any] = {"key": key, "version": version, "sha256": document.sha256()}
+    pinned = {}
+    for part in parts.calls(document):
+        found = in_force(session, part)
+        if found is not None:
+            pinned[part] = found[0]
+    if pinned:
+        said["parts"] = pinned
+    return said
 
 
 def _flow_now(session: Session, key: str) -> dict[str, Any]:

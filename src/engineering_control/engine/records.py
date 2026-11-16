@@ -22,6 +22,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.db.models import FlowVersion, SavedTask
+from engineering_control.engine import parts as flow_parts
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS, budget
@@ -62,6 +63,8 @@ def described(document: Document) -> dict[str, Any]:
     return {
         "document": document.as_dict(),
         "sha256": document.sha256(),
+        # For a part: the ways it can be left, which the flows that run it lead on from.
+        "exits": list(flow_parts.exits(document)) if document.part else None,
         "problems": validate.problems(document),
         "prompts": [CONTRACTS[name].describe(document.prompts.get(name) or {}) for name in names],
     }
@@ -82,6 +85,40 @@ def _row(version: FlowVersion) -> dict[str, Any]:
 class FlowRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+        # Parts are flows of these records: what runs one is checked and run with it.
+        flow_parts.use(self.part)
+
+    def part(self, key: str, version: int | None = None) -> Document | None:
+        """A flow another flow runs: at that version, or as it is in force."""
+        try:
+            if version is None:
+                version = self.version_in_force(key)
+                if version is None:
+                    return None
+            return self.document(key, version)
+        except ProjectNotFound:
+            return None
+
+    def parts_in_force(self) -> list[dict[str, Any]]:
+        """The parts that are in force, as the designer offers them."""
+        listed = []
+        for key in self.keys():
+            found = self.part(key)
+            if found is not None and found.part:
+                listed.append(flow_parts.described(found))
+        return listed
+
+    def runs_part(self, key: str) -> list[dict[str, Any]]:
+        """The flows that run that part, as they stand: by their draft when they have one."""
+        listed = []
+        for other in self.keys():
+            version = self.draft(other)
+            if version is None:
+                version = self.version_in_force(other)
+            document = self.document(other, version or 0)
+            if document is not None and key in flow_parts.calls(document):
+                listed.append({"flow": other, "name": document.name})
+        return listed
 
     # --- tasks kept under a name ----------------------------------------------------------
 
@@ -218,6 +255,8 @@ class FlowRecords:
                     "version": version,
                     "draft": draft,
                     "builtin": key in BUILTIN,
+                    # A part runs only inside the flows that run it.
+                    "part": document.part,
                     "section_action": section_action(document),
                     "publishes": traits(document)["publishes"],
                     "tasks": len(document.nodes),

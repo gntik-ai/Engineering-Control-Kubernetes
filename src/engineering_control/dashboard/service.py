@@ -567,9 +567,11 @@ class DashboardService:
             # The agents a task can name, and the flows a new flow can be started from.
             "agents": await asyncio.to_thread(self.repository.agents.names),
             "starters": [
-                {"key": key, "name": flow.name, "summary": flow.summary}
+                {"key": key, "name": flow.name, "summary": flow.summary, "part": flow.part}
                 for key, flow in STARTERS.items()
             ],
+            # The parts a flow can run: the flows marked as parts that are in force.
+            "parts": await asyncio.to_thread(self.repository.flows.parts_in_force),
             # The platform's kinds of task that are not offered in the designer's list.
             "hidden": await asyncio.to_thread(self.repository.tasks.hidden),
         }
@@ -703,6 +705,7 @@ class DashboardService:
         copy_of: str | None,
         version: int | None,
         document: dict[str, Any] | None,
+        part: bool = False,
     ) -> dict[str, object]:
         """A new flow of the library: a document that is brought in, a copy of a flow
         that exists, or a flow with nothing in it yet. It starts as a draft."""
@@ -726,6 +729,18 @@ class DashboardService:
                 if found is None:
                     raise ProjectNotFound(copy_of)
                 raw = {**found.as_dict(), "key": key, "name": name, "summary": summary}
+            elif part:
+                # A part with one task to build on: what it does not lead on from is
+                # how the part is left.
+                raw = {
+                    "format": FLOW_FORMAT,
+                    "key": key,
+                    "name": name,
+                    "summary": summary,
+                    "part": True,
+                    "start": "find",
+                    "tasks": [{"id": "find", "task": "code.find"}],
+                }
             else:
                 raw = {
                     "format": FLOW_FORMAT,

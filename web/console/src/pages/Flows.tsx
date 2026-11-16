@@ -56,6 +56,8 @@ export const versionName = (version: number | null) =>
 
 const KEY = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
 const NOTHING = '__nothing__';
+/** A part with one task to build on: a flow other flows run. */
+const PART = '__part__';
 
 /** "Dead code sweep" -> "dead-code-sweep": a starting point the administrator can change. */
 const suggestKey = (name: string) =>
@@ -89,7 +91,8 @@ function NewFlowDialog({
         key: finalKey,
         name: name.trim(),
         summary: summary.trim(),
-        copy_of: from === NOTHING ? null : from,
+        copy_of: from === NOTHING || from === PART ? null : from,
+        part: from === PART,
       }),
     () => {
       onOpenChange(false);
@@ -155,6 +158,7 @@ function NewFlowDialog({
               <SimpleSelect
                 items={[
                   { value: NOTHING, label: 'Nothing: one task to build on' },
+                  { value: PART, label: 'Nothing, as a part: other flows run it, it does not run by itself' },
                   ...flows
                     .filter((flow) => flow.engine)
                     .map((flow) => ({ value: flow.key, label: `A copy of ${flow.name}` })),
@@ -417,9 +421,16 @@ export function FlowsPage() {
                         <TableRow key={flow.key}>
                           <TableCell className="max-w-xl">
                             {flow.engine ? (
-                              <Link href={`${BASE}/flow?key=${flow.key}`} className="font-medium">
-                                {flow.name}
-                              </Link>
+                              <span className="flex flex-wrap items-center gap-2">
+                                <Link href={`${BASE}/flow?key=${flow.key}`} className="font-medium">
+                                  {flow.name}
+                                </Link>
+                                {flow.engine.part ? (
+                                  <Badge tone="neutral" size="sm">
+                                    A part
+                                  </Badge>
+                                ) : null}
+                              </span>
                             ) : (
                               <span className="font-medium text-muted-foreground">{flow.name}</span>
                             )}

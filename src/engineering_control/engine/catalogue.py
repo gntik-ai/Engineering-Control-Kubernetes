@@ -86,6 +86,7 @@ class TaskType:
     # without a sandbox, and the task is a step of the run like a sandbox's. "platform":
     # the platform performs it itself, with its own credentials, after the steps.
     # "control": it only decides where the flow goes on.
+    # "part": it stands for the tasks of another flow, which run in its place.
     where: str
     account: bool = False  # an agent of a subscription works in it
     writes: bool = False  # it may change the checkout
@@ -824,6 +825,26 @@ _TASKS: Final = (
                 "How it is merged: squash puts the change on the branch as one commit, "
                 "merge adds a merge commit, rebase puts the pull request's commits on top.",
                 choices=MERGE_METHODS,
+            ),
+        ),
+    ),
+    TaskType(
+        "control.part",
+        "Control",
+        "Run a part",
+        "Runs a part here: a flow of the library that is marked as a part, written once "
+        "for every flow that runs it. The part's tasks run as tasks of this flow, named "
+        "after this task, and every rule is checked on them. It ends the ways the part "
+        "can be left, and this flow says where each goes on.",
+        "part",
+        outcomes=(),
+        params=(
+            Param(
+                "part",
+                "part",
+                "",
+                "Which part is run. It has to be in force; a run keeps the version it "
+                "started with.",
             ),
         ),
     ),

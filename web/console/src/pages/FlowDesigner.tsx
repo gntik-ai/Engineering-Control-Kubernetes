@@ -24,7 +24,7 @@ import {
   taskTypes,
   validId,
 } from '../flowEdit';
-import { TARGET, ThemedCanvas, WIDTH, edgeOf, graphOf, renderersOf } from './FlowGraph';
+import { TARGET, ThemedCanvas, WIDTH, edgeOf, graphOf, outcomesOf, renderersOf } from './FlowGraph';
 import { Setting, WHERE } from './FlowParts';
 import { useSubmit } from './ProjectDialogs';
 
@@ -334,7 +334,7 @@ function Inspector({
           onChange={(value) => change(setSetting(document, node.id, param.name, value))}
         />
       ))}
-      {(type?.outcomes ?? []).map((outcome) => (
+      {outcomesOf(node, catalogue).map((outcome) => (
         <Field key={outcome}>
           <FieldLabel>
             When it ends with <span className="font-mono text-[12px]">{outcome}</span>
@@ -438,9 +438,10 @@ export function Designer({
     const fromType = from ? types.get(from.task) : undefined;
     const places = layoutOf(document);
     // After the selected task: on its first outcome, between it and what that led to.
-    if (from && fromType?.outcomes[0]) {
+    const leaves = from ? outcomesOf(from, catalogue)[0] : undefined;
+    if (from && fromType && leaves) {
       const at = { x: (places[from.id]?.x ?? 0) + ACROSS / 2, y: (places[from.id]?.y ?? 0) + DOWN / 2 };
-      const added = insertAfter(document, type, from.id, fromType.outcomes[0], { at, saved });
+      const added = insertAfter(document, type, from.id, leaves, { at, saved });
       change(added.document);
       setSelected(added.id);
       return;

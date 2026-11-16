@@ -36,7 +36,7 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     ProjectNotFound,
 )
-from engineering_control.db.models import ProjectRecord, ProjectSection
+from engineering_control.db.models import FlowVersion, ProjectRecord, ProjectSection
 from engineering_control.engine.library import describe, document_in_force
 from engineering_control.flow_library import FLOWS
 
@@ -471,6 +471,13 @@ class SectionRecords:
     def assign(self, project: str, key: str, flow: str | None) -> dict[str, Any]:
         with self.sessions() as session:
             if flow is not None and flow not in FLOWS and document_in_force(session, flow) is None:
+                row = session.scalar(
+                    select(FlowVersion.document).where(FlowVersion.flow_key == flow).limit(1)
+                )
+                if isinstance(row, dict) and row.get("part") is True:
+                    raise ProjectInvalid(
+                        "That is a part: it runs only inside the flows that run it"
+                    )
                 raise ProjectInvalid("That flow is not in the library, or was never put in force")
             record = self._project(session, project)
             section = self._section(session, record, key)

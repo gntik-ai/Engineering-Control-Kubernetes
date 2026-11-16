@@ -90,6 +90,9 @@ class Document:
     action: str = ""
     # Where the designer drew each task. It says nothing about what the flow does.
     layout: dict[str, dict[str, int]] = field(default_factory=dict)
+    # A part: a flow that does not run by itself, and that other flows run with the task
+    # "Run a part". Where it leads nowhere, it is left, and the flow that runs it goes on.
+    part: bool = False
 
     def node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
@@ -112,6 +115,8 @@ class Document:
             said["items"] = self.items
         if self.action:
             said["action"] = self.action
+        if self.part:
+            said["part"] = True
         if layout and self.layout:
             said["layout"] = {name: dict(self.layout[name]) for name in sorted(self.layout)}
         return said
@@ -191,6 +196,7 @@ def parse(raw: Any) -> Document:
         items="request" if raw.get("items") == "request" else "deliver",
         action=_text(raw.get("action"), 60),
         layout=_layout(raw.get("layout"), seen),
+        part=raw.get("part") is True,
     )
 
 
