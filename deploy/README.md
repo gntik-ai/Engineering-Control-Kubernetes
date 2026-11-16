@@ -916,8 +916,41 @@ new one.
   the other, and nothing leaves them: they end where the administrator would decide, no
   pull request is opened, nothing is added to the backlog and no item is touched. Each
   case is put next to the run as it went: whether the work came through, in how many
-  rounds, how long, how many tokens. The verdict goes by the first two only; what the
-  work is worth is for people to judge, and each case links to both runs.
+  rounds and steps, how long by the clock and in sandboxes, how many tokens, how many
+  questions to models over an API and what they cost, and how many of the files the two
+  changes touch are the same. The verdict goes by the first two only; what the work is
+  worth is for people to judge, and each case links to both runs.
+
+**One way of working next to another.** The runs an evaluation goes through need not be
+runs of the flow that is tried. In the lab of a flow, "Past runs of" offers every other
+flow that does the same kind of work and has runs to go through (a flow that changes
+code for an item, or a flow started for a section; the two kinds are not mixed). Tried
+on those, the flow does the same work by its own tasks: the same words, the same commit.
+This is how a flow in which a model asked over an API does the work (one made from a
+starter, see the library) is put next to Deliver issue, in which an agent in a sandbox
+does it:
+
+1. New flow → a starter; give its tasks a model, or an agent that has one. It stays a
+   draft: nothing has to be put in force for this.
+2. On its page, the lab → Past runs of: Deliver issue → choose up to eight runs → Try it.
+3. Each case shows the run as it went, by Deliver issue, and the same work by the new
+   flow, with the numbers above.
+
+What to keep in mind when reading the result:
+
+- The run as it went is the run that happened, by the version of its flow at that time
+  and at the speed of that day. It is not run again.
+- An agent on a subscription costs no money by the token, so its side shows tokens and
+  time; a model asked over an API shows a cost only when its account says what its
+  models cost (Accounts → Change → What its models cost).
+- Time by the clock includes waiting for a free subscription or a busy provider; time
+  in sandboxes does not, and a model that is asked uses no sandbox at all.
+- Files in common say whether both ways went to the same places. They do not say which
+  change is right: open both runs and read the changes.
+- The cases of the new flow ask real models and are paid for; a flow's budget in US
+  dollars (the designer's Budgets) stops a run that costs more.
+- On another flow's runs, the version in force of the flow tried can be tried as well,
+  since those runs do not show how it does.
 
 **What runs use.** The clients report how many tokens an agent read and wrote; the
 launcher keeps that with each step (`sandbox_steps.usage`). Subscriptions are not paid by

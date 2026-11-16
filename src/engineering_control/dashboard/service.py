@@ -747,23 +747,43 @@ class DashboardService:
     async def usage(self, days: int) -> dict[str, object]:
         return await asyncio.to_thread(lambda: self.repository.runs.usage_totals(days=days))
 
-    async def evaluations(self, key: str) -> dict[str, object]:
+    async def evaluations(self, key: str, of: str | None = None) -> dict[str, object]:
+        """The evaluations of a flow, the flows whose past runs it can be tried on, and
+        the runs of one of them (``of``, or the flow itself) that can be gone through."""
+
         def read() -> dict[str, Any]:
+            lab = self.repository.evaluations
+            sources = lab.sources(key)
+            # Asked for, or else the flow's own runs, or else the first flow that has any.
+            known = {source["key"] for source in sources}
+            chosen = of if of in known else None
+            if chosen is None:
+                with_runs = [source["key"] for source in sources if source["runs"]]
+                chosen = key if key in with_runs or not with_runs else with_runs[0]
             return {
-                "items": self.repository.evaluations.listing(key),
-                "candidates": self.repository.evaluations.candidates(key),
+                "items": lab.listing(key),
+                "sources": sources,
+                "of": chosen,
+                "candidates": lab.candidates(key, of=chosen),
             }
 
         return await asyncio.to_thread(read)
 
     async def start_evaluation(
-        self, key: str, *, version: int, run_ids: list[UUID], note: str | None
+        self,
+        key: str,
+        *,
+        version: int,
+        run_ids: list[UUID],
+        note: str | None,
+        of: str | None = None,
     ) -> dict[str, object]:
         def start() -> dict[str, Any]:
             started = self.repository.evaluations.start(
-                key, version=version, run_ids=run_ids, note=note
+                key, version=version, run_ids=run_ids, note=note, of=of
             )
-            return {**started, "evaluation": f"{key} version {version}"}
+            on = f" on runs of {started['of']}" if started["of"] != key else ""
+            return {**started, "evaluation": f"{key} version {version}{on}"}
 
         return await asyncio.to_thread(start)
 

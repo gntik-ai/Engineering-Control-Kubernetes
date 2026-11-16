@@ -6,10 +6,16 @@ worked on. What it is compared with is the run as it went. The runs of an evalua
 ordinary runs in ordinary sandboxes, on the same subscriptions, and they leave nothing
 behind: no pull request, nothing added to the backlog, no item touched. They are started
 one after the other, so that an evaluation never takes the subscriptions from the work.
+
+The runs gone through need not be runs of the flow that is tried. A flow can be tried on
+the past runs of another flow of the same sort: one in which a model asked over an API
+does the work, on the runs of the one in which an agent in a sandbox did it. That puts
+the two ways of doing the same work next to each other, on the same words and commit.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import UUID
@@ -31,7 +37,8 @@ from engineering_control.db.models import (
 )
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import FLOW_OF_KIND, kind_of
-from engineering_control.engine.document import FlowInvalid, parse
+from engineering_control.engine.document import Document, FlowInvalid, parse
+from engineering_control.engine.library import traits
 from engineering_control.engine.records import FlowRecords, in_force
 from engineering_control.sandbox.runs import FINISHED, Runs, usage_of
 
@@ -54,6 +61,27 @@ def _follows(run: SandboxRun, key: str) -> bool:
     return said == key if said else FLOW_OF_KIND.get(run.kind) == key
 
 
+def sort_of(document: Document) -> str:
+    """What a flow works on: an item whose code it changes, or a section it looks at.
+    Only runs of flows of one sort can be put next to each other."""
+    return "item" if traits(document)["writes"] else "section"
+
+
+_SORTS: Final = {"item": "works on an item", "section": "is started for a section"}
+
+
+def _elapsed(steps: list[SandboxStep]) -> int:
+    """How long the work took by the clock, in whole minutes: from the first step that
+    started to the last that ended, waiting for a sandbox or a model included."""
+    started = [step.started_at for step in steps if step.started_at is not None]
+    ended = [step.finished_at for step in steps if step.finished_at is not None]
+    if not started or not ended:
+        return 0
+    first = min(value if value.tzinfo else value.replace(tzinfo=UTC) for value in started)
+    last = max(value if value.tzinfo else value.replace(tzinfo=UTC) for value in ended)
+    return max(0, math.ceil((last - first).total_seconds() / 60))
+
+
 def measure(
     run: SandboxRun, steps: list[SandboxStep], used: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -61,6 +89,14 @@ def measure(
     data = run.data or {}
     result = data.get("result") or {}
     change = data.get("change") or {}
+    files = change.get("files") if isinstance(change, dict) else None
+    paths = sorted(
+        {
+            str(entry.get("path"))
+            for entry in (files if isinstance(files, list) else [])
+            if isinstance(entry, dict) and entry.get("path")
+        }
+    )
     return {
         "run_id": str(run.id),
         "state": run.state,
@@ -77,9 +113,26 @@ def measure(
         "sandboxes": (used or {}).get("sandboxes", 0),
         "minutes": (used or {}).get("minutes", 0),
         "tokens": (used or {}).get("tokens", 0),
+        # By the clock, how many steps, how many of them asked a model over an API, and
+        # what those questions cost where the accounts say what their models cost.
+        "elapsed": _elapsed(steps),
+        "steps": len(steps),
+        "asked": int((used or {}).get("asked", 0)),
+        "cost": round(float((used or {}).get("cost", 0) or 0), 4),
         "counts": result.get("counts") if isinstance(result.get("counts"), dict) else None,
         "files": len(change.get("files") or []) if isinstance(change, dict) else 0,
+        "paths": paths[:400],
     }
+
+
+def in_common(baseline: dict[str, Any] | None, candidate: dict[str, Any] | None) -> int | None:
+    """How many files both changes touch, when both changed any: whether the two ways
+    went to the same places, which says nothing of which change is the better one."""
+    if baseline is None or candidate is None:
+        return None
+    if not baseline.get("paths") or not candidate.get("paths"):
+        return None
+    return len(set(baseline["paths"]) & set(candidate["paths"]))
 
 
 def verdict(baseline: dict[str, Any] | None, candidate: dict[str, Any] | None) -> str | None:
@@ -102,13 +155,46 @@ class Evaluations:
 
     # --- what can be gone through again ---------------------------------------------------
 
-    def candidates(
-        self, key: str, *, project: str | None = None, limit: int = 40
-    ) -> list[dict[str, Any]]:
-        """The runs of the flow that can be gone through again, newest first: the ones
-        that got as far as checking the repository out."""
+    def _latest(self, key: str) -> Document | None:
+        """The flow as it would be tried: its draft, or else the version in force."""
+        version = self.flows.draft(key)
+        if version is None:
+            version = self.flows.version_in_force(key) or 0
+        return self.flows.document(key, version)
+
+    def _in_force(self, key: str) -> Document | None:
+        return self.flows.document(key, self.flows.version_in_force(key) or 0)
+
+    def sources(self, key: str) -> list[dict[str, Any]]:
+        """The flows whose past runs this flow can be tried on: itself, and every other
+        flow of the same sort, each with how many of its runs can be gone through."""
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
+        mine = self._latest(key)
+        if mine is None:
+            return []
+        listed = []
+        for other in [key, *(name for name in self.flows.keys() if name != key)]:
+            theirs = mine if other == key else self._in_force(other)
+            if theirs is None or sort_of(theirs) != sort_of(mine):
+                continue
+            runs = len(self.candidates(key, of=other, limit=100))
+            if other == key or runs:
+                listed.append({"key": other, "name": theirs.name, "runs": runs})
+        return listed
+
+    def candidates(
+        self, key: str, *, of: str | None = None, project: str | None = None, limit: int = 40
+    ) -> list[dict[str, Any]]:
+        """The runs that can be gone through again, newest first: the ones that got as
+        far as checking the repository out. They are runs of the flow itself, or of the
+        flow ``of``."""
+        if not self.flows.exists(key):
+            raise ProjectNotFound(key)
+        if of and of != key:
+            if not self.flows.exists(of):
+                raise ProjectNotFound(of)
+            key = of
         kind = kind_of(key)
         with self.sessions() as session:
             query = (
@@ -149,18 +235,37 @@ class Evaluations:
     # --- starting and stopping ------------------------------------------------------------
 
     def start(
-        self, key: str, *, version: int, run_ids: list[UUID], note: str | None = None
+        self,
+        key: str,
+        *,
+        version: int,
+        run_ids: list[UUID],
+        note: str | None = None,
+        of: str | None = None,
     ) -> dict[str, Any]:
-        """Try that version of the flow on those runs' work."""
+        """Try that version of the flow on those runs' work. The runs are runs of the
+        flow itself, or of the flow ``of``, which is of the same sort."""
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
-        kind = kind_of(key)
+        source = of if of and of != key else key
+        if not self.flows.exists(source):
+            raise ProjectNotFound(source)
+        kind = kind_of(source)
         document = self.flows.document(key, version)
         if document is None:
             raise ProjectNotFound(f"{key} version {version}")
         wrong = validate.errors(document)
         if wrong:
             raise ProjectInvalid(f"That version cannot run: {wrong[0]['text']}")
+        if source != key:
+            theirs = self._in_force(source)
+            if theirs is None:
+                raise ProjectInvalid("That flow has never been in force: it has no runs")
+            if sort_of(theirs) != sort_of(document):
+                raise ProjectInvalid(
+                    f"{document.name} {_SORTS[sort_of(document)]} and {theirs.name} "
+                    f"{_SORTS[sort_of(theirs)]}: the runs of one say nothing of the other"
+                )
         chosen = list(dict.fromkeys(run_ids))
         if not chosen or len(chosen) > MAX_CASES:
             raise ProjectInvalid(f"Choose between 1 and {MAX_CASES} runs to go through again")
@@ -172,16 +277,20 @@ class Evaluations:
             )
             if busy is not None:
                 raise ProjectConflict("An evaluation of this flow is already under way")
-            current = in_force(session, key)
-            if current is not None and current[1] == document.sha256():
+            current = in_force(session, source)
+            if source == key and current is not None and current[1] == document.sha256():
                 raise ProjectInvalid(
                     "That version is the one in force: the runs already show how it does"
                 )
             past: list[SandboxRun] = []
             for run_id in chosen:
                 run = session.get(SandboxRun, run_id)
-                if run is None or run.kind != kind or not _follows(run, key):
-                    raise ProjectInvalid("One of those runs is not a run of this flow")
+                if run is None or run.kind != kind or not _follows(run, source):
+                    raise ProjectInvalid(
+                        "One of those runs is not a run of this flow"
+                        if source == key
+                        else "One of those runs is not a run of that flow"
+                    )
                 if run.state not in REPLAYABLE or not (run.data or {}).get("base_sha"):
                     raise ProjectInvalid(f"The run {run.title} cannot be gone through again")
                 past.append(run)
@@ -195,6 +304,7 @@ class Evaluations:
                 note=" ".join((note or "").split())[:300] or None,
                 document=document.as_dict(),
                 sha256=document.sha256(),
+                of_flow=source if source != key else None,
             )
             session.add(evaluation)
             session.flush()
@@ -327,6 +437,8 @@ class Evaluations:
         return {
             "id": str(evaluation.id),
             "flow": evaluation.flow_key,
+            # The flow whose past runs are gone through: the flow tried, or another.
+            "of": evaluation.of_flow or evaluation.flow_key,
             "candidate_version": evaluation.candidate_version,
             "baseline_version": evaluation.baseline_version,
             "sha256": evaluation.sha256,
@@ -388,6 +500,10 @@ class Evaluations:
         listed = [by_number[number] for number in sorted(by_number)]
         for entry in listed:
             entry["verdict"] = verdict(entry["baseline"], entry["candidate"])
+            entry["common"] = in_common(entry["baseline"], entry["candidate"])
+            for arm in ("baseline", "candidate"):
+                if entry[arm] is not None:
+                    entry[arm] = {k: v for k, v in entry[arm].items() if k != "paths"}
         done = sum(
             1
             for entry in listed
@@ -395,6 +511,8 @@ class Evaluations:
             or (entry["candidate"] is not None and entry["candidate"]["state"] in FINISHED)
         )
         row = self._row(evaluation, len(listed), done)
+        theirs = self._in_force(row["of"])
+        row["of_name"] = theirs.name if theirs is not None else row["of"]
 
         def total(arm: str) -> dict[str, Any]:
             measured = [
@@ -410,6 +528,9 @@ class Evaluations:
                 "rounds": sum(m["rounds"] for m in measured),
                 "minutes": sum(m["minutes"] for m in measured),
                 "tokens": sum(m["tokens"] for m in measured),
+                "elapsed": sum(m["elapsed"] for m in measured),
+                "asked": sum(m["asked"] for m in measured),
+                "cost": round(sum(m["cost"] for m in measured), 4),
             }
 
         row["totals"] = {"baseline": total("baseline"), "candidate": total("candidate")}

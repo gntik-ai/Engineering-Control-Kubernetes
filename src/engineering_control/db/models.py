@@ -716,6 +716,9 @@ class Evaluation(UUIDPrimaryKey, Timestamps, Base):
     # The candidate as it was when the evaluation started: a draft may change afterwards.
     document: Mapped[dict[str, Any]] = mapped_column(JSON)
     sha256: Mapped[str] = mapped_column(String(64))
+    # The flow whose past runs are gone through, when it is not the flow tried
+    # (migration 0044): a flow tried on the runs of another of the same sort.
+    of_flow: Mapped[str | None] = mapped_column(String(64))
     __table_args__ = (CheckConstraint("state IN ('running', 'finished', 'stopped')", name="state"),)
 
 

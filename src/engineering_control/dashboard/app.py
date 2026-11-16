@@ -1627,12 +1627,14 @@ def create_app(
 
     @app.get("/api/dashboard/flows/{key}/evaluations")
     async def evaluations_api(key: str, request: Request) -> Response:
-        """The evaluations of a flow, and the runs that can be gone through again."""
+        """The evaluations of a flow, and the runs that can be gone through again: its
+        own, or with ``?of=`` those of another flow of the same sort."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
         try:
-            return JSONResponse(await service(request).evaluations(key))
+            of = request.query_params.get("of")
+            return JSONResponse(await service(request).evaluations(key, of=of or None))
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
 
@@ -1644,7 +1646,7 @@ def create_app(
             request,
             EvaluationInput,
             lambda body: service(request).start_evaluation(
-                key, version=body.version, run_ids=body.run_ids, note=body.note
+                key, version=body.version, run_ids=body.run_ids, note=body.note, of=body.of
             ),
             event="dashboard.evaluation_started",
             status_code=201,

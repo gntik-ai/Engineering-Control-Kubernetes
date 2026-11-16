@@ -287,6 +287,8 @@ export function TryOnPaper({
   );
 }
 
+const dollars = (amount: number) => '$' + (amount < 1 ? amount.toFixed(4) : amount.toFixed(2));
+
 const VERDICTS: Record<string, { label: string; tone: Tone }> = {
   better: { label: 'Better', tone: 'success' },
   same: { label: 'The same', tone: 'neutral' },
@@ -331,9 +333,16 @@ function Arm({ measured, waiting }: { measured: Measured | null; waiting?: strin
       </div>
       <div className="mt-1 text-[12px] text-muted-foreground">
         {versionName(measured.flow_version)} · {measured.rounds === 1 ? '1 round' : `${measured.rounds} rounds`} ·{' '}
-        {minutes(measured.minutes)} · {tokens(measured.tokens)} tokens
+        {measured.steps} steps
         {measured.files ? ` · ${measured.files} files changed` : ''}
         {counted ? ` · ${counted}` : ''}
+      </div>
+      <div className="text-[12px] text-muted-foreground">
+        {minutes(measured.elapsed)} by the clock · {minutes(measured.minutes)} in sandboxes · {tokens(measured.tokens)}{' '}
+        tokens
+        {measured.asked
+          ? ` · ${measured.asked} ${measured.asked === 1 ? 'question' : 'questions'} to a model, ${measured.cost ? dollars(measured.cost) : 'no price known'}`
+          : ''}
       </div>
       {measured.detail ? <div className="mt-1 max-w-md text-[12px]">{measured.detail}</div> : null}
     </TableCell>
@@ -352,11 +361,16 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
   );
   const shown = detail.data ?? row;
   const { baseline, candidate } = shown.totals;
+  // Tried on the runs of another flow: two ways of doing the same work, side by side.
+  const other = shown.of !== shown.flow;
   return (
     <Card>
       <CardBody className="grid gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium">{versionName(shown.candidate_version)}</span>
+          <span className="font-medium">
+            {versionName(shown.candidate_version)}
+            {other ? ` on runs of ${shown.of_name}` : ''}
+          </span>
           <Badge tone={STATES[shown.state].tone} size="sm">
             {STATES[shown.state].label}
           </Badge>
@@ -392,10 +406,15 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
         {stop.problem ? <Alert tone="destructive" title={stop.problem} /> : null}
         {candidate.cases ? (
           <p className="text-[13px]">
-            Of {candidate.cases} {candidate.cases === 1 ? 'case' : 'cases'}: {candidate.through} came through on the
-            version tried, {baseline.through} as the runs went. Rounds {candidate.rounds} against {baseline.rounds},{' '}
-            {minutes(candidate.minutes)} against {minutes(baseline.minutes)}, {tokens(candidate.tokens)} tokens against{' '}
-            {tokens(baseline.tokens)}.
+            Of {candidate.cases} {candidate.cases === 1 ? 'case' : 'cases'}: {candidate.through} came through on{' '}
+            {other ? 'this flow' : 'the version tried'}, {baseline.through} as the runs went. Rounds {candidate.rounds}{' '}
+            against {baseline.rounds}, {minutes(candidate.elapsed)} by the clock against {minutes(baseline.elapsed)},{' '}
+            {minutes(candidate.minutes)} in sandboxes against {minutes(baseline.minutes)}, {tokens(candidate.tokens)}{' '}
+            tokens against {tokens(baseline.tokens)}
+            {candidate.asked || baseline.asked
+              ? `, ${candidate.asked} questions to models (${dollars(candidate.cost)}) against ${baseline.asked} (${dollars(baseline.cost)})`
+              : ''}
+            .
           </p>
         ) : null}
         {open ? (
@@ -408,8 +427,8 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
                   <TableHeader>
                     <TableRow>
                       <TableHead>Past work</TableHead>
-                      <TableHead>As the run went</TableHead>
-                      <TableHead>On the version tried</TableHead>
+                      <TableHead>{other ? `As the run went, by ${shown.of_name}` : 'As the run went'}</TableHead>
+                      <TableHead>{other ? 'By this flow' : 'On the version tried'}</TableHead>
                       <TableHead>Verdict</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -442,6 +461,12 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
                           ) : (
                             <span className={mono}>—</span>
                           )}
+                          {entry.common !== null && entry.baseline && entry.candidate ? (
+                            <div className="mt-1 max-w-[11rem] text-[12px] text-muted-foreground">
+                              {entry.common} of the files changed are the same ({entry.baseline.files} as it went,{' '}
+                              {entry.candidate.files} here)
+                            </div>
+                          ) : null}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -459,17 +484,35 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
 /** Try a version of the flow on the work of runs that happened. */
 export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; detail: FlowDetail; dirty: boolean }) {
   const [busy, setBusy] = useState(false);
-  const lab = useResource<Lab>(apiUrl(`flows/${flowKey}/evaluations`), busy ? 8_000 : 60_000);
+  // Whose past runs are gone through: this flow's, or another flow's of the same sort.
+  const [wanted, setWanted] = useState<string | null>(null);
+  const lab = useResource<Lab>(apiUrl(`flows/${flowKey}/evaluations`, { of: wanted }), busy ? 8_000 : 60_000);
   const running = lab.data?.items.some((row) => row.state === 'running') ?? false;
   useEffect(() => setBusy(running), [running]);
-  // What can be tried: the draft, and versions that were in force before.
-  const versions = detail.versions.filter((row) => row.version !== detail.in_force?.version && row.errors === 0);
+  const sources = lab.data?.sources ?? [];
+  const source = lab.data?.of ?? flowKey;
+  const other = source !== flowKey;
+  const sourceName = sources.find((entry) => entry.key === source)?.name ?? source;
+  // What can be tried on the flow's own runs: the draft, and versions that were in force
+  // before. On another flow's runs the version in force can be tried as well, since those
+  // runs do not show how it does.
+  const versions = detail.versions.filter(
+    (row) => row.errors === 0 && (other || row.version !== detail.in_force?.version),
+  );
   const [version, setVersion] = useState<number | null>(null);
-  const tried = version ?? versions[0]?.version ?? null;
+  const tried = versions.some((row) => row.version === version) ? version : (versions[0]?.version ?? null);
   const [chosen, setChosen] = useState<string[]>([]);
   const [note, setNote] = useState('');
+  // The runs chosen are runs of one flow: another flow's are chosen anew.
+  useEffect(() => setChosen([]), [source]);
   const start = useSubmit(
-    () => postJson(`flows/${flowKey}/evaluations`, { version: tried, run_ids: chosen, note: note.trim() || null }),
+    () =>
+      postJson(`flows/${flowKey}/evaluations`, {
+        version: tried,
+        run_ids: chosen,
+        note: note.trim() || null,
+        of: other ? source : null,
+      }),
     () => {
       setChosen([]);
       setNote('');
@@ -485,12 +528,34 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
         the backlog, no item touched. Each is put next to the run as it went. The cases run one after the other, so an
         evaluation of several takes a while and uses the subscriptions as that many runs would.
       </p>
+      {sources.length > 1 ? (
+        <p className="text-[13px] text-muted-foreground">
+          The runs need not be this flow’s own. Tried on the runs of another flow that does the same kind of work, this
+          flow is put next to that one: a flow in which a model asked over an API writes the change, next to the one in
+          which an agent in a sandbox wrote it. Questions to models over an API are paid by use, and their cost is
+          shown where the accounts say what their models cost.
+        </p>
+      ) : null}
       <LoadError resource={lab} />
+      {sources.length > 1 ? (
+        <Field className="w-80">
+          <FieldLabel>Past runs of</FieldLabel>
+          <SimpleSelect
+            aria-label="Past runs of"
+            items={sources.map((entry) => ({
+              value: entry.key,
+              label: `${entry.key === flowKey ? 'This flow' : entry.name} (${entry.runs} to go through)`,
+            }))}
+            value={source}
+            onValueChange={(next) => setWanted(next)}
+          />
+        </Field>
+      ) : null}
       {versions.length === 0 ? (
         <Alert
           tone="info"
           title="There is nothing to try yet"
-          description="Change the flow and save it as the draft. The draft can then be tried here before it is put in force."
+          description="Change the flow and save it as the draft. The draft can then be tried here before it is put in force. The version in force can be tried on the runs of another flow, when there is one that does the same kind of work and has runs."
         />
       ) : (
         <Card>
@@ -508,7 +573,12 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
                 <SimpleSelect
                   items={versions.map((row) => ({
                     value: String(row.version),
-                    label: row.state === 'draft' ? `The draft (version ${row.version})` : versionName(row.version),
+                    label:
+                      row.state === 'draft'
+                        ? `The draft (version ${row.version})`
+                        : row.version === detail.in_force?.version
+                          ? `${versionName(row.version)}, in force`
+                          : versionName(row.version),
                   }))}
                   value={tried === null ? null : String(tried)}
                   onValueChange={(next) => setVersion(next === null ? null : Number(next))}
@@ -533,8 +603,8 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
             ) : null}
             {candidates.length === 0 ? (
               <p className="text-[13px]">
-                No run of this flow has got as far as checking a repository out yet, so there is no past work to go
-                through.
+                No run of {other ? sourceName : 'this flow'} has got as far as checking a repository out yet, so there
+                is no past work to go through.
               </p>
             ) : (
               <TableFrame>

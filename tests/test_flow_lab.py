@@ -524,7 +524,12 @@ def test_the_console_edits_tries_and_publishes_a_flow(world: Any) -> None:  # no
         assert post("/flows/deliver-issue/draft/discard").status_code == 200
         assert post("/flows/deliver-issue/draft/discard").status_code == 409
         lab = client.get("/api/dashboard/flows/deliver-issue/evaluations").json()
-        assert lab == {"items": [], "candidates": []}
+        assert lab == {
+            "items": [],
+            "candidates": [],
+            "sources": [{"key": "deliver-issue", "name": "Deliver issue", "runs": 0}],
+            "of": "deliver-issue",
+        }
         nothing = post(
             "/flows/deliver-issue/evaluations",
             version=0,

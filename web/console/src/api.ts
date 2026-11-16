@@ -398,6 +398,12 @@ export interface Measured {
   sandboxes: number;
   minutes: number;
   tokens: number;
+  /** By the clock, from the first step that started to the last that ended, in minutes. */
+  elapsed: number;
+  steps: number;
+  /** How many of its steps asked a model over an API, and what those questions cost. */
+  asked: number;
+  cost: number;
   counts: Record<string, number> | null;
   files: number;
 }
@@ -408,6 +414,8 @@ export interface EvaluationCase {
   candidate: Measured | null;
   skipped: string | null;
   verdict: 'better' | 'same' | 'worse' | null;
+  /** How many files both changes touch, when both changed any. */
+  common: number | null;
 }
 
 interface EvaluationTotal {
@@ -416,12 +424,18 @@ interface EvaluationTotal {
   rounds: number;
   minutes: number;
   tokens: number;
+  elapsed: number;
+  asked: number;
+  cost: number;
 }
 
 /** A version of a flow tried on past work. */
 export interface Evaluation {
   id: string;
   flow: string;
+  /** The flow whose past runs are gone through: the flow tried, or another of its sort. */
+  of: string;
+  of_name: string;
   candidate_version: number;
   baseline_version: number;
   state: 'running' | 'finished' | 'stopped';
@@ -437,6 +451,10 @@ export interface Evaluation {
 
 export interface EvaluationLab {
   items: Evaluation[];
+  /** The flows whose past runs this flow can be tried on: itself first. */
+  sources: { key: string; name: string; runs: number }[];
+  /** The flow whose runs `candidates` are. */
+  of: string;
   candidates: ReplayCandidate[];
 }
 

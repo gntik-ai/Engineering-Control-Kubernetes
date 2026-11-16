@@ -410,6 +410,8 @@ class EvaluationInput(DashboardModel):
     version: int = Field(ge=0)
     run_ids: list[UUID] = Field(min_length=1, max_length=8)
     note: str | None = Field(default=None, max_length=300)
+    # The flow whose past runs these are, when it is not the flow tried.
+    of: str | None = Field(default=None, max_length=64)
 
 
 class RunDecisionInput(DashboardModel):
