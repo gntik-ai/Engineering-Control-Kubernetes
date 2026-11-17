@@ -34,7 +34,18 @@ import {
   TableRow,
   Textarea,
 } from '@gntik-ai/ui';
-import { DatabaseZap, FlaskConical, KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
+import {
+  DatabaseZap,
+  FlaskConical,
+  KeyRound,
+  Layers,
+  LogIn,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  Trash2,
+} from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -311,6 +322,81 @@ function readPrices(text: string): { prices: Record<string, ModelPrice>; problem
     prices[model] = { input, output, ...(cached === undefined ? {} : { cached }) };
   }
   return { prices, problem: null };
+}
+
+/** Hand one small question to the account's provider as a batch, to see that batches
+ * work with the key. Where it is then shows on the Runs page, with the other batches. */
+function BatchTrialDialog({
+  account,
+  provider,
+  open,
+  onOpenChange,
+  onSaved,
+}: DialogProps & { account: Account; provider: ProviderType }) {
+  const models = account.models ?? [];
+  const [model, setModel] = useState(models[0] ?? '');
+  const [handed, setHanded] = useState(false);
+  const { pending, problem, submit, reset } = useSubmit(
+    () => postJson<unknown>(`accounts/${account.id}/batch-trial`, { model }).then(() => setHanded(true)),
+    onSaved,
+  );
+  useEffect(() => {
+    if (!open) return;
+    setModel((account.models ?? [])[0] ?? '');
+    setHanded(false);
+    reset();
+    // Only when it opens.
+  }, [open]);
+  const send = (event: FormEvent) => {
+    event.preventDefault();
+    void submit();
+  };
+  const part = Math.round((provider.batch_price ?? 0.5) * 100);
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <form onSubmit={send} className="contents">
+          <DialogHeader>
+            <DialogTitle>Try a batch with {account.name}</DialogTitle>
+            <DialogDescription>
+              One small question is handed to {provider.name} as a batch, which it answers within hours, most within
+              one, at {part}% of the price. It belongs to no run. This costs what a few dozen tokens cost at the
+              model.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            <Field>
+              <FieldLabel required>Model</FieldLabel>
+              {models.length ? (
+                <SimpleSelect
+                  aria-label="Model"
+                  items={models.map((name) => ({ value: name, label: name }))}
+                  value={model}
+                  onValueChange={(value) => setModel(value ?? model)}
+                />
+              ) : (
+                <Input name="model" value={model} onValueChange={setModel} maxLength={100} />
+              )}
+            </Field>
+            {handed ? (
+              <Alert tone="success" title="The batch is handed in.">
+                It is followed like any other: the Runs page lists it with the batches, and says when it has ended.
+              </Alert>
+            ) : null}
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Close
+            </Button>
+            <Button type="submit" loading={pending} disabled={!model.trim() || handed}>
+              Hand it in
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 /** Ask a model of the account the same long question again, and show what the provider
@@ -607,7 +693,7 @@ function AccountRow({
   onChanged: () => void;
   onProblem: (message: string) => void;
 }) {
-  const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | 'cache' | null>(null);
+  const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | 'cache' | 'batch' | null>(null);
   const shown = state(account);
   const signedIn = account.state !== 'signed_out';
   const api = account.kind === 'api';
@@ -679,6 +765,9 @@ function AccountRow({
               ...(api && signedIn
                 ? [{ label: 'Try the cache', icon: DatabaseZap, onSelect: () => setDialog('cache') }]
                 : []),
+              ...(api && signedIn && provider?.batch
+                ? [{ label: 'Try a batch', icon: Layers, onSelect: () => setDialog('batch') }]
+                : []),
               ...(signedIn && canSignIn
                 ? [
                     {
@@ -708,6 +797,15 @@ function AccountRow({
             account={account}
             open={dialog === 'cache'}
             onOpenChange={(open) => setDialog(open ? 'cache' : null)}
+            onSaved={onChanged}
+          />
+        ) : null}
+        {api && provider?.batch ? (
+          <BatchTrialDialog
+            account={account}
+            provider={provider}
+            open={dialog === 'batch'}
+            onOpenChange={(open) => setDialog(open ? 'batch' : null)}
             onSaved={onChanged}
           />
         ) : null}

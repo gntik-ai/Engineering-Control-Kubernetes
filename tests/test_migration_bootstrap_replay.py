@@ -45,8 +45,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # NEW-245's 0024 (stored cleanup lists), NEW-234
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
-    # 0045 (summaries of a project's code) follows 0044.
-    assert (head, parent) == ("0045", "0044")
+    # 0046 (batches of questions to a model) follows 0045 (summaries of a project's code).
+    assert (head, parent) == ("0046", "0045")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -100,6 +100,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0046: batches of questions handed to a provider, and their requests.
+    assert {"model_batches", "model_batch_requests"} <= set(inspect(engine).get_table_names())
+    command.downgrade(config, parent)
+    assert not {"model_batches", "model_batch_requests"} & set(inspect(engine).get_table_names())
+    parent = "0044"
     # 0045: summaries of a project's code.
     assert "code_summaries" in inspect(engine).get_table_names()
     command.downgrade(config, parent)

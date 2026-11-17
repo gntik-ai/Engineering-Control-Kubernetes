@@ -186,6 +186,8 @@ WAYS: Final = ("done", "search", "read", "edit", "check", "other")
 FOUND_CEILING: Final = 80
 # What a task that asks a model over an API is set with.
 ASK_TOKENS: Final = 8000
+# How long a question asked in a batch is waited for, and at most.
+BATCH_HOURS: Final = 24
 ASK_TOKENS_CEILING: Final = 32000
 ASK_MINUTES: Final = 5
 ASK_MINUTES_CEILING: Final = 30
@@ -265,6 +267,32 @@ _ASKED: Final = (
         "once, for a few minutes; hour keeps it for an hour, at a higher price, for "
         "flows whose questions are far apart; off never asks.",
         choices=("automatic", "off", "hour"),
+    ),
+    Param(
+        "asked",
+        "choice",
+        "at_once",
+        "How the model is asked: at once, or in a batch. A batch is answered within "
+        "hours, most within one, at about half the price, where the provider takes "
+        "batches. The run waits for it and goes on when the answer is there.",
+        choices=("at_once", "batch"),
+    ),
+    Param(
+        "hours",
+        "int",
+        BATCH_HOURS,
+        "For a question asked in a batch: how many hours its answer is waited for.",
+        low=1,
+        high=BATCH_HOURS,
+    ),
+    Param(
+        "late",
+        "choice",
+        "stop",
+        "For a question asked in a batch: what happens when its answer has not come in "
+        "its time. Stop: the run fails and says so, and what was not answered is not "
+        "charged. Ask: the question is asked at once, at the full price.",
+        choices=("stop", "ask"),
     ),
     Param(
         "tokens",

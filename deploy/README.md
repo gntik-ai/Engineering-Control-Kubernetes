@@ -1049,6 +1049,81 @@ An agent in a sandbox needs none of this: Claude Code and Codex keep and read th
 conversation from the provider's cache, on a subscription and through the gateway
 alike, and a step shows how much was read again.
 
+### Asking in a batch
+
+Some providers answer a question within hours instead of seconds, at about half the
+price: the question is handed in as a batch and fetched when it is answered. Every task
+that asks a model has three settings for it:
+
+| Setting | Choices | What it means |
+| --- | --- | --- |
+| How it is asked | At once (default), In a batch | In a batch the run waits for the answer and goes on when it is there |
+| Hours a batch is waited for | 1 to 24, usually 24 | After that the platform stops waiting, whatever the provider's own limit is |
+| When a batch is late | Tell me and stop (default), Ask at once | Stop: the run fails and says so, and what was not answered is not charged. Ask: the question is asked at once, at the full price |
+
+Which providers take batches is shown on the Accounts page and checked by the rules: a
+task set to a batch at a provider that takes none is an error. Anthropic takes them
+(most are answered within the hour, all within a day, at half the price; what it kept
+in and read from its cache is half the price as well).
+
+It fits work nobody waits for: a nightly audit, a report, summaries, a trial in the
+lab. An agent in a sandbox cannot be asked this way: its work is many questions, each
+depending on the answer before. A loop may be asked in batches, and the rules say what
+that means: every step of it is then answered within hours.
+
+What happens to a question that is asked in a batch:
+
+1. The batch is written into the platform's records, then handed to the provider, then
+   recorded as handed in, with an account that has a key as for a question at once.
+2. The step is running and says where its batch is: at which provider, since when, how
+   many of its questions are answered, and until when it is waited for. No sandbox runs
+   for it; a run's own sandbox is given back after ten idle minutes and made again when
+   the run goes on.
+3. The provider is asked about the batch once a minute for the first ten minutes and
+   every five minutes after that.
+4. When it has ended, the answer is fetched and kept, and the run goes on as if it had
+   been asked at once. The step shows that it was asked in a batch, after how long it
+   was answered, and what it cost at the batch's price.
+
+Nothing of this is kept in memory. A launcher that starts again, after a release or a
+crash, finds the batch in the records and goes on following it; it hands nothing in a
+second time. Should it have stopped between recording a batch and hearing from the
+provider, it asks the provider what it was handed lately: one batch of that size and
+time that the platform knows nothing of is taken as the one, none means it is handed in
+now, and with several it is not handed in again but said, so that nothing is paid twice.
+
+What can go differently:
+
+- **The answer does not have the asked shape.** It is asked for again at once, saying
+  what was wrong: one more question at the full price, not another batch. Both are
+  counted with the step.
+- **The batch is late.** At the end of its hours the provider is asked to stop it. What
+  it answered by then is kept and paid; what it did not answer is not charged. Then the
+  task's setting decides: the run fails with "The batch was not answered within N
+  hours", or the question is asked at once.
+- **The provider cannot answer it** (an error on its side) is treated like a late one.
+  A request it rejects, or a model that declines, fails the step with its words, as at
+  once.
+- **The run is stopped.** Its batch is stopped at the provider. What the provider had
+  answered by then is paid for.
+- **The provider is busy when the batch is handed in**, or the key is refused: nothing
+  is recorded, and the step tries again as a question at once would.
+
+**Where to see them.** The Runs page lists the batches under the runs: what each is
+for, where it was asked, its state, how many questions are answered, when it was handed
+in and when it ended or until when it is waited for. The chat channel says when a batch
+has ended, was late or failed. `/metrics` has `engineering_batches_out` and
+`engineering_batch_oldest_seconds`.
+
+**Whether batches work for an account** is tried on the Accounts page (an account's
+menu → Try a batch): one small question is handed in as a batch that belongs to no run.
+It shows with the others and costs what a few dozen tokens cost.
+
+A batch and the cache go together: a question in a batch is built like any other, and
+what it shares with others is marked for Anthropic to keep. Questions of one batch are
+answered side by side, though, so one cannot count on the first having written what the
+others read.
+
 ## Items that are not issues
 
 A backlog item need not be an issue on GitHub. One written in the console, proposed by the

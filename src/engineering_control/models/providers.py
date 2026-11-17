@@ -99,6 +99,7 @@ API_PROVIDERS: Final = (
         key_shape="it starts with sk-ant-api",
         cache="marked",
         cache_write=(1.25, 2.0),
+        batch="anthropic",
     ),
     ApiProvider(
         key="openai",

@@ -1248,6 +1248,17 @@ def create_app(
             entity="account",
         )
 
+    @app.post("/api/dashboard/accounts/{account_id}/batch-trial")
+    async def try_batch_api(account_id: UUID, request: Request) -> Response:
+        """Hand one small question to the account's provider as a batch."""
+        return await project_change(
+            request,
+            CacheTrialInput,
+            lambda body: service(request).try_batch(account_id, body.model, models_of(request)),
+            event="dashboard.account_batch_tried",
+            entity="account",
+        )
+
     @app.post("/api/dashboard/accounts/{account_id}/try")
     async def try_account_api(account_id: UUID, request: Request) -> Response:
         """Start a run that asks the account's client one trivial question."""
@@ -1703,6 +1714,15 @@ def create_app(
             return authenticated
         await check_project(request, project)
         return JSONResponse(await service(request).runs(project=project))
+
+    @app.get("/api/dashboard/batches")
+    async def batches_api(request: Request) -> Response:
+        """Questions handed to a provider as batches: the ones that are out, and the
+        ones that ended last."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).batches())
 
     @app.get("/api/dashboard/runs/{run_id}")
     async def run_api(run_id: UUID, request: Request) -> Response:

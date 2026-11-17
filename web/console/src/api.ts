@@ -998,6 +998,35 @@ export interface Account {
   prices?: Record<string, ModelPrice>;
 }
 
+/** Questions handed to a provider as one batch: answered within hours, at a lower price. */
+export interface Batch {
+  id: string;
+  provider: string;
+  provider_name: string;
+  model: string;
+  account: string | null;
+  /** submitting, waiting, stopping (asked to stop), ended or failed. */
+  state: 'submitting' | 'waiting' | 'stopping' | 'ended' | 'failed';
+  /** Why it was stopped: its time was over ("late"), or its run was stopped. */
+  stopping: string | null;
+  requests: number;
+  answered: number;
+  detail: string | null;
+  run_id: string | null;
+  run: string | null;
+  step: string | null;
+  created_at: string | null;
+  submitted_at: string | null;
+  ended_at: string | null;
+  deadline_at: string | null;
+}
+
+export interface Batches {
+  items: Batch[];
+  /** How many are out at a provider right now. */
+  out: number;
+}
+
 /** What trying a provider's cache showed: each time the model was asked, and what it read. */
 export interface CacheTrial {
   account: string;
@@ -1029,6 +1058,11 @@ export interface ProviderType {
   note: string;
   kind: 'subscription' | 'api';
   endpoints?: { key: string; name: string; host: string }[];
+  /** For a provider asked over its API: how it keeps what it read, and whether it takes batches. */
+  cache?: string;
+  batch?: boolean;
+  /** What a token costs in a batch, as a part of what it costs asked at once. */
+  batch_price?: number;
 }
 
 export interface Accounts extends Listing<Account> {

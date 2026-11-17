@@ -239,6 +239,10 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
             "with_files",
             # Whether a provider is asked to keep what it read: tests/test_prompt_cache.py.
             "cache",
+            # Asked at once or in a batch, and what a late batch means: tests/test_batches.py.
+            "asked",
+            "hours",
+            "late",
             "tokens",
             "minutes",
             # Which of the administrator's agents is asked: tests/test_agents.py.

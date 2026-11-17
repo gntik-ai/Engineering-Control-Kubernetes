@@ -31,6 +31,7 @@ import { ArrowLeft, Bot, CircleSlash, GitBranch, Trash2 } from '@gntik-ai/icons'
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
 import { LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
+import { BatchesCard } from './Batches';
 import { BASE, RouterLink, setQuery, useLocation } from '../router';
 import { API_PROVIDER_NAMES } from './FlowParts';
 import { minutes, tokens, versionName } from './Flows';
@@ -201,6 +202,7 @@ export function RunsPage() {
             </Table>
           </TableFrame>
         )}
+        <BatchesCard />
       </div>
     </Page>
   );

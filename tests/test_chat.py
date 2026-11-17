@@ -449,6 +449,33 @@ async def test_runs_queues_and_accounts_that_need_the_administrator_are_told_onc
     assert await world.channel.deliver() == 1
     assert world.transport.texts()[0].startswith("The account **claude one** needs a new sign-in.")
     assert await world.channel.deliver() == 0
+    # A batch that has ended, was late, or failed; not one the administrator stopped.
+    from engineering_control.db.models import ModelBatch
+
+    def batch(**fields: Any) -> None:
+        with world.sessions.begin() as session:
+            session.add(
+                ModelBatch(
+                    provider="anthropic",
+                    model="claude-haiku-5-5",
+                    requests=4,
+                    deadline_at=datetime.now(UTC),
+                    **fields,
+                )
+            )
+
+    batch(state="ended", answered=4)
+    batch(state="ended", answered=1, stopping="late", detail="1 of 4 were answered.")
+    batch(state="failed", answered=0, detail="Anthropic rejected the request.")
+    batch(state="ended", answered=0, stopping="stopped")
+    batch(state="waiting", answered=0)
+    assert await world.channel.deliver() == 3
+    assert sorted(world.transport.texts()) == [
+        "A batch at Anthropic API failed. Anthropic rejected the request.",
+        "A batch at Anthropic API has ended: 4 of 4 questions answered. The run goes on.",
+        "A batch at Anthropic API was not answered in its time. 1 of 4 were answered.",
+    ]
+    assert await world.channel.deliver() == 0
 
 
 async def test_the_digest_is_sent_once_a_day_after_its_hour(world: Any) -> None:

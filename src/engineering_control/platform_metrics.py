@@ -17,6 +17,7 @@ from engineering_control.dashboard.backlog_items import OPEN_STATES
 from engineering_control.db.models import (
     BacklogItem,
     BacklogSync,
+    ModelBatch,
     ProjectRecord,
     ProviderAccount,
     SandboxRun,
@@ -45,6 +46,8 @@ DESCRIPTIONS: Final[dict[str, str]] = {
     "engineering_queues": "Queues that are running or paused.",
     "engineering_backlog_open_items": "Items of the backlogs still to do.",
     "engineering_backlog_sync_failing": "Projects whose last sync with GitHub failed.",
+    "engineering_batches_out": "Batches of questions handed to a provider and not ended.",
+    "engineering_batch_oldest_seconds": "How long the oldest batch that is out has been out.",
 }
 
 
@@ -121,7 +124,13 @@ def platform_metrics(sessions: sessionmaker[Session], *, now: datetime | None = 
             .join(ProjectRecord, BacklogSync.project_id == ProjectRecord.id)
             .where(BacklogSync.error.is_not(None), ProjectRecord.archived_at.is_(None))
         )
+        out, first = session.execute(
+            select(func.count(), func.min(ModelBatch.created_at)).where(
+                ModelBatch.state.in_(("submitting", "waiting", "stopping"))
+            )
+        ).one()
     waited = max(0.0, (moment - _utc(oldest)).total_seconds()) if oldest else 0.0
+    batch_age = max(0.0, (moment - _utc(first)).total_seconds()) if first else 0.0
     lines = _described("engineering_database_up", [sample("engineering_database_up", 1)])
     lines += _described(
         "engineering_runs",
@@ -169,5 +178,12 @@ def platform_metrics(sessions: sessionmaker[Session], *, now: datetime | None = 
     lines += _described(
         "engineering_backlog_sync_failing",
         [sample("engineering_backlog_sync_failing", int(failing or 0))],
+    )
+    lines += _described(
+        "engineering_batches_out", [sample("engineering_batches_out", int(out or 0))]
+    )
+    lines += _described(
+        "engineering_batch_oldest_seconds",
+        [sample("engineering_batch_oldest_seconds", batch_age)],
     )
     return lines

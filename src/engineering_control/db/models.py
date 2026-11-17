@@ -772,6 +772,75 @@ class CodeSummary(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class ModelBatch(UUIDPrimaryKey, Timestamps, Base):
+    """Questions handed to a provider as one batch (migration 0046): answered within
+    hours instead of seconds, at a lower price. The record is what the platform knows
+    of it, so that a batch is followed across restarts and never handed in twice.
+
+    ``state``: ``submitting`` (recorded here, not yet known to be at the provider),
+    ``waiting`` (at the provider), ``stopping`` (asked to stop: its time was over, or
+    its run was stopped), ``ended`` (what it answered is in its requests) or ``failed``
+    (it could not be handed in, or the provider gave it up).
+    """
+
+    __tablename__ = "model_batches"
+    step_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("sandbox_steps.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("provider_accounts.id", ondelete="SET NULL")
+    )
+    provider: Mapped[str] = mapped_column(String(40))
+    model: Mapped[str] = mapped_column(String(120))
+    # The batch's name at the provider, once the provider has it.
+    remote_id: Mapped[str | None] = mapped_column(String(200))
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    # Why it is being stopped: "late" (not answered in its time) or "stopped".
+    stopping: Mapped[str | None] = mapped_column(String(20))
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    answered: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str | None] = mapped_column(String(600))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # After this the platform stops waiting, whatever the provider's own limit is.
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('submitting', 'waiting', 'stopping', 'ended', 'failed')", name="state"
+        ),
+    )
+
+
+class ModelBatchRequest(UUIDPrimaryKey, Timestamps, Base):
+    """One question of a batch (migration 0046): what was asked, and what came back.
+
+    ``state``: ``waiting``, ``answered``, ``failed`` (the provider could not answer it,
+    or the model declined) or ``late`` (the batch ended before it was answered)."""
+
+    __tablename__ = "model_batch_requests"
+    batch_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("model_batches.id", ondelete="CASCADE"), index=True
+    )
+    # The name the request has in the batch: answers come back by it, in any order.
+    name: Mapped[str] = mapped_column(String(64))
+    position: Mapped[int] = mapped_column(Integer)
+    question: Mapped[dict[str, Any]] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(20))
+    answer: Mapped[str | None] = mapped_column(Text)
+    # The model that answered, and what the answer used.
+    model: Mapped[str | None] = mapped_column(String(120))
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # Why there is no answer: the kind (as a call that brings none has it) and the words.
+    kind: Mapped[str | None] = mapped_column(String(20))
+    error: Mapped[str | None] = mapped_column(String(600))
+    __table_args__ = (
+        UniqueConstraint("batch_id", "name", name="uq_model_batch_requests_batch_name"),
+        CheckConstraint("state IN ('waiting', 'answered', 'failed', 'late')", name="state"),
+    )
+
+
 class Skill(UUIDPrimaryKey, Timestamps, Base):
     """Named instructions an agent can be given (migration 0043): how something is done
     here, written once and handed to every agent that has the skill."""

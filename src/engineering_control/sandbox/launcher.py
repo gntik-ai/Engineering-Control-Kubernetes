@@ -40,6 +40,8 @@ from engineering_control.gateway.grants import issue as issue_grant
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
+from engineering_control.models import shape
+from engineering_control.models.batches import Batches, Followed, plus
 from engineering_control.models.sealing import read_sealing_key
 from engineering_control.models.service import ModelError, Models, Question, Reply
 from engineering_control.platform_metrics import platform_metrics, unavailable
@@ -75,6 +77,10 @@ START_SECONDS: Final = 600
 # busy or the launcher started anew, before the run gives up. Waiting for an account
 # with a key is not counted.
 MODEL_TRIES: Final = 5
+# The name a step's one question has in its batch, and how often batches that are
+# left over are looked for.
+ONE: Final = "question"
+SWEEP_SECONDS: Final = 300.0
 # How often a step is handed to a new workbench when the one it ran in was lost.
 BENCH_TRIES: Final = 5
 # How many steps that need no sandbox of their own a run may get through in one pass, and
@@ -159,6 +165,9 @@ class Launcher:
         # Who asks a model over a provider's API, and the questions that are out: a step
         # that asks one is not a sandbox, so it is followed here and not in the cluster.
         self.models = models
+        # Questions asked in a batch: handed in, followed and fetched from their records.
+        self.batches: Batches | None = Batches(models) if models is not None else None
+        self._swept = 0.0
         self._calls: dict[UUID, asyncio.Task[Reply]] = {}
         self._questions: dict[UUID, Question] = {}
         # What a step's grant to reach a project's own application is signed with.
@@ -219,6 +228,15 @@ class Launcher:
             await asyncio.to_thread(self.evaluations.advance)
         if self.triggers is not None:
             await self._trigger()
+        if self.batches is not None:
+            # Batches nobody waits for any more are brought to an end, now and then.
+            now = asyncio.get_running_loop().time()
+            if now - self._swept > SWEEP_SECONDS:
+                self._swept = now
+                try:
+                    await self.batches.sweep()
+                except Exception as error:  # noqa: BLE001 - never holds the runs up
+                    LOG.warning("batches_not_swept", error=type(error).__name__)
         work = await asyncio.to_thread(self.runs.work)
         # Steps already in a sandbox count against the limit; a step that has to wait for
         # a free one says so and is looked at again on the next pass, oldest run first.
@@ -445,17 +463,110 @@ class Launcher:
         except ValueError as error:
             await self._fail_step(item, "not_asked", str(error))
             return
-        # Whatever happens to the provider, the step does not wait for ever.
-        limit = question.seconds * 4 + 300
-        self._calls[item.step_id] = asyncio.create_task(
-            asyncio.wait_for(self.models.ask(question), timeout=limit)
-        )
-        self._questions[item.step_id] = question
+        if question.batch and self.batches is not None:
+            await asyncio.to_thread(self.runs.step_started, item.step_id, None)
+            try:
+                await self.batches.submit(
+                    item.step_id, item.run_id, [(ONE, question)], hours=question.hours
+                )
+            except ModelError as error:
+                await self._not_asked(item, error)
+                return
+            self._questions[item.step_id] = question
+            LOG.info("model_asked_in_a_batch", run=str(item.run_id), step=item.name)
+            return
+        self._at_once(item, question)
         await asyncio.to_thread(self.runs.step_started, item.step_id, None)
         LOG.info("model_asked", run=str(item.run_id), step=item.name)
 
+    def _at_once(self, item: StepWork, question: Question, earlier: str | None = None) -> None:
+        """Put the question to a model now. Whatever happens to the provider, the step
+        does not wait for ever."""
+        assert self.models is not None  # noqa: S101 - a step that asks has them
+        limit = question.seconds * 4 + 300
+        self._calls[item.step_id] = asyncio.create_task(
+            asyncio.wait_for(self.models.ask(question, earlier), timeout=limit)
+        )
+        self._questions[item.step_id] = question
+
+    async def _not_asked(self, item: StepWork, error: ModelError) -> None:
+        if error.later:
+            detail, forgiven = error.detail, error.label == "no_account"
+            await asyncio.to_thread(
+                lambda: self.runs.step_again(item.step_id, detail, forgiven=forgiven)
+            )
+        else:
+            await self._fail_step(item, error.label, error.detail)
+
+    async def _batched(self, item: StepWork, followed: Followed) -> bool:
+        """Go on from where the step's batch is: wait, or take what it answered."""
+        if followed.state == "waiting":
+            await asyncio.to_thread(self.runs.step_waiting, item.step_id, followed.detail)
+            return False
+        if followed.state == "failed" or not followed.answers:
+            await self._fail_step(item, "batch_failed", followed.detail or "The batch failed.")
+            return False
+        answer = followed.answers[0]
+        engine = cast(Engine, self.flows[item.run_kind])
+        try:
+            # The question as it was put: what the step's log shows, and what is asked
+            # at once when the batch brought nothing that can be used.
+            question = await engine.question(item)
+        except ValueError as error:
+            await self._fail_step(item, "not_asked", str(error))
+            return False
+        if answer.state == "answered":
+            data = shape.read_object(answer.text)
+            why = (
+                "it was not a JSON object"
+                if data is None
+                else shape.problem(question.schema, data) or ""
+            )
+            if data is not None and not why:
+                reply = Reply(
+                    data=data,
+                    text=answer.text,
+                    provider=followed.provider,
+                    model=answer.model,
+                    account_id=followed.account_id or item.step_id,
+                    account=followed.account,
+                    usage=answer.usage or {},
+                    seconds=followed.seconds,
+                    asked=1,
+                )
+                await self._answered(item, reply, question, batch=True)
+                return True
+            # An answer of the wrong shape is asked for again at once, not in another
+            # batch: one more question, saying what was wrong.
+            self._at_once(item, question, why)
+            return False
+        if answer.state == "late" or answer.kind == "busy":
+            if question.late == "ask":
+                self._at_once(item, question)
+                return False
+            await self._fail_step(
+                item,
+                "batch_late" if answer.state == "late" else "batch_failed",
+                (
+                    f"The batch was not answered within {question.hours} hours. What was "
+                    "not answered is not charged. Start the run again, or set the task "
+                    "to be asked at once when its batch is late."
+                    if answer.state == "late"
+                    else f"The provider could not answer in the batch: {answer.error or ''}"
+                ),
+            )
+            return False
+        await self._fail_step(
+            item, answer.kind or "batch_failed", answer.error or "The batch gave no answer."
+        )
+        return False
+
     async def _asked(self, item: StepWork) -> bool:
         call = self._calls.get(item.step_id)
+        if call is None and self.batches is not None:
+            followed = await self.batches.follow(item.step_id)
+            if followed is not None:
+                return await self._batched(item, followed)
         if call is None:
             # The launcher started again while the model was being asked: ask again.
             await asyncio.to_thread(
@@ -477,13 +588,7 @@ class Launcher:
         try:
             reply = call.result()
         except ModelError as error:
-            if error.later:
-                detail, forgiven = error.detail, error.label == "no_account"
-                await asyncio.to_thread(
-                    lambda: self.runs.step_again(item.step_id, detail, forgiven=forgiven)
-                )
-            else:
-                await self._fail_step(item, error.label, error.detail)
+            await self._not_asked(item, error)
             return False
         except TimeoutError:
             await self._fail_step(item, "model_timeout", "The model did not answer in time.")
@@ -491,17 +596,34 @@ class Launcher:
         except asyncio.CancelledError:
             await self._fail_step(item, "cancelled", "The question was withdrawn.")
             return False
-        await asyncio.to_thread(self.runs.note_usage, item.step_id, reply.usage)
+        await self._answered(item, reply, question)
+        return True
+
+    async def _answered(
+        self, item: StepWork, reply: Reply, question: Question | None, *, batch: bool = False
+    ) -> None:
+        """Keep what the question used and go on as the answer says."""
+        used = reply.usage
+        if self.batches is not None and not batch:
+            # A question that was first asked in a batch, and then at once: both count.
+            earlier = await asyncio.to_thread(self.batches.used, item.step_id)
+            used = plus(earlier, reply.usage) or reply.usage
+        await asyncio.to_thread(self.runs.note_usage, item.step_id, used)
         result = await cast(Engine, self.flows[item.run_kind]).answered(item, reply)
+        how = (
+            f"in a batch; answered after {_span(reply.seconds)}"
+            if batch
+            else f"{'twice; ' if reply.asked > 1 else ''}answered in {reply.seconds} seconds"
+        )
         said = (
-            f"--- asked {reply.provider} ({reply.model}) with the account {reply.account}"
-            f"{', twice' if reply.asked > 1 else ''}; answered in {reply.seconds} seconds ---\n"
+            f"--- asked {reply.provider} ({reply.model}) with the account {reply.account}, "
+            f"{how} ---\n"
             f"{question.system if question else ''}\n\n{question.prompt if question else ''}"
             f"\n\n--- answered ---\n{reply.text}"
         )
+        self._questions.pop(item.step_id, None)
         await self._settle(item, result, result.verdict, log=said, exit_code=None)
         LOG.info("model_answered", run=str(item.run_id), step=item.name, model=reply.model)
-        return True
 
     # --- starting ------------------------------------------------------------------------
 
@@ -752,10 +874,13 @@ class Launcher:
 
     async def _cancel(self, item: StepWork) -> None:
         call = self._calls.pop(item.step_id, None)
+        self._questions.pop(item.step_id, None)
         if call is not None:
             # A question that is out is withdrawn: its answer is not waited for.
-            self._questions.pop(item.step_id, None)
             call.cancel()
+        elif self.batches is not None and item.state == "running":
+            # A batch the step waits for is stopped at the provider.
+            await self.batches.stop(item.step_id)
         if item.state == "running" and item.pod_name is not None:
             await self.cluster.delete_pod(item.pod_name, grace_seconds=0)
             await self.flows[item.run_kind].ended(item)
@@ -787,6 +912,15 @@ class Launcher:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _span(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 2:
+        return f"{int(seconds)} seconds"
+    if minutes < 120:
+        return f"{minutes} minutes"
+    return f"{minutes // 60} hours and {minutes % 60} minutes"
 
 
 def sandboxes_from(settings: Settings) -> pods.Sandboxes:

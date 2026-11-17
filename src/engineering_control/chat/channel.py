@@ -32,6 +32,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import (
     ChatDelivery,
     ChatState,
+    ModelBatch,
     ProviderAccount,
     SandboxRun,
     SupervisorAction,
@@ -39,6 +40,7 @@ from engineering_control.db.models import (
     WorkQueue,
 )
 from engineering_control.flow_library import DELIVER, WORK_KINDS
+from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import CONVERSATION, Runs
 from engineering_control.supervisor.conversation import Conversation
@@ -531,6 +533,40 @@ class ChatChannel:
                             None,
                         )
                     )
+            for batch in session.scalars(
+                select(ModelBatch)
+                .where(
+                    ModelBatch.state.in_(("ended", "failed")),
+                    ModelBatch.updated_at > since,
+                    # One the administrator stopped with its run is no news to them.
+                    ModelBatch.stopping.is_distinct_from("stopped"),
+                )
+                .order_by(ModelBatch.updated_at)
+                .limit(30)
+            ):
+                run = session.get(SandboxRun, batch.run_id) if batch.run_id else None
+                kind = API_BY_KEY.get(batch.provider)
+                where = kind.name if kind is not None else batch.provider
+                about = f" for **{run.title}**" if run is not None else ""
+                if batch.state == "failed":
+                    text = f"A batch at {where}{about} failed. {batch.detail or ''}"
+                elif batch.stopping == "late":
+                    text = f"A batch at {where}{about} was not answered in its time. " + (
+                        batch.detail or ""
+                    )
+                else:
+                    text = (
+                        f"A batch at {where}{about} has ended: {batch.answered} of "
+                        f"{batch.requests} questions answered. The run goes on."
+                    )
+                news.append(
+                    (
+                        "batch",
+                        f"{batch.id}:{batch.state}",
+                        text + (self._link(f"run?id={batch.run_id}") if batch.run_id else ""),
+                        None,
+                    )
+                )
             for account in session.scalars(
                 select(ProviderAccount).where(
                     ProviderAccount.archived_at.is_(None),

@@ -34,6 +34,7 @@ from engineering_control.engine import parts as flow_parts
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import KEY, Document, Node
 from engineering_control.engine.prompts import CONTRACTS
+from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.sandbox.deliver import PROVIDERS, commands_of
 
 Problem = dict[str, Any]
@@ -403,6 +404,30 @@ def _problems(document: Document) -> list[Problem]:
                             f"{node.id} does not name {which} it asks: write the name the "
                             "provider gives it",
                             node.id,
+                        )
+                    )
+            if param.name == "asked" and node.params.get("asked") == "batch":
+                provider = API_BY_KEY.get(str(node.params.get("provider") or ""))
+                if provider is not None and not provider.batch and not node.params.get("agent"):
+                    found.append(
+                        _problem(
+                            "setting",
+                            f"{node.id} is to be asked in a batch, and {provider.name} "
+                            "takes none: ask it at once, or name a provider that does ("
+                            + ", ".join(kind.name for kind in API_BY_KEY.values() if kind.batch)
+                            + ")",
+                            node.id,
+                        )
+                    )
+                if task.loops:
+                    found.append(
+                        _problem(
+                            "setting",
+                            f"{node.id} is asked in a batch at every step of its loop: a "
+                            "step is then answered within hours, and a loop of many steps "
+                            "may take days",
+                            node.id,
+                            "warning",
                         )
                     )
             if param.kind == "task" and not node.params.get(param.name):

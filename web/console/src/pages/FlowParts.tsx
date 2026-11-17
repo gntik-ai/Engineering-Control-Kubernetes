@@ -51,6 +51,9 @@ const SETTING_NAMES: Record<string, string> = {
   agent: 'Agent',
   paid: 'Paid by',
   cache: 'Prompt cache',
+  asked: 'How it is asked',
+  hours: 'Hours a batch is waited for',
+  late: 'When a batch is late',
   part: 'Part',
   steps: 'Steps of the loop at most',
   dollars: 'US dollars for models asked over an API',
@@ -73,6 +76,10 @@ const CHOICE_NAMES: Record<string, string> = {
   'cache:automatic': 'Automatic',
   'cache:off': 'Off',
   'cache:hour': 'Keep for an hour',
+  'asked:at_once': 'At once',
+  'asked:batch': 'In a batch, at a lower price',
+  'late:stop': 'Tell me and stop',
+  'late:ask': 'Ask at once, at the full price',
 };
 export const settingName = (name: string) =>
   SETTING_NAMES[name] ?? name.replace(/_/g, ' ').replace(/^./, (first) => first.toUpperCase());

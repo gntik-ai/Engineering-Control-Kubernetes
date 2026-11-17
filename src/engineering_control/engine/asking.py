@@ -23,6 +23,7 @@ from typing import Any, Final, Protocol
 from engineering_control.engine.catalogue import (
     ASK_MINUTES,
     ASK_TOKENS,
+    BATCH_HOURS,
     TASKS,
     WAYS,
     loop_steps,
@@ -232,7 +233,25 @@ async def _asked(
         cache=kept_for(ctx),
         prefer=prefer,
         loose=_several(ctx) and str(ctx.params.get("cache") or "automatic") != "off",
+        batch=in_a_batch(ctx, where[0][0]),
+        hours=int(params.get("hours") or BATCH_HOURS),
+        late=str(params.get("late") or "stop"),
     )
+
+
+def in_a_batch(ctx: Context, provider: str) -> bool:
+    """Whether the question is handed in as a batch: where the task says so, and for a
+    run whose questions are all to be asked that way, where the provider takes them."""
+    takes = bool(BY_KEY[provider].batch)
+    if str(ctx.params.get("asked") or "at_once") == "batch":
+        if not takes:
+            raise ValueError(
+                f"{ctx.node.id} is to be asked in a batch, and {BY_KEY[provider].name} "
+                f"takes none: ask it at once, or name a provider that does "
+                f"({', '.join(kind.name for kind in BY_KEY.values() if kind.batch)})"
+            )
+        return True
+    return takes and ctx.data.get("ask") == "batch"
 
 
 def kept_for(ctx: Context) -> str:

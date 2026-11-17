@@ -70,6 +70,13 @@ class Question:
     # question, at its end, the shape leaves the beginning the same. The platform
     # checks the answer either way.
     loose: bool = False
+    # Asked in a batch: handed to the provider and answered within hours, at a lower
+    # price. ``hours`` is how long the answer is waited for; ``late`` what happens when
+    # it has not come by then: "stop" (the step fails and says so) or "ask" (the
+    # question is asked at once, at the full price).
+    batch: bool = False
+    hours: int = 24
+    late: str = "stop"
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,22 @@ def usage_of(
         "account": held.name,
         "account_id": str(held.id),
     }
+
+
+def with_shape(question: Question) -> str:
+    """The question as it is put to a model: its prompt, and the shape of the answer
+    said after it."""
+    return (
+        f"{question.prompt}\n\nAnswer with one JSON object of exactly this shape and "
+        f"nothing else, no text before or after it:\n{shape.words(question.schema)}"
+    )
+
+
+def complaint(base: str, why: str) -> str:
+    return (
+        f"{base}\n\nAn earlier answer could not be used: {why}. Answer "
+        "again with only the JSON object."
+    )
 
 
 def names(choices: tuple[tuple[str, str], ...]) -> str:
@@ -312,16 +335,15 @@ class Models:
 
     # --- a question ----------------------------------------------------------------------
 
-    async def ask(self, question: Question) -> Reply:
+    async def ask(self, question: Question, earlier: str | None = None) -> Reply:
+        """Ask the question at once. ``earlier`` says why an answer it already got (in a
+        batch) could not be used: it is then asked once, saying so."""
         if self.sealing_key is None:
             raise ModelError(
                 "no_key",
                 "This installation has no key to open API keys with, so no model can be asked.",
             )
-        base = (
-            f"{question.prompt}\n\nAnswer with one JSON object of exactly this shape and "
-            f"nothing else, no text before or after it:\n{shape.words(question.schema)}"
-        )
+        base = with_shape(question)
         busy: list[str] = []
         had_account = False
         for provider, model in question.choices:
@@ -334,9 +356,9 @@ class Models:
                 had_account = True
                 started = time.monotonic()
                 used = {"input": 0, "output": 0, "cached": 0, "cache_write": 0}
-                prompt, why = base, ""
+                prompt, why = (complaint(base, earlier), earlier) if earlier else (base, "")
                 try:
-                    for asked in (1, 2):
+                    for asked in (2,) if earlier else (1, 2):
                         wire = await self._patient(held, model, question, prompt)
                         used["input"] += wire.read
                         used["output"] += wire.written
@@ -361,10 +383,7 @@ class Models:
                                 seconds=round(time.monotonic() - started, 1),
                                 asked=asked,
                             )
-                        prompt = (
-                            f"{base}\n\nAn earlier answer could not be used: {why}. Answer "
-                            "again with only the JSON object."
-                        )
+                        prompt = complaint(base, why)
                 except WireError as error:
                     if error.kind == "refused":
                         await asyncio.to_thread(

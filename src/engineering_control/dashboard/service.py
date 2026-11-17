@@ -36,9 +36,12 @@ from engineering_control.engine.records import described
 from engineering_control.engine.simulate import recorded, simulate
 from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
+from engineering_control.models.batches import Batches
+from engineering_control.models.batches import listing as batches_listing
+from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.models.providers import MODEL_NAME, check_key, is_api
 from engineering_control.models.sealing import seal
-from engineering_control.models.service import ModelError, Models
+from engineering_control.models.service import ModelError, Models, Question
 from engineering_control.sandbox.deliver import PROVIDERS as AGENT_PROVIDERS
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
@@ -884,6 +887,11 @@ class DashboardService:
     async def runs(self, *, project: str | None = None) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.listing, project=project)
 
+    async def batches(self) -> dict[str, object]:
+        """The batches of questions that are out at a provider, and the ones that ended
+        last."""
+        return await asyncio.to_thread(batches_listing, self.repository.sessions)
+
     async def run(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.get, run_id)
 
@@ -973,6 +981,48 @@ class DashboardService:
             return await models.try_cache(account_id, model.strip())
         except ModelError as error:
             raise ProjectInvalid(error.detail) from error
+
+    async def try_batch(
+        self, account_id: UUID, model: str, models: Models | None
+    ) -> dict[str, object]:
+        """Hand one small question to the account's provider as a batch. It is followed
+        like any other and shown with the batches; it belongs to no run. It costs what
+        a few dozen tokens cost."""
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        kind = API_BY_KEY.get(str(account["provider"]))
+        if kind is None:
+            raise ProjectInvalid("Only an account with an API key is asked this way")
+        if not kind.batch:
+            raise ProjectInvalid(f"{kind.name} takes no questions in a batch")
+        if models is None:
+            raise ProjectInvalid("This installation cannot ask a provider")
+        if not MODEL_NAME.fullmatch(model.strip()):
+            raise ProjectInvalid("That is not the name of a model")
+        question = Question(
+            choices=((kind.key, model.strip()),),
+            system="You answer one question, shortly.",
+            prompt="Is two and two four?",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["answer"],
+                "properties": {"answer": {"type": "boolean"}},
+            },
+            max_tokens=2000,
+            seconds=120,
+            batch=True,
+            prefer=account_id,
+        )
+        try:
+            batch_id = await Batches(models).submit(None, None, [("question", question)])
+        except ModelError as error:
+            raise ProjectInvalid(error.detail) from error
+        return {
+            "account": str(account["name"]),
+            "provider": kind.key,
+            "model": model.strip(),
+            "batch": str(batch_id),
+        }
 
     async def remove_account(self, account_id: UUID, cluster: Cluster | None) -> dict[str, object]:
         """The sign-in leaves the cluster first; the record is removed only when it is gone."""
