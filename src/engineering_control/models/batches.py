@@ -30,9 +30,10 @@ from typing import Any, Final
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.project_records import ProjectConflict, ProjectNotFound
 from engineering_control.db.models import (
     ModelBatch,
     ModelBatchRequest,
@@ -801,6 +802,26 @@ class Batches:
             ).one()
         age = (self._now() - _aware(oldest)).total_seconds() if oldest is not None else 0.0
         return {"out": int(count or 0), "oldest_seconds": max(0.0, age)}
+
+
+def remove(sessions: sessionmaker[Session], batch_id: UUID) -> dict[str, Any]:
+    """Delete what is kept of a batch that has ended: the record and its questions. A
+    batch that is out, or whose run has not ended, is still followed and stays."""
+    with sessions.begin() as session:
+        batch = session.get(ModelBatch, batch_id, with_for_update=True)
+        if batch is None:
+            raise ProjectNotFound(str(batch_id))
+        if batch.state in OPEN:
+            raise ProjectConflict(
+                "The batch is still out at the provider: it is followed until it ends"
+            )
+        run = session.get(SandboxRun, batch.run_id) if batch.run_id else None
+        if run is not None and run.state in ("queued", "running", "waiting"):
+            raise ProjectConflict("The run that asked in this batch has not ended")
+        gone = {"id": str(batch.id), "batch": f"{batch.provider} {batch.model}"}
+        session.execute(delete(ModelBatchRequest).where(ModelBatchRequest.batch_id == batch.id))
+        session.delete(batch)
+        return gone
 
 
 def listing(sessions: sessionmaker[Session], limit: int = 60) -> dict[str, Any]:

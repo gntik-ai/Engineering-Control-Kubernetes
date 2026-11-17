@@ -46,8 +46,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # PR6's 0023 (one active request per decomposition lineage), 0022 (backlog
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
     # 0046 (batches of questions to a model) follows 0045 (summaries of a project's code).
-    # 0047 (the day a backlog item was done) follows it.
-    assert (head, parent) == ("0047", "0046")
+    # 0047 (the day a backlog item was done) follows it, and 0048 (deleted flows of the
+    # platform's own) follows that.
+    assert (head, parent) == ("0048", "0047")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -101,6 +102,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0048: the flows of the platform's own that were deleted.
+    assert "removed_flows" in inspect(engine).get_table_names()
+    command.downgrade(config, parent)
+    assert "removed_flows" not in inspect(engine).get_table_names()
+    parent = "0046"
     # 0047: the day a backlog item was done.
     assert "done_at" in {c["name"] for c in inspect(engine).get_columns("backlog_items")}
     command.downgrade(config, parent)

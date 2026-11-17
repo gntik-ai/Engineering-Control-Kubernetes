@@ -86,6 +86,7 @@ from engineering_control.dashboard.schemas import (
     RecordsApplyInput,
     RecordsInput,
     RunDecisionInput,
+    RunsRemoveInput,
     SavedTaskInput,
     SectionCreateInput,
     SectionFlowInput,
@@ -1626,6 +1627,29 @@ def create_app(
             entity="flow",
         )
 
+    @app.post("/api/dashboard/flows/{key}/remove")
+    async def flow_remove_api(key: str, request: Request) -> Response:
+        """Delete a flow: its versions, its draft and its evaluations. Sections that have
+        it are left without one. One of the platform's own can be put back."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_flow(key),
+            event="dashboard.flow_removed",
+            entity="flow",
+        )
+
+    @app.post("/api/dashboard/flows/{key}/put-back")
+    async def flow_put_back_api(key: str, request: Request) -> Response:
+        """Have a deleted flow of the platform's own back, as the platform made it."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).put_flow_back(key),
+            event="dashboard.flow_put_back",
+            entity="flow",
+        )
+
     @app.post("/api/dashboard/flows/{key}/publish")
     async def flow_publish_api(key: str, request: Request) -> Response:
         """Put the draft in force: every run that starts afterwards follows it. It asks
@@ -1705,6 +1729,28 @@ def create_app(
             return JSONResponse(await service(request).evaluation(evaluation_id))
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.post("/api/dashboard/evaluations/{evaluation_id}/remove")
+    async def remove_evaluation_api(evaluation_id: UUID, request: Request) -> Response:
+        """Delete an evaluation that is not under way, with the runs it made."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_evaluation(evaluation_id),
+            event="dashboard.evaluation_removed",
+            entity="evaluation",
+        )
+
+    @app.post("/api/dashboard/batches/{batch_id}/remove")
+    async def remove_batch_api(batch_id: UUID, request: Request) -> Response:
+        """Delete what is kept of a batch that has ended."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_batch(batch_id),
+            event="dashboard.batch_removed",
+            entity="batch",
+        )
 
     @app.post("/api/dashboard/evaluations/{evaluation_id}/stop")
     async def stop_evaluation_api(evaluation_id: UUID, request: Request) -> Response:
@@ -1798,6 +1844,41 @@ def create_app(
             entity="run",
         )
 
+    @app.post("/api/dashboard/runs/{run_id}/remove")
+    async def remove_run_api(run_id: UUID, request: Request) -> Response:
+        """Delete a run that has ended, with its steps and their logs."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_run(run_id),
+            event="dashboard.run_removed",
+            entity="run",
+        )
+
+    @app.post("/api/dashboard/runs/remove-ended")
+    async def remove_ended_runs_api(request: Request) -> Response:
+        """Delete every run that ended at least so many days ago, of one project or of
+        all. It needs the password again."""
+        return await project_change(
+            request,
+            RunsRemoveInput,
+            lambda body: service(request).remove_ended_runs(project=body.project, days=body.days),
+            event="dashboard.runs_removed",
+            subject="runs that have ended",
+            password=True,
+        )
+
+    @app.post("/api/dashboard/items/{item_id}/remove")
+    async def remove_item_api(item_id: UUID, request: Request) -> Response:
+        """Delete an item of the backlog."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).remove_item(item_id),
+            event="dashboard.item_removed",
+            entity="item",
+        )
+
     @app.post("/api/dashboard/runs/{run_id}/cancel")
     async def cancel_run_api(run_id: UUID, request: Request) -> Response:
         return await project_change(
@@ -1833,6 +1914,7 @@ def create_app(
                 route_to=body.route_to,
                 clear_route=body.clear_route,
                 state_to=body.state_to,
+                remove=body.remove,
             ),
             event="dashboard.items_changed_together",
             subject=name,

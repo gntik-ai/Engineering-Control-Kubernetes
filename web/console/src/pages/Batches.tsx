@@ -1,5 +1,6 @@
 import {
   Badge,
+  Button,
   Card,
   CardBody,
   CardHeader,
@@ -13,7 +14,10 @@ import {
   TableHeader,
   TableRow,
 } from '@gntik-ai/ui';
-import { apiUrl, useResource, type Batch, type Batches } from '../api';
+import { Trash2 } from '@gntik-ai/icons';
+import { useState } from 'react';
+import { apiUrl, postJson, useResource, type Batch, type Batches } from '../api';
+import { Confirm } from '../confirm';
 import { When, mono } from '../parts';
 import { BASE } from '../router';
 
@@ -43,6 +47,7 @@ function shown(batch: Batch): { label: string; tone: Tone } {
  * shown while no question was ever asked in a batch. */
 export function BatchesCard() {
   const batches = useResource<Batches>(apiUrl('batches'), 30_000);
+  const [removing, setRemoving] = useState<Batch | null>(null);
   const items = batches.data?.items ?? [];
   if (items.length === 0) return null;
   const waiting = batches.data?.out ?? 0;
@@ -67,6 +72,9 @@ export function BatchesCard() {
               <TableHead>Answered</TableHead>
               <TableHead>Handed in</TableHead>
               <TableHead>Ended, or waited for until</TableHead>
+              <TableHead>
+                <span className="sr-only">Actions</span>
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -108,11 +116,33 @@ export function BatchesCard() {
                   <TableCell>
                     <When value={batch.ended_at ?? batch.deadline_at} />
                   </TableCell>
+                  <TableCell className="text-right">
+                    {batch.state === 'ended' || batch.state === 'failed' ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={Trash2}
+                        aria-label={`Delete the batch at ${batch.provider_name}`}
+                        onClick={() => setRemoving(batch)}
+                      />
+                    ) : null}
+                  </TableCell>
                 </TableRow>
               );
             })}
           </TableBody>
         </Table>
+        {removing ? (
+          <Confirm
+            title="Delete what is kept of this batch?"
+            about="The record of the batch and its questions are deleted here. Nothing changes at the provider, and the run that asked keeps its answers."
+            action="Delete it"
+            destructive
+            run={() => postJson(`batches/${removing.id}/remove`)}
+            onClose={() => setRemoving(null)}
+            onDone={batches.reload}
+          />
+        ) : null}
       </CardBody>
     </Card>
   );

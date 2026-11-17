@@ -32,19 +32,21 @@ import {
   TabsPanel,
   TabsTab,
 } from '@gntik-ai/ui';
-import { Plus, Upload } from '@gntik-ai/icons';
+import { Plus, Trash2, Undo2, Upload } from '@gntik-ai/icons';
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
   apiUrl,
   postJson,
   useResource,
   type FlowCatalogue,
+  type FlowGone,
+  type FlowLibrary,
   type FlowListed,
   type FlowVersionShown,
-  type Listing,
   type Usage,
   type UsageRow,
 } from '../api';
+import { Confirm } from '../confirm';
 import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
 import { BASE, navigate, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
@@ -355,9 +357,19 @@ function UsageCard() {
 }
 
 export function FlowsPage() {
-  const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
+  const flows = useResource<FlowLibrary>(apiUrl('flows'));
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<FlowListed | null>(null);
+  const [gone, setGone] = useState<FlowGone | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  const removed = flows.data?.removed ?? [];
+  const putBack = (key: string) => {
+    setFailed(null);
+    postJson(`flows/${key}/put-back`)
+      .then(flows.reload)
+      .catch((error: unknown) => setFailed(error instanceof Error ? error.message : 'The request failed.'));
+  };
   const wanted = useLocation().query.get('tab');
   const tab = wanted === 'tasks' || wanted === 'agents' ? wanted : 'flows';
   return (
@@ -384,6 +396,27 @@ export function FlowsPage() {
         />
       ) : null}
       <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
+      {deleting ? (
+        <Confirm
+          title={`Delete ${deleting.name}?`}
+          about={
+            (deleting.engine
+              ? 'Its versions, its draft and the evaluations made of it are deleted. A section that has it is left without a flow, and nothing starts for that section until it is given another. Runs that followed it stay in the list of runs.'
+              : 'It is a name of the library that runs nothing here. A section that has it is left without a flow.') +
+            (deleting.engine && !deleting.engine.builtin
+              ? ' It was made here: it cannot be brought back, unless you took it out as a file.'
+              : ' It is one of the platform’s own: it can be put back, as the platform made it, from the deleted flows below.')
+          }
+          action="Delete the flow"
+          destructive
+          run={() => postJson<FlowGone>(`flows/${deleting.key}/remove`)}
+          onClose={() => setDeleting(null)}
+          onDone={(result) => {
+            setGone(result as FlowGone);
+            flows.reload();
+          }}
+        />
+      ) : null}
       <Tabs
         value={tab}
         onValueChange={(value) => setQuery({ tab: value === 'tasks' || value === 'agents' ? value : null })}
@@ -402,6 +435,19 @@ export function FlowsPage() {
         <TabsPanel value="flows" className="pt-4">
           <div className="grid gap-6">
             <LoadError resource={flows} />
+            {failed ? <Alert tone="destructive" title={failed} onDismiss={() => setFailed(null)} /> : null}
+            {gone ? (
+              <Alert
+                tone="success"
+                title={`${gone.name} was deleted`}
+                description={
+                  gone.sections.length
+                    ? `Left without a flow: ${gone.sections.map((use) => `${use.section_name} of ${use.project}`).join(', ')}. Give ${gone.sections.length === 1 ? 'it' : 'them'} another on the project’s page.`
+                    : 'No section had it.'
+                }
+                onDismiss={() => setGone(null)}
+              />
+            ) : null}
             <TableFrame>
               <Table>
                 <TableCaption className="sr-only">Flows</TableCaption>
@@ -412,10 +458,13 @@ export function FlowsPage() {
                     <TableHead>Tasks</TableHead>
                     <TableHead>Rounds</TableHead>
                     <TableHead>Changed here</TableHead>
+                    <TableHead>
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  <Rows resource={flows} columns={5} empty="There are no flows">
+                  <Rows resource={flows} columns={6} empty="There are no flows">
                     {(items) =>
                       items.map((flow) => (
                         <TableRow key={flow.key}>
@@ -467,6 +516,17 @@ export function FlowsPage() {
                               Does not run on this platform yet.
                             </TableCell>
                           )}
+                          <TableCell className="text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              icon={Trash2}
+                              aria-label={`Delete ${flow.name}`}
+                              onClick={() => setDeleting(flow)}
+                            >
+                              Delete
+                            </Button>
+                          </TableCell>
                         </TableRow>
                       ))
                     }
@@ -474,6 +534,53 @@ export function FlowsPage() {
                 </TableBody>
               </Table>
             </TableFrame>
+            {removed.length ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Deleted flows of the platform</CardTitle>
+                </CardHeader>
+                <CardBody className="grid gap-3">
+                  <p className="text-[13px] text-muted-foreground">
+                    Nothing lists these, assigns them or starts them. Putting one back brings it back as the platform
+                    made it; the versions you made of it went with it.
+                  </p>
+                  <TableFrame>
+                    <Table>
+                      <TableCaption className="sr-only">Deleted flows of the platform</TableCaption>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Flow</TableHead>
+                          <TableHead>
+                            <span className="sr-only">Actions</span>
+                          </TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {removed.map((flow) => (
+                          <TableRow key={flow.key}>
+                            <TableCell className="max-w-xl">
+                              <span className="font-medium">{flow.name}</span>
+                              <div className="text-[12px] text-muted-foreground">{flow.summary}</div>
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                icon={Undo2}
+                                aria-label={`Put ${flow.name} back`}
+                                onClick={() => putBack(flow.key)}
+                              >
+                                Put back
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableFrame>
+                </CardBody>
+              </Card>
+            ) : null}
             <UsageCard />
           </div>
         </TabsPanel>

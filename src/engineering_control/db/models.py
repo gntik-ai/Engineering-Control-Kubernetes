@@ -878,6 +878,17 @@ class AgentRecord(UUIDPrimaryKey, Timestamps, Base):
     skills: Mapped[list[str]] = mapped_column(JSON)
 
 
+class RemovedFlow(UUIDPrimaryKey, Timestamps, Base):
+    """A flow the platform knows from the start that the administrator deleted (migration
+    0048): one of the platform's own, or a name of the library. The platform's own are in
+    its code, so what is kept is that the flow is not wanted: nothing lists it, assigns
+    it or starts it until it is put back. A run that followed it still shows what it
+    followed."""
+
+    __tablename__ = "removed_flows"
+    flow_key: Mapped[str] = mapped_column(String(64), unique=True)
+
+
 class HiddenTask(UUIDPrimaryKey, Timestamps, Base):
     """A kind of task of the platform's own that is not offered in the designer's list
     (migration 0040). Nothing else changes for it: a flow that has one keeps it."""

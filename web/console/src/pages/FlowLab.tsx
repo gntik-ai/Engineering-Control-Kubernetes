@@ -20,7 +20,7 @@ import {
   TableHeader,
   TableRow,
 } from '@gntik-ai/ui';
-import { CircleSlash, Play } from '@gntik-ai/icons';
+import { CircleSlash, Play, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useMemo, useState } from 'react';
 import {
   apiUrl,
@@ -34,6 +34,7 @@ import {
   type Measured,
   type Simulation,
 } from '../api';
+import { Confirm } from '../confirm';
 import { LoadError, TableFrame, When, mono } from '../parts';
 import { BASE } from '../router';
 import { minutes, tokens, versionName } from './Flows';
@@ -359,6 +360,7 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
     () => postJson(`evaluations/${row.id}/stop`),
     () => (detail.reload(), onChanged()),
   );
+  const [removing, setRemoving] = useState(false);
   const shown = detail.data ?? row;
   const { baseline, candidate } = shown.totals;
   // Tried on the runs of another flow: two ways of doing the same work, side by side.
@@ -401,8 +403,28 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
             <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(!open)}>
               {open ? 'Hide the cases' : 'Show the cases'}
             </Button>
+            {shown.state !== 'running' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={Trash2}
+                aria-label={`Delete the evaluation of ${versionName(shown.candidate_version)}`}
+                onClick={() => setRemoving(true)}
+              />
+            ) : null}
           </span>
         </div>
+        {removing ? (
+          <Confirm
+            title="Delete this evaluation?"
+            about="The evaluation is deleted with its cases and the runs it made to try the version. The past runs it was compared with stay."
+            action="Delete the evaluation"
+            destructive
+            run={() => postJson(`evaluations/${row.id}/remove`)}
+            onClose={() => setRemoving(false)}
+            onDone={onChanged}
+          />
+        ) : null}
         {stop.problem ? <Alert tone="destructive" title={stop.problem} /> : null}
         {candidate.cases ? (
           <p className="text-[13px]">

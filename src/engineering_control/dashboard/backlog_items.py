@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
@@ -26,7 +26,14 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.dashboard.project_sections import SECTION_KEY
-from engineering_control.db.models import BacklogItem, BacklogSync, ProjectRecord, ProjectSection
+from engineering_control.db.models import (
+    BacklogItem,
+    BacklogSync,
+    ProjectRecord,
+    ProjectSection,
+    SandboxRun,
+    WorkQueueEntry,
+)
 from engineering_control.engine.library import plan_for_item
 from engineering_control.github_app import Issue
 
@@ -126,6 +133,32 @@ def serialize(
     }
 
 
+def _at_work(session: Session, item_ids: list[UUID]) -> set[UUID]:
+    """Of those items, the ones a run that has not ended is working on."""
+    busy: set[UUID] = set()
+    for start in range(0, len(item_ids), 500):
+        busy.update(
+            found
+            for found in session.scalars(
+                select(SandboxRun.item_id).where(
+                    SandboxRun.item_id.in_(item_ids[start : start + 500]),
+                    SandboxRun.state.in_(("queued", "running", "waiting")),
+                )
+            )
+            if found is not None
+        )
+    return busy
+
+
+def _delete(session: Session, item_ids: list[UUID]) -> None:
+    """Delete those items with their places in queues. Their runs stay, without them."""
+    for start in range(0, len(item_ids), 500):
+        some = item_ids[start : start + 500]
+        session.execute(delete(WorkQueueEntry).where(WorkQueueEntry.item_id.in_(some)))
+        session.execute(update(SandboxRun).where(SandboxRun.item_id.in_(some)).values(item_id=None))
+        session.execute(delete(BacklogItem).where(BacklogItem.id.in_(some)))
+
+
 class BacklogItems:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -210,14 +243,18 @@ class BacklogItems:
         route_to: str | None = None,
         clear_route: bool = False,
         state_to: str | None = None,
+        remove: bool = False,
     ) -> dict[str, Any]:
-        """One change to every item of ``project`` the filters match.
+        """One change to every item of ``project`` the filters match: another section,
+        another state, or the items deleted.
 
         ``expected`` is the number of items the administrator was shown. If the filters
         match another number by now, nothing is changed: they decide again on what is there.
         """
-        if (route_to is not None) + clear_route + (state_to is not None) != 1:
-            raise ProjectInvalid("Choose exactly one change: a section, no section, or a state")
+        if (route_to is not None) + clear_route + (state_to is not None) + remove != 1:
+            raise ProjectInvalid(
+                "Choose exactly one change: a section, no section, a state, or deleting them"
+            )
         if state_to is not None and state_to not in STATES:
             raise ProjectInvalid("That is not a state an item can have")
         with self.sessions() as session:
@@ -238,6 +275,13 @@ class BacklogItems:
                     "list again before changing them"
                 )
             changed = unchanged = 0
+            if remove:
+                # An item a run is working on stays, with its run.
+                busy = _at_work(session, [item.id for item, _record, _section in rows])
+                gone = [item.id for item, _record, _section in rows if item.id not in busy]
+                _delete(session, gone)
+                session.commit()
+                return {"project": record.name, "changed": len(gone), "unchanged": len(busy)}
             for item, _record, _section in rows:
                 if state_to is not None:
                     if state_to in OPEN_STATES and item.issue_state == "closed":
@@ -258,6 +302,26 @@ class BacklogItems:
                 changed += 1
             session.commit()
             return {"project": record.name, "changed": changed, "unchanged": unchanged}
+
+    def remove(self, item_id: UUID) -> dict[str, Any]:
+        """Delete an item: it leaves the backlog and every queue it is in. The runs that
+        worked on it stay in the list of runs. An item that is an issue still open on
+        GitHub comes back the next time the backlog is brought in step."""
+        with self.sessions.begin() as session:
+            item, record = self._item(session, item_id)
+            if _at_work(session, [item.id]):
+                raise ProjectConflict(
+                    "A run of the item has not ended: stop it or wait, then delete the item"
+                )
+            gone = {
+                "id": str(item.id),
+                "item": item.title,
+                "title": item.title,
+                "project": record.name,
+                "returns": item.source == "github" and item.issue_state == "open",
+            }
+            _delete(session, [item.id])
+            return gone
 
     def project_of(self, item_id: UUID) -> str | None:
         """The name of the project an item belongs to."""

@@ -1487,10 +1487,10 @@ tables, each with the flows that use a task (a flow as it stands: its draft when
 one, with the names the task has there).
 
 **The platform's tasks** are the kinds of task the platform has. They are code: they
-hold the rules every flow keeps and the credentials no agent is given, so they are not
-changed or removed in the console. One that is not used can be left out of the
-designer's list with its switch; a flow that has it keeps it, and it can be offered
-again at any time.
+hold the rules every flow keeps and the credentials no agent is given, so what they do
+is not changed in the console. One that is not wanted is deleted with **Delete**: it
+leaves this list and the designer's, a flow that has it keeps it, and it is listed
+under **Deleted tasks of the platform**, where **Put back** offers it again.
 
 **Your tasks** are tasks of the administrator's own: one of the platform's kinds with
 its settings filled in (subscriptions, model and reasoning, minutes, and for an agent's
@@ -1688,6 +1688,38 @@ in chat; one that can change code or publish is saved as the flow's draft and is
 force on the Flows page with the password, like any draft. The supervisor never writes
 over a draft that is being worked on, and proposing the same flow again replaces its
 earlier proposal.
+
+## Deleting what is not wanted
+
+Everything the console lists can be deleted there. Each deletion asks once, says what
+goes with it, and is written to the record of changes. What is still at work is never
+deleted: it is stopped first.
+
+| What | Where | What goes, and what stays |
+| --- | --- | --- |
+| A flow | Flows, and the flow's own page | Its versions, its draft and the evaluations made of it go. A section that has it is left without a flow. Runs that followed it stay. Refused while a run that follows it has not ended, and while another flow runs it as a part. |
+| A task of the platform's own | Flows, Tasks | It leaves the list and the designer. A flow that has it keeps it. |
+| A task, an agent, a skill of your own | Flows, Tasks and Agents | The flows made with it keep what they have. |
+| An item of the backlog | Backlog, the item's menu; many at once from the page's menu, with the password | It leaves the backlog and the queues it is in. Its runs stay. An item a run is working on is kept. |
+| A run | Runs, and the run's own page; all that ended, with the password | Its steps, their logs and the batches it asked in go, and what it used no longer counts in the totals or on the dashboard. A pull request, a branch and the items it proposed stay. Only a run that has ended. |
+| An evaluation | The flow's Lab | Its cases and the runs it made go; the past runs it was compared with stay. Not while it is under way. |
+| A batch | Runs, Batches | What is kept of it here goes; nothing changes at the provider. Only one that has ended, of a run that has ended. |
+| A queue, a trigger, a section, an account, a project | Their own pages, as before | |
+
+**A flow of the platform's own** (Deliver issue, Audit code, Discover enhancements,
+Code clean, UI audit, UX audit) is in the platform's code, and so are the names of the
+library that run nothing yet. Deleting one keeps it out (`removed_flows`, migration
+0048): nothing lists it, a section cannot be given it, nothing starts by it, and no
+flow can be made under its key. It is listed under **Deleted flows of the platform**
+on the Flows page, where **Put back** brings it back as the platform made it; the
+versions made of it here went with it and do not come back. A flow made here does not
+come back at all: take it out as a file first to keep it.
+
+Deleting **Deliver issue** also means that the items produced by an audit or a search
+for enhancements cannot be delivered, because that is the flow they are delivered by.
+
+**An item that is an issue still open on GitHub** comes back the next time the
+backlog is brought in step with GitHub. To keep such an item out, skip it instead.
 
 ## Moving a project's work here
 

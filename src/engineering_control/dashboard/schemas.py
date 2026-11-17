@@ -173,10 +173,21 @@ class ItemBulkInput(DashboardModel):
     search: str | None = Field(default=None, max_length=200)
     # How many items the administrator was shown.
     expected: int = Field(ge=1, le=5000)
-    # Exactly one of the three.
+    # Exactly one of the four.
     route_to: str | None = Field(default=None, max_length=40)
     clear_route: bool = False
     state_to: str | None = Field(default=None, pattern=r"^(proposed|accepted|skipped|done)$")
+    remove: bool = False
+
+
+class RunsRemoveInput(DashboardModel):
+    """Delete the runs that ended at least ``days`` days ago. It needs the password
+    again."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    project: str | None = Field(default=None, max_length=64)
+    days: int = Field(default=0, ge=0, le=3650)
 
 
 class BacklogSyncInput(DashboardModel):

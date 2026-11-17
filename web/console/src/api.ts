@@ -58,6 +58,31 @@ export interface FlowListed extends Flow {
   engine: FlowEngine | null;
 }
 
+/** A flow the platform knows from the start that was deleted; it can be put back. */
+export interface FlowRemoved {
+  key: string;
+  name: string;
+  summary: string;
+  /** Whether it is a flow that runs here, or only a name of the library. */
+  runs: boolean;
+}
+
+/** The library of flows, and the platform's own that were deleted. */
+export interface FlowLibrary extends Listing<FlowListed> {
+  removed?: FlowRemoved[];
+}
+
+/** What deleting a flow did. */
+export interface FlowGone {
+  key: string;
+  name: string;
+  builtin: boolean;
+  versions: number;
+  evaluations: number;
+  /** The sections that had it and are left without a flow. */
+  sections: { project: string; section: string; section_name: string }[];
+}
+
 /** One setting of a task. */
 export interface TaskParam {
   name: string;

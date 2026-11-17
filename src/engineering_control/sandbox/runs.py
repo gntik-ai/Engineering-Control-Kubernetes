@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
@@ -26,14 +26,19 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import (
     BacklogItem,
     Budget,
+    EvaluationCase,
     FlowVersion,
     ModelBatch,
+    ModelBatchRequest,
     ProjectRecord,
     ProjectSection,
     ProviderAccount,
     SandboxRun,
     SandboxStep,
+    SupervisorAction,
     SupervisorDefinition,
+    SupervisorMessage,
+    WorkQueueEntry,
 )
 from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN, COMMANDS_CHECK, FLOW_OF_KIND, kind_of
@@ -211,6 +216,23 @@ def _run_row(run: SandboxRun) -> dict[str, Any]:
         "finished_at": _when(run.finished_at),
         "run": run.title,
     }
+
+
+def delete_runs(session: Session, run_ids: list[UUID]) -> None:
+    """Delete those runs with what belongs to them alone: steps, logs, batches. What
+    only points at a run is kept, without it."""
+    for start in range(0, len(run_ids), 500):
+        some = run_ids[start : start + 500]
+        batches = list(session.scalars(select(ModelBatch.id).where(ModelBatch.run_id.in_(some))))
+        if batches:
+            session.execute(
+                delete(ModelBatchRequest).where(ModelBatchRequest.batch_id.in_(batches))
+            )
+            session.execute(delete(ModelBatch).where(ModelBatch.id.in_(batches)))
+        for table in (WorkQueueEntry, SupervisorMessage, SupervisorAction, EvaluationCase):
+            session.execute(update(table).where(table.run_id.in_(some)).values(run_id=None))
+        session.execute(delete(SandboxStep).where(SandboxStep.run_id.in_(some)))
+        session.execute(delete(SandboxRun).where(SandboxRun.id.in_(some)))
 
 
 def _shown_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -766,6 +788,40 @@ class Runs:
             if key in BUILTIN:
                 return {"key": key, "version": 0, "document": BUILTIN[key].as_dict()}
             raise ProjectNotFound(str(run_id))
+
+    def remove(self, run_id: UUID) -> dict[str, Any]:
+        """Delete a run that has ended, with its steps, their logs and the batches it
+        asked in. What it used no longer counts in any total. What it left outside the
+        platform stays: a pull request, a branch, the items it proposed."""
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(SandboxRun).where(SandboxRun.id == run_id).with_for_update()
+            )
+            if run is None or run.kind == CONVERSATION:
+                raise ProjectNotFound(str(run_id))
+            if run.state not in FINISHED:
+                raise ProjectConflict("The run has not ended: stop it first, then delete it")
+            gone = _run_row(run)
+            delete_runs(session, [run.id])
+            return gone
+
+    def remove_ended(self, *, project: str | None = None, days: int = 0) -> dict[str, Any]:
+        """Delete every run that ended at least ``days`` days ago, of one project or of
+        all. Returns how many went."""
+        before = datetime.now(UTC) - timedelta(days=max(0, min(days, 3650)))
+        query = select(SandboxRun.id).where(
+            SandboxRun.kind != CONVERSATION,
+            SandboxRun.state.in_(FINISHED),
+            func.coalesce(SandboxRun.finished_at, SandboxRun.updated_at) <= before,
+        )
+        if project is not None:
+            query = query.join(ProjectRecord, SandboxRun.project_id == ProjectRecord.id).where(
+                ProjectRecord.name == project
+            )
+        with self.sessions.begin() as session:
+            run_ids = list(session.scalars(query))
+            delete_runs(session, run_ids)
+        return {"removed": len(run_ids), "project": project, "days": days}
 
     def request_cancel(self, run_id: UUID) -> dict[str, Any]:
         with self.sessions.begin() as session:

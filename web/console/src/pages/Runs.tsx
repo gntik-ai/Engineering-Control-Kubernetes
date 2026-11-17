@@ -19,6 +19,7 @@ import {
   Link,
   Page,
   PasswordInput,
+  SimpleSelect,
   Table,
   TableBody,
   TableCaption,
@@ -30,9 +31,10 @@ import {
 import { ArrowLeft, Bot, CircleSlash, GitBranch, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, type RunStep } from '../api';
+import { Confirm } from '../confirm';
 import { LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BatchesCard } from './Batches';
-import { BASE, RouterLink, setQuery, useLocation } from '../router';
+import { BASE, RouterLink, navigate, setQuery, useLocation } from '../router';
 import { API_PROVIDER_NAMES } from './FlowParts';
 import { minutes, tokens, versionName } from './Flows';
 import { RunGraph } from './RunGraph';
@@ -136,6 +138,11 @@ export function RunState({ run }: { run: Pick<Run, 'state'> }) {
   );
 }
 
+/** The states of a run that has ended: only such a run can be deleted. */
+const ENDED: Run['state'][] = ['succeeded', 'failed', 'cancelled'];
+const ABOUT_DELETING =
+  'What it used no longer counts in the totals and on the dashboard. What it left outside the platform stays: a pull request, a branch, the items it proposed.';
+
 const active = (run: Pick<Run, 'state'> | null | undefined) =>
   run?.state === 'queued' || run?.state === 'running';
 
@@ -145,17 +152,82 @@ export function RunsPage() {
   const runs = useResource<Listing<Run>>(apiUrl('runs', { project }), busy ? 5_000 : 30_000);
   const any = runs.data?.items.some(active) ?? false;
   useEffect(() => setBusy(any), [any]);
+  const [removing, setRemoving] = useState<Run | null>(null);
+  const [sweeping, setSweeping] = useState(false);
+  const [age, setAge] = useState('30');
+  const [notice, setNotice] = useState<string | null>(null);
+  const ended = runs.data?.items.some((run) => ENDED.includes(run.state)) ?? false;
   return (
     <Page
       title="Runs"
       description="Work done in sandboxes: every run with what it is doing or how it ended."
-      actions={<RefreshButton resource={runs} />}
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton resource={runs} />
+          <Button variant="secondary" size="sm" icon={Trash2} disabled={!ended} onClick={() => setSweeping(true)}>
+            Delete ended runs
+          </Button>
+        </div>
+      }
     >
+      {removing ? (
+        <Confirm
+          title={`Delete the run ${removing.title}?`}
+          about={ABOUT_DELETING}
+          action="Delete the run"
+          destructive
+          run={() => postJson(`runs/${removing.id}/remove`)}
+          onClose={() => setRemoving(null)}
+          onDone={() => {
+            setNotice(`The run ${removing.title} was deleted.`);
+            runs.reload();
+          }}
+        />
+      ) : null}
+      {sweeping ? (
+        <Confirm
+          title={project ? `Delete the ended runs of ${project}?` : 'Delete the ended runs of every project?'}
+          about={`Every run that has ended, as long ago as you choose, is deleted with its steps and logs. ${ABOUT_DELETING} Runs that are queued, running or waiting for you stay.`}
+          action="Delete them"
+          destructive
+          password
+          run={(password) =>
+            postJson<{ removed: number }>('runs/remove-ended', {
+              current_password: password,
+              project,
+              days: Number(age),
+            })
+          }
+          onClose={() => setSweeping(false)}
+          onDone={(result) => {
+            const count = (result as { removed: number }).removed;
+            setNotice(count ? `${count.toLocaleString('en')} ${count === 1 ? 'run was' : 'runs were'} deleted.` : 'No run had ended that long ago.');
+            runs.reload();
+          }}
+        >
+          <Field>
+            <FieldLabel>Which ones</FieldLabel>
+            <SimpleSelect
+              aria-label="Which ended runs"
+              className="w-full"
+              items={[
+                { value: '0', label: 'All that have ended' },
+                { value: '7', label: 'Ended more than 7 days ago' },
+                { value: '30', label: 'Ended more than 30 days ago' },
+                { value: '90', label: 'Ended more than 90 days ago' },
+              ]}
+              value={age}
+              onValueChange={(next) => setAge(next ?? '30')}
+            />
+          </Field>
+        </Confirm>
+      ) : null}
       <div className="grid gap-4">
         <div className="flex flex-wrap items-center gap-2">
           <ProjectFilter value={project} onChange={(value) => setQuery({ project: value })} />
         </div>
         <LoadError resource={runs} />
+        {notice ? <Alert tone="success" title={notice} onDismiss={() => setNotice(null)} /> : null}
         {runs.data?.items.length === 0 ? (
           <EmptyState
             icon={Bot}
@@ -173,10 +245,13 @@ export function RunsPage() {
                   <TableHead>State</TableHead>
                   <TableHead>What happened</TableHead>
                   <TableHead>Started</TableHead>
+                  <TableHead>
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <Rows resource={runs} columns={5} empty="Nothing has run yet">
+                <Rows resource={runs} columns={6} empty="Nothing has run yet">
                   {(items) =>
                     items.map((run) => (
                       <TableRow key={run.id}>
@@ -193,6 +268,17 @@ export function RunsPage() {
                         <TableCell className="max-w-md text-[13px] text-muted-foreground">{run.detail ?? '—'}</TableCell>
                         <TableCell>
                           <When value={run.started_at ?? run.created_at} />
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {ENDED.includes(run.state) ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              icon={Trash2}
+                              aria-label={`Delete the run ${run.title}`}
+                              onClick={() => setRemoving(run)}
+                            />
+                          ) : null}
                         </TableCell>
                       </TableRow>
                     ))
@@ -539,6 +625,7 @@ function RunDetail({ id }: { id: string }) {
   useEffect(() => setBusy(running), [running]);
   const [decision, setDecision] = useState<'publish' | 'discard' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
   const stop = () => {
     postJson<Run>(`runs/${id}/cancel`)
       .then(resource.reload)
@@ -566,6 +653,22 @@ function RunDetail({ id }: { id: string }) {
             <Button variant="secondary" size="sm" icon={CircleSlash} onClick={stop}>
               Stop
             </Button>
+          ) : null}
+          {run && ENDED.includes(run.state) ? (
+            <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setRemoving(true)}>
+              Delete the run
+            </Button>
+          ) : null}
+          {run && removing ? (
+            <Confirm
+              title={`Delete the run ${run.title}?`}
+              about={`It is deleted with its steps and their logs. ${ABOUT_DELETING}`}
+              action="Delete the run"
+              destructive
+              run={() => postJson(`runs/${id}/remove`)}
+              onClose={() => setRemoving(false)}
+              onDone={() => navigate(`${BASE}/runs`)}
+            />
           ) : null}
           {run?.state === 'waiting' ? (
             <>

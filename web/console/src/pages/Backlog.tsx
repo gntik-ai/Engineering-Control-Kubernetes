@@ -43,6 +43,7 @@ import {
   RefreshCw,
   Route,
   RotateCcw,
+  Trash2,
 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
@@ -57,6 +58,7 @@ import {
   type SyncResult,
   type WorkItem,
 } from '../api';
+import { Confirm } from '../confirm';
 import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BASE, navigate, setQuery, useLocation } from '../router';
 import { ItemBadges, ItemDialog } from './ItemDialog';
@@ -179,7 +181,7 @@ function AddItemDialog({
   );
 }
 
-type BulkChange = { kind: 'route' } | { kind: 'state'; state: 'accepted' | 'skipped' };
+type BulkChange = { kind: 'route' } | { kind: 'state'; state: 'accepted' | 'skipped' } | { kind: 'remove' };
 
 /**
  * One change to every item the page's filters match. It says how many, and asks for the
@@ -220,7 +222,9 @@ function BulkDialog({
       ? change.state === 'accepted'
         ? `Accept ${items}`
         : `Skip ${items}`
-      : `Route ${items}`;
+      : change?.kind === 'remove'
+        ? `Delete ${items}`
+        : `Route ${items}`;
   const ready = password !== '' && (change?.kind !== 'route' || target !== '');
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -236,12 +240,16 @@ function BulkDialog({
         expected: total,
         ...(change.kind === 'state'
           ? { state_to: change.state }
-          : target === NO_SECTION
+          : change.kind === 'remove'
+            ? { remove: true }
+            : target === NO_SECTION
             ? { clear_route: true }
             : { route_to: target }),
       });
       onDone(
-        `${result.changed.toLocaleString('en')} changed${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} left as they were` : ''}.`,
+        change.kind === 'remove'
+          ? `${result.changed.toLocaleString('en')} deleted${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} kept: a run is working on them` : ''}.`
+          : `${result.changed.toLocaleString('en')} changed${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} left as they were` : ''}.`,
       );
       onOpenChange(false);
     } catch (error) {
@@ -257,8 +265,9 @@ function BulkDialog({
           <DialogHeader>
             <DialogTitle>{what}</DialogTitle>
             <DialogDescription>
-              This changes every item of {project} that the filters on the page match now: {items}. Items outside
-              the filters are not touched.
+              {change?.kind === 'remove'
+                ? `This deletes every item of ${project} that the filters on the page match now: ${items}. They leave the backlog and the queues they are in; the runs that worked on them stay. An item a run is working on is kept. An issue that is still open on GitHub comes back the next time the backlog is brought in step: skip those instead to keep them out.`
+                : `This changes every item of ${project} that the filters on the page match now: ${items}. Items outside the filters are not touched.`}
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
@@ -297,7 +306,12 @@ function BulkDialog({
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" loading={pending} disabled={!ready}>
+            <Button
+              type="submit"
+              variant={change?.kind === 'remove' ? 'destructive' : 'primary'}
+              loading={pending}
+              disabled={!ready}
+            >
               {what}
             </Button>
           </DialogFooter>
@@ -359,6 +373,7 @@ function ItemRow({
   selected,
   onSelect,
   onOpen,
+  onRemove,
   onChanged,
   onProblem,
 }: {
@@ -369,6 +384,7 @@ function ItemRow({
   selected?: boolean;
   onSelect?: (selected: boolean) => void;
   onOpen: () => void;
+  onRemove: () => void;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
@@ -415,6 +431,7 @@ function ItemRow({
       ? { label: 'Back to proposed', icon: RotateCcw, onSelect: () => void change('state', { state: 'proposed' }) }
       : null,
     item.state !== 'done' ? { label: 'Mark done', icon: Check, onSelect: () => void change('state', { state: 'done' }) } : null,
+    runActive ? null : { label: 'Delete', icon: Trash2, destructive: true, onSelect: onRemove },
   ].filter((action) => action !== null);
   return (
     <TableRow>
@@ -523,6 +540,7 @@ export function BacklogPage() {
   const [draft, setDraft] = useState(search);
   const [adding, setAdding] = useState(false);
   const [bulk, setBulk] = useState<BulkChange | null>(null);
+  const [removing, setRemoving] = useState<WorkItem | null>(null);
   // The items chosen for a queue. They are of one project, so a change of project clears them.
   const [selection, setSelection] = useState<string[]>([]);
   const [queueing, setQueueing] = useState(false);
@@ -582,6 +600,12 @@ export function BacklogPage() {
                   label: `Skip all ${total.toLocaleString('en')}…`,
                   icon: CircleSlash,
                   onSelect: () => setBulk({ kind: 'state', state: 'skipped' }),
+                },
+                {
+                  label: `Delete all ${total.toLocaleString('en')}…`,
+                  icon: Trash2,
+                  destructive: true,
+                  onSelect: () => setBulk({ kind: 'remove' }),
                 },
               ]}
             />
@@ -683,6 +707,7 @@ export function BacklogPage() {
                           : undefined
                       }
                       onOpen={() => setQuery({ item: item.id })}
+                      onRemove={() => setRemoving(item)}
                       onChanged={backlog.reload}
                       onProblem={setProblem}
                     />
@@ -705,6 +730,27 @@ export function BacklogPage() {
         onOpenChange={(open) => (open ? null : setQuery({ item: null }))}
         onChanged={backlog.reload}
       />
+      {removing ? (
+        <Confirm
+          title={`Delete ${removing.title}?`}
+          about={
+            'It leaves the backlog and every queue it is in. The runs that worked on it stay in the list of runs.' +
+            (removing.issue_number && removing.issue_state !== 'closed'
+              ? ' Its issue is still open on GitHub, so it comes back the next time the backlog is brought in step: skip it instead to keep it out.'
+              : '')
+          }
+          action="Delete the item"
+          destructive
+          run={() => postJson(`items/${removing.id}/remove`)}
+          onClose={() => setRemoving(null)}
+          onDone={() => {
+            setSelection((previous) => previous.filter((id) => id !== removing.id));
+            setNotice(`${removing.title} was deleted.`);
+            setProblem(null);
+            backlog.reload();
+          }}
+        />
+      ) : null}
       {project ? <QueueDialog project={project} items={selection} open={queueing} onOpenChange={setQueueing} /> : null}
       {project && sections ? (
         <>

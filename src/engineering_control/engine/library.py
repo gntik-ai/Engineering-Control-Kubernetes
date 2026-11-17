@@ -14,7 +14,7 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from engineering_control.db.models import FlowVersion
+from engineering_control.db.models import FlowVersion, RemovedFlow
 from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS
@@ -25,6 +25,15 @@ from engineering_control.flow_library import FLOWS
 DELIVERY: Final = "deliver-issue"
 # What a run started for a section is called, before what it looks at.
 _SECTION_WORDS: Final = {"audit-code": "Audit", "discover-enhancements": "Enhancements"}
+
+
+def is_removed(session: Session, key: str) -> bool:
+    """Whether that flow of the platform's was deleted by the administrator."""
+    return session.scalar(select(RemovedFlow.id).where(RemovedFlow.flow_key == key)) is not None
+
+
+def removed_keys(session: Session) -> set[str]:
+    return set(session.scalars(select(RemovedFlow.flow_key)))
 
 
 def document_in_force(session: Session, key: str) -> tuple[Document, int] | None:
@@ -42,7 +51,7 @@ def document_in_force(session: Session, key: str) -> tuple[Document, int] | None
             return None
         # A part runs only inside the flows that run it: for a section it is no flow.
         return None if found.part else (found, row.version)
-    if key in BUILTIN:
+    if key in BUILTIN and not is_removed(session, key):
         return BUILTIN[key], 0
     return None
 
@@ -76,7 +85,7 @@ def describe(session: Session, key: str | None) -> dict[str, Any] | None:
     found = document_in_force(session, key)
     if found is None:
         named = FLOWS.get(key)
-        return named.as_dict() if named is not None else None
+        return named.as_dict() if named is not None and not is_removed(session, key) else None
     document, version = found
     return {
         "key": key,

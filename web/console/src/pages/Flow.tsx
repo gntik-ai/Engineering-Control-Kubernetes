@@ -47,8 +47,9 @@ import {
   type FlowVersionShown,
   type PromptShown,
 } from '../api';
+import { Confirm } from '../confirm';
 import { LoadError, TableFrame, When, mono } from '../parts';
-import { BASE, RouterLink, setQuery, useLocation } from '../router';
+import { BASE, RouterLink, navigate, setQuery, useLocation } from '../router';
 import { Designer } from './FlowDesigner';
 import { EvaluationLab, TryOnPaper } from './FlowLab';
 import { Setting, WHERE, copy, same, settingName } from './FlowParts';
@@ -532,6 +533,7 @@ function Editor({
     () => reload(),
   );
   const discard = useSubmit(() => postJson(`flows/${flowKey}/draft/discard`), reload);
+  const [deleting, setDeleting] = useState(false);
   const open = (version: number) => {
     setProblem(null);
     fetch(apiUrl(`flows/${flowKey}/versions/${version}`), {
@@ -582,6 +584,28 @@ function Editor({
             >
               Take it out as a file
             </Button>
+          ) : null}
+          <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setDeleting(true)}>
+            Delete the flow
+          </Button>
+          {deleting ? (
+            <Confirm
+              title={`Delete ${saved.document.name}?`}
+              about={
+                'Its versions, its draft and the evaluations made of it are deleted. Runs that followed it stay in the list of runs.' +
+                (detail.used_by.length
+                  ? ` Left without a flow: ${detail.used_by.map((use) => `${use.section_name} of ${use.project_name}`).join(', ')}.`
+                  : ' No section has it.') +
+                (detail.builtin
+                  ? ' It is one of the platform’s own: it can be put back, as the platform made it, from the deleted flows on the Flows page.'
+                  : ' It was made here: it cannot be brought back, unless you took it out as a file.')
+              }
+              action="Delete the flow"
+              destructive
+              run={() => postJson(`flows/${flowKey}/remove`)}
+              onClose={() => setDeleting(false)}
+              onDone={() => navigate(`${BASE}/flows`)}
+            />
           ) : null}
         </div>
       }

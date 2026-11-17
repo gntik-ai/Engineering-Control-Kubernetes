@@ -1,12 +1,5 @@
 import {
   Alert,
-  AlertDialog,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Badge,
   Button,
   Card,
@@ -26,7 +19,6 @@ import {
   Input,
   Link,
   SimpleSelect,
-  Switch,
   Table,
   TableBody,
   TableCaption,
@@ -36,7 +28,7 @@ import {
   TableRow,
   Textarea,
 } from '@gntik-ai/ui';
-import { Copy, Pencil, Plus, RefreshCw, Trash2 } from '@gntik-ai/icons';
+import { Copy, Pencil, Plus, RefreshCw, Trash2, Undo2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -51,6 +43,7 @@ import {
   type TaskType,
   type TaskUse,
 } from '../api';
+import { Confirm } from '../confirm';
 import { LoadError, TableFrame, mono } from '../parts';
 import { BASE } from '../router';
 import { Setting, WHERE } from './FlowParts';
@@ -258,57 +251,6 @@ function TaskDialog({
   );
 }
 
-/** One question before something that reaches further than the row it is asked on. */
-function Confirm({
-  title,
-  about,
-  action,
-  destructive = false,
-  run,
-  onClose,
-  onDone,
-}: {
-  title: string;
-  about: string;
-  action: string;
-  destructive?: boolean;
-  run: () => Promise<unknown>;
-  onClose: () => void;
-  onDone: (result: unknown) => void;
-}) {
-  const [result, setResult] = useState<{ value: unknown } | null>(null);
-  const go = useSubmit(
-    async () => setResult({ value: await run() }),
-    () => undefined,
-  );
-  useEffect(() => {
-    if (!result) return;
-    onDone(result.value);
-    onClose();
-  }, [result]);
-  return (
-    <AlertDialog open onOpenChange={(open) => (open ? undefined : onClose())}>
-      <AlertDialogContent>
-        <AlertDialogHeader tone={destructive ? 'destructive' : undefined}>
-          <AlertDialogTitle>{title}</AlertDialogTitle>
-          <AlertDialogDescription>{about}</AlertDialogDescription>
-        </AlertDialogHeader>
-        {go.problem ? <Alert tone="destructive" title={go.problem} /> : null}
-        <AlertDialogFooter>
-          <AlertDialogCancel>Not now</AlertDialogCancel>
-          <Button
-            variant={destructive ? 'destructive' : 'primary'}
-            loading={go.pending}
-            onClick={() => void go.submit()}
-          >
-            {action}
-          </Button>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  );
-}
-
 const flowsOf = (uses: TaskUse[]) => uses.map((use) => use.name).join(', ');
 
 export function TasksTab() {
@@ -317,6 +259,7 @@ export function TasksTab() {
   const [editing, setEditing] = useState<Editing | null>(null);
   const [removing, setRemoving] = useState<Mine | null>(null);
   const [applying, setApplying] = useState<Mine | null>(null);
+  const [deleting, setDeleting] = useState<Kind | null>(null);
   const [applied, setApplied] = useState<TaskApplied | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const reload = () => {
@@ -342,7 +285,11 @@ export function TasksTab() {
       .then(reload)
       .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The request failed.'));
   };
-  const groups = [...new Set(kinds.map((kind) => kind.group))];
+  // The platform's tasks that were deleted are listed apart, where they can be put back.
+  // One that is not offered any more is listed only while a flow still has it.
+  const kept = kinds.filter((kind) => (kind.retired ? kind.used_by.length > 0 : !kind.hidden));
+  const deleted = kinds.filter((kind) => kind.hidden && !kind.retired);
+  const groups = [...new Set(kept.map((kind) => kind.group))];
   return (
     <div className="grid gap-6">
       <LoadError resource={library} />
@@ -388,6 +335,22 @@ export function TasksTab() {
           destructive
           run={() => postJson(`tasks/${removing.id}/remove`)}
           onClose={() => setRemoving(null)}
+          onDone={reload}
+        />
+      ) : null}
+      {deleting ? (
+        <Confirm
+          title={`Delete ${deleting.title}?`}
+          about={
+            (deleting.used_by.length
+              ? `It leaves this list and the designer’s. ${flowsOf(deleting.used_by)} keep${deleting.used_by.length === 1 ? 's' : ''} it and run${deleting.used_by.length === 1 ? 's' : ''} as before: delete or change ${deleting.used_by.length === 1 ? 'that flow' : 'those flows'} to be rid of it there too.`
+              : 'It leaves this list and the designer’s. No flow uses it.') +
+            ' It is one of the platform’s own: it can be put back from the deleted tasks below.'
+          }
+          action="Delete the task"
+          destructive
+          run={() => postJson(`task-kinds/${deleting.key}/hidden`, { hidden: true })}
+          onClose={() => setDeleting(null)}
           onDone={reload}
         />
       ) : null}
@@ -502,9 +465,9 @@ export function TasksTab() {
         </CardHeader>
         <CardBody className="grid gap-3">
           <p className="text-[13px] text-muted-foreground">
-            The kinds of task the platform has. They are part of the platform: they hold the rules every flow keeps and
-            the credentials no agent is given, so they are not changed or removed here. One you do not use can be left
-            out of the designer’s list; a flow that has it keeps it.
+            The kinds of task the platform has. They hold the rules every flow keeps and the credentials no agent is
+            given, so what they do is not changed here. One you do not want can be deleted: it leaves this list and the
+            designer’s, and a flow that has it keeps it.
           </p>
           <TableFrame>
             <Table>
@@ -515,12 +478,14 @@ export function TasksTab() {
                   <TableHead>Runs</TableHead>
                   <TableHead>Ends with</TableHead>
                   <TableHead>Used by</TableHead>
-                  <TableHead>In the designer’s list</TableHead>
+                  <TableHead>
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {groups.flatMap((group) =>
-                  kinds
+                  kept
                     .filter((kind) => kind.group === group)
                     .map((kind) => (
                       <TableRow key={kind.key}>
@@ -557,19 +522,22 @@ export function TasksTab() {
                         <TableCell>
                           <UsedBy uses={kind.used_by} />
                         </TableCell>
-                        <TableCell>
+                        <TableCell className="text-right">
                           {kind.retired ? (
-                            <span className="text-[12px] text-muted-foreground">
-                              Not offered any more: {kind.retired} took its place. It is kept for the flows that have
-                              it.
-                            </span>
+                            <div className="max-w-56 text-left text-[12px] text-muted-foreground">
+                              Not offered any more: {kind.retired} took its place. It is listed for as long as a flow
+                              has it.
+                            </div>
                           ) : (
-                            <Switch
-                              label={kind.hidden ? 'Left out' : 'Offered'}
-                              aria-label={`${kind.title} is offered in the designer’s list`}
-                              checked={!kind.hidden}
-                              onCheckedChange={(offered) => hide(kind, !offered)}
-                            />
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              icon={Trash2}
+                              aria-label={`Delete ${kind.title}`}
+                              onClick={() => setDeleting(kind)}
+                            >
+                              Delete
+                            </Button>
                           )}
                         </TableCell>
                       </TableRow>
@@ -580,6 +548,63 @@ export function TasksTab() {
           </TableFrame>
         </CardBody>
       </Card>
+
+      {deleted.length ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Deleted tasks of the platform</CardTitle>
+          </CardHeader>
+          <CardBody className="grid gap-3">
+            <p className="text-[13px] text-muted-foreground">
+              These are not offered in the designer. A flow that has one keeps it. Putting one back offers it again, as
+              the platform made it.
+            </p>
+            <TableFrame>
+              <Table>
+                <TableCaption className="sr-only">Deleted tasks of the platform</TableCaption>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Task</TableHead>
+                    <TableHead>Used by</TableHead>
+                    <TableHead>
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {deleted.map((kind) => (
+                    <TableRow key={kind.key}>
+                      <TableCell className="max-w-md">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-medium">{kind.title}</span>
+                          <span className="text-[11px] tracking-wide text-muted-foreground uppercase">
+                            {kind.group}
+                          </span>
+                        </div>
+                        <div className="text-[12px] text-muted-foreground">{kind.summary}</div>
+                      </TableCell>
+                      <TableCell>
+                        <UsedBy uses={kind.used_by} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          icon={Undo2}
+                          aria-label={`Put ${kind.title} back`}
+                          onClick={() => hide(kind, false)}
+                        >
+                          Put back
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableFrame>
+          </CardBody>
+        </Card>
+      ) : null}
     </div>
   );
 }

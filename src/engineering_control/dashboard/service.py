@@ -40,6 +40,7 @@ from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.models.batches import Batches
 from engineering_control.models.batches import listing as batches_listing
+from engineering_control.models.batches import remove as remove_batch
 from engineering_control.models.pricelist import PriceListError
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.models.providers import MODEL_NAME, check_key, is_api
@@ -559,13 +560,27 @@ class DashboardService:
         running = {
             row["key"]: row for row in await asyncio.to_thread(self.repository.flows.summary)
         }
-        listed = [{**flow, "engine": running.pop(flow["key"], None)} for flow in library()]
+        removed = await asyncio.to_thread(self.repository.flows.removed)
+        gone = {flow["key"] for flow in removed}
+        listed = [
+            {**flow, "engine": running.pop(flow["key"], None)}
+            for flow in library()
+            # A name of the library that was deleted is listed again once a flow is made of it.
+            if flow["key"] not in gone or flow["key"] in running
+        ]
         # Flows made here that the library does not know.
         listed += [
             {"key": key, "name": row["name"], "summary": row["summary"], "engine": row}
             for key, row in running.items()
         ]
-        return {"items": listed}
+        # The platform's own that were deleted: they can be put back.
+        return {"items": listed, "removed": removed}
+
+    async def remove_flow(self, key: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.flows.remove, key)
+
+    async def put_flow_back(self, key: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.flows.put_back, key)
 
     async def flow_catalogue(self) -> dict[str, object]:
         """What a flow can be built from: the tasks, the prompts and the budgets."""
@@ -928,6 +943,23 @@ class DashboardService:
 
     async def run_flow(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.flow_of, run_id)
+
+    async def remove_run(self, run_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.runs.remove, run_id)
+
+    async def remove_ended_runs(self, *, project: str | None, days: int) -> dict[str, object]:
+        return await asyncio.to_thread(
+            lambda: self.repository.runs.remove_ended(project=project, days=days)
+        )
+
+    async def remove_batch(self, batch_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(remove_batch, self.repository.sessions, batch_id)
+
+    async def remove_evaluation(self, evaluation_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.evaluations.remove, evaluation_id)
+
+    async def remove_item(self, item_id: UUID) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.backlog.remove, item_id)
 
     async def cancel_run(self, run_id: UUID) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.runs.request_cancel, run_id)

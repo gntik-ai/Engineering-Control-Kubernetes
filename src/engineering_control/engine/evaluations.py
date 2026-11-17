@@ -41,8 +41,9 @@ from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.library import traits
 from engineering_control.engine.records import FlowRecords, in_force
+from engineering_control.flow_library import EVALUATION
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
-from engineering_control.sandbox.runs import FINISHED, Runs, usage_of
+from engineering_control.sandbox.runs import FINISHED, Runs, delete_runs, usage_of
 
 MAX_CASES: Final = 8
 # A run that waits for the administrator has done all its work: it can be gone through
@@ -388,6 +389,46 @@ class Evaluations:
         for run_id in running:
             self.runs.request_cancel(run_id)
         return self.get(evaluation_id)
+
+    def remove(self, evaluation_id: UUID) -> dict[str, Any]:
+        """Delete an evaluation that is not under way, with its cases and the runs it
+        made: those tried a version and left nothing else behind."""
+        with self.sessions.begin() as session:
+            evaluation = session.get(Evaluation, evaluation_id, with_for_update=True)
+            if evaluation is None:
+                raise ProjectNotFound(str(evaluation_id))
+            if evaluation.state == "running":
+                raise ProjectConflict("The evaluation is under way: stop it first")
+            cases = session.scalars(
+                select(EvaluationCase).where(EvaluationCase.evaluation_id == evaluation.id)
+            ).all()
+            # Only the runs the evaluation made itself: the candidate's. What it is
+            # compared with is past work, which stays.
+            made = [
+                case.run_id for case in cases if case.arm == "candidate" and case.run_id is not None
+            ]
+            ended = list(
+                session.scalars(
+                    select(SandboxRun.id).where(
+                        SandboxRun.id.in_(made),
+                        SandboxRun.kind == EVALUATION,
+                        SandboxRun.state.in_(FINISHED),
+                    )
+                )
+            )
+            gone = {
+                "id": str(evaluation.id),
+                "flow": evaluation.flow_key,
+                "candidate_version": evaluation.candidate_version,
+                "evaluation": f"{evaluation.flow_key} version {evaluation.candidate_version}",
+                "runs": len(ended),
+            }
+            for case in cases:
+                session.delete(case)
+            session.flush()
+            delete_runs(session, ended)
+            session.delete(evaluation)
+            return gone
 
     def advance(self) -> int:
         """Start the next case of every evaluation under way, one at a time, and close

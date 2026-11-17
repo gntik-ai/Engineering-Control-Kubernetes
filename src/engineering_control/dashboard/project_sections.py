@@ -37,7 +37,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.db.models import FlowVersion, ProjectRecord, ProjectSection
-from engineering_control.engine.library import describe, document_in_force
+from engineering_control.engine.library import describe, document_in_force, is_removed
 from engineering_control.flow_library import FLOWS
 
 SECTION_KEY = re.compile(r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
@@ -470,6 +470,8 @@ class SectionRecords:
 
     def assign(self, project: str, key: str, flow: str | None) -> dict[str, Any]:
         with self.sessions() as session:
+            if flow is not None and is_removed(session, flow):
+                raise ProjectInvalid("That flow was deleted: put it back first, on the Flows page")
             if flow is not None and flow not in FLOWS and document_in_force(session, flow) is None:
                 row = session.scalar(
                     select(FlowVersion.document).where(FlowVersion.flow_key == flow).limit(1)
