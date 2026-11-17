@@ -1129,8 +1129,32 @@ has ended, was late or failed. `/metrics` has `engineering_batches_out` and
 `engineering_batch_oldest_seconds`.
 
 **Whether batches work for an account** is tried on the Accounts page (an account's
-menu → Try a batch): one small question is handed in as a batch that belongs to no run.
-It shows with the others and costs what a few dozen tokens cost.
+menu → Try a batch): three small questions are handed in as one batch that belongs to no
+run. It shows with the others and costs what a few dozen tokens cost. Google answers
+"Precondition check failed" to a key of a project that has no billing: it takes batches
+from paying projects only.
+
+**The time a run waits for a batch is not time it took.** A flow's limit of minutes
+counts the run from its start, without what it spent waiting for a batch.
+
+**Many questions in one batch.** A step may hand in several questions at once, each
+with its own name in the batch and its own end: answered, not answered in time, or
+refused. Two things use it:
+
+- **Summaries of the code** (Project → Summaries of the code → Ask in batches). The
+  task that picks the files then picks up to twenty groups of twelve at a time, and the
+  model is asked about them as one batch, a question a group, at the batch's price.
+  What it says of a group is kept as ever. A group that gets no answer keeps nothing:
+  its files still have no summary and are picked again the next time round, so a run
+  comes back for what a batch left. A question the provider rejects ends the run with
+  the provider's words. In a flow of your own the same is set with "Groups" on Pick the
+  files to summarise and "How it is asked" on Ask a model: summarise files; several
+  groups at once are asked about in a batch only.
+- **A trial in the lab** (a flow's Lab → Ask the models in batches). The flow is tried
+  with every question to a model asked in a batch where its provider takes them; a task
+  whose provider takes none, and one that brings its model with an agent, is asked at
+  once. Nobody waits for a trial, and it costs about half. What the trial shows as cost
+  is then the price of a batch, not what the flow costs asked at once.
 
 A batch and the cache go together: a question in a batch is built like any other, and
 what it shares with others is marked for Anthropic to keep. Questions of one batch are

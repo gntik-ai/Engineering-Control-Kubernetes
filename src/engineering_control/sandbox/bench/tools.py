@@ -599,25 +599,37 @@ def digest(question: dict[str, Any]) -> dict[str, Any]:
         limit = max(1, min(int(question.get("limit") or 12), 40))
         lines = max(20, min(int(question.get("lines") or 300), 2000))
         budget = max(2000, min(int(question.get("characters") or 60_000), 400_000))
-        used = 0
-        for path in waiting:
-            if len(picked) >= limit:
+        # Several groups at a time, for a run that asks about them in one batch: each
+        # group is picked as the only one would be, from what the ones before left.
+        groups = max(1, min(int(question.get("groups") or 1), 40))
+        taken: set[str] = set()
+        for group in range(1, groups + 1):
+            used, count = 0, 0
+            for path in waiting:
+                if count >= limit:
+                    break
+                if path in taken:
+                    continue
+                rows = _text(path).splitlines()
+                shown = "\n".join(rows[:lines])[:budget]
+                if count and used + len(shown) > budget:
+                    continue
+                used += len(shown)
+                count += 1
+                taken.add(path)
+                picked.append(
+                    {
+                        "path": path,
+                        "hash": wanted[path]["hash"],
+                        "lines": len(rows),
+                        "shown": min(len(rows), lines),
+                        "cut": len(rows) > lines or len(shown) < len("\n".join(rows[:lines])),
+                        "text": shown,
+                        "group": group,
+                    }
+                )
+            if not count:
                 break
-            rows = _text(path).splitlines()
-            shown = "\n".join(rows[:lines])[:budget]
-            if picked and used + len(shown) > budget:
-                continue
-            used += len(shown)
-            picked.append(
-                {
-                    "path": path,
-                    "hash": wanted[path]["hash"],
-                    "lines": len(rows),
-                    "shown": min(len(rows), lines),
-                    "cut": len(rows) > lines or len(shown) < len("\n".join(rows[:lines])),
-                    "text": shown,
-                }
-            )
     return {
         "files": picked,
         "left": len(waiting) - len(picked),

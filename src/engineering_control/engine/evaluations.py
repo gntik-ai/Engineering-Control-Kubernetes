@@ -37,9 +37,11 @@ from engineering_control.db.models import (
 )
 from engineering_control.engine import parts, validate
 from engineering_control.engine.builtin import FLOW_OF_KIND, kind_of
+from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.library import traits
 from engineering_control.engine.records import FlowRecords, in_force
+from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.sandbox.runs import FINISHED, Runs, usage_of
 
 MAX_CASES: Final = 8
@@ -147,6 +149,26 @@ def verdict(baseline: dict[str, Any] | None, candidate: dict[str, Any] | None) -
     return "same"
 
 
+def in_batches(document: Document) -> Document:
+    """The flow with every question to a model asked in a batch, where the task can be
+    and its provider takes batches. A task that brings its model with an agent, and one
+    whose provider takes none, is asked at once as it is."""
+    raw = document.as_dict()
+    for task in raw.get("tasks") or []:
+        kind = TASKS.get(str(task.get("task")))
+        given = dict(task.get("with") or {})
+        provider = API_BY_KEY.get(str(given.get("provider") or ""))
+        if (
+            kind is not None
+            and kind.where == "model"
+            and any(param.name == "asked" for param in kind.params)
+            and provider is not None
+            and provider.batch
+        ):
+            task["with"] = {**given, "asked": "batch"}
+    return parse(raw)
+
+
 class Evaluations:
     def __init__(self, sessions: sessionmaker[Session], runs: Runs) -> None:
         self.sessions = sessions
@@ -242,9 +264,12 @@ class Evaluations:
         run_ids: list[UUID],
         note: str | None = None,
         of: str | None = None,
+        batch: bool = False,
     ) -> dict[str, Any]:
         """Try that version of the flow on those runs' work. The runs are runs of the
-        flow itself, or of the flow ``of``, which is of the same sort."""
+        flow itself, or of the flow ``of``, which is of the same sort. With ``batch``
+        the models the flow asks are asked in batches, where their providers take them:
+        a trial is work nobody waits for, and costs about half that way."""
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
         source = of if of and of != key else key
@@ -262,6 +287,8 @@ class Evaluations:
         # What the cases follow is the flow as it runs now, its parts in place: an
         # evaluation keeps what it started with.
         carried, _wrong, _origin = parts.expand(document)
+        if batch:
+            carried = in_batches(carried)
         if source != key:
             theirs = self._in_force(source)
             if theirs is None:

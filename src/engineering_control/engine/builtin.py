@@ -13,6 +13,8 @@ from typing import Any, Final
 from engineering_control.engine.document import FORMAT, Document, parse
 
 _PROVIDERS: Final = ["chatgpt", "claude"]
+# How many groups of files a run that summarises in batches picks at a time.
+SUMMARY_GROUPS: Final = 20
 
 _DELIVER: Final[dict[str, Any]] = {
     "format": FORMAT,
@@ -353,6 +355,7 @@ def summarise_code(
     steps: int = 20,
     dollars: int = 5,
     tests: bool = False,
+    batch: bool = False,
 ) -> Document:
     """What summarising a project's code runs: the clone, then batch after batch picked
     and summarised by the model that is named, until none is left, the run has been
@@ -361,6 +364,12 @@ def summarise_code(
     asked: dict[str, Any] = {"provider": provider, "model": model}
     if agent:
         asked["agent"] = agent
+    picked: dict[str, Any] = {"steps": steps, "tests": tests}
+    if batch:
+        # In a batch nobody waits for one answer: as many groups of files as can be
+        # handed over are picked at a time, and asked about as one batch.
+        asked["asked"] = "batch"
+        picked["groups"] = SUMMARY_GROUPS
     return parse(
         {
             "format": FORMAT,
@@ -379,7 +388,7 @@ def summarise_code(
                 {
                     "id": "pick",
                     "task": "code.digest",
-                    "with": {"steps": steps, "tests": tests},
+                    "with": picked,
                     "next": {"files": "summarise"},
                 },
                 {

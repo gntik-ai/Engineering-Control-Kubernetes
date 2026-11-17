@@ -503,6 +503,7 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
   const tried = versions.some((row) => row.version === version) ? version : (versions[0]?.version ?? null);
   const [chosen, setChosen] = useState<string[]>([]);
   const [note, setNote] = useState('');
+  const [inBatches, setInBatches] = useState(false);
   // The runs chosen are runs of one flow: another flow's are chosen anew.
   useEffect(() => setChosen([]), [source]);
   const start = useSubmit(
@@ -512,6 +513,7 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
         run_ids: chosen,
         note: note.trim() || null,
         of: other ? source : null,
+        batch: inBatches,
       }),
     () => {
       setChosen([]);
@@ -588,6 +590,12 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
                 <FieldLabel>What it is to show</FieldLabel>
                 <Input maxLength={300} placeholder="Optional" value={note} onValueChange={setNote} />
               </Field>
+              <Switch
+                label="Ask the models in batches"
+                checked={inBatches}
+                onCheckedChange={setInBatches}
+                title="Where a provider takes batches, the flow's questions to models are handed in as batches: answered within hours, at about half the price. What the trial then cost is the price of a batch."
+              />
               <Button
                 icon={Play}
                 loading={start.pending}

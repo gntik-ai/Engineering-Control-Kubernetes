@@ -1672,7 +1672,12 @@ def create_app(
             request,
             EvaluationInput,
             lambda body: service(request).start_evaluation(
-                key, version=body.version, run_ids=body.run_ids, note=body.note, of=body.of
+                key,
+                version=body.version,
+                run_ids=body.run_ids,
+                note=body.note,
+                of=body.of,
+                batch=body.batch,
             ),
             event="dashboard.evaluation_started",
             status_code=201,
@@ -1958,6 +1963,7 @@ def create_app(
                 batches=body.batches,
                 dollars=body.dollars,
                 tests=body.tests,
+                in_batch=body.in_batch,
             ),
             event="dashboard.project_summaries_started",
             subject=name,

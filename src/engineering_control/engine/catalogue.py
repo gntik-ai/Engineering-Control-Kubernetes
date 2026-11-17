@@ -638,6 +638,15 @@ _TASKS: Final = (
                 high=LOOP_STEPS_CEILING,
             ),
             Param("limit", "int", 12, "How many files one batch has at most.", low=1, high=40),
+            Param(
+                "groups",
+                "int",
+                1,
+                "How many such groups of files are picked at a time. More than one is for "
+                "a model that is asked in a batch: each group is one question of it.",
+                low=1,
+                high=20,
+            ),
             Param("lines", "int", 300, "The lines read of each file at most.", low=20, high=2000),
             Param(
                 "characters",
@@ -751,7 +760,18 @@ _TASKS: Final = (
             param
             for param in _ASKED
             if param.name
-            in ("provider", "model", "then_provider", "then_model", "effort", "tokens", "minutes")
+            in (
+                "provider",
+                "model",
+                "then_provider",
+                "then_model",
+                "effort",
+                "asked",
+                "hours",
+                "late",
+                "tokens",
+                "minutes",
+            )
         ),
     ),
     TaskType(

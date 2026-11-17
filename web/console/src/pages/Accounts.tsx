@@ -359,7 +359,7 @@ function BatchTrialDialog({
           <DialogHeader>
             <DialogTitle>Try a batch with {account.name}</DialogTitle>
             <DialogDescription>
-              One small question is handed to {provider.name} as a batch, which it answers within hours, most within
+              Three small questions are handed to {provider.name} as one batch, which it answers within hours, most within
               one, at {part}% of the price. It belongs to no run. This costs what a few dozen tokens cost at the
               model.
             </DialogDescription>

@@ -197,6 +197,10 @@ def test_two_tasks_make_the_summaries_and_a_run_of_a_project_carries_them() -> N
         "then_provider",
         "then_model",
         "effort",
+        # Asked at once or in a batch: tests/test_batches_many.py.
+        "asked",
+        "hours",
+        "late",
         "tokens",
         "minutes",
         "agent",
@@ -299,6 +303,8 @@ async def test_a_run_summarises_a_projects_code_batch_by_batch(stage: Any) -> No
         "limit": 12,
         "lines": 300,
         "characters": 60000,
+        # One group at a time, unless the run asks about them in batches.
+        "groups": 1,
         "tests": False,
         "stop": False,
     }

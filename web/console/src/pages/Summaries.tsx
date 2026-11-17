@@ -35,6 +35,9 @@ export function SummariesCard({ project }: { project: string }) {
   const [batches, setBatches] = useState('20');
   const [dollars, setDollars] = useState('5');
   const [tests, setTests] = useState(false);
+  const [inBatch, setInBatch] = useState(false);
+  const takesBatches = accounts.find((account) => account.provider === provider && account.batch);
+  const part = Math.round((takesBatches?.batch_price ?? 0.5) * 100);
   const [started, setStarted] = useState<string | null>(null);
   const [forgetting, setForgetting] = useState(false);
   const start = useSubmit(
@@ -48,6 +51,7 @@ export function SummariesCard({ project }: { project: string }) {
             batches: Math.round(Number(batches)),
             dollars: Math.round(Number(dollars)),
             tests,
+            in_batch: Boolean(takesBatches) && inBatch,
           })
         ).id,
       ),
@@ -170,6 +174,13 @@ export function SummariesCard({ project }: { project: string }) {
                 <Input type="number" min={1} max={1000} value={dollars} onValueChange={setDollars} />
               </Field>
               <Switch label="Summarise test files as well" checked={tests} onCheckedChange={setTests} />
+              {takesBatches ? (
+                <Switch
+                  label={`Ask in batches, at ${part}% of the price`}
+                  checked={inBatch}
+                  onCheckedChange={setInBatch}
+                />
+              ) : null}
               <Button loading={start.pending} disabled={!ready} onClick={() => void start.submit()}>
                 Summarise the code
               </Button>
@@ -178,6 +189,9 @@ export function SummariesCard({ project }: { project: string }) {
               A batch is up to twelve files. The run ends when no file is left, after the batches it may do, or when its
               questions have cost what they may; the cost is known only where the account says what its models cost.
               What is left is taken up by the next run.
+              {takesBatches
+                ? ' Asked in batches, up to twenty such groups of files are handed to the provider at a time and answered within hours; a group that gets no answer is picked again the next time round.'
+                : ''}
             </p>
           </>
         ) : null}

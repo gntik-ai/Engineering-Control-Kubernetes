@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
@@ -108,6 +109,9 @@ class DashboardService:
                     "provider": account["provider"],
                     "name": account["name"],
                     "models": account.get("models") or [],
+                    # Whether its provider takes questions in a batch, and at what price.
+                    "batch": bool(API_BY_KEY[str(account["provider"])].batch),
+                    "batch_price": API_BY_KEY[str(account["provider"])].batch_price,
                 }
                 for account in self.repository.accounts.listing()["items"]
                 if account.get("kind") == "api" and account.get("state") == "ready"
@@ -130,8 +134,11 @@ class DashboardService:
         batches: int,
         dollars: int,
         tests: bool,
+        in_batch: bool = False,
     ) -> dict[str, object]:
-        """Start a run that asks a model what the project's files are for."""
+        """Start a run that asks a model what the project's files are for. ``in_batch``:
+        the model is asked in batches at its provider, at a lower price, many groups of
+        files at a time."""
 
         def start() -> dict[str, Any]:
             try:
@@ -143,6 +150,7 @@ class DashboardService:
                     steps=batches + 1,
                     dollars=dollars,
                     tests=tests,
+                    batch=in_batch,
                 )
             except FlowInvalid as error:
                 raise ProjectInvalid(str(error)) from error
@@ -861,10 +869,11 @@ class DashboardService:
         run_ids: list[UUID],
         note: str | None,
         of: str | None = None,
+        batch: bool = False,
     ) -> dict[str, object]:
         def start() -> dict[str, Any]:
             started = self.repository.evaluations.start(
-                key, version=version, run_ids=run_ids, note=note, of=of
+                key, version=version, run_ids=run_ids, note=note, of=of, batch=batch
             )
             on = f" on runs of {started['of']}" if started["of"] != key else ""
             return {**started, "evaluation": f"{key} version {version}{on}"}
@@ -985,9 +994,9 @@ class DashboardService:
     async def try_batch(
         self, account_id: UUID, model: str, models: Models | None
     ) -> dict[str, object]:
-        """Hand one small question to the account's provider as a batch. It is followed
-        like any other and shown with the batches; it belongs to no run. It costs what
-        a few dozen tokens cost."""
+        """Hand three small questions to the account's provider as one batch. It is
+        followed like any other and shown with the batches; it belongs to no run. It
+        costs what a few dozen tokens cost."""
         account = await asyncio.to_thread(self.repository.accounts.get, account_id)
         kind = API_BY_KEY.get(str(account["provider"]))
         if kind is None:
@@ -998,10 +1007,11 @@ class DashboardService:
             raise ProjectInvalid("This installation cannot ask a provider")
         if not MODEL_NAME.fullmatch(model.strip()):
             raise ProjectInvalid("That is not the name of a model")
-        question = Question(
+        asks = ("Is two and two four?", "Is seven a prime number?", "Is a week eight days?")
+        common = Question(
             choices=((kind.key, model.strip()),),
             system="You answer one question, shortly.",
-            prompt="Is two and two four?",
+            prompt="",
             schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -1013,8 +1023,12 @@ class DashboardService:
             batch=True,
             prefer=account_id,
         )
+        questions = [
+            (f"question-{number}", dataclasses.replace(common, prompt=ask))
+            for number, ask in enumerate(asks, 1)
+        ]
         try:
-            batch_id = await Batches(models).submit(None, None, [("question", question)])
+            batch_id = await Batches(models).submit(None, None, questions)
         except ModelError as error:
             raise ProjectInvalid(error.detail) from error
         return {

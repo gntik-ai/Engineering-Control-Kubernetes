@@ -474,7 +474,8 @@ export interface ProjectSummaries {
   without: number;
   latest: string | null;
   models: string[];
-  accounts: { provider: string; name: string; models: string[] }[];
+  /** The accounts that could be asked; batch: whether their provider takes batches. */
+  accounts: { provider: string; name: string; models: string[]; batch?: boolean; batch_price?: number }[];
   agents: { id: string; name: string }[];
 }
 

@@ -621,71 +621,126 @@ class Summarise:
     kept with the project, each summary with the content it was written from."""
 
     @staticmethod
-    async def _batch(ctx: Context) -> list[dict[str, Any]]:
+    async def _groups(ctx: Context) -> dict[str, list[dict[str, Any]]]:
+        """The files that were picked last, by the group each is in: a group is one
+        question. One group, unless the task that picked was told to pick several."""
         picked = await ctx.outputs("code.digest")
         files = picked[-1].get("files") if picked else None
-        return [entry for entry in files or [] if isinstance(entry, dict) and entry.get("path")]
+        found: dict[str, list[dict[str, Any]]] = {}
+        for entry in files or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                found.setdefault(f"group-{int(entry.get('group') or 1)}", []).append(entry)
+        return found
 
-    async def question(self, ctx: Context) -> Question:
-        batch = await self._batch(ctx)
-        if not batch:
+    async def questions(self, ctx: Context) -> list[tuple[str, Question]]:
+        groups = await self._groups(ctx)
+        if not groups:
             raise ValueError(
                 f"{ctx.node.id} has no files to summarise: no task before it picked any"
             )
         asked = await _asked(ctx, SUMMARISING, SUMMARIES_SCHEMA, change=False, hand=False)
-        parts = []
-        for entry in batch:
-            whole = (
-                f" (its first {entry.get('shown')} of {entry.get('lines')} lines: say only "
-                "what these show)"
-                if entry.get("cut")
-                else ""
+        if len(groups) > 1 and not asked.batch:
+            raise ValueError(
+                f"{ctx.node.id} was handed {len(groups)} groups of files at once, which it "
+                "asks about in one batch only: set it to be asked in a batch, or the task "
+                "that picks the files to pick one group at a time"
             )
-            parts.append(
-                _material(f"The file {entry.get('path')}{whole}", str(entry.get("text") or ""))
+        found = []
+        for name, group in groups.items():
+            parts = []
+            for entry in group:
+                whole = (
+                    f" (its first {entry.get('shown')} of {entry.get('lines')} lines: say "
+                    "only what these show)"
+                    if entry.get("cut")
+                    else ""
+                )
+                parts.append(
+                    _material(f"The file {entry.get('path')}{whole}", str(entry.get("text") or ""))
+                )
+            found.append(
+                (
+                    name,
+                    dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(parts)),
+                )
             )
-        return dataclasses.replace(asked, prompt=asked.prompt + "\n\n" + "\n\n".join(parts))
+        return found
+
+    async def question(self, ctx: Context) -> Question:
+        return (await self.questions(ctx))[0][1]
 
     async def answered(self, ctx: Context, reply: Reply) -> Concluded:
+        groups = await self._groups(ctx)
+        return await self.answered_all(ctx, {next(iter(groups), "group-1"): reply}, {})
+
+    async def answered_all(
+        self, ctx: Context, replies: dict[str, Reply], failed: dict[str, str]
+    ) -> Concluded:
+        """Keep what the model said of each group of files it answered for. A group
+        that got no answer is kept nothing of: its files have no summary still, and
+        are picked again the next time round."""
         summaries = ctx.services.summaries
         if summaries is None or not ctx.data.get("project"):
             return Failed("no_project", "There is no project to keep the summaries with.")
-        batch = {str(entry["path"]): entry for entry in await self._batch(ctx)}
-        written: dict[str, str] = {}
-        for entry in reply.data.get("summaries") or []:
-            path = str((entry or {}).get("path") or "")
-            text = _words((entry or {}).get("summary"), SUMMARY_CHARACTERS)
-            if path in batch and path not in written and text:
-                written[path] = text
-        skipped = [path for path in batch if path not in written]
-        # A file the model said nothing of is kept as asked about, without a summary, so
-        # that the same content is not asked about again.
-        entries = [
-            {"path": path, "blob": str(batch[path].get("hash") or ""), "summary": text}
-            for path, text in [*written.items(), *((path, "") for path in skipped)]
-        ]
-        await asyncio.to_thread(
-            lambda: summaries.store(
+        groups = await self._groups(ctx)
+        if not replies:
+            why = next(iter(failed.values()), "no question was answered")
+            return Failed(
+                "not_answered",
+                f"None of the {len(groups)} groups of files was answered for: {why}"[:600],
+            )
+        stored: list[str] = []
+        skipped: list[str] = []
+        for name, reply in replies.items():
+            batch = {str(entry["path"]): entry for entry in groups.get(name) or []}
+            written: dict[str, str] = {}
+            for entry in reply.data.get("summaries") or []:
+                path = str((entry or {}).get("path") or "")
+                text = _words((entry or {}).get("summary"), SUMMARY_CHARACTERS)
+                if path in batch and path not in written and text:
+                    written[path] = text
+            left = [path for path in batch if path not in written]
+            # A file the model said nothing of is kept as asked about, without a
+            # summary, so that the same content is not asked about again.
+            entries = [
+                {"path": path, "blob": str(batch[path].get("hash") or ""), "summary": text}
+                for path, text in [*written.items(), *((path, "") for path in left)]
+            ]
+            await asyncio.to_thread(
+                summaries.store,
                 str(ctx.data["project"]),
                 entries,
                 provider=reply.provider,
                 model=reply.model,
                 run_id=ctx.item.run_id,
             )
+            stored += list(written)
+            skipped += left
+        files = sum(len(group) for group in groups.values())
+        again = (
+            f" {len(failed)} of {len(groups)} groups got no answer and are picked again."
+            if failed
+            else ""
         )
-        output = {"stored": len(written), "paths": list(written)[:60], "skipped": skipped[:60]}
-        if not written:
+        output = {
+            "stored": len(stored),
+            "paths": stored[:60],
+            "skipped": skipped[:60],
+            **({"not_answered": dict(list(failed.items())[:20])} if failed else {}),
+        }
+        if not stored:
             return Done(
                 "nothing",
                 "nothing_written",
-                f"The model gave no summary for any of the {len(batch)} files.",
+                f"The model gave no summary for any of the {files} files.{again}",
                 output=output,
             )
         return Done(
             "written",
             "summarised",
-            f"Summaries of {len(written)} files were written."
-            + (f" {len(skipped)} got none." if skipped else ""),
+            f"Summaries of {len(stored)} files were written."
+            + (f" {len(skipped)} got none." if skipped else "")
+            + again,
             output=output,
         )
 

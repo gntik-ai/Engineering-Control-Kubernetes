@@ -40,6 +40,8 @@ LOG = structlog.get_logger(__name__)
 BUSY_WAITS: Final = (3.0, 15.0)
 REST_MINUTES: Final = 5
 MAX_WAIT: Final = 60.0
+# The name a step's one question has, where questions are told apart by name.
+ONE: Final = "question"
 
 
 @dataclass(frozen=True)

@@ -49,7 +49,7 @@ from engineering_control.engine.tasks import (
     merges_after,
 )
 from engineering_control.github_app import GitHubApp
-from engineering_control.models.service import Question, Reply
+from engineering_control.models.service import ONE, Question, Reply
 from engineering_control.sandbox.flows import (
     Checkouts,
     End,
@@ -227,6 +227,45 @@ class Engine:
         if noted:
             await asyncio.to_thread(self.runs.note_step, item.step_id, noted)
         return asked
+
+    async def questions(self, item: StepWork) -> list[tuple[str, Question]]:
+        """The questions the step asks, each by a name: one for most tasks, several for
+        a task that asks about several things at once, in one batch."""
+        ctx = self._context(item)
+        await self._agent(ctx)
+        task = MODEL[ctx.node.task]
+        several = getattr(task, "questions", None)
+        asked: list[tuple[str, Question]] = (
+            await several(ctx) if several is not None else [(ONE, await task.question(ctx))]
+        )
+        noted: dict[str, Any] = {}
+        if ctx.model_used is not None:
+            noted["model"] = ctx.model_used
+        if ctx.prompt_used is not None:
+            noted["prompt"] = ctx.prompt_used
+        if noted:
+            await asyncio.to_thread(self.runs.note_step, item.step_id, noted)
+        return asked
+
+    async def answered_all(
+        self, item: StepWork, replies: dict[str, Reply], failed: dict[str, str]
+    ) -> Result:
+        """Go on from what several questions of one step brought: the answers by the
+        questions' names, and why the others brought none."""
+        try:
+            ctx = self._context(item)
+        except ValueError as error:
+            return _failed("unknown", str(error))
+        task = MODEL[ctx.node.task]
+        several = getattr(task, "answered_all", None)
+        if several is None:
+            return _failed("unknown", f"{ctx.node.id} asks one question at a time")
+        concluded = await several(ctx, replies, failed)
+        if isinstance(concluded, Done):
+            await asyncio.to_thread(self.runs.note_step, item.step_id, {"went": concluded.outcome})
+        if isinstance(concluded, Failed | Again):
+            return _failed(concluded.label, concluded.detail, concluded.output)
+        return await self._route(ctx, concluded)
 
     async def answered(self, item: StepWork, reply: Reply) -> Result:
         try:

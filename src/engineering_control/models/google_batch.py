@@ -71,7 +71,15 @@ async def _send(
     if status >= 500:
         raise WireError("busy", f"Google answered {status}: {words}")
     if status != 200:
-        raise WireError("invalid", f"Google rejected the request ({status}): {words}")
+        # What Google says to a key of a project without billing, for what it gives to
+        # paying projects only: batches are among that.
+        hint = (
+            " Google answers this to a key of a project that has no billing: it takes "
+            "batches from paying projects only."
+            if "precondition" in words.lower()
+            else ""
+        )
+        raise WireError("invalid", f"Google rejected the request ({status}): {words}{hint}")
     try:
         found = response.json()
     except ValueError as error:

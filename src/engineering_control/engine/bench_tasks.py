@@ -35,6 +35,8 @@ _FOLDER: Final = "/tmp/bench"  # noqa: S108 - the pod's own empty volume
 _ANSWERS: Final = "/workspace/.run"
 QUESTION_CHARACTERS: Final = 20_000
 RELATED_MINUTES: Final = 10
+# How much text of files the picker hands back at a time, in all its groups.
+DIGEST_CHARACTERS: Final = 1_200_000
 FOUND_KEPT: Final = 80
 
 
@@ -286,11 +288,16 @@ class Digest:
         if summaries is None or not ctx.data.get("project"):
             raise ValueError(f"{ctx.node.id} has no project to keep summaries for")
         count = int((ctx.given.get("loops") or {}).get(ctx.node.id) or 1)
+        characters = int(ctx.params.get("characters") or 60_000)
         question = {
             "known": await asyncio.to_thread(summaries.known, str(ctx.data["project"])),
             "limit": int(ctx.params.get("limit") or 12),
             "lines": int(ctx.params.get("lines") or 300),
-            "characters": int(ctx.params.get("characters") or 60_000),
+            "characters": characters,
+            # As many groups as the task says, and no more than can be handed back.
+            "groups": max(
+                1, min(int(ctx.params.get("groups") or 1), DIGEST_CHARACTERS // characters)
+            ),
             "tests": bool(ctx.params.get("tests", False)),
             # The last time it may be come to, it picks nothing and says what is left.
             "stop": count >= loop_steps(ctx.params),
@@ -326,10 +333,16 @@ class Digest:
             )
         paths = [str(entry.get("path")) for entry in files]
         first = ", ".join(paths[:3]) + (" and others" if len(paths) > 3 else "")
+        groups = len({int(entry.get("group") or 1) for entry in files})
         return Done(
             "files",
             "picked",
-            _words(f"{len(files)} files to summarise: {first}. {left:,} more wait.", 500),
+            _words(
+                f"{len(files)} files to summarise"
+                + (f", in {groups} groups" if groups > 1 else "")
+                + f": {first}. {left:,} more wait.",
+                500,
+            ),
             output={**counted, "files": files},
         )
 

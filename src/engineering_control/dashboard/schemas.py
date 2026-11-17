@@ -293,6 +293,8 @@ class SummariesInput(DashboardModel):
     batches: int = Field(default=20, ge=1, le=199)
     dollars: int = Field(default=5, ge=1, le=1000)
     tests: bool = False
+    # The model is asked in batches at its provider: answered within hours, at a lower price.
+    in_batch: bool = False
 
 
 class CacheTrialInput(DashboardModel):
@@ -435,6 +437,8 @@ class EvaluationInput(DashboardModel):
     note: str | None = Field(default=None, max_length=300)
     # The flow whose past runs these are, when it is not the flow tried.
     of: str | None = Field(default=None, max_length=64)
+    # The models the flow asks are asked in batches, where their providers take them.
+    batch: bool = False
 
 
 class RunDecisionInput(DashboardModel):

@@ -27,6 +27,7 @@ from engineering_control.db.models import (
     BacklogItem,
     Budget,
     FlowVersion,
+    ModelBatch,
     ProjectRecord,
     ProjectSection,
     ProviderAccount,
@@ -126,7 +127,16 @@ def _step_row(step: SandboxStep, *, with_log: bool) -> dict[str, Any]:
     return row
 
 
-_SHOWN_OF_A_FILE: Final = ("why", "summary", "summary_of", "lines", "test", "score", "cut")
+_SHOWN_OF_A_FILE: Final = (
+    "why",
+    "summary",
+    "summary_of",
+    "lines",
+    "test",
+    "score",
+    "cut",
+    "group",
+)
 
 
 def _shown(output: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1287,12 +1297,26 @@ class Runs:
             return _run_row(run)
 
     def minutes_running(self, run_id: UUID) -> int:
-        """How long the run has been under way, in whole minutes."""
+        """How long the run has been under way, in whole minutes. The time it waited for
+        a batch at a provider is left out: the run did nothing then, and a batch may
+        take hours."""
+        now = datetime.now(UTC)
         with self.sessions() as session:
             run = session.get(SandboxRun, run_id)
             if run is None or run.started_at is None:
                 return 0
-            return int((datetime.now(UTC) - _aware(run.started_at)).total_seconds() // 60)
+            waited = 0.0
+            for handed, made, ended in session.execute(
+                select(ModelBatch.submitted_at, ModelBatch.created_at, ModelBatch.ended_at).where(
+                    ModelBatch.run_id == run_id, ModelBatch.state != "failed"
+                )
+            ):
+                since = max(_aware(handed or made), _aware(run.started_at))
+                waited += max(
+                    0.0, (_aware(ended) if ended else now).timestamp() - since.timestamp()
+                )
+            took = (now - _aware(run.started_at)).total_seconds() - waited
+            return int(max(0.0, took) // 60)
 
     def tokens_used(self, run_id: UUID) -> int:
         """How many tokens the run's agents have reported using so far."""

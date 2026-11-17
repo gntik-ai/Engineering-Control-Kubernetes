@@ -77,9 +77,7 @@ START_SECONDS: Final = 600
 # busy or the launcher started anew, before the run gives up. Waiting for an account
 # with a key is not counted.
 MODEL_TRIES: Final = 5
-# The name a step's one question has in its batch, and how often batches that are
-# left over are looked for.
-ONE: Final = "question"
+# How often batches that are left over are looked for.
 SWEEP_SECONDS: Final = 300.0
 # How often a step is handed to a new workbench when the one it ran in was lost.
 BENCH_TRIES: Final = 5
@@ -459,21 +457,32 @@ class Launcher:
             return
         engine = cast(Engine, self.flows[item.run_kind])
         try:
-            question = await engine.question(item)
+            questions = await engine.questions(item)
         except ValueError as error:
             await self._fail_step(item, "not_asked", str(error))
             return
+        question = questions[0][1]
         if question.batch and self.batches is not None:
             await asyncio.to_thread(self.runs.step_started, item.step_id, None)
             try:
                 await self.batches.submit(
-                    item.step_id, item.run_id, [(ONE, question)], hours=question.hours
+                    item.step_id, item.run_id, questions, hours=question.hours
                 )
             except ModelError as error:
                 await self._not_asked(item, error)
                 return
             self._questions[item.step_id] = question
-            LOG.info("model_asked_in_a_batch", run=str(item.run_id), step=item.name)
+            LOG.info(
+                "model_asked_in_a_batch",
+                run=str(item.run_id),
+                step=item.name,
+                questions=len(questions),
+            )
+            return
+        if len(questions) > 1:
+            await self._fail_step(
+                item, "not_asked", "Several questions at once are asked in a batch only."
+            )
             return
         self._at_once(item, question)
         await asyncio.to_thread(self.runs.step_started, item.step_id, None)
@@ -506,6 +515,8 @@ class Launcher:
         if followed.state == "failed" or not followed.answers:
             await self._fail_step(item, "batch_failed", followed.detail or "The batch failed.")
             return False
+        if len(followed.answers) > 1:
+            return await self._batched_many(item, followed)
         answer = followed.answers[0]
         engine = cast(Engine, self.flows[item.run_kind])
         try:
@@ -560,6 +571,71 @@ class Launcher:
             item, answer.kind or "batch_failed", answer.error or "The batch gave no answer."
         )
         return False
+
+    async def _batched_many(self, item: StepWork, followed: Followed) -> bool:
+        """A batch of several questions has ended: go on with the ones that were
+        answered. What was not answered is said, and left to the task: one that goes
+        round a loop comes to it again."""
+        replies: dict[str, Reply] = {}
+        failed: dict[str, str] = {}
+        late = 0
+        for answer in followed.answers:
+            if answer.state != "answered":
+                failed[answer.name] = answer.error or "it was not answered"
+                late += answer.state == "late"
+                continue
+            data = shape.read_object(answer.text)
+            why = (
+                "it was not a JSON object"
+                if data is None
+                else shape.problem(answer.question.schema, data) or ""
+            )
+            if data is None or why:
+                failed[answer.name] = f"the answer did not have the asked shape: {why}"
+                continue
+            replies[answer.name] = Reply(
+                data=data,
+                text=answer.text,
+                provider=followed.provider,
+                model=answer.model,
+                account_id=followed.account_id or item.step_id,
+                account=followed.account,
+                usage=answer.usage or {},
+                seconds=followed.seconds,
+                asked=1,
+            )
+        first = followed.answers[0].question
+        if not replies and late == len(followed.answers) and first.late != "ask":
+            await self._fail_step(
+                item,
+                "batch_late",
+                f"The batch was not answered within {first.hours} hours. What was not "
+                "answered is not charged.",
+            )
+            return False
+        used = plus(*[answer.usage for answer in followed.answers])
+        if used is not None:
+            await asyncio.to_thread(self.runs.note_usage, item.step_id, used)
+        result = await cast(Engine, self.flows[item.run_kind]).answered_all(item, replies, failed)
+        lines = [
+            f"--- asked {followed.provider} with the account {followed.account}, "
+            f"{len(followed.answers)} questions in a batch; {len(replies)} answered after "
+            f"{_span(followed.seconds)} ---",
+            first.system,
+        ]
+        for answer in followed.answers:
+            lines += [
+                f"\n--- {answer.name} ---",
+                answer.question.prompt[first.shared :][:4000],
+                "--- answered ---"
+                if answer.name in replies
+                else f"--- not answered: {failed.get(answer.name, '')} ---",
+                answer.text[:6000],
+            ]
+        self._questions.pop(item.step_id, None)
+        await self._settle(item, result, result.verdict, log="\n".join(lines), exit_code=None)
+        LOG.info("batch_answered", run=str(item.run_id), step=item.name, answered=len(replies))
+        return True
 
     async def _asked(self, item: StepWork) -> bool:
         call = self._calls.get(item.step_id)
