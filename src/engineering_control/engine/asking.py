@@ -231,6 +231,7 @@ async def _asked(
         shared=shared,
         cache=kept_for(ctx),
         prefer=prefer,
+        loose=_several(ctx) and str(ctx.params.get("cache") or "automatic") != "off",
     )
 
 
@@ -245,8 +246,16 @@ def kept_for(ctx: Context) -> str:
         return "none"
     if wanted == "hour":
         return "hour"
+    return "short" if _several(ctx) else "none"
+
+
+def _several(ctx: Context) -> bool:
+    """Whether another question of the run is likely to begin as this one does: in a
+    loop, or in a flow that asks a model more than once. Such questions are asked so
+    that they can share what a provider kept: the shape of the answer is said at the
+    end of the question and not given to the provider apart."""
     asks = [node for node in ctx.document.nodes if _where(node.task) == "model"]
-    return "short" if ctx.task.loops or len(asks) > 1 else "none"
+    return ctx.task.loops or len(asks) > 1
 
 
 def _where(task: str) -> str:

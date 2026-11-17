@@ -64,6 +64,12 @@ class Question:
     cache: str = "none"
     # The account the run asked with before: a provider's cache belongs to one account.
     prefer: UUID | None = None
+    # The shape of the answer is only said in the question, not given to the provider's
+    # API to hold the model to. A provider reads a shape it is given before everything
+    # else, so questions with different shapes share nothing it kept; said in the
+    # question, at its end, the shape leaves the beginning the same. The platform
+    # checks the answer either way.
+    loose: bool = False
 
 
 @dataclass(frozen=True)
@@ -274,6 +280,7 @@ class Models:
                 cuts=question.cuts,
                 keep=marks(held.provider, question),
                 hour=question.cache == "hour",
+                loose=question.loose,
             )
         return await openai_style.complete(
             http=self.http,
@@ -287,7 +294,7 @@ class Models:
             max_tokens=question.max_tokens,
             seconds=question.seconds,
             limit_name=held.provider.limit_name,
-            strict=held.provider.shape == "schema",
+            strict=held.provider.shape == "schema" and not question.loose,
             effort=question.effort if held.provider.effort else None,
             model_prefix=held.provider.model_prefix,
         )
@@ -413,7 +420,7 @@ class Models:
         material = f"A register, made for this one trial ({seed}):\n{lines}\n\n"
         ask = "How many entries does the register have? Answer with the number."
 
-        def question(schema: dict[str, Any]) -> Question:
+        def question(schema: dict[str, Any], loose: bool = False) -> Question:
             prompt = (
                 f"{material}{ask}\n\nAnswer with one JSON object of exactly this shape and "
                 f"nothing else, no text before or after it:\n{shape.words(schema)}"
@@ -430,6 +437,7 @@ class Models:
                 keep=(len(material),),
                 shared=len(material),
                 cache="short",
+                loose=loose,
             )
 
         def number(name: str) -> dict[str, Any]:
@@ -452,6 +460,13 @@ class Models:
             other = question(number("count"))
             wire = await self._patient(held, model, other, other.prompt)
             asked.append(_trial(wire, "the same beginning, another shape of answer"))
+            # The same again with the shapes only said in the question: the first
+            # writes what the second, of another shape, should then read.
+            for name in ("entries", "count"):
+                said = question(number(name), loose=True)
+                wire = await self._patient(held, model, said, said.prompt)
+                asked.append(_trial(wire, f"the shape only said in the question ({name})"))
+                await self._sleep(TRIAL_PAUSE)
         except WireError as error:
             if error.kind == "refused":
                 await asyncio.to_thread(
@@ -459,7 +474,7 @@ class Models:
                 )
             raise ModelError(error.kind, error.detail) from error
         await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
-        again = [entry for entry in asked[1:-1] if entry["cached"]]
+        again = [entry for entry in asked[1:-3] if entry["cached"]]
         return {
             "account": held.name,
             "provider": held.provider.key,
@@ -467,7 +482,8 @@ class Models:
             "how": held.provider.cache,
             "asked": asked,
             "works": bool(again),
-            "with_another_shape": bool(asked[-1]["cached"]),
+            "with_another_shape": bool(asked[-3]["cached"]),
+            "when_only_said": bool(asked[-1]["cached"]),
         }
 
     def _one(self, account_id: UUID) -> _Held:

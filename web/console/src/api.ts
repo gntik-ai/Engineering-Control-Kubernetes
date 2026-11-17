@@ -1008,6 +1008,8 @@ export interface CacheTrial {
   asked: { what: string; input: number; cache_write: number; cached: number; output: number }[];
   works: boolean;
   with_another_shape: boolean;
+  /** Whether a question of another shape read from the cache when the shapes were only said. */
+  when_only_said: boolean;
 }
 
 export interface ModelPrice {

@@ -285,6 +285,11 @@ async def test_a_run_summarises_a_projects_code_batch_by_batch(stage: Any) -> No
     ]
     for _pass in range(3):
         await stage.launcher.tick()
+        # A question that is out is waited for, so that the next pass is not made
+        # before the provider was asked.
+        out = list(stage.launcher._calls.values())
+        if out:
+            await asyncio.wait(out, timeout=10)
         if stage.provider.asked:
             break
     key, job = stage.door.handed[-1]

@@ -105,9 +105,16 @@ def request_of(
     cuts: tuple[int, ...] = (),
     keep: tuple[int, ...] = (),
     hour: bool = False,
+    loose: bool = False,
 ) -> dict[str, Any]:
-    """One question as a request to the Messages API, asked at once or in a batch."""
-    output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
+    """One question as a request to the Messages API, asked at once or in a batch. The
+    API is given the shape of the answer and holds the model to it, unless the question
+    is ``loose``: then the shape is only said in the question. The API reads a shape it
+    is given before everything else, so two questions with different shapes begin
+    differently for it and share nothing it kept."""
+    output_config: dict[str, Any] = (
+        {} if loose else {"format": {"type": "json_schema", "schema": schema}}
+    )
     if effort in EFFORTS:
         output_config["effort"] = effort
     return {
@@ -115,7 +122,7 @@ def request_of(
         "max_tokens": max_tokens,
         "system": system,
         "messages": [{"role": "user", "content": content(prompt, cuts, keep, hour)}],
-        "output_config": output_config,
+        **({"output_config": output_config} if output_config else {}),
     }
 
 
@@ -155,6 +162,7 @@ async def complete(
     cuts: tuple[int, ...] = (),
     keep: tuple[int, ...] = (),
     hour: bool = False,
+    loose: bool = False,
 ) -> Wire:
     request = request_of(
         model=model,
@@ -166,6 +174,7 @@ async def complete(
         cuts=cuts,
         keep=keep,
         hour=hour,
+        loose=loose,
     )
     client = _client(key, base_url, seconds, http)
     try:
@@ -182,6 +191,130 @@ async def complete(
     finally:
         await client.close()
     return read(message, model, max_tokens)
+
+
+# --- batches ---------------------------------------------------------------------------------
+#
+# A batch is a list of requests Anthropic answers within a day, most within the hour, at
+# half the price. It is made, then asked about until it has ended, then its answers are
+# fetched: each by the name the request was given, in no particular order.
+
+
+async def batch_create(
+    *,
+    key: str,
+    base_url: str,
+    requests: list[tuple[str, dict[str, Any]]],
+    seconds: float = 120,
+    http: HttpFactory | None = None,
+) -> str:
+    """Hand Anthropic the requests as one batch. Returns the batch's name there."""
+    client = _client(key, base_url, seconds, http)
+    try:
+        made = await client.messages.batches.create(
+            requests=[{"custom_id": name, "params": params} for name, params in requests]  # type: ignore[typeddict-item]
+        )
+    except anthropic.APIError as error:
+        raise _failure(error) from error
+    finally:
+        await client.close()
+    return str(made.id)
+
+
+def _state(batch: Any) -> dict[str, Any]:
+    counts = batch.request_counts
+    return {
+        "id": str(batch.id),
+        "ended": batch.processing_status == "ended",
+        "status": str(batch.processing_status),
+        "created_at": batch.created_at,
+        "expires_at": batch.expires_at,
+        "waiting": int(counts.processing or 0),
+        "succeeded": int(counts.succeeded or 0),
+        "errored": int(counts.errored or 0),
+        "cancelled": int(counts.canceled or 0),
+        "expired": int(counts.expired or 0),
+    }
+
+
+async def batch_state(
+    *, key: str, base_url: str, batch_id: str, seconds: float = 60, http: HttpFactory | None = None
+) -> dict[str, Any]:
+    """Where a batch is: whether it has ended, and how many of its requests ended how."""
+    client = _client(key, base_url, seconds, http)
+    try:
+        return _state(await client.messages.batches.retrieve(batch_id))
+    except anthropic.APIError as error:
+        raise _failure(error) from error
+    finally:
+        await client.close()
+
+
+async def batch_recent(
+    *, key: str, base_url: str, seconds: float = 60, http: HttpFactory | None = None
+) -> list[dict[str, Any]]:
+    """The batches made last with this key, the latest first."""
+    client = _client(key, base_url, seconds, http)
+    found: list[dict[str, Any]] = []
+    try:
+        async for batch in client.messages.batches.list(limit=20):
+            found.append(_state(batch))
+            if len(found) >= 20:
+                break
+    except anthropic.APIError as error:
+        raise _failure(error) from error
+    finally:
+        await client.close()
+    return found
+
+
+async def batch_cancel(
+    *, key: str, base_url: str, batch_id: str, seconds: float = 60, http: HttpFactory | None = None
+) -> None:
+    """Ask Anthropic to stop a batch. What it has answered by then stays answered."""
+    client = _client(key, base_url, seconds, http)
+    try:
+        await client.messages.batches.cancel(batch_id)
+    except anthropic.APIError as error:
+        raise _failure(error) from error
+    finally:
+        await client.close()
+
+
+async def batch_results(
+    *,
+    key: str,
+    base_url: str,
+    batch_id: str,
+    tokens: dict[str, int],
+    seconds: float = 300,
+    http: HttpFactory | None = None,
+) -> dict[str, Wire | WireError]:
+    """What a batch that has ended answered, by the name of each request: an answer, or
+    why there is none. ``tokens`` says how long each answer was allowed to be."""
+    client = _client(key, base_url, seconds, http)
+    found: dict[str, Wire | WireError] = {}
+    try:
+        async for entry in await client.messages.batches.results(batch_id):
+            name, result = str(entry.custom_id), entry.result
+            if result.type == "succeeded":
+                try:
+                    found[name] = read(result.message, "", tokens.get(name, 0))
+                except WireError as error:
+                    found[name] = error
+            elif result.type == "errored":
+                inner = result.error.error
+                kind = "invalid" if inner.type == "invalid_request_error" else "busy"
+                found[name] = WireError(kind, f"Anthropic could not answer: {said(inner.message)}")
+            elif result.type == "expired":
+                found[name] = WireError("late", "Anthropic did not answer within its day.")
+            else:
+                found[name] = WireError("late", "The batch was stopped before this was answered.")
+    except anthropic.APIError as error:
+        raise _failure(error) from error
+    finally:
+        await client.close()
+    return found
 
 
 async def models(

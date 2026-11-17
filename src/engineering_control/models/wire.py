@@ -27,7 +27,8 @@ class WireError(Exception):
     - ``busy``: the provider is over its limit or not answering, and may later;
     - ``invalid``: the provider rejects the request itself (an unknown model, say);
     - ``declined``: the model would not answer this;
-    - ``cut``: the answer was longer than the task allows.
+    - ``cut``: the answer was longer than the task allows;
+    - ``late``: asked in a batch, it was not answered before the batch ended.
     """
 
     def __init__(self, kind: str, detail: str, *, retry_after: float | None = None) -> None:

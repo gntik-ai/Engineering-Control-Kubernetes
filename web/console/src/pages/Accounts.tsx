@@ -342,9 +342,10 @@ function CacheTrialDialog({ account, open, onOpenChange, onSaved }: DialogProps 
           <DialogHeader>
             <DialogTitle>Try the cache of {account.name}</DialogTitle>
             <DialogDescription>
-              A model is asked the same long question again, four times at most. A provider that keeps what it read
-              reads the beginning from its cache the second time, at a part of the price. This costs what about thirty
-              thousand tokens cost at the model.
+              A model is asked the same long question again, six times at most: as it is, with another shape of
+              answer, and with the shape only said in the question. A provider that keeps what it read reads the
+              beginning from its cache, at a part of the price. This costs what about a hundred thousand tokens cost
+              at the model.
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
@@ -375,7 +376,9 @@ function CacheTrialDialog({ account, open, onOpenChange, onSaved }: DialogProps 
                   {shown.works
                     ? shown.with_another_shape
                       ? 'It did so for another shape of answer as well: tasks of different kinds share what is kept.'
-                      : 'With another shape of answer it read anew: only questions of the same kind share what is kept.'
+                      : shown.when_only_said
+                        ? 'A question of another shape read anew when the shape was given to the provider apart, and from the cache when the shape was only said in the question: that is how a flow that asks more than once is asked.'
+                        : 'With another shape of answer it read anew, however the shape was given: only questions of the same kind share what is kept.'
                     : 'Providers keep what they read as they can and promise nothing; try again, or another model.'}
                 </Alert>
                 <Table>

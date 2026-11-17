@@ -1027,12 +1027,23 @@ was read again at the account's price for that ("read again from its cache", thi
 number of a model's prices). A change of the model, of the level of reasoning or, at
 Anthropic, of the system text starts a cache anew.
 
+**The shape of the answer is part of the beginning.** A provider that is given the
+shape apart, to hold the model to it (Anthropic, OpenAI, Google), reads the shape before
+everything else. Two questions with different shapes, a judgement and a change, then
+begin differently for it and share nothing it kept. So in a loop, and in a flow that
+asks a model more than once, the shape is only said at the end of the question and not
+given to the provider apart: the questions of the run then begin the same whatever they
+ask for. The platform checks every answer's shape itself, as it always did, and asks
+once more for one that does not fit. A flow's only question, a summary, and a task
+whose Prompt cache is off are asked with the shape given to the provider.
+
 **Whether it works for an account** is tried on the Accounts page (an account's menu →
-Try the cache): a model of the account is asked the same long question again, four
-times at most, the last time with another shape of answer, and the page shows what each
-time read new, kept and read from the cache. That costs what about thirty thousand
-tokens cost at the model. Providers keep what they read as they can and promise
-nothing, so a trial that reads nothing from the cache is worth a second try.
+Try the cache): a model of the account is asked the same long question again, six times
+at most: as it is until the beginning is read from the cache, then with another shape
+of answer, then twice with the shape only said. The page shows what each time read new,
+kept and read from the cache. That costs what about a hundred thousand tokens cost at
+the model. Providers keep what they read as they can and promise nothing, so a trial
+that reads nothing from the cache is worth a second try.
 
 An agent in a sandbox needs none of this: Claude Code and Codex keep and read their own
 conversation from the provider's cache, on a subscription and through the gateway

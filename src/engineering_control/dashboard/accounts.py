@@ -80,7 +80,11 @@ class ProviderType:
         }
         api = API_BY_KEY.get(self.key)
         if api is not None:
-            found["endpoints"] = api.as_dict()["endpoints"]
+            said = api.as_dict()
+            found["endpoints"] = said["endpoints"]
+            # How it keeps what it read, and whether it takes questions in a batch.
+            found["cache"], found["batch"] = said["cache"], said["batch"]
+            found["batch_price"] = said["batch_price"]
         return found
 
 

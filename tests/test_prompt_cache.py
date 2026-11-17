@@ -259,40 +259,93 @@ def _kept(read: int, cached: int, name: str = "entries") -> httpx.Response:
 
 @pytest.mark.asyncio
 async def test_trying_a_cache_asks_until_the_beginning_is_read_from_it(asked: Asked) -> None:  # noqa: F811
-    account = asked.account("DeepSeek one", "deepseek")
+    account = asked.account("OpenAI one", "openai", key="sk-" + "o1" * 24)
     asked.provider.answers = [
         _kept(9000, 0),
         _kept(9000, 0),
         _kept(300, 8700),
+        # Another shape, given to the provider apart: it reads everything anew.
+        _kept(9000, 0, "count"),
+        # The shapes only said in the question: the second reads what the first wrote.
+        _kept(9000, 0),
         _kept(300, 8700, "count"),
     ]
-    trial = await asked.models.try_cache(account, "model-a")
-    assert (trial["works"], trial["with_another_shape"], trial["how"]) == (True, True, "automatic")
-    assert [entry["cached"] for entry in trial["asked"]] == [0, 0, 8700, 8700]
-    assert trial["asked"][-1]["what"] == "the same beginning, another shape of answer"
-    assert asked.waited == [3.0, 3.0], "a moment between two tries, none after the one that read"
-    sent = [entry[2]["messages"][1]["content"] for entry in asked.provider.asked[-4:]]
+    trial = await asked.models.try_cache(account, "gpt-nano")
+    assert (trial["works"], trial["how"]) == (True, "automatic")
+    assert (trial["with_another_shape"], trial["when_only_said"]) == (False, True)
+    assert [entry["cached"] for entry in trial["asked"]] == [0, 0, 8700, 0, 0, 8700]
+    assert [entry["what"] for entry in trial["asked"][-3:]] == [
+        "the same beginning, another shape of answer",
+        "the shape only said in the question (entries)",
+        "the shape only said in the question (count)",
+    ]
+    assert asked.waited == [3.0, 3.0, 3.0, 3.0]
+    bodies = [entry[2] for entry in asked.provider.asked[-6:]]
+    sent = [body["messages"][1]["content"] for body in bodies]
     # The same text each time, and a beginning no question had before this trial.
     assert sent[0] == sent[1] == sent[2] and sent[3] != sent[0]
     assert sent[0].count("\n") > TRIAL_LINES and len(sent[0]) > 30_000
-    again = await asked.models.try_cache(account, "model-a")
+    # What differs between the two ways of asking is only what the provider is given
+    # apart: the question's own text says the shape either way.
+    assert [body["response_format"]["type"] for body in bodies] == [
+        "json_schema",
+        "json_schema",
+        "json_schema",
+        "json_schema",
+        "json_object",
+        "json_object",
+    ]
+    assert sent[4] == sent[0] and sent[5] == sent[3]
+    again = await asked.models.try_cache(account, "gpt-nano")
     assert (
         again["asked"]
-        and asked.provider.asked[-1][2]["messages"][1]["content"][:200] != sent[3][:200]
+        and asked.provider.asked[-1][2]["messages"][1]["content"][:200] != (sent[3][:200])
     )
 
     # A provider that keeps nothing is said to keep nothing, and nothing is hidden.
-    asked.provider.answers = [_kept(9000, 0)] * 4
-    nothing = await asked.models.try_cache(account, "model-a")
-    assert (nothing["works"], nothing["with_another_shape"]) == (False, False)
-    assert len(nothing["asked"]) == 4
+    asked.provider.answers = [_kept(9000, 0)] * 6
+    nothing = await asked.models.try_cache(account, "gpt-nano")
+    assert (nothing["works"], nothing["with_another_shape"], nothing["when_only_said"]) == (
+        False,
+        False,
+        False,
+    )
+    assert len(nothing["asked"]) == 6
 
     # A key that is refused is said, and the account waits for a new one.
     asked.provider.answers = [httpx.Response(401, json={"error": {"message": "Invalid key"}})]
     with pytest.raises(ModelError, match="does not accept the key") as refused:
-        await asked.models.try_cache(account, "model-a")
+        await asked.models.try_cache(account, "gpt-nano")
     assert refused.value.label == "refused"
     assert asked.state(account)["state"] == "sign_in_required"
+
+
+@pytest.mark.asyncio
+async def test_a_shape_that_is_only_said_is_not_given_to_anthropic_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(anthropic_api, "RETRIES", 0)
+    hub = Anthropic()
+    common: dict[str, Any] = {
+        "key": ANTHROPIC_KEY,
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-haiku-5-5",
+        "system": "The rules.",
+        "prompt": "The question.",
+        "schema": SHAPE,
+        "max_tokens": 4000,
+        "seconds": 60,
+        "http": hub.factory,
+    }
+    await anthropic_api.complete(**common)
+    held = hub.asked[-1][2]
+    assert held is not None and held["output_config"]["format"]["schema"] == SHAPE
+    await anthropic_api.complete(**common, loose=True)
+    said_only = hub.asked[-1][2]
+    assert said_only is not None and "output_config" not in said_only
+    await anthropic_api.complete(**common, loose=True, effort="low")
+    with_effort = hub.asked[-1][2]
+    assert with_effort is not None and with_effort["output_config"] == {"effort": "low"}
 
 
 def test_the_console_tries_the_cache_of_an_account_with_a_key(tmp_path: Path) -> None:
@@ -301,7 +354,13 @@ def test_the_console_tries_the_cache_of_an_account_with_a_key(tmp_path: Path) ->
     try:
         account = _post(client, "", name="DeepSeek one", provider="deepseek").json()
         assert _post(client, f"/{account['id']}/sign-in", credential=OTHER_KEY).status_code == 200
-        stand_in.answers = [_kept(9000, 0), _kept(200, 8800), _kept(9000, 0, "count")]
+        stand_in.answers = [
+            _kept(9000, 0),
+            _kept(200, 8800),
+            _kept(9000, 0, "count"),
+            _kept(9000, 0),
+            _kept(9000, 0, "count"),
+        ]
         tried = _post(client, f"/{account['id']}/cache-trial", model="model-a")
         assert tried.status_code == 200, tried.text
         shown = tried.json()
@@ -310,7 +369,8 @@ def test_the_console_tries_the_cache_of_an_account_with_a_key(tmp_path: Path) ->
             "model-a",
             True,
         )
-        assert shown["with_another_shape"] is False and len(shown["asked"]) == 3
+        assert shown["with_another_shape"] is False and len(shown["asked"]) == 5
+        assert shown["when_only_said"] is False
         assert OTHER_KEY not in tried.text
         # What is no model's name is not asked, and a subscription is not asked this way.
         assert _post(client, f"/{account['id']}/cache-trial", model="two words").status_code == 422
@@ -362,6 +422,8 @@ async def test_what_a_run_shares_comes_first_and_the_question_last(
     assert "The files the change touches" not in prompt[:steady]
     # One question in the flow: nothing is asked to be kept, whoever is asked.
     assert asks.cache == "none" and asks.prefer is None
+    # And it is asked with its shape given to the provider, which then holds to it.
+    assert asks.loose is False
     await _answered(world)
     judged = _step(world, run["id"], "judge")
     assert judged["usage"]["account_id"] == str(first)
@@ -405,12 +467,15 @@ async def test_a_flow_that_asks_more_than_once_asks_for_what_it_read_to_be_kept(
     await world.launcher.tick()
     judge = _asking(world)
     assert judge.cache == "short" and judge.prefer is None
+    # Its shape is only said at the end of the question, so that the question after
+    # it, of another shape, begins the same for the provider.
+    assert judge.loose is True
     await _answered(world)
     if not world.launcher._questions:
         await world.launcher.tick()
     tell = _asking(world)
     # The run stays with the account that answered: its cache is there.
-    assert tell.cache == "short" and tell.prefer == first
+    assert tell.cache == "short" and tell.prefer == first and tell.loose is True
     # And the second question begins as the first did, up to the change.
     assert tell.prompt[: judge.shared] == judge.prompt[: judge.shared]
     assert "Notes of the earlier task" not in tell.prompt[: judge.shared]
