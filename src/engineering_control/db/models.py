@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -19,7 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from engineering_control.db.base import Base, Timestamps, UUIDPrimaryKey
 
@@ -537,6 +537,19 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     issue_state: Mapped[str | None] = mapped_column(String(16))
     issue_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
     issue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the item was done (migration 0047): merged by a run, closed on GitHub or marked
+    # by the administrator. Empty for as long as it is not, and again if it is reopened.
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @validates("state")
+    def _dated(self, _key: str, value: str) -> str:
+        # Whoever changes the state, the day it was done is kept with it.
+        if value != "done":
+            self.done_at = None
+        elif self.done_at is None:
+            self.done_at = datetime.now(UTC)
+        return value
+
     __table_args__ = (
         UniqueConstraint(
             "project_id", "repository", "issue_number", name="uq_backlog_items_project_issue"

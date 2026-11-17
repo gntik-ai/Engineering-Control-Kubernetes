@@ -60,7 +60,7 @@ const ENTRY_STATES: Record<QueueEntry['state'], { label: string; tone: Tone }> =
 const message = (error: unknown) => (error instanceof Error ? error.message : 'The request failed.');
 
 /** "2 of 5 done, 1 running, 1 failed" */
-function progress(counts: Queue['counts']): string {
+export function progress(counts: Queue['counts']): string {
   const parts = [`${counts.done} of ${counts.total} done`];
   if (counts.running) parts.push(`${counts.running} running`);
   if (counts.failed) parts.push(`${counts.failed} failed`);
@@ -68,7 +68,7 @@ function progress(counts: Queue['counts']): string {
   return parts.join(', ');
 }
 
-function QueueState({ queue }: { queue: Pick<Queue, 'state' | 'proposed_by'> }) {
+export function QueueState({ queue }: { queue: Pick<Queue, 'state' | 'proposed_by'> }) {
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
       <Badge tone={QUEUE_STATES[queue.state].tone} size="sm">

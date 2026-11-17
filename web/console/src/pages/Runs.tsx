@@ -114,7 +114,7 @@ function decisionWords(run: Run) {
   };
 }
 
-const KINDS: Record<Run['kind'], string> = {
+export const KINDS: Record<Run['kind'], string> = {
   account_check: 'Trying an account',
   deliver_issue: 'Delivering an item',
   audit_code: 'Auditing code',

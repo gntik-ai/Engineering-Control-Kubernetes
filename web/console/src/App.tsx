@@ -4,6 +4,7 @@ import {
   FolderKanban,
   Inbox as InboxIcon,
   KeyRound,
+  LayoutDashboard,
   ListOrdered,
   ListTodo,
   LogOut,
@@ -13,6 +14,7 @@ import {
 import { useEffect, useState, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { AccountsPage } from './pages/Accounts';
+import { DashboardPage } from './pages/Dashboard';
 import { FlowPage } from './pages/Flow';
 import { FlowsPage } from './pages/Flows';
 import { InboxPage } from './pages/Inbox';
@@ -24,7 +26,7 @@ import { QueuePage, QueuesPage } from './pages/Queues';
 import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { usePageTitle } from './parts';
-import { BASE, navigate, useLocation } from './router';
+import { BASE, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -33,6 +35,7 @@ const navigation = (waiting: number): NavGroup[] => [
     id: 'console',
     label: 'Engineering',
     items: [
+      { label: 'Dashboard', href: BASE, icon: LayoutDashboard },
       {
         label: 'Inbox',
         href: `${BASE}/inbox`,
@@ -51,6 +54,7 @@ const navigation = (waiting: number): NavGroup[] => [
 ];
 
 const VIEWS: Record<string, () => ReactNode> = {
+  [BASE]: () => <DashboardPage />,
   [`${BASE}/inbox`]: () => <InboxPage />,
   [`${BASE}/projects`]: () => <ProjectsPage />,
   [`${BASE}/project`]: () => <ProjectPage />,
@@ -67,6 +71,7 @@ const VIEWS: Record<string, () => ReactNode> = {
 
 /** What the browser tab says for each view. */
 const TITLES: Record<string, string> = {
+  [BASE]: 'Dashboard',
   [`${BASE}/inbox`]: 'Inbox',
   [`${BASE}/projects`]: 'Projects',
   [`${BASE}/project`]: 'Project',
@@ -111,12 +116,8 @@ export default function App() {
     window.addEventListener(CHANGED, recount);
     return () => window.removeEventListener(CHANGED, recount);
   }, [recount]);
-  const home = current === BASE;
-  usePageTitle(home ? undefined : (TITLES[current] ?? 'Not found'));
-  useEffect(() => {
-    if (home) navigate(`${BASE}/projects`, { replace: true });
-  }, [home]);
-  if (!view && !home) return <NotFoundPage />;
+  usePageTitle(TITLES[current] ?? 'Not found');
+  if (!view) return <NotFoundPage />;
   return (
     <div className="h-dvh">
       <SidebarLayout
@@ -156,7 +157,7 @@ export default function App() {
             <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
           </div>
         ) : null}
-        {view ? view() : null}
+        {view()}
       </SidebarLayout>
     </div>
   );

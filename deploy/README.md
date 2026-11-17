@@ -297,6 +297,33 @@ kubectl -n engineering-control logs deploy/engineering-control-gateway --tail=50
 403 is a grant used for the other provider; `gateway_unreachable` is the provider not
 answering.
 
+## The start page
+
+The console opens on **Dashboard**. From top to bottom it shows:
+
+- **Resolved issues**, day by day: the items of the backlog that were done on each day.
+  An item counts on the day it was done, whoever did it: a run that merged its pull
+  request, GitHub, where its issue was closed, or you, marking it as done. An item that
+  is opened again does not count any more. The day is kept with the item
+  (`backlog_items.done_at`, migration 0047); an item that was done before that migration
+  is dated by when it was last changed.
+- **Spend**, day by day: what the calls over an API cost, in US dollars at the prices
+  written on the accounts, on the day each step ended. Work done on a subscription has
+  no price of its own and adds nothing; neither does a model whose price is not written
+  on its account.
+- **Runs under way**, on the left: the runs that have not ended, the newest first:
+  waiting to start, running, or waiting for you. The supervisor's turns are not runs.
+- **Queues**, on the right: the queues that are under way first, then the ones that
+  finished last.
+
+The period is the last 30 days, or the last 14 or 7: never more than a month. A day is a
+day where you are: the console tells the platform how far its clock is from UTC. Pointing
+at a day says its number, and so do the arrow keys once a chart has the focus; **Show as
+table** gives the same days as a table. The page reads again every half minute.
+
+`GET /api/dashboard/start?days=30&minutes=60` is what it reads: `minutes` is how far
+ahead of UTC the days are counted.
+
 ## Runs and the launcher
 
 A run is work done in sandboxes: a sequence of steps, each step one pod of the sandbox

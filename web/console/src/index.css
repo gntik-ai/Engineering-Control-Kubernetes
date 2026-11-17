@@ -7,3 +7,16 @@
 @import "@gntik-ai/ui/styles.css";
 @import "@gntik-ai/tokens/base.css";
 @import "@gntik-ai/flow/styles.css";
+
+/* The colours of the start page's charts, one for each: checked against the surface of a
+   card in each theme, for contrast and for eyes that tell fewer colours apart. */
+:root {
+  --chart-resolved: var(--category-violet);
+  --chart-spend: 190 80% 36%;
+}
+.dark {
+  --chart-spend: 190 82% 42%;
+}
+.high_contrast {
+  --chart-spend: var(--category-cyan);
+}

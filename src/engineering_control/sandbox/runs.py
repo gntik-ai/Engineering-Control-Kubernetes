@@ -709,6 +709,21 @@ class Runs:
                 "total": len(runs),
             }
 
+    def under_way(self, *, limit: int = 50) -> dict[str, Any]:
+        """The runs that have not ended, newest first: waiting to start, at work, or
+        waiting for the administrator. ``total`` counts them all, also past the limit."""
+        open_states = ("queued", "running", "waiting")
+        where = (SandboxRun.kind != CONVERSATION, SandboxRun.state.in_(open_states))
+        with self.sessions() as session:
+            runs = session.scalars(
+                select(SandboxRun)
+                .where(*where)
+                .order_by(SandboxRun.created_at.desc())
+                .limit(max(1, min(limit, 200)))
+            ).all()
+            total = session.scalar(select(func.count()).select_from(SandboxRun).where(*where))
+            return {"items": [_run_row(run) for run in runs], "total": int(total or 0)}
+
     def get(self, run_id: UUID) -> dict[str, Any]:
         with self.sessions() as session:
             run = session.get(SandboxRun, run_id)

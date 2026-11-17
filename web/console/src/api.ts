@@ -718,6 +718,19 @@ export interface Queue {
   finished_at: string | null;
 }
 
+/** The start page: a number of days, the oldest first, and what is under way now. */
+export interface Overview {
+  days: number;
+  /** On each day: the items of the backlog that were done, and the US dollars spent. */
+  series: { day: string; resolved: number; cost: number }[];
+  resolved: number;
+  cost: number;
+  /** The runs that have not ended; `total` counts the ones that are not listed too. */
+  runs: { items: Run[]; total: number };
+  /** The queues under way first, then the ones that finished last. */
+  queues: { items: Queue[]; total: number; not_finished: number };
+}
+
 export interface QueueDetail extends Queue {
   /** Why nothing further starts right now, when a budget holds the queue back. */
   waiting_for: string | null;

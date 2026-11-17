@@ -13,6 +13,7 @@ from engineering_control.dashboard.accounts import (
     provider_catalogue,
     secret_name,
 )
+from engineering_control.dashboard.overview import daily
 from engineering_control.dashboard.project_list import project_list
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -49,6 +50,9 @@ from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
+
+# How many runs and queues the start page lists; the rest is on their own pages.
+OVERVIEW_ROWS = 8
 
 
 class DashboardService:
@@ -836,6 +840,23 @@ class DashboardService:
             return {**result, "flow": key, "sha256": flow.sha256(), "of_run": of_run}
 
         return await asyncio.to_thread(go)
+
+    async def overview(self, *, days: int, minutes: int) -> dict[str, object]:
+        """The start page: what was done and what was spent on each of the last days,
+        the runs that have not ended, and the queues, the ones under way first."""
+
+        def read() -> dict[str, Any]:
+            queues = self.repository.queues
+            return {
+                **daily(self.repository.sessions, days=days, minutes=minutes),
+                "runs": self.repository.runs.under_way(limit=OVERVIEW_ROWS),
+                "queues": {
+                    **queues.listing(limit=OVERVIEW_ROWS),
+                    "not_finished": queues.not_finished(),
+                },
+            }
+
+        return await asyncio.to_thread(read)
 
     async def usage(self, days: int) -> dict[str, object]:
         return await asyncio.to_thread(lambda: self.repository.runs.usage_totals(days=days))

@@ -1716,6 +1716,16 @@ def create_app(
             entity="evaluation",
         )
 
+    @app.get("/api/dashboard/start")
+    async def start_api(request: Request, days: int = 30, minutes: int = 0) -> Response:
+        """The start page: the items done and the money spent on each of the last days
+        (a month at most), the runs under way and the queues. ``minutes`` is how far
+        ahead of UTC the console's clock is: a day is a day there."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).overview(days=days, minutes=minutes))
+
     @app.get("/api/dashboard/usage")
     async def usage_api(request: Request, days: int = 30) -> Response:
         """What the runs of the last days used, by project and by version of a flow."""

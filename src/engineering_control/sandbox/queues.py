@@ -283,6 +283,17 @@ class Queues:
             "queue": queue.name,
         }
 
+    def not_finished(self) -> int:
+        """How many queues of projects that are not archived have not finished."""
+        with self.sessions() as session:
+            found = session.scalar(
+                select(func.count())
+                .select_from(WorkQueue)
+                .join(ProjectRecord, WorkQueue.project_id == ProjectRecord.id)
+                .where(ProjectRecord.archived_at.is_(None), WorkQueue.state != "finished")
+            )
+            return int(found or 0)
+
     def listing(self, *, project: str | None = None, limit: int = 100) -> dict[str, Any]:
         """Queues under way first, then the finished ones, newest first."""
         with self.sessions() as session:
