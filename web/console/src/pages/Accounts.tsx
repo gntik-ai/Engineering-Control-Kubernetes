@@ -55,6 +55,7 @@ import {
   type Accounts,
   type CacheTrial,
   type ModelPrice,
+  type PricesListed,
   type ProviderType,
 } from '../api';
 import { LoadError, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
@@ -595,7 +596,9 @@ function EditAccountDialog({
                   <FieldDescription>
                     One model per line: its name, then US dollars per million tokens read and written and, if the
                     provider prices it apart, read again from its cache. A call on a model without a price is
-                    counted in tokens only.
+                    counted in tokens only. Refresh on the Accounts page fills in the list prices and keeps them
+                    up to date; a price you change here is yours and is left alone. Delete its line to have the
+                    list price again.
                     {account.models?.length ? ` The key reaches: ${account.models.slice(0, 30).join(', ')}.` : ''}
                   </FieldDescription>
                   {read.problem ? <p className="text-[12px] text-destructive">{read.problem}</p> : null}
@@ -835,6 +838,31 @@ export function AccountsPage() {
   useEffect(() => setBusy(trying), [trying]);
   const [adding, setAdding] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [listing, setListing] = useState(false);
+  const [listed, setListed] = useState<PricesListed | null>(null);
+  const [unlisted, setUnlisted] = useState<string | null>(null);
+  const withKeys = accounts.data?.items.some((item) => item.kind === 'api' && item.models?.length) ?? false;
+  // Refresh looks at the accounts again and, where there are keys, at what their models
+  // cost: the list prices are read and put in, and prices written by hand are kept.
+  const refresh = () => {
+    if (!withKeys) {
+      accounts.reload();
+      return;
+    }
+    setListing(true);
+    setUnlisted(null);
+    postJson<PricesListed>('account-prices')
+      .then(setListed)
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setListed(null);
+        setUnlisted(error instanceof Error ? error.message : 'The prices could not be read.');
+      })
+      .finally(() => {
+        setListing(false);
+        accounts.reload();
+      });
+  };
   const providers = accounts.data?.providers ?? [];
   const canSignIn = accounts.data?.sign_in_available ?? false;
   const canKeepKeys = accounts.data?.keys_available ?? false;
@@ -845,7 +873,7 @@ export function AccountsPage() {
       description="The subscriptions agents work with in sandboxes, and the API keys models are asked with directly."
       actions={
         <div className="flex items-center gap-2">
-          <RefreshButton resource={accounts} />
+          <RefreshButton resource={{ loading: accounts.loading || listing, reload: refresh }} />
           <Button icon={Plus} size="sm" disabled={!accounts.data} onClick={() => setAdding(true)}>
             Add account
           </Button>
@@ -856,6 +884,37 @@ export function AccountsPage() {
         <LoadError resource={accounts} />
         {problem ? (
           <Alert tone="destructive" title="Could not change the account" description={problem} onDismiss={() => setProblem(null)} />
+        ) : null}
+        {unlisted ? (
+          <Alert
+            tone="warning"
+            title="The prices were not updated"
+            description={unlisted}
+            onDismiss={() => setUnlisted(null)}
+          />
+        ) : null}
+        {listed ? (
+          <Alert
+            tone={listed.changed ? 'success' : 'info'}
+            title={
+              listed.changed
+                ? `Prices updated: ${listed.changed} of ${listed.priced} models are new or changed`
+                : `Prices checked: ${listed.priced} models, nothing changed`
+            }
+            description={
+              `List prices from ${listed.lists.join(' and ')}. ` +
+              listed.accounts
+                .map(
+                  (entry) =>
+                    `${entry.name}: ${entry.priced} priced` +
+                    (entry.yours ? `, ${entry.yours} of yours kept` : '') +
+                    (entry.unlisted ? `, ${entry.unlisted} not in the lists` : ''),
+                )
+                .join('; ') +
+              '.'
+            }
+            onDismiss={() => setListed(null)}
+          />
         ) : null}
         {accounts.data && !canSignIn ? (
           <Alert

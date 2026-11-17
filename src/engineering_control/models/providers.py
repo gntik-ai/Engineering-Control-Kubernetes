@@ -196,6 +196,8 @@ FAMILY_OF: Final = {
     "chatgpt": "chatgpt",
     **{provider.key: provider.family for provider in API_PROVIDERS},
 }
+# How many models an account keeps prices for at most.
+MAX_PRICED: Final = 300
 # What a model's name may look like, whoever the provider.
 MODEL_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}$")
 _KEY: Final = re.compile(r"^[\x21-\x7e]{16,400}$")
@@ -252,8 +254,8 @@ def clean_prices(value: Any) -> dict[str, dict[str, float]]:
         if "input" not in entry or "output" not in entry:
             raise ValueError(f"{name} needs a price for what is read and for what is written")
         cleaned[name] = entry
-    if len(cleaned) > 60:
-        raise ValueError("Prices for at most 60 models are kept")
+    if len(cleaned) > MAX_PRICED:
+        raise ValueError(f"Prices for at most {MAX_PRICED} models are kept")
     return cleaned
 
 

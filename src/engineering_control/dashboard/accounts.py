@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import json
 import re
 import unicodedata
@@ -34,6 +35,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
 )
 from engineering_control.db.models import ProviderAccount
+from engineering_control.models.pricelist import PriceList, renewed
 from engineering_control.models.providers import API_PROVIDERS, clean_prices, host_of
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
 
@@ -253,6 +255,21 @@ def _when(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _written(now: dict[str, Any], wanted: dict[str, dict[str, float]]) -> dict[str, Any]:
+    """Prices as the administrator wrote them. One they changed or added is theirs
+    (``own``): it is not replaced when the list prices are read again. One they left
+    as the list had it stays the list's."""
+    kept: dict[str, Any] = {}
+    for model, entry in wanted.items():
+        before = now.get(model)
+        same = isinstance(before, dict) and all(
+            before.get(part) == entry.get(part) for part in ("input", "output", "cached")
+        )
+        own = bool(before.get("own")) if same and isinstance(before, dict) else True
+        kept[model] = {**entry, **({"own": True} if own else {})}
+    return kept
+
+
 def _row(account: ProviderAccount) -> dict[str, Any]:
     kind = _BY_KEY.get(account.provider)
     api = API_BY_KEY.get(account.provider)
@@ -383,7 +400,9 @@ class Accounts:
                     account.endpoint = at
                 if prices is not None:
                     try:
-                        account.prices = clean_prices(prices) or None
+                        account.prices = (
+                            _written(dict(account.prices or {}), clean_prices(prices)) or None
+                        )
                     except ValueError as error:
                         raise ProjectInvalid(str(error)) from error
             if name is not None:
@@ -398,6 +417,37 @@ class Accounts:
                 account.paused = paused
             session.flush()
             return _row(account)
+
+    def list_prices(self, found: PriceList) -> dict[str, Any]:
+        """Put the list prices in for every account with an API key: for each model its
+        key reaches that the list has a price for. Prices written by hand stay."""
+        said: list[dict[str, Any]] = []
+        with self.sessions.begin() as session:
+            accounts = session.scalars(
+                select(ProviderAccount)
+                .where(
+                    ProviderAccount.archived_at.is_(None),
+                    ProviderAccount.provider.in_(list(API_BY_KEY)),
+                )
+                .order_by(ProviderAccount.name)
+                .with_for_update()
+            ).all()
+            for account in accounts:
+                prices, done = renewed(
+                    dict(account.prices or {}),
+                    [str(model) for model in account.models or []],
+                    functools.partial(found.price, account.provider, account.endpoint),
+                )
+                if done["added"] or done["changed"]:
+                    account.prices = prices or None
+                said.append({"name": account.name, "provider": account.provider, **done})
+        return {
+            "lists": list(found.read),
+            "read_at": found.at.isoformat(),
+            "accounts": said,
+            "changed": sum(entry["added"] + entry["changed"] for entry in said),
+            "priced": sum(entry["priced"] for entry in said),
+        }
 
     def signed_in(self, account_id: UUID, identity: str | None) -> dict[str, Any]:
         """The cluster holds a new sign-in for the account; it has not been tried yet."""

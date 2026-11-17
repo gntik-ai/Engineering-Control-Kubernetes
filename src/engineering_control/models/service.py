@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.db.models import ProviderAccount
 from engineering_control.models import anthropic_api, openai_style, shape
+from engineering_control.models.pricelist import PriceLists
 from engineering_control.models.providers import BY_KEY, ApiProvider, cost_of
 from engineering_control.models.sealing import SealError, unseal
 from engineering_control.models.wire import Wire, WireError
@@ -199,6 +200,8 @@ class Models:
         self._http = http
         self._anthropic_http = anthropic_http
         self._sleep = sleep
+        # What the providers' models cost, as public lists say it.
+        self.price_lists = PriceLists(lambda: self.http)
 
     @property
     def http(self) -> httpx.AsyncClient:

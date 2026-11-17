@@ -1236,6 +1236,18 @@ def create_app(
             entity="account",
         )
 
+    @app.post("/api/dashboard/account-prices")
+    async def list_prices_api(request: Request) -> Response:
+        """Read the list prices of the models the accounts' keys reach, and keep them."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).list_prices(models_of(request)),
+            event="dashboard.account_prices_listed",
+            subject="prices",
+            entity="account",
+        )
+
     @app.post("/api/dashboard/accounts/{account_id}/cache-trial")
     async def try_cache_api(account_id: UUID, request: Request) -> Response:
         """Ask a model of the account twice and say what was read from the provider's

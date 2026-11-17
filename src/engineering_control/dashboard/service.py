@@ -39,6 +39,7 @@ from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.models.batches import Batches
 from engineering_control.models.batches import listing as batches_listing
+from engineering_control.models.pricelist import PriceListError
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.models.providers import MODEL_NAME, check_key, is_api
 from engineering_control.models.sealing import seal
@@ -972,6 +973,17 @@ class DashboardService:
             raise ProjectInvalid("This installation cannot ask a provider")
         await models.check(account_id)
         return await asyncio.to_thread(self.repository.accounts.get, account_id)
+
+    async def list_prices(self, models: Models | None) -> dict[str, object]:
+        """Read what the providers' models cost from the public lists, and put it in
+        for every account with an API key. Prices written by hand stay as they are."""
+        if models is None:
+            raise ProjectInvalid("This installation cannot ask a provider")
+        try:
+            found = await models.price_lists.read()
+        except PriceListError as error:
+            raise ProjectInvalid(str(error)) from error
+        return await asyncio.to_thread(self.repository.accounts.list_prices, found)
 
     async def try_cache(
         self, account_id: UUID, model: str, models: Models | None

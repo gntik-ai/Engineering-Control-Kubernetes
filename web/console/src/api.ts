@@ -1042,10 +1042,33 @@ export interface CacheTrial {
   when_only_said: boolean;
 }
 
+/** What reading the list prices did, account by account. */
+export interface PricesListed {
+  /** The public lists that could be read. */
+  lists: string[];
+  read_at: string;
+  accounts: {
+    name: string;
+    provider: string;
+    /** Models that have the list's price now, of which some are new and some changed. */
+    priced: number;
+    added: number;
+    changed: number;
+    /** Models whose price was written by hand, and is kept. */
+    yours: number;
+    /** Models neither list has a price for. */
+    unlisted: number;
+  }[];
+  priced: number;
+  changed: number;
+}
+
 export interface ModelPrice {
   input: number;
   output: number;
   cached?: number;
+  /** Written by hand: not replaced when the list prices are read again. */
+  own?: boolean;
 }
 
 /** A kind of account, and how the administrator signs one in or gives it its key. */

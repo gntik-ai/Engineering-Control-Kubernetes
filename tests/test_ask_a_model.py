@@ -150,7 +150,8 @@ def test_an_account_with_an_api_key_is_added_given_its_key_tried_and_removed(
             f"/{account['id']}/update",
             prices={"model-a": {"input": 0.6, "output": 2.5, "cached": None}},
         )
-        assert priced.json()["prices"] == {"model-a": {"input": 0.6, "output": 2.5}}
+        # A price written by hand is the administrator's own: tests/test_price_list.py.
+        assert priced.json()["prices"] == {"model-a": {"input": 0.6, "output": 2.5, "own": True}}
         wrong = _post(client, f"/{account['id']}/update", prices={"model-a": {"input": 1}})
         assert wrong.status_code == 422 and "needs a price" in wrong.json()["detail"]
         moved = _post(client, f"/{account['id']}/update", endpoint="international")

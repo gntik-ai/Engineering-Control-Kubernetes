@@ -208,10 +208,30 @@ When a key is entered the provider is asked at once which models the key reaches
 costs nothing and shows whether the key is accepted; "Ask for its models" does it again.
 An account whose key the provider refuses says "New key needed" and waits in the inbox.
 
-Prices are yours to write (Change → What its models cost): per model, US dollars per
-million tokens read, written and, if the provider prices it apart, read again from its
-cache. A call on a model with a price shows what it cost; without one it is counted in
-tokens only. The platform does not know any provider's prices by itself.
+**What the models cost** is kept with the account: per model, US dollars per million
+tokens read, written and, if the provider prices it apart, read again from its cache. A
+call on a model with a price shows what it cost; without one it is counted in tokens
+only.
+
+No provider says over its API what its models cost, so the prices are read from two
+lists that are kept in public: models.dev, which tells a provider's addresses apart (Qwen
+costs something else at its Chinese address than at the international one), and, for a
+model the first does not have, LiteLLM's list on GitHub. **Refresh on the Accounts page
+reads them**, and puts the list price in for every model an account's key reaches that
+a list has one for. The page then says how many models are priced and how many prices
+are new or changed. Pressed again within ten minutes, what was read is used again.
+
+- These are list prices. A price that depends on the size of the prompt, on a region or
+  on a contract is not in the lists: the first price of the model is taken.
+- **A price you write is yours** (Change → What its models cost). One you change or add
+  there is kept as it is and never replaced by Refresh; delete its line to have the list
+  price again. A line you leave as the list had it stays the list's and is kept up to
+  date.
+- A model neither list knows keeps what it had, and the page says how many those are.
+- If neither list can be read, the page says so and the prices stay as they were. The
+  console reads `models.dev` and `raw.githubusercontent.com`; nothing is sent to them.
+- The discount of a batch and what a provider charges more for keeping a token in its
+  cache are not prices of the list: the platform applies them itself.
 
 ### An agent paid by an API key
 
