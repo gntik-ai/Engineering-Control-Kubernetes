@@ -228,7 +228,10 @@ export function ColumnChart({
           className="pointer-events-none absolute text-center text-[13px] text-muted-foreground"
           style={{ left, right: RIGHT, top: TOP + tall / 2 - 10 }}
         >
-          {empty}
+          {/* On the card's own colour, so that no line of the scale runs through the words. */}
+          <span className="rounded px-2 py-0.5" style={{ background: 'hsl(var(--card))' }}>
+            {empty}
+          </span>
         </p>
       ) : null}
       {shown && active !== null ? (
