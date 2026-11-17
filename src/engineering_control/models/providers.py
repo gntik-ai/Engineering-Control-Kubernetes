@@ -60,6 +60,9 @@ class ApiProvider:
     batch: str = ""
     # What a token costs in a batch, as a part of what it costs asked at once.
     batch_price: float = 0.5
+    # For a provider that takes a batch as a file of requests: what a request names as
+    # the place it is put to.
+    batch_endpoint: str = "/v1/chat/completions"
 
     def endpoint(self, key: str | None) -> Endpoint:
         for endpoint in self.endpoints:
@@ -113,6 +116,7 @@ API_PROVIDERS: Final = (
         limit_name="max_completion_tokens",
         shape="schema",
         effort=True,
+        batch="files",
     ),
     ApiProvider(
         # The Gemini API of Google AI Studio, through the address at which it accepts
@@ -131,6 +135,7 @@ API_PROVIDERS: Final = (
         shape="schema",
         effort=True,
         model_prefix="models/",
+        batch="google",
     ),
     ApiProvider(
         key="deepseek",
@@ -156,6 +161,7 @@ API_PROVIDERS: Final = (
             ),
         ),
         keys_at="Alibaba Cloud Model Studio → API keys (a key works in its own region only)",
+        batch="files",
     ),
     ApiProvider(
         key="glm",
@@ -178,6 +184,8 @@ API_PROVIDERS: Final = (
             Endpoint("china", "China", "https://api.moonshot.cn/v1"),
         ),
         keys_at="platform.moonshot.ai → API keys (or platform.moonshot.cn)",
+        batch="files",
+        batch_price=0.6,
     ),
 )
 BY_KEY: Final = {provider.key: provider for provider in API_PROVIDERS}

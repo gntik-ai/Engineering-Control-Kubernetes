@@ -40,7 +40,7 @@ from engineering_control.db.models import (
     SandboxRun,
     SandboxStep,
 )
-from engineering_control.models import anthropic_api
+from engineering_control.models import anthropic_api, google_batch, openai_batch, openai_style
 from engineering_control.models.providers import BY_KEY
 from engineering_control.models.service import (
     ModelError,
@@ -171,8 +171,11 @@ class Batches:
 
     # --- the provider ----------------------------------------------------------------------
 
-    async def _create(self, held: _Held, model: str, requests: list[tuple[str, Question]]) -> str:
-        if held.provider.batch == "anthropic":
+    async def _create(
+        self, held: _Held, model: str, requests: list[tuple[str, Question]], label: str
+    ) -> str:
+        how = held.provider.batch
+        if how == "anthropic":
             return await anthropic_api.batch_create(
                 key=held.key,
                 base_url=held.url,
@@ -196,31 +199,134 @@ class Batches:
                 ],
                 http=self.models._anthropic_http,
             )
+        if how == "files":
+            return await openai_batch.create(
+                http=self.models.http,
+                name=held.provider.name,
+                key=held.key,
+                base_url=held.url,
+                requests=[
+                    (
+                        name,
+                        openai_style.body_of(
+                            model=model,
+                            system=question.system,
+                            prompt=question.prompt,
+                            schema=question.schema,
+                            max_tokens=question.max_tokens,
+                            limit_name=held.provider.limit_name,
+                            strict=held.provider.shape == "schema" and not question.loose,
+                            effort=question.effort if held.provider.effort else None,
+                        ),
+                    )
+                    for name, question in requests
+                ],
+                label=label,
+                endpoint=held.provider.batch_endpoint,
+            )
+        if how == "google":
+            return await google_batch.create(
+                http=self.models.http,
+                key=held.key,
+                base_url=held.url,
+                model=model,
+                requests=[
+                    (
+                        name,
+                        google_batch.request_of(
+                            system=question.system,
+                            prompt=question.prompt,
+                            max_tokens=question.max_tokens,
+                        ),
+                    )
+                    for name, question in requests
+                ],
+                label=label,
+            )
         raise WireError("invalid", f"{held.provider.name} takes no questions in a batch.")
 
     async def _state(self, held: _Held, remote_id: str) -> dict[str, Any]:
+        how = held.provider.batch
+        if how == "files":
+            return await openai_batch.state(
+                http=self.models.http,
+                name=held.provider.name,
+                key=held.key,
+                base_url=held.url,
+                batch_id=remote_id,
+            )
+        if how == "google":
+            return await google_batch.state(
+                http=self.models.http, key=held.key, base_url=held.url, batch_id=remote_id
+            )
         return await anthropic_api.batch_state(
             key=held.key, base_url=held.url, batch_id=remote_id, http=self.models._anthropic_http
         )
 
     async def _recent(self, held: _Held) -> list[dict[str, Any]]:
+        how = held.provider.batch
+        if how == "files":
+            return await openai_batch.recent(
+                http=self.models.http, name=held.provider.name, key=held.key, base_url=held.url
+            )
+        if how == "google":
+            return await google_batch.recent(http=self.models.http, key=held.key, base_url=held.url)
         return await anthropic_api.batch_recent(
             key=held.key, base_url=held.url, http=self.models._anthropic_http
         )
 
     async def _cancel(self, held: _Held, remote_id: str) -> None:
-        await anthropic_api.batch_cancel(
-            key=held.key, base_url=held.url, batch_id=remote_id, http=self.models._anthropic_http
-        )
+        how = held.provider.batch
+        if how == "files":
+            await openai_batch.cancel(
+                http=self.models.http,
+                name=held.provider.name,
+                key=held.key,
+                base_url=held.url,
+                batch_id=remote_id,
+            )
+        elif how == "google":
+            await google_batch.cancel(
+                http=self.models.http, key=held.key, base_url=held.url, batch_id=remote_id
+            )
+        else:
+            await anthropic_api.batch_cancel(
+                key=held.key,
+                base_url=held.url,
+                batch_id=remote_id,
+                http=self.models._anthropic_http,
+            )
 
     async def _results(
-        self, held: _Held, remote_id: str, requests: list[tuple[str, Question]]
+        self,
+        held: _Held,
+        remote_id: str,
+        model: str,
+        requests: list[tuple[str, Question]],
+        where: dict[str, Any],
     ) -> dict[str, Wire | WireError]:
+        """What the batch answered. ``where`` is its state as the provider last gave it:
+        some providers say there where the answers are, or give them with it."""
+        tokens = {name: question.max_tokens for name, question in requests}
+        how = held.provider.batch
+        if how == "files":
+            return await openai_batch.results(
+                http=self.models.http,
+                name=held.provider.name,
+                key=held.key,
+                base_url=held.url,
+                where=where,
+                model=model,
+                tokens=tokens,
+                model_prefix=held.provider.model_prefix,
+            )
+        if how == "google":
+            return google_batch.results(where, model, tokens, [name for name, _ in requests])
         return await anthropic_api.batch_results(
             key=held.key,
             base_url=held.url,
             batch_id=remote_id,
-            tokens={name: question.max_tokens for name, question in requests},
+            tokens=tokens,
             http=self.models._anthropic_http,
         )
 
@@ -410,7 +516,7 @@ class Batches:
             return
         batch, requests = read
         try:
-            remote = await self._create(held, str(batch["model"]), requests)
+            remote = await self._create(held, str(batch["model"]), requests, str(batch_id))
         except WireError as error:
             kind, detail = error.kind, error.detail
             if kind in ("refused", "busy"):
@@ -528,7 +634,9 @@ class Batches:
             if state["ended"]:
                 read = await asyncio.to_thread(self._read, batch["id"])
                 requests = read[1] if read is not None else []
-                results = await self._results(held, str(batch["remote_id"]), requests)
+                results = await self._results(
+                    held, str(batch["remote_id"]), str(batch["model"]), requests, state
+                )
         except WireError as error:
             # A provider that cannot be asked just now is asked again at the next time.
             await asyncio.to_thread(lambda: self._change(batch["id"], checked_at=now))
@@ -555,16 +663,22 @@ class Batches:
             return Followed("waiting", f"{held.provider.name} could not be asked about the batch.")
         known = await asyncio.to_thread(self._known)
         since = batch["created_at"] - timedelta(seconds=60)
-        found = [
+        # A provider that keeps the label a batch was handed in with says which it is.
+        labelled = [entry for entry in recent if entry.get("label") == str(batch["id"])]
+        found = labelled or [
             entry
             for entry in recent
             if entry["id"] not in known
+            and not entry.get("label")
             and _aware(entry["created_at"]) >= since
-            and entry["waiting"]
-            + entry["succeeded"]
-            + entry["errored"]
-            + entry["cancelled"]
-            + entry["expired"]
+            and entry.get(
+                "total",
+                entry["waiting"]
+                + entry["succeeded"]
+                + entry["errored"]
+                + entry["cancelled"]
+                + entry["expired"],
+            )
             == batch["requests"]
         ]
         if len(found) > 1:

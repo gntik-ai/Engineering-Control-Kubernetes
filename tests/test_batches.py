@@ -575,7 +575,7 @@ def test_every_task_that_asks_a_model_can_be_asked_in_a_batch_where_the_provider
     assert (
         "error",
         "judge is to be asked in a batch, and DeepSeek takes none: ask it at once, or name a "
-        "provider that does (Anthropic API)",
+        "provider that does (Anthropic API, OpenAI API, Google Gemini API, Qwen, Kimi)",
     ) in said(wrong)
     assert any("hours of judge is between 1 and 24" in text for _, text in said(_judging(hours=30)))
     # In a loop it is allowed, and said what it means.

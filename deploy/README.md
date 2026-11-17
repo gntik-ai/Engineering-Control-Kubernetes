@@ -1061,10 +1061,23 @@ that asks a model has three settings for it:
 | Hours a batch is waited for | 1 to 24, usually 24 | After that the platform stops waiting, whatever the provider's own limit is |
 | When a batch is late | Tell me and stop (default), Ask at once | Stop: the run fails and says so, and what was not answered is not charged. Ask: the question is asked at once, at the full price |
 
-Which providers take batches is shown on the Accounts page and checked by the rules: a
-task set to a batch at a provider that takes none is an error. Anthropic takes them
-(most are answered within the hour, all within a day, at half the price; what it kept
-in and read from its cache is half the price as well).
+Which providers take batches is checked by the rules: a task set to a batch at a
+provider that takes none is an error.
+
+| Provider | Batches | Price of a token in a batch | How it is handed in |
+| --- | --- | --- | --- |
+| Anthropic API | Yes | Half; what it kept in and read from its cache is half as well | Its own interface; most are answered within the hour, all within a day |
+| OpenAI API | Yes | Half | A file of requests is uploaded and a batch made of it; answered within a day. The file of questions is deleted there when the batch has ended |
+| Google Gemini API | Yes | Half | Google's own interface for batches, not the one it shares with OpenAI; it aims at a day and gives up after two |
+| Qwen | Yes | Half | As OpenAI. A question in a batch gets no price for what was read from the cache |
+| Kimi | Yes, for the models Moonshot names for it | 60% | As OpenAI |
+| GLM | No | | The international address has no batches |
+| DeepSeek | No | | It has none |
+
+A batch at Google is asked for JSON and not held to the shape by Google, and is not told
+how hard to reason: the shape is said in the question and checked by the platform, as
+everywhere. Qwen and Kimi are built from their documentation and tried against
+stand-ins only: no key of theirs was there to try them with.
 
 It fits work nobody waits for: a nightly audit, a report, summaries, a trial in the
 lab. An agent in a sandbox cannot be asked this way: its work is many questions, each
