@@ -1344,6 +1344,25 @@ class Runs:
                 for step in steps
             ]
 
+    def asked_with(self, run_id: UUID) -> dict[str, UUID]:
+        """The account the run last asked a model with, for each provider it asked: a
+        provider's cache belongs to one account, so the run stays with it."""
+        with self.sessions() as session:
+            used = session.scalars(
+                select(SandboxStep.usage)
+                .where(SandboxStep.run_id == run_id, SandboxStep.usage.is_not(None))
+                .order_by(SandboxStep.position)
+            ).all()
+        found: dict[str, UUID] = {}
+        for usage in used:
+            if not isinstance(usage, dict) or not usage.get("account_id"):
+                continue
+            try:
+                found[str(usage.get("provider"))] = UUID(str(usage["account_id"]))
+            except ValueError:
+                continue
+        return found
+
     def cost_of(self, run_id: UUID) -> float:
         """What the run's questions to models over an API cost so far, in US dollars,
         where their accounts say what their models cost."""

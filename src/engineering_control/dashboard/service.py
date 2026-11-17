@@ -36,9 +36,9 @@ from engineering_control.engine.records import described
 from engineering_control.engine.simulate import recorded, simulate
 from engineering_control.flow_library import flow_catalogue as library
 from engineering_control.github_app import GitHubApp, GitHubAppError
-from engineering_control.models.providers import check_key, is_api
+from engineering_control.models.providers import MODEL_NAME, check_key, is_api
 from engineering_control.models.sealing import seal
-from engineering_control.models.service import Models
+from engineering_control.models.service import ModelError, Models
 from engineering_control.sandbox.deliver import PROVIDERS as AGENT_PROVIDERS
 from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
@@ -955,6 +955,24 @@ class DashboardService:
             raise ProjectInvalid("This installation cannot ask a provider")
         await models.check(account_id)
         return await asyncio.to_thread(self.repository.accounts.get, account_id)
+
+    async def try_cache(
+        self, account_id: UUID, model: str, models: Models | None
+    ) -> dict[str, object]:
+        """Ask a model of the account the same long question again and see whether the
+        provider read its beginning from its cache. It costs what a few thousand tokens
+        cost at that model."""
+        account = await asyncio.to_thread(self.repository.accounts.get, account_id)
+        if not is_api(str(account["provider"])):
+            raise ProjectInvalid("Only an account with an API key is asked this way")
+        if models is None:
+            raise ProjectInvalid("This installation cannot ask a provider")
+        if not MODEL_NAME.fullmatch(model.strip()):
+            raise ProjectInvalid("That is not the name of a model")
+        try:
+            return await models.try_cache(account_id, model.strip())
+        except ModelError as error:
+            raise ProjectInvalid(error.detail) from error
 
     async def remove_account(self, account_id: UUID, cluster: Cluster | None) -> dict[str, object]:
         """The sign-in leaves the cluster first; the record is removed only when it is gone."""

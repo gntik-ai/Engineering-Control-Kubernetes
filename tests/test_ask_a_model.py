@@ -237,6 +237,8 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
             "effort",
             "with_change",
             "with_files",
+            # Whether a provider is asked to keep what it read: tests/test_prompt_cache.py.
+            "cache",
             "tokens",
             "minutes",
             # Which of the administrator's agents is asked: tests/test_agents.py.
@@ -388,6 +390,7 @@ async def test_a_model_judges_the_collected_change_without_a_sandbox(
         "provider": "deepseek",
         "model": "model-a-0915",
         "account": "DeepSeek one",
+        "account_id": judged["usage"]["account_id"],
     }
     assert judged["input"]["model"] == {"provider": "deepseek", "model": "model-a"}
     assert world.runs.tokens_used(UUID(run["id"])) >= 1280

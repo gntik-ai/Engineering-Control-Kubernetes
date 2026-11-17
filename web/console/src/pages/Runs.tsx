@@ -311,7 +311,7 @@ function Step({ step, producer = false }: { step: RunStep; producer?: boolean })
           <span className="ml-auto flex items-center gap-3 text-[12px] text-muted-foreground">
             {step.input?.round && step.input.round > 1 ? <span>Round {step.input.round}</span> : null}
             {step.usage ? (
-              <span title={`${step.usage.input.toLocaleString('en')} read, ${step.usage.output.toLocaleString('en')} written, ${step.usage.cached.toLocaleString('en')} read again from cache`}>
+              <span title={`${step.usage.input.toLocaleString('en')} read${step.usage.cache_write ? ` (${step.usage.cache_write.toLocaleString('en')} of them kept in the provider's cache)` : ''}, ${step.usage.output.toLocaleString('en')} written, ${step.usage.cached.toLocaleString('en')} read again from cache${step.usage.batch ? ', asked in a batch' : ''}`}>
                 {tokens(step.usage.tokens)} tokens
                 {step.usage.cost !== undefined ? ', ' + dollars(step.usage.cost) : ''}
               </span>

@@ -936,10 +936,10 @@ Such a task is a step of the run like a sandbox's, but no sandbox runs: the laun
 asks the provider and goes on with the other runs while it waits. What holds for it:
 
 - **The model has no tools.** It cannot read the repository, run a command or look
-  anything up. It goes by what the platform puts before it: your instruction, what the
-  run is about, the notes of earlier tasks, an earlier task's findings and, when the run
-  has collected one, the change (the files it touches and its diff). To judge a change,
-  put the task after Collect the change.
+  anything up. It goes by what the platform puts before it: what the run is about, the
+  notes of earlier tasks, the files in hand, the change when the run has collected one
+  (the files it touches and its diff) and then, last, your instruction and an earlier
+  task's findings. To judge a change, put the task after Collect the change.
 - **What comes from outside is marked as material** (the issue's text, the diff, notes),
   with the rule not to follow instructions in it.
 - **The answer has a fixed shape**, stated in the question and checked by the platform
@@ -974,6 +974,69 @@ Every question and answer is kept with its step on the run's page ("Show what wa
 and answered"), with the provider, the account, the model, the tokens read and written,
 and the cost when the account has a price for the model. Tokens count against a flow's
 token budget like an agent's.
+
+### Reading again from a provider's cache
+
+A provider that has read the beginning of a prompt before can read it again from a cache
+of its own, at a part of the price: a tenth at most providers, a twentieth or less on
+Anthropic's newest models. It only helps when two questions begin with exactly the same
+text, so the platform builds every question the same way: what the questions of a run
+have in common first, what changes least before what changes most, and the question
+itself last.
+
+| Comes | What | Changes when |
+| --- | --- | --- |
+| First | The repository, what the run is about | Never, within a run |
+| Then | Notes of earlier tasks | A task reports |
+| Then | The files in hand, the ones seen longest ago first | A file is read or changed |
+| Then | The change: its files and its diff | The change is collected again |
+| Last | What the task's agent is told, the task's own rules, your instruction, findings | Every question |
+
+The loop's own account of what happened so far only grows: a step adds a line and
+changes none before it. When it passes eighty lines the oldest forty are left out at
+once, not one at every step.
+
+Two more things follow from "exactly the same text":
+
+- **A run stays with one account.** A cache belongs to the account that wrote it. The
+  first question of a run takes the account unused longest, as before; the ones after
+  it take the same account while it can answer.
+- **Providers differ in how they keep.** OpenAI, Google, DeepSeek, Qwen, GLM and Kimi
+  keep what they read by themselves, from about a thousand tokens (Google: two to four
+  thousand), and nothing is sent to ask for it. Anthropic keeps only what a request
+  marks, and charges more for a token it keeps than for one it only reads: a quarter
+  more when kept for five minutes, twice as much when kept for an hour.
+
+So every task that asks a model has the setting **Prompt cache**, which matters at
+Anthropic only:
+
+| Choice | What Anthropic is asked |
+| --- | --- |
+| Automatic (default) | To keep, for five minutes, in a loop and in a flow that asks a model more than once: where another question is likely to begin the same way soon. Not for a flow's only question, where keeping would only cost |
+| Keep for an hour | To keep for an hour, at twice the price of reading: for flows whose questions are far apart (tests that run for ten minutes between two questions) |
+| Off | Nothing |
+
+What is marked: the end of what never changes in a run, and the end of what the
+questions share. Less than about five hundred tokens is not marked, since nothing that
+short is kept. Summaries of the code have no such setting: every question is about other
+files.
+
+A step shows what it read new, how much of that the provider kept, and what it read
+from the cache; the cost counts what was kept at the provider's higher price and what
+was read again at the account's price for that ("read again from its cache", third
+number of a model's prices). A change of the model, of the level of reasoning or, at
+Anthropic, of the system text starts a cache anew.
+
+**Whether it works for an account** is tried on the Accounts page (an account's menu →
+Try the cache): a model of the account is asked the same long question again, four
+times at most, the last time with another shape of answer, and the page shows what each
+time read new, kept and read from the cache. That costs what about thirty thousand
+tokens cost at the model. Providers keep what they read as they can and promise
+nothing, so a trial that reads nothing from the cache is worth a second try.
+
+An agent in a sandbox needs none of this: Claude Code and Codex keep and read their own
+conversation from the provider's cache, on a subscription and through the gateway
+alike, and a step shows how much was read again.
 
 ## Items that are not issues
 

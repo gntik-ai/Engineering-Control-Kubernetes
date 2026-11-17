@@ -380,6 +380,11 @@ async def test_what_the_related_tests_say_goes_back_to_the_model_that_wrote_the_
     assert command["argv"][-3] == "tests" and command["env"] == deliver.TOOLS
     assert command["timeout"] == 300
     # The model is asked again, and is told what failed.
+    import asyncio
+
+    out = list(stage.launcher._calls.values())
+    if out:
+        await asyncio.wait(out, timeout=10)
     again = stage.provider.asked[-1][2]["messages"][1]["content"]
     assert "[packages/billing] vitest run src/money.test.ts" in again
     assert "expected 3 to be 2" in again

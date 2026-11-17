@@ -869,6 +869,10 @@ export interface RunStep {
     input: number;
     output: number;
     cached: number;
+    /** Of the tokens read, the ones the provider kept in its cache, where it says so. */
+    cache_write?: number;
+    /** The question was asked in a batch, at the provider's lower price. */
+    batch?: boolean;
     /** For a step that asked a model over an API: where, and what it cost if known. */
     cost?: number;
     provider?: string;
@@ -992,6 +996,18 @@ export interface Account {
   models?: string[];
   /** US dollars per million tokens, by model. */
   prices?: Record<string, ModelPrice>;
+}
+
+/** What trying a provider's cache showed: each time the model was asked, and what it read. */
+export interface CacheTrial {
+  account: string;
+  provider: string;
+  model: string;
+  /** How the provider caches: by itself, or where a request marks it. */
+  how: string;
+  asked: { what: string; input: number; cache_write: number; cached: number; output: number }[];
+  works: boolean;
+  with_another_shape: boolean;
 }
 
 export interface ModelPrice {

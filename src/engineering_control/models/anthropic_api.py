@@ -72,6 +72,74 @@ def _failure(error: anthropic.APIError) -> WireError:
     )
 
 
+def content(
+    prompt: str, cuts: tuple[int, ...] = (), keep: tuple[int, ...] = (), hour: bool = False
+) -> str | list[dict[str, Any]]:
+    """The prompt as the API takes it. With nothing to keep it is one text. Otherwise it
+    is cut into pieces at ``cuts``, and the pieces that end at an offset of ``keep`` are
+    marked: what comes before a mark is written to Anthropic's cache, and read from it
+    by a later question that begins with the same pieces."""
+    ends = {end for end in keep if 0 < end <= len(prompt)}
+    if not ends:
+        return prompt
+    edges = sorted({cut for cut in (*cuts, *ends) if 0 < cut < len(prompt)})
+    blocks: list[dict[str, Any]] = []
+    start = 0
+    for edge in (*edges, len(prompt)):
+        block: dict[str, Any] = {"type": "text", "text": prompt[start:edge]}
+        if edge in ends:
+            block["cache_control"] = {"type": "ephemeral", **({"ttl": "1h"} if hour else {})}
+        blocks.append(block)
+        start = edge
+    return blocks
+
+
+def request_of(
+    *,
+    model: str,
+    system: str,
+    prompt: str,
+    schema: dict[str, Any],
+    max_tokens: int,
+    effort: str | None = None,
+    cuts: tuple[int, ...] = (),
+    keep: tuple[int, ...] = (),
+    hour: bool = False,
+) -> dict[str, Any]:
+    """One question as a request to the Messages API, asked at once or in a batch."""
+    output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
+    if effort in EFFORTS:
+        output_config["effort"] = effort
+    return {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": content(prompt, cuts, keep, hour)}],
+        "output_config": output_config,
+    }
+
+
+def read(message: Any, model: str, max_tokens: int) -> Wire:
+    """What a message of the API says, or why it is no answer."""
+    if message.stop_reason == "refusal":
+        details = getattr(message, "stop_details", None)
+        why = said(getattr(details, "explanation", "") or getattr(details, "category", ""))
+        raise WireError("declined", f"The model declined to answer{': ' + why if why else '.'}")
+    if message.stop_reason == "max_tokens":
+        raise WireError("cut", f"The answer was longer than the {max_tokens:,} tokens it may have.")
+    text = "".join(block.text for block in message.content if block.type == "text")
+    usage = message.usage
+    kept = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    return Wire(
+        text=text,
+        model=str(message.model or model),
+        read=int(usage.input_tokens or 0) + kept,
+        written=int(usage.output_tokens or 0),
+        cached=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        cache_written=kept,
+    )
+
+
 async def complete(
     *,
     key: str,
@@ -84,17 +152,21 @@ async def complete(
     seconds: float,
     effort: str | None = None,
     http: HttpFactory | None = None,
+    cuts: tuple[int, ...] = (),
+    keep: tuple[int, ...] = (),
+    hour: bool = False,
 ) -> Wire:
-    output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
-    if effort in EFFORTS:
-        output_config["effort"] = effort
-    request: dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": prompt}],
-        "output_config": output_config,
-    }
+    request = request_of(
+        model=model,
+        system=system,
+        prompt=prompt,
+        schema=schema,
+        max_tokens=max_tokens,
+        effort=effort,
+        cuts=cuts,
+        keep=keep,
+        hour=hour,
+    )
     client = _client(key, base_url, seconds, http)
     try:
         if model in FALLBACK_MODELS:
@@ -109,21 +181,7 @@ async def complete(
         raise _failure(error) from error
     finally:
         await client.close()
-    if message.stop_reason == "refusal":
-        details = getattr(message, "stop_details", None)
-        why = said(getattr(details, "explanation", "") or getattr(details, "category", ""))
-        raise WireError("declined", f"The model declined to answer{': ' + why if why else '.'}")
-    if message.stop_reason == "max_tokens":
-        raise WireError("cut", f"The answer was longer than the {max_tokens:,} tokens it may have.")
-    text = "".join(block.text for block in message.content if block.type == "text")
-    usage = message.usage
-    return Wire(
-        text=text,
-        model=str(message.model or model),
-        read=int(usage.input_tokens or 0) + int(usage.cache_creation_input_tokens or 0),
-        written=int(usage.output_tokens or 0),
-        cached=int(usage.cache_read_input_tokens or 0),
-    )
+    return read(message, model, max_tokens)
 
 
 async def models(

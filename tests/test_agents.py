@@ -453,9 +453,12 @@ async def test_an_agent_asked_over_an_api_brings_its_model_and_what_it_is_told(s
     body = stage.provider.asked[-1][2]
     assert body["model"] == "model-from-the-agent"
     question = body["messages"][1]["content"]
-    assert question.startswith(
+    # What the run is about comes first: what the agent is told opens the question
+    # itself, after it.
+    told = question.index(
         "Who does this work, as the administrator set it: the agent Second opinion."
     )
+    assert question.index("What the run is about") < told < question.index("Is the issue clear?")
     assert (
         "You judge whether an issue is clear enough to work on." in question
         and "Is the issue clear?" in question

@@ -298,7 +298,9 @@ async def test_a_run_summarises_a_projects_code_batch_by_batch(stage: Any) -> No
         "stop": False,
     }
     asked = stage.provider.asked[-1][2]["messages"][1]["content"]
-    assert asked.startswith("Summarise each of the files below")
+    # What the run is about comes first, the question after it, and the files last.
+    assert asked.startswith("The repository is gntik-ai/falcone-workflow.")
+    assert asked.index("Summarise each of the files below") < asked.index("The file src/session.ts")
     assert "The file src/session.ts:\n<<<material\n// src/session.ts" in asked
     assert "The file src/price.ts:" in asked and "What you are asked" not in asked
 

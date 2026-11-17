@@ -50,6 +50,7 @@ const SETTING_NAMES: Record<string, string> = {
   with_files: 'Give it the files read',
   agent: 'Agent',
   paid: 'Paid by',
+  cache: 'Prompt cache',
   part: 'Part',
   steps: 'Steps of the loop at most',
   dollars: 'US dollars for models asked over an API',
@@ -69,6 +70,9 @@ const SETTING_NAMES: Record<string, string> = {
 const CHOICE_NAMES: Record<string, string> = {
   'paid:subscription': 'The subscription',
   'paid:api': 'An API key, through the gateway',
+  'cache:automatic': 'Automatic',
+  'cache:off': 'Off',
+  'cache:hour': 'Keep for an hour',
 };
 export const settingName = (name: string) =>
   SETTING_NAMES[name] ?? name.replace(/_/g, ' ').replace(/^./, (first) => first.toUpperCase());

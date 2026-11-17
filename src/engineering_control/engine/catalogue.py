@@ -254,6 +254,19 @@ _ASKED: Final = (
         "Give the model the files Read the files read last, when a task before it read any.",
     ),
     Param(
+        "cache",
+        "choice",
+        "automatic",
+        "Whether the provider keeps the beginning of what the model is given, to read it "
+        "again at a part of the price when another question of the run begins the same "
+        "way. Most providers do it by themselves and are not asked. Anthropic does it "
+        "where it is asked, and charges more for what it keeps than for what it only "
+        "reads: automatic asks it in a loop and in a flow that asks a model more than "
+        "once, for a few minutes; hour keeps it for an hour, at a higher price, for "
+        "flows whose questions are far apart; off never asks.",
+        choices=("automatic", "off", "hour"),
+    ),
+    Param(
         "tokens",
         "int",
         ASK_TOKENS,

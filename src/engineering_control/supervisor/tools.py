@@ -17,6 +17,7 @@ supervisor's history of decisions.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,9 +39,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.db.models import ProjectRecord, SupervisorAction
 from engineering_control.engine import validate
-from engineering_control.engine.catalogue import AGENT as AGENT_SETTING
 from engineering_control.engine.catalogue import BUDGETS
-from engineering_control.engine.catalogue import PAID as PAID_SETTING
 from engineering_control.engine.catalogue import catalogue as task_catalogue
 from engineering_control.engine.conditions import catalogue as condition_catalogue
 from engineering_control.engine.document import FORMAT as FLOW_FORMAT
@@ -74,7 +73,27 @@ AUTOMATIC_PER_TURN: Final = 40
 AUTOMATIC_PER_HOUR: Final = 200
 MAX_ANSWER: Final = 40_000
 # Settings many tasks have: the supervisor is told what they are once, not per task.
-SHARED_SETTINGS: Final = frozenset({AGENT_SETTING.name, PAID_SETTING.name})
+SHARED_BY: Final = 3
+
+
+@functools.cache
+def shared_settings() -> dict[str, str]:
+    """The settings three tasks or more have in the same words: the supervisor is told
+    what they are once, not with every task."""
+    seen: dict[tuple[str, str], int] = {}
+    for task in task_catalogue():
+        for param in task["params"]:
+            said = f"{param['doc']} Usual: {json.dumps(param['default'])}."
+            seen[(param["name"], said)] = seen.get((param["name"], said), 0) + 1
+    names = [name for name, _said in seen]
+    return {
+        name: said
+        for (name, said), count in seen.items()
+        # A name that means two things is said with each task, so that neither is lost.
+        if count >= SHARED_BY and names.count(name) == 1
+    }
+
+
 ISSUE_CHARACTERS: Final = 6_000
 LOG_CHARACTERS: Final = 6_000
 REFUSALS: Final = (ProjectInvalid, ProjectConflict, ProjectNotFound)
@@ -400,7 +419,7 @@ class Toolbox:
                         "outcomes": task["outcomes"],
                         "settings": {
                             param["name"]: "As settings_tasks_share says."
-                            if param["name"] in SHARED_SETTINGS
+                            if param["name"] in shared_settings()
                             else f"{param['doc']} Usual: {json.dumps(param['default'])}."
                             for param in task["params"]
                         },
@@ -414,10 +433,7 @@ class Toolbox:
                     if not task["retired"]
                 ],
                 # Said once, since many tasks have them.
-                "settings_tasks_share": {
-                    param.name: f"{param.doc} Usual: {json.dumps(param.default)}."
-                    for param in (AGENT_SETTING, PAID_SETTING)
-                },
+                "settings_tasks_share": shared_settings(),
                 "prompts": {
                     contract.name: {
                         "parts_a_flow_may_word": [

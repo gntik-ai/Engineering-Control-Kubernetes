@@ -121,27 +121,34 @@ async def _asked(
         )
     about = _about(data)
     repository = str(data.get("repository") or "")
+    # What the questions of a run have in common comes first, what changes least
+    # before what changes most, and the question itself last: a provider that has read
+    # the beginning of a prompt before reads it again from its cache, at a part of the
+    # price. ``parts`` is that beginning, piece by piece.
     parts = [
-        what
-        + (
-            f"\n\nWhat you are asked:\n{str(params.get('instruction') or '').strip()}"
-            if str(params.get("instruction") or "").strip()
-            else ""
-        ),
         f"The repository is {repository}." if repository else "",
         _material(
             "What the run is about", f"{about.get('title') or ''}\n\n{about.get('body') or ''}"
         ),
     ]
+    steady = len([part for part in parts if part])
     notes = [note for note in data.get("notes") or [] if isinstance(note, dict)]
     for note in notes:
         parts.append(
             _material(f"Notes of the earlier task {note.get('task')}", str(note.get("text") or ""))
         )
+    asking = [
+        what
+        + (
+            f"\n\nWhat you are asked:\n{str(params.get('instruction') or '').strip()}"
+            if str(params.get("instruction") or "").strip()
+            else ""
+        )
+    ]
     findings = ctx.given.get("findings")
     if findings:
         listed = "\n".join(f"- {_words(finding, 600)}" for finding in findings[:40])
-        parts.append(_material("What an earlier task found", listed))
+        asking.append(_material("What an earlier task found", listed))
     with_change = params.get("with_change", True) if change is None else change
     collected = data.get("change") if with_change else None
     if isinstance(collected, dict) and collected.get("files"):
@@ -153,7 +160,6 @@ async def _asked(
                 "smaller change, or without the change."
             )
         files = "\n".join(f"{f.get('status')} {f.get('path')}" for f in collected["files"])
-        parts.append(_material("The files the change touches", files))
         whole = (
             ""
             if collected.get("diff_complete", True)
@@ -162,9 +168,14 @@ async def _asked(
                 "more to the change than you see."
             )
         )
-        parts.append(_material(f"The change as a diff.{whole}", diff))
+        changed = [
+            _material("The files the change touches", files),
+            _material(f"The change as a diff.{whole}", diff),
+        ]
     elif with_change:
-        parts.append("No change has been collected in this run so far.")
+        changed = ["No change has been collected in this run so far."]
+    else:
+        changed = []
     let_go: list[str] = []
     if params.get("with_files", True) if hand is None else hand:
         # The files in hand: what the run read, and what it changed, as last seen.
@@ -192,17 +203,55 @@ async def _asked(
             "These files were read earlier and are no longer in hand, to make room. They "
             "can be read again: " + ", ".join(let_go[:60])
         )
+    # The change comes after the files: it is what an edit changes first.
+    parts.extend(changed)
     effort = str(ctx.node.params.get("effort") or api.get("effort") or "default")
     ctx.model_used = {"provider": where[0][0], "model": where[0][1]}
+    beginning, cuts, keep = "", [], []
+    for number, part in enumerate([part for part in parts if part], start=1):
+        if beginning:
+            cuts.append(len(beginning))
+        beginning += f"{part}\n\n"
+        if number == steady:
+            # What the run is about never changes: kept apart from what does.
+            keep.append(len(beginning))
+    shared = len(beginning)
+    asked_with = await asyncio.to_thread(ctx.services.runs.asked_with, ctx.item.run_id)
+    prefer = asked_with.get(where[0][0])
     return Question(
         choices=where,
         system=SYSTEM,
-        prompt=ctx.as_agent("\n\n".join(part for part in parts if part)),
+        prompt=beginning + ctx.as_agent("\n\n".join(part for part in asking if part)),
         schema=schema,
         max_tokens=int(params.get("tokens") or ASK_TOKENS),
         seconds=int(params.get("minutes") or ASK_MINUTES) * 60,
         effort=None if effort == "default" else effort,
+        cuts=(*cuts, shared),
+        keep=tuple(dict.fromkeys((*keep, shared))),
+        shared=shared,
+        cache=kept_for(ctx),
+        prefer=prefer,
     )
+
+
+def kept_for(ctx: Context) -> str:
+    """Whether a provider that caches only what it is asked to is asked: as the task
+    says, and left to the platform when it says nothing. Writing to a cache costs more
+    than reading, so left to itself the platform asks only where another question of
+    the run is likely to begin the same way soon: in a loop, or in a flow that asks a
+    model more than once."""
+    wanted = str(ctx.params.get("cache") or "automatic")
+    if wanted == "off":
+        return "none"
+    if wanted == "hour":
+        return "hour"
+    asks = [node for node in ctx.document.nodes if _where(node.task) == "model"]
+    return "short" if ctx.task.loops or len(asks) > 1 else "none"
+
+
+def _where(task: str) -> str:
+    kind = TASKS.get(task)
+    return kind.where if kind is not None else ""
 
 
 class ModelTask(Protocol):
@@ -474,9 +523,11 @@ def _so_far(ctx: Context, happened: list[dict[str, Any]]) -> str:
         + _words(step.get("detail"), 400)
         for number, step in enumerate(happened[first:], start=1)
     ]
-    earlier = len(lines) - LOG_LINES
+    # The lines only grow, so that what was read before is read from a cache: the
+    # oldest are left out a whole lot at a time, not one at every step.
+    earlier = max(0, (len(lines) - 1) // LOG_LINES - 1) * LOG_LINES
     if earlier > 0:
-        lines = [f"({earlier} earlier steps are not shown.)", *lines[-LOG_LINES:]]
+        lines = [f"({earlier} earlier steps are not shown.)", *lines[earlier:]]
     return "\n".join(lines)
 
 
@@ -633,6 +684,7 @@ class Choose:
         said = [
             "The ways you can go:\n"
             + "\n".join(f"- {_way(ctx, way, target)}" for way, target in ways),
+            "What happened so far:\n" + _so_far(ctx, happened),
             f"This is step {count} of at most {limit}."
             + (
                 " It is the last time you are asked: say done if the work can stand as it "
@@ -649,7 +701,6 @@ class Choose:
                 else "(none yet: make one)"
             ),
             _material("Your notes", str(kept.get("notes") or "(none yet)")),
-            "What happened so far:\n" + _so_far(ctx, happened),
         ]
         found = _found(happened)
         if found:

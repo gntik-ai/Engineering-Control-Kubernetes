@@ -34,7 +34,7 @@ import {
   TableRow,
   Textarea,
 } from '@gntik-ai/ui';
-import { FlaskConical, KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
+import { DatabaseZap, FlaskConical, KeyRound, LogIn, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
@@ -42,6 +42,7 @@ import {
   useResource,
   type Account,
   type Accounts,
+  type CacheTrial,
   type ModelPrice,
   type ProviderType,
 } from '../api';
@@ -312,6 +313,110 @@ function readPrices(text: string): { prices: Record<string, ModelPrice>; problem
   return { prices, problem: null };
 }
 
+/** Ask a model of the account the same long question again, and show what the provider
+ * read from its cache: whether caching works for the way the platform asks. */
+function CacheTrialDialog({ account, open, onOpenChange, onSaved }: DialogProps & { account: Account }) {
+  const models = account.models ?? [];
+  const [model, setModel] = useState(models[0] ?? '');
+  const [shown, setShown] = useState<CacheTrial | null>(null);
+  const { pending, problem, submit, reset } = useSubmit(
+    () => postJson<CacheTrial>(`accounts/${account.id}/cache-trial`, { model }).then(setShown),
+    onSaved,
+  );
+  useEffect(() => {
+    if (!open) return;
+    setModel((account.models ?? [])[0] ?? '');
+    setShown(null);
+    reset();
+    // Only when it opens.
+  }, [open]);
+  const send = (event: FormEvent) => {
+    event.preventDefault();
+    void submit();
+  };
+  const number = (value: number) => value.toLocaleString('en');
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <form onSubmit={send} className="contents">
+          <DialogHeader>
+            <DialogTitle>Try the cache of {account.name}</DialogTitle>
+            <DialogDescription>
+              A model is asked the same long question again, four times at most. A provider that keeps what it read
+              reads the beginning from its cache the second time, at a part of the price. This costs what about thirty
+              thousand tokens cost at the model.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="grid gap-4">
+            {problem ? <Alert tone="destructive" title={problem} /> : null}
+            <Field>
+              <FieldLabel required>Model</FieldLabel>
+              {models.length ? (
+                <SimpleSelect
+                  aria-label="Model"
+                  items={models.map((name) => ({ value: name, label: name }))}
+                  value={model}
+                  onValueChange={(value) => setModel(value ?? model)}
+                />
+              ) : (
+                <Input name="model" value={model} onValueChange={setModel} maxLength={100} />
+              )}
+            </Field>
+            {shown ? (
+              <div className="grid gap-2">
+                <Alert
+                  tone={shown.works ? 'success' : 'warning'}
+                  title={
+                    shown.works
+                      ? `${shown.model} read the beginning from the cache.`
+                      : `${shown.model} read nothing from the cache.`
+                  }
+                >
+                  {shown.works
+                    ? shown.with_another_shape
+                      ? 'It did so for another shape of answer as well: tasks of different kinds share what is kept.'
+                      : 'With another shape of answer it read anew: only questions of the same kind share what is kept.'
+                    : 'Providers keep what they read as they can and promise nothing; try again, or another model.'}
+                </Alert>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Asked</TableHead>
+                      <TableHead>Read new</TableHead>
+                      <TableHead>Of that, kept</TableHead>
+                      <TableHead>Read from cache</TableHead>
+                      <TableHead>Written</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {shown.asked.map((entry, index) => (
+                      <TableRow key={index}>
+                        <TableCell>{entry.what}</TableCell>
+                        <TableCell className={mono}>{number(entry.input)}</TableCell>
+                        <TableCell className={mono}>{number(entry.cache_write)}</TableCell>
+                        <TableCell className={mono}>{number(entry.cached)}</TableCell>
+                        <TableCell className={mono}>{number(entry.output)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            ) : null}
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              Close
+            </Button>
+            <Button type="submit" loading={pending} disabled={!model.trim()}>
+              {shown ? 'Try again' : 'Try it'}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function EditAccountDialog({
   account,
   provider,
@@ -499,7 +604,7 @@ function AccountRow({
   onChanged: () => void;
   onProblem: (message: string) => void;
 }) {
-  const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | null>(null);
+  const [dialog, setDialog] = useState<'sign-in' | 'edit' | 'remove' | 'cache' | null>(null);
   const shown = state(account);
   const signedIn = account.state !== 'signed_out';
   const api = account.kind === 'api';
@@ -568,6 +673,9 @@ function AccountRow({
               ...(signedIn && !account.being_tried
                 ? [{ label: api ? 'Ask for its models' : 'Try it', icon: FlaskConical, onSelect: tryIt }]
                 : []),
+              ...(api && signedIn
+                ? [{ label: 'Try the cache', icon: DatabaseZap, onSelect: () => setDialog('cache') }]
+                : []),
               ...(signedIn && canSignIn
                 ? [
                     {
@@ -592,6 +700,14 @@ function AccountRow({
           onOpenChange={(open) => setDialog(open ? 'sign-in' : null)}
           onSaved={onChanged}
         />
+        {api ? (
+          <CacheTrialDialog
+            account={account}
+            open={dialog === 'cache'}
+            onOpenChange={(open) => setDialog(open ? 'cache' : null)}
+            onSaved={onChanged}
+          />
+        ) : null}
         <EditAccountDialog
           account={account}
           provider={provider}

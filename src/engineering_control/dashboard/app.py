@@ -61,6 +61,7 @@ from engineering_control.dashboard.schemas import (
     AgentInput,
     BacklogSyncInput,
     BudgetInput,
+    CacheTrialInput,
     EvaluationInput,
     FlowCheckInput,
     FlowCreateInput,
@@ -1232,6 +1233,18 @@ def create_app(
             PlainChangeInput,
             lambda _body: service(request).check_account(account_id, models_of(request)),
             event="dashboard.account_checked",
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/accounts/{account_id}/cache-trial")
+    async def try_cache_api(account_id: UUID, request: Request) -> Response:
+        """Ask a model of the account twice and say what was read from the provider's
+        cache the second time."""
+        return await project_change(
+            request,
+            CacheTrialInput,
+            lambda body: service(request).try_cache(account_id, body.model, models_of(request)),
+            event="dashboard.account_cache_tried",
             entity="account",
         )
 

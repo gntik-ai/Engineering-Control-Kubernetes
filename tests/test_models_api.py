@@ -657,6 +657,7 @@ async def test_a_question_is_asked_with_the_account_unused_longest_and_costed(as
         "provider": "deepseek",
         "model": "model-a-0915",
         "account": "DeepSeek one",
+        "account_id": str(first),
     }, "the price is written for the name asked for, not for what the provider calls it"
     asked.accounts.update(first, prices={"model-a": {"input": 1, "output": 4}})
     assert asked.state(first)["state"] == "ready" and asked.state(first)["last_used_at"]

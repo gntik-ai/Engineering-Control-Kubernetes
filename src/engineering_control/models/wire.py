@@ -15,6 +15,9 @@ class Wire:
     read: int  # tokens read new
     written: int  # tokens written
     cached: int  # tokens read again from the provider's cache
+    # Of the tokens read new, the ones the provider wrote to its cache on the way:
+    # some providers charge more for these than for a token only read.
+    cache_written: int = 0
 
 
 class WireError(Exception):

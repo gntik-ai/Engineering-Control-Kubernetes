@@ -295,6 +295,13 @@ class SummariesInput(DashboardModel):
     tests: bool = False
 
 
+class CacheTrialInput(DashboardModel):
+    """Try whether a provider reads from its cache: with which model of the account."""
+
+    csrf_token: str = Field(min_length=20, max_length=200)
+    model: str = Field(min_length=1, max_length=100)
+
+
 class PlainChangeInput(DashboardModel):
     """A change that needs nothing but the session's token."""
 

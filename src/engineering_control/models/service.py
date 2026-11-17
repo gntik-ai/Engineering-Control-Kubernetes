@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import structlog
@@ -52,6 +52,18 @@ class Question:
     max_tokens: int = 8000
     seconds: int = 300
     effort: str | None = None
+    # The prompt begins with what the questions of a run have in common and ends with
+    # the question itself. ``cuts`` are the offsets at which a new piece of it begins;
+    # ``keep`` the offsets at which something ends that a later question is likely to
+    # begin with again; ``shared`` where the question itself begins.
+    cuts: tuple[int, ...] = ()
+    keep: tuple[int, ...] = ()
+    shared: int = 0
+    # Whether a provider that caches only what a request marks is asked to: "none",
+    # "short" (kept for minutes) or "hour".
+    cache: str = "none"
+    # The account the run asked with before: a provider's cache belongs to one account.
+    prefer: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,51 @@ class _Held:
     prices: dict[str, Any]
 
 
+# Below this many characters nothing is marked to be kept: no provider caches so
+# little, and a mark would only cost.
+KEEP_CHARACTERS: Final = 2000
+
+
+def marks(provider: ApiProvider, question: Question) -> tuple[int, ...]:
+    """Where the provider is asked to keep what it read: only a provider that caches
+    what a request marks, and only when the question wants it kept."""
+    if provider.cache != "marked" or question.cache == "none":
+        return ()
+    return tuple(end for end in question.keep if end >= KEEP_CHARACTERS)
+
+
+def usage_of(
+    held: _Held,
+    model: str,
+    answered: str,
+    used: dict[str, int],
+    question: Question,
+    *,
+    batch: bool = False,
+) -> dict[str, Any]:
+    """What a question used, as it is kept with its step: tokens, and what they cost
+    when the account says what its model costs."""
+    write = held.provider.cache_write[1 if question.cache == "hour" else 0]
+    cost = cost_of(
+        held.prices,
+        model,
+        used,
+        write=write,
+        part=held.provider.batch_price if batch else 1.0,
+    )
+    counted = {name: count for name, count in used.items() if name != "cache_write" or count}
+    return {
+        "tokens": used["input"] + used["output"],
+        **counted,
+        **({"cost": cost} if cost is not None else {}),
+        **({"batch": True} if batch else {}),
+        "provider": held.provider.key,
+        "model": answered,
+        "account": held.name,
+        "account_id": str(held.id),
+    }
+
+
 def names(choices: tuple[tuple[str, str], ...]) -> str:
     said = [f"{BY_KEY[p].name if p in BY_KEY else p} ({m})" for p, m in choices]
     return " or ".join(said)
@@ -124,9 +181,10 @@ class Models:
 
     # --- accounts ------------------------------------------------------------------------
 
-    def _held(self, provider: str, besides: set[UUID]) -> _Held | None:
-        """The account of that provider to ask with: the one unused longest that has a
-        key, is not paused and is not resting."""
+    def _held(self, provider: str, besides: set[UUID], prefer: UUID | None = None) -> _Held | None:
+        """The account of that provider to ask with: the one the run asked with before,
+        or else the one unused longest, that has a key, is not paused and is not
+        resting."""
         kind = BY_KEY.get(provider)
         if kind is None or self.sealing_key is None:
             return None
@@ -151,7 +209,12 @@ class Models:
                     and _aware(account.limited_until) > now
                 )
             ]
-            ready.sort(key=lambda a: _aware(a.last_used_at) if a.last_used_at else _EPOCH)
+            ready.sort(
+                key=lambda a: (
+                    a.id != prefer,
+                    _aware(a.last_used_at) if a.last_used_at else _EPOCH,
+                )
+            )
             for account in ready:
                 try:
                     key = unseal(self.sealing_key, account.id, str(account.sealed_key))
@@ -208,6 +271,9 @@ class Models:
                 seconds=question.seconds,
                 effort=question.effort,
                 http=self._anthropic_http,
+                cuts=question.cuts,
+                keep=marks(held.provider, question),
+                hour=question.cache == "hour",
             )
         return await openai_style.complete(
             http=self.http,
@@ -254,13 +320,13 @@ class Models:
         for provider, model in question.choices:
             tried: set[UUID] = set()
             while True:
-                held = await asyncio.to_thread(self._held, provider, tried)
+                held = await asyncio.to_thread(self._held, provider, tried, question.prefer)
                 if held is None:
                     break
                 tried.add(held.id)
                 had_account = True
                 started = time.monotonic()
-                used = {"input": 0, "output": 0, "cached": 0}
+                used = {"input": 0, "output": 0, "cached": 0, "cache_write": 0}
                 prompt, why = base, ""
                 try:
                     for asked in (1, 2):
@@ -268,6 +334,7 @@ class Models:
                         used["input"] += wire.read
                         used["output"] += wire.written
                         used["cached"] += wire.cached
+                        used["cache_write"] += wire.cache_written
                         data = shape.read_object(wire.text)
                         why = (
                             "it was not a JSON object"
@@ -276,7 +343,6 @@ class Models:
                         )
                         if not why and data is not None:
                             await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
-                            cost = cost_of(held.prices, model, used)
                             return Reply(
                                 data=data,
                                 text=wire.text,
@@ -284,14 +350,7 @@ class Models:
                                 model=wire.model,
                                 account_id=held.id,
                                 account=held.name,
-                                usage={
-                                    "tokens": used["input"] + used["output"],
-                                    **used,
-                                    **({"cost": cost} if cost is not None else {}),
-                                    "provider": provider,
-                                    "model": wire.model,
-                                    "account": held.name,
-                                },
+                                usage=usage_of(held, model, wire.model, used, question),
                                 seconds=round(time.monotonic() - started, 1),
                                 asked=asked,
                             )
@@ -335,6 +394,103 @@ class Models:
             f"Waiting for an account of {names(question.choices)} that has a key and is ready.",
             later=True,
         )
+
+    # --- trying the cache ------------------------------------------------------------------
+
+    async def try_cache(self, account_id: UUID, model: str) -> dict[str, Any]:
+        """Ask a model of the account the same long question until the provider reads
+        its beginning from its cache, three times at most, and once more with another
+        shape of answer. Says what each time read new, wrote to the cache and read from
+        it: whether the provider's cache works for the way the platform asks. It costs
+        what a few thousand tokens cost."""
+        held = await asyncio.to_thread(self._one, account_id)
+        seed = uuid4().hex
+        # A beginning no question had before, so that the first time finds nothing kept.
+        lines = "\n".join(
+            f"{number}. Entry {seed}-{number} of the register is {number * 7919 % 9973}."
+            for number in range(1, TRIAL_LINES + 1)
+        )
+        material = f"A register, made for this one trial ({seed}):\n{lines}\n\n"
+        ask = "How many entries does the register have? Answer with the number."
+
+        def question(schema: dict[str, Any]) -> Question:
+            prompt = (
+                f"{material}{ask}\n\nAnswer with one JSON object of exactly this shape and "
+                f"nothing else, no text before or after it:\n{shape.words(schema)}"
+            )
+            return Question(
+                choices=((held.provider.key, model),),
+                system="You answer one question about the text you are given, shortly.",
+                prompt=prompt,
+                schema=schema,
+                max_tokens=4000,
+                seconds=120,
+                effort="low" if held.provider.effort else None,
+                cuts=(len(material),),
+                keep=(len(material),),
+                shared=len(material),
+                cache="short",
+            )
+
+        def number(name: str) -> dict[str, Any]:
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [name],
+                "properties": {name: {"type": "integer"}},
+            }
+
+        asked: list[dict[str, Any]] = []
+        try:
+            for schema in (number("entries"), number("entries"), number("entries")):
+                first = question(schema)
+                wire = await self._patient(held, model, first, first.prompt)
+                asked.append(_trial(wire, "the same question"))
+                if wire.cached:
+                    break
+                await self._sleep(TRIAL_PAUSE)
+            other = question(number("count"))
+            wire = await self._patient(held, model, other, other.prompt)
+            asked.append(_trial(wire, "the same beginning, another shape of answer"))
+        except WireError as error:
+            if error.kind == "refused":
+                await asyncio.to_thread(
+                    self._learn, held.id, state="sign_in_required", reason=error.detail
+                )
+            raise ModelError(error.kind, error.detail) from error
+        await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+        again = [entry for entry in asked[1:-1] if entry["cached"]]
+        return {
+            "account": held.name,
+            "provider": held.provider.key,
+            "model": model,
+            "how": held.provider.cache,
+            "asked": asked,
+            "works": bool(again),
+            "with_another_shape": bool(asked[-1]["cached"]),
+        }
+
+    def _one(self, account_id: UUID) -> _Held:
+        """That account, with its key open. Raises ``ModelError`` when it cannot ask."""
+        with self.sessions() as session:
+            account = session.get(ProviderAccount, account_id)
+            kind = BY_KEY.get(account.provider) if account is not None else None
+            if account is None or kind is None or not account.sealed_key:
+                raise ModelError("no_account", "That account has no API key.")
+            if self.sealing_key is None:
+                raise ModelError("no_key", "This installation has no key to open API keys with.")
+            try:
+                key = unseal(self.sealing_key, account.id, str(account.sealed_key))
+            except SealError as error:
+                raise ModelError("refused", str(error)) from error
+            return _Held(
+                id=account.id,
+                name=account.name,
+                provider=kind,
+                url=kind.endpoint(account.endpoint).url,
+                key=key,
+                prices=dict(account.prices or {}),
+            )
 
     # --- trying an account ----------------------------------------------------------------
 
@@ -381,6 +537,20 @@ class Models:
 
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+# The trial of a cache: how long its text is, in lines of about a dozen tokens each (more
+# than any provider's least for caching), and how long is waited between two tries.
+TRIAL_LINES: Final = 700
+TRIAL_PAUSE: Final = 3.0
+
+
+def _trial(wire: Wire, what: str) -> dict[str, Any]:
+    return {
+        "what": what,
+        "input": wire.read,
+        "cache_write": wire.cache_written,
+        "cached": wire.cached,
+        "output": wire.written,
+    }
 
 
 def _aware(value: datetime) -> datetime:

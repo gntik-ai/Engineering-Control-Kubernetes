@@ -47,6 +47,19 @@ class ApiProvider:
     effort: bool = False
     # What the provider puts before the name of a model when it lists or names one.
     model_prefix: str = ""
+    # How the provider reads the beginning of a prompt again from a cache instead of
+    # anew, at a lower price: by itself ("automatic"), or only where the request marks
+    # the end of what is to be kept ("marked").
+    cache: str = "automatic"
+    # What a token written to the cache costs, as a multiple of a token that is only
+    # read: kept for minutes, kept for an hour. 1 where writing costs nothing more.
+    cache_write: tuple[float, float] = (1.0, 1.0)
+    # How the provider takes questions in a batch, answered within hours at a lower
+    # price: "" when it takes none, "anthropic" (its own interface), "files" (a file of
+    # requests is uploaded and a batch made of it, as OpenAI has it) or "google".
+    batch: str = ""
+    # What a token costs in a batch, as a part of what it costs asked at once.
+    batch_price: float = 0.5
 
     def endpoint(self, key: str | None) -> Endpoint:
         for endpoint in self.endpoints:
@@ -64,6 +77,9 @@ class ApiProvider:
             ],
             "keys_at": self.keys_at,
             "key_shape": self.key_shape,
+            "cache": self.cache,
+            "batch": bool(self.batch),
+            "batch_price": self.batch_price,
         }
 
 
@@ -81,6 +97,8 @@ API_PROVIDERS: Final = (
         keys_at="console.anthropic.com → API keys",
         key_pattern=re.compile(r"^sk-ant-api\d{2}-[A-Za-z0-9_-]{40,400}$"),
         key_shape="it starts with sk-ant-api",
+        cache="marked",
+        cache_write=(1.25, 2.0),
     ),
     ApiProvider(
         key="openai",
@@ -230,17 +248,27 @@ def clean_prices(value: Any) -> dict[str, dict[str, float]]:
     return cleaned
 
 
-def cost_of(prices: dict[str, Any] | None, model: str, used: dict[str, int]) -> float | None:
+def cost_of(
+    prices: dict[str, Any] | None,
+    model: str,
+    used: dict[str, Any],
+    *,
+    write: float = 1.0,
+    part: float = 1.0,
+) -> float | None:
     """What a call cost, when the account says what its model costs. Tokens read again
-    from the provider's cache count at their own price, or else as tokens read."""
+    from the provider's cache count at their own price, or else as tokens read. Of the
+    tokens read, the ones written to the cache count ``write`` times; ``part`` is what
+    is paid of the whole, for a question that was asked in a batch."""
     entry = (prices or {}).get(model)
     if not isinstance(entry, dict):
         return None
     try:
         read, written = float(entry["input"]), float(entry["output"])
         again = float(entry.get("cached", read))
+        kept = int(used.get("cache_write", 0) or 0)
+        total = int(used.get("input", 0) or 0) * read + int(used.get("output", 0) or 0) * written
+        total += int(used.get("cached", 0) or 0) * again + kept * read * (write - 1.0)
     except (KeyError, TypeError, ValueError):
         return None
-    total = used.get("input", 0) * read + used.get("output", 0) * written
-    total += used.get("cached", 0) * again
-    return round(total / 1_000_000, 6)
+    return round(total * part / 1_000_000, 6)
