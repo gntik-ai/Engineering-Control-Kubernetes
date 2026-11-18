@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { setQuery, useLocation } from '../router';
+import { useSubmit } from './ProjectDialogs';
 import { WorkspaceReview, WorkspaceSync, type StageReview } from './WorkspaceReview';
 
 export interface ImportState {
@@ -57,19 +58,38 @@ export function WorkspaceImport({
   const [running, setRunning] = useState(false);
   const [error, setError] = useState('');
   const [choice, setChoice] = useState('');
+  const [refreshNote, setRefreshNote] = useState('');
   const [edit, setEdit] = useState<string | null>(null);
   const [auto] = useState(useLocation().query.get('import') === '1');
   const active = useRef(true);
   const submitted = useRef(false);
   const started = useRef(false);
   const state =
-    latest && (!persisted.data || latest.version >= persisted.data.version) ? latest : persisted.data;
+    latest && (!persisted.data || latest.version > persisted.data.version) ? latest : persisted.data;
   const options = (state?.models ?? []).map(({ provider, model }) => ({
     value: encode(provider, model),
     label: provider + ' · ' + model,
   }));
   const selected = choice || (state?.provider && state.model ? encode(state.provider, state.model) : '');
   const model = state?.models.find((option) => encode(option.provider, option.model) === selected);
+  const refreshModels = useSubmit(
+    () => {
+      setRefreshNote('');
+      return postJson<{ refreshed: number; unavailable: number }>(
+        'account-models/refresh', {}, { quiet: true },
+      );
+    },
+    ({ refreshed, unavailable }) => {
+      persisted.reload();
+      setRefreshNote(
+        unavailable
+          ? `Refreshed ${refreshed} of ${refreshed + unavailable} account catalogs. Check the accounts in the Administrator Console.`
+          : refreshed
+            ? 'Model list refreshed.'
+            : 'No active API accounts with a key.',
+      );
+    },
+  );
   useEffect(() => {
     active.current = true;
     return () => {
@@ -170,25 +190,43 @@ export function WorkspaceImport({
           )}
         </p>
       )}
-      {(state.stage === 'analysis' || state.review) &&
-        (options.length ? (
-          <Field>
-            <FieldLabel>Model for analysis</FieldLabel>
-            <SimpleSelect
-              aria-label="Model for analysis"
-              placeholder="Choose a configured model"
-              items={options}
-              value={selected || null}
-              onValueChange={(v) => setChoice(v ?? '')}
+      {(state.stage === 'analysis' || state.review) && (
+        <>
+          {options.length ? (
+            <Field>
+              <FieldLabel>Model for analysis</FieldLabel>
+              <SimpleSelect
+                aria-label="Model for analysis"
+                placeholder="Choose a configured model"
+                items={options}
+                value={model ? selected : null}
+                onValueChange={(v) => setChoice(v ?? '')}
+              />
+            </Field>
+          ) : (
+            <Alert
+              tone="info"
+              title="A configured model is required"
+              description="Refresh the model list or check an API account in the Administrator Console."
             />
-          </Field>
-        ) : (
-          <Alert
-            tone="info"
-            title="A configured model is required"
-            description="Check a model account in the Administrator Console, then return to this project."
-          />
-        ))}
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={refreshModels.pending}
+              disabled={running || refreshModels.pending}
+              onClick={() => void refreshModels.submit()}
+            >
+              Refresh models
+            </Button>
+            {refreshNote && (
+              <span role="status" className="text-sm text-muted-foreground">{refreshNote}</span>
+            )}
+          </div>
+          {refreshModels.problem && <Alert tone="destructive" title={refreshModels.problem} />}
+        </>
+      )}
       {state.review && (
         <WorkspaceReview
           key={state.stage}

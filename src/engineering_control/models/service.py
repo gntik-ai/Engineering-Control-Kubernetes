@@ -200,6 +200,7 @@ class Models:
         self._http = http
         self._anthropic_http = anthropic_http
         self._sleep = sleep
+        self._catalog_lock = asyncio.Lock()
         # What the providers' models cost, as public lists say it.
         self.price_lists = PriceLists(lambda: self.http)
 
@@ -273,7 +274,6 @@ class Models:
         reason: str | None = None,
         rest: bool = False,
         used: bool = False,
-        models: list[str] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
@@ -286,9 +286,6 @@ class Models:
             account.limited_until = now + timedelta(minutes=REST_MINUTES) if rest else None
             if used:
                 account.last_used_at = now
-            if models is not None:
-                account.models = models
-                account.identity = f"{len(models)} models" if models else None
 
     # --- one call ------------------------------------------------------------------------
 
@@ -534,7 +531,35 @@ class Models:
 
     # --- trying an account ----------------------------------------------------------------
 
-    async def check(self, account_id: UUID) -> tuple[str, str | None]:
+    def _catalog_accounts(self) -> list[UUID]:
+        with self.sessions() as session:
+            return list(
+                session.scalars(
+                    select(ProviderAccount.id).where(
+                        ProviderAccount.provider.in_(tuple(BY_KEY)),
+                        ProviderAccount.sealed_key.is_not(None),
+                        ProviderAccount.archived_at.is_(None),
+                        ProviderAccount.paused.is_(False),
+                        ProviderAccount.state.in_(("ready", "limited", "unchecked")),
+                    )
+                )
+            )
+
+    async def refresh_catalogs(self) -> dict[str, int]:
+        """Refresh what configured keys can see using only model-list requests."""
+        checked = failed = 0
+        async with self._catalog_lock:
+            for account_id in await asyncio.to_thread(self._catalog_accounts):
+                state, _ = await self.check(account_id, catalog_only=True)
+                if state == "ready":
+                    checked += 1
+                else:
+                    failed += 1
+        return {"refreshed": checked, "unavailable": failed}
+
+    async def check(
+        self, account_id: UUID, *, catalog_only: bool = False
+    ) -> tuple[str, str | None]:
         """Ask the provider which models the account's key reaches. That costs nothing,
         and says whether the key is accepted. Returns the state and the reason."""
 
@@ -551,6 +576,10 @@ class Models:
             return "signed_out", "The account has no key yet."
         if sealing_key is None:
             return "unchecked", "This installation has no key to open API keys with."
+        if account.archived_at is not None or (catalog_only and account.paused):
+            return "unchecked", "The account is inactive."
+        found: list[str] | None = None
+        reason: str | None
         try:
             key = unseal(sealing_key, account.id, account.sealed_key)
             url = kind.endpoint(account.endpoint).url
@@ -570,9 +599,35 @@ class Models:
             state = "sign_in_required" if error.kind == "refused" else "unchecked"
             reason = error.detail
         else:
-            await asyncio.to_thread(self._learn, account_id, state="ready", models=found)
-            return "ready", None
-        await asyncio.to_thread(self._learn, account_id, state=state, reason=reason)
+            state, reason = "ready", None
+
+        def save() -> bool:
+            with self.sessions.begin() as session:
+                current = session.get(ProviderAccount, account_id, with_for_update=True)
+                if (
+                    current is None
+                    or current.archived_at is not None
+                    or current.credential_generation != account.credential_generation
+                    or current.endpoint != account.endpoint
+                    or (
+                        catalog_only
+                        and (
+                            current.paused or current.state not in ("ready", "limited", "unchecked")
+                        )
+                    )
+                ):
+                    return False
+                if not catalog_only or state == "sign_in_required":
+                    current.state, current.state_reason = state, reason[:300] if reason else None
+                    current.checked_at = datetime.now(UTC)
+                    current.limited_until = None
+                if found is not None:
+                    current.models = found
+                    current.identity = f"{len(found)} models" if found else None
+                return True
+
+        if not await asyncio.to_thread(save):
+            return "unchecked", "The account changed while the model list was being read."
         return state, reason
 
 

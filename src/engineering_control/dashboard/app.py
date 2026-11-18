@@ -323,6 +323,20 @@ def create_app(
                 log_failure("workspace-sync", "workspace publication retry failed", error)
             await asyncio.sleep(30)
 
+    async def keep_model_catalogs_current(available: Models) -> None:
+        while True:
+            try:
+                result = await available.refresh_catalogs()
+                LOGGER.info(
+                    "Model catalogs refreshed=%d unavailable=%d",
+                    result["refreshed"],
+                    result["unavailable"],
+                )
+                log_recovery("model-catalogs", "model catalog refresh recovered")
+            except Exception as error:  # noqa: BLE001 - existing model choices remain usable
+                log_failure("model-catalogs", "model catalog refresh failed", error)
+            await asyncio.sleep(24 * 3600)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -376,6 +390,8 @@ def create_app(
         # cluster, and keeps its own record within its time.
         if repository is None:
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
+            if app.state.models.sealing_key is not None:
+                keepers.append(asyncio.create_task(keep_model_catalogs_current(app.state.models)))
             told = await listen(
                 health, resolved.health_host, resolved.health_port, extra=told_to_the_cluster
             )
@@ -1436,6 +1452,23 @@ def create_app(
             PlainChangeInput,
             lambda _body: service(request).check_account(account_id, models_of(request)),
             event="dashboard.account_checked",
+            entity="account",
+        )
+
+    @app.post("/api/dashboard/account-models/refresh")
+    async def refresh_account_models_api(request: Request) -> Response:
+        async def refresh(_: PlainChangeInput) -> dict[str, int]:
+            available = models_of(request)
+            if available is None or available.sealing_key is None:
+                raise ProjectInvalid("This installation cannot read model catalogs")
+            return await available.refresh_catalogs()
+
+        return await project_change(
+            request,
+            PlainChangeInput,
+            refresh,
+            event="dashboard.account_models_refreshed",
+            subject="models",
             entity="account",
         )
 

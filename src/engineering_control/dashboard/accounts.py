@@ -480,6 +480,7 @@ class Accounts:
             account.sealed_key = sealed
             account.state, account.state_reason = "unchecked", None
             account.identity = None
+            account.models = None
             account.limited_until = None
             account.signed_in_at = datetime.now(UTC)
             account.credential_generation += 1

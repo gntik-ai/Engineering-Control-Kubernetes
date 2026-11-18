@@ -326,8 +326,6 @@ async def models(
     try:
         async for model in client.models.list(limit=100):
             found.append(str(model.id))
-            if len(found) >= 200:
-                break
     except anthropic.APIError as error:
         raise _failure(error) from error
     finally:
