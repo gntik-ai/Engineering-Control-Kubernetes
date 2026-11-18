@@ -327,6 +327,17 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class WorkspaceImportStep(PlainChangeInput):
+    version: int = Field(ge=0)
+    provider: str | None = Field(default=None, max_length=16)
+    model: str | None = Field(default=None, max_length=200)
+
+
+class WorkspaceDescription(PlainChangeInput):
+    version: int = Field(ge=0)
+    description: str = Field(min_length=1, max_length=4000)
+
+
 class EpicInput(PlainChangeInput):
     title: str = Field(min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=40000)

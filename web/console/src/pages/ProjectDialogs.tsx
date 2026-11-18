@@ -80,7 +80,7 @@ function RepositoryField({ value, onChange }: { value: string; onChange: (value:
         onValueChange={onChange}
         maxLength={200}
         inputClassName="font-mono"
-        placeholder="gntik-ai/documentation"
+        placeholder="https://github.com/owner/repository"
       />
       <FieldDescription>{description}</FieldDescription>
     </Field>
@@ -93,12 +93,12 @@ function RepositoryField({ value, onChange }: { value: string; onChange: (value:
           title="GitHub could not be asked for the repositories"
           description="Type the repository instead. It is checked against GitHub when the project is created."
         />
-        {typed('Written as owner/name.')}
+        {typed('Enter a GitHub repository URL or owner/name.')}
       </>
     );
   }
   if (!repositories.data) return <Skeleton className="h-16 w-full" />;
-  if (!repositories.data.configured) return typed('Written as owner/name. A repository belongs to one project.');
+  if (!repositories.data.configured) return typed('Enter a GitHub repository URL or owner/name. A repository belongs to one project.');
   const free = repositories.data.items.filter((item) => !item.project && !item.archived);
   if (free.length === 0) {
     return (

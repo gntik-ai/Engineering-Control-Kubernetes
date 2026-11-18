@@ -108,6 +108,8 @@ from engineering_control.dashboard.schemas import (
     TaskInput,
     TriggerInput,
     TriggerUpdateInput,
+    WorkspaceDescription,
+    WorkspaceImportStep,
     WorkspaceIssueInput,
 )
 from engineering_control.dashboard.service import DashboardService
@@ -825,6 +827,52 @@ def create_app(
             PlainChangeInput,
             lambda _body: service(request).set_default_project(name),
             event="dashboard.default_project_changed",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/import")
+    async def workspace_import_status(name: str, request: Request) -> Response:
+        try:
+            imports = repo(request).workspace_imports
+            result = await asyncio.to_thread(imports.status, name)
+            return JSONResponse(result)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Project not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/import/start")
+    async def start_workspace_import(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).workspace_imports.start, name),
+            event="workspace.import_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/import/advance")
+    async def advance_workspace_import(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceImportStep,
+            lambda body: repo(request).workspace_imports.advance(
+                name, body.version, github(request), models_of(request), body.provider, body.model
+            ),
+            event="workspace.import_advanced",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/import/description")
+    async def approve_workspace_description(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceDescription,
+            lambda body: asyncio.to_thread(
+                repo(request).workspace_imports.approve_description,
+                name,
+                body.version,
+                body.description,
+            ),
+            event="workspace.description_approved",
+            subject=name,
         )
 
     @app.get("/api/dashboard/projects/{name}/planning")

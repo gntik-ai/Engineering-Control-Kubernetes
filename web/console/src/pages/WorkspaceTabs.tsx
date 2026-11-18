@@ -8,6 +8,7 @@ import { apiUrl, postJson, useResource, type ProjectSummary } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
 import { setQuery, useLocation } from '../router';
+import { WorkspaceImport } from './WorkspaceImport';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = { home: 'Home', epics: 'Epics', stories: 'User Stories', issues: 'Issues', architecture: 'Architecture' };
@@ -136,7 +137,7 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
   );
 }
 
-export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
+export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary; onApproved: () => void }) {
   const requested = useLocation().query.get('tab') ?? 'home';
   const tab = Object.hasOwn(sections, requested) ? requested : 'home';
   return (
@@ -151,6 +152,7 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
             <div><dt className="mb-1 font-medium">Description</dt><dd className="max-w-prose whitespace-pre-wrap break-words">{project.description ?? 'No description yet.'}</dd></div>
             <div><dt className="mb-1 font-medium">Repository</dt><dd className="break-all"><Link href={project.repository_url} target="_blank" rel="noreferrer">{project.repository_url}</Link></dd></div>
           </dl>
+          {tab === 'home' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={onApproved} />}
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map(kind =>
           <TabsPanel key={kind} value={kind} className="pt-5">{tab === kind && <Records kind={kind} project={project.project} />}</TabsPanel>)}

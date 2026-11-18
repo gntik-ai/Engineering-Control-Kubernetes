@@ -15,13 +15,13 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import ProjectRecord, ProjectSettings
+from engineering_control.db.models import ProjectRecord, ProjectSettings, WorkspaceImport
 from engineering_control.projects import DEFAULT_BRANCH, PROJECT_REPOSITORIES, PROJECTS
 
 # The name is an identifier: it appears in addresses, filters and records.
@@ -43,6 +43,24 @@ class ProjectConflict(ValueError):
 
 class ProjectNotFound(LookupError):
     """No active project has that name (404)."""
+
+
+def active_project(session: Session, name: str, *, lock: bool = False) -> ProjectRecord:
+    where = (ProjectRecord.name == name, ProjectRecord.archived_at.is_(None))
+    if lock:
+        # Take a write lock before reading parent sets on PostgreSQL and SQLite. Two
+        # concurrent removals must never each see the other as the remaining parent.
+        row = session.scalar(
+            update(ProjectRecord)
+            .where(*where)
+            .values(updated_at=ProjectRecord.updated_at)
+            .returning(ProjectRecord)
+        )
+    else:
+        row = session.scalar(select(ProjectRecord).where(*where))
+    if row is None:
+        raise ProjectNotFound(name)
+    return row
 
 
 def clean_display_name(value: str | None, *, fallback: str) -> str:
@@ -243,6 +261,14 @@ class ProjectRecords:
                 from engineering_control.dashboard.project_sections import ensure_core_sections
 
                 ensure_core_sections(session, record)
+                session.add(
+                    WorkspaceImport(
+                        project_id=record.id,
+                        repository=record.source_repository,
+                        branch=record.default_branch,
+                        progress={"counts": {}, "page": 1},
+                    )
+                )
                 if settings.default_project_id is None:
                     settings.default_project_id = record.id
                 session.commit()

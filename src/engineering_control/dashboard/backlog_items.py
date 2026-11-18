@@ -24,6 +24,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    active_project,
 )
 from engineering_control.dashboard.project_sections import SECTION_KEY
 from engineering_control.db.models import (
@@ -33,6 +34,7 @@ from engineering_control.db.models import (
     ProjectSection,
     SandboxRun,
     WorkQueueEntry,
+    WorkspaceImport,
 )
 from engineering_control.engine.library import plan_for_item
 from engineering_control.github_app import Issue
@@ -659,7 +661,8 @@ class BacklogItems:
         """
         counts = {"imported": 0, "updated": 0, "closed": 0, "reopened": 0, "routed": 0}
         with self.sessions() as session:
-            record = self._project(session, project)
+            record = active_project(session, project, lock=True)
+            reviewed_import = session.get(WorkspaceImport, record.id) is not None
             repository = record.source_repository
             sections = list(
                 session.scalars(
@@ -682,6 +685,12 @@ class BacklogItems:
                 seen.add(issue.number)
                 labels = [label for label in issue.labels if label][:50]
                 item = existing.get(issue.number)
+                # The wizard owns newly discovered issues on an enrolled project.
+                # The legacy open-issue scanner must not create an executable copy.
+                if reviewed_import and (
+                    item is None or item.workspace_review not in (None, "approved")
+                ):
+                    continue
                 if item is None:
                     item = BacklogItem(
                         project_id=record.id,
@@ -716,7 +725,11 @@ class BacklogItems:
                     item.routing_reason = reason
             if complete:
                 for number, item in existing.items():
-                    if number in seen or item.issue_state != "open":
+                    if (
+                        number in seen
+                        or item.issue_state != "open"
+                        or item.workspace_review not in (None, "approved")
+                    ):
                         continue
                     item.issue_state = "closed"
                     if item.state in OPEN_STATES:

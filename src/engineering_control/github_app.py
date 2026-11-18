@@ -370,6 +370,105 @@ class GitHubApp:
             raise GitHubAppError(f"{full_name} has no branch {branch}")
         return sha
 
+    async def workspace_head(
+        self, repository: str, branch: str, *, token: str
+    ) -> tuple[str, str] | None:
+        try:
+            commit = await self.branch_head(repository, branch, token=token)
+        except GitHubAppError as error:
+            if "409" not in str(error):
+                raise
+            metadata = await self._request("GET", f"/repos/{repository}", token=token)
+            if isinstance(metadata, dict) and metadata.get("size") == 0:
+                return None
+            raise
+        data = await self._request("GET", f"/repos/{repository}/git/commits/{commit}", token=token)
+        tree = (data.get("tree") or {}).get("sha") if isinstance(data, dict) else None
+        if not isinstance(tree, str) or not COMMIT.fullmatch(tree):
+            raise GitHubAppError("GitHub returned no root tree for the repository")
+        return commit, tree
+
+    async def workspace_tree(
+        self, repository: str, tree: str, *, token: str, recursive: bool
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not COMMIT.fullmatch(tree):
+            raise GitHubAppError("Invalid repository tree")
+        data = await self._request(
+            "GET",
+            f"/repos/{repository}/git/trees/{tree}",
+            token=token,
+            params={"recursive": "1"} if recursive else {},
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+            raise GitHubAppError("GitHub returned an incomplete repository tree")
+        return data["tree"], bool(data.get("truncated"))
+
+    async def workspace_blob(self, repository: str, sha: str, *, token: str) -> str:
+        if not COMMIT.fullmatch(sha):
+            raise GitHubAppError("Invalid repository file")
+        data = await self._request("GET", f"/repos/{repository}/git/blobs/{sha}", token=token)
+        if not isinstance(data, dict) or data.get("encoding") != "base64":
+            raise GitHubAppError("GitHub returned an unreadable file")
+        try:
+            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubAppError("GitHub returned an unreadable file") from error
+
+    async def workspace_history(
+        self, repository: str, page: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Page through creation order, including closed issues and excluding pull requests."""
+        if not REPOSITORY_NAME.fullmatch(repository) or page < 1:
+            raise GitHubAppError("Invalid issue history request")
+        raw = await self._request(
+            "GET",
+            f"/repos/{repository}/issues",
+            token=await self._installation_token(),
+            params={
+                "state": "all",
+                "sort": "created",
+                "direction": "asc",
+                "per_page": PAGE_SIZE,
+                "page": page,
+            },
+        )
+        if not isinstance(raw, list):
+            raise GitHubAppError("GitHub returned no issue history")
+        rows = []
+        for issue in raw:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            if (
+                not isinstance(issue.get("number"), int)
+                or issue.get("state") not in ("open", "closed")
+                or not isinstance(issue.get("title"), str)
+            ):
+                raise GitHubAppError("GitHub returned an incomplete issue")
+            rows.append(
+                {
+                    key: issue.get(key)
+                    for key in (
+                        "number",
+                        "title",
+                        "body",
+                        "state",
+                        "state_reason",
+                        "created_at",
+                        "updated_at",
+                        "closed_at",
+                        "html_url",
+                    )
+                }
+                | {
+                    "labels": [
+                        label["name"]
+                        for label in issue.get("labels", [])
+                        if isinstance(label, dict) and isinstance(label.get("name"), str)
+                    ]
+                }
+            )
+        return rows, len(raw) < PAGE_SIZE
+
     async def publish(
         self,
         full_name: str,

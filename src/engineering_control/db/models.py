@@ -477,6 +477,38 @@ class ProjectSettings(Base):
     __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
 
 
+class WorkspaceImport(Timestamps, Base):
+    """One resumable analysis of the connected repository per project."""
+
+    __tablename__ = "workspace_imports"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(String(24), default="inventory")
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    repository: Mapped[str] = mapped_column(String(140))
+    branch: Mapped[str] = mapped_column(String(100))
+    commit_sha: Mapped[str | None] = mapped_column(String(40))
+    progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    draft: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str | None] = mapped_column(String(16))
+    model: Mapped[str | None] = mapped_column(String(200))
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceSource(Base):
+    """Repository evidence retained for subsequent human-reviewed stages."""
+
+    __tablename__ = "workspace_sources"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("workspace_imports.project_id", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(24))
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class ProjectEpic(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "project_epics"
     project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))

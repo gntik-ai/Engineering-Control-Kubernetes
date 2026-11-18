@@ -54,7 +54,7 @@ export function ProjectWorkspace({ name, actions, notice }: { name: string; acti
         {notice}
         <LoadError resource={projects} />
         {project ? (
-          <WorkspaceTabs key={project.project} project={project} />
+          <WorkspaceTabs key={project.project} project={project} onApproved={projects.reload} />
         ) : projects.loading ? (
           <Skeleton className="h-36 w-full" />
         ) : projects.error ? (
@@ -81,7 +81,7 @@ export function ProjectWorkspace({ name, actions, notice }: { name: string; acti
         onOpenChange={setCreating}
         onSaved={({ project }) => {
           projects.reload();
-          navigate(workspaceUrl(project));
+          navigate(workspaceUrl(project) + '?import=1');
         }}
       />
     </StackedLayout>
