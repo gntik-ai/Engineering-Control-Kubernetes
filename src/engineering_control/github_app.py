@@ -460,14 +460,77 @@ class GitHubApp:
                     )
                 }
                 | {
+                    "actor": (issue.get("user") or {}).get("login"),
+                    "issue_type": (issue.get("type") or {}).get("name"),
                     "labels": [
                         label["name"]
                         for label in issue.get("labels", [])
                         if isinstance(label, dict) and isinstance(label.get("name"), str)
-                    ]
+                    ],
                 }
             )
         return rows, len(raw) < PAGE_SIZE
+
+    async def workspace_issue(self, repository: str, number: int) -> dict[str, Any]:
+        if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
+            raise GitHubAppError("Invalid issue reference")
+        data = await self._request(
+            "GET", f"/repos/{repository}/issues/{number}", token=await self._installation_token()
+        )
+        if (
+            not isinstance(data, dict)
+            or "pull_request" in data
+            or data.get("number") != number
+            or data.get("state") not in ("open", "closed")
+        ):
+            raise GitHubAppError("GitHub returned a different record for this issue")
+        return data
+
+    async def close_workspace_issue(self, repository: str, number: int, *, token: str) -> None:
+        if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
+            raise GitHubAppError("Invalid issue reference")
+        data = await self._request(
+            "PATCH", f"/repos/{repository}/issues/{number}", token=token, json={"state": "closed"}
+        )
+        if (
+            not isinstance(data, dict)
+            or data.get("state") != "closed"
+            or data.get("number") != number
+        ):
+            raise GitHubAppError("GitHub did not confirm the issue closure")
+
+    async def create_workspace_issue(
+        self, repository: str, title: str, body: str, *, token: str
+    ) -> int:
+        if not REPOSITORY_NAME.fullmatch(repository):
+            raise GitHubAppError("Invalid issue repository")
+        data = await self._request(
+            "POST", f"/repos/{repository}/issues", token=token, json={"title": title, "body": body}
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("number"), int):
+            raise GitHubAppError("GitHub did not return the new issue number")
+        return int(data["number"])
+
+    async def workspace_published(self, repository: str, marker: str) -> int | None:
+        """Find this app's marker in open and closed issues of this repository."""
+        if self._key is None:
+            self._key = await asyncio.to_thread(load_private_key, self.private_key_file)
+        app = await self._request("GET", "/app", token=app_token(self.app_id, self._key))
+        if not isinstance(app, dict) or app.get("id") != self.app_id or not app.get("slug"):
+            raise GitHubAppError("GitHub did not confirm the publishing app identity")
+        actor = str(app["slug"]) + "[bot]"
+        page = 1
+        found = None
+        while True:
+            issues, end = await self.workspace_history(repository, page)
+            for issue in issues:
+                if issue["actor"] == actor and marker in str(issue.get("body") or "").splitlines():
+                    if found is not None:
+                        raise GitHubAppError("More than one issue carries this approval reference")
+                    found = int(issue["number"])
+            if end:
+                return found
+            page += 1
 
     async def publish(
         self,

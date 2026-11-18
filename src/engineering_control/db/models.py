@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -509,6 +510,64 @@ class WorkspaceSource(Base):
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
+    """A proposal from a retained issue or a gap found in the project evidence."""
+
+    __tablename__ = "workspace_candidates"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    identity: Mapped[str] = mapped_column(String(96))
+    number: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str | None] = mapped_column(Text)
+    parents: Mapped[list[str]] = mapped_column(JSON, default=list)
+    decision: Mapped[str] = mapped_column(String(16), default="pending")
+    local_id: Mapped[UUID | None] = mapped_column(Uuid)
+    __table_args__ = (
+        UniqueConstraint("project_id", "kind", "identity", name="uq_workspace_candidate_identity"),
+        UniqueConstraint("project_id", "number", name="uq_workspace_candidate_issue"),
+    )
+
+
+class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):
+    """An approved GitHub change, durably recorded before an external write."""
+
+    __tablename__ = "workspace_actions"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    operation: Mapped[str] = mapped_column(String(16))
+    local_id: Mapped[UUID] = mapped_column(Uuid)
+    repository: Mapped[str] = mapped_column(String(140))
+    number: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[str | None] = mapped_column(String(350))
+    __table_args__ = (
+        UniqueConstraint("project_id", "operation", "local_id", name="uq_workspace_action_record"),
+    )
+
+
+class WorkspaceBilledDay(Base):
+    """The feed's finalized total for a single project and UTC billing date, in EUR."""
+
+    __tablename__ = "workspace_billed_days"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    source: Mapped[str] = mapped_column(String(100))
+    reference: Mapped[str] = mapped_column(String(200))
+    revision: Mapped[int] = mapped_column(Integer)
+    euro_micros: Mapped[int] = mapped_column(BigInteger)
+    __table_args__ = (
+        UniqueConstraint("source", "reference", name="uq_workspace_billed_reference"),
+    )
+
+
 class ProjectEpic(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "project_epics"
     project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
@@ -648,6 +707,7 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     issue_number: Mapped[int | None] = mapped_column(Integer)
     issue_url: Mapped[str | None] = mapped_column(String(300))
     issue_state: Mapped[str | None] = mapped_column(String(16))
+    github_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     issue_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
     issue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # When the item was done (migration 0047): merged by a run, closed on GitHub or marked

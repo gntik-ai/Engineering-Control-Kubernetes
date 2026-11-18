@@ -28,6 +28,12 @@ def parser() -> argparse.ArgumentParser:
         password.add_argument("--output-file", type=Path, required=True)
         password.add_argument("--force-output", action="store_true")
 
+    billing = commands.add_parser("billing", help="ingest finalized project billing totals")
+    feed = billing.add_subparsers(dest="billing_command", required=True).add_parser(
+        "import-finalized", help="read a JSON lines export of finalized project-day EUR totals"
+    )
+    feed.add_argument("--file", type=Path, help="billing export; read standard input if omitted")
+
     records = commands.add_parser(
         "records", help="bring a project's records over from the original system"
     )
@@ -55,13 +61,30 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
     try:
-        if arguments.command == "records":
+        if arguments.command == "billing":
+            _import_billing(arguments.file)
+        elif arguments.command == "records":
             _records_command(arguments)
         else:
             _dashboard_password_command(arguments)
     except Exception as error:  # noqa: BLE001 - one line for the terminal, never a traceback
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
+
+
+def _import_billing(file: Path | None) -> None:
+    from contextlib import nullcontext
+
+    from engineering_control.dashboard.repository import DashboardRepository
+    from engineering_control.dashboard.workspace_metrics import BilledDay
+
+    storage = DashboardRepository(_database_url())
+    try:
+        with file.open(encoding="utf-8") if file else nullcontext(sys.stdin) as stream:
+            rows = [BilledDay.model_validate_json(line) for line in stream if line.strip()]
+        print(json.dumps(storage.workspace_metrics.load_finalized(rows)))
+    finally:
+        storage.engine.dispose()
 
 
 def _records_command(arguments: argparse.Namespace) -> None:

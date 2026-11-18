@@ -1128,11 +1128,22 @@ class DashboardService:
         repository = await asyncio.to_thread(self.repository.backlog.repository, project)
         try:
             issues, complete = await github.open_issues(repository)
+            closed = {}
+            if complete:
+                missing = await asyncio.to_thread(
+                    self.repository.backlog.missing_workspace_issues,
+                    project,
+                    {i.number for i in issues},
+                )
+                for number in missing:
+                    closed[number] = await github.workspace_issue(repository, number)
         except GitHubAppError as error:
             await asyncio.to_thread(self.repository.backlog.record_failure, project, str(error))
             raise
         return await asyncio.to_thread(
-            lambda: self.repository.backlog.apply_import(project, issues, complete=complete)
+            lambda: self.repository.backlog.apply_import(
+                project, issues, complete=complete, closed=closed
+            )
         )
 
     async def active_project_names(self) -> list[str]:
