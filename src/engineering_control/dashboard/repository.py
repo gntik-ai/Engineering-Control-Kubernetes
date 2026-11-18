@@ -22,6 +22,7 @@ from engineering_control.dashboard.session_store import (
     lock_authentication,
     retire_session,
 )
+from engineering_control.dashboard.workspace_import import WorkspaceImports
 from engineering_control.db.models import (
     DashboardAuthentication,
     DashboardEvent,
@@ -91,6 +92,7 @@ class DashboardRepository:
         self.redactor = SecretRedactor()
         self.projects = ProjectRecords(self.sessions)
         self.planning = PlanningRecords(self.sessions)
+        self.workspace_imports = WorkspaceImports(self.sessions)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

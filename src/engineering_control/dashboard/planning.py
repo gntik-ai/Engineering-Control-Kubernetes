@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
@@ -15,6 +15,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    active_project,
 )
 from engineering_control.db.models import (
     BacklogItem,
@@ -26,24 +27,6 @@ from engineering_control.db.models import (
 )
 
 Kind = Literal["epics", "stories", "issues"]
-
-
-def active_project(session: Session, name: str, *, lock: bool = False) -> ProjectRecord:
-    where = (ProjectRecord.name == name, ProjectRecord.archived_at.is_(None))
-    if lock:
-        # Take a write lock before reading parent sets on PostgreSQL and SQLite. Two
-        # concurrent removals must never each see the other as the remaining parent.
-        row = session.scalar(
-            update(ProjectRecord)
-            .where(*where)
-            .values(updated_at=ProjectRecord.updated_at)
-            .returning(ProjectRecord)
-        )
-    else:
-        row = session.scalar(select(ProjectRecord).where(*where))
-    if row is None:
-        raise ProjectNotFound(name)
-    return row
 
 
 def _replace_parents(
