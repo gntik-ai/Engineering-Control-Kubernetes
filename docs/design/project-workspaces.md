@@ -25,3 +25,9 @@ Model prices per million tokens live in the provider account records. The usage 
 Keep the existing project identifiers, repository identity, historical issue states and completion dates. Importing a technical issue may attach it to Stories without reopening or reclosing it. Closing an imported Epic or Story is a planning action and must be excluded from resolved-Issue counts. Keep a stable mapping from repository and issue number to the local record.
 
 Persist each review stage and its approved inputs. A restart must resume at the last committed stage. A timeout after GitHub receives a create request requires reconciliation before another request can create an issue. Read-only scanning and local review remain usable when a write grant or a billing source is unavailable.
+
+## Release verification
+
+The acceptance suite exercises a repository with no planning issues and a repository with open and closed Epics, Stories and technical issues. It checks stage order, multiple parents, stable identity after a lost GitHub response, and retention of the original technical closure date. Chromium covers the five tabs at desktop and mobile widths. Both a fresh PostgreSQL installation and a physical upgrade from revision 0051 reached revision 0053 while retaining Falcone as the default.
+
+The Home charts use UTC days. A billed day comes from a finalized, attributed EUR total with a stable source reference. The import command and data contract are in the deployment guide. The production billing-feed location and a real settled project-day are still needed for reconciliation. [Billing import guide](../../deploy/README.md#finalized-project-billing)

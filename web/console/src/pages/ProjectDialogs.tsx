@@ -70,6 +70,7 @@ export interface DialogProps {
  * cannot be reached, it is typed.
  */
 function RepositoryField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [typing, setTyping] = useState(false);
   const repositories = useResource<GitHubRepositories>(apiUrl('github/repositories'));
   const typed = (description: string) => (
     <Field>
@@ -100,15 +101,15 @@ function RepositoryField({ value, onChange }: { value: string; onChange: (value:
   if (!repositories.data) return <Skeleton className="h-16 w-full" />;
   if (!repositories.data.configured) return typed('Enter a GitHub repository URL or owner/name. A repository belongs to one project.');
   const free = repositories.data.items.filter((item) => !item.project && !item.archived);
-  if (free.length === 0) {
-    return (
-      <Alert
-        tone="info"
-        title="No repository is free"
-        description="Every repository the GitHub App is installed on already belongs to a project. Install the app on another repository in GitHub, then open this dialog again."
-      />
-    );
-  }
+  if (!free.length) return typed('Enter the repository URL. Existing projects can be analyzed from their Home tab.');
+  if (typing) return (
+    <div className="grid justify-items-start gap-1">
+      <div className="w-full">{typed('The GitHub App must have access to this repository.')}</div>
+      <Button type="button" variant="ghost" size="sm" onClick={() => { onChange(''); setTyping(false); }}>
+        Choose from GitHub
+      </Button>
+    </div>
+  );
   return (
     <Field>
       <FieldLabel>GitHub repository</FieldLabel>
@@ -123,6 +124,11 @@ function RepositoryField({ value, onChange }: { value: string; onChange: (value:
       <FieldDescription>
         The repositories the GitHub App is installed on that no project uses yet ({free.length}).
       </FieldDescription>
+      <div>
+        <Button type="button" variant="ghost" size="sm" onClick={() => { onChange(''); setTyping(true); }}>
+          Enter repository URL
+        </Button>
+      </div>
     </Field>
   );
 }
