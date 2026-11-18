@@ -891,7 +891,13 @@ def create_app(
             request,
             WorkspaceImportStep,
             lambda body: repo(request).workspace_imports.advance(
-                name, body.version, github(request), models_of(request), body.provider, body.model
+                name,
+                body.version,
+                github(request),
+                models_of(request),
+                body.provider,
+                body.model,
+                all_epics=body.all_epics,
             ),
             event="workspace.import_advanced",
             subject=name,

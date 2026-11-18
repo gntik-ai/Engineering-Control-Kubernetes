@@ -289,7 +289,9 @@ class Models:
 
     # --- one call ------------------------------------------------------------------------
 
-    async def _call(self, held: _Held, model: str, question: Question, prompt: str) -> Wire:
+    async def _call(
+        self, held: _Held, model: str, question: Question, prompt: str, *, retry: bool = True
+    ) -> Wire:
         if held.provider.style == "anthropic":
             return await anthropic_api.complete(
                 key=held.key,
@@ -306,6 +308,7 @@ class Models:
                 keep=marks(held.provider, question),
                 hour=question.cache == "hour",
                 loose=question.loose,
+                retry=retry,
             )
         return await openai_style.complete(
             http=self.http,
@@ -322,13 +325,16 @@ class Models:
             strict=held.provider.shape == "schema" and not question.loose,
             effort=question.effort if held.provider.effort else None,
             model_prefix=held.provider.model_prefix,
+            retry=retry,
         )
 
-    async def _patient(self, held: _Held, model: str, question: Question, prompt: str) -> Wire:
+    async def _patient(
+        self, held: _Held, model: str, question: Question, prompt: str, *, retry: bool = True
+    ) -> Wire:
         """One call, waiting and asking again while the provider is only busy."""
-        for wait in (*BUSY_WAITS, None):
+        for wait in (*BUSY_WAITS, None) if retry else (None,):
             try:
-                return await self._call(held, model, question, prompt)
+                return await self._call(held, model, question, prompt, retry=retry)
             except WireError as error:
                 if error.kind != "busy" or wait is None:
                     raise
@@ -337,9 +343,12 @@ class Models:
 
     # --- a question ----------------------------------------------------------------------
 
-    async def ask(self, question: Question, earlier: str | None = None) -> Reply:
+    async def ask(
+        self, question: Question, earlier: str | None = None, *, retry: bool = True
+    ) -> Reply:
         """Ask the question at once. ``earlier`` says why an answer it already got (in a
-        batch) could not be used: it is then asked once, saying so."""
+        batch) could not be used: it is then asked once, saying so. With retries
+        disabled, at most one inference request is sent across all accounts."""
         if self.sealing_key is None:
             raise ModelError(
                 "no_key",
@@ -360,8 +369,9 @@ class Models:
                 used = {"input": 0, "output": 0, "cached": 0, "cache_write": 0}
                 prompt, why = (complaint(base, earlier), earlier) if earlier else (base, "")
                 try:
-                    for asked in (2,) if earlier else (1, 2):
-                        wire = await self._patient(held, model, question, prompt)
+                    attempts = (2,) if earlier else ((1, 2) if retry else (1,))
+                    for asked in attempts:
+                        wire = await self._patient(held, model, question, prompt, retry=retry)
                         used["input"] += wire.read
                         used["output"] += wire.written
                         used["cached"] += wire.cached
@@ -392,22 +402,23 @@ class Models:
                             self._learn, held.id, state="sign_in_required", reason=error.detail
                         )
                         LOG.warning("model_key_refused", account=held.name)
-                        continue
-                    if error.kind == "busy":
+                    elif error.kind == "busy":
                         await asyncio.to_thread(
                             self._learn, held.id, state="limited", reason=error.detail, rest=True
                         )
                         busy.append(error.detail)
-                        continue
-                    # The request itself is wrong, the model declined, or its answer was
-                    # cut: another account would be told the same.
-                    await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
-                    raise ModelError(error.kind, error.detail) from error
+                    else:
+                        # Another account cannot repair a declined or truncated request.
+                        await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+                        raise ModelError(error.kind, error.detail) from error
+                    if not retry:
+                        raise ModelError(error.kind, error.detail, later=True) from error
+                    continue
                 await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
                 raise ModelError(
                     "no_answer",
-                    f"{held.provider.name} ({model}) gave no answer of the asked shape "
-                    f"twice: {why}.",
+                    f"{held.provider.name} ({model}) gave no answer of the asked shape"
+                    f"{' twice' if retry else ''}: {why}.",
                 )
         if busy:
             raise ModelError("busy", busy[-1], later=True)

@@ -331,6 +331,7 @@ class WorkspaceImportStep(PlainChangeInput):
     version: int = Field(ge=0)
     provider: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=200)
+    all_epics: bool = False
 
 
 class WorkspaceDescription(PlainChangeInput):

@@ -4,29 +4,44 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from sqlalchemy import select
 
 from engineering_control.db.models import (
     BacklogItem,
+    ProjectEpic,
     ProjectRecord,
     ProviderAccount,
+    WorkspaceCandidate,
     WorkspaceImport,
     WorkspaceSource,
 )
 from engineering_control.github_app import GitHubAppError
-from engineering_control.models.service import Question, Reply
+from engineering_control.models.sealing import seal
+from engineering_control.models.service import Models, Question, Reply
 from tests.test_dashboard_web import _authenticated_client
+from tests.test_models_api import said
 
 
 class ReviewModel:
     async def aclose(self) -> None:
         pass
 
-    async def ask(self, question: Question) -> Reply:
+    async def ask(self, question: Question, *, retry: bool = True) -> Reply:
         data = json.loads(question.prompt)
         stage = question.system.split(".")[0].split()[-1]
         parents = [p["id"] for p in data["parents"]]
-        if "records" in question.schema["properties"]:
+        if "epics" in question.schema["properties"]:
+            assert not retry
+            answer = {
+                "complete": True,
+                "epics": [
+                    {"title": title, "description": "Project reporting capabilities"}
+                    for title in ("Reporting", "Data exports")
+                    if title not in data["existing"]
+                ],
+            }
+        elif "records" in question.schema["properties"]:
             hints = {"epics": "epic", "stories": "story", "issues": "tech"}
             answer = {
                 "records": [
@@ -102,6 +117,179 @@ class PublishingFixture:
 
     async def workspace_published(self, repo: str, marker: str) -> int | None:
         return next((n for n, issue in self.issues.items() if marker in issue["body"]), None)
+
+
+def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    base = "/api/dashboard/projects/falcone/"
+    remote = PublishingFixture()
+    client.app.state.github_app = remote
+    requests = []
+    replies = [
+        {"complete": False, "epics": [{"title": "Partial", "description": "Incomplete"}]},
+        {
+            "complete": True,
+            "epics": [
+                {"title": "Partial", "description": "Valid first row"},
+                {"title": " ", "description": "Missing title"},
+            ],
+        },
+        {
+            "complete": True,
+            "epics": [
+                {"title": title, "description": "An evidenced outcome"}
+                for title in (
+                    "PAYMENTS",
+                    " Bookings ",
+                    "Reporting",
+                    "REPORTING",
+                    "Exports",
+                    "Alerts",
+                )
+            ],
+        },
+        {"complete": True, "epics": []},
+    ]
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        assert (request.method, str(request.url)) == (
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+        )
+        body = json.loads(request.content)
+        assert body["model"] == "analysis"
+        assert (
+            "Payments" in body["messages"][1]["content"]
+            and "Bookings" in body["messages"][1]["content"]
+        )
+        assert "Approved booking platform" in body["messages"][1]["content"]
+        assert "docs/architecture.md" in body["messages"][1]["content"]
+        requests.append(body)
+        if len(requests) == 3:
+            repo.planning.save("falcone", "epics", "Alerts", "Entered while generating", [])
+        return said(replies.pop(0))
+
+    sealing = b"bulk-epic-test-key" * 3
+    client.app.state.models = Models(
+        repo.sessions, sealing, http=httpx.AsyncClient(transport=httpx.MockTransport(provider))
+    )
+    try:
+        with repo.sessions.begin() as db:
+            project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+            account_id = uuid4()
+            db.add(
+                ProviderAccount(
+                    id=account_id,
+                    name="API",
+                    provider="openai",
+                    state="ready",
+                    models=["analysis"],
+                    sealed_key=seal(sealing, account_id, "fixture"),
+                )
+            )
+            db.add(ProjectEpic(project_id=project.id, title="Payments"))
+            db.add(
+                WorkspaceImport(
+                    project_id=project.id,
+                    repository=project.source_repository,
+                    branch=project.default_branch,
+                    stage="epics",
+                    version=4,
+                    draft="Approved booking platform",
+                    progress={
+                        "evidence_notes": [
+                            {
+                                "references": ["docs/architecture.md"],
+                                "summary": "Payments and exports",
+                            }
+                        ]
+                    },
+                )
+            )
+            db.flush()
+            db.add(
+                WorkspaceCandidate(
+                    project_id=project.id,
+                    kind="epics",
+                    identity="issue:1",
+                    number=1,
+                    title="Bookings",
+                    description="Booking tools",
+                    parents=[],
+                )
+            )
+            db.add(
+                WorkspaceSource(
+                    project_id=project.id, key="issue:1", kind="issue", evidence=remote.issues[1]
+                )
+            )
+        csrf = client.get("/api/dashboard/session").json()["csrf_token"]
+
+        def advance(version: int, *, bulk: bool = True) -> httpx.Response:
+            return client.post(
+                base + "import/advance",
+                json={
+                    "csrf_token": csrf,
+                    "version": version,
+                    "all_epics": bulk,
+                    "provider": "openai",
+                    "model": "analysis",
+                },
+            )
+
+        assert advance(4).status_code == 409
+        before = advance(4, bulk=False).json()
+        version = before["version"]
+        assert before["review"]["mode"] == "gaps" and not requests
+        for expected_calls, status in ((1, 409), (2, 422)):
+            assert advance(version).status_code == status
+            unchanged = client.get(base + "import").json()
+            assert (unchanged["version"], unchanged["review"], unchanged["busy"]) == (
+                version,
+                before["review"],
+                False,
+            )
+            assert len(requests) == expected_calls
+
+        done = advance(version).json()
+        assert done["stage"] == "epics" and done["review"]["mode"] == "review"
+        candidates = done["review"]["candidates"]
+        assert {c["title"]: c["number"] for c in candidates} == {
+            "Bookings": 1,
+            "Exports": None,
+            "Reporting": None,
+        }
+        assert len(candidates) == 3 and len(requests) == 3
+        assert advance(version).status_code == 409 and len(requests) == 3
+        assert client.get(base + "import").json()["review"]["candidates"] == candidates
+        assert {c["title"] for c in client.get(base + "planning").json()["epics"]} == {
+            "Payments",
+            "Alerts",
+        }
+        assert client.get(base + "synchronization").json()["items"] == [] and not remote.closed
+
+        empty = advance(done["version"]).json()
+        assert empty["review"] == done["review"] and len(requests) == 4
+        choices = [
+            {k: c[k] for k in ("id", "title", "description", "parents")}
+            | {"include": c["title"] == "Exports"}
+            for c in candidates
+        ]
+        selected = next(c for c in choices if c["include"])
+        selected["title"] = "Custom exports"
+        approved = client.post(
+            base + "import/review",
+            json={"csrf_token": csrf, "version": empty["version"], "choices": choices},
+        ).json()
+        assert approved["stage"] == "stories"
+        assert {c["title"] for c in client.get(base + "planning").json()["epics"]} == {
+            "Payments",
+            "Alerts",
+            "Custom exports",
+        }
+        assert advance(approved["version"]).status_code == 409 and len(requests) == 4
+    finally:
+        client.__exit__(None, None, None)
 
 
 def test_mixed_history_human_gates_and_uncertain_publication(tmp_path: Path) -> None:
