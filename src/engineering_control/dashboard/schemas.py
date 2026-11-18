@@ -37,11 +37,17 @@ class ProjectCreateInput(DashboardModel):
     name: str = Field(min_length=1, max_length=32)
     display_name: str | None = Field(default=None, max_length=200)
     repository: str = Field(min_length=3, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class ProjectRenameInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     display_name: str = Field(min_length=1, max_length=200)
+
+
+class ProjectDescriptionInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    description: str | None = Field(max_length=2000)
 
 
 class ProjectArchiveInput(DashboardModel):

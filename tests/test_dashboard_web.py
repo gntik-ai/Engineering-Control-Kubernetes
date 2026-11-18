@@ -239,6 +239,8 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/logout",
         "/api/dashboard/projects",
         "/api/dashboard/projects/{name}/rename",
+        "/api/dashboard/projects/{name}/description",
+        "/api/dashboard/projects/{name}/default",
         "/api/dashboard/projects/{name}/archive",
         "/api/dashboard/projects/{name}/sections",
         "/api/dashboard/projects/{name}/sections/{key}/update",

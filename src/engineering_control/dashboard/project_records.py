@@ -15,11 +15,13 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import ProjectRecord
+from engineering_control.db.models import ProjectRecord, ProjectSettings
 from engineering_control.projects import DEFAULT_BRANCH, PROJECT_REPOSITORIES, PROJECTS
 
 # The name is an identifier: it appears in addresses, filters and records.
@@ -80,6 +82,7 @@ class ProjectRecords:
         """Give every project of the registry its record. Returns the names added."""
         added: list[str] = []
         with self.sessions() as session:
+            settings = self._lock_settings(session)
             existing = set(session.scalars(select(ProjectRecord.name)))
             for name in PROJECTS:
                 if name in existing:
@@ -97,12 +100,59 @@ class ProjectRecords:
                 )
                 added.append(name)
             try:
+                if settings.default_project_id is None:
+                    settings.default_project_id = self._initial_default(session)
                 session.commit()
             except IntegrityError:
                 # Another process added the same rows at the same moment.
                 session.rollback()
                 return []
         return added
+
+    @staticmethod
+    def _lock_settings(session: Session) -> ProjectSettings:
+        """Serialize project creation, archiving and default changes on both databases."""
+        insert = (
+            postgresql_insert(ProjectSettings)
+            if session.get_bind().dialect.name == "postgresql"
+            else sqlite_insert(ProjectSettings)
+        )
+        # The upsert also creates the settings on databases initialized from the models.
+        # Updating the singleton row acquires a write lock before reading the active projects.
+        return session.scalars(
+            insert.values(id=1)
+            .on_conflict_do_update(index_elements=[ProjectSettings.id], set_={"id": 1})
+            .returning(ProjectSettings)
+        ).one()
+
+    @staticmethod
+    def _initial_default(session: Session) -> UUID | None:
+        return session.scalar(
+            select(ProjectRecord.id)
+            .where(ProjectRecord.archived_at.is_(None))
+            .order_by(
+                case((ProjectRecord.name == "falcone", 0), else_=1),
+                ProjectRecord.created_at,
+                ProjectRecord.name,
+            )
+            .limit(1)
+        )
+
+    def default_name(self) -> str | None:
+        with self.sessions() as session:
+            return session.scalar(
+                select(ProjectRecord.name)
+                .join(ProjectSettings, ProjectSettings.default_project_id == ProjectRecord.id)
+                .where(ProjectSettings.id == 1, ProjectRecord.archived_at.is_(None))
+            )
+
+    def set_default(self, name: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            settings = self._lock_settings(session)
+            record = self._active(session, name)
+            settings.default_project_id = record.id
+            session.commit()
+            return serialize(record)
 
     def active(self) -> list[ProjectRecord]:
         """Registry projects in registry order, then the console's by age."""
@@ -149,11 +199,15 @@ class ProjectRecords:
         display_name: str | None,
         repository: str,
         default_branch: str = "main",
+        description: str | None = None,
     ) -> dict[str, Any]:
+        from engineering_control.dashboard.backlog_items import clean_description
+
         name = clean_name(name)
         repository = clean_repository(repository)
         display = clean_display_name(display_name, fallback=name)
         with self.sessions() as session:
+            settings = self._lock_settings(session)
             taken = session.scalar(select(ProjectRecord).where(ProjectRecord.name == name))
             if taken is not None:
                 raise ProjectConflict(
@@ -176,6 +230,7 @@ class ProjectRecords:
             record = ProjectRecord(
                 name=name,
                 display_name=display,
+                description=clean_description(description),
                 source_repository=repository,
                 deployment_repository=repository,
                 default_branch=default_branch[:100] or "main",
@@ -188,6 +243,8 @@ class ProjectRecords:
                 from engineering_control.dashboard.project_sections import ensure_core_sections
 
                 ensure_core_sections(session, record)
+                if settings.default_project_id is None:
+                    settings.default_project_id = record.id
                 session.commit()
             except IntegrityError as error:
                 session.rollback()
@@ -200,6 +257,15 @@ class ProjectRecords:
         with self.sessions() as session:
             record = self._active(session, name)
             record.display_name = clean_display_name(display_name, fallback=record.name)
+            session.commit()
+            return serialize(record)
+
+    def set_description(self, name: str, description: str | None) -> dict[str, Any]:
+        from engineering_control.dashboard.backlog_items import clean_description
+
+        with self.sessions() as session:
+            record = self._active(session, name)
+            record.description = clean_description(description)
             session.commit()
             return serialize(record)
 
@@ -312,12 +378,15 @@ class ProjectRecords:
 
     def archive(self, name: str) -> dict[str, Any]:
         with self.sessions() as session:
+            settings = self._lock_settings(session)
             record = self._active(session, name)
             if record.origin != "console":
                 raise ProjectConflict(
                     f"The project {name} is one the workflows run for; it cannot be removed"
                 )
             record.archived_at = datetime.now(UTC)
+            if settings.default_project_id == record.id:
+                settings.default_project_id = self._initial_default(session)
             session.commit()
             return serialize(record)
 
@@ -341,7 +410,10 @@ def serialize(record: ProjectRecord) -> dict[str, Any]:
     return {
         "project": record.name,
         "display_name": record.display_name,
+        "description": record.description,
+        "architecture": record.architecture,
         "source_repository": record.source_repository,
+        "repository_url": f"https://github.com/{record.source_repository}",
         "deployment_repository": record.deployment_repository,
         "self_contained": record.source_repository == record.deployment_repository,
         "default_branch": record.default_branch,
