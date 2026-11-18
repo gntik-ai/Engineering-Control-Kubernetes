@@ -1,8 +1,10 @@
 import { Button, Logo, StatusLayout } from '@gntik-ai/ui';
+import { usePageTitle } from '../parts';
 import { BASE, RouterLink } from '../router';
 
 /** Any address of the console that is not one of its views. */
 export function NotFoundPage() {
+  usePageTitle('Not found');
   return (
     <StatusLayout
       fullScreen

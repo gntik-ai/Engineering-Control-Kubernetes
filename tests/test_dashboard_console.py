@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from engineering_control.dashboard.app import (
@@ -13,16 +14,22 @@ from engineering_control.dashboard.app import (
 )
 from engineering_control.db.models import ProjectRecord, SandboxRun
 from engineering_control.projects import PROJECTS
-from tests.test_dashboard_web import _authenticated_client
+from tests.test_dashboard_web import PASSWORD, _authenticated_client
 
 
 def test_console_requires_a_session(tmp_path: Path) -> None:
     client, _repository = _authenticated_client(tmp_path)
     try:
         client.cookies.clear()
-        page = client.get("/console/backlog", follow_redirects=False)
-        assert page.status_code == 303
-        assert page.headers["location"] == "/login?next=/console/backlog"
+        for path in (
+            "/console/backlog",
+            "/console/admin",
+            "/console/workspace/falcone",
+            "/console/runs?project=falcone&state=running",
+        ):
+            page = client.get(path, follow_redirects=False)
+            assert page.status_code == 303
+            assert page.headers["location"] == "/login"
         assert client.get("/api/dashboard/projects").status_code == 401
         # The console's own code is not given out; only what the sign-in page loads is.
         index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
@@ -112,6 +119,8 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
         index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
         for path in (
             "/console",
+            "/console/admin",
+            "/console/workspace/falcone",
             "/console/projects",
             "/console/backlog",
             "/console/runs",
@@ -187,7 +196,12 @@ def test_session_endpoint_gives_the_csrf_token_sign_out_needs(tmp_path: Path) ->
         client.__exit__(None, None, None)
 
 
-def test_login_returns_to_the_console(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "next_path", ["/console/admin", "/console/workspace/llmwiki", "//outside.invalid"]
+)
+def test_fresh_login_uses_the_global_default_even_from_a_bookmark(
+    tmp_path: Path, next_path: str
+) -> None:
     client, _repository = _authenticated_client(tmp_path)
     try:
         client.cookies.clear()
@@ -195,16 +209,65 @@ def test_login_returns_to_the_console(tmp_path: Path) -> None:
         token = re.search(r'"csrf_token":\s*"([^"]+)"', login.text)
         assert token
         response = client.post(
-            "/login?next=/console/runs",
+            "/login",
             data={
                 "csrf_token": token.group(1),
-                "password": "correct horse battery staple",
-                "next_path": "/console/runs",
+                "password": PASSWORD,
+                "next_path": next_path,
             },
             follow_redirects=False,
         )
         assert response.status_code == 303
-        assert response.headers["location"] == "/console/runs"
+        assert response.headers["location"] == "/console"
+        assert client.get("/console").url.path == "/console/workspace/falcone"
+        assert client.get("/console/workspace/llmwiki").url.path == "/console/workspace/llmwiki"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_console_lands_on_the_global_default_at_sign_in(tmp_path: Path) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        first = client.get("/console", follow_redirects=False)
+        assert first.status_code == 303
+        assert first.headers["location"] == "/console/workspace/falcone"
+        session = client.get("/api/dashboard/session").json()
+        changed = client.post(
+            "/api/dashboard/projects/llmwiki/default", json={"csrf_token": session["csrf_token"]}
+        )
+        assert changed.status_code == 200
+        client.cookies.clear()
+        form = {
+            "csrf_token": client.get("/login/challenge").json()["csrf_token"],
+            "password": PASSWORD,
+        }
+        landed = client.post("/login", data=form, follow_redirects=True)
+        assert landed.status_code == 200
+        assert landed.url.path == "/console/workspace/llmwiki"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_console_opens_the_empty_workspace_without_projects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("engineering_control.dashboard.project_records.PROJECTS", ())
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        landed = client.get("/console", follow_redirects=True)
+        assert landed.status_code == 200
+        assert landed.url.path == "/console/workspace"
+        session = client.get("/api/dashboard/session").json()
+        created = client.post(
+            "/api/dashboard/projects",
+            json={
+                "csrf_token": session["csrf_token"],
+                "name": "first",
+                "repository": "owner/first",
+            },
+        )
+        assert created.status_code == 201
+        assert client.get("/console").url.path == "/console/workspace/first"
     finally:
         client.__exit__(None, None, None)
 

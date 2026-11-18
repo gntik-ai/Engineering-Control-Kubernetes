@@ -5,13 +5,6 @@ import { BASE } from '../router';
 
 /** The server keeps a sign-in token valid for 15 minutes; ask for a new one well before. */
 const TOKEN_LIFETIME_MS = 10 * 60 * 1000;
-const VIEW = /^\/console(\/[a-z]+)?$/;
-
-/** Where to go after signing in: a console view, never an address taken from the link as is. */
-function destination(): string {
-  const next = new URLSearchParams(window.location.search).get('next') ?? '';
-  return VIEW.test(next) ? next : BASE;
-}
 
 async function requestToken(): Promise<string> {
   const response = await fetch('/login/challenge', {
@@ -49,18 +42,17 @@ export function SignInPage() {
     if (pending || !password) return;
     setPending(true);
     setProblem(null);
-    const next = destination();
     try {
       const response = await fetch('/login', {
         method: 'POST',
         credentials: 'same-origin',
         redirect: 'manual',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-        body: new URLSearchParams({ csrf_token: await freshToken(), password, next_path: next }).toString(),
+        body: new URLSearchParams({ csrf_token: await freshToken(), password }).toString(),
       });
       // The server answers a correct password with a redirect, which is opaque to a script.
       if (response.type === 'opaqueredirect' || response.ok) {
-        window.location.assign(next);
+        window.location.assign(BASE);
         return;
       }
       const body = (await response.json().catch(() => null)) as { csrf_token?: unknown } | null;

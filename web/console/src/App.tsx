@@ -1,4 +1,4 @@
-import { Alert, Button, Logo, NavList, SidebarLayout, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
+import { Alert, Button, Link, Logo, NavList, SidebarLayout, ThemeCycleButton, ThemeSwitcher, type NavGroup } from '@gntik-ai/ui';
 import {
   Bot,
   FolderKanban,
@@ -11,7 +11,7 @@ import {
   Sparkles,
   Workflow,
 } from '@gntik-ai/icons';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { AccountsPage } from './pages/Accounts';
 import { DashboardPage } from './pages/Dashboard';
@@ -25,17 +25,18 @@ import { ProjectsPage } from './pages/Projects';
 import { QueuePage, QueuesPage } from './pages/Queues';
 import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
+import { ProjectWorkspace } from './pages/Workspace';
 import { usePageTitle } from './parts';
-import { BASE, useLocation } from './router';
+import { ADMIN, BASE, WORKSPACE, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
 const navigation = (waiting: number): NavGroup[] => [
   {
-    id: 'console',
-    label: 'Engineering',
+    id: 'administration',
+    label: 'Administration',
     items: [
-      { label: 'Dashboard', href: BASE, icon: LayoutDashboard },
+      { label: 'Dashboard', href: ADMIN, icon: LayoutDashboard },
       {
         label: 'Inbox',
         href: `${BASE}/inbox`,
@@ -53,37 +54,27 @@ const navigation = (waiting: number): NavGroup[] => [
   },
 ];
 
-const VIEWS: Record<string, () => ReactNode> = {
-  [BASE]: () => <DashboardPage />,
-  [`${BASE}/inbox`]: () => <InboxPage />,
-  [`${BASE}/projects`]: () => <ProjectsPage />,
-  [`${BASE}/project`]: () => <ProjectPage />,
-  [`${BASE}/backlog`]: () => <BacklogPage />,
-  [`${BASE}/accounts`]: () => <AccountsPage />,
-  [`${BASE}/queues`]: () => <QueuesPage />,
-  [`${BASE}/queue`]: () => <QueuePage />,
-  [`${BASE}/runs`]: () => <RunsPage />,
-  [`${BASE}/run`]: () => <RunPage />,
-  [`${BASE}/flows`]: () => <FlowsPage />,
-  [`${BASE}/flow`]: () => <FlowPage />,
-  [`${BASE}/supervisor`]: () => <SupervisorPage />,
+const ADMIN_VIEWS: Record<string, { title: string; Page: ComponentType }> = {
+  [ADMIN]: { title: 'Administrator Console', Page: DashboardPage },
+  [`${BASE}/inbox`]: { title: 'Inbox', Page: InboxPage },
+  [`${BASE}/projects`]: { title: 'Projects', Page: ProjectsPage },
+  [`${BASE}/project`]: { title: 'Project', Page: ProjectPage },
+  [`${BASE}/backlog`]: { title: 'Backlog', Page: BacklogPage },
+  [`${BASE}/accounts`]: { title: 'Accounts', Page: AccountsPage },
+  [`${BASE}/queues`]: { title: 'Queues', Page: QueuesPage },
+  [`${BASE}/queue`]: { title: 'Queue', Page: QueuePage },
+  [`${BASE}/runs`]: { title: 'Runs', Page: RunsPage },
+  [`${BASE}/run`]: { title: 'Run', Page: RunPage },
+  [`${BASE}/flows`]: { title: 'Flows', Page: FlowsPage },
+  [`${BASE}/flow`]: { title: 'Flow', Page: FlowPage },
+  [`${BASE}/supervisor`]: { title: 'Supervisor', Page: SupervisorPage },
 };
 
-/** What the browser tab says for each view. */
-const TITLES: Record<string, string> = {
-  [BASE]: 'Dashboard',
-  [`${BASE}/inbox`]: 'Inbox',
-  [`${BASE}/projects`]: 'Projects',
-  [`${BASE}/project`]: 'Project',
-  [`${BASE}/backlog`]: 'Backlog',
-  [`${BASE}/accounts`]: 'Accounts',
-  [`${BASE}/queues`]: 'Queues',
-  [`${BASE}/queue`]: 'Queue',
-  [`${BASE}/runs`]: 'Runs',
-  [`${BASE}/run`]: 'Run',
-  [`${BASE}/flows`]: 'Flows',
-  [`${BASE}/flow`]: 'Flow',
-  [`${BASE}/supervisor`]: 'Supervisor',
+const DETAIL_PARENTS: Record<string, string> = {
+  [`${BASE}/project`]: `${BASE}/projects`,
+  [`${BASE}/queue`]: `${BASE}/queues`,
+  [`${BASE}/run`]: `${BASE}/runs`,
+  [`${BASE}/flow`]: `${BASE}/flows`,
 };
 
 function SignOut({ onError }: { onError: (message: string) => void }) {
@@ -97,17 +88,28 @@ function SignOut({ onError }: { onError: (message: string) => void }) {
     });
   };
   return (
-    <Button variant="ghost" size="sm" icon={LogOut} loading={pending} onClick={run}>
-      Sign out
+    <Button
+      variant="ghost"
+      size="sm"
+      icon={LogOut}
+      aria-label="Sign out"
+      className="max-sm:w-8 max-sm:px-0"
+      loading={pending}
+      onClick={run}
+    >
+      <span className="hidden sm:inline">Sign out</span>
     </Button>
   );
 }
 
-export default function App() {
-  const [problem, setProblem] = useState<string | null>(null);
-  const { path } = useLocation();
-  const current = path.replace(/\/$/, '');
-  const view = VIEWS[current];
+function AdministratorConsole({
+  current, title, actions, children,
+}: {
+  current: string;
+  title: string;
+  actions: ReactNode;
+  children: ReactNode;
+}) {
   const inbox = useResource<Inbox>(apiUrl('inbox'), 60_000);
   // What waits changes with what was just done on a page: count again on every move.
   const { reload: recount } = inbox;
@@ -116,49 +118,64 @@ export default function App() {
     window.addEventListener(CHANGED, recount);
     return () => window.removeEventListener(CHANGED, recount);
   }, [recount]);
-  usePageTitle(TITLES[current] ?? 'Not found');
+  usePageTitle(title);
+  return (
+    <SidebarLayout
+      fullScreen
+      mainId="console-main"
+      storageKey="engineering-console-sidebar"
+      sidebarLabel="Administrator Console"
+      sidebarHeader={({ collapsed }) => <Logo size={26} wordmark={!collapsed} />}
+      sidebar={({ collapsed, closeDrawer }) => (
+        <NavList
+          groups={navigation(inbox.data?.total ?? 0)}
+          currentHref={DETAIL_PARENTS[current] ?? current}
+          collapsed={collapsed}
+          label="Administrator Console"
+          onNavigate={closeDrawer}
+        />
+      )}
+      topbar={
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="hidden text-sm font-semibold text-foreground md:inline">Administrator Console</span>
+          <div className="ms-auto flex items-center gap-2">
+            <Link href={BASE} className="text-center text-xs leading-tight sm:text-sm">Project workspace</Link>
+            <SupervisorPanel />
+            {actions}
+          </div>
+        </div>
+      }
+    >
+      {children}
+    </SidebarLayout>
+  );
+}
+
+export default function App() {
+  const [problem, setProblem] = useState<string | null>(null);
+  const { path } = useLocation();
+  const current = path.replace(/\/$/, '');
+  const actions = (
+    <>
+      <ThemeCycleButton size="sm" variant="ghost" className="sm:hidden" />
+      <ThemeSwitcher size="sm" showLabels={false} className="hidden sm:inline-flex" />
+      <SignOut onError={setProblem} />
+    </>
+  );
+  const notice = problem ? (
+    <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
+  ) : null;
+
+  if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
+    const name = current === WORKSPACE ? '' : current.slice(WORKSPACE.length + 1);
+    return <ProjectWorkspace name={name} actions={actions} notice={notice} />;
+  }
+  const view = ADMIN_VIEWS[current];
   if (!view) return <NotFoundPage />;
   return (
-    <div className="h-dvh">
-      <SidebarLayout
-        mainId="console-main"
-        storageKey="engineering-console-sidebar"
-        sidebarLabel="Console"
-        sidebarHeader={({ collapsed }) => <Logo size={26} wordmark={!collapsed} />}
-        sidebar={({ collapsed, closeDrawer }) => (
-          <NavList
-            groups={navigation(inbox.data?.total ?? 0)}
-            currentHref={
-              current === `${BASE}/project`
-                  ? `${BASE}/projects`
-                  : current === `${BASE}/run`
-                    ? `${BASE}/runs`
-                    : current === `${BASE}/queue`
-                      ? `${BASE}/queues`
-                      : current === `${BASE}/flow`
-                        ? `${BASE}/flows`
-                        : current
-            }
-            collapsed={collapsed}
-            label="Console"
-            onNavigate={closeDrawer}
-          />
-        )}
-        topbar={
-          <div className="flex w-full items-center justify-end gap-2">
-            <SupervisorPanel />
-            <ThemeSwitcher size="sm" showLabels={false} />
-            <SignOut onError={setProblem} />
-          </div>
-        }
-      >
-        {problem ? (
-          <div className="px-6 pt-4">
-            <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
-          </div>
-        ) : null}
-        {view()}
-      </SidebarLayout>
-    </div>
+    <AdministratorConsole current={current} title={view.title} actions={actions}>
+      {notice ? <div className="px-6 pt-4">{notice}</div> : null}
+      <view.Page />
+    </AdministratorConsole>
   );
 }
