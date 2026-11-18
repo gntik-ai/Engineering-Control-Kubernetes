@@ -592,6 +592,9 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     title: Mapped[str] = mapped_column(String(300))
     source: Mapped[str] = mapped_column(String(16))
     state: Mapped[str] = mapped_column(String(16), index=True)
+    # Workspace approval is independent of delivery progress and the issue's GitHub state.
+    # Older backlog items retain their original execution rules.
+    workspace_review: Mapped[str | None] = mapped_column(String(16))
     routed_by: Mapped[str | None] = mapped_column(String(16))
     routing_reason: Mapped[str | None] = mapped_column(String(300))
     # Who proposed an item that did not come from GitHub: nobody named means the

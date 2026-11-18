@@ -327,6 +327,19 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class EpicInput(PlainChangeInput):
+    title: str = Field(min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=40000)
+
+
+class StoryInput(EpicInput):
+    epic_ids: list[UUID] = Field(min_length=1)
+
+
+class WorkspaceIssueInput(EpicInput):
+    story_ids: list[UUID] = Field(min_length=1)
+
+
 class FlowDraftInput(DashboardModel):
     """A changed flow, kept as the draft of its key."""
 

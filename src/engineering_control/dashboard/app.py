@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
@@ -41,6 +41,7 @@ from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
+from engineering_control.dashboard.planning import Kind
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -62,6 +63,7 @@ from engineering_control.dashboard.schemas import (
     BacklogSyncInput,
     BudgetInput,
     CacheTrialInput,
+    EpicInput,
     EvaluationInput,
     FlowCheckInput,
     FlowCreateInput,
@@ -96,6 +98,7 @@ from engineering_control.dashboard.schemas import (
     SectionRunInput,
     SectionUpdateInput,
     SkillInput,
+    StoryInput,
     SummariesInput,
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
@@ -105,6 +108,7 @@ from engineering_control.dashboard.schemas import (
     TaskInput,
     TriggerInput,
     TriggerUpdateInput,
+    WorkspaceIssueInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
@@ -821,6 +825,55 @@ def create_app(
             PlainChangeInput,
             lambda _body: service(request).set_default_project(name),
             event="dashboard.default_project_changed",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/planning")
+    async def project_planning(name: str, request: Request) -> Response:
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).planning.listing, name))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    async def save_planning(name: str, kind: Kind, key: UUID | None, request: Request) -> Response:
+        schema = {"epics": EpicInput, "stories": StoryInput, "issues": WorkspaceIssueInput}[kind]
+
+        async def change(body: EpicInput) -> dict[str, str]:
+            parents = (
+                body.epic_ids
+                if isinstance(body, StoryInput)
+                else (body.story_ids if isinstance(body, WorkspaceIssueInput) else [])
+            )
+            return await asyncio.to_thread(
+                repo(request).planning.save, name, kind, body.title, body.description, parents, key
+            )
+
+        return await project_change(
+            request,
+            schema,
+            change,
+            event="workspace.planning_saved",
+            subject=name,
+            status_code=201 if key is None else 200,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}")
+    async def create_planning(name: str, kind: Kind, request: Request) -> Response:
+        return await save_planning(name, kind, None, request)
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/update")
+    async def update_planning(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        return await save_planning(name, kind, key, request)
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/remove")
+    async def remove_planning(
+        name: str, kind: Literal["epics", "stories"], key: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).planning.remove, name, kind, key),
+            event="workspace.planning_removed",
+            subject=name,
         )
 
     @app.get("/api/dashboard/flows")

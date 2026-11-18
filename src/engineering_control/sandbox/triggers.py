@@ -358,6 +358,8 @@ class Triggers:
                     BacklogItem.project_id == record.id,
                     BacklogItem.section_id == section.id,
                     BacklogItem.state.in_(("proposed", "accepted")),
+                    BacklogItem.workspace_review.is_(None)
+                    | (BacklogItem.workspace_review == "approved"),
                     BacklogItem.created_at > since,
                 )
                 .order_by(BacklogItem.created_at)

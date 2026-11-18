@@ -452,6 +452,10 @@ class Queues:
             item = items.get(item_id)
             if item is None or item.project_id != queue.project_id:
                 raise ProjectInvalid("A queue holds items of its own project only")
+            if item.workspace_review not in (None, "approved"):
+                raise ProjectConflict(
+                    "This workspace issue is awaiting approval or synchronization"
+                )
             if item.state not in OPEN_STATES:
                 raise ProjectInvalid(f"“{item.title[:80]}” is not open any more")
             if item_id in elsewhere:

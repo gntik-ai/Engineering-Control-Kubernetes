@@ -325,6 +325,10 @@ class Runs:
             item, project, section = found
             if refusal := paused_refusal(project):
                 raise ProjectConflict(refusal)
+            if item.workspace_review not in (None, "approved"):
+                raise ProjectConflict(
+                    "This workspace issue is awaiting approval or synchronization"
+                )
             if item.state not in ("proposed", "accepted"):
                 raise ProjectInvalid("The item is not open any more")
             if section is None:

@@ -90,6 +90,8 @@ def _starts(item: BacklogItem, section: ProjectSection | None) -> str | None:
     """What starting the item does: "item" when it is worked on (delivered), "scope" when
     it asks its section's flow to look at what it names, None when nothing can run."""
     session = object_session(item)
+    if item.workspace_review not in (None, "approved"):
+        return None
     if session is None or section is None or not section.flow_key:
         return None
     produced = item.source_run_id is not None or bool((item.facts or {}).get("kind"))
