@@ -3,7 +3,6 @@
 import asyncio
 import os
 import sys
-from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from engineering_control.config import get_settings
@@ -42,7 +41,6 @@ async def verify() -> None:
                         "per_page": 100,
                         "page": page,
                         "sort": "updated",
-                        "since": (datetime.now(UTC) - timedelta(days=7)).isoformat(),
                     },
                 )
                 for issue in issues:
@@ -52,6 +50,8 @@ async def verify() -> None:
                         and issue.get("body") == details
                         and issue["user"]["type"] == "Bot"
                     ):
+                        if (issue.get("performed_via_github_app") or {}).get("id") != app.app_id:
+                            raise RuntimeError("Existing check needs operator reconciliation")
                         found = issue
                         break
                 if len(issues) < 100:
