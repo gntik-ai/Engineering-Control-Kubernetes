@@ -1,7 +1,10 @@
 import { useSyncExternalStore, type ComponentPropsWithRef, type MouseEvent } from 'react';
 
-/** History routing for the three console views; everything lives under /console. */
+/** History routing for the console. The server resolves /console to the default project. */
 export const BASE = '/console';
+export const ADMIN = `${BASE}/admin`;
+export const WORKSPACE = `${BASE}/workspace`;
+export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
 const NAV_EVENT = 'console:navigate';
 
 const subscribe = (onChange: () => void) => {
@@ -38,7 +41,7 @@ export function setQuery(values: Record<string, string | null | undefined>) {
   navigate(window.location.pathname + (search ? `?${search}` : ''), { replace: true });
 }
 
-const inConsole = (href: string) => href === BASE || href.startsWith(`${BASE}/`) || href.startsWith(`${BASE}?`);
+const inConsole = (href: string) => href.startsWith(`${BASE}/`);
 
 /** Link for the kit's LinkProvider: console hrefs route on the client, the rest load normally. */
 export function RouterLink({ href = '', onClick, ...props }: ComponentPropsWithRef<'a'>) {

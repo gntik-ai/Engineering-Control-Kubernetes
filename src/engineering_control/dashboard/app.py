@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
@@ -41,6 +41,7 @@ from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
+from engineering_control.dashboard.planning import Kind
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -62,6 +63,7 @@ from engineering_control.dashboard.schemas import (
     BacklogSyncInput,
     BudgetInput,
     CacheTrialInput,
+    EpicInput,
     EvaluationInput,
     FlowCheckInput,
     FlowCreateInput,
@@ -96,6 +98,7 @@ from engineering_control.dashboard.schemas import (
     SectionRunInput,
     SectionUpdateInput,
     SkillInput,
+    StoryInput,
     SummariesInput,
     SupervisorDecisionInput,
     SupervisorDefinitionInput,
@@ -105,6 +108,7 @@ from engineering_control.dashboard.schemas import (
     TaskInput,
     TriggerInput,
     TriggerUpdateInput,
+    WorkspaceIssueInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
@@ -134,6 +138,8 @@ CONSOLE_INLINE_STYLE_HASH = (
 CONSOLE_VIEWS = frozenset(
     {
         "",
+        "admin",
+        "workspace",
         "inbox",
         "projects",
         "project",
@@ -479,11 +485,7 @@ def create_app(
             return authenticated
         if api:
             return JSONResponse({"detail": "authentication required"}, status_code=401)
-        destination = request.url.path
-        target = "/login"
-        if destination not in {"/", "/login"}:
-            target = f"/login?next={destination}"
-        response = RedirectResponse(target, status_code=303)
+        response = RedirectResponse("/login", status_code=303)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
 
@@ -542,7 +544,6 @@ def create_app(
         form = await _form(request)
         csrf = form.get("csrf_token", "")
         csrf_cookie = request.cookies.get(LOGIN_CSRF_COOKIE, "")
-        next_path = _safe_next(form.get("next_path"))
         address = _client_address(request, trusted_proxies)
         csrf_valid = (
             bool(csrf)
@@ -581,7 +582,7 @@ def create_app(
                 {"detail": "Sign-in is temporarily unavailable; try again."}, status_code=503
             )
         login_limiter.success(address)
-        redirect = RedirectResponse(next_path, status_code=303)
+        redirect = RedirectResponse("/console", status_code=303)
         _set_cookie(
             redirect, SESSION_COOKIE, token, max_age=resolved.dashboard_session_hours * 3600
         )
@@ -824,6 +825,55 @@ def create_app(
             PlainChangeInput,
             lambda _body: service(request).set_default_project(name),
             event="dashboard.default_project_changed",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/planning")
+    async def project_planning(name: str, request: Request) -> Response:
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).planning.listing, name))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    async def save_planning(name: str, kind: Kind, key: UUID | None, request: Request) -> Response:
+        schema = {"epics": EpicInput, "stories": StoryInput, "issues": WorkspaceIssueInput}[kind]
+
+        async def change(body: EpicInput) -> dict[str, str]:
+            parents = (
+                body.epic_ids
+                if isinstance(body, StoryInput)
+                else (body.story_ids if isinstance(body, WorkspaceIssueInput) else [])
+            )
+            return await asyncio.to_thread(
+                repo(request).planning.save, name, kind, body.title, body.description, parents, key
+            )
+
+        return await project_change(
+            request,
+            schema,
+            change,
+            event="workspace.planning_saved",
+            subject=name,
+            status_code=201 if key is None else 200,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}")
+    async def create_planning(name: str, kind: Kind, request: Request) -> Response:
+        return await save_planning(name, kind, None, request)
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/update")
+    async def update_planning(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        return await save_planning(name, kind, key, request)
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/remove")
+    async def remove_planning(
+        name: str, kind: Literal["epics", "stories"], key: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).planning.remove, name, kind, key),
+            event="workspace.planning_removed",
+            subject=name,
         )
 
     @app.get("/api/dashboard/flows")
@@ -2263,15 +2313,22 @@ def create_app(
         return FileResponse(path, media_type=media_type)
 
     @app.get("/console")
-    @app.get("/console/{view}")
-    async def console_page(request: Request, view: str = "") -> Response:
-        """The gntik-ui console: one client-routed page over the read-only dashboard API."""
+    @app.get("/console/{view:path}")
+    async def console_page(request: Request) -> Response:
+        """Open the global default workspace or serve a specific console view."""
         authenticated = await require_session(request)
         if isinstance(authenticated, Response):
             return authenticated
+        view: str = request.path_params.get("view", "").removesuffix("/")
         index = CONSOLE_ROOT / "index.html"
-        if view not in CONSOLE_VIEWS or not index.is_file():
+        if not _console_view(view) or not index.is_file():
             raise HTTPException(status_code=404, detail="page not found")
+        if view in {"", "workspace"}:
+            default = await service(request).default_project()
+            if default is not None:
+                return RedirectResponse(f"/console/workspace/{default}", status_code=303)
+            if not view:
+                return RedirectResponse("/console/workspace", status_code=303)
         return FileResponse(index, media_type="text/html")
 
     @app.exception_handler(404)
@@ -2350,12 +2407,11 @@ def _valid_csrf(authenticated: AuthenticatedSession, supplied: str | None) -> bo
     return supplied is not None and hmac.compare_digest(authenticated.data.csrf_token, supplied)
 
 
-def _safe_next(value: str | None) -> str:
-    if value is not None and value.startswith("/console/"):
-        view = value.removeprefix("/console/")
-        if view and view in CONSOLE_VIEWS:
-            return value
-    return "/console"
+def _console_view(view: str) -> bool:
+    return view in CONSOLE_VIEWS or (
+        view.startswith("workspace/")
+        and PROJECT_NAME.fullmatch(view.removeprefix("workspace/")) is not None
+    )
 
 
 def _client_address(

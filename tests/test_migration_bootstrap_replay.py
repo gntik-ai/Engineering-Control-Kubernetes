@@ -48,7 +48,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0046 (batches of questions to a model) follows 0045 (summaries of a project's code).
     # 0047 (the day a backlog item was done) follows it, and 0048 (deleted flows of the
     # platform's own) follows that. 0049 adds the workspace records and default.
-    assert (head, parent) == ("0049", "0048")
+    assert (head, parent) == ("0050", "0049")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -121,7 +121,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             )
             == "falcone"
         )
+    assert "workspace_review" in {c["name"] for c in inspect(engine).get_columns("backlog_items")}
     command.downgrade(config, parent)
+    assert "workspace_review" not in {
+        c["name"] for c in inspect(engine).get_columns("backlog_items")
+    }
+    command.downgrade(config, "0048")
     assert not planning_tables & set(inspect(engine).get_table_names())
     assert "description" not in {c["name"] for c in inspect(engine).get_columns("projects")}
     parent = "0047"

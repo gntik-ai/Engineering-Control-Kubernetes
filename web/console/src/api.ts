@@ -5,10 +5,12 @@ export interface ProjectSummary {
   project: string;
   /** What the administrator calls it; the name above is the identifier and never changes. */
   display_name: string;
+  description: string | null;
   /** "registry": the workflows run for it and it cannot be removed. "console": made here. */
   origin: 'registry' | 'console';
   default_branch: string;
   source_repository: string;
+  repository_url: string;
   deployment_repository: string;
   self_contained: boolean;
   /** Items of the backlog still to do. */
@@ -1155,6 +1157,11 @@ export interface Listing<T> {
   items: T[];
   refreshed_at?: string | null;
 }
+
+export interface ProjectListing extends Listing<ProjectSummary> {
+  default_project: string | null;
+}
+
 export interface Paged<T> extends Listing<T> {
   page: number;
   pages: number;
@@ -1172,12 +1179,15 @@ export function apiUrl(path: string, params: Params = {}): string {
   return `/api/dashboard/${path}${search ? `?${search}` : ''}`;
 }
 
+function returnToSignIn(): never {
+  window.location.assign('/login');
+  throw new DOMException('Signed out', 'AbortError');
+}
+
 async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, credentials: 'same-origin', headers: { Accept: 'application/json' } });
   if (response.status === 401) {
-    // The session ended: the dashboard's own sign-in page brings the operator back here.
-    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
-    throw new DOMException('Signed out', 'AbortError');
+    returnToSignIn();
   }
   if (!response.ok) throw new Error(`The dashboard API answered ${response.status}.`);
   return (await response.json()) as T;
@@ -1213,8 +1223,7 @@ export async function postJson<T>(
   });
   const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null;
   if (response.status === 401) {
-    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
-    throw new DOMException('Signed out', 'AbortError');
+    returnToSignIn();
   }
   if (!response.ok) {
     const detail = typeof payload?.detail === 'string' ? payload.detail : `The request was refused (${response.status}).`;

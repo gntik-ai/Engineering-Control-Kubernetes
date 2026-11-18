@@ -38,15 +38,15 @@ const suggestName = (display: string) =>
     .slice(0, 32)
     .replace(/-+$/, '');
 
-export function useSubmit(action: () => Promise<unknown>, done: () => void) {
+export function useSubmit<T>(action: () => Promise<T>, done: (result: T) => void) {
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const submit = async () => {
     setPending(true);
     setProblem(null);
     try {
-      await action();
-      done();
+      const result = await action();
+      done(result);
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return;
       setProblem(error instanceof Error ? error.message : 'The request failed.');
@@ -127,16 +127,20 @@ function RepositoryField({ value, onChange }: { value: string; onChange: (value:
   );
 }
 
-export function NewProjectDialog({ open, onOpenChange, onSaved }: DialogProps) {
+export function NewProjectDialog({
+  open,
+  onOpenChange,
+  onSaved,
+}: Omit<DialogProps, 'onSaved'> & { onSaved: (project: Pick<ProjectSummary, 'project'>) => void }) {
   const [display, setDisplay] = useState('');
   const [name, setName] = useState('');
   const [nameEdited, setNameEdited] = useState(false);
   const [repository, setRepository] = useState('');
   const finalName = nameEdited ? name : suggestName(display);
   const { pending, problem, submit, reset } = useSubmit(
-    () => postJson<ProjectSummary>('projects', { name: finalName, display_name: display, repository }),
-    () => {
-      onSaved();
+    () => postJson<Pick<ProjectSummary, 'project'>>('projects', { name: finalName, display_name: display, repository }),
+    (project) => {
+      onSaved(project);
       onOpenChange(false);
     },
   );

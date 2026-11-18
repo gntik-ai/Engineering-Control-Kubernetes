@@ -13,7 +13,7 @@ import {
 } from '@gntik-ai/ui';
 import { Inbox, RefreshCw } from '@gntik-ai/icons';
 import type { ReactNode } from 'react';
-import { apiUrl, useResource, type Listing, type ProjectSummary, type Resource } from './api';
+import { apiUrl, useResource, type Listing, type ProjectListing, type Resource } from './api';
 
 /** Names the page in the browser tab while it is shown. */
 export function usePageTitle(page: string | undefined) {
@@ -40,7 +40,7 @@ export function IssueRef({ number, url }: { number: number | null; url?: string 
 
 /** The registered projects, for the filter of every view. */
 export function useProjects(intervalMs: number | null = null) {
-  return useResource<Listing<ProjectSummary>>(apiUrl('projects'), intervalMs);
+  return useResource<ProjectListing>(apiUrl('projects'), intervalMs);
 }
 
 const ALL = '__all__';

@@ -385,13 +385,20 @@ function Conversation() {
   );
 }
 
-/** The supervisor's panel: a button in the top bar of every page, and the conversation. */
+/** The supervisor's conversation, opened from the Administrator Console top bar. */
 export function SupervisorPanel() {
   const [open, setOpen] = useState(false);
   return (
     <Drawer side="right" open={open} onOpenChange={setOpen}>
-      <Button variant="secondary" size="sm" icon={Sparkles} onClick={() => setOpen(true)}>
-        Supervisor
+      <Button
+        variant="secondary"
+        size="sm"
+        icon={Sparkles}
+        aria-label="Supervisor"
+        className="max-sm:w-8 max-sm:px-0"
+        onClick={() => setOpen(true)}
+      >
+        <span className="hidden sm:inline">Supervisor</span>
       </Button>
       <DrawerContent size="lg" aria-label="Supervisor">
         <DrawerHeader>

@@ -1,4 +1,5 @@
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -13,12 +14,12 @@ import {
   Skeleton,
   StatusDot,
 } from '@gntik-ai/ui';
-import { FolderKanban, Pencil, Plus, Trash2 } from '@gntik-ai/icons';
+import { FolderKanban, Pencil, Plus, Star, Trash2 } from '@gntik-ai/icons';
 import { useState } from 'react';
-import type { ProjectSummary } from '../api';
+import { postJson, type ProjectSummary } from '../api';
 import { LoadError, RefreshButton, When, useProjects } from '../parts';
 import { BASE } from '../router';
-import { NewProjectDialog, RemoveProjectDialog, RenameProjectDialog } from './ProjectDialogs';
+import { NewProjectDialog, RemoveProjectDialog, RenameProjectDialog, useSubmit } from './ProjectDialogs';
 
 const filtered = (view: string, project: string) => `${BASE}/${view}?project=${encodeURIComponent(project)}`;
 
@@ -31,10 +32,19 @@ function Metric({ label, value, href }: { label: string; value: number; href: st
   );
 }
 
-function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () => void }) {
+function ProjectCard({
+  item,
+  isDefault,
+  onChanged,
+}: {
+  item: ProjectSummary;
+  isDefault: boolean;
+  onChanged: () => void;
+}) {
   const busy = item.active_runs > 0;
   const [dialog, setDialog] = useState<'rename' | 'remove' | null>(null);
   const removable = item.origin === 'console';
+  const makeDefault = useSubmit(() => postJson(`projects/${item.project}/default`), onChanged);
   return (
     <Card>
       <CardHeader>
@@ -47,6 +57,7 @@ function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () 
             </CardTitle>
             <div className="mt-0.5 flex items-center gap-2">
               <span className="font-mono text-[12px] text-muted-foreground">{item.project}</span>
+              {isDefault ? <Badge size="sm">Default</Badge> : null}
               {removable ? null : (
                 <Badge tone="neutral" size="sm">
                   Built in
@@ -60,6 +71,9 @@ function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () 
             align="end"
             items={[
               { label: 'Rename', icon: Pencil, onSelect: () => setDialog('rename') },
+              ...(!isDefault
+                ? [{ label: 'Set as default', icon: Star, disabled: makeDefault.pending, onSelect: makeDefault.submit }]
+                : []),
               ...(removable
                 ? [{ label: 'Remove', icon: Trash2, destructive: true, onSelect: () => setDialog('remove') }]
                 : []),
@@ -73,6 +87,9 @@ function ProjectCard({ item, onChanged }: { item: ProjectSummary; onChanged: () 
         </CardDescription>
       </CardHeader>
       <CardBody className="grid gap-3">
+        {makeDefault.problem ? (
+          <Alert tone="destructive" title="Could not change the default project" description={makeDefault.problem} />
+        ) : null}
         <div className="grid grid-cols-3 gap-2">
           <Metric label="Items to do" value={item.open_items} href={filtered('backlog', item.project)} />
           <Metric label="Runs under way" value={item.active_runs} href={filtered('runs', item.project)} />
@@ -125,7 +142,14 @@ export function ProjectsPage() {
         {items?.length === 0 ? <EmptyState icon={FolderKanban} title="No projects yet" /> : null}
         <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
           {items
-            ? items.map((item) => <ProjectCard key={item.project} item={item} onChanged={projects.reload} />)
+            ? items.map((item) => (
+                <ProjectCard
+                  key={item.project}
+                  item={item}
+                  isDefault={item.project === projects.data?.default_project}
+                  onChanged={projects.reload}
+                />
+              ))
             : !projects.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-44 w-full" />)}
         </div>
       </div>

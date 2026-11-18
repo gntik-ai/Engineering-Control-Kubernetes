@@ -65,6 +65,9 @@ class DashboardService:
     async def projects(self) -> dict[str, object]:
         return await asyncio.to_thread(project_list, self.repository.sessions)
 
+    async def default_project(self) -> str | None:
+        return await asyncio.to_thread(self.repository.projects.default_name)
+
     async def project_exists(self, name: str) -> bool:
         return await asyncio.to_thread(self.repository.projects.exists, name)
 
