@@ -16,7 +16,7 @@ The Project is the workspace for a single repository. The Superadmin signs in to
 
 ## Evidence needed before enabling external effects
 
-The normal GitHub scanner uses read permissions. Publishing a technical issue and closing an approved planning issue each use a short-lived Issues write token scoped to that repository. Use the designated repository, `gntik-ai/falcone`, to verify create, read-back and close through the product's installation. Use a dedicated verification issue and close only that issue. The personal account used for a pull request cannot establish the product installation's permissions.
+The normal GitHub scanner uses read permissions. Publishing a technical issue and closing an approved planning issue each use a short-lived Issues write token scoped to that repository. On 18 November 2026 the installed app created, read back and closed Falcone issue 1649 as `engineering-control[bot]`. The acceptance check used a repository-scoped Issues write token. [GitHub record](https://github.com/gntik-ai/falcone/issues/1649)
 
 Model prices per million tokens live in the provider account records. The usage service multiplies those rates by reported tokens and also accepts client-reported cost. Neither source establishes a finalized EUR charge for a particular project and day. Verify a settled entry from the billing feed with its project attribution, date, currency, amount and source identifier before marking spend available. Replayed entries must preserve totals.
 

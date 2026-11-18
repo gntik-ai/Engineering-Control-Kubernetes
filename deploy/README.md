@@ -95,7 +95,7 @@ kubectl -n engineering-control create secret generic engineering-control-github-
 ```
 
 The app needs these permissions on the repositories: Contents (read and write), Pull
-requests (read and write), Issues (read), Metadata (read), and, for the tasks
+requests (read and write), Issues (read and write for approved workspace publication and closure), Metadata (read), and, for the tasks
 that wait for GitHub's checks and merge, Checks (read) and Commit statuses (read). A
 permission added later has to be accepted for the organisation before it counts
 (GitHub → the organisation's Settings → GitHub Apps → Engineering Control → Review
