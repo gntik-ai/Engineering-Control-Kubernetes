@@ -20,7 +20,13 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     active_project,
 )
-from engineering_control.db.models import ProviderAccount, WorkspaceImport, WorkspaceSource
+from engineering_control.dashboard.workspace_review import KINDS, WorkspaceReview, review_state
+from engineering_control.db.models import (
+    ProviderAccount,
+    WorkspaceCandidate,
+    WorkspaceImport,
+    WorkspaceSource,
+)
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.models.service import ModelError, Models, Question
 
@@ -78,6 +84,7 @@ class Update:
     sources: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
     commit: str | None = None
     description: str | None = None
+    suggestions: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _file_key(path: str) -> str:
@@ -117,13 +124,15 @@ def _aware(value: datetime) -> datetime:
 class WorkspaceImports:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+        self.review = WorkspaceReview(sessions)
 
     def status(self, name: str) -> dict[str, Any]:
         with self.sessions() as session:
             project = active_project(session, name)
             row = session.get(WorkspaceImport, project.id)
             return {
-                "models": self.model_choices() if row and row.stage == "analysis" else [],
+                "models": self.model_choices() if row and row.stage in ("analysis", *KINDS) else [],
+                "review": review_state(session, row) if row and row.stage in KINDS else None,
                 "project": name,
                 "stage": row.stage if row else "new",
                 "version": row.version if row else 0,
@@ -173,17 +182,17 @@ class WorkspaceImports:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             row = session.get(WorkspaceImport, project.id)
-            if row is None or row.version != version or row.stage not in PHASES:
+            if row is None or row.version != version or row.stage not in (*PHASES, *KINDS):
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
-            if row.stage == "analysis" and (row.provider, row.model) != (provider, model):
+            if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
                 if {"provider": provider, "model": model} not in self.model_choices():
                     raise ProjectInvalid(
                         "Choose an available model account in the Administrator Console"
                     )
                 row.provider, row.model = provider, model
-            if row.stage == "analysis" and not row.model:
+            if row.stage in ("analysis", *KINDS) and not row.model:
                 raise ProjectInvalid("Choose a configured model for the repository analysis")
             row.lease, row.lease_until = uuid4(), datetime.now(UTC) + timedelta(minutes=15)
             session.flush()
@@ -203,6 +212,10 @@ class WorkspaceImports:
                             project_id=project.id, key=key, kind=kind, evidence=evidence
                         )
                     )
+                for suggestion in result.suggestions:
+                    session.add(
+                        WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)
+                    )
                 row.stage, row.progress = result.stage, result.progress
                 row.commit_sha = result.commit or row.commit_sha
                 if result.description is not None:
@@ -221,7 +234,10 @@ class WorkspaceImports:
     ) -> dict[str, Any]:
         row = await asyncio.to_thread(self._claim, name, version, provider, model)
         try:
-            if row.stage == "analysis":
+            if row.stage in KINDS:
+                progress, suggestions = await self.review.propose(row, models)
+                result = Update(row.stage, progress, suggestions=suggestions)
+            elif row.stage == "analysis":
                 result = await self._analyze(row, models)
             elif github is None:
                 raise ProjectConflict("Connect the GitHub App to scan this repository")
@@ -397,6 +413,14 @@ class WorkspaceImports:
         day = datetime.now(UTC).date().isoformat()
         daily[day] = daily.get(day, 0) + (reply.usage.get("tokens") or 0)
         progress.update(after=batch[-1].key if batch else "", counts=counts, usage_daily=daily)
+        notes = list(progress.get("evidence_notes", []))
+        notes.append(
+            {
+                "references": [s.evidence.get("path") or s.evidence.get("number") for s in batch],
+                "summary": value[:2000],
+            }
+        )
+        progress["evidence_notes"] = notes
         return Update(
             "analysis" if len(sources) > MODEL_BATCH else "description",
             progress,

@@ -29,7 +29,7 @@ from engineering_control.db.models import (
 Kind = Literal["epics", "stories", "issues"]
 
 
-def _replace_parents(
+def replace_parents(
     session: Session, kind: Kind, project: UUID, key: UUID, parents: list[UUID]
 ) -> None:
     parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
@@ -111,7 +111,7 @@ def save_record(
     session.add(row)
     session.flush()
     if kind != "epics":
-        _replace_parents(session, kind, project.id, row.id, parents)
+        replace_parents(session, kind, project.id, row.id, parents)
     return row.id
 
 

@@ -282,12 +282,16 @@ class BacklogItems:
             if remove:
                 # An item a run is working on stays, with its run.
                 busy = _at_work(session, [item.id for item, _record, _section in rows])
+                busy.update(item.id for item, _, _ in rows if item.workspace_review is not None)
                 gone = [item.id for item, _record, _section in rows if item.id not in busy]
                 _delete(session, gone)
                 session.commit()
                 return {"project": record.name, "changed": len(gone), "unchanged": len(busy)}
             for item, _record, _section in rows:
                 if state_to is not None:
+                    if item.workspace_review not in (None, "approved"):
+                        unchanged += 1
+                        continue
                     if state_to in OPEN_STATES and item.issue_state == "closed":
                         unchanged += 1  # its issue is closed on GitHub
                         continue
@@ -313,6 +317,8 @@ class BacklogItems:
         GitHub comes back the next time the backlog is brought in step."""
         with self.sessions.begin() as session:
             item, record = self._item(session, item_id)
+            if item.workspace_review is not None:
+                raise ProjectConflict("This item is managed in the project workspace")
             if _at_work(session, [item.id]):
                 raise ProjectConflict(
                     "A run of the item has not ended: stop it or wait, then delete the item"
@@ -644,6 +650,8 @@ class BacklogItems:
             raise ProjectInvalid("That is not a state an item can have")
         with self.sessions() as session:
             item, record = self._item(session, item_id)
+            if item.workspace_review not in (None, "approved"):
+                raise ProjectConflict("This workspace item is under review")
             if state in OPEN_STATES and item.issue_state == "closed":
                 raise ProjectConflict("Its issue is closed on GitHub; reopen the issue there first")
             item.state = state
@@ -651,8 +659,29 @@ class BacklogItems:
             found = session.get(ProjectSection, item.section_id) if item.section_id else None
             return serialize(item, record, found)
 
+    def missing_workspace_issues(self, project: str, seen: set[int]) -> list[int]:
+        with self.sessions() as session:
+            record = self._project(session, project)
+            return [
+                n
+                for n in session.scalars(
+                    select(BacklogItem.issue_number).where(
+                        BacklogItem.project_id == record.id,
+                        BacklogItem.workspace_review == "approved",
+                        BacklogItem.issue_state == "open",
+                        BacklogItem.issue_number.is_not(None),
+                    )
+                )
+                if n is not None and n not in seen
+            ]
+
     def apply_import(
-        self, project: str, issues: Sequence[Issue], *, complete: bool
+        self,
+        project: str,
+        issues: Sequence[Issue],
+        *,
+        complete: bool,
+        closed: dict[int, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Bring the project's items in step with the open issues GitHub gave.
 
@@ -711,6 +740,7 @@ class BacklogItems:
                 item.title = clean_title(issue.title or f"Issue {issue.number}")
                 item.issue_url = issue.url[:300] or None
                 item.issue_state = "open"
+                item.github_closed_at = None
                 item.issue_labels = labels
                 item.issue_updated_at = issue.updated_at
                 if item.routed_by != "administrator":
@@ -731,9 +761,27 @@ class BacklogItems:
                         or item.workspace_review not in (None, "approved")
                     ):
                         continue
+                    snapshot = (closed or {}).get(number) if number else None
+                    if item.workspace_review == "approved" and (
+                        snapshot is None or snapshot["state"] != "closed"
+                    ):
+                        continue
                     item.issue_state = "closed"
+                    if snapshot:
+                        timestamp = snapshot.get("closed_at")
+                        item.github_closed_at = (
+                            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                            if timestamp
+                            else None
+                        )
+                        item.facts = {
+                            **(item.facts or {}),
+                            "github_state_reason": snapshot.get("state_reason"),
+                        }
                     if item.state in OPEN_STATES:
                         item.state = "done"
+                        if snapshot:
+                            item.done_at = item.github_closed_at
                     counts["closed"] += 1
             now = datetime.now(UTC)
             status = session.get(BacklogSync, record.id)

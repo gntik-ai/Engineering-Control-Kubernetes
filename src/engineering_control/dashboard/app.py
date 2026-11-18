@@ -111,6 +111,7 @@ from engineering_control.dashboard.schemas import (
     WorkspaceDescription,
     WorkspaceImportStep,
     WorkspaceIssueInput,
+    WorkspaceReviewInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
@@ -308,6 +309,20 @@ def create_app(
     async def told_to_the_cluster() -> list[str]:
         return own_metrics()
 
+    async def publish_workspace_approvals(
+        records: DashboardRepository, installed: GitHubApp
+    ) -> None:
+        while True:
+            try:
+                for name, key in await asyncio.to_thread(records.publishing.due):
+                    try:
+                        await records.publishing.sync(name, key, installed)
+                    except (ProjectConflict, ProjectNotFound):
+                        continue
+            except Exception as error:  # noqa: BLE001 - the durable change remains for a retry
+                log_failure("workspace-sync", "workspace publication retry failed", error)
+            await asyncio.sleep(30)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -336,6 +351,12 @@ def create_app(
             resolved_repository.sessions, read_sealing_key(resolved.model_keys_key_file)
         )
         keepers: list[asyncio.Task[None]] = []
+        if repository is None and resolved_github is not None:
+            keepers.append(
+                asyncio.create_task(
+                    publish_workspace_approvals(resolved_repository, resolved_github)
+                )
+            )
         # Keep every project's backlog in step with GitHub, unless a fixture supplied the
         # app (a test drives the import itself) or the interval is zero.
         if github_app is None and resolved_github is not None and resolved.backlog_sync_minutes:
@@ -875,6 +896,68 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/import/review")
+    async def review_workspace_stage(name: str, request: Request) -> Response:
+        async def apply(body: WorkspaceReviewInput) -> dict[str, Any]:
+            records = repo(request)
+            await asyncio.to_thread(
+                records.workspace_imports.review.apply,
+                name,
+                body.version,
+                [v.model_dump(mode="json") for v in body.choices],
+            )
+            return await asyncio.to_thread(records.workspace_imports.status, name)
+
+        return await project_change(
+            request,
+            WorkspaceReviewInput,
+            apply,
+            event="workspace.stage_reviewed",
+            subject=name,
+            max_bytes=4_000_000,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/issues/{key}/approve")
+    async def approve_workspace_issue(name: str, key: UUID, request: Request) -> Response:
+        async def approve(_: PlainChangeInput) -> dict[str, Any]:
+            publishing = repo(request).publishing
+            action = await asyncio.to_thread(publishing.approve, name, key)
+            if action:
+                return await publishing.sync(name, action, github(request))
+            return {"project": name, "status": "done"}
+
+        return await project_change(
+            request, PlainChangeInput, approve, event="workspace.issue_approved", subject=name
+        )
+
+    @app.get("/api/dashboard/projects/{name}/synchronization")
+    async def outstanding_workspace_actions(name: str, request: Request) -> Response:
+        try:
+            items = await asyncio.to_thread(repo(request).publishing.outstanding, name)
+            return JSONResponse({"items": items})
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Project not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/synchronization/{key}")
+    async def reconcile_workspace_action(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: repo(request).publishing.sync(name, key, github(request)),
+            event="workspace.github_reconciled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/statistics")
+    async def workspace_statistics(name: str, request: Request, days: int = 7) -> Response:
+        try:
+            data = await asyncio.to_thread(repo(request).workspace_metrics.daily, name, days)
+            return JSONResponse(data)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Project not found"}, status_code=404)
+        except ProjectInvalid as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+
     @app.get("/api/dashboard/projects/{name}/planning")
     async def project_planning(name: str, request: Request) -> Response:
         try:
@@ -899,6 +982,7 @@ def create_app(
             request,
             schema,
             change,
+            max_bytes=256_000,
             event="workspace.planning_saved",
             subject=name,
             status_code=201 if key is None else 200,

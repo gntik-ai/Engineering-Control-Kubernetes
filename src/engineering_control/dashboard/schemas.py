@@ -338,6 +338,19 @@ class WorkspaceDescription(PlainChangeInput):
     description: str = Field(min_length=1, max_length=4000)
 
 
+class WorkspaceChoice(DashboardModel):
+    id: UUID
+    include: bool
+    title: str = Field(max_length=300)
+    description: str | None = Field(default=None, max_length=40000)
+    parents: list[UUID] = Field(default_factory=list)
+
+
+class WorkspaceReviewInput(PlainChangeInput):
+    version: int = Field(ge=0)
+    choices: list[WorkspaceChoice]
+
+
 class EpicInput(PlainChangeInput):
     title: str = Field(min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=40000)

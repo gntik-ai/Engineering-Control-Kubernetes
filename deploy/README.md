@@ -108,6 +108,28 @@ issues for the backlog, using a token limited to reading metadata and issues; th
 checks a repository out for a run and publishes a change the administrator agreed to. It reads the issues of every project every
 fifteen minutes (`ENGINEERING_BACKLOG_SYNC_MINUTES`; zero leaves it to the Sync button).
 
+## Finalized project billing
+
+The project Home chart reads finalized daily EUR totals attributed to a single project. An operator can ingest a normalized JSON Lines export from the billing feed inside the console pod.
+
+```bash
+kubectl -n engineering-control exec -i deploy/engineering-control-console -- \
+  engineering-ctl billing import-finalized < finalized-project-days.jsonl
+```
+
+Each line has the fields below.
+
+| Field | Value |
+| --- | --- |
+| `project` | Existing project identifier, such as `falcone` |
+| `day` | UTC billing date in YYYY-MM-DD format |
+| `currency`, `status`, `basis` | `EUR`, `finalized`, `project_day_total` |
+| `amount` | Source total as a decimal string, up to six fractional places. A confirmed zero or a credit is valid. |
+| `source`, `reference` | Feed name and a unique stable upstream reference for the project-day |
+| `revision` | Positive integer. A correction uses the same reference and a higher revision. |
+
+The transaction validates the complete export. Replaying the same records leaves totals unchanged. A missing date displays as unavailable. The daily figures table shows each recorded amount's source and reference. Account prices and client-reported costs continue to serve their existing uses.
+
 ## Rules the manifests keep
 
 `tests/test_deploy_manifests.py` fails if a pod could run as root, write its root
