@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -434,6 +435,8 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "projects"
     name: Mapped[str] = mapped_column(String(32), unique=True)
     display_name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str | None] = mapped_column(Text)
+    architecture: Mapped[str | None] = mapped_column(Text)
     source_repository: Mapped[str] = mapped_column(String(140))
     deployment_repository: Mapped[str] = mapped_column(String(140))
     default_branch: Mapped[str] = mapped_column(String(100), default="main")
@@ -461,6 +464,81 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     # Not set: the commands of the platform's own file for the project.
     toolchain: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     __table_args__ = (CheckConstraint("origin IN ('registry', 'console')", name="origin"),)
+
+
+class ProjectSettings(Base):
+    """The global setting shared by all project workspaces."""
+
+    __tablename__ = "project_settings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    default_project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
+
+
+class ProjectEpic(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "project_epics"
+    project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str | None] = mapped_column(Text)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (UniqueConstraint("project_id", "id", name="uq_project_epics_project_epic"),)
+
+
+class ProjectUserStory(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "project_user_stories"
+    project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str | None] = mapped_column(Text)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("project_id", "id", name="uq_project_user_stories_project_story"),
+    )
+
+
+class ProjectStoryEpic(Base):
+    __tablename__ = "project_story_epics"
+    project_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    story_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    epic_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "story_id"],
+            ["project_user_stories.project_id", "project_user_stories.id"],
+            ondelete="CASCADE",
+            name="fk_project_story_epics_story",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "epic_id"],
+            ["project_epics.project_id", "project_epics.id"],
+            ondelete="CASCADE",
+            name="fk_project_story_epics_epic",
+        ),
+    )
+
+
+class ProjectIssueStory(Base):
+    """A technical issue uses the backlog item that already tracks its GitHub state."""
+
+    __tablename__ = "project_issue_stories"
+    project_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    item_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    story_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "item_id"],
+            ["backlog_items.project_id", "backlog_items.id"],
+            ondelete="CASCADE",
+            name="fk_project_issue_stories_item",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "story_id"],
+            ["project_user_stories.project_id", "project_user_stories.id"],
+            ondelete="CASCADE",
+            name="fk_project_issue_stories_story",
+        ),
+    )
 
 
 class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
@@ -554,6 +632,7 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
         UniqueConstraint(
             "project_id", "repository", "issue_number", name="uq_backlog_items_project_issue"
         ),
+        Index("uq_backlog_items_project_item", "project_id", "id", unique=True),
         # An index, not a constraint: a constraint cannot be added to a table that exists
         # on every engine, and empty values count as different either way.
         Index("uq_backlog_items_project_origin", "project_id", "origin_ref", unique=True),

@@ -78,6 +78,7 @@ from engineering_control.dashboard.schemas import (
     ProjectArchiveInput,
     ProjectCommandsInput,
     ProjectCreateInput,
+    ProjectDescriptionInput,
     ProjectPauseInput,
     ProjectRenameInput,
     QueueCreateInput,
@@ -787,6 +788,7 @@ def create_app(
                 display_name=body.display_name,
                 repository=repository,
                 default_branch=default_branch,
+                description=body.description,
             )
 
         return await project_change(
@@ -804,6 +806,24 @@ def create_app(
             ProjectRenameInput,
             lambda body: service(request).rename_project(name, body.display_name),
             event="dashboard.project_renamed",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/description")
+    async def describe_project_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProjectDescriptionInput,
+            lambda body: service(request).describe_project(name, body.description),
+            event="dashboard.project_description_changed",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/default")
+    async def default_project_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).set_default_project(name),
+            event="dashboard.default_project_changed",
         )
 
     @app.get("/api/dashboard/flows")

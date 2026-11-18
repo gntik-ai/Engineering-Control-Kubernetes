@@ -26,6 +26,7 @@ def project_list(sessions: sessionmaker[Session]) -> dict[str, Any]:
     Counts only, read from the records themselves, so the page can ask again and again.
     A run's state is the run's record: nothing else holds a copy of it.
     """
+    projects = ProjectRecords(sessions)
     summaries: dict[str, dict[str, Any]] = {
         record.name: {
             **serialize(record),
@@ -34,7 +35,7 @@ def project_list(sessions: sessionmaker[Session]) -> dict[str, Any]:
             "active_runs": 0,
             "last_activity_at": None,
         }
-        for record in ProjectRecords(sessions).active()
+        for record in projects.active()
     }
     for name, count in BacklogItems(sessions).open_counts().items():
         if name in summaries:
@@ -64,5 +65,6 @@ def project_list(sessions: sessionmaker[Session]) -> dict[str, Any]:
         item["last_activity_at"] = latest.isoformat().replace("+00:00", "Z") if latest else None
     return {
         "items": items,
+        "default_project": projects.default_name(),
         "refreshed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }

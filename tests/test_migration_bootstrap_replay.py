@@ -47,8 +47,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # decompositions), 0021 (MERGED and gap consolidations) and 0020 (UI blueprints).
     # 0046 (batches of questions to a model) follows 0045 (summaries of a project's code).
     # 0047 (the day a backlog item was done) follows it, and 0048 (deleted flows of the
-    # platform's own) follows that.
-    assert (head, parent) == ("0048", "0047")
+    # platform's own) follows that. 0049 adds the workspace records and default.
+    assert (head, parent) == ("0049", "0048")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -102,6 +102,29 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"description", "use_when", "avoid_when", "labels", "examples", "flow_key"} <= columns
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM project_sections")) == 0
+    # 0049: a fresh database uses the same default as an upgraded installation.
+    planning_tables = {
+        "project_settings",
+        "project_epics",
+        "project_user_stories",
+        "project_story_epics",
+        "project_issue_stories",
+    }
+    assert planning_tables <= set(inspect(engine).get_table_names())
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT name FROM projects "
+                    "JOIN project_settings ON default_project_id = projects.id"
+                )
+            )
+            == "falcone"
+        )
+    command.downgrade(config, parent)
+    assert not planning_tables & set(inspect(engine).get_table_names())
+    assert "description" not in {c["name"] for c in inspect(engine).get_columns("projects")}
+    parent = "0047"
     # 0048: the flows of the platform's own that were deleted.
     assert "removed_flows" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
