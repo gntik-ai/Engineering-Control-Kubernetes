@@ -9,9 +9,10 @@ import httpx
 from sqlalchemy import select
 
 from engineering_control.dashboard.workspace_import import WorkspaceImports
-from engineering_control.db.models import ProviderAccount, WorkspaceSource
+from engineering_control.db.models import ProviderAccount, WorkspaceImport, WorkspaceSource
 from engineering_control.github_app import GitHubApp, Issue
-from engineering_control.models.service import Question, Reply
+from engineering_control.models.sealing import seal
+from engineering_control.models.service import Models, Question, Reply
 from tests.test_dashboard_web import _authenticated_client
 from tests.test_github_app import _key_file
 
@@ -194,6 +195,69 @@ def test_existing_project_uses_durable_history_and_explicit_description_approval
             next(p for p in listing if p["project"] == "falcone")["description"]
             == "Approved transit description."
         )
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_refresh_exposes_the_full_account_catalog_without_advancing_an_import(
+    tmp_path: Path,
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    path = "/api/dashboard/projects/falcone/import"
+    refresh = "/api/dashboard/account-models/refresh"
+    available = [f"earlier-{i:03d}" for i in range(220)] + ["gpt-6.2-astra", "gpt-6.2-sol"]
+    responses = [
+        httpx.Response(200, json={"data": [{"id": m} for m in available]}),
+        httpx.Response(200, json={"error": "unavailable"}),
+    ]
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        assert (request.method, str(request.url)) == ("GET", "https://api.openai.com/v1/models")
+        return responses.pop(0)
+
+    sealing = b"fixture" * 7
+    client.app.state.models = Models(
+        repo.sessions, sealing, http=httpx.AsyncClient(transport=httpx.MockTransport(provider))
+    )
+    try:
+        csrf = {"csrf_token": client.get("/api/dashboard/session").json()["csrf_token"]}
+        client.post(path + "/start", json=csrf).raise_for_status()
+        uid = uuid4()
+        with repo.sessions.begin() as db:
+            row = db.scalars(select(WorkspaceImport)).one()
+            row.stage, row.provider, row.model = "analysis", "openai", available[0]
+            db.add(
+                ProviderAccount(
+                    id=uid,
+                    name="API",
+                    provider="openai",
+                    state="limited",
+                    limited_until=datetime.now(UTC) + timedelta(minutes=5),
+                    sealed_key=seal(sealing, uid, "fixture"),
+                    models=available[:1],
+                )
+            )
+            db.add(
+                ProviderAccount(
+                    name="Paused",
+                    provider="openai",
+                    state="ready",
+                    paused=True,
+                    sealed_key="unused",
+                )
+            )
+        before = client.get(path).json()
+        assert client.post(refresh, json={"csrf_token": "x" * 40}).status_code == 403
+        assert client.post(refresh, json=csrf).json() == {"refreshed": 1, "unavailable": 0}
+        after = client.get(path).json()
+        assert [m["model"] for m in after["models"]] == available
+        assert {**after, "models": before["models"]} == before
+        assert client.post(refresh, json=csrf).json() == {"refreshed": 0, "unavailable": 1}
+        assert client.get(path).json() == after
+        assert not responses
+        with repo.sessions() as db:
+            account = db.get(ProviderAccount, uid)
+            assert account and account.state == "limited" and account.limited_until
     finally:
         client.__exit__(None, None, None)
 

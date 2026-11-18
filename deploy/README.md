@@ -206,6 +206,10 @@ key" → Enter key):
 The address is chosen from that list and never typed, so a key is sent nowhere else. A
 key works at the address it was made for.
 
+The console refreshes model catalogs from active API accounts on startup and daily.
+Choose **Refresh models** in a project's analysis wizard to check immediately. This
+reads the providers' model lists and preserves the current import stage and selection.
+
 Google's is the Gemini API of Google AI Studio (a key from aistudio.google.com → API
 keys), asked at the address where it accepts the same kind of request as OpenAI. Vertex
 AI, which signs in with a Google Cloud account and not with a key, is not supported. The

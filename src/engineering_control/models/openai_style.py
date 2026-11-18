@@ -190,13 +190,15 @@ async def models(
     """The models the key can ask, as the provider lists them."""
     response = await _send(http, name, "GET", f"{base_url}/models", key, seconds)
     try:
-        listed = response.json().get("data") or []
+        listed = response.json().get("data")
     except (ValueError, AttributeError) as error:
         raise WireError("busy", f"{name} answered something that is not a list.") from error
+    if not isinstance(listed, list):
+        raise WireError("busy", f"{name} returned an incomplete model catalog.")
     return sorted(
         {
-            str(entry.get("id")).removeprefix(model_prefix)
+            entry["id"].removeprefix(model_prefix)
             for entry in listed
-            if isinstance(entry, dict) and entry.get("id")
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"]
         }
-    )[:200]
+    )

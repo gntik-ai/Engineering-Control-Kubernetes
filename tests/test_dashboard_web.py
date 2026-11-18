@@ -177,6 +177,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/accounts/{account_id}/remove",
         "/api/dashboard/accounts/{account_id}/try",
         "/api/dashboard/accounts/{account_id}/check",
+        "/api/dashboard/account-models/refresh",
         "/api/dashboard/accounts/{account_id}/cache-trial",
         "/api/dashboard/account-prices",
         "/api/dashboard/accounts/{account_id}/batch-trial",

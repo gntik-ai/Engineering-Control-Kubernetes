@@ -771,6 +771,22 @@ async def test_a_refused_key_a_busy_provider_and_a_wrong_request_are_told_apart(
 
 
 @pytest.mark.asyncio
+async def test_catalog_response_for_a_replaced_key_is_discarded(asked: Asked) -> None:
+    account = asked.account("OpenAI", "openai")
+
+    def rotate(_request: httpx.Request) -> httpx.Response:
+        asked.accounts.key_stored(account, seal(SEALING, account, "replacement"))
+        return httpx.Response(200, json={"data": [{"id": "old-key-only"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(rotate)) as http:
+        catalogs = Models(asked.sessions, SEALING, http=http)
+        assert await catalogs.refresh_catalogs() == {"refreshed": 0, "unavailable": 1}
+    assert asked.state(account)["models"] == []
+    assert asked.state(account)["state"] == "unchecked"
+    await asked.http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_is_asked_like_the_others_and_an_account_is_tried_for_free(
     asked: Asked, monkeypatch: pytest.MonkeyPatch
 ) -> None:
