@@ -1,0 +1,59 @@
+# Opt-in acceptance check, deployed separately from the application.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-workspace-issues
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: verify-workspace-issues
+    spec:
+      restartPolicy: Never
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify
+          image: ghcr.io/gntik-ai/engineering-control-kubernetes:d3464878915ad0dacd87cdc6fd342ea41093064c
+          command: ["python", "-B", "/check/verify.py"]
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          env:
+            - name: VERIFY_REPOSITORY
+              value: gntik-ai/falcone
+            - name: CONFIRM_CREATE_AND_CLOSE
+              value: gntik-ai/falcone
+            - name: VERIFY_ID
+              value: b60a5570-6e81-4102-a8b2-d332c92c2597
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {cpu: 300m, memory: 192Mi}
+          volumeMounts:
+            - {name: check, mountPath: /check, readOnly: true}
+            - {name: github-app, mountPath: /var/run/secrets/engineering-control-github-app, readOnly: true}
+      volumes:
+        - name: check
+          configMap:
+            name: verify-workspace-issues-script
+        - name: github-app
+          secret:
+            secretName: engineering-control-github-app
+            defaultMode: 0440
+            items:
+              - {key: private-key.pem, path: private-key.pem}
