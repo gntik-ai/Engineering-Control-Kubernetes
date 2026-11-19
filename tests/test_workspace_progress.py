@@ -385,3 +385,189 @@ def test_older_paused_review_and_expired_worker_are_resumable(tmp_path: Path) ->
         )
     finally:
         client.__exit__(None, None, None)
+
+
+def test_generate_all_stories_checkpoints_and_preserves_approval(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 1)
+    epic = repo.planning.save("falcone", "epics", "Bookings", None, [])["id"]
+    other = repo.planning.save("falcone", "epics", "Reporting", None, [])["id"]
+    repo.planning.save("falcone", "stories", "Manual story", None, [UUID(epic)])
+    with repo.sessions.begin() as db:
+        db.scalars(select(WorkspaceImport)).one().stage = "stories"
+        source = db.scalars(select(WorkspaceSource)).one()
+        source.evidence = {**source.evidence, "labels": ["story"], "title": "Imported story"}
+
+    def story(title: str, *parents: str) -> dict[str, Any]:
+        return {
+            "title": title,
+            "description": "As a customer I can review my bookings.",
+            "parents": list(parents),
+        }
+
+    waiting = threading.Event()
+    resume = threading.Event()
+    replies = [
+        {
+            "complete": False,
+            "stories": [
+                story("Manual story", epic),
+                story("Imported story", other),
+                story("Export reports", other),
+                story("Booking history", epic, other),
+                story("BOOKING HISTORY", epic),
+                story("Account preferences", epic),
+            ],
+        },
+        {"complete": True, "stories": [story("Monthly report", other)]},
+        {"complete": True, "stories": []},
+    ]
+
+    class StoryModel(ReviewModel):
+        async def ask(self, question: Question, *, retry: bool = True) -> Reply:
+            if "stories" not in question.schema["properties"]:
+                return await super().ask(question, retry=retry)
+            assert question.choices == (("fixture", "analysis"),) and not retry
+            ctx = json.loads(question.prompt)
+            assert {p["id"] for p in ctx["parents"]} == {epic, other}
+            assert {"Manual story", "Export reports", "Imported story"} <= set(ctx["existing"])
+            answer = replies.pop(0)
+            if len(replies) == 1:
+                assert {"Booking history", "Account preferences"} <= set(ctx["existing"])
+                assert question.on_text
+                await question.on_text(json.dumps(answer))
+                waiting.set()
+                assert await asyncio.to_thread(resume.wait, 15)
+            return Reply(
+                answer, "", "fixture", "analysis", uuid4(), "Fixture", {"tokens": 10}, 0.1, 1
+            )
+
+    client.app.state.models = StoryModel()
+    args = {"provider": "fixture", "model": "analysis"}
+    try:
+        assert (
+            post(client, "import/advance", version=1, all_stories=True, **args).status_code == 409
+        )
+        reviewed = post(client, "import/advance", version=1, **args).json()
+        assert reviewed["review"]["mode"] == "gaps"
+        single = post(client, "import/advance", version=reviewed["version"], **args).json()
+        version = single["version"]
+        assert (
+            post(client, "import/advance", version=version, all_epics=True, **args).status_code
+            == 409
+        )
+        started = post(
+            client, "import/advance", version=version, all_stories=True, background=True, **args
+        )
+        assert started.status_code == 200 and waiting.wait(10)
+        running = client.get(BASE + "import").json()
+        assert running["activity"] == "all" and running["busy"] and running["found"] == 5
+        assert running["operation"] == {"action": "all", "state": "running", "added": 2}
+        assert (
+            post(
+                client, "import/advance", version=running["version"], all_stories=True, **args
+            ).status_code
+            == 409
+        )
+        resume.set()
+        for _ in range(100):
+            done = client.get(BASE + "import").json()
+            if not done["busy"]:
+                break
+            time.sleep(0.02)
+        assert done["operation"] == {"action": "all", "state": "completed", "added": 3}
+        candidates = {c["title"]: c for c in done["review"]["candidates"]}
+        assert len(candidates) == 5 and done["review"]["mode"] == "review"
+        assert set(candidates["Booking history"]["parents"]) == {epic, other}
+        assert candidates["Monthly report"]["parents"] == [other]
+        assert all(c["decision"] == "pending" for c in candidates.values())
+        assert [s["title"] for s in repo.planning.listing("falcone")["stories"]] == ["Manual story"]
+        assert client.get(BASE + "synchronization").json()["items"] == []
+        repeated = post(
+            client, "import/advance", version=done["version"], all_stories=True, **args
+        ).json()
+        assert repeated["review"] == done["review"] and repeated["operation"]["added"] == 0
+        assert not replies
+        approved = post(
+            client,
+            "planning/stories/decisions",
+            version=repeated["version"],
+            ids=[candidates["Booking history"]["id"]],
+        )
+        assert approved.status_code == 200
+        saved = next(
+            s
+            for s in repo.planning.listing("falcone")["stories"]
+            if s["title"] == "Booking history"
+        )
+        assert set(saved["epic_ids"]) == {epic, other}
+    finally:
+        resume.set()
+        client.__exit__(None, None, None)
+
+
+def test_bulk_story_retry_preserves_earlier_batch_and_validates_epics(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    epic = repo.planning.save("falcone", "epics", "Bookings", None, [])["id"]
+    other = repo.planning.save("falcone", "epics", "Reports", None, [])["id"]
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.stage = "stories"
+        row.progress = {"review_mode": "gaps"}
+
+    def story(title: str, parent: str) -> dict[str, Any]:
+        return {"title": title, "description": title + " for users", "parents": [parent]}
+
+    batches = [
+        [story("Browse bookings", epic)],
+        [story("Invalid link", str(uuid4()))],
+        [story("Browse bookings", epic)],
+        [story("Download report", other), story("Saved concurrently", other)],
+    ]
+
+    class Model(ReviewModel):
+        async def ask(self, question: Question, *, retry: bool = True) -> Reply:
+            stories = batches.pop(0)
+            if not batches:
+                repo.planning.save("falcone", "stories", "Saved concurrently", None, [UUID(other)])
+            return Reply(
+                {"complete": True, "stories": stories},
+                "",
+                "fixture",
+                "analysis",
+                uuid4(),
+                "Fixture",
+                {},
+                0.1,
+                1,
+            )
+
+    client.app.state.models = Model()
+
+    def generate() -> httpx.Response:
+        version = client.get(BASE + "import").json()["version"]
+        return post(
+            client,
+            "import/advance",
+            version=version,
+            provider="fixture",
+            model="analysis",
+            all_stories=True,
+        )
+
+    try:
+        assert generate().status_code == 422
+        saved = client.get(BASE + "import").json()
+        assert saved["operation"]["state"] == "failed" and saved["operation"]["added"] == 1
+        assert [c["title"] for c in saved["review"]["candidates"]] == ["Browse bookings"]
+        assert generate().status_code == 409
+        done = generate().json()
+        assert done["operation"] == {"action": "all", "state": "completed", "added": 1}
+        assert {c["title"] for c in done["review"]["candidates"]} == {
+            "Browse bookings",
+            "Download report",
+        }
+        assert not batches
+    finally:
+        client.__exit__(None, None, None)

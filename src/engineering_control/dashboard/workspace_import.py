@@ -29,6 +29,7 @@ from engineering_control.dashboard.workspace_review import (
 )
 from engineering_control.db.models import (
     ProjectEpic,
+    ProjectUserStory,
     ProviderAccount,
     WorkspaceCandidate,
     WorkspaceImport,
@@ -258,7 +259,7 @@ class WorkspaceImports:
         version: int,
         provider: str | None,
         model: str | None,
-        all_epics: bool,
+        bulk_stage: str | None,
         background: bool = False,
     ) -> WorkspaceImport:
         with self.sessions.begin() as session:
@@ -270,11 +271,12 @@ class WorkspaceImports:
                 raise ProjectConflict("This import step is already running")
             if background and row.stage not in KINDS:
                 raise ProjectConflict("Only a planning review can run in the background")
-            if all_epics and (
-                row.stage != "epics" or row.progress.get("review_mode") not in ("gaps", "review")
+            if bulk_stage and (
+                row.stage != bulk_stage or row.progress.get("review_mode") not in ("gaps", "review")
             ):
+                label = "Epics" if bulk_stage == "epics" else "User Stories"
                 raise ProjectConflict(
-                    "Finish reviewing existing GitHub issues in the Epics stage first"
+                    f"Finish reviewing existing GitHub issues in the {label} stage first"
                 )
             if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
                 if {"provider": provider, "model": model} not in self.model_choices():
@@ -286,7 +288,7 @@ class WorkspaceImports:
                 raise ProjectInvalid("Choose a configured model for the repository analysis")
             if row.stage in KINDS:
                 mode = row.progress.get("review_mode", "existing")
-                action = "existing" if mode == "existing" else ("all" if all_epics else "next")
+                action = "existing" if mode == "existing" else ("all" if bulk_stage else "next")
                 row.progress = {
                     **row.progress,
                     "reviewed_issues": _reviewed_issues(session, row),
@@ -333,18 +335,19 @@ class WorkspaceImports:
                         )
                     )
                 covered = set()
-                if row.stage == "epics" and any(s["number"] is None for s in result.suggestions):
-                    # An admin can add an Epic in another tab while the model is answering.
+                generating = any(s["number"] is None for s in result.suggestions)
+                if generating and row.stage in ("epics", "stories"):
+                    # A record may have been added in another tab while the model was answering.
+                    model = ProjectEpic if row.stage == "epics" else ProjectUserStory
                     covered = {
                         gap_identity(title)
                         for title in session.scalars(
-                            select(ProjectEpic.title).where(
-                                ProjectEpic.project_id == project.id,
-                                ProjectEpic.archived_at.is_(None),
+                            select(model.title).where(
+                                model.project_id == project.id, model.archived_at.is_(None)
                             )
                         )
                     }
-                if any(s["number"] is None for s in result.suggestions):
+                if generating:
                     covered.update(
                         session.scalars(
                             select(WorkspaceCandidate.identity).where(
@@ -353,6 +356,24 @@ class WorkspaceImports:
                             )
                         )
                     )
+                if generating and row.stage == "stories":
+                    linked = {
+                        UUID(parent)
+                        for s in result.suggestions
+                        if s["identity"] not in covered
+                        for parent in s["parents"]
+                    }
+                    active = session.scalars(
+                        select(ProjectEpic.id).where(
+                            ProjectEpic.project_id == project.id,
+                            ProjectEpic.archived_at.is_(None),
+                            ProjectEpic.id.in_(linked),
+                        )
+                    )
+                    if linked != set(active):
+                        raise ProjectConflict(
+                            "An Epic changed during generation. Retry with the current Epic list."
+                        )
                 for suggestion in result.suggestions:
                     if suggestion["identity"] in covered:
                         continue
@@ -367,12 +388,18 @@ class WorkspaceImports:
                 row.version += 1
             if job and job["state"] == "running":
                 job = {**job, "added": job["added"] + added}
-                if (
-                    result
-                    and job["action"] == "existing"
-                    and result.progress.get("review_mode", "existing") == "existing"
+                if result and (
+                    (
+                        job["action"] == "existing"
+                        and result.progress.get("review_mode", "existing") == "existing"
+                    )
+                    or (
+                        job["action"] == "all"
+                        and row.stage == "stories"
+                        and result.progress["review_mode"] == "gaps"
+                    )
                 ):
-                    # Checkpoint this page and keep the same lease through the next page.
+                    # Keep the same lease while the next page or story batch is generated.
                     row.progress = {**row.progress, "operation": job, "checked": 0, "found": 0}
                     session.flush()
                     session.expunge(row)
@@ -406,13 +433,13 @@ class WorkspaceImports:
             await asyncio.to_thread(self._renew, row)
 
     async def _run_review(
-        self, name: str, first: WorkspaceImport, models: Models | None, all_epics: bool
+        self, name: str, first: WorkspaceImport, models: Models | None, *, propagate: bool = False
     ) -> None:
         heartbeat = asyncio.create_task(self._heartbeat(first))
         row: WorkspaceImport | None = first
         try:
             while row is not None:
-                progress, suggestions = await self.review.propose(row, models, all_epics=all_epics)
+                progress, suggestions = await self.review.propose(row, models)
                 result = Update(row.stage, progress, suggestions=suggestions)
                 row = await asyncio.to_thread(self._release, name, first.lease, result)
         except asyncio.CancelledError:
@@ -430,6 +457,8 @@ class WorkspaceImports:
                 await asyncio.to_thread(self._release, name, first.lease, None, error=message)
             except ProjectConflict:
                 pass  # Another worker already owns the lease.
+            if propagate:
+                raise
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
@@ -450,19 +479,26 @@ class WorkspaceImports:
         model: str | None,
         *,
         all_epics: bool = False,
+        all_stories: bool = False,
         background: bool = False,
     ) -> dict[str, Any]:
+        if all_epics and all_stories:
+            raise ProjectInvalid("Choose one planning stage for generation")
+        bulk_stage = "epics" if all_epics else "stories" if all_stories else None
         row = await asyncio.to_thread(
-            self._claim, name, version, provider, model, all_epics, background
+            self._claim, name, version, provider, model, bulk_stage, background or all_stories
         )
         if background:
-            task = asyncio.create_task(self._run_review(name, row, models, all_epics))
+            task = asyncio.create_task(self._run_review(name, row, models))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             return await asyncio.to_thread(self.status, name)
+        if all_stories:
+            await self._run_review(name, row, models, propagate=True)
+            return await asyncio.to_thread(self.status, name)
         try:
             if row.stage in KINDS:
-                progress, suggestions = await self.review.propose(row, models, all_epics=all_epics)
+                progress, suggestions = await self.review.propose(row, models)
                 result = Update(row.stage, progress, suggestions=suggestions)
             elif row.stage == "analysis":
                 result = await self._analyze(row, models)

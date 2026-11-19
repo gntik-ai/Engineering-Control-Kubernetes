@@ -179,22 +179,31 @@ function RecordEditor({
   );
 }
 
-function DescriptionPreview({ record, onRead }: { record: PlanRow; onRead: (record: PlanRow) => void }) {
-  const text = (record.description ?? '').trim().replace(/\s+/gu, ' ');
+type DescriptionContent = { title: string; text: string };
+type ReadDescription = (content: DescriptionContent) => void;
+
+function DescriptionPreview({ title, text, onRead }: DescriptionContent & { onRead: ReadDescription }) {
+  const summary = text.trim().replace(/\s+/gu, ' ');
   // Keep the preview on a word boundary when possible and preserve the original in the dialog.
-  const preview = text.match(/^.{1,140}(?=\s|$)|^.{1,140}/u)?.[0] ?? '';
-  const shortened = preview.length < text.length;
+  const preview = summary.match(/^.{1,140}(?=\s|$)|^.{1,140}/u)?.[0] ?? '';
+  if (preview.length === summary.length) return <>{text}</>;
   return (
-    <p className="mt-1 break-words text-sm text-muted-foreground">
-      {preview}{shortened && <>…{' '}
-        <button type="button" aria-haspopup="dialog" aria-label={'Read More about ' + record.title}
-          className={linkVariants({ underline: 'always' }).root()} onClick={() => onRead(record)}>Read More</button>
-      </>}
-    </p>
+    <>
+      {preview}…{' '}
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        aria-label={'Read More about ' + title}
+        className={linkVariants({ underline: 'always' }).root()}
+        onClick={() => onRead({ title, text })}
+      >
+        Read More
+      </button>
+    </>
   );
 }
 
-function Records({ kind, project }: { kind: Kind; project: string }) {
+function Records({ kind, project, onRead }: { kind: Kind; project: string; onRead: ReadDescription }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
   const { query } = useLocation();
@@ -239,7 +248,6 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
     () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
     () => { reload(); setQuery({ tab: null, page: null, search: null, epic: null }); },
   );
-  const [reading, setReading] = useState<PlanRow | null>(null);
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
@@ -263,7 +271,11 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
               className="rounded-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">
               {record.title}
             </span>
-            {record.description && <DescriptionPreview record={record} onRead={setReading} />}
+            {record.description && (
+              <p className="mt-1 break-words text-sm text-muted-foreground">
+                <DescriptionPreview title={record.title} text={record.description} onRead={onRead} />
+              </p>
+            )}
           </>
         );
       },
@@ -369,16 +381,6 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
         filtered={Boolean(search)}
         noResultsState={<p role="status" className="text-sm text-muted-foreground">No {sections[kind]} match “{search}”.</p>}
       />
-      {reading && (
-        <Dialog open onOpenChange={(open) => { if (!open) setReading(null); }}>
-          <DialogContent size="lg" showClose closeLabel="Close description">
-            <DialogHeader><DialogTitle>{reading.title}</DialogTitle></DialogHeader>
-            <DialogBody role="region" aria-label="Full description" tabIndex={0} className="max-h-[65dvh] overflow-y-auto">
-              <p className="whitespace-pre-wrap break-words">{reading.description}</p>
-            </DialogBody>
-          </DialogContent>
-        </Dialog>
-      )}
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
@@ -427,6 +429,8 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
   }, [counts.reload]);
   const requested = useLocation().query.get('tab') ?? 'home';
   const tab = Object.hasOwn(sections, requested) ? requested : 'home';
+  const [reading, setReading] = useState<DescriptionContent | null>(null);
+  useEffect(() => { setReading(null); }, [tab]);
   return (
     <div className="grid min-w-0 gap-4">
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
@@ -451,7 +455,9 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
             <div>
               <dt className="mb-1 font-medium">Description</dt>
               <dd className="max-w-prose whitespace-pre-wrap break-words">
-                {project.description ?? 'No description yet.'}
+                {project.description?.trim() ? (
+                  <DescriptionPreview title={project.display_name} text={project.description} onRead={setReading} />
+                ) : 'No description yet.'}
               </dd>
             </div>
             <div>
@@ -474,11 +480,21 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (
           <TabsPanel key={kind} value={kind} className="pt-5">
-            {tab === kind && <Records kind={kind} project={project.project} />}
+            {tab === kind && <Records kind={kind} project={project.project} onRead={setReading} />}
           </TabsPanel>
         ))}
         <TabsPanel value="architecture" />
       </Tabs>
+      {reading && (
+        <Dialog open onOpenChange={(open) => { if (!open) setReading(null); }}>
+          <DialogContent size="lg" showClose closeLabel="Close description">
+            <DialogHeader><DialogTitle>{reading.title}</DialogTitle></DialogHeader>
+            <DialogBody role="region" aria-label="Full description" tabIndex={0} className="max-h-[65dvh] overflow-y-auto">
+              <p className="whitespace-pre-wrap break-words">{reading.text}</p>
+            </DialogBody>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }
