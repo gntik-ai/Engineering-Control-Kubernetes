@@ -539,6 +539,17 @@ async def test_a_claude_model_is_asked_through_anthropics_library_in_a_fixed_sha
     assert body["fallbacks"] == "default"
     assert "server-side-fallback-2026-07-01" in headers["anthropic-beta"]
 
+    snapshots = []
+
+    async def observe(text: str) -> None:
+        snapshots.append(text)
+
+    for model in ("claude-opus-5-5", "claude-haiku-5-5"):
+        snapshots.clear()
+        reply = await anthropic_api.complete(model=model, on_text=observe, **common)
+        assert snapshots == ["", reply.text] and json.loads(reply.text) == GOOD
+        assert reply.written == 60
+
     await anthropic_api.complete(model="claude-haiku-5-5", **common)
     _method, url, body, headers = hub.asked[-1]
     assert body is not None and "fallbacks" not in body and "anthropic-beta" not in headers

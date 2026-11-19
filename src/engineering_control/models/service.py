@@ -33,7 +33,7 @@ from engineering_control.models import anthropic_api, openai_style, shape
 from engineering_control.models.pricelist import PriceLists
 from engineering_control.models.providers import BY_KEY, ApiProvider, cost_of
 from engineering_control.models.sealing import SealError, unseal
-from engineering_control.models.wire import Wire, WireError
+from engineering_control.models.wire import TextUpdate, Wire, WireError
 
 LOG = structlog.get_logger(__name__)
 # How long a provider that is busy is waited for before it is asked again, and how long
@@ -80,6 +80,7 @@ class Question:
     batch: bool = False
     hours: int = 24
     late: str = "stop"
+    on_text: TextUpdate | None = None
 
 
 @dataclass(frozen=True)
@@ -309,6 +310,7 @@ class Models:
                 hour=question.cache == "hour",
                 loose=question.loose,
                 retry=retry,
+                on_text=question.on_text,
             )
         return await openai_style.complete(
             http=self.http,
@@ -326,6 +328,7 @@ class Models:
             effort=question.effort if held.provider.effort else None,
             model_prefix=held.provider.model_prefix,
             retry=retry,
+            on_text=question.on_text,
         )
 
     async def _patient(

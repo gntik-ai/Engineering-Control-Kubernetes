@@ -1184,7 +1184,7 @@ function returnToSignIn(): never {
   throw new DOMException('Signed out', 'AbortError');
 }
 
-async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
+export async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, credentials: 'same-origin', headers: { Accept: 'application/json' } });
   if (response.status === 401) {
     returnToSignIn();

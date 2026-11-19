@@ -4,11 +4,13 @@ is asked for as a JSON object, and the platform checks its shape."""
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any, Final
 
 import httpx
 
-from engineering_control.models.wire import Wire, WireError, said
+from engineering_control.models.wire import TextUpdate, Wire, WireError, said
 
 EFFORTS: Final = ("low", "medium", "high")
 
@@ -132,6 +134,76 @@ def read(name: str, answer: Any, model: str, max_tokens: int, model_prefix: str 
     )
 
 
+async def _events(response: httpx.Response) -> AsyncIterator[str]:
+    lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line.startswith("data:"):
+            lines.append(line[5:].removeprefix(" "))
+        elif not line and lines:
+            yield "\n".join(lines)
+            lines.clear()
+    if lines:
+        yield "\n".join(lines)
+
+
+async def _stream(
+    http: httpx.AsyncClient,
+    name: str,
+    url: str,
+    key: str,
+    seconds: float,
+    body: dict[str, Any],
+    on_text: TextUpdate,
+) -> dict[str, Any]:
+    text, refusal, finish = "", "", ""
+    usage: dict[str, Any] = {}
+    model = body["model"]
+    await on_text("")
+    try:
+        async with http.stream(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=seconds,
+            json={**body, "stream": True, "stream_options": {"include_usage": True}},
+        ) as response:
+            if response.status_code != 200:
+                await response.aread()
+                raise _failure(name, response)
+            # Some compatible endpoints answer with a complete JSON object in the same request.
+            if "application/json" in response.headers.get("content-type", ""):
+                await response.aread()
+                return dict(response.json())
+            async for event in _events(response):
+                if event == "[DONE]":
+                    break
+                chunk = json.loads(event)
+                if chunk.get("error"):
+                    raise WireError("busy", f"{name} interrupted the answer.")
+                model = chunk.get("model") or model
+                usage = chunk.get("usage") or usage
+                for choice in chunk.get("choices") or []:
+                    if choice.get("index", 0) != 0:
+                        continue
+                    delta = choice.get("delta") or {}
+                    finish = choice.get("finish_reason") or finish
+                    refusal += delta.get("refusal") or ""
+                    if delta.get("content"):
+                        text += delta["content"]
+                        await on_text(text)
+    except httpx.HTTPError as error:
+        raise WireError("busy", f"{name} did not answer: {type(error).__name__}") from error
+    except (ValueError, TypeError, AttributeError) as error:
+        raise WireError("busy", f"{name} returned unreadable answer data.") from error
+    if not finish:
+        raise WireError("busy", f"{name} stopped sending the answer before it finished.")
+    return {
+        "model": model,
+        "usage": usage,
+        "choices": [{"finish_reason": finish, "message": {"content": text, "refusal": refusal}}],
+    }
+
+
 async def complete(
     *,
     http: httpx.AsyncClient,
@@ -149,6 +221,7 @@ async def complete(
     effort: str | None = None,
     model_prefix: str = "",
     retry: bool = True,
+    on_text: TextUpdate | None = None,
 ) -> Wire:
     body = body_of(
         model=model,
@@ -161,21 +234,22 @@ async def complete(
         effort=effort,
     )
     url = f"{base_url}/chat/completions"
+
+    async def send(payload: dict[str, Any]) -> Any:
+        if on_text is not None:
+            return await _stream(http, name, url, key, seconds, payload, on_text)
+        response = await _send(http, name, "POST", url, key, seconds, json=payload)
+        try:
+            return response.json()
+        except ValueError as error:
+            raise WireError("busy", f"{name} answered something that is not an answer.") from error
+
     try:
-        response = await _send(http, name, "POST", url, key, seconds, json=body)
+        answer = await send(body)
     except WireError as error:
         if not (retry and strict and error.kind == "invalid"):
             raise
-        # A provider that will not take the shape as it is written (a rejected request
-        # costs nothing) is asked once more for a JSON object: the shape is in the
-        # question as well, and the platform checks it. A request that is wrong for
-        # another reason, a model that does not exist, is rejected again and said.
-        loose = {**body, "response_format": {"type": "json_object"}}
-        response = await _send(http, name, "POST", url, key, seconds, json=loose)
-    try:
-        answer = response.json()
-    except ValueError as error:
-        raise WireError("busy", f"{name} answered something that is not an answer.") from error
+        answer = await send({**body, "response_format": {"type": "json_object"}})
     return read(name, answer, model, max_tokens, model_prefix)
 
 

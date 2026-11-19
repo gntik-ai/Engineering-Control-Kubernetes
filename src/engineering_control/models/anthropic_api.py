@@ -15,7 +15,7 @@ from typing import Any, Final
 import anthropic
 import httpx2
 
-from engineering_control.models.wire import Wire, WireError, said
+from engineering_control.models.wire import TextUpdate, Wire, WireError, said
 
 # The models whose requests can be declined by a safety classifier and that the API can
 # answer in place of: the fallback is asked for on these.
@@ -164,6 +164,7 @@ async def complete(
     hour: bool = False,
     loose: bool = False,
     retry: bool = True,
+    on_text: TextUpdate | None = None,
 ) -> Wire:
     request = request_of(
         model=model,
@@ -179,14 +180,19 @@ async def complete(
     )
     client = _client(key, base_url, seconds, http, retry=retry)
     try:
-        if model in FALLBACK_MODELS:
-            async with client.beta.messages.stream(
-                **request, betas=[FALLBACK_BETA], fallbacks="default"
-            ) as stream:
-                message: Any = await stream.get_final_message()
-        else:
-            async with client.messages.stream(**request) as stream:
-                message = await stream.get_final_message()
+        stream_request = (
+            client.beta.messages.stream(**request, betas=[FALLBACK_BETA], fallbacks="default")
+            if model in FALLBACK_MODELS
+            else client.messages.stream(**request)
+        )
+        async with stream_request as stream:
+            if on_text is not None:
+                await on_text("")
+                text = ""
+                async for delta in stream.text_stream:
+                    text += delta
+                    await on_text(text)
+            message = await stream.get_final_message()
     except anthropic.APIError as error:
         raise _failure(error) from error
     finally:

@@ -83,6 +83,8 @@ from engineering_control.dashboard.schemas import (
     ProjectDescriptionInput,
     ProjectPauseInput,
     ProjectRenameInput,
+    ProposalDecisions,
+    ProposalEdit,
     QueueCreateInput,
     QueueItemsInput,
     QueueUpdateInput,
@@ -396,6 +398,7 @@ def create_app(
                 health, resolved.health_host, resolved.health_port, extra=told_to_the_cluster
             )
         yield
+        await resolved_repository.workspace_imports.stop_reviews()
         if told is not None:
             told.close()
         for keeper in keepers:
@@ -867,10 +870,12 @@ def create_app(
         )
 
     @app.get("/api/dashboard/projects/{name}/import")
-    async def workspace_import_status(name: str, request: Request) -> Response:
+    async def workspace_import_status(
+        name: str, request: Request, progress_only: bool = False
+    ) -> Response:
         try:
             imports = repo(request).workspace_imports
-            result = await asyncio.to_thread(imports.status, name)
+            result = await asyncio.to_thread(imports.status, name, progress_only=progress_only)
             return JSONResponse(result)
         except ProjectNotFound:
             return JSONResponse({"detail": "Project not found"}, status_code=404)
@@ -898,6 +903,7 @@ def create_app(
                 body.provider,
                 body.model,
                 all_epics=body.all_epics,
+                background=body.background,
             ),
             event="workspace.import_advanced",
             subject=name,
@@ -937,6 +943,43 @@ def create_app(
             event="workspace.stage_reviewed",
             subject=name,
             max_bytes=4_000_000,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/decisions")
+    async def decide_proposals(name: str, kind: Kind, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProposalDecisions,
+            lambda body: asyncio.to_thread(
+                repo(request).workspace_imports.review.decide,
+                name,
+                kind,
+                body.ids,
+                body.version,
+                dismiss=body.dismiss,
+            ),
+            event="workspace.proposals_reviewed",
+            subject=name,
+            max_bytes=4_000_000,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/proposal")
+    async def edit_proposal(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProposalEdit,
+            lambda body: asyncio.to_thread(
+                repo(request).workspace_imports.review.edit,
+                name,
+                kind,
+                key,
+                body.version,
+                body.title,
+                body.description,
+                body.parents,
+            ),
+            event="workspace.proposal_edited",
+            subject=name,
         )
 
     @app.post("/api/dashboard/projects/{name}/planning/issues/{key}/approve")

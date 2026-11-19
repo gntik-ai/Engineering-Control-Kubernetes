@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+
+# The current answer text, including an empty string when a new attempt starts.
+TextUpdate = Callable[[str], Awaitable[None]]
 
 
 @dataclass(frozen=True)

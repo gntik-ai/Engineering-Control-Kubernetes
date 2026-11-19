@@ -1,6 +1,7 @@
-import { Alert, Button, Field, FieldLabel, Input, Link, Textarea } from '@gntik-ai/ui';
+import { Alert, Button } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
-import { CHANGED, apiUrl, postJson, useResource } from '../api';
+import { CHANGED, apiUrl, getJson, postJson, useResource } from '../api';
+import { setQuery } from '../router';
 import { LoadError } from '../parts';
 import { useSubmit } from './ProjectDialogs';
 import type { ImportState } from './WorkspaceImport';
@@ -11,219 +12,146 @@ export interface Candidate {
   description: string | null;
   parents: string[];
   number: number | null;
+  decision: string;
 }
 export interface StageReview {
   mode: 'existing' | 'gaps' | 'review';
+  can_continue: boolean;
   candidates: Candidate[];
   parents: { id: string; title: string }[];
 }
-type Edit = Pick<Candidate, 'id' | 'title' | 'parents' | 'description'> & { include: boolean };
+export type ReviewActivity = 'existing' | 'next' | 'all';
+type Progress = Pick<ImportState, 'stage' | 'version' | 'activity' | 'busy' | 'found' | 'checked'>;
+
+function useReviewProgress(path: string, state: ImportState, watching: boolean, reload: () => void) {
+  const [progress, setProgress] = useState<Progress | null>(null);
+  useEffect(() => {
+    if (!watching) {
+      setProgress(null);
+      return;
+    }
+    const controller = new AbortController();
+    let timer: number;
+    let reloadingVersion: number | undefined;
+    async function poll() {
+      try {
+        const next = await getJson<Progress>(apiUrl(path) + '?progress_only=true', controller.signal);
+        if (controller.signal.aborted) return;
+        setProgress(next);
+        if ((next.version > state.version || (state.busy && !next.busy)) && reloadingVersion !== next.version) {
+          reloadingVersion = next.version;
+          reload();
+        }
+      } catch {
+        // The advance response remains authoritative if an observation is missed.
+      }
+      if (!controller.signal.aborted) timer = window.setTimeout(poll, 750);
+    }
+    void poll();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [path, state.version, state.busy, watching, reload]);
+  return watching && progress?.stage === state.stage && progress.version >= state.version ? progress : state;
+}
+
+export const nextStageLabel = { epics: 'Continue to User Stories', stories: 'Continue to Issues', issues: 'Finish import' };
+
 export function WorkspaceReview({
-  path,
-  repository,
-  state,
-  model,
-  saved,
+  path, state, model, reload, saved,
 }: {
   path: string;
-  repository: string;
   state: ImportState;
   model?: { provider: string; model: string };
+  reload: () => void;
   saved: (state: ImportState) => void;
 }) {
-  const [edits, setEdits] = useState<Record<string, Edit>>({});
-  const [bulkResult, setBulkResult] = useState('');
-  const active = useRef(true);
-  useEffect(() => {
-    active.current = true;
-    return () => {
-      active.current = false;
-    };
-  }, []);
   const review = state.review!;
-  const label = state.stage === 'epics' ? 'Epic' : state.stage === 'stories' ? 'User Story' : 'Issue';
-  const choices = review.candidates.map(
-    (c) =>
-      edits[c.id] ?? {
-        id: c.id,
-        title: c.title,
-        description: c.description,
-        parents: c.parents,
-        include: true,
-      },
-  );
-  const update = (c: Edit, patch: Partial<Edit>) =>
-    setEdits((previous) => ({ ...previous, [c.id]: { ...c, ...patch } }));
-  const generate = useSubmit(
-    async () => {
-      setBulkResult('');
-      let next = state;
-      do {
-        next = await postJson<ImportState>(
-          path + '/advance',
-          { version: next.version, ...model },
-          { quiet: true },
-        );
-        if (active.current) saved(next);
-      } while (active.current && next.review?.mode === 'existing');
-    },
-    () => undefined,
-  );
-  const generateAllEpics = useSubmit(
-    () => {
-      setBulkResult('');
-      return postJson<ImportState>(
+  const stage = state.stage as keyof typeof nextStageLabel;
+  const label = stage === 'epics' ? 'Epic' : stage === 'stories' ? 'User Story' : 'Issue';
+  const table = stage === 'epics' ? 'Epics' : stage === 'stories' ? 'User Stories' : 'Issues';
+  const pending = review.candidates.filter(c => c.decision === 'pending').length;
+  const [action, setAction] = useState<ReviewActivity | null>(null);
+  const [problem, setProblem] = useState('');
+  const submitting = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  async function generate(which: ReviewActivity) {
+    if (!model || submitting.current || state.busy) return;
+    submitting.current = true;
+    setAction(which);
+    setProblem('');
+    try {
+      const next = await postJson<ImportState>(
         path + '/advance',
-        { version: state.version, ...model, all_epics: true },
+        { version: state.version, ...model, background: true, all_epics: which === 'all' },
         { quiet: true },
       );
-    },
-    (next) => {
-      if (!active.current || !next.review) return;
-      saved(next);
-      const added = next.review.candidates.length - review.candidates.length;
-      if (added > 0) {
-        setBulkResult(`${added} new Epic proposal${added === 1 ? '' : 's'} ready for review.`);
-      } else {
-        setBulkResult(next.review.mode === 'review'
-          ? 'No additional Epics found.'
-          : 'No Epics were proposed. You can add an Epic in the Epics tab.');
+      if (mounted.current) saved(next);
+    } catch (error) {
+      if (mounted.current) {
+        setProblem(error instanceof Error ? error.message : 'The review could not be started.');
+        reload();
       }
-    },
-  );
-  const approve = useSubmit(
-    () => postJson<ImportState>(path + '/review', { version: state.version, choices }),
-    saved,
-  );
-  const working = generate.pending || generateAllEpics.pending || approve.pending || state.busy;
+    } finally {
+      submitting.current = false;
+      if (mounted.current) setAction(null);
+    }
+  }
+  const finish = useSubmit(() => postJson<ImportState>(path + '/review', { version: state.version, choices: [] }), saved);
+  const watching = action !== null || state.busy;
+  const progress = useReviewProgress(path, state, watching, reload);
+  const current = action ?? (state.busy ? progress.activity ?? state.activity : null);
+  const job = state.operation;
+  const stopped = job?.state === 'interrupted' || job?.state === 'failed';
+  function actionButton(which: ReviewActivity, idle: string, busy: string) {
+    const loading = current === which;
+    const completed = job?.state === 'completed' && job.action === which;
+    return (
+      <Button
+        className="h-auto min-h-9 max-w-full whitespace-normal py-2"
+        variant={which === 'next' ? 'secondary' : 'primary'}
+        loading={loading}
+        focusableWhenDisabled={false}
+        disabled={!model || watching || finish.pending}
+        onClick={() => void generate(which)}
+      >
+        {loading ? busy : stopped && job.action === which ? (which === 'existing' ? 'Resume GitHub issue review' : 'Retry generation') : idle}
+        {loading ? (
+          <span className="tabular-nums" aria-live="polite" aria-atomic="true">
+            {which === 'existing' ? ` · ${progress.checked} checked` : ''}
+            {' · '}{progress.found} found
+          </span>
+        ) : completed && job.added !== undefined && <span className="tabular-nums"> · {job.added} new</span>}
+      </Button>
+    );
+  }
   return (
-    <div className="grid min-w-0 gap-4">
-      {generate.problem && <Alert tone="destructive" title={generate.problem} />}
-      {generateAllEpics.problem && <Alert tone="destructive" title={generateAllEpics.problem} />}
-      {approve.problem && <Alert tone="destructive" title={approve.problem} />}
-      {review.mode === 'existing' ? (
-        <div>
-          <Button
-            loading={generate.pending}
-            disabled={!model || working}
-            onClick={() => void generate.submit()}
-          >
-            Review existing GitHub issues
+    <div className="grid min-w-0 gap-3">
+      {(problem || job?.detail || finish.problem) && <Alert tone="destructive" title={problem || job?.detail || finish.problem || ''} />}
+      <div className="flex flex-wrap items-center gap-2">
+        {review.mode === 'existing' || current === 'existing'
+          ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
+          : <>
+              {stage === 'epics' && actionButton('all', 'Generate all remaining Epics', 'Generating Epics')}
+              {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
+            </>}
+        <Button variant="ghost" onClick={() => setQuery({ tab: stage })}>
+          View {table}{pending > 0 ? ` (${pending} proposal${pending === 1 ? '' : 's'})` : ''}
+        </Button>
+        {!watching && job?.state === 'completed' && job.action === 'existing' && (
+          <span role="status" className="text-sm text-muted-foreground">GitHub review complete</span>
+        )}
+        {!watching && review.can_continue && (
+          <Button variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
+            {nextStageLabel[stage]}
           </Button>
-        </div>
-      ) : (
-        <>
-          <p className="text-sm text-muted-foreground">
-            {state.stage === 'issues'
-              ? 'Save the selected proposals as local drafts. Approve each draft in Issues to synchronize it.'
-              : 'Approving saves the selected records and closes their open planning issues on GitHub.'}
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {state.stage === 'epics' && (
-              <Button
-                loading={generateAllEpics.pending}
-                disabled={!model || working}
-                onClick={() => void generateAllEpics.submit()}
-              >
-                Generate all remaining Epics
-              </Button>
-            )}
-            <Button
-              variant="secondary"
-              loading={generate.pending}
-              disabled={!model || working}
-              onClick={() => void generate.submit()}
-            >
-              Generate next {label}
-            </Button>
-          </div>
-          {bulkResult && <p role="status" className="text-sm text-muted-foreground">{bulkResult}</p>}
-        </>
-      )}
-      {review.candidates.map((record, i) => {
-        const c = choices[i]!;
-        return (
-          <fieldset key={c.id} className="grid gap-3 rounded-lg border border-border p-4" disabled={working}>
-            <legend className="px-1 text-sm font-medium">
-              {record.number ? (
-                <Link href={repository + '/issues/' + record.number} target="_blank" rel="noreferrer">
-                  GitHub #{record.number}
-                </Link>
-              ) : (
-                'Generated ' + label
-              )}
-            </legend>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={c.include}
-                onChange={(e) => update(c, { include: e.target.checked })}
-              />
-              Include {record.title}
-            </label>
-            {c.include && (
-              <>
-                <Field>
-                  <FieldLabel>Title</FieldLabel>
-                  <Input value={c.title} maxLength={300} onValueChange={(title) => update(c, { title })} />
-                </Field>
-                <Field>
-                  <FieldLabel>Description</FieldLabel>
-                  <Textarea
-                    rows={3}
-                    maxLength={40000}
-                    value={c.description ?? ''}
-                    onValueChange={(description) => update(c, { description })}
-                  />
-                </Field>
-                {state.stage !== 'epics' && (
-                  <fieldset className="grid gap-1">
-                    <legend className="mb-1 text-sm font-medium">
-                      {state.stage === 'stories' ? 'Epics' : 'User Stories'} (choose at least one)
-                    </legend>
-                    {review.parents.map((p) => (
-                      <label className="flex items-start gap-2 text-sm" key={p.id}>
-                        <input
-                          type="checkbox"
-                          checked={c.parents.includes(p.id)}
-                          onChange={(e) =>
-                            update(c, {
-                              parents: e.target.checked
-                                ? [...c.parents, p.id]
-                                : c.parents.filter((id) => id !== p.id),
-                            })
-                          }
-                        />
-                        {p.title}
-                      </label>
-                    ))}
-                  </fieldset>
-                )}
-              </>
-            )}
-          </fieldset>
-        );
-      })}
-      {review.mode === 'review' && (
-        <div>
-          <Button
-            loading={approve.pending}
-            disabled={
-              working ||
-              choices.some(
-                (c) => c.include && (!c.title.trim() || (state.stage !== 'epics' && !c.parents.length)),
-              )
-            }
-            onClick={() => void approve.submit()}
-          >
-            {state.stage === 'epics'
-              ? 'Approve Epics and continue'
-              : state.stage === 'stories'
-                ? 'Approve User Stories and continue'
-                : 'Save technical drafts'}
-          </Button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

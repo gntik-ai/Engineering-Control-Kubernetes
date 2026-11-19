@@ -57,6 +57,25 @@ def enqueue(
     return row
 
 
+def approve_issue(session: Session, project: ProjectRecord, key: UUID) -> UUID | None:
+    item = session.scalar(
+        select(BacklogItem).where(BacklogItem.project_id == project.id, BacklogItem.id == key)
+    )
+    if item is None:
+        raise ProjectNotFound(str(key))
+    if item.workspace_review == "approved":
+        return None
+    if item.workspace_review not in ("pending", "publishing"):
+        raise ProjectConflict("This issue has no pending workspace approval")
+    if item.issue_number:
+        item.workspace_review = "publishing"
+        return enqueue(
+            session, project.id, "link", key, project.source_repository, item.issue_number
+        ).id
+    item.workspace_review = "publishing"
+    return enqueue(session, project.id, "create", key, project.source_repository).id
+
+
 class WorkspacePublishing:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -64,24 +83,7 @@ class WorkspacePublishing:
     def approve(self, name: str, key: UUID) -> UUID | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
-            item = session.scalar(
-                select(BacklogItem).where(
-                    BacklogItem.project_id == project.id, BacklogItem.id == key
-                )
-            )
-            if item is None:
-                raise ProjectNotFound(str(key))
-            if item.workspace_review == "approved":
-                return None
-            if item.workspace_review not in ("pending", "publishing"):
-                raise ProjectConflict("This issue has no pending workspace approval")
-            if item.issue_number:
-                item.workspace_review = "publishing"
-                return enqueue(
-                    session, project.id, "link", key, project.source_repository, item.issue_number
-                ).id
-            item.workspace_review = "publishing"
-            return enqueue(session, project.id, "create", key, project.source_repository).id
+            return approve_issue(session, project, key)
 
     def _claim(self, name: str, key: UUID) -> tuple[WorkspaceAction, str, str] | None:
         with self.sessions.begin() as session:

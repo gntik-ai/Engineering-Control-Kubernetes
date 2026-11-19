@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
@@ -127,32 +128,101 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
+def _reviewed_issues(session: Session, row: WorkspaceImport | None) -> int:
+    if row is None:
+        return 0
+    if "reviewed_issues" in row.progress or not row.progress.get("review_after"):
+        return int(row.progress.get("reviewed_issues", 0))
+    # A review started before progress counters existed still has its last source key.
+    earlier = select(WorkspaceCandidate.identity).where(
+        WorkspaceCandidate.project_id == row.project_id,
+        WorkspaceCandidate.kind != row.stage,
+        WorkspaceCandidate.number.is_not(None),
+        WorkspaceCandidate.decision != "dismissed",
+    )
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(WorkspaceSource)
+            .where(
+                WorkspaceSource.project_id == row.project_id,
+                WorkspaceSource.kind == "issue",
+                WorkspaceSource.key <= row.progress["review_after"],
+                WorkspaceSource.key.not_in(earlier),
+            )
+        )
+        or 0
+    )
+
+
 class WorkspaceImports:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
         self.review = WorkspaceReview(sessions)
+        self.tasks: set[asyncio.Task[None]] = set()
 
-    def status(self, name: str) -> dict[str, Any]:
+    def status(self, name: str, *, progress_only: bool = False) -> dict[str, Any]:
         with self.sessions() as session:
             project = active_project(session, name)
-            row = session.get(WorkspaceImport, project.id)
+            # Read the lease and candidate count in one database snapshot. A batch
+            # can commit between polls, moving its previews into the candidate table.
+            count = (
+                select(func.count())
+                .select_from(WorkspaceCandidate)
+                .where(
+                    WorkspaceCandidate.project_id == project.id,
+                    WorkspaceCandidate.kind == WorkspaceImport.stage,
+                )
+                .correlate(WorkspaceImport)
+                .scalar_subquery()
+            )
+            entry = session.execute(
+                select(WorkspaceImport, count).where(WorkspaceImport.project_id == project.id)
+            ).one_or_none()
+            row, proposals = entry if entry else (None, 0)
+            busy = bool(
+                row
+                and row.lease
+                and row.lease_until
+                and _aware(row.lease_until) > datetime.now(UTC)
+            )
+            progress = row.progress if row else {}
+            job = progress.get("operation")
+            mode = progress.get("review_mode", "existing")
+            default_action = "existing" if mode == "existing" else "next"
+            if row and row.stage in KINDS:
+                if row.lease and not busy:
+                    job = {
+                        **(job or {}),
+                        "action": progress.get("activity", default_action),
+                        "state": "interrupted",
+                    }
+                elif not job and not busy and mode == "existing" and progress.get("review_after"):
+                    job = {"action": "existing", "state": "interrupted"}
+                elif not job and not busy and mode != "existing":
+                    job = {"action": "existing", "state": "completed"}
+            status = {
+                "stage": row.stage if row else "new",
+                "version": row.version if row else 0,
+                "busy": busy,
+                "activity": progress.get("activity", default_action) if busy else None,
+                "operation": job,
+                "found": proposals + (progress.get("found", 0) if busy else 0),
+                "checked": _reviewed_issues(session, row)
+                + (progress.get("checked", 0) if busy else 0),
+            }
+            if progress_only:
+                return status
             return {
+                **status,
                 "models": self.model_choices() if row and row.stage in ("analysis", *KINDS) else [],
                 "review": review_state(session, row) if row and row.stage in KINDS else None,
                 "project": name,
-                "stage": row.stage if row else "new",
-                "version": row.version if row else 0,
                 "commit": row.commit_sha if row else None,
                 "description": row.draft if row else None,
                 "provider": row.provider if row else None,
                 "model": row.model if row else None,
-                "counts": (row.progress.get("counts") or {}) if row else {},
-                "busy": bool(
-                    row
-                    and row.lease
-                    and row.lease_until
-                    and _aware(row.lease_until) > datetime.now(UTC)
-                ),
+                "counts": progress.get("counts") or {},
             }
 
     def model_choices(self) -> list[dict[str, str]]:
@@ -183,7 +253,13 @@ class WorkspaceImports:
         return self.status(name)
 
     def _claim(
-        self, name: str, version: int, provider: str | None, model: str | None, all_epics: bool
+        self,
+        name: str,
+        version: int,
+        provider: str | None,
+        model: str | None,
+        all_epics: bool,
+        background: bool = False,
     ) -> WorkspaceImport:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -192,6 +268,8 @@ class WorkspaceImports:
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
+            if background and row.stage not in KINDS:
+                raise ProjectConflict("Only a planning review can run in the background")
             if all_epics and (
                 row.stage != "epics" or row.progress.get("review_mode") not in ("gaps", "review")
             ):
@@ -206,17 +284,47 @@ class WorkspaceImports:
                 row.provider, row.model = provider, model
             if row.stage in ("analysis", *KINDS) and not row.model:
                 raise ProjectInvalid("Choose a configured model for the repository analysis")
-            row.lease, row.lease_until = uuid4(), datetime.now(UTC) + timedelta(minutes=15)
+            if row.stage in KINDS:
+                mode = row.progress.get("review_mode", "existing")
+                action = "existing" if mode == "existing" else ("all" if all_epics else "next")
+                row.progress = {
+                    **row.progress,
+                    "reviewed_issues": _reviewed_issues(session, row),
+                    "activity": action,
+                    "checked": 0,
+                    "found": 0,
+                    "operation": None,
+                }
+                if background:
+                    row.progress = {
+                        **row.progress,
+                        "operation": {"state": "running", "action": action, "added": 0},
+                    }
+                    row.version += 1
+            row.lease, row.lease_until = (
+                uuid4(),
+                datetime.now(UTC)
+                + (timedelta(seconds=90) if background else timedelta(minutes=15)),
+            )
             session.flush()
             session.expunge(row)
             return row
 
-    def _release(self, name: str, lease: UUID | None, result: Update | None) -> None:
+    def _release(
+        self,
+        name: str,
+        lease: UUID | None,
+        result: Update | None,
+        *,
+        error: str | None = None,
+    ) -> WorkspaceImport | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             row = session.get(WorkspaceImport, project.id)
             if row is None or row.lease != lease:
                 raise ProjectConflict("This step has been resumed in another session")
+            job = row.progress.get("operation")
+            added = 0
             if result is not None:
                 for key, kind, evidence in result.sources:
                     session.merge(
@@ -236,9 +344,19 @@ class WorkspaceImports:
                             )
                         )
                     }
+                if any(s["number"] is None for s in result.suggestions):
+                    covered.update(
+                        session.scalars(
+                            select(WorkspaceCandidate.identity).where(
+                                WorkspaceCandidate.project_id == project.id,
+                                WorkspaceCandidate.kind == row.stage,
+                            )
+                        )
+                    )
                 for suggestion in result.suggestions:
                     if suggestion["identity"] in covered:
                         continue
+                    added += 1
                     session.add(
                         WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)
                     )
@@ -247,7 +365,80 @@ class WorkspaceImports:
                 if result.description is not None:
                     row.draft = result.description
                 row.version += 1
+            if job and job["state"] == "running":
+                job = {**job, "added": job["added"] + added}
+                if (
+                    result
+                    and job["action"] == "existing"
+                    and result.progress.get("review_mode", "existing") == "existing"
+                ):
+                    # Checkpoint this page and keep the same lease through the next page.
+                    row.progress = {**row.progress, "operation": job, "checked": 0, "found": 0}
+                    session.flush()
+                    session.expunge(row)
+                    return row
+                job["state"] = "completed" if result else ("failed" if error else "interrupted")
+                if error:
+                    job["detail"] = error
+                if not result:
+                    row.version += 1
+                row.progress = {**row.progress, "operation": job}
+            row.progress = {
+                k: v for k, v in row.progress.items() if k not in ("activity", "checked", "found")
+            }
             row.lease = row.lease_until = None
+            return None
+
+    def _renew(self, row: WorkspaceImport) -> None:
+        with self.sessions.begin() as session:
+            session.execute(
+                update(WorkspaceImport)
+                .where(
+                    WorkspaceImport.project_id == row.project_id,
+                    WorkspaceImport.lease == row.lease,
+                )
+                .values(lease_until=datetime.now(UTC) + timedelta(seconds=90))
+            )
+
+    async def _heartbeat(self, row: WorkspaceImport) -> None:
+        while True:
+            await asyncio.sleep(20)
+            await asyncio.to_thread(self._renew, row)
+
+    async def _run_review(
+        self, name: str, first: WorkspaceImport, models: Models | None, all_epics: bool
+    ) -> None:
+        heartbeat = asyncio.create_task(self._heartbeat(first))
+        row: WorkspaceImport | None = first
+        try:
+            while row is not None:
+                progress, suggestions = await self.review.propose(row, models, all_epics=all_epics)
+                result = Update(row.stage, progress, suggestions=suggestions)
+                row = await asyncio.to_thread(self._release, name, first.lease, result)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(self._release, name, first.lease, None)
+            raise
+        except Exception as exc:
+            message = (
+                str(exc)
+                if isinstance(exc, (ProjectConflict, ProjectInvalid))
+                else "Review interrupted. Resume from the last saved batch."
+            )
+            if not isinstance(exc, (ProjectConflict, ProjectInvalid)):
+                logging.getLogger(__name__).exception("Workspace review failed")
+            try:
+                await asyncio.to_thread(self._release, name, first.lease, None, error=message)
+            except ProjectConflict:
+                pass  # Another worker already owns the lease.
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def stop_reviews(self) -> None:
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def advance(
         self,
@@ -259,8 +450,16 @@ class WorkspaceImports:
         model: str | None,
         *,
         all_epics: bool = False,
+        background: bool = False,
     ) -> dict[str, Any]:
-        row = await asyncio.to_thread(self._claim, name, version, provider, model, all_epics)
+        row = await asyncio.to_thread(
+            self._claim, name, version, provider, model, all_epics, background
+        )
+        if background:
+            task = asyncio.create_task(self._run_review(name, row, models, all_epics))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+            return await asyncio.to_thread(self.status, name)
         try:
             if row.stage in KINDS:
                 progress, suggestions = await self.review.propose(row, models, all_epics=all_epics)

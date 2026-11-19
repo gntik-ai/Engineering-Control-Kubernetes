@@ -4,7 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
-import { WorkspaceReview, WorkspaceSync, type StageReview } from './WorkspaceReview';
+import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity } from './WorkspaceReview';
 
 export interface ImportState {
   review?: StageReview | null;
@@ -24,6 +24,10 @@ export interface ImportState {
   description: string | null;
   counts: Record<string, number>;
   busy: boolean;
+  activity: ReviewActivity | null;
+  operation?: { action: ReviewActivity; state: 'running' | 'completed' | 'failed' | 'interrupted'; added?: number; detail?: string } | null;
+  found: number;
+  checked: number;
   provider: string | null;
   model: string | null;
   models: { provider: string; model: string }[];
@@ -154,6 +158,12 @@ export function WorkspaceImport({
   }
   if (!state) return <LoadError resource={persisted} />;
   const c = state.counts;
+  const analyzing = running || state.busy;
+  const analysisCount = state.stage === 'history'
+    ? `${(c.issues_open ?? 0) + (c.issues_closed ?? 0)} issues`
+    : state.stage === 'analysis'
+      ? `${c.analyzed_sources ?? 0} sources`
+      : `${c.files ?? 0} files`;
   return (
     <section
       className="grid gap-3 rounded-xl border border-border bg-card p-5"
@@ -164,31 +174,35 @@ export function WorkspaceImport({
         {(scanning(state) || state.stage === 'new') && (
           <Button
             size="sm"
-            loading={running}
-            disabled={running || state.busy || (state.stage === 'analysis' && !model)}
+            loading={analyzing}
+            focusableWhenDisabled={false}
+            disabled={analyzing || (state.stage === 'analysis' && !model)}
             onClick={() => void advance(state)}
           >
-            {state.stage === 'new' ? 'Analyze repository' : 'Continue analysis'}
+            {analyzing ? `Analyzing · ${analysisCount}` : state.stage === 'new' ? 'Analyze repository' : 'Continue analysis'}
           </Button>
         )}
       </div>
       {error && <Alert tone="destructive" title={error} />}
-      {state.stage !== 'new' && (
-        <p className="text-sm text-muted-foreground" aria-live="polite">
-          {c.files ?? 0} files read or inventoried · {c.issues_open ?? 0} open and {c.issues_closed ?? 0}{' '}
-          closed issues
-          {c.oversized_files ? ' · ' + c.oversized_files + ' oversized files listed by path' : ''}
-          {c.analyzed_sources ? ' · ' + c.analyzed_sources + ' sources analyzed' : ''}
-          {state.commit && (
-            <>
-              {' '}
-              ·{' '}
-              <Link href={repository + '/tree/' + state.commit} target="_blank" rel="noreferrer">
-                Commit {state.commit.slice(0, 8)}
-              </Link>
-            </>
-          )}
-        </p>
+      {state.stage !== 'new' && !analyzing && (
+        <details className="text-sm text-muted-foreground">
+          <summary className="w-fit cursor-pointer">Repository scan details</summary>
+          <p className="mt-1">
+            {c.files ?? 0} files read or inventoried · {c.issues_open ?? 0} open and {c.issues_closed ?? 0}{' '}
+            closed issues
+            {c.oversized_files ? ' · ' + c.oversized_files + ' oversized files listed by path' : ''}
+            {c.analyzed_sources ? ' · ' + c.analyzed_sources + ' sources analyzed' : ''}
+            {state.commit && (
+              <>
+                {' '}
+                ·{' '}
+                <Link href={repository + '/tree/' + state.commit} target="_blank" rel="noreferrer">
+                  Commit {state.commit.slice(0, 8)}
+                </Link>
+              </>
+            )}
+          </p>
+        </details>
       )}
       {(state.stage === 'analysis' || state.review) && (
         <>
@@ -231,12 +245,12 @@ export function WorkspaceImport({
         <WorkspaceReview
           key={state.stage}
           path={path}
-          repository={repository}
           state={state}
           model={model}
+          reload={persisted.reload}
           saved={(value) => {
             setLatest(value);
-            onApproved();
+            if (state.stage !== value.stage) onApproved();
           }}
         />
       )}
@@ -255,7 +269,8 @@ export function WorkspaceImport({
           <div>
             <Button
               loading={running}
-              disabled={!(edit ?? state.description ?? '').trim()}
+              focusableWhenDisabled={false}
+              disabled={running || !(edit ?? state.description ?? '').trim()}
               onClick={() => void approve()}
             >
               Approve description
