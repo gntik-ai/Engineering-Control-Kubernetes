@@ -1,0 +1,257 @@
+import type { QueryCondition } from '@gntik-ai/ui';
+import type { ReactNode } from 'react';
+import type { DataTableEditValue, DataTableRenderEditor } from './row-edit-types';
+export type {
+  DataTableEditValue,
+  DataTableRowEdit,
+  DataTableRowSaveResult,
+  DataTableRowsSaveResult,
+  DataTableEditorContext,
+} from './row-edit-types';
+
+export type SortDirectionValue = 'ascending' | 'descending';
+/** Include lists selected ids; exclude selects every match except the listed ids. */
+export type DataTableSelectionModel = { type: 'include'; ids: string[] } | { type: 'exclude'; ids: string[] };
+export type CellValue = string | number | boolean | Date | null | undefined;
+
+export type DataTableColumnVariant = 'default' | 'mono' | 'muted' | 'numeric';
+
+/** Body-cell classes of each column variant. */
+export const COLUMN_VARIANT_CLASSES: Record<DataTableColumnVariant, string> = {
+  default: '',
+  mono: 'font-mono text-[12px]',
+  muted: 'text-[12.5px] text-muted-foreground',
+  numeric: 'font-mono text-[12.5px] tabular-nums',
+};
+
+/** Effective alignment of a column (numeric columns default to right). */
+export function columnAlign<T>(column: DataTableColumn<T>): DataTableColumn<T>['align'] {
+  return column.align ?? (column.variant === 'numeric' ? 'right' : undefined);
+}
+
+/** Draft edited by a header; identity and field are assigned on Apply. */
+export type DataTableFilterValue = Pick<QueryCondition, 'operator' | 'value'>;
+
+export interface DataTableFilterContext {
+  value: DataTableFilterValue | null;
+  setValue: (value: DataTableFilterValue | null) => void;
+  apply: () => void;
+  clear: () => void;
+}
+
+export type DataTableColumnFilter =
+  | { type: 'enum'; options: ReadonlyArray<{ value: string; label: string }>; searchable?: boolean }
+  | { type: 'text' | 'number' | 'date' | 'boolean' }
+  | { type: 'custom'; render: (context: DataTableFilterContext) => ReactNode };
+
+/** One typed column of a DataTable. */
+export interface DataTableColumn<T> {
+  /** Stable key (sorting, visibility). */
+  id: string;
+  /** Plain column name for the menu, resize separator, editor labels and export. */
+  header: string;
+  /** Help shown in an InfoTip beside the header label. Use only for columns needing a definition. */
+  description?: ReactNode;
+  /** Visible label only; use non-interactive content and aria-hidden icons. `header` keeps naming the column. */
+  renderHeader?: () => ReactNode;
+  /** Raw value: used to sort, and rendered when `cell` is absent. */
+  accessor?: (row: T) => CellValue;
+  /** Raw CSV/clipboard value; nullish results fall back to the accessor. */
+  exportValue?: (row: T) => CellValue;
+  /** Include in CSV/clipboard output (default true). Hidden columns are always omitted. */
+  exportable?: boolean;
+  /** Custom cell rendering. */
+  cell?: (row: T) => ReactNode;
+  sortable?: boolean;
+  /** Opt-in header editor; accessor results are evaluated using this type. */
+  filter?: DataTableColumnFilter;
+  /**
+   * Quick filter: unset searches the column's accessor and display text while it is visible, `true`
+   * also while it is hidden, `false` never, and a function replaces the text match for this column
+   * (it receives the row and one term, and follows the same visibility rule as unset).
+   */
+  quickFilter?: boolean | ((row: T, term: string) => boolean);
+  align?: 'left' | 'right' | 'center';
+  /** Can be hidden from the column menu (default true). */
+  hideable?: boolean;
+  /** Hidden until turned on in the column menu. */
+  defaultHidden?: boolean;
+  /**
+   * Presentational preset for the body cells: `mono` (monospace ids, regions), `muted`
+   * (secondary text), `numeric` (monospace tabular figures, right-aligned unless `align` is set).
+   */
+  variant?: DataTableColumnVariant;
+  /** Classes for the body cells (merged after the variant's). */
+  className?: string;
+  /** Classes for the header cell (e.g. a width). */
+  headClassName?: string;
+
+  /** Initial width in px (resizable or pinned tables; default 160). */
+  width?: number;
+  /** Smallest width a resize can reach (default 60). */
+  minWidth?: number;
+  /** Largest width a resize can reach (default 640). */
+  maxWidth?: number;
+  /** Shows a resize handle when the table is `resizable` (default true). */
+  resizable?: boolean;
+  /** Can be pinned from the column menu (default true). */
+  pinnable?: boolean;
+
+  /** Inline editing: Enter or F2 on the cell edits it (needs `onCellEdit` on the table). */
+  editable?: boolean | ((row: T) => boolean);
+  /** Editor of an editable cell (default a text input). */
+  editor?: DataTableCellEditor;
+  /** Value the editor starts from (default the accessor's value). */
+  editValue?: (row: T) => DataTableEditValue | undefined;
+  validate?: (value: DataTableEditValue, row: T) => string | undefined;
+  renderEditor?: DataTableRenderEditor<T>;
+}
+
+/** Editor of an editable column. */
+export type DataTableCellEditor =
+  | { type: 'text'; placeholder?: string }
+  | { type: 'textarea'; rows?: number }
+  | { type: 'switch' }
+  | { type: 'date' }
+  | { type: 'combobox'; options: ReadonlyArray<{ value: string; label: string }> }
+  | { type: 'number'; min?: number; max?: number; step?: number }
+  | { type: 'select'; options: ReadonlyArray<{ value: string; label: string }> };
+
+export interface SortState {
+  columnId: string;
+  direction: SortDirectionValue;
+}
+
+/** Compares two cell values: nulls last, numbers and dates numerically, strings with localeCompare (numeric). */
+export function compareValues(a: CellValue, b: CellValue): number {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  const na = a instanceof Date ? a.getTime() : a;
+  const nb = b instanceof Date ? b.getTime() : b;
+  if (typeof na === 'number' && typeof nb === 'number') return na - nb;
+  if (typeof na === 'boolean' && typeof nb === 'boolean') return Number(na) - Number(nb);
+  return String(na).localeCompare(String(nb), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/** Client-side sort (stable). Returns the input order when there is no sort or the column has no accessor. */
+export function sortRows<T>(
+  rows: readonly T[],
+  columns: ReadonlyArray<DataTableColumn<T>>,
+  sort: SortState | null,
+): T[] {
+  const column = sort ? columns.find((c) => c.id === sort.columnId) : undefined;
+  if (!sort || !column?.accessor) return [...rows];
+  const get = column.accessor;
+  const sign = sort.direction === 'ascending' ? 1 : -1;
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((x, y) => {
+      const va = get(x.row);
+      const vb = get(y.row);
+      // Nulls stay last in both directions.
+      if (va == null || vb == null) return compareValues(va, vb) || x.index - y.index;
+      return sign * compareValues(va, vb) || x.index - y.index;
+    })
+    .map(({ row }) => row);
+}
+
+/** Number of pages for a row count (at least 1). */
+export function pageCountOf(total: number, pageSize: number): number {
+  return Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
+}
+
+/** Client-side pagination: the rows of a 1-based page (clamped to the valid range). */
+export function paginate<T>(rows: readonly T[], page: number, pageSize: number): T[] {
+  const last = pageCountOf(rows.length, pageSize);
+  const p = Math.min(Math.max(1, page), last);
+  return rows.slice((p - 1) * pageSize, p * pageSize);
+}
+
+/** Header checkbox state for the rows on screen. */
+export function selectionState(
+  visibleIds: readonly string[],
+  selected: ReadonlySet<string>,
+): { checked: boolean; indeterminate: boolean } {
+  const count = visibleIds.filter((id) => selected.has(id)).length;
+  return { checked: count > 0 && count === visibleIds.length, indeterminate: count > 0 && count < visibleIds.length };
+}
+
+/** Selects all of `ids` when not all are selected; otherwise clears them. Other selections are kept. */
+export function toggleAll(ids: readonly string[], selected: ReadonlySet<string>): Set<string> {
+  const next = new Set(selected);
+  const all = ids.length > 0 && ids.every((id) => selected.has(id));
+  for (const id of ids) {
+    if (all) next.delete(id);
+    else next.add(id);
+  }
+  return next;
+}
+
+export function toggleOne(id: string, selected: ReadonlySet<string>): Set<string> {
+  const next = new Set(selected);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  return next;
+}
+
+/** Optional locale and boolean text for default cells. */
+export interface DataTableCellFormatOptions {
+  locale?: string;
+  booleanLabels?: [trueLabel: string, falseLabel: string];
+}
+
+/** Default cell text for a raw value. Omitting options preserves the legacy output. */
+export function formatCell(value: CellValue, options?: DataTableCellFormatOptions): ReactNode {
+  if (value == null) return '—';
+  if (value instanceof Date) {
+    if (!options) return value.toLocaleDateString();
+    if (Number.isNaN(value.getTime())) return '—';
+    return new Intl.DateTimeFormat(options.locale, { year: 'numeric', month: 'numeric', day: 'numeric' }).format(value);
+  }
+  if (typeof value === 'boolean') return (options?.booleanLabels ?? ['Yes', 'No'])[value ? 0 : 1];
+  if (typeof value === 'number' && Number.isFinite(value) && options?.locale !== undefined) {
+    const decimal = new Intl.NumberFormat(options.locale).formatToParts(1.1).find((part) => part.type === 'decimal');
+    return String(value).replace('.', decimal?.value ?? '.');
+  }
+  return value;
+}
+
+/** Groups rows by a field key or by a function returning the group key. */
+export type DataTableGroupBy<T> = Extract<keyof T, string> | ((row: T) => string | number | null | undefined);
+
+/** One group of rows, in display order. */
+export interface DataTableGroup<T> {
+  /** Group key (`''` for rows without a value). */
+  key: string;
+  rows: T[];
+}
+
+/** Group key of a row (`''` when the value is null or undefined). */
+export function groupKeyOf<T>(row: T, groupBy: DataTableGroupBy<T>): string {
+  const value = typeof groupBy === 'function' ? groupBy(row) : (row as Record<string, unknown>)[groupBy];
+  return value == null ? '' : String(value);
+}
+
+/**
+ * Splits rows into groups, keeping the row order inside each group. Groups follow `order` (the
+ * keys' first appearance in it, e.g. the unsorted input) and then any key not seen there.
+ */
+export function groupRows<T>(
+  rows: readonly T[],
+  groupBy: DataTableGroupBy<T>,
+  order: readonly T[] = rows,
+): DataTableGroup<T>[] {
+  const groups = new Map<string, T[]>();
+  for (const row of order) {
+    const key = groupKeyOf(row, groupBy);
+    if (!groups.has(key)) groups.set(key, []);
+  }
+  for (const row of rows) {
+    const key = groupKeyOf(row, groupBy);
+    const list = groups.get(key);
+    if (list) list.push(row);
+    else groups.set(key, [row]);
+  }
+  return [...groups].filter(([, list]) => list.length > 0).map(([key, list]) => ({ key, rows: list }));
+}

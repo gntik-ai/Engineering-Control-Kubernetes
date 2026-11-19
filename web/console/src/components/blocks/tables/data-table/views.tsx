@@ -1,0 +1,204 @@
+import { Bookmark, ChevronDown } from '@gntik-ai/icons';
+import {
+  type QueryGroup,
+  type QueryNode,
+  Button,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  Menu,
+  MenuContent,
+  MenuGroup,
+  MenuGroupLabel,
+  MenuItem,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuTrigger,
+} from '@gntik-ai/ui';
+import { useId, useState } from 'react';
+import type { ColumnWidths, PinnedColumns } from './column-sizing';
+import type { DataTableLabels } from './labels';
+import type { SortState } from './data-table-utils';
+
+/** What a saved view captures. Every field is optional: a missing field keeps the table's default. */
+export interface DataTableViewState {
+  /** Opaque filter state of the page's toolbar (see the table's `filters` / `onFiltersChange`). */
+  filters?: unknown;
+  filterModel?: QueryGroup;
+  sort?: SortState | null;
+  hiddenColumns?: readonly string[];
+  columnWidths?: ColumnWidths;
+  pinnedColumns?: PinnedColumns;
+  /** A field key, or `null` for no grouping (function `groupBy`s cannot be saved). */
+  groupBy?: string | null;
+}
+
+export interface DataTableView {
+  id: string;
+  name: string;
+  state: DataTableViewState;
+}
+
+// Query ids identify editor nodes; they do not change a view's filter meaning.
+function normalizedFilter(node: QueryNode): unknown {
+  return node.type === 'condition'
+    ? { type: node.type, field: node.field, operator: node.operator, value: node.value ?? null }
+    : { type: node.type, combinator: node.combinator, children: node.children.map(normalizedFilter) };
+}
+
+const norm = (s: DataTableViewState) =>
+  JSON.stringify({
+    filters: s.filters ?? null,
+    filterModel: s.filterModel?.children.length ? normalizedFilter(s.filterModel) : null,
+    sort: s.sort ?? null,
+    hiddenColumns: [...(s.hiddenColumns ?? [])].sort(),
+    columnWidths: Object.fromEntries(Object.entries(s.columnWidths ?? {}).sort(([a], [b]) => a.localeCompare(b))),
+    pinnedColumns: { left: s.pinnedColumns?.left ?? [], right: s.pinnedColumns?.right ?? [] },
+    groupBy: s.groupBy ?? null,
+  });
+
+/** Whether two view states are equivalent (key order and empty values ignored). */
+export function sameViewState(a: DataTableViewState, b: DataTableViewState): boolean {
+  return norm(a) === norm(b);
+}
+
+/** A new view id that does not collide with `views`. */
+export function newViewId(name: string, views: readonly DataTableView[]): string {
+  const base =
+    name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'view';
+  let id = base;
+  for (let i = 2; views.some((v) => v.id === id); i++) id = `${base}-${i}`;
+  return id;
+}
+
+export interface ViewSwitcherProps {
+  labels?: Partial<DataTableLabels>;
+  views: readonly DataTableView[];
+  activeId: string | null;
+  /** The table differs from the active view (or from the defaults when none is active). */
+  dirty: boolean;
+  onSelect: (id: string | null) => void;
+  onSaveAs: (name: string) => void;
+  onSave: () => void;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string) => void;
+  onReset: () => void;
+}
+
+const DEFAULT_VALUE = '__default__';
+
+/** "Views" menu: switch between saved views, save the current table as a view, rename, delete, reset. */
+export function ViewSwitcher({
+  labels,
+  views,
+  activeId,
+  dirty,
+  onSelect,
+  onSaveAs,
+  onSave,
+  onRename,
+  onDelete,
+  onReset,
+}: ViewSwitcherProps) {
+  const inputId = useId();
+  const active = views.find((v) => v.id === activeId) ?? null;
+  const [dialog, setDialog] = useState<'create' | 'rename' | null>(null);
+  const [name, setName] = useState('');
+  const open = (mode: 'create' | 'rename') => {
+    setName(mode === 'rename' && active ? active.name : '');
+    setDialog(mode);
+  };
+  const submit = () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (dialog === 'rename' && active) onRename(active.id, trimmed);
+    else onSaveAs(trimmed);
+    setDialog(null);
+  };
+  return (
+    <>
+      <Menu>
+        <MenuTrigger render={<Button variant="secondary" size="sm" icon={Bookmark} trailingIcon={ChevronDown} />}>
+          <span className="max-w-40 truncate">{active ? active.name : (labels?.defaultView ?? 'Default view')}</span>
+          {dirty && (
+            <>
+              {' '}
+              <span aria-hidden className="size-1.5 rounded-full bg-primary" />{' '}
+              <span className="sr-only">{labels?.modified ?? '(modified)'}</span>
+            </>
+          )}
+        </MenuTrigger>
+        <MenuContent align="end" className="min-w-[220px]">
+          <MenuGroup>
+            <MenuGroupLabel>{labels?.views ?? 'Views'}</MenuGroupLabel>
+            <MenuRadioGroup
+              value={activeId ?? DEFAULT_VALUE}
+              onValueChange={(v: unknown) => onSelect(v === DEFAULT_VALUE ? null : String(v))}
+            >
+              <MenuRadioItem value={DEFAULT_VALUE}>{labels?.defaultViewOption ?? 'Default view'}</MenuRadioItem>
+              {views.map((v) => (
+                <MenuRadioItem key={v.id} value={v.id}>
+                  {v.name}
+                </MenuRadioItem>
+              ))}
+            </MenuRadioGroup>
+          </MenuGroup>
+          <MenuSeparator />
+          <MenuItem disabled={!active || !dirty} onClick={onSave}>
+            {labels?.saveChanges ?? 'Save changes'}
+          </MenuItem>
+          <MenuItem onClick={() => open('create')}>{labels?.saveAs ?? 'Save as new view…'}</MenuItem>
+          <MenuItem disabled={!active} onClick={() => open('rename')}>
+            {labels?.renameView ?? 'Rename view…'}
+          </MenuItem>
+          <MenuItem disabled={!active} onClick={() => active && onDelete(active.id)}>
+            {labels?.deleteView ?? 'Delete view'}
+          </MenuItem>
+          <MenuItem disabled={!dirty} onClick={onReset}>
+            {labels?.resetChanges ?? 'Reset changes'}
+          </MenuItem>
+        </MenuContent>
+      </Menu>
+      <Dialog open={dialog != null} onOpenChange={(o) => !o && setDialog(null)}>
+        <DialogContent size="sm" closeLabel={labels?.closeDialog}>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              submit();
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>
+                {dialog === 'rename'
+                  ? (labels?.renameViewTitle ?? 'Rename view')
+                  : (labels?.saveViewTitle ?? 'Save view')}
+              </DialogTitle>
+            </DialogHeader>
+            <DialogBody>
+              <label htmlFor={inputId} className="mb-1.5 block text-[12.5px] font-medium text-foreground">
+                {labels?.viewName ?? 'View name'}
+              </label>
+              <Input id={inputId} value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" required />
+            </DialogBody>
+            <DialogFooter>
+              <DialogClose render={<Button variant="ghost" />}>{labels?.cancel ?? 'Cancel'}</DialogClose>
+              <Button type="submit" disabled={!name.trim()}>
+                {dialog === 'rename' ? (labels?.rename ?? 'Rename') : (labels?.saveView ?? 'Save view')}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
