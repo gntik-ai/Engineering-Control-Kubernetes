@@ -438,6 +438,8 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     display_name: Mapped[str] = mapped_column(String(80))
     description: Mapped[str | None] = mapped_column(Text)
     architecture: Mapped[str | None] = mapped_column(Text)
+    planning_provider: Mapped[str | None] = mapped_column(String(16))
+    planning_model: Mapped[str | None] = mapped_column(String(200))
     source_repository: Mapped[str] = mapped_column(String(140))
     deployment_repository: Mapped[str] = mapped_column(String(140))
     default_branch: Mapped[str] = mapped_column(String(100), default="main")
@@ -520,6 +522,7 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
     )
     kind: Mapped[str] = mapped_column(String(16))
     identity: Mapped[str] = mapped_column(String(96))
+    review_reason: Mapped[str | None] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(String(16), default="import", server_default="import")
     number: Mapped[int | None] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(300))
@@ -531,6 +534,28 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
         UniqueConstraint("project_id", "kind", "identity", name="uq_workspace_candidate_identity"),
         UniqueConstraint("project_id", "number", name="uq_workspace_candidate_issue"),
     )
+
+
+class PlanningReview(Timestamps, Base):
+    """A resumable review of one new workspace record, independent of the import wizard."""
+
+    __tablename__ = "planning_reviews"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    record_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    title: Mapped[str] = mapped_column(String(300))
+    scope: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    __table_args__ = (Index("ix_planning_reviews_due", "status", "due_at"),)
 
 
 class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):

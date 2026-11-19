@@ -347,6 +347,15 @@ def create_app(
                 worked = False
             await asyncio.sleep(0.2 if worked else 5)
 
+    async def review_new_planning(records: DashboardRepository, available: Models) -> None:
+        while True:
+            try:
+                worked = await records.planning_analysis.tick(available)
+            except Exception as error:  # noqa: BLE001 - an expired lease is resumed on the next pass
+                log_failure("planning-review", "Automatic planning review could not run", error)
+                worked = False
+            await asyncio.sleep(0.2 if worked else 5)
+
     async def keep_model_catalogs_current(available: Models) -> None:
         while True:
             try:
@@ -428,6 +437,9 @@ def create_app(
         if repository is None:
             keepers.append(
                 asyncio.create_task(analyze_connections(resolved_repository, app.state.models))
+            )
+            keepers.append(
+                asyncio.create_task(review_new_planning(resolved_repository, app.state.models))
             )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
@@ -1188,6 +1200,49 @@ def create_app(
             return JSONResponse({"detail": "Project not found"}, status_code=404)
         except ProjectInvalid as error:
             return JSONResponse({"detail": str(error)}, status_code=422)
+
+    @app.get("/api/dashboard/projects/{name}/planning-reviews")
+    async def planning_reviews(name: str, request: Request, page: int = Query(1, ge=1)) -> Response:
+        records = repo(request)
+        try:
+            result = await asyncio.to_thread(records.planning_analysis.status, name, page)
+            result["models"] = await asyncio.to_thread(records.workspace_imports.model_choices)
+            return JSONResponse(result)
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/planning-reviews/model")
+    async def planning_review_model(name: str, request: Request) -> Response:
+        async def change(body: ConnectionAnalysisInput) -> dict[str, str]:
+            records = repo(request)
+            choices = await asyncio.to_thread(records.workspace_imports.model_choices)
+            if (
+                not body.provider
+                or not body.model
+                or {"provider": body.provider, "model": body.model} not in choices
+            ):
+                raise ProjectInvalid("Choose an available model from Accounts")
+            return await asyncio.to_thread(
+                records.planning_analysis.set_model, name, body.provider, body.model
+            )
+
+        return await project_change(
+            request,
+            ConnectionAnalysisInput,
+            change,
+            event="planning.review_model_selected",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning-reviews/{kind}/{key}/retry")
+    async def retry_planning_review(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).planning_analysis.retry, name, kind, key),
+            event="planning.review_retried",
+            subject=name,
+        )
 
     @app.get("/api/dashboard/projects/{name}/planning")
     async def project_planning(name: str, request: Request) -> Response:

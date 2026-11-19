@@ -20,6 +20,7 @@ from engineering_control.dashboard.planning import (
     coverage_problem,
     save_record,
 )
+from engineering_control.dashboard.planning_queue import queue_review, record_changed
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -36,6 +37,7 @@ from engineering_control.dashboard.workspace_publishing import approve_issue, en
 from engineering_control.db.models import (
     BacklogItem,
     ConnectionFinding,
+    PlanningReview,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
@@ -305,7 +307,17 @@ def _linked_parents(session: Session, project: UUID, stage: str) -> set[str]:
         query = select(ProjectIssueStory.story_id).where(ProjectIssueStory.project_id == project)
     else:
         return set()
-    return set(map(str, session.scalars(query)))
+    linked = set(map(str, session.scalars(query)))
+    for ids in session.scalars(
+        select(WorkspaceCandidate.parents).where(
+            WorkspaceCandidate.project_id == project,
+            WorkspaceCandidate.kind == stage,
+            WorkspaceCandidate.origin != "import",
+            WorkspaceCandidate.decision == "pending",
+        )
+    ):
+        linked.update(ids)
+    return linked
 
 
 def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
@@ -457,6 +469,18 @@ class WorkspaceReview:
                 if row.stage != "issues"
                 else [{"title": t} for t in known_issue_titles(session, row.project_id)]
             )
+            if row.stage != "issues":
+                state["existing"].extend(
+                    {"title": title, "description": body}
+                    for title, body in session.execute(
+                        select(WorkspaceCandidate.title, WorkspaceCandidate.description).where(
+                            WorkspaceCandidate.project_id == row.project_id,
+                            WorkspaceCandidate.kind == row.stage,
+                            WorkspaceCandidate.origin != "import",
+                            WorkspaceCandidate.decision != "approved",
+                        )
+                    )
+                )
             if row.stage == "issues" and row.progress.get("activity") == "all":
                 saved_links: dict[str, list[str]] = {}
                 for title, story_id in session.execute(
@@ -773,8 +797,23 @@ class WorkspaceReview:
                 )
             ).one()
             add_story_links(session, project.id, item.id, set(parents))
+            queue_review(session, project.id, kind, item.id, item.title)
             return item.id
-        key = save_record(session, project, kind, title, body, parents)
+        # A generated Story's approval opens its technical follow-up. A generated
+        # Issue receives a quality and parent check, which ends this chain.
+        scope = "full"
+        if candidate.origin == "review":
+            scope = "children" if kind == "stories" else "verify"
+        key = save_record(
+            session,
+            project,
+            kind,
+            title,
+            body,
+            parents,
+            review_scope=scope,
+            new_id=candidate.id if candidate.origin in ("intake", "review") else None,
+        )
         if evidence is not None:
             # The original is marked for closure only after its durable local record exists.
             if evidence.evidence["state"] == "open":
@@ -854,9 +893,12 @@ class WorkspaceReview:
                     [str(p) for p in parents],
                     self._active_parents(session, project.id, kind),
                     kind,
-                    orphan=kind == "issues" and candidate.number is not None,
+                    orphan=(kind == "issues" and candidate.number is not None)
+                    or candidate.origin == "intake",
                 )
             ]
+            if candidate.origin == "intake":
+                record_changed(session, project.id, kind, key, candidate.title)
             if row is not None and candidate.origin == "import":
                 row.version += 1
 
@@ -899,6 +941,10 @@ class WorkspaceReview:
                     changed = True
                 if dismiss:
                     candidate.decision, candidate.number = "dismissed", None
+                    if candidate.origin == "intake":
+                        job = session.get(PlanningReview, (project.id, kind, candidate.id))
+                        if job:
+                            job.status, job.lease = "dismissed", None
                     continue
                 parents = _parents(
                     candidate.parents,

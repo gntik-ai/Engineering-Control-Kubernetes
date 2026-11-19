@@ -405,7 +405,7 @@ class EpicInput(PlainChangeInput):
 
 
 class StoryInput(EpicInput):
-    epic_ids: list[UUID] = Field(min_length=1)
+    epic_ids: list[UUID] = Field(default_factory=list)
 
 
 class WorkspaceIssueStories(PlainChangeInput):
@@ -413,7 +413,7 @@ class WorkspaceIssueStories(PlainChangeInput):
 
 
 class WorkspaceIssueInput(EpicInput):
-    story_ids: list[UUID] = Field(min_length=1)
+    story_ids: list[UUID] = Field(default_factory=list)
 
 
 class FlowDraftInput(DashboardModel):

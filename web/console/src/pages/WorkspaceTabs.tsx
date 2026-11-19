@@ -30,6 +30,7 @@ import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl } from '
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { WorkspaceImport } from './WorkspaceImport';
+import { PlanningReviews, RecordReview, type ReviewResult } from './PlanningReviews';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = {
@@ -52,6 +53,8 @@ export interface PlanRow {
   review?: string | null;
   proposal?: boolean;
   orphan?: boolean;
+  automatic_review?: ReviewResult | null;
+  review_reason?: string | null;
   github_state?: string | null;
   number?: number | null;
   url?: string | null;
@@ -77,7 +80,8 @@ type PendingSnapshot = { ids: string[]; version: number | null; close_numbers?: 
 const pageSizes = [10, 25, 50, 100];
 const pageParam = (page: number) => page > 1 ? String(page) : null;
 
-function ParentChoices({ path, kind, parents, setParents }: {
+function ParentChoices({ path, kind, parents, setParents, optional = false }: {
+  optional?: boolean;
   path: string;
   kind: Kind;
   parents: string[];
@@ -87,7 +91,7 @@ function ParentChoices({ path, kind, parents, setParents }: {
   return (
     <fieldset className="grid gap-2">
       <legend className="mb-2 text-sm font-medium">
-        {kind === 'stories' ? 'Epics' : 'User Stories'} (choose at least one)
+        {kind === 'stories' ? 'Epics' : 'User Stories'} {optional ? '(optional · automatic review can identify a parent)' : '(choose at least one)'}
       </legend>
       <LoadError resource={choices} />
       {choices.error && <RefreshButton resource={choices} />}
@@ -146,6 +150,7 @@ function RecordEditor({
   const [description, setDescription] = useState(row?.description ?? '');
   const [parents, setParents] = useState(row?.epic_ids ?? row?.story_ids ?? []);
   const label = singular[kind];
+  const allowUnassigned = !row || Boolean(row.proposal && row.automatic_review);
   const save = useSubmit(
     () =>
       postJson(row ? path + '/' + row.id + (row.proposal ? '/proposal' : '/update') : path, {
@@ -188,7 +193,7 @@ function RecordEditor({
               <Textarea value={description} onValueChange={setDescription} maxLength={40000} rows={4} />
             </Field>
             {kind !== 'epics' && (
-              <ParentChoices path={path} kind={kind} parents={parents} setParents={setParents} />
+              <ParentChoices path={path} kind={kind} parents={parents} setParents={setParents} optional={allowUnassigned} />
             )}
           </DialogBody>
           <DialogFooter>
@@ -198,7 +203,7 @@ function RecordEditor({
             <Button
               type="submit"
               loading={save.pending}
-              disabled={!title.trim() || (kind !== 'epics' && !parents.length)}
+              disabled={!title.trim() || (kind !== 'epics' && !allowUnassigned && !parents.length)}
             >
               {kind === 'issues' ? 'Save draft' : 'Save'}
             </Button>
@@ -300,13 +305,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   }, [data, changingPage, pageValue, sizeValue, searchValue, search]);
 
   const linkedTitle = useRef<HTMLSpanElement>(null);
-  const foundEpic = Boolean(focus && rows?.some((row) => row.id === focus && !row.proposal));
+  const foundRecord = Boolean(focus && rows?.some((row) => row.id === focus || row.automatic_review?.id === focus));
   useEffect(() => {
-    if (foundEpic) {
+    if (foundRecord) {
       linkedTitle.current?.focus({ preventScroll: true });
       linkedTitle.current?.scrollIntoView({ block: 'center', inline: 'nearest' });
     }
-  }, [focus, foundEpic]);
+  }, [focus, foundRecord]);
   const epicUrl = (id: string) => {
     const target = new URLSearchParams({ tab: 'epics', epic: id });
     if (pageSize !== 10) target.set('page_size', String(pageSize));
@@ -330,13 +335,12 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   );
   const locked = Boolean(changingPage || data?.busy);
   const rowLocked = (row: PlanRow) => Boolean(changingPage || (row.proposal && data?.busy));
-  const needsParents = kind !== 'epics' && !data?.has_parents;
   const columns: DataTableColumn<PlanRow>[] = [
     {
       id: 'title', header: 'Title', sortable: false, accessor: (record) => record.title,
       className: 'min-w-40 max-w-lg whitespace-normal align-top',
       cell: (record) => {
-        const targeted = foundEpic && !record.proposal && record.id === focus;
+        const targeted = foundRecord && (record.id === focus || record.automatic_review?.id === focus);
         return (
           <>
             <span ref={targeted ? linkedTitle : undefined} tabIndex={targeted ? -1 : undefined}
@@ -344,6 +348,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               className="rounded-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">
               {record.title}
             </span>
+            {record.review_reason && <p className="mt-1 text-sm">Reason for proposal · {record.review_reason}</p>}
             {record.description && (
               <p className="mt-1 break-words text-sm text-muted-foreground">
                 <DescriptionPreview title={record.title} text={record.description} onRead={onRead} />
@@ -388,6 +393,8 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       cell: (record) => (
         <>
           {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
+          {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
+            id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} /></div>}
           {record.url && (
             <div><Link href={record.url} target="_blank" rel="noreferrer">
               #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
@@ -410,7 +417,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>Edit</Button>
           )}
           {(record.proposal || record.review === 'pending') && (
-            <Button size="sm" variant="secondary" disabled={rowLocked(record)} aria-label={'Approve ' + record.title}
+            <Button size="sm" variant="secondary" disabled={rowLocked(record) || Boolean(record.proposal && kind !== 'epics' && !(kind === 'issues' && record.number) && !(record.epic_ids ?? record.story_ids)?.length)} aria-label={'Approve ' + record.title}
               onClick={() => setApproving({ ids: [record.id], title: record.title, close_numbers: kind !== 'issues' && record.number && record.github_state === 'open' ? [record.number] : [], version: data?.version ?? null })}>Approve</Button>
           )}
           {(record.proposal || kind !== 'issues') && (
@@ -423,9 +430,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       ),
     },
   );
-  const empty = needsParents && view === 'open'
-    ? kind === 'stories' ? 'Add an Epic before creating a User Story.' : 'Add a User Story before creating an Issue.'
-    : view === 'draft' ? 'No drafts.' : 'No ' + view + ' ' + sections[kind] + '.';
+  const empty = view === 'draft' ? 'No drafts.' : 'No ' + view + ' ' + sections[kind] + '.';
   const table = (
       <DataTable
         className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
@@ -450,7 +455,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
                 {nextStageLabel[kind]}
               </Button>
             )}
-            <Button size="sm" disabled={!rows || needsParents} onClick={() => setEditor({})}>New {singular[kind]}</Button>
+            <Button size="sm" disabled={!rows} onClick={() => setEditor({})}>New {singular[kind]}</Button>
           </div>
         }
         paginationMode="server" paginated={Boolean(currentFilter && data.total)}
@@ -470,7 +475,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     <section className="grid min-w-0 grid-cols-1 gap-4">
       <h2 className="text-xl font-semibold">{sections[kind]}</h2>
       <LoadError resource={plan} />
-      {focus && currentFilter && !foundEpic && (
+      {focus && currentFilter && !foundRecord && (
         <p role="status" className="text-sm text-muted-foreground">This {singular[kind]} is unavailable in this project.</p>
       )}
       {refreshIssues.problem && <Alert tone="destructive" title={refreshIssues.problem} />}
@@ -583,6 +588,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
               </dd>
             </div>
           </dl>
+          {tab === 'home' && <PlanningReviews key={project.project} project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
           {tab === 'home' && (
             <WorkspaceImport

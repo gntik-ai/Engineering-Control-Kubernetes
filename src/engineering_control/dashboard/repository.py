@@ -16,6 +16,7 @@ from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.planning import PlanningRecords
+from engineering_control.dashboard.planning_analysis import PlanningAnalysis
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.schemas import ActivityEventInput
@@ -99,6 +100,7 @@ class DashboardRepository:
         self.connections = Connections(self.sessions)
         self.connection_analysis = ConnectionAnalysis(self.sessions)
         self.planning = PlanningRecords(self.sessions)
+        self.planning_analysis = PlanningAnalysis(self.sessions)
         self.workspace_imports = WorkspaceImports(self.sessions)
         self.issue_inventory = WorkspaceIssueInventory(self.sessions)
         self.publishing = WorkspacePublishing(self.sessions)
