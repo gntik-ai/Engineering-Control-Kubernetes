@@ -14,6 +14,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from engineering_control.config import Settings
+from engineering_control.dashboard.workspace_metrics import WorkspaceMetrics
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS
@@ -446,6 +447,11 @@ async def test_what_a_subscription_reports_as_cost_is_not_counted(world: Any) ->
     await world.launcher.tick()
     done = next(s for s in world.run(run["id"])["steps"] if s["name"] == "implement")
     assert done["usage"] == {"tokens": 180, "input": 150, "output": 30, "cached": 900}
+    assert world.run(run["id"])["usage"]["cost"] == 0
+    day = WorkspaceMetrics(world.sessions).daily("falcone-workflow", 7)["series"][-1]
+    assert float(day["estimated_eur"]) * float(day["usd_per_eur"]) == pytest.approx(
+        0.4321, abs=0.000001
+    )
 
 
 @pytest.mark.asyncio

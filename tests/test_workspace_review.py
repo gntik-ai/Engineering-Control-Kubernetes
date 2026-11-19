@@ -185,6 +185,7 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
                     state="ready",
                     models=["analysis"],
                     sealed_key=seal(sealing, account_id, "fixture"),
+                    prices={"analysis": {"input": 1, "output": 2}},
                 )
             )
             db.add(ProjectEpic(project_id=project.id, title="Payments"))
@@ -250,6 +251,10 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
                 False,
             )
             assert len(requests) == expected_calls
+            # A paid response is metered even when its proposed records fail validation.
+            usage = repo.workspace_metrics.daily("falcone", 7)["series"]
+            assert sum(d["tokens"] for d in usage) == 1280 * expected_calls
+            assert sum(d["unpriced_tokens"] for d in usage) == 0
 
         done = advance(version).json()
         assert done["stage"] == "epics" and done["review"]["mode"] == "review"
@@ -270,6 +275,9 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
 
         empty = advance(done["version"]).json()
         assert empty["review"] == done["review"] and len(requests) == 4
+        assert (
+            sum(d["tokens"] for d in repo.workspace_metrics.daily("falcone", 7)["series"]) == 5120
+        )
         choices = [
             {k: c[k] for k in ("id", "title", "description", "parents")}
             | {"include": c["title"] == "Exports"}

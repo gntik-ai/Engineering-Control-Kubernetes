@@ -27,6 +27,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
+from engineering_control.dashboard.workspace_costs import record_model_usage
 from engineering_control.dashboard.workspace_publishing import approve_issue, enqueue
 from engineering_control.db.models import (
     BacklogItem,
@@ -482,6 +483,7 @@ class WorkspaceReview:
             raise ProjectConflict(
                 f"The model could not finish this review step: {error}"
             ) from error
+        await asyncio.to_thread(record_model_usage, self.sessions, row, reply)
         suggestions = []
         if mode == "existing":
             responses = reply.data["records"]
@@ -515,10 +517,6 @@ class WorkspaceReview:
                 state["uncovered"],
                 bulk=bulk,
             )
-        daily = dict(progress.get("usage_daily", {}))
-        today = datetime.now(UTC).date().isoformat()
-        daily[today] = daily.get(today, 0) + (reply.usage.get("tokens") or 0)
-        progress["usage_daily"] = daily
         return progress, suggestions
 
     @staticmethod

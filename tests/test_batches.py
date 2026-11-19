@@ -548,7 +548,11 @@ def test_what_two_questions_of_a_step_used_is_added() -> None:
         "model": "m",
         "account": "A",
         "batch": True,
+        "unpriced_tokens": 50,
     }
+    combined = plus(plus(first, second), first)
+    assert combined is not None
+    assert (combined["tokens"], combined["unpriced_tokens"], combined["cost"]) == (250, 50, 0.002)
 
 
 # --- the settings and the rules --------------------------------------------------------------
