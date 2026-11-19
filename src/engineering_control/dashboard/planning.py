@@ -189,6 +189,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceImport.stage == kind,
         )
     )
+    saved: Select[Any]
     if kind == "issues":
         saved = select(
             BacklogItem.id,
