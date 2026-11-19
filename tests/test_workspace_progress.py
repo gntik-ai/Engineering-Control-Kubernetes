@@ -15,6 +15,7 @@ from sqlalchemy import select
 from starlette.testclient import TestClient
 
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.dashboard.workspace_review import _observe_records
 from engineering_control.db.models import (
     ProjectRecord,
@@ -674,5 +675,163 @@ def test_legacy_completed_bulk_stories_advance_without_new_model_usage(tmp_path:
         current = client.get(BASE + "import").json()
         assert current["stage"] == "issues" and current["review"]["mode"] == "existing"
         assert current["version"] == 2
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_generate_all_issues_checks_each_story_and_leaves_local_drafts(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    epic = UUID(repo.planning.save("falcone", "epics", "Bookings", None, [])["id"])
+    stories = sorted(
+        repo.planning.save("falcone", "stories", f"Booking outcome {i}", None, [epic])["id"]
+        for i in range(9)
+    )
+    repo.planning.save("falcone", "issues", "Existing work", None, [UUID(stories[0])])
+    finished = repo.planning.save("falcone", "stories", "Finished work", None, [epic])["id"]
+    repo.planning.set_state("falcone", "stories", UUID(finished), "closed")
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.stage = "issues"
+        import_issues(
+            db,
+            db.get(ProjectRecord, row.project_id),
+            [
+                {"number": n, "state": s, "title": f"GitHub task {n}", "labels": [], "body": ""}
+                for n, s in ((31, "open"), (32, "closed"))
+            ],
+        )
+    started, resume = threading.Event(), threading.Event()
+    batches = []
+
+    class Model(ReviewModel):
+        async def ask(self, q: Question, *, retry: bool = True) -> Reply:
+            if "records" in q.schema["properties"]:
+                return await super().ask(q, retry=retry)
+            assert not retry and q.choices == (("fixture", "analysis"),)
+            ctx = json.loads(q.prompt)
+            group = ctx["stories_for_this_batch"]
+            batches.append(group)
+            assert {"Existing work", "GitHub task 31", "GitHub task 32"} <= set(ctx["existing"])
+            assert finished not in {p["id"] for p in ctx["parents"]}
+            issues = [
+                {
+                    "title": "Implement " + p,
+                    "description": "Test the booking contract.",
+                    "parents": [p],
+                }
+                for p in group
+            ]
+            if len(batches) == 1:
+                assert {"title": "Existing work", "parents": [stories[0]]} in ctx[
+                    "saved_issue_links"
+                ]
+                issues.extend([issues[0], {**issues[0], "title": "Existing work"}])
+            answer = {"issues": issues, "complete": True}
+            if len(batches) == 2:
+                assert q.on_text
+                await q.on_text(json.dumps(answer))
+                started.set()
+                assert await asyncio.to_thread(resume.wait, 15)
+            return Reply(answer, "", "fixture", "analysis", uuid4(), "Fixture", {}, 0.1, 1)
+
+    client.app.state.models = Model()
+    args = {"provider": "fixture", "model": "analysis", "all_issues": True}
+    try:
+        assert post(client, "import/advance", version=1, **args).status_code == 409
+        assert post(client, "import/advance", version=1, all_epics=True, **args).status_code == 422
+        reviewed = post(
+            client, "import/advance", version=1, provider="fixture", model="analysis"
+        ).json()
+        running = post(
+            client, "import/advance", version=reviewed["version"], background=True, **args
+        )
+        assert running.status_code == 200 and started.wait(10)
+        progress = client.get(BASE + "import?progress_only=true").json()
+        assert progress["busy"] and progress["activity"] == "all"
+        assert progress["found"] == 11 and progress["run_found"] == 9
+        assert (
+            post(client, "import/advance", version=progress["version"], **args).status_code == 409
+        )
+        resume.set()
+        for _ in range(100):
+            state = client.get(BASE + "import").json()
+            if not state["busy"]:
+                break
+            time.sleep(0.02)
+        assert batches == [stories[:8], stories[8:]]
+        assert state["operation"] == {"action": "all", "state": "completed", "added": 9}
+        assert state["review"]["bulk_complete"] and not state["review"]["can_continue"]
+        candidates = state["review"]["candidates"]
+        assert {c["number"] for c in candidates if c["number"]} == {31, 32}
+        drafts = [c for c in candidates if c["number"] is None]
+        assert all(c["number"] is None and c["decision"] == "pending" for c in drafts)
+        assert {c["parents"][0] for c in drafts} == set(stories)
+        repeated = post(client, "import/advance", version=state["version"], **args).json()
+        assert repeated["review"] == state["review"] and repeated["operation"]["added"] == 0
+        assert (
+            post(
+                client,
+                "import/advance",
+                version=repeated["version"],
+                provider="fixture",
+                model="analysis",
+            ).status_code
+            == 409
+        )
+        assert len(batches) == 2
+        assert client.get(BASE + "synchronization").json()["items"] == []
+        last = next(c for c in drafts if c["parents"] == [stories[-1]])
+        dismissed = post(
+            client,
+            "planning/issues/decisions",
+            ids=[last["id"]],
+            dismiss=True,
+            version=repeated["version"],
+        )
+        assert dismissed.status_code == 200
+        state = client.get(BASE + "import").json()
+        assert not state["review"]["bulk_complete"] and state["review"]["mode"] == "gaps"
+    finally:
+        resume.set()
+        client.__exit__(None, None, None)
+
+
+def test_bulk_issues_preserve_partial_batches_and_can_resume(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    epic = UUID(repo.planning.save("falcone", "epics", "Operations", None, [])["id"])
+    story = repo.planning.save("falcone", "stories", "Inspect logs", None, [epic])["id"]
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.stage, row.progress = "issues", {"review_mode": "gaps"}
+    calls = []
+
+    class Model(ReviewModel):
+        async def ask(self, q: Question, *, retry: bool = True) -> Reply:
+            ctx = json.loads(q.prompt)
+            assert set(calls) <= set(ctx["existing"])
+            title = f"Add log adapter {len(calls)}"
+            calls.append(title)
+            answer = {
+                "complete": len(calls) == 4,
+                "issues": [
+                    {"title": title, "description": "Test log ingestion.", "parents": [story]}
+                ],
+            }
+            return Reply(answer, "", "fixture", "analysis", uuid4(), "Fixture", {}, 0.1, 1)
+
+    client.app.state.models = Model()
+    args = {"provider": "fixture", "model": "analysis", "all_issues": True}
+    try:
+        assert post(client, "import/advance", version=1, **args).status_code == 409
+        paused = client.get(BASE + "import").json()
+        assert paused["operation"]["state"] == "failed" and paused["operation"]["added"] == 3
+        assert set(calls) == {c["title"] for c in paused["review"]["candidates"]}
+        assert not paused["review"]["bulk_complete"]
+        done = post(client, "import/advance", version=paused["version"], **args).json()
+        assert done["review"]["bulk_complete"] and done["operation"]["added"] == 1
+        assert len(done["review"]["candidates"]) == len(calls) == 4
+        assert client.get(BASE + "synchronization").json()["items"] == []
     finally:
         client.__exit__(None, None, None)

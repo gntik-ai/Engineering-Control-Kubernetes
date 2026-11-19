@@ -84,6 +84,7 @@ def _bulk_schema(kind: str, fields: dict[str, Any]) -> dict[str, Any]:
 BULK_SCHEMAS = {
     "epics": _bulk_schema("epics", {"title": STRING, "description": STRING}),
     "stories": _bulk_schema("stories", FIELDS),
+    "issues": _bulk_schema("issues", FIELDS),
 }
 INSTRUCTIONS = {
     "epics": "Identify genuine high-level product initiatives spanning multiple user outcomes. "
@@ -99,15 +100,29 @@ def gap_identity(title: str) -> str:
     return "gap:" + hashlib.sha256(clean_title(title).casefold().encode()).hexdigest()
 
 
-def _records(session: Session, project: UUID, kind: str) -> list[dict[str, str]]:
+def known_issue_titles(session: Session, project: UUID) -> list[str]:
+    saved = select(BacklogItem.title).where(
+        BacklogItem.project_id == project,
+        BacklogItem.workspace_review.in_(("pending", "approved", "publishing")),
+    )
+    proposed = select(WorkspaceCandidate.title).where(
+        WorkspaceCandidate.project_id == project, WorkspaceCandidate.kind == "issues"
+    )
+    return list(session.scalars(saved.union(proposed).order_by("title")))
+
+
+def _records(
+    session: Session, project: UUID, kind: str, *, open_only: bool = False
+) -> list[dict[str, str]]:
     cls = ProjectEpic if kind == "epics" else ProjectUserStory
+    query = select(cls.id, cls.title, cls.description).where(
+        cls.project_id == project, cls.archived_at.is_(None)
+    )
+    if open_only:
+        query = query.where(cls.closed_at.is_(None))
     return [
         {"id": str(uid), "title": title, "description": description or ""}
-        for uid, title, description in session.execute(
-            select(cls.id, cls.title, cls.description)
-            .where(cls.project_id == project, cls.archived_at.is_(None))
-            .order_by(cls.id)
-        )
+        for uid, title, description in session.execute(query.order_by(cls.id))
     ]
 
 
@@ -176,7 +191,7 @@ def _gap_proposals(
             )
         description = clean_description(record["description"])
         if bulk and not description:
-            label = "Epic" if kind == "epics" else "User Story"
+            label = {"epics": "Epic", "stories": "User Story", "issues": "Issue"}[kind]
             raise ProjectInvalid(f"Each generated {label} needs a description")
         parents = record.get("parents", [])
         _parents(parents, valid_parents, kind)
@@ -204,7 +219,7 @@ def _gap_proposals(
 # These are the only top-level arrays returned by review models. Decode whole objects
 # with the JSON decoder so braces, quotes and nested arrays in proposal text are safe.
 _REVIEW_ARRAY = re.compile(
-    r'\{\s*(?:"complete"\s*:\s*(?:true|false)\s*,\s*)?"(records|epics|stories)"\s*:\s*\['
+    r'\{\s*(?:"complete"\s*:\s*(?:true|false)\s*,\s*)?"(records|epics|stories|issues)"\s*:\s*\['
 )
 
 
@@ -294,15 +309,31 @@ def _linked_parents(session: Session, project: UUID, stage: str) -> set[str]:
 
 
 def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
+    mode = row.progress.get("review_mode", "existing")
     parents = (
         []
         if row.stage == "epics"
-        else _records(session, row.project_id, "epics" if row.stage == "stories" else "stories")
+        else _records(
+            session,
+            row.project_id,
+            "epics" if row.stage == "stories" else "stories",
+            open_only=mode != "existing",
+        )
     )
-    mode = row.progress.get("review_mode", "existing")
     candidates = _candidates(session, row.project_id, row.stage)
+    bulk_complete = False
+    if row.stage == "issues" and mode == "review" and "issue_checked_stories" in row.progress:
+        linked = _linked_parents(session, row.project_id, row.stage)
+        for c in candidates:
+            if c.decision == "pending":
+                linked.update(c.parents)
+        checked = set(row.progress["issue_checked_stories"])
+        bulk_complete = all(p["id"] in checked and p["id"] in linked for p in parents)
+        if not bulk_complete:
+            mode = "gaps"
     return {
         "mode": mode,
+        "bulk_complete": bulk_complete,
         "can_continue": mode != "existing"
         and not any(c.decision == "pending" for c in candidates)
         and not coverage_problem(session, row.project_id, row.stage),
@@ -367,7 +398,9 @@ def settle_stories(session: Session, row: WorkspaceImport) -> None:
         str(i)
         for i in session.scalars(
             select(ProjectEpic.id).where(
-                ProjectEpic.project_id == row.project_id, ProjectEpic.archived_at.is_(None)
+                ProjectEpic.project_id == row.project_id,
+                ProjectEpic.archived_at.is_(None),
+                ProjectEpic.closed_at.is_(None),
             )
         )
     }
@@ -422,19 +455,24 @@ class WorkspaceReview:
             state["existing"] = (
                 _records(session, row.project_id, row.stage)
                 if row.stage != "issues"
-                else [
-                    {"title": t}
-                    for t in session.scalars(
-                        select(BacklogItem.title).where(
-                            BacklogItem.project_id == row.project_id,
-                            BacklogItem.workspace_review.is_not(None),
-                        )
-                    )
-                ]
+                else [{"title": t} for t in known_issue_titles(session, row.project_id)]
             )
+            if row.stage == "issues" and row.progress.get("activity") == "all":
+                saved_links: dict[str, list[str]] = {}
+                for title, story_id in session.execute(
+                    select(BacklogItem.title, ProjectIssueStory.story_id)
+                    .join(ProjectIssueStory, ProjectIssueStory.item_id == BacklogItem.id)
+                    .where(ProjectIssueStory.project_id == row.project_id)
+                ):
+                    saved_links.setdefault(title, []).append(str(story_id))
+                state["saved_links"] = [
+                    {"title": t, "parents": story_ids} for t, story_ids in saved_links.items()
+                ]
             linked = _linked_parents(session, row.project_id, row.stage)
             for c in state["candidates"]:
-                if c["decision"] != "dismissed":
+                if c["decision"] == "pending" or (
+                    row.stage != "issues" and c["decision"] != "dismissed"
+                ):
                     linked.update(c["parents"])
             state["uncovered"] = [p["id"] for p in state["parents"] if p["id"] not in linked]
             return state, sources
@@ -460,18 +498,29 @@ class WorkspaceReview:
         bulk = progress.get("activity") == "all"
         mode = state["mode"]
         focus: list[str] = []
-        if bulk and row.stage == "stories":
-            progress["stories_bulk"] = True
-            if mode == "review":
+        if bulk and row.stage in ("stories", "issues"):
+            stories = row.stage == "stories"
+            if stories:
+                progress["stories_bulk"] = True
+            if (stories and mode == "review") or state["bulk_complete"]:
                 return progress, []
             ids = [p["id"] for p in state["parents"]]
             if not ids:
-                raise ProjectInvalid("Approve an Epic before generating User Stories")
-            checked = set(progress.get("story_checked_epics", [])).difference(state["uncovered"])
+                if stories:
+                    raise ProjectInvalid("Approve an open Epic before generating User Stories")
+                progress.update(review_mode="review", issue_checked_stories=[])
+                return progress, []
+            checkpoint = "story_checked_epics" if stories else "issue_checked_stories"
+            checked = set(progress.get(checkpoint, [])).difference(state["uncovered"])
             focus = sorted(set(ids) - checked)[:8]
             if not focus:
                 progress["review_mode"] = "review"
                 return progress, []
+            if not stories and progress.get("issue_partial_batches", 0) >= 3:
+                raise ProjectConflict(
+                    "The model reported more work for this group after three batches. "
+                    "The drafts are saved. Retry to continue with these User Stories."
+                )
         if mode == "review":
             mode = "gaps"
             progress["review_mode"] = mode
@@ -535,10 +584,11 @@ class WorkspaceReview:
             )
         elif bulk:
             schema = BULK_SCHEMAS[row.stage]
-            context["covered_" + row.stage] = [
-                {"title": r["title"], "description": (r["description"] or "")[:1000]}
-                for r in [*state["existing"], *candidates]
-            ]
+            if row.stage != "issues":
+                context["covered_" + row.stage] = [
+                    {"title": r["title"], "description": (r["description"] or "")[:1000]}
+                    for r in [*state["existing"], *candidates]
+                ]
             if row.stage == "epics":
                 task = (
                     "Identify all remaining distinct Epics supported by the approved description "
@@ -548,7 +598,7 @@ class WorkspaceReview:
                     "Return an empty epics array when existing initiatives cover the evidence. "
                     "Set complete true only if the entire set fits in this answer."
                 )
-            else:
+            elif row.stage == "stories":
                 context["epics_for_this_batch"] = focus
                 task = (
                     "Review only epics_for_this_batch. Identify all remaining distinct User "
@@ -560,6 +610,33 @@ class WorkspaceReview:
                     "Return up to 20 missing stories per batch. Set complete false only when more "
                     "stories remain for another batch. When all evidenced "
                     "outcomes are already covered, return complete true and an empty stories array."
+                )
+            else:
+                focused = set(focus)
+                context["stories_for_this_batch"] = focus
+                context["existing"] = list(dict.fromkeys(context["existing"]))
+                context["parents"] = [
+                    p if p["id"] in focused else {"id": p["id"], "title": p["title"]}
+                    for p in state["parents"]
+                ]
+                context["uncovered_parents"] = [p for p in state["uncovered"] if p in focused]
+                context["parent_links_already_proposed"] = [
+                    r
+                    for r in context["parent_links_already_proposed"]
+                    if focused.intersection(r["parents"])
+                ]
+                context["saved_issue_links"] = [
+                    r for r in state["saved_links"] if focused.intersection(r["parents"])
+                ]
+                task = (
+                    "Review the User Stories in stories_for_this_batch. Propose all distinct "
+                    "technical work still required, considering existing open and closed issues "
+                    "and pending drafts. Skip equivalent work even when its title differs. "
+                    "Give each issue a precise title, implementation scope and a verifiable "
+                    "outcome. Link it to at least one Story in this batch and include other "
+                    "applicable approved Story IDs. Prioritize uncovered Stories. Return up to "
+                    "20 new issues. Set complete true when no further evidenced work remains "
+                    "for this batch, including when existing issues already cover it."
                 )
         else:
             schema = GAP
@@ -630,20 +707,36 @@ class WorkspaceReview:
                 bulk=bulk,
             )
             if focus:
-                uncovered = set(state["uncovered"]) - {
-                    p for story in suggestions for p in story["parents"]
-                }
-                # A model may always ask for more. Each group gets at most one overflow pass,
-                # and a pass over uncovered Epics must cover at least one of them.
-                overflow = (
-                    not reply.data["complete"]
-                    and suggestions
-                    and progress.get("story_continuation") != focus
-                )
-                progress["story_continuation"] = focus if overflow else []
+                focused = set(focus)
+                needs_coverage = focused.intersection(state["uncovered"])
+                proposed_parents = {p for record in suggestions for p in record["parents"]}
+                uncovered = needs_coverage - proposed_parents
+                if row.stage == "stories":
+                    overflow = (
+                        not reply.data["complete"]
+                        and bool(suggestions)
+                        and progress.get("story_continuation") != focus
+                    )
+                    progress["story_continuation"] = focus if overflow else []
+                else:
+                    if any(focused.isdisjoint(s["parents"]) for s in suggestions):
+                        raise ProjectInvalid(
+                            "Each generated issue must link to a Story in this batch"
+                        )
+                    overflow = not reply.data["complete"]
+                    if (overflow and not suggestions) or (
+                        not overflow and needs_coverage and uncovered == needs_coverage
+                    ):
+                        raise ProjectConflict(
+                            "The model made no progress on the remaining technical work. "
+                            "Review the Story links or retry generation."
+                        )
+                    progress["issue_partial_batches"] = (
+                        progress.get("issue_partial_batches", 0) + 1 if overflow else 0
+                    )
                 if not overflow:
-                    checked.update(set(focus) - uncovered)
-                progress["story_checked_epics"] = sorted(checked)
+                    checked.update(focused - uncovered)
+                progress[checkpoint] = sorted(checked)
                 progress["review_mode"] = "review" if set(ids) <= checked else "gaps"
         return progress, suggestions
 

@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
   Field,
+  FieldDescription,
   FieldLabel,
   Input,
   Link,
@@ -88,12 +89,14 @@ const base = (project: string) => 'projects/' + encodeURIComponent(project) + '/
 
 function ConnectionEditor({
   project,
+  projectLabel,
   choices,
   row,
   close,
   saved,
 }: {
   project: string;
+  projectLabel: string;
   choices: ProjectSummary[];
   row?: Connection;
   close: () => void;
@@ -102,6 +105,12 @@ function ConnectionEditor({
   const [peer, setPeer] = useState(row?.peer.name ?? '');
   const [relation, setRelation] = useState(row?.relation ?? 'depends_on');
   const [purpose, setPurpose] = useState(row?.purpose ?? '');
+  const peerLabel = row?.peer.label ?? choices.find((p) => p.project === peer)?.display_name ?? 'the selected project';
+  const relationshipHelp = relation === 'related'
+    ? `${projectLabel} and ${peerLabel} share work. Both projects show “Related to”.`
+    : relation === 'used_by'
+      ? `${projectLabel} provides a service or library that ${peerLabel} uses. The other project shows “Depends on ${projectLabel}”.`
+      : `${projectLabel} uses a service or library provided by ${peerLabel}. The other project shows “Used by ${projectLabel}”.`;
   const save = useSubmit(
     () =>
       postJson<{ id: string }>(base(project) + (row ? '/' + row.id + '/update' : ''), {
@@ -145,10 +154,12 @@ function ConnectionEditor({
               <FieldLabel>Relationship from this project</FieldLabel>
               <SimpleSelect
                 aria-label="Relationship"
+                aria-describedby="connection-relationship-help"
                 items={options(relations)}
                 value={relation}
                 onValueChange={(v) => setRelation(v ?? 'depends_on')}
               />
+              <FieldDescription id="connection-relationship-help" aria-live="polite">{relationshipHelp}</FieldDescription>
             </Field>
             <Field>
               <FieldLabel>Purpose</FieldLabel>
@@ -451,7 +462,7 @@ function ConnectionDetail({
     if (issue) setQuery({ issue: null });
   };
   return (
-    <section className="grid min-w-0 gap-4">
+    <section className="grid min-w-0 grid-cols-1 gap-4">
       <div>
         <Link href={connectionsUrl(project)}>All connections</Link>
       </div>
@@ -587,6 +598,7 @@ function ConnectionDetail({
           {editor === 'settings' && (
             <ConnectionEditor
               project={project}
+              projectLabel={projects.find((p) => p.project === project)?.display_name ?? project}
               choices={projects}
               row={c}
               close={close}
@@ -647,7 +659,7 @@ export function ConnectionsPage({
   const href = (key: string) =>
     connectionsUrl(name, key) + (issue ? '&issue=' + encodeURIComponent(issue) : '');
   return (
-    <div className="grid min-w-0 gap-4">
+    <div className="grid min-w-0 grid-cols-1 gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold">Connections</h1>
         {!id && (
@@ -705,6 +717,7 @@ export function ConnectionsPage({
       {create && (
         <ConnectionEditor
           project={name}
+          projectLabel={project.display_name}
           choices={available}
           close={() => setCreate(false)}
           saved={(key) => {

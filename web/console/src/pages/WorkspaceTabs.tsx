@@ -64,8 +64,8 @@ interface PlanningPage extends Paged<PlanRow> {
   epic: string | null;
   record: string | null;
   connected: string;
-  issue_state: IssueView | null;
-  issue_counts: Partial<Record<IssueView, number>>;
+  state: IssueView | null;
+  state_counts: Partial<Record<IssueView, number>>;
   pending: number;
   parents: Record<string, string>;
   has_parents: boolean;
@@ -241,6 +241,20 @@ function ConnectionFilter({project,value}:{project:string;value:string}) {
     onValueChange={v=>setQuery({connected:v==='all'?null:v,page:null,record:null,epic:null})}/>;
 }
 
+function PlanningStateAction({ path, row, closed, locked, saved }: {
+  path: string; row: PlanRow; closed: boolean; locked: boolean; saved: () => void;
+}) {
+  const change = useSubmit(() => postJson(path + '/' + row.id + '/state', { state: closed ? 'open' : 'closed' }), saved);
+  const label = closed ? 'Reopen' : 'Close';
+  return (
+    <div>
+      <Button size="sm" variant="ghost" aria-label={label + ' ' + row.title}
+        loading={change.pending} disabled={locked || change.pending} onClick={() => void change.submit()}>{label}</Button>
+      {change.problem && <Alert tone="destructive" title={change.problem} />}
+    </div>
+  );
+}
+
 function Records({ kind, project, onRead }: { kind: Kind; project: string; onRead: ReadDescription }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
@@ -257,22 +271,23 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   // An Epic link locates the row even after other records have moved it to a different page.
   const page = !focus && Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
   const pageSize = pageSizes.includes(Number(sizeValue)) ? Number(sizeValue) : 10;
-  const requestedState = query.get('issue_state');
-  const issueState: IssueView | null = kind !== 'issues' ? null : requestedState === 'closed' || requestedState === 'draft' ? requestedState : 'open';
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, issue_state: issueState }), 4000, { keepPreviousData: true });
+  const stateKey = kind === 'issues' ? 'issue_state' : 'state';
+  const requestedState = query.get(stateKey);
+  const view: IssueView = requestedState === 'closed' || (kind === 'issues' && requestedState === 'draft') ? requestedState : 'open';
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, [stateKey]: view }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && (kind !== 'issues' || data.issue_state === issueState);
+  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && data.state === view;
   const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
   const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
   useEffect(() => {
-    if (kind !== 'issues' || !data || (data.record ?? null) !== recordId) return;
-    if (recordId && data.issue_state && data.issue_state !== issueState) {
-      setQuery({ issue_state: data.issue_state, page: null });
-    } else if (!recordId && issueState === 'draft' && data.issue_state === 'draft' && !data.issue_counts?.draft) {
+    if (!data || (data.record ?? null) !== recordId || data.epic !== epic) return;
+    if (focus && data.state && data.state !== view) {
+      setQuery({ [stateKey]: data.state, page: null });
+    } else if (!focus && view === 'draft' && data.state === 'draft' && !data.state_counts.draft) {
       setQuery({ issue_state: null, page: null });
     }
-  }, [kind, recordId, issueState, data]);
+  }, [stateKey, recordId, epic, focus, view, data]);
   const [linking, setLinking] = useState<PlanRow | null>(null);
   const refreshIssues = useSubmit(() => postJson('projects/' + encodeURIComponent(project) + '/backlog/sync', {}), reload);
   useEffect(() => {
@@ -310,7 +325,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
   const selectAll = useSubmit(
-    () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { issue_state: issueState }), new AbortController().signal),
+    () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { [stateKey]: view }), new AbortController().signal),
     (snapshot) => { if (snapshot.ids.length) setApproving(snapshot); else reload(); },
   );
   const locked = Boolean(changingPage || data?.busy);
@@ -384,7 +399,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     {
       id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
       cell: (record) => (
-        <div className="flex justify-end gap-1">
+        <div className="flex flex-wrap justify-end gap-1">
+          {kind !== 'issues' && !record.proposal && <PlanningStateAction path={path} row={record}
+            closed={view === 'closed'} locked={rowLocked(record)} saved={reload} />}
           {kind === 'issues' && Boolean(record.number) && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
             onClick={() => setLinking(record)}>Link User Stories</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
@@ -406,9 +423,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       ),
     },
   );
-  const empty = needsParents
+  const empty = needsParents && view === 'open'
     ? kind === 'stories' ? 'Add an Epic before creating a User Story.' : 'Add a User Story before creating an Issue.'
-    : 'No ' + sections[kind] + ' yet.';
+    : view === 'draft' ? 'No drafts.' : 'No ' + view + ' ' + sections[kind] + '.';
   const table = (
       <DataTable
         className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
@@ -425,7 +442,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             </>}
             {data && data.pending > 0 && (
               <Button size="sm" variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
-                Approve all {sections[kind]}{kind === 'issues' && issueState ? ' in ' + issueViews[issueState] : search ? ' in project' : ''} ({data.pending})
+                Approve all {sections[kind]} in {issueViews[view]} ({data.pending})
               </Button>
             )}
             {data?.can_continue && !locked && (
@@ -450,7 +467,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       />
   );
   return (
-    <section className="grid min-w-0 gap-4">
+    <section className="grid min-w-0 grid-cols-1 gap-4">
       <h2 className="text-xl font-semibold">{sections[kind]}</h2>
       <LoadError resource={plan} />
       {focus && currentFilter && !foundEpic && (
@@ -460,22 +477,20 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
       {finish.problem && <Alert tone="destructive" title={finish.problem} />}
       {plan.error && <div><RefreshButton resource={plan} /></div>}
-      {kind === 'issues' && issueState ? (
-        <Tabs value={issueState} onValueChange={v => setQuery({ issue_state: v === 'open' ? null : String(v), page: null, record: null })}>
-          <TabsList aria-label="Issue state">
-            {(Object.keys(issueViews) as IssueView[]).filter(v => v !== 'draft' || Boolean(data?.issue_counts?.draft)).map(v =>
-              <TabsTab key={v} value={v} count={data?.issue_counts?.[v] ?? 0}>{issueViews[v]}</TabsTab>)}
-          </TabsList>
-          <TabsPanel value={issueState} className="pt-3">{table}</TabsPanel>
-        </Tabs>
-      ) : table}
+      <Tabs value={view} onValueChange={v => setQuery({ [stateKey]: v === 'open' ? null : String(v), page: null, record: null, epic: null })}>
+        <TabsList aria-label={singular[kind] + ' state'}>
+          {(Object.keys(issueViews) as IssueView[]).filter(v => v !== 'draft' || (kind === 'issues' && Boolean(data?.state_counts.draft))).map(v =>
+            <TabsTab key={v} value={v} count={data?.state_counts[v] ?? 0}>{issueViews[v]}</TabsTab>)}
+        </TabsList>
+        <TabsPanel value={view} className="pt-3">{table}</TabsPanel>
+      </Tabs>
       {linking && <LinkStories path={path} issue={linking} close={() => setLinking(null)} saved={reload} />}
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
           title={approving.title ? `Approve ${singular[kind]}?` : `Approve all ${approving.ids.length} ${sections[kind]}?`}
           about={(approving.title ? approving.title + '. ' : 'Approval applies across all pages in this view. ') + (
-            kind === 'issues' ? (issueState === 'draft' ? 'Publish these drafts as new GitHub issues.' : 'Link these GitHub issues in their current state.')
+            kind === 'issues' ? (view === 'draft' ? 'Publish these drafts as new GitHub issues.' : 'Link these GitHub issues in their current state.')
             : approving.close_numbers?.length ? 'Save the planning records and close the ' + approving.close_numbers.length + ' GitHub source ' + (approving.close_numbers.length === 1 ? 'issue shown below.' : 'issues shown below.')
             : 'Save the planning records in Engineering Control.')}
           action={approving.title ? 'Approve' : 'Approve all'}
@@ -497,7 +512,10 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           row={editor.row}
           version={editor.version}
           close={() => setEditor(null)}
-          saved={reload}
+          saved={() => {
+            if (!editor.row && kind !== 'issues' && view === 'closed') setQuery({ state: null, page: null, epic: null, record: null, search: null });
+            reload();
+          }}
         />
       )}
       {removing && (
@@ -528,11 +546,11 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
   const [reading, setReading] = useState<DescriptionContent | null>(null);
   useEffect(() => { setReading(null); }, [tab]);
   return (
-    <div className="grid min-w-0 gap-4">
+    <div className="grid min-w-0 grid-cols-1 gap-4">
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, issue_state: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, issue_state: null, state: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {
@@ -546,7 +564,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
             })}
           </TabsList>
         </div>
-        <TabsPanel value="home" className="grid gap-5 pt-5">
+        <TabsPanel value="home" className="grid min-w-0 grid-cols-1 gap-5 pt-5">
           <dl className="grid gap-4 rounded-xl border border-border bg-card p-5 text-sm">
             <div>
               <dt className="mb-1 font-medium">Description</dt>

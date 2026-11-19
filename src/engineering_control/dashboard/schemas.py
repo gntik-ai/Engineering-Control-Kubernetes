@@ -356,7 +356,12 @@ class WorkspaceImportStep(PlainChangeInput):
     model: str | None = Field(default=None, max_length=200)
     all_epics: bool = False
     all_stories: bool = False
+    all_issues: bool = False
     background: bool = False
+
+
+class PlanningStateInput(PlainChangeInput):
+    state: Literal["open", "closed"]
 
 
 class WorkspaceDescription(PlainChangeInput):
