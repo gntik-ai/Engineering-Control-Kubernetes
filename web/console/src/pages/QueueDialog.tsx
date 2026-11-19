@@ -15,7 +15,7 @@ import {
 } from '@gntik-ai/ui';
 import { useEffect, useState, type FormEvent } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Queue, type QueueDetail } from '../api';
-import { BASE, navigate } from '../router';
+import { queueUrl, navigate } from '../router';
 import { useSubmit } from './ProjectDialogs';
 
 const NEW = '__new__';
@@ -42,7 +42,7 @@ export function QueueDialog({
         target === NEW
           ? await postJson<QueueDetail>(`projects/${project}/queues`, { name: name.trim(), items })
           : await postJson<QueueDetail>(`queues/${target}/add`, { items });
-      navigate(`${BASE}/queue?id=${queue.id}`);
+      navigate(queueUrl(project, queue.id));
     },
     () => onOpenChange(false),
   );

@@ -5,6 +5,7 @@ export const BASE = '/console';
 export const ADMIN = `${BASE}/admin`;
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
+export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');
 export const connectionsUrl = (name: string, id?: string) => workspaceUrl(name) + '/settings/connections' + (id ? '?connection=' + encodeURIComponent(id) : '');
 export const recordUrl = (name: string, kind: string, id: string) => workspaceUrl(name) + '?' + new URLSearchParams({ tab: kind, record: id }).toString();
 const NAV_EVENT = 'console:navigate';

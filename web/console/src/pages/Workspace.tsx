@@ -9,13 +9,14 @@ import {
   NavList,
   WorkspaceSwitcher,
 } from '@gntik-ai/ui';
-import { FolderKanban, LayoutDashboard, Network, Plus } from '@gntik-ai/icons';
+import { FolderKanban, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
-import { ADMIN, RouterLink, navigate, connectionsUrl, workspaceUrl } from '../router';
+import { ADMIN, RouterLink, navigate, connectionsUrl, queueUrl, workspaceUrl } from '../router';
 import { WorkspaceTabs } from './WorkspaceTabs';
 import { NewProjectDialog } from './ProjectDialogs';
 
+import { ProjectQueue } from './ProjectQueue';
 import { ConnectionsPage } from './Connections';
 
 export function ProjectWorkspace({
@@ -23,9 +24,11 @@ export function ProjectWorkspace({
   actions,
   notice,
   connections,
+  queue,
 }: {
   name: string;
   connections: boolean;
+  queue: boolean;
   actions: ReactNode;
   notice: ReactNode;
 }) {
@@ -35,7 +38,7 @@ export function ProjectWorkspace({
   const defaultName = projects.data?.default_project;
   const project = items.find((item) => item.project === name);
   usePageTitle(
-    connections ? 'Connections · ' + (project?.display_name ?? name) : (project?.display_name ?? 'Projects'),
+    queue ? 'Queue · ' + (project?.display_name ?? name) : connections ? 'Connections · ' + (project?.display_name ?? name) : (project?.display_name ?? 'Projects'),
   );
 
   return (
@@ -52,11 +55,11 @@ export function ProjectWorkspace({
           collapsed={collapsed}
           onNavigate={closeDrawer}
           label="Project navigation"
-          currentHref={connections ? connectionsUrl(name) : workspaceUrl(name)}
+          currentHref={queue ? queueUrl(name) : connections ? connectionsUrl(name) : workspaceUrl(name)}
           groups={
             name
               ? [
-                  { items: [{ label: 'Dashboard', href: workspaceUrl(name), icon: LayoutDashboard }] },
+                  { items: [{ label: 'Dashboard', href: workspaceUrl(name), icon: LayoutDashboard }, { label: 'Queue', href: queueUrl(name), icon: ListOrdered }] },
                   {
                     label: 'Settings',
                     collapsible: true,
@@ -83,7 +86,7 @@ export function ProjectWorkspace({
                   name: item.display_name,
                   meta: item.project === defaultName ? 'Default project' : item.source_repository,
                 }))}
-                onSelect={(item) => navigate(workspaceUrl(item.id))}
+                onSelect={(item) => navigate(queue ? queueUrl(item.id) : workspaceUrl(item.id))}
                 onCreate={() => setCreating(true)}
               />
             </div>
@@ -106,7 +109,7 @@ export function ProjectWorkspace({
         {notice}
         <LoadError resource={projects} />
         {project ? (
-          connections ? (
+          queue ? <ProjectQueue key={name} project={name} /> : connections ? (
             <ConnectionsPage key={project.project} project={project} projects={items} />
           ) : (
             <WorkspaceTabs key={project.project} project={project} onApproved={projects.reload} />

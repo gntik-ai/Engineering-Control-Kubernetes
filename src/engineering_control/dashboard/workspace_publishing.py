@@ -70,6 +70,15 @@ def enqueue(
     return row
 
 
+def schedule_classification(db: Session, project: ProjectRecord, item: BacklogItem) -> None:
+    if not item.type_confirmed or not item.issue_number:
+        return
+    repo = item.repository or project.source_repository
+    action = enqueue(db, project.id, "label", item.id, repo, item.issue_number)
+    # A worker holding a lease will compare its target to the latest decision at commit.
+    action.status, action.detail = "pending", None
+
+
 def approve_issue(session: Session, project: ProjectRecord, key: UUID) -> UUID | None:
     item = session.scalar(
         select(BacklogItem).where(BacklogItem.project_id == project.id, BacklogItem.id == key)
@@ -117,6 +126,18 @@ class WorkspacePublishing:
                 if item is None or item.workspace_review != "publishing":
                     raise ProjectConflict("This issue no longer has a recorded approval")
                 title, body = item.title, item.description or ""
+            if action.operation == "label":
+                item = session.get(BacklogItem, action.local_id)
+                if (
+                    not item
+                    or item.project_id != project.id
+                    or not item.type_confirmed
+                    or item.issue_number != action.number
+                    or (item.repository or project.source_repository) != action.repository
+                    or item.execution_type not in ("bug", "enhancement")
+                ):
+                    raise ProjectConflict("The Issue no longer matches this classification")
+                title = item.execution_type
             action.lease, action.lease_until = uuid4(), now + timedelta(minutes=5)
             session.flush()
             session.expunge(action)
@@ -161,6 +182,8 @@ class WorkspacePublishing:
         number: int | None = None,
         snapshot: dict[str, Any] | None = None,
         error: str | None = None,
+        category: str | None = None,
+        labels: list[str] | None = None,
     ) -> None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -180,6 +203,13 @@ class WorkspacePublishing:
             action.detail = error[:350] if error else None
             if error:
                 return
+            if action.operation == "label":
+                item = session.get(BacklogItem, action.local_id)
+                if item and item.execution_type != category:
+                    action.status, action.detail = "pending", None
+                    return
+                if item and labels is not None:
+                    item.issue_labels = labels
             if action.operation in ("create", "link"):
                 item = session.get(BacklogItem, action.local_id)
                 if item is None or number is None:
@@ -208,6 +238,7 @@ class WorkspacePublishing:
                         "github_state_reason": snapshot.get("state_reason"),
                     }
                 item.workspace_review = "approved"
+                schedule_classification(session, project, item)
             action.status = "done"
 
     async def sync(self, name: str, key: UUID, github: GitHubApp | None) -> dict[str, Any]:
@@ -216,6 +247,7 @@ class WorkspacePublishing:
             return {"project": name, "status": action.status}
         number = action.number
         snapshot = None
+        labels = None
         try:
             if github is None:
                 raise GitHubAppError("Configure the GitHub App to synchronize this approval")
@@ -253,7 +285,11 @@ class WorkspacePublishing:
             else:
                 token = await github.repository_token(action.repository, {"issues": "write"})
                 try:
-                    if action.operation == "create":
+                    if action.operation == "label" and number:
+                        labels = await github.classify_workspace_issue(
+                            action.repository, number, title, token=token
+                        )
+                    elif action.operation == "create":
                         await asyncio.to_thread(self._update, name, action, sent=True)
                         number = await github.create_workspace_issue(
                             action.repository, title, body.rstrip() + "\n\n" + marker, token=token
@@ -265,7 +301,15 @@ class WorkspacePublishing:
         except GitHubAppError as error:
             await asyncio.to_thread(self._update, name, action, error=str(error))
             return {"project": name, "status": "needs_attention", "detail": str(error)}
-        await asyncio.to_thread(self._update, name, action, number=number, snapshot=snapshot)
+        await asyncio.to_thread(
+            self._update,
+            name,
+            action,
+            number=number,
+            snapshot=snapshot,
+            category=title,
+            labels=labels,
+        )
         return {"project": name, "status": "done", "number": number}
 
     def due(self) -> list[tuple[str, UUID]]:

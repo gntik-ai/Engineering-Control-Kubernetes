@@ -32,13 +32,13 @@ import {
   useResource,
   type BudgetRow,
   type Budgets,
-  type Listing,
   type Queue,
   type QueueDetail,
   type QueueEntry,
 } from '../api';
-import { IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
-import { BASE, navigate, setQuery, useLocation } from '../router';
+import { IssueRef, LoadError, TableFrame, mono, useProjects } from '../parts';
+import { BASE, navigate, queueUrl, useLocation } from '../router';
+import { ExecutionEditor } from './ProjectQueue';
 import { RunState } from './Runs';
 
 type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'destructive';
@@ -161,7 +161,6 @@ function BudgetsSection() {
   return (
     <section className="grid gap-2">
       <div>
-        <h2 className="text-sm font-medium">Budgets</h2>
         <p className="text-[13px] text-muted-foreground">
           How much the platform starts by itself: a queue's next item, and work the supervisor starts. A run you start
           yourself from the backlog is your own decision and is not held back, except that an account past its budget is
@@ -211,67 +210,32 @@ function BudgetsSection() {
   );
 }
 
-export function QueuesPage() {
+export function BudgetsPage() {
+  return <Page title="Budgets"><BudgetsSection /></Page>;
+}
+
+export function LegacyQueue() {
   const { query } = useLocation();
-  const project = query.get('project');
-  const queues = useResource<Listing<Queue>>(apiUrl('queues', { project }), 15_000);
-  return (
-    <Page
-      title="Queues"
-      description="Items to be worked on in order. Make a queue from the backlog, or ask the supervisor to propose one."
-      actions={<RefreshButton resource={queues} />}
-    >
-      <div className="grid gap-6">
-        <div className="grid gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <ProjectFilter value={project} onChange={(value) => setQuery({ project: value })} />
-          </div>
-          <LoadError resource={queues} />
-          <TableFrame>
-            <Table>
-              <TableCaption className="sr-only">Queues</TableCaption>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Queue</TableHead>
-                  <TableHead>Project</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>Progress</TableHead>
-                  <TableHead>Started</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                <Rows resource={queues} columns={5} empty="No queue yet. Select items in the backlog and queue them.">
-                  {(items) =>
-                    items.map((queue) => (
-                      <TableRow key={queue.id}>
-                        <TableCell className="max-w-md">
-                          <Link href={`${BASE}/queue?id=${queue.id}`} className="font-medium">
-                            {queue.name}
-                          </Link>
-                          {queue.pause_reason ? (
-                            <div className="text-[12px] text-muted-foreground">{queue.pause_reason}</div>
-                          ) : null}
-                        </TableCell>
-                        <TableCell className={mono}>{queue.project}</TableCell>
-                        <TableCell>
-                          <QueueState queue={queue} />
-                        </TableCell>
-                        <TableCell className="text-[13px]">{progress(queue.counts)}</TableCell>
-                        <TableCell>
-                          <When value={queue.started_at} />
-                        </TableCell>
-                      </TableRow>
-                    ))
-                  }
-                </Rows>
-              </TableBody>
-            </Table>
-          </TableFrame>
-        </div>
-        <BudgetsSection />
-      </div>
-    </Page>
-  );
+  const id = query.get('id');
+  return id ? <QueueRedirect id={id} /> : <ProjectRedirect project={query.get('project')} />;
+}
+
+function QueueRedirect({id}: {id: string}) {
+  const queue = useResource<QueueDetail>(apiUrl(`queues/${id}`));
+  useEffect(() => {
+    if (queue.data) navigate(queueUrl(queue.data.project, id), {replace: true});
+  }, [queue.data, id]);
+  return <LoadError resource={queue} />;
+}
+
+function ProjectRedirect({project}: {project: string | null}) {
+  const projects = useProjects();
+  useEffect(() => {
+    const name = project ?? projects.data?.default_project;
+    if (name) navigate(queueUrl(name), {replace:true});
+    else if (projects.data) navigate(BASE + '/workspace', {replace:true});
+  }, [project, projects.data]);
+  return <LoadError resource={projects} />;
 }
 
 function DiscardDialog({
@@ -288,8 +252,8 @@ function DiscardDialog({
   const discard = () => {
     setPending(true);
     setProblem(null);
-    postJson(`queues/${queue.id}/discard`)
-      .then(() => navigate(`${BASE}/queues`))
+    postJson(`projects/${queue.project}/queues/${queue.id}/discard`)
+      .then(() => navigate(queueUrl(queue.project)))
       .catch((error: unknown) => setProblem(message(error)))
       .finally(() => setPending(false));
   };
@@ -314,10 +278,9 @@ function DiscardDialog({
   );
 }
 
-export function QueuePage() {
-  const { query } = useLocation();
-  const id = query.get('id') ?? '';
-  const queue = useResource<QueueDetail>(apiUrl(`queues/${id}`), 5_000);
+export function QueuePage({project,id}: {project: string; id: string}) {
+  const path = `projects/${project}/queues/${id}`;
+  const queue = useResource<QueueDetail>(apiUrl(path), 5_000);
   const [pending, setPending] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [discarding, setDiscarding] = useState(false);
@@ -328,7 +291,7 @@ export function QueuePage() {
   const change = (what: string, path: string, body: Record<string, unknown> = {}) => {
     setPending(what);
     setProblem(null);
-    postJson(`queues/${id}/${path}`, body)
+    postJson(`projects/${project}/queues/${id}/${path}`, body)
       .then(queue.reload)
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') return;
@@ -353,7 +316,7 @@ export function QueuePage() {
     setDragged(null);
     setOver(null);
   };
-  const editable = data ? data.state !== 'finished' : false;
+  const editable = data ? !data.epic_plan && data.state !== 'finished' : false;
 
   return (
     <Page
@@ -383,7 +346,7 @@ export function QueuePage() {
                 }}
               />
             ) : null}
-            {data.state === 'draft' || data.state === 'paused' ? (
+            {(data.state === 'draft' && !data.epic_plan) || data.state === 'paused' ? (
               <Button
                 size="sm"
                 icon={Play}
@@ -416,7 +379,9 @@ export function QueuePage() {
       }
     >
       <div className="grid gap-3">
+        <Link href={queueUrl(project)}>All project queues</Link>
         <LoadError resource={queue} />
+        {data?.epic_plan && <ExecutionEditor project={project} queue={data} reloadQueue={queue.reload} />}
         {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
         {data?.proposed_by === 'supervisor' && data.state === 'draft' ? (
           <Alert
@@ -431,7 +396,7 @@ export function QueuePage() {
         {data?.state === 'running' && data.waiting_for ? (
           <Alert tone="info" title="Nothing further starts right now" description={data.waiting_for} />
         ) : null}
-        {data ? (
+        {data?.epic_plan && data.state === 'draft' ? null : data ? (
           data.entries.length ? (
             <TableFrame>
               <Table>
@@ -517,7 +482,7 @@ export function QueuePage() {
                         <TableCell>
                           <div className="flex flex-wrap items-center gap-1.5">
                             <Badge tone={ENTRY_STATES[entry.state].tone} size="sm">
-                              {ENTRY_STATES[entry.state].label}
+                              {entry.run?.state === 'waiting' ? 'Awaiting approval' : ENTRY_STATES[entry.state].label}
                             </Badge>
                             {entry.run ? (
                               <span className="flex items-center gap-1.5 text-[12px]">
@@ -531,6 +496,7 @@ export function QueuePage() {
                           ) : null}
                         </TableCell>
                         <TableCell className="text-right">
+                          {entry.state === 'failed' && <Button size="sm" variant="secondary" onClick={() => change('retry', `items/${entry.item_id}/retry`)}>Retry</Button>}
                           {movable ? (
                             <IconButton
                               icon={X}

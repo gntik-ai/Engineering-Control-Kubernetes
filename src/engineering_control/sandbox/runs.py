@@ -26,12 +26,17 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import (
     BacklogItem,
     Budget,
+    EpicExecutionPlan,
     EvaluationCase,
     FlowVersion,
     ModelBatch,
     ModelBatchRequest,
+    ProjectEpic,
+    ProjectIssueStory,
     ProjectRecord,
     ProjectSection,
+    ProjectStoryEpic,
+    ProjectUserStory,
     ProviderAccount,
     SandboxRun,
     SandboxStep,
@@ -54,6 +59,7 @@ from engineering_control.engine.records import in_force
 from engineering_control.flow_library import EVALUATION, FLOW, WORK_KINDS
 from engineering_control.models.providers import API_KEYS, FAMILY_OF, cost_of
 from engineering_control.sandbox import deliver
+from engineering_control.sandbox.execution_order import eligible, reserve_dispatch
 from engineering_control.sandbox.pods import BENCH_PREFIX, identity_secret
 
 ACTIVE: Final = ("queued", "running", "waiting")
@@ -192,8 +198,14 @@ def item_facts(item: BacklogItem) -> dict[str, Any]:
     """What a run carries about the item it works on beyond its text: its labels, where
     it comes from, and what a run made it as."""
     facts = item.facts or {}
+    labels = [str(label)[:100] for label in (item.issue_labels or [])[:50]]
+    if item.type_confirmed and item.execution_type:
+        labels = [
+            item.execution_type,
+            *(label for label in labels if label.casefold() not in ("bug", "enhancement")),
+        ]
     return {
-        "labels": [str(label)[:100] for label in (item.issue_labels or [])[:50]],
+        "labels": labels,
         "by": "github" if item.source == "github" else (item.proposed_by or "administrator"),
         **({"kind": str(facts["kind"])} if facts.get("kind") else {}),
         **({"severity": str(facts["severity"])} if facts.get("severity") else {}),
@@ -306,7 +318,12 @@ class Runs:
             return _run_row(run)
 
     def start_item(
-        self, item_id: UUID, *, toolchain: dict[str, Any], max_rounds: int | None = None
+        self,
+        item_id: UUID,
+        *,
+        toolchain: dict[str, Any],
+        max_rounds: int | None = None,
+        queue_entry: UUID | None = None,
     ) -> dict[str, Any]:
         """Start work on a backlog item: the run its section's flow says.
 
@@ -316,6 +333,12 @@ class Runs:
         is an audit of what it names.
         """
         with self.sessions.begin() as session:
+            session.scalar(
+                select(ProjectRecord.id)
+                .join(BacklogItem, BacklogItem.project_id == ProjectRecord.id)
+                .where(BacklogItem.id == item_id)
+                .with_for_update(of=ProjectRecord)
+            )
             found = session.execute(
                 select(BacklogItem, ProjectRecord, ProjectSection)
                 .join(ProjectRecord, BacklogItem.project_id == ProjectRecord.id)
@@ -326,6 +349,30 @@ class Runs:
             if found is None:
                 raise ProjectNotFound(str(item_id))
             item, project, section = found
+            entry = reserve_dispatch(session, item, queue_entry)
+            if entry is not None and (execution := session.get(EpicExecutionPlan, entry.queue_id)):
+                if reason := eligible(session, item, section):
+                    raise ProjectConflict(reason)
+                parents = execution.data.get("parents", {}).get(str(item.id), [])
+                if not session.scalar(
+                    select(ProjectIssueStory.story_id)
+                    .join(ProjectUserStory, ProjectUserStory.id == ProjectIssueStory.story_id)
+                    .join(ProjectStoryEpic, ProjectStoryEpic.story_id == ProjectUserStory.id)
+                    .join(ProjectEpic, ProjectEpic.id == ProjectStoryEpic.epic_id)
+                    .where(
+                        ProjectEpic.id == execution.epic_id,
+                        ProjectEpic.closed_at.is_(None),
+                        ProjectEpic.archived_at.is_(None),
+                        ProjectUserStory.closed_at.is_(None),
+                        ProjectUserStory.archived_at.is_(None),
+                        ProjectIssueStory.item_id == item.id,
+                        ProjectIssueStory.story_id.in_([UUID(s) for s in parents]),
+                    )
+                    .limit(1)
+                ):
+                    raise ProjectConflict(
+                        "The Issue is no longer linked to a Story in the approved plan."
+                    )
             if refusal := paused_refusal(project):
                 raise ProjectConflict(refusal)
             if item.workspace_review not in (None, "approved"):
@@ -421,6 +468,8 @@ class Runs:
             session.add(
                 SandboxStep(run_id=run.id, position=1, name=start, state="pending", attempt=0)
             )
+            if entry is not None:
+                entry.run_id, entry.state, entry.detail = run.id, "running", None
             # Starting work on an item is deciding that it is wanted.
             if item.state == "proposed":
                 item.state = "accepted"

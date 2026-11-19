@@ -240,11 +240,13 @@ def test_a_started_queue_runs_its_items_in_order(world: Any) -> None:
     (run,) = world.runs.listing()["items"]
     assert run["kind"] == "deliver_issue" and run["title"] == "#11 Expired cookie"
     assert world.queues.advance() == 0, "one at a time"
-    # A change that waits for the administrator does not hold the queue up.
+    # The next Issue needs this workflow to finish its approval step.
     world.end(0, "waiting")
-    assert world.queues.advance() == 1
+    assert world.queues.advance() == 0
     first = world.queues.get(queue_id)["entries"][0]
-    assert (first["state"], first["detail"]) == ("done", "A change waits for your decision.")
+    assert (first["state"], first["detail"]) == ("running", "Awaiting approval")
+    world.end(0, "succeeded")
+    assert world.queues.advance() == 1
     # What still waits can be reordered while the queue runs; what ran keeps its place.
     world.queues.pause(queue_id)
     assert world.queues.advance() == 0

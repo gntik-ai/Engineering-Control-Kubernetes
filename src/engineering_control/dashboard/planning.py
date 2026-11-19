@@ -500,6 +500,22 @@ class PlanningRecords:
             )
             for uid, badge in finding_links(session, project.id, kind, connection_keys):
                 external[uid].append(badge)
+            classifications = (
+                {
+                    uid: (value, confirmed)
+                    for uid, value, confirmed in session.execute(
+                        select(
+                            BacklogItem.id, BacklogItem.execution_type, BacklogItem.type_confirmed
+                        ).where(
+                            BacklogItem.project_id == project.id,
+                            BacklogItem.id.in_(connection_keys),
+                            BacklogItem.execution_type.is_not(None),
+                        )
+                    )
+                }
+                if kind == "issues"
+                else {}
+            )
             row_ids = [item["id"] for item in items]
             reviews = review_results(
                 session,
@@ -538,6 +554,10 @@ class PlanningRecords:
                     ids_for_row = [v for v in (rels or linked[key]) if v in parents]
                     item["epic_ids" if kind == "stories" else "story_ids"] = ids_for_row
                     if kind == "issues":
+                        mirror = mirror_ids.get(item["number"], key) if item["proposal"] else key
+                        item["execution_type"], item["type_confirmed"] = classifications.get(
+                            mirror, (None, False)
+                        )
                         item["orphan"] = not ids_for_row and not any(
                             link["kind"] == "stories"
                             and link["record"]
