@@ -27,9 +27,11 @@ from engineering_control.dashboard.workspace_review import (
     WorkspaceReview,
     gap_identity,
     review_state,
+    settle_stories,
 )
 from engineering_control.db.models import (
     ProjectEpic,
+    ProjectRecord,
     ProjectUserStory,
     ProviderAccount,
     WorkspaceCandidate,
@@ -174,6 +176,7 @@ class WorkspaceImports:
                 .where(
                     WorkspaceCandidate.project_id == project.id,
                     WorkspaceCandidate.kind == WorkspaceImport.stage,
+                    WorkspaceCandidate.origin == "import",
                 )
                 .correlate(WorkspaceImport)
                 .scalar_subquery()
@@ -292,6 +295,14 @@ class WorkspaceImports:
                 row.provider, row.model = provider, model
             if row.stage in ("analysis", *KINDS) and not row.model:
                 raise ProjectInvalid("Choose a configured model for the repository analysis")
+            if (
+                row.stage == "stories"
+                and row.progress.get("review_mode") == "review"
+                and bulk_stage != "stories"
+            ):
+                raise ProjectConflict(
+                    "User Story generation is complete. Review the proposals in the table."
+                )
             if row.stage in KINDS:
                 mode = row.progress.get("review_mode", "existing")
                 action = "existing" if mode == "existing" else ("all" if bulk_stage else "next")
@@ -420,7 +431,30 @@ class WorkspaceImports:
                 k: v for k, v in row.progress.items() if k not in ("activity", "checked", "found")
             }
             row.lease = row.lease_until = None
+            session.flush()
+            settle_stories(session, row)
             return None
+
+    def settle_existing_stories(self) -> None:
+        with self.sessions.begin() as db:
+            names = list(
+                db.scalars(
+                    select(ProjectRecord.name)
+                    .join(WorkspaceImport, WorkspaceImport.project_id == ProjectRecord.id)
+                    .where(
+                        WorkspaceImport.stage == "stories",
+                        ProjectRecord.archived_at.is_(None),
+                        WorkspaceImport.progress["review_mode"].as_string().in_(("review", "gaps")),
+                        WorkspaceImport.progress["activity"].as_string() == "all",
+                    )
+                )
+            )
+        for name in names:
+            with self.sessions.begin() as db:
+                project = active_project(db, name, lock=True)
+                row = db.get(WorkspaceImport, project.id)
+                if row:
+                    settle_stories(db, row)
 
     def _renew(self, row: WorkspaceImport) -> None:
         with self.sessions.begin() as session:

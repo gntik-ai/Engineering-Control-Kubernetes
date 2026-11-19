@@ -519,6 +519,7 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
     )
     kind: Mapped[str] = mapped_column(String(16))
     identity: Mapped[str] = mapped_column(String(96))
+    origin: Mapped[str] = mapped_column(String(16), default="import", server_default="import")
     number: Mapped[int | None] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(300))
     description: Mapped[str | None] = mapped_column(Text)
@@ -561,6 +562,72 @@ class WorkspaceModelUsage(UUIDPrimaryKey, Base):
     )
     usage: Mapped[dict[str, Any]] = mapped_column(JSON)
     __table_args__ = (Index("ix_workspace_model_usage_project_time", "project_id", "recorded_at"),)
+
+
+class ProjectConnection(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "project_connections"
+    first_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"), index=True)
+    second_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"), index=True)
+    owner_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"))
+    dependent_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("projects.id"))
+    purpose: Mapped[str] = mapped_column(Text, default="")
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider: Mapped[str | None] = mapped_column(String(16))
+    model: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    last_checked: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[str | None] = mapped_column(String(400))
+    progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    __table_args__ = (
+        UniqueConstraint("first_id", "second_id", name="uq_connection_pair"),
+        CheckConstraint("first_id < second_id", name="connection_order"),
+        CheckConstraint("owner_id IN (first_id, second_id)", name="connection_owner"),
+        CheckConstraint("dependent_id IN (first_id, second_id)", name="connection_direction"),
+        Index("ix_connection_due", "archived_at", "due_at"),
+    )
+
+
+class ConnectionFinding(UUIDPrimaryKey, Timestamps, Base):
+    """A project reference or a review decision, including its original evidence."""
+
+    __tablename__ = "connection_findings"
+    connection_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("project_connections.id"), index=True
+    )
+    identity: Mapped[str] = mapped_column(String(64))
+    source_project: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"))
+    source_kind: Mapped[str] = mapped_column(String(16))
+    source_id: Mapped[UUID | None] = mapped_column(Uuid)
+    source_number: Mapped[int | None] = mapped_column(Integer)
+    target_kind: Mapped[str | None] = mapped_column(String(16))
+    target_id: Mapped[UUID | None] = mapped_column(Uuid)
+    target_number: Mapped[int | None] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String(12))
+    origin: Mapped[str] = mapped_column(String(12))
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    proposal_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("workspace_candidates.id"))
+    __table_args__ = (
+        UniqueConstraint("connection_id", "identity", name="uq_connection_finding"),
+        Index("ix_connection_source", "source_project", "source_kind", "source_id"),
+        Index("ix_connection_target", "target_kind", "target_id"),
+    )
+
+
+class ConnectionEvent(UUIDPrimaryKey, Base):
+    __tablename__ = "connection_events"
+    connection_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("project_connections.id"), index=True
+    )
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    message: Mapped[str] = mapped_column(Text)
 
 
 class WorkspaceBilledDay(Base):

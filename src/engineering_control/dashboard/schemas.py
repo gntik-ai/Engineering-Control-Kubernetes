@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -327,6 +327,29 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class ConnectionInput(PlainChangeInput):
+    other: str = Field(min_length=1, max_length=32)
+    relation: Literal["depends_on", "used_by", "related"]
+    purpose: str = Field(default="", max_length=4000)
+
+
+class ConnectionAnalysisInput(PlainChangeInput):
+    provider: str | None = Field(default=None, max_length=16)
+    model: str | None = Field(default=None, max_length=200)
+
+
+class ConnectionLinkInput(PlainChangeInput):
+    source_id: UUID
+    target_kind: Literal["epics", "stories", "issues"] | None = None
+    target_id: UUID | None = None
+    reason: str = Field(default="", max_length=2000)
+
+
+class ConnectionDecisionInput(PlainChangeInput):
+    version: str = Field(min_length=64, max_length=64)
+    accept: bool
+
+
 class WorkspaceImportStep(PlainChangeInput):
     version: int = Field(ge=0)
     provider: str | None = Field(default=None, max_length=16)
@@ -361,7 +384,7 @@ class ProposalDecisions(PlainChangeInput):
 
 
 class ProposalEdit(PlainChangeInput):
-    version: int = Field(ge=0)
+    version: int | None = Field(default=None, ge=0)
     title: str = Field(min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=40000)
     parents: list[UUID] = Field(default_factory=list)

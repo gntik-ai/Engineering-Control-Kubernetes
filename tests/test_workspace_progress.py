@@ -487,7 +487,7 @@ def test_generate_all_stories_checkpoints_and_preserves_approval(tmp_path: Path)
             client, "import/advance", version=done["version"], all_stories=True, **args
         ).json()
         assert repeated["review"] == done["review"] and repeated["operation"]["added"] == 0
-        assert not replies
+        assert len(replies) == 1, "a completed story batch must not call the model again"
         approved = post(
             client,
             "planning/stories/decisions",
@@ -501,6 +501,16 @@ def test_generate_all_stories_checkpoints_and_preserves_approval(tmp_path: Path)
             if s["title"] == "Booking history"
         )
         assert set(saved["epic_ids"]) == {epic, other}
+        state = client.get(BASE + "import").json()
+        assert state["stage"] == "stories"
+        remaining = [c["id"] for c in state["review"]["candidates"] if c["decision"] == "pending"]
+        assert (
+            post(
+                client, "planning/stories/decisions", version=state["version"], ids=remaining
+            ).status_code
+            == 200
+        )
+        assert client.get(BASE + "import").json()["stage"] == "issues"
     finally:
         resume.set()
         client.__exit__(None, None, None)
@@ -569,5 +579,100 @@ def test_bulk_story_retry_preserves_earlier_batch_and_validates_epics(tmp_path: 
             "Download report",
         }
         assert not batches
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_bulk_story_generation_has_a_finite_pass_even_when_model_always_wants_more(
+    tmp_path: Path,
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.stage = "stories"
+        row.progress = {"review_mode": "gaps"}
+    for i in range(9):
+        repo.planning.save("falcone", "epics", f"Epic {i}", None, [])
+    calls = []
+
+    class OpenEnded(ReviewModel):
+        async def ask(self, q: Question, *, retry: bool = True) -> Reply:
+            ctx = json.loads(q.prompt)
+            group = ctx["epics_for_this_batch"]
+            calls.append(group)
+            assert len(calls) <= 4, "one evidence pass and at most one overflow pass per Epic group"
+            stories = [
+                {
+                    "title": f"Outcome {key} pass {len(calls)}",
+                    "description": "As a user I can finish the task.",
+                    "parents": [key],
+                }
+                for key in group
+            ]
+            return Reply(
+                {"complete": False, "stories": stories},
+                "",
+                "fixture",
+                "analysis",
+                uuid4(),
+                "Fixture",
+                {},
+                0.1,
+                1,
+            )
+
+    client.app.state.models = OpenEnded()
+    try:
+        state = post(
+            client,
+            "import/advance",
+            version=1,
+            all_stories=True,
+            provider="fixture",
+            model="analysis",
+        ).json()
+        assert (
+            len(calls) == 4 and state["stage"] == "stories" and state["review"]["mode"] == "review"
+        )
+        assert state["operation"]["state"] == "completed"
+        records = state["review"]["candidates"]
+        first = records[0]["parents"][0]
+        rejected = [r["id"] for r in records if r["parents"] == [first]]
+        assert (
+            post(
+                client,
+                "planning/stories/decisions",
+                ids=rejected,
+                dismiss=True,
+                version=state["version"],
+            ).status_code
+            == 200
+        )
+        current = client.get(BASE + "import").json()
+        assert current["stage"] == "stories" and current["review"]["mode"] == "gaps"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_legacy_completed_bulk_stories_advance_without_new_model_usage(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    ep = repo.planning.save("falcone", "epics", "Existing Epic", None, [])
+    repo.planning.save("falcone", "stories", "Approved outcome", None, [UUID(ep["id"])])
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.stage = "stories"
+        row.progress = {
+            "review_mode": "review",
+            "activity": "all",
+            "operation": {"action": "all", "state": "completed", "added": 0},
+        }
+    try:
+        repo.workspace_imports.settle_existing_stories()
+        repo.workspace_imports.settle_existing_stories()
+        current = client.get(BASE + "import").json()
+        assert current["stage"] == "issues" and current["review"]["mode"] == "existing"
+        assert current["version"] == 2
     finally:
         client.__exit__(None, None, None)

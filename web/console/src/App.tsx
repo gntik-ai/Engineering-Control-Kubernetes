@@ -167,8 +167,10 @@ export default function App() {
   ) : null;
 
   if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
-    const name = current === WORKSPACE ? '' : current.slice(WORKSPACE.length + 1);
-    return <ProjectWorkspace name={name} actions={actions} notice={notice} />;
+    const [name = '', ...rest] = current.slice(WORKSPACE.length + 1).split('/');
+    const connections = rest.join('/') === 'settings/connections';
+    if (rest.length && !connections) return <NotFoundPage />;
+    return <ProjectWorkspace name={name} connections={connections} actions={actions} notice={notice} />;
   }
   const view = ADMIN_VIEWS[current];
   if (!view) return <NotFoundPage />;
