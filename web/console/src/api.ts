@@ -1263,7 +1263,11 @@ export interface Resource<T> {
  * GET `url` now and every `intervalMs` while the tab is visible. The previous data stays
  * on screen during a refresh and after a failed one (with `error` set), never a blank table.
  */
-export function useResource<T>(url: string, intervalMs: number | null = null): Resource<T> {
+export function useResource<T>(
+  url: string,
+  intervalMs: number | null = null,
+  { keepPreviousData = false }: { keepPreviousData?: boolean } = {},
+): Resource<T> {
   const [state, setState] = useState<Omit<Resource<T>, 'reload'>>({
     data: null,
     error: null,
@@ -1278,7 +1282,7 @@ export function useResource<T>(url: string, intervalMs: number | null = null): R
     const changed = latest.current !== url;
     latest.current = url;
     const controller = new AbortController();
-    setState((previous) => ({ ...previous, loading: true, data: changed ? null : previous.data }));
+    setState((previous) => ({ ...previous, loading: true, data: changed && !keepPreviousData ? null : previous.data }));
     getJson<T>(url, controller.signal)
       .then((data) => setState({ data, error: null, loading: false, fetchedAt: Date.now() }))
       .catch((error: unknown) => {
@@ -1287,7 +1291,7 @@ export function useResource<T>(url: string, intervalMs: number | null = null): R
         setState((previous) => ({ ...previous, error: message, loading: false }));
       });
     return () => controller.abort();
-  }, [url, tick]);
+  }, [url, tick, keepPreviousData]);
 
   useEffect(() => {
     if (!intervalMs) return;

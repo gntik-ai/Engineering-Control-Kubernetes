@@ -1030,6 +1030,35 @@ def create_app(
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
+    @app.get("/api/dashboard/projects/{name}/planning/{kind}")
+    async def planning_page(
+        name: str,
+        kind: Kind,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).planning.page, name, kind, page, page_size)
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/planning/{kind}/pending")
+    async def pending_planning(name: str, kind: Kind, request: Request) -> Response:
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).planning.pending, name, kind))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/planning/{kind}/parents")
+    async def planning_parents(name: str, kind: Kind, request: Request) -> Response:
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).planning.parents, name, kind))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
     async def save_planning(name: str, kind: Kind, key: UUID | None, request: Request) -> Response:
         schema = {"epics": EpicInput, "stories": StoryInput, "issues": WorkspaceIssueInput}[kind]
 

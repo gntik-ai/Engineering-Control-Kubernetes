@@ -15,7 +15,12 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
-from engineering_control.dashboard.planning import Kind, replace_parents, save_record
+from engineering_control.dashboard.planning import (
+    Kind,
+    coverage_problem,
+    replace_parents,
+    save_record,
+)
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -259,23 +264,6 @@ def _linked_parents(session: Session, project: UUID, stage: str) -> set[str]:
     return set(map(str, session.scalars(query)))
 
 
-def _coverage_problem(session: Session, project: UUID, stage: str, parents: set[str]) -> str | None:
-    if stage == "epics" and not session.scalar(
-        select(ProjectEpic.id)
-        .where(ProjectEpic.project_id == project, ProjectEpic.archived_at.is_(None))
-        .limit(1)
-    ):
-        return "Approve or add an Epic before generating User Stories"
-    missing = parents - _linked_parents(session, project, stage)
-    if missing:
-        label = "Epic" if stage == "stories" else "User Story"
-        return (
-            f"{len(missing)} {label} records still need coverage. "
-            "Add proposals or adjust their links."
-        )
-    return None
-
-
 def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
     parents = (
         []
@@ -288,7 +276,7 @@ def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
         "mode": mode,
         "can_continue": mode != "existing"
         and not any(c.decision == "pending" for c in candidates)
-        and not _coverage_problem(session, row.project_id, row.stage, {p["id"] for p in parents}),
+        and not coverage_problem(session, row.project_id, row.stage),
         "parents": parents,
         "candidates": [
             {
@@ -741,7 +729,7 @@ class WorkspaceReview:
                 c.local_id = self._materialize(session, project, c, c.title, c.description, parents)
                 c.decision = "approved"
             session.flush()
-            problem = _coverage_problem(session, project.id, stage, valid)
+            problem = coverage_problem(session, project.id, stage)
             if problem:
                 raise ProjectConflict(problem)
             row.stage = {"epics": "stories", "stories": "issues", "issues": "complete"}[stage]
