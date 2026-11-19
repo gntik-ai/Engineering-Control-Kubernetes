@@ -130,13 +130,19 @@ def catalog(session: Session, project: ProjectRecord) -> Catalog:
             result.local[key] = item
         if number:
             result.numbers[number] = item
-    for key, number in session.execute(
-        select(WorkspaceCandidate.local_id, WorkspaceCandidate.number).where(
+    for key, number, kind in session.execute(
+        select(
+            WorkspaceCandidate.local_id, WorkspaceCandidate.number, WorkspaceCandidate.kind
+        ).where(
             WorkspaceCandidate.project_id == project.id,
             WorkspaceCandidate.decision == "approved",
             WorkspaceCandidate.number.is_not(None),
         )
     ):
+        # A reclassified technical issue owns its GitHub number. Keep the historic
+        # local planning record and its existing relationships independently.
+        if kind in ("epics", "stories") and number in result.numbers:
+            continue
         if key in result.local and number:
             result.local[key].number = number
             result.numbers[number] = result.local[key]
@@ -170,7 +176,17 @@ def catalog(session: Session, project: ProjectRecord) -> Catalog:
 def watermark(session: Session, project: ProjectRecord) -> str:
     # Import progress covers source insertions. Counts also detect hard removals.
     marks: list[Any] = [project.source_repository, project.description, project.archived_at]
-    for table in (ProjectEpic, ProjectUserStory, BacklogItem, WorkspaceCandidate, WorkspaceImport):
+    marks.append(
+        tuple(
+            session.execute(
+                select(WorkspaceImport.stage, WorkspaceImport.version).where(
+                    WorkspaceImport.project_id == project.id
+                )
+            ).one_or_none()
+            or ()
+        )
+    )
+    for table in (ProjectEpic, ProjectUserStory, BacklogItem, WorkspaceCandidate):
         marks.append(
             tuple(
                 session.execute(

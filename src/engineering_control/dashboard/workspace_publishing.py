@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,8 +16,19 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.db.models import BacklogItem, ProjectRecord, WorkspaceAction
+from engineering_control.dashboard.workspace_issues import planning_kind
+from engineering_control.db.models import (
+    BacklogItem,
+    ProjectEpic,
+    ProjectRecord,
+    ProjectUserStory,
+    WorkspaceAction,
+    WorkspaceCandidate,
+    WorkspaceSource,
+)
 from engineering_control.github_app import GitHubApp, GitHubAppError
+
+LOGGER = logging.getLogger(__name__)
 
 
 def action_row(action: WorkspaceAction) -> dict[str, Any]:
@@ -85,14 +97,15 @@ class WorkspacePublishing:
             project = active_project(session, name, lock=True)
             return approve_issue(session, project, key)
 
-    def _claim(self, name: str, key: UUID) -> tuple[WorkspaceAction, str, str] | None:
+    def _claim(self, name: str, key: UUID) -> tuple[WorkspaceAction, str, str]:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             action = session.get(WorkspaceAction, key)
             if action is None or action.project_id != project.id:
                 raise ProjectNotFound(str(key))
-            if action.status == "done":
-                return None
+            if action.status in ("done", "retained"):
+                session.expunge(action)
+                return action, "", ""
             now = datetime.now(UTC)
             if action.lease_until and action.lease_until.replace(tzinfo=UTC) > now:
                 raise ProjectConflict("Synchronization is already running")
@@ -107,12 +120,42 @@ class WorkspacePublishing:
             session.expunge(action)
             return action, title, body
 
+    def _approved_planning_kind(self, action: WorkspaceAction) -> str | None:
+        with self.sessions() as db:
+            candidate = db.scalar(
+                select(WorkspaceCandidate)
+                .join(ProjectRecord, ProjectRecord.id == WorkspaceCandidate.project_id)
+                .where(
+                    ProjectRecord.id == action.project_id,
+                    ProjectRecord.source_repository == action.repository,
+                    WorkspaceCandidate.local_id == action.local_id,
+                    WorkspaceCandidate.number == action.number,
+                    WorkspaceCandidate.decision == "approved",
+                    WorkspaceCandidate.kind.in_(("epics", "stories")),
+                )
+            )
+            if candidate is None:
+                return None
+            source = db.get(WorkspaceSource, (action.project_id, candidate.identity))
+            if not source or planning_kind(source.evidence) != candidate.kind:
+                return None
+            model = ProjectEpic if candidate.kind == "epics" else ProjectUserStory
+            active = db.scalar(
+                select(model.id).where(
+                    model.project_id == action.project_id,
+                    model.id == action.local_id,
+                    model.archived_at.is_(None),
+                )
+            )
+            return candidate.kind if active is not None else None
+
     def _update(
         self,
         name: str,
         claimed: WorkspaceAction,
         *,
         sent: bool = False,
+        retained: bool = False,
         number: int | None = None,
         snapshot: dict[str, Any] | None = None,
         error: str | None = None,
@@ -126,6 +169,12 @@ class WorkspacePublishing:
                 action.status = "uncertain"
                 return
             action.lease = action.lease_until = None
+            if retained:
+                action.status = "retained"
+                action.detail = (
+                    "GitHub source retained because its planning type could not be verified."
+                )
+                return
             action.detail = error[:350] if error else None
             if error:
                 return
@@ -160,10 +209,9 @@ class WorkspacePublishing:
             action.status = "done"
 
     async def sync(self, name: str, key: UUID, github: GitHubApp | None) -> dict[str, Any]:
-        work = await asyncio.to_thread(self._claim, name, key)
-        if work is None:
-            return {"project": name, "status": "done"}
-        action, title, body = work
+        action, title, body = await asyncio.to_thread(self._claim, name, key)
+        if action.status in ("done", "retained"):
+            return {"project": name, "status": action.status}
         number = action.number
         snapshot = None
         try:
@@ -179,16 +227,31 @@ class WorkspacePublishing:
                         "The creation outcome is uncertain. Recheck GitHub before publishing again."
                     )
                 snapshot = await github.workspace_issue(action.repository, number)
+            elif action.operation == "close" and number:
+                expected = await asyncio.to_thread(self._approved_planning_kind, action)
+                current = (
+                    await github.workspace_issue(action.repository, number) if expected else {}
+                )
+                if expected is None or planning_kind(current) != expected:
+                    await asyncio.to_thread(self._update, name, action, retained=True)
+                    return {"project": name, "status": "retained", "number": number}
+                if current["state"] != "closed":
+                    token = await github.repository_token(action.repository, {"issues": "write"})
+                    try:
+                        await github.close_workspace_issue(action.repository, number, token=token)
+                        LOGGER.info(
+                            "Closed GitHub planning issue project=%s issue=%d kind=%s action=%s",
+                            name,
+                            number,
+                            expected,
+                            key,
+                        )
+                    finally:
+                        await github.revoke(token)
             else:
                 token = await github.repository_token(action.repository, {"issues": "write"})
                 try:
-                    if action.operation == "close" and number:
-                        current = await github.workspace_issue(action.repository, number)
-                        if current["state"] != "closed":
-                            await github.close_workspace_issue(
-                                action.repository, number, token=token
-                            )
-                    elif action.operation == "create":
+                    if action.operation == "create":
                         await asyncio.to_thread(self._update, name, action, sent=True)
                         number = await github.create_workspace_issue(
                             action.repository, title, body.rstrip() + "\n\n" + marker, token=token
@@ -235,7 +298,8 @@ class WorkspacePublishing:
                 for a in session.scalars(
                     select(WorkspaceAction)
                     .where(
-                        WorkspaceAction.project_id == project.id, WorkspaceAction.status != "done"
+                        WorkspaceAction.project_id == project.id,
+                        WorkspaceAction.status.not_in(("done", "retained")),
                     )
                     .order_by(WorkspaceAction.created_at)
                 )
