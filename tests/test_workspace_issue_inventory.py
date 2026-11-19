@@ -281,10 +281,12 @@ def test_review_cannot_promote_a_change_request_or_drop_an_unmatched_issue(tmp_p
         model = cast(Models, Model())
         for kind in ("epics", "stories"):
             row.stage = kind
-            _, proposals = asyncio.run(repo.workspace_imports.review.propose(row, model))
+            _, proposals, _ = asyncio.run(
+                repo.workspace_imports.review.propose("falcone", row, model)
+            )
             assert not proposals
         row.stage = "issues"
-        _, proposals = asyncio.run(repo.workspace_imports.review.propose(row, model))
+        _, proposals, _ = asyncio.run(repo.workspace_imports.review.propose("falcone", row, model))
         assert {s["number"] for s in proposals} == {19, 20}
         assert all(not s["parents"] and s["title"] != "Model title" for s in proposals)
     finally:

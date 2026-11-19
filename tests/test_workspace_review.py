@@ -30,8 +30,10 @@ class ReviewModel:
     async def ask(self, question: Question, *, retry: bool = True) -> Reply:
         data = json.loads(question.prompt)
         stage = question.system.split(".")[0].split()[-1]
-        parents = [p["id"] for p in data["parents"]]
-        if "epics" in question.schema["properties"]:
+        parents = [p["id"] for p in data.get("parents", [])]
+        if "matches" in question.schema["properties"]:
+            answer = {"matches": []}
+        elif "epics" in question.schema["properties"]:
             assert not retry
             answer = {
                 "complete": True,

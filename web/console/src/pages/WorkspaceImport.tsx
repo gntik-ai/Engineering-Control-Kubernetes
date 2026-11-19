@@ -25,6 +25,7 @@ export interface ImportState {
   counts: Record<string, number>;
   busy: boolean;
   activity: ReviewActivity | null;
+  coverage_run?: { state: 'running' | 'waiting' | 'failed' | 'completed'; epics: number; stories: number; issues: number; links: number; orphans?: number; match_existing?: boolean; detail?: string } | null;
   operation?: { action: ReviewActivity; state: 'running' | 'completed' | 'failed' | 'interrupted'; added?: number; detail?: string } | null;
   found: number;
   run_found: number;
@@ -77,6 +78,18 @@ export function WorkspaceImport({
   }));
   const selected = choice || (state?.provider && state.model ? encode(state.provider, state.model) : '');
   const model = state?.models.find((option) => encode(option.provider, option.model) === selected);
+  const coverage = state?.coverage_run;
+  const eligible = !!state && ['epics', 'stories', 'issues', 'complete'].includes(state.stage);
+  const managed = coverage?.state === 'running' || coverage?.state === 'waiting';
+  const checkCoverage = useSubmit(
+    () => postJson<ImportState>(path + '/coverage', { version: state?.version, ...model }),
+    value => { setLatest(value); persisted.reload(); },
+  );
+  useEffect(() => {
+    if (coverage?.state !== 'running') return;
+    const timer = window.setInterval(persisted.reload, 2000);
+    return () => window.clearInterval(timer);
+  }, [coverage?.state, persisted.reload]);
   const refreshModels = useSubmit(
     () => {
       setRefreshNote('');
@@ -184,6 +197,50 @@ export function WorkspaceImport({
           </Button>
         )}
       </div>
+      <section aria-label="Project coverage" className="grid justify-items-start gap-2">
+        <Button
+          loading={coverage?.state === 'running' || checkCoverage.pending}
+          disabled={!eligible || !model || state.busy || checkCoverage.pending || coverage?.state === 'running' || coverage?.state === 'waiting'}
+          onClick={() => void checkCoverage.submit()}
+        >
+          {coverage?.state === 'running' ? 'Checking project coverage'
+            : coverage?.state === 'failed' ? 'Resume project coverage check' : 'Check project coverage'}
+        </Button>
+        {coverage ? (
+          <div role="status" className="text-sm">
+            {coverage.state === 'running' && <p>{coverage.match_existing ? 'Matching imported issues to existing User Stories' : labels[state.stage]}</p>}
+            {coverage.state === 'completed' && <p>Coverage check complete.{coverage.orphans !== undefined && (
+              coverage.orphans === 0 ? ' All imported technical issues are linked.' :
+                ` ${coverage.orphans} imported ${coverage.orphans === 1 ? 'issue still needs' : 'issues still need'} a User Story.`
+            )}</p>}
+            {coverage.state === 'waiting' && <p>
+              {(state.review?.candidates.some(c => c.decision === 'pending'))
+                ? 'Review the proposals to continue the coverage check.'
+                : state.stage === 'epics' ? 'Add or reopen an Epic to continue.' : 'Approve a User Story for each open Epic to continue.'}
+            </p>}
+            <p>{coverage.links} existing issue {coverage.links === 1 ? 'link' : 'links'} added · {coverage.epics} new {coverage.epics === 1 ? 'Epic' : 'Epics'} · {coverage.stories} new {coverage.stories === 1 ? 'User Story' : 'User Stories'} · {coverage.issues} new {coverage.issues === 1 ? 'Issue' : 'Issues'}</p>
+          </div>
+        ) : <p className="text-sm text-muted-foreground">{eligible
+          ? 'Checks Epics, User Stories and technical Issues. Links existing issues and proposes missing work.'
+          : 'Approve the repository description to check Epics, User Stories and technical Issues.'}</p>}
+        {(coverage?.state === 'waiting' || coverage?.state === 'completed') && (
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="secondary" onClick={() => setQuery({
+              tab: coverage.state === 'completed' ? 'issues' : state.stage, issue_state: null,
+              state: null, page: null, search: null, record: null, epic: null, connected: null,
+            })}>
+              {coverage.state === 'completed' ? 'View Issues' : state.stage === 'epics' ? 'Review Epics' : 'Review User Stories'}
+            </Button>
+            {coverage.state === 'completed' && coverage.issues > 0 && (
+              <Button size="sm" variant="secondary" onClick={() => setQuery({
+                tab: 'issues', issue_state: 'draft', state: null, page: null, search: null, record: null, epic: null, connected: null,
+              })}>Review issue drafts</Button>
+            )}
+          </div>
+        )}
+        {(checkCoverage.problem || (coverage?.state === 'failed' && coverage.detail)) &&
+          <Alert tone="destructive" title={checkCoverage.problem || coverage?.detail || 'Coverage check interrupted'} />}
+      </section>
       {error && <Alert tone="destructive" title={error} />}
       {state.stage !== 'new' && !analyzing && (
         <details className="text-sm text-muted-foreground">
@@ -205,7 +262,7 @@ export function WorkspaceImport({
           </p>
         </details>
       )}
-      {(state.stage === 'analysis' || state.review) && (
+      {(state.stage === 'analysis' || state.review || state.stage === 'complete') && (
         <>
           {options.length ? (
             <Field>
@@ -214,6 +271,7 @@ export function WorkspaceImport({
                 aria-label="Model for analysis"
                 placeholder="Choose a configured model"
                 items={options}
+                disabled={coverage?.state === 'running' || coverage?.state === 'waiting'}
                 value={model ? selected : null}
                 onValueChange={(v) => setChoice(v ?? '')}
               />
@@ -242,7 +300,7 @@ export function WorkspaceImport({
           {refreshModels.problem && <Alert tone="destructive" title={refreshModels.problem} />}
         </>
       )}
-      {state.review && (
+      {state.review && !managed && (
         <WorkspaceReview
           key={state.stage}
           path={path}

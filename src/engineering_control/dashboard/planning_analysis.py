@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import digest
+from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.planning import replace_parents
 from engineering_control.dashboard.planning_queue import reset_review, review_results
 from engineering_control.dashboard.project_records import (
@@ -68,7 +69,10 @@ GUIDANCE = (
     "uncovered requirement and its link to this source. Do not generate work just to reach a "
     "quota or replace a closed issue. When coverage is sufficient return empty arrays. The "
     "intake and verify scopes only check text and parent matches. The children scope may "
-    "propose only technical Issues belonging to the source Story."
+    "propose only technical Issues belonging to the source Story. Evaluate imported_issue_coverage "
+    "first. Multiple imported issues may jointly cover all acceptance criteria. Only draft "
+    "specific work missing after these matches, and skip fully_covered_stories. Use parents "
+    "from the assessed Stories only. Closed not_planned issues are historical links only."
 )
 
 
@@ -161,6 +165,15 @@ class Work:
     cursor: str
     last: bool
     scanned: int
+    coverage: Coverage | None = None
+
+
+def target_stories(work: Work) -> set[str]:
+    if work.screen or work.scope in ("verify", "intake"):
+        return set()
+    source = work.prompt["source"]
+    rows = [source] if work.scope == "children" else [source, *work.prompt["records"]]
+    return {r["id"] for r in rows if r["kind"] == "stories" and r["saved"] and r["state"] == "open"}
 
 
 def source_revision(
@@ -186,6 +199,15 @@ class PlanningAnalysis:
                     j.status.in_(("queued", "running")),
                     j.due_at <= now,
                     j.project_id.not_in(occupied),
+                    # The project-wide pass already generates children. Resume these
+                    # independent reviews when it finishes or pauses for approval.
+                    (~j.scope.in_(("full", "children")))
+                    | (
+                        func.coalesce(
+                            WorkspaceImport.progress["coverage_run"]["state"].as_string(), ""
+                        )
+                        != "running"
+                    ),
                     ProjectRecord.archived_at.is_(None),
                     ProjectRecord.paused_at.is_(None),
                     func.coalesce(ProjectRecord.planning_model, WorkspaceImport.model).is_not(None),
@@ -316,6 +338,8 @@ class PlanningAnalysis:
                     0,
                 )
                 return
+            if work.coverage:
+                work.coverage.validate(db, project)
             self.save_result(db, project, job, work, src, rows, answer)
             job.lease, job.progress = None, {}
 
@@ -351,7 +375,15 @@ class PlanningAnalysis:
         if current and set(matched) - current:
             questions.append("Review the additional parent matches and confirm the intended links.")
         proposals = list(job.result.get("proposals", []))
+        if job.kind != "epics" and not current and not matched and not questions:
+            questions.append(
+                "Which Epic does this Story belong to?"
+                if job.kind == "stories"
+                else "Which User Story does this Issue support?"
+            )
         if not questions:
+            if work.coverage:
+                work.coverage.link(db, project)
             if job.scope == "intake":
                 candidate = db.get(WorkspaceCandidate, job.record_id)
                 if candidate and matched and not current:
@@ -399,6 +431,14 @@ class PlanningAnalysis:
                         raise ProjectInvalid(
                             "A proposal lacks a valid parent, description or reason."
                         )
+                    if kind == "issues" and work.coverage:
+                        linked = [
+                            s
+                            for s in linked
+                            if s in work.coverage.revisions and s not in work.coverage.full
+                        ]
+                        if not linked or (work.scope == "children" and source["id"] not in linked):
+                            continue
                     candidate = WorkspaceCandidate(
                         project_id=project.id,
                         kind=kind,
@@ -413,12 +453,6 @@ class PlanningAnalysis:
                     db.flush()
                     proposals.append({"kind": kind, "id": str(candidate.id), "title": title})
                     identities.add(identity)
-            if job.kind != "epics" and not current and not matched:
-                questions.append(
-                    "Which Epic does this Story belong to?"
-                    if job.kind == "stories"
-                    else "Which User Story does this Issue support?"
-                )
         job.status = (
             "needs_input"
             if questions
@@ -451,6 +485,22 @@ class PlanningAnalysis:
         try:
             work = await asyncio.to_thread(self.prepare, key, name, token)
             if work:
+                targets = target_stories(work)
+                if targets:
+
+                    def owner(db: Session) -> None:
+                        job = db.get(PlanningReview, key)
+                        if not job or job.lease != token:
+                            raise ProjectConflict(
+                                "The planning review was resumed in another session."
+                            )
+                        job.due_at = datetime.now(UTC) + timedelta(minutes=6)
+
+                    work.coverage = await IssueCoverage(self.sessions).check(
+                        name, key[0], targets, work.provider, work.model, models, owner
+                    )
+                    work.prompt["imported_issue_coverage"] = work.coverage.matches
+                    work.prompt["fully_covered_stories"] = sorted(work.coverage.full)
                 instruction = (
                     f"Keep up to {SHORTLIST} relevant IDs from the supplied records. "
                     "Preserve likely parents, overlapping closed or proposed work, and links "

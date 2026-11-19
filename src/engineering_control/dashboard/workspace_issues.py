@@ -88,9 +88,9 @@ def _story_numbers(issue: dict[str, Any], repository: str) -> set[int]:
     }
 
 
-def add_story_links(db: Session, project: UUID, item: UUID, stories: set[UUID]) -> None:
+def add_story_links(db: Session, project: UUID, item: UUID, stories: set[UUID]) -> int:
     if not stories:
-        return
+        return 0
     existing = set(
         db.scalars(
             select(ProjectIssueStory.story_id).where(
@@ -99,15 +99,16 @@ def add_story_links(db: Session, project: UUID, item: UUID, stories: set[UUID]) 
             )
         )
     )
-    db.add_all(
-        ProjectIssueStory(project_id=project, item_id=item, story_id=s) for s in stories - existing
-    )
+    missing = stories - existing
+    db.add_all(ProjectIssueStory(project_id=project, item_id=item, story_id=s) for s in missing)
+    return len(missing)
 
 
-def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, Any]]) -> None:
+def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, Any]]) -> int:
     """Called under the project lock. A real issue keeps one row and its original number."""
     if not issues:
-        return
+        return 0
+    added_links = 0
     wizard = db.get(WorkspaceImport, project.id)
     numbers = {i["number"] for i in issues}
     repo = project.source_repository
@@ -278,9 +279,10 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
         refs = {stories[n] for n in _story_numbers(issue, repo) if n in stories}
         if refs:
             db.flush()
-            add_story_links(db, project.id, item.id, refs)
+            added_links += add_story_links(db, project.id, item.id, refs)
             if cand and cand.kind == "issues" and cand.decision == "pending":
                 cand.parents = sorted(set(cand.parents or []) | {str(v) for v in refs})
+    return added_links
 
 
 class WorkspaceIssueInventory:

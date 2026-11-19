@@ -366,10 +366,13 @@ class ConnectionBulkLinksInput(PlainChangeInput):
     through: AwareDatetime
 
 
-class WorkspaceImportStep(PlainChangeInput):
+class WorkspaceCoverageInput(PlainChangeInput):
     version: int = Field(ge=0)
     provider: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=200)
+
+
+class WorkspaceImportStep(WorkspaceCoverageInput):
     all_epics: bool = False
     all_stories: bool = False
     all_issues: bool = False

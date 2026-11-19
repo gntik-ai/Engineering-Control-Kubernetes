@@ -341,7 +341,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     (snapshot) => { if (snapshot.ids.length) setApproving(snapshot); else reload(); },
   );
   const locked = Boolean(changingPage || data?.busy);
-  const rowLocked = (row: PlanRow) => Boolean(changingPage || (row.proposal && data?.busy));
+  const rowLocked = (row: PlanRow) => Boolean(changingPage || row.review === 'awaiting_stage' || (row.proposal && data?.busy));
   const columns: DataTableColumn<PlanRow>[] = [
     {
       id: 'title', header: 'Title', sortable: false, accessor: (record) => record.title,
@@ -400,6 +400,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       cell: (record) => (
         <>
           {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
+          {record.review === 'awaiting_stage' && <div className="text-xs text-muted-foreground">Awaiting {sections[kind]} review</div>}
           {record.execution_type && <div className="mt-1 text-xs font-medium">{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'}{record.type_confirmed ? ' · Confirmed' : ' · Suggested'}</div>}
           {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
             id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} /></div>}
