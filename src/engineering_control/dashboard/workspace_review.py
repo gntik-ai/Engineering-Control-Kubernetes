@@ -90,8 +90,8 @@ INSTRUCTIONS = {
     "A feature request or a single implementation task is not automatically an Epic.",
     "stories": "Identify user outcomes with an actor, goal and benefit. "
     "Link each to all relevant approved Epics.",
-    "issues": "Identify technical work supporting the approved User Stories. Preserve history. "
-    "Exclude pull requests, planning administration and verification-only records.",
+    "issues": "Map technical work to the approved User Stories it supports. "
+    "Keep open and closed technical issues, including issues without a matching Story.",
 }
 
 
@@ -522,6 +522,10 @@ class WorkspaceReview:
             "github_issues": records,
         }
         if mode == "existing":
+            if row.stage == "issues":
+                # Only the current issues and their possible parent Stories are needed for mapping.
+                context["existing"] = []
+                context["parent_links_already_proposed"] = []
             schema = EXISTING
             task = (
                 "Review every supplied GitHub issue. Return one decision per supplied number. "

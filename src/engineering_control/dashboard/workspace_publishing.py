@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -26,6 +27,8 @@ from engineering_control.db.models import (
     WorkspaceSource,
 )
 from engineering_control.github_app import GitHubApp, GitHubAppError
+
+LOGGER = logging.getLogger(__name__)
 
 
 def action_row(action: WorkspaceAction) -> dict[str, Any]:
@@ -226,7 +229,9 @@ class WorkspacePublishing:
                 snapshot = await github.workspace_issue(action.repository, number)
             elif action.operation == "close" and number:
                 expected = await asyncio.to_thread(self._approved_planning_kind, action)
-                current = await github.workspace_issue(action.repository, number)
+                current = (
+                    await github.workspace_issue(action.repository, number) if expected else {}
+                )
                 if expected is None or planning_kind(current) != expected:
                     await asyncio.to_thread(self._update, name, action, retained=True)
                     return {"project": name, "status": "retained", "number": number}
@@ -234,6 +239,13 @@ class WorkspacePublishing:
                     token = await github.repository_token(action.repository, {"issues": "write"})
                     try:
                         await github.close_workspace_issue(action.repository, number, token=token)
+                        LOGGER.info(
+                            "Closed GitHub planning issue project=%s issue=%d kind=%s action=%s",
+                            name,
+                            number,
+                            expected,
+                            key,
+                        )
                     finally:
                         await github.revoke(token)
             else:

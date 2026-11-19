@@ -147,6 +147,8 @@ def test_full_inventory_links_orphans_views_and_replays(tmp_path: Path) -> None:
             client.get(BASE + "?issue_state=open&record=" + closed["id"]).json()["issue_state"]
             == "closed"
         )
+        focused = client.get(BASE + "?issue_state=open&page_size=1&record=" + closed["id"]).json()
+        assert focused["page"] == 1 and focused["items"][0]["id"] == closed["id"]
         csrf = client.get("/api/dashboard/session").json()["csrf_token"]
         assert (
             client.post(

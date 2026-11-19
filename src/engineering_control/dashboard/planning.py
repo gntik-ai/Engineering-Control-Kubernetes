@@ -382,11 +382,15 @@ class PlanningRecords:
             requested_page = page
             page = min(page, pages)
             if focus:
-                ranked = select(
-                    rows.c.id,
-                    rows.c.proposal,
-                    func.row_number().over(order_by=ordering).label("position"),
-                ).subquery()
+                ranked = (
+                    select(
+                        rows.c.id,
+                        rows.c.proposal,
+                        func.row_number().over(order_by=ordering).label("position"),
+                    )
+                    .where(scope)
+                    .subquery()
+                )
                 position = session.scalar(
                     select(ranked.c.position).where(ranked.c.id == focus, ~ranked.c.proposal)
                 )
