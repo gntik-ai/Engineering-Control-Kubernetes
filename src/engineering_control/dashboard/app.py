@@ -18,6 +18,7 @@ from typing import Any, Final, Literal, cast
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
@@ -117,6 +118,7 @@ from engineering_control.dashboard.schemas import (
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.session_store import SessionAuthorization
+from engineering_control.dashboard.workspace_costs import ecb_rates
 from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.health import Health, listen
 from engineering_control.logging import configure_logging
@@ -339,6 +341,19 @@ def create_app(
                 log_failure("model-catalogs", "model catalog refresh failed", error)
             await asyncio.sleep(24 * 3600)
 
+    async def keep_exchange_rates_current(records: DashboardRepository) -> None:
+        async with httpx.AsyncClient(timeout=20) as client:
+            while True:
+                try:
+                    fresh = await ecb_rates(client)
+                    records.workspace_metrics.exchange_rates = fresh
+                    log_recovery("exchange-rates", "ECB exchange rates refreshed")
+                except Exception as error:  # noqa: BLE001 - serve the last available reference
+                    log_failure(
+                        "exchange-rates", "ECB exchange rates could not be refreshed", error
+                    )
+                await asyncio.sleep(6 * 3600)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -392,6 +407,7 @@ def create_app(
         # cluster, and keeps its own record within its time.
         if repository is None:
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
+            keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
             if app.state.models.sealing_key is not None:
                 keepers.append(asyncio.create_task(keep_model_catalogs_current(app.state.models)))
             told = await listen(

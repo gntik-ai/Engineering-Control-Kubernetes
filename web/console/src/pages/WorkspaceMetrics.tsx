@@ -8,9 +8,11 @@ interface Day {
   day: string;
   resolved: number;
   tokens: number;
-  billed_eur: string | null;
-  billing_reference: string | null;
-  billing_source: string | null;
+  estimated_eur: string | null;
+  assumed_mix_tokens: number;
+  unpriced_tokens: number;
+  usd_per_eur: string;
+  exchange_rate_date: string;
 }
 const count = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
 const euros = new Intl.NumberFormat(undefined, {
@@ -25,9 +27,15 @@ const shortDay = (day: string) =>
     day: 'numeric',
     timeZone: 'UTC',
   });
+function estimate(day: Day) {
+  if (day.estimated_eur == null) return 'Estimate unavailable';
+  const amount = euros.format(Number(day.estimated_eur));
+  return day.unpriced_tokens ? amount + ' (partial estimate)' : amount;
+}
+
 function CostUsage({ series }: { series: Day[] }) {
   const [active, setActive] = useState<number | null>(null);
-  const amounts = series.flatMap((d) => (d.billed_eur === null ? [] : [Number(d.billed_eur)]));
+  const amounts = series.flatMap((d) => (d.estimated_eur == null ? [] : [Number(d.estimated_eur)]));
   const low = Math.min(0, ...amounts);
   const high = Math.max(0, ...amounts);
   const top = high === low ? low + 1 : high;
@@ -43,7 +51,7 @@ function CostUsage({ series }: { series: Day[] }) {
   const lines: string[] = [];
   let segment = '';
   series.forEach((d, i) => {
-    if (d.billed_eur !== null) segment += (segment ? ' L' : 'M') + x(i) + ' ' + ye(Number(d.billed_eur));
+    if (d.estimated_eur != null) segment += (segment ? ' L' : 'M') + x(i) + ' ' + ye(Number(d.estimated_eur));
     else if (segment) {
       lines.push(segment);
       segment = '';
@@ -55,13 +63,13 @@ function CostUsage({ series }: { series: Day[] }) {
     <div className="grid gap-2">
       <div className="flex flex-wrap justify-between gap-2 text-xs font-medium">
         <span style={{ color: 'hsl(var(--chart-resolved))' }}>Measured tokens · left axis</span>
-        <span style={{ color: 'hsl(var(--chart-spend))' }}>Billed EUR · right axis</span>
+        <span style={{ color: 'hsl(var(--chart-spend))' }}>Estimated cost (EUR) · right axis</span>
       </div>
       <svg
         viewBox="0 0 608 178"
         className="w-full"
         role="img"
-        aria-label="Daily measured tokens and finalized EUR charges"
+        aria-label="Daily measured tokens and estimated cost in EUR"
       >
         {[0, 0.5, 1].map((f) => (
           <g key={f}>
@@ -98,11 +106,11 @@ function CostUsage({ series }: { series: Day[] }) {
         ))}
         {series.map(
           (d, i) =>
-            d.billed_eur !== null && (
+            d.estimated_eur != null && (
               <circle
                 key={d.day}
                 cx={x(i)}
-                cy={ye(Number(d.billed_eur))}
+                cy={ye(Number(d.estimated_eur))}
                 r="3"
                 fill="hsl(var(--chart-spend))"
               />
@@ -120,7 +128,7 @@ function CostUsage({ series }: { series: Day[] }) {
           >
             <title>
               {longDay(d.day)} · {d.tokens} tokens ·{' '}
-              {d.billed_eur === null ? 'Billing unavailable' : euros.format(Number(d.billed_eur))}
+              {estimate(d)}
             </title>
           </rect>
         ))}
@@ -141,13 +149,18 @@ function CostUsage({ series }: { series: Day[] }) {
       </svg>
       <p className="text-sm">
         {longDay(current.day)} · {current.tokens.toLocaleString()} tokens ·{' '}
-        {current.billed_eur === null ? 'Billing unavailable' : euros.format(Number(current.billed_eur))}
+        {estimate(current)}
       </p>
-      <p className="text-xs text-muted-foreground">
-        {amounts.length
-          ? 'Finalized billing covers ' + amounts.length + ' of ' + series.length + ' days.'
-          : 'Billed EUR is unavailable for this period.'}
-      </p>
+      {current.unpriced_tokens > 0 && (
+        <p className="text-xs text-muted-foreground">
+          {current.unpriced_tokens.toLocaleString()} tokens have no matching model price.
+        </p>
+      )}
+      {series.some((d) => d.assumed_mix_tokens > 0) && (
+        <p className="text-xs text-muted-foreground">
+          Total-only usage assumes half input and half output tokens. Older imports use their last recorded model.
+        </p>
+      )}
     </div>
   );
 }
@@ -214,7 +227,7 @@ export function WorkspaceMetrics({ project }: { project: string }) {
               <table className="w-full text-left text-sm">
                 <thead>
                   <tr>
-                    {['Date', 'Resolved Issues', 'Measured tokens', 'Billed EUR', 'Billing reference'].map(
+                    {['Date', 'Resolved Issues', 'Measured tokens', 'Estimated EUR', 'Unpriced tokens', 'ECB rate (USD per EUR)'].map(
                       (h) => (
                         <th key={h} className="p-2">
                           {h}
@@ -229,10 +242,9 @@ export function WorkspaceMetrics({ project }: { project: string }) {
                       <td className="p-2">{d.day}</td>
                       <td>{d.resolved}</td>
                       <td>{d.tokens.toLocaleString()}</td>
-                      <td>{d.billed_eur === null ? 'Unavailable' : euros.format(Number(d.billed_eur))}</td>
-                      <td>
-                        {d.billing_reference ? [d.billing_source, d.billing_reference].join(' · ') : '—'}
-                      </td>
+                      <td>{estimate(d)}</td>
+                      <td>{d.unpriced_tokens?.toLocaleString() ?? '—'}</td>
+                      <td>{d.usd_per_eur ? d.usd_per_eur + ' · ' + d.exchange_rate_date : '—'}</td>
                     </tr>
                   ))}
                 </tbody>

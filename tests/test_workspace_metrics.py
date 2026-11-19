@@ -1,16 +1,28 @@
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
 from engineering_control.cli import main
 from engineering_control.dashboard.project_records import ProjectConflict
+from engineering_control.dashboard.workspace_costs import ECB_URL, ecb_rates
 from engineering_control.dashboard.workspace_metrics import BilledDay
-from engineering_control.db.models import BacklogItem, ProjectRecord, SandboxRun, SandboxStep
+from engineering_control.db.models import (
+    BacklogItem,
+    ProjectRecord,
+    ProviderAccount,
+    SandboxRun,
+    SandboxStep,
+    WorkspaceImport,
+    WorkspaceModelUsage,
+)
+from engineering_control.models.batches import plus
 from tests.test_dashboard_web import _authenticated_client
 
 
@@ -109,3 +121,131 @@ def test_finalized_eur_feed_project_attribution_and_missing_days(
         assert client.get("/api/dashboard/projects/unknown/statistics").status_code == 404
     finally:
         client.__exit__(None, None, None)
+
+
+def test_project_estimates_include_historical_totals_snapshots_and_unpriced_tokens(
+    tmp_path: Path,
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        now = datetime(2026, 11, 16, 12, tzinfo=UTC)
+        weekend = now - timedelta(days=2)
+        metrics = repo.workspace_metrics
+        metrics.exchange_rates = {date(2026, 11, 13): Decimal("1.25"), now.date(): Decimal("1.6")}
+        with repo.sessions.begin() as db:
+            project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+            account = ProviderAccount(
+                name="Test prices",
+                provider="openai",
+                state="ready",
+                prices={
+                    "tariff": {"input": 1.0, "output": 3.0, "cached": 0.5},
+                    "free": {"input": 0, "output": 0},
+                },
+            )
+            run = SandboxRun(project_id=project.id, kind="flow", title="Demo", state="succeeded")
+            db.add_all([run, account])
+            db.flush()
+            db.add(
+                WorkspaceImport(
+                    project_id=project.id,
+                    repository=project.source_repository,
+                    branch="main",
+                    stage="complete",
+                    model="other-model",
+                    provider="openai",
+                    progress={
+                        "usage_daily": {weekend.date().isoformat(): 1_000_000},
+                        "legacy_price_model": {"provider": "openai", "model": "tariff"},
+                    },
+                )
+            )
+            db.add_all(
+                [
+                    SandboxStep(
+                        run_id=run.id,
+                        position=0,
+                        name="saved",
+                        state="succeeded",
+                        finished_at=weekend,
+                        usage={"cost": 1.25, "tokens": 10},
+                    ),
+                    SandboxStep(
+                        run_id=run.id,
+                        position=1,
+                        name="missing",
+                        state="succeeded",
+                        finished_at=weekend,
+                        usage={"tokens": 2500},
+                    ),
+                    SandboxStep(
+                        run_id=run.id,
+                        position=2,
+                        name="free",
+                        state="succeeded",
+                        account_id=account.id,
+                        finished_at=now,
+                        input={"model": {"model": "free"}},
+                        usage={"input": 10, "output": 10, "tokens": 20},
+                    ),
+                    WorkspaceModelUsage(
+                        project_id=project.id,
+                        recorded_at=weekend,
+                        usage={
+                            "tokens": 1_500_000,
+                            "input": 1_000_000,
+                            "output": 500_000,
+                            "cached": 200_000,
+                            "account_id": str(account.id),
+                            "requested_model": "tariff",
+                            "model": "versioned",
+                        },
+                    ),
+                    WorkspaceModelUsage(
+                        project_id=project.id,
+                        recorded_at=weekend - timedelta(days=1),
+                        usage={"tokens": 80, "model": "no price"},
+                    ),
+                ]
+            )
+        days = metrics.daily("falcone", 7, now)["series"]
+        assert days[-3]["tokens"] == 2_502_510
+        assert days[-3]["estimated_eur"] == "4.680000"
+        assert days[-3]["unpriced_tokens"] == 2500 and days[-3]["assumed_mix_tokens"] == 1_000_000
+        assert days[-3]["exchange_rate_date"] == "2026-11-13"
+        assert days[-3]["billed_eur"] is None
+        assert days[-4]["estimated_eur"] is None and days[-4]["unpriced_tokens"] == 80
+        assert days[-1]["estimated_eur"] == days[-2]["estimated_eur"] == "0.000000"
+        assert days[-1]["unpriced_tokens"] == 0
+        assert all(r["tokens"] == 0 for r in metrics.daily("llmwiki", 30, now)["series"])
+        with repo.sessions.begin() as db:
+            db.add(
+                ProviderAccount(
+                    name="Different contract",
+                    provider="openai",
+                    state="ready",
+                    prices={"tariff": {"input": 10, "output": 30}},
+                )
+            )
+        ambiguous = metrics.daily("falcone", 7, now)["series"][-3]
+        assert ambiguous["unpriced_tokens"] == 1_002_500 and ambiguous["assumed_mix_tokens"] == 0
+        assert ambiguous["estimated_eur"] == "3.080000"
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_ecb_reference_and_mixed_step_coverage() -> None:
+    def response(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith(ECB_URL)
+        return httpx.Response(
+            200,
+            text="CURRENCY,CURRENCY_DENOM,TIME_PERIOD,OBS_VALUE\nUSD,EUR,2025-05-23,1.1357\nJPY,EUR,2025-05-23,161\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        assert await ecb_rates(http) == {date(2025, 5, 23): Decimal("1.1357")}
+    mixed = plus({"tokens": 20, "cost": 0}, {"tokens": 5})
+    assert mixed is not None and mixed["cost"] == 0 and mixed["unpriced_tokens"] == 5
+    mixed = plus(mixed, {"tokens": 2, "cost": 1})
+    assert mixed is not None and mixed["tokens"] == 27 and mixed["unpriced_tokens"] == 5

@@ -108,9 +108,15 @@ issues for the backlog, using a token limited to reading metadata and issues; th
 checks a repository out for a run and publishes a change the administrator agreed to. It reads the issues of every project every
 fifteen minutes (`ENGINEERING_BACKLOG_SYNC_MINUTES`; zero leaves it to the Sync button).
 
+## Estimated project cost
+
+Project Home estimates daily EUR cost for measured sandbox steps, repository analysis and planning. It uses the recorded account or client USD estimate when available, including a subscription client’s reported usage equivalent, and otherwise applies the account's per-million-token model rates to measured input, output and cached tokens. Earlier imports retained only a daily token total. When the last recorded provider and model have an unambiguous tariff, their estimate assumes half input and half output tokens. Days with incomplete pricing identify the unpriced tokens.
+
+The console refreshes the European Central Bank's USD-per-EUR reference rates every six hours. Each UTC day uses the latest published rate on or before that date. The console keeps the last successful rates in memory and ships dated references for offline startup. For dates preceding all available references it uses the earliest available one. The daily figures table shows the exchange rate and its observation date. [ECB reference series](https://data.ecb.europa.eu/data/datasets/EXR/EXR.D.USD.EUR.SP00.A)
+
 ## Finalized project billing
 
-The project Home chart reads finalized daily EUR totals attributed to a single project. An operator can ingest a normalized JSON Lines export from the billing feed inside the console pod.
+The statistics API also provides separately recorded finalized EUR totals attributed to a single project. An operator can ingest a normalized JSON Lines export from the billing feed inside the console pod.
 
 ```bash
 kubectl -n engineering-control exec -i deploy/engineering-control-console -- \
@@ -128,7 +134,7 @@ Each line has the fields below.
 | `source`, `reference` | Feed name and a unique stable upstream reference for the project-day |
 | `revision` | Positive integer. A correction uses the same reference and a higher revision. |
 
-The transaction validates the complete export. Replaying the same records leaves totals unchanged. A missing date displays as unavailable. The daily figures table shows each recorded amount's source and reference. Account prices and client-reported costs continue to serve their existing uses.
+The transaction validates the complete export. Replaying the same records leaves totals unchanged. Missing billing records produce a null billed amount in the API. Each recorded charge includes its source and reference.
 
 ## Rules the manifests keep
 

@@ -110,6 +110,9 @@ def _when(value: datetime | None) -> str | None:
 
 
 def _step_row(step: SandboxStep, *, with_log: bool) -> dict[str, Any]:
+    usage = step.usage
+    if usage and "client_cost" in usage:
+        usage = {name: value for name, value in usage.items() if name != "client_cost"}
     row: dict[str, Any] = {
         "id": str(step.id),
         "position": step.position,
@@ -123,7 +126,7 @@ def _step_row(step: SandboxStep, *, with_log: bool) -> dict[str, Any]:
         "detail": step.detail,
         "started_at": _when(step.started_at),
         "finished_at": _when(step.finished_at),
-        "usage": step.usage,
+        "usage": usage,
     }
     if with_log:
         row["log"] = step.log or ""
@@ -1008,9 +1011,11 @@ class Runs:
     def paid_by_key(
         self, step_id: UUID, used: dict[str, Any], client_cost: float | None = None
     ) -> dict[str, Any]:
-        """What a step's client used, with whose key paid for it and what that cost: what
-        the client itself worked out, or else the account's prices for the model the
-        step named. Unchanged for a step on a subscription, which is not paid by the token."""
+        """Record API usage at the client estimate or the account's model price.
+
+        Keep a subscription client's estimate available for the project chart separately
+        from the run's API spend.
+        """
         with self.sessions() as session:
             step = session.get(SandboxStep, step_id)
             account = (
@@ -1019,7 +1024,9 @@ class Runs:
                 else None
             )
             if step is None or account is None or account.provider not in API_KEYS:
-                return used
+                # A subscription client's metered equivalent can estimate project usage.
+                # Its ordinary per-token spending and budget accounting stay separate.
+                return {**used, "client_cost": client_cost} if client_cost is not None else used
             paid = {**used, "provider": account.provider, "account": account.name}
             cost = client_cost
             if cost is None:

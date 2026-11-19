@@ -21,6 +21,7 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     active_project,
 )
+from engineering_control.dashboard.workspace_costs import record_model_usage
 from engineering_control.dashboard.workspace_review import (
     KINDS,
     WorkspaceReview,
@@ -283,6 +284,11 @@ class WorkspaceImports:
                     raise ProjectInvalid(
                         "Choose an available model account in the Administrator Console"
                     )
+                if row.progress.get("usage_daily") and "legacy_price_model" not in row.progress:
+                    row.progress = {
+                        **row.progress,
+                        "legacy_price_model": {"provider": row.provider, "model": row.model},
+                    }
                 row.provider, row.model = provider, model
             if row.stage in ("analysis", *KINDS) and not row.model:
                 raise ProjectInvalid("Choose a configured model for the repository analysis")
@@ -664,6 +670,7 @@ class WorkspaceImports:
             )
         except ModelError as error:
             raise ProjectConflict(f"The model could not complete this step: {error}") from error
+        await asyncio.to_thread(record_model_usage, self.sessions, row, reply)
         value = str(reply.data["description"]).strip()
         if not value:
             raise ProjectConflict("The model returned an empty description")
@@ -672,10 +679,7 @@ class WorkspaceImports:
         counts["analysis_tokens"] = counts.get("analysis_tokens", 0) + (
             reply.usage.get("tokens") or 0
         )
-        daily = dict(progress.get("usage_daily", {}))
-        day = datetime.now(UTC).date().isoformat()
-        daily[day] = daily.get(day, 0) + (reply.usage.get("tokens") or 0)
-        progress.update(after=batch[-1].key if batch else "", counts=counts, usage_daily=daily)
+        progress.update(after=batch[-1].key if batch else "", counts=counts)
         notes = list(progress.get("evidence_notes", []))
         notes.append(
             {

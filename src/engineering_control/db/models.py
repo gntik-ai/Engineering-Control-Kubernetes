@@ -551,6 +551,18 @@ class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class WorkspaceModelUsage(UUIDPrimaryKey, Base):
+    """One metered response from repository analysis or planning, including its price snapshot."""
+
+    __tablename__ = "workspace_model_usage"
+    project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON)
+    __table_args__ = (Index("ix_workspace_model_usage_project_time", "project_id", "recorded_at"),)
+
+
 class WorkspaceBilledDay(Base):
     """The feed's finalized total for a single project and UTC billing date, in EUR."""
 

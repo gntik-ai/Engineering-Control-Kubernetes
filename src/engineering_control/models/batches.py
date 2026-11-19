@@ -880,6 +880,24 @@ def plus(*used: dict[str, Any] | None) -> dict[str, Any] | None:
         if any(name in entry for entry in given):
             added = sum(entry.get(name) or 0 for entry in given)
             total[name] = round(added, 6) if name == "cost" else int(added)
+    # Preserve coverage when priced and unpriced calls share one step. A multi-model
+    # aggregate cannot later be priced using the last model's tariff.
+    if len(given) > 1:
+        identities = {
+            (
+                e.get("account_id") or e.get("account"),
+                e.get("provider"),
+                e.get("model"),
+                bool(e.get("batch")),
+            )
+            for e in given
+        }
+        if "cost" in total or len(identities) > 1 or any("unpriced_tokens" in e for e in given):
+            missing = sum(
+                e.get("unpriced_tokens", 0 if "cost" in e else e.get("tokens", 0)) for e in given
+            )
+            if missing:
+                total["unpriced_tokens"] = missing
     if any(entry.get("batch") for entry in given):
         total["batch"] = True
     return total

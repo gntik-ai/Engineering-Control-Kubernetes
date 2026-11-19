@@ -1,8 +1,8 @@
-"""Daily project-scoped technical resolutions, metered tokens and settled EUR spend."""
+"""Daily project resolutions, measured tokens, estimated costs and finalized charges."""
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -18,6 +18,7 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     active_project,
 )
+from engineering_control.dashboard.workspace_costs import RELEASE_RATES, AccountPrices, DailyUsage
 from engineering_control.db.models import (
     BacklogItem,
     ProjectIssueStory,
@@ -25,9 +26,14 @@ from engineering_control.db.models import (
     SandboxStep,
     WorkspaceBilledDay,
     WorkspaceImport,
+    WorkspaceModelUsage,
 )
 
 MICROS = 1_000_000
+
+
+def _utc_day(at: datetime) -> date:
+    return at.astimezone(UTC).date() if at.tzinfo else at.date()
 
 
 class BilledDay(BaseModel):
@@ -48,6 +54,7 @@ class BilledDay(BaseModel):
 class WorkspaceMetrics:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+        self.exchange_rates = RELEASE_RATES.copy()
 
     def load_finalized(self, rows: Iterable[BilledDay]) -> dict[str, int]:
         changed = 0
@@ -103,7 +110,8 @@ class WorkspaceMetrics:
         since = datetime.combine(first, time.min, UTC)
         until = datetime.combine(today + timedelta(days=1), time.min, UTC)
         resolved: Counter[date] = Counter()
-        tokens: Counter[date] = Counter()
+        usage_by_day: defaultdict[date, DailyUsage] = defaultdict(DailyUsage)
+        rates = self.exchange_rates
         with self.sessions() as session:
             project = active_project(session, name)
             dates = session.execute(
@@ -122,10 +130,17 @@ class WorkspaceMetrics:
             )
             for at, facts in dates:
                 if at and (facts or {}).get("github_state_reason") != "not_planned":
-                    resolved[at.date()] += 1
+                    resolved[_utc_day(at)] += 1
             ended = func.coalesce(SandboxStep.finished_at, SandboxStep.updated_at)
-            for usage, at in session.execute(
-                select(SandboxStep.usage, ended)
+            prices = AccountPrices(session)
+            for usage, at, account, provider, model in session.execute(
+                select(
+                    SandboxStep.usage,
+                    ended,
+                    SandboxStep.account_id,
+                    SandboxStep.provider,
+                    SandboxStep.input["model"]["model"].as_string(),
+                )
                 .join(SandboxRun, SandboxRun.id == SandboxStep.run_id)
                 .where(
                     SandboxRun.project_id == project.id,
@@ -135,13 +150,36 @@ class WorkspaceMetrics:
                 )
             ):
                 if isinstance(usage, dict) and at:
-                    measured = usage.get("tokens")
-                    if type(measured) is int and measured >= 0:
-                        tokens[at.date()] += measured
+                    usage_by_day[_utc_day(at)].add(
+                        usage,
+                        prices,
+                        provider=provider or "",
+                        model=model or "",
+                        account=str(account) if account else None,
+                    )
+            for usage, at in session.execute(
+                select(WorkspaceModelUsage.usage, WorkspaceModelUsage.recorded_at).where(
+                    WorkspaceModelUsage.project_id == project.id,
+                    WorkspaceModelUsage.recorded_at >= since,
+                    WorkspaceModelUsage.recorded_at < until,
+                )
+            ):
+                usage_by_day[_utc_day(at)].add(usage, prices)
+            # Older releases retained one token total per UTC day, before per-call metering.
             scan = session.get(WorkspaceImport, project.id)
             if scan:
+                legacy = scan.progress.get(
+                    "legacy_price_model", {"model": scan.model, "provider": scan.provider}
+                )
                 for stamp, measured in scan.progress.get("usage_daily", {}).items():
-                    tokens[date.fromisoformat(stamp)] += measured
+                    day = date.fromisoformat(stamp)
+                    if first <= day <= today:
+                        usage_by_day[day].add(
+                            {"tokens": measured},
+                            prices,
+                            provider=legacy.get("provider") or "",
+                            model=legacy.get("model") or "",
+                        )
             billed = {
                 b.day: b
                 for b in session.scalars(
@@ -156,11 +194,19 @@ class WorkspaceMetrics:
             for offset in range(days):
                 day = first + timedelta(days=offset)
                 bill = billed.get(day)
+                usage = usage_by_day[day]
+                rate_day = max((d for d in rates if d <= day), default=min(rates))
+                rate = rates[rate_day]
                 series.append(
                     {
                         "day": day.isoformat(),
                         "resolved": resolved[day],
-                        "tokens": tokens[day],
+                        "tokens": usage.tokens,
+                        "estimated_eur": usage.euros(rate),
+                        "unpriced_tokens": usage.unpriced,
+                        "assumed_mix_tokens": usage.assumed,
+                        "usd_per_eur": str(rate),
+                        "exchange_rate_date": rate_day.isoformat(),
                         "billed_eur": format(Decimal(bill.euro_micros) / MICROS, "f")
                         if bill
                         else None,
