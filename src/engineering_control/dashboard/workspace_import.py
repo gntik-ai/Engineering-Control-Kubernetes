@@ -20,8 +20,14 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     active_project,
 )
-from engineering_control.dashboard.workspace_review import KINDS, WorkspaceReview, review_state
+from engineering_control.dashboard.workspace_review import (
+    KINDS,
+    WorkspaceReview,
+    gap_identity,
+    review_state,
+)
 from engineering_control.db.models import (
+    ProjectEpic,
     ProviderAccount,
     WorkspaceCandidate,
     WorkspaceImport,
@@ -177,7 +183,7 @@ class WorkspaceImports:
         return self.status(name)
 
     def _claim(
-        self, name: str, version: int, provider: str | None, model: str | None
+        self, name: str, version: int, provider: str | None, model: str | None, all_epics: bool
     ) -> WorkspaceImport:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -186,6 +192,12 @@ class WorkspaceImports:
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
+            if all_epics and (
+                row.stage != "epics" or row.progress.get("review_mode") not in ("gaps", "review")
+            ):
+                raise ProjectConflict(
+                    "Finish reviewing existing GitHub issues in the Epics stage first"
+                )
             if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
                 if {"provider": provider, "model": model} not in self.model_choices():
                     raise ProjectInvalid(
@@ -212,7 +224,21 @@ class WorkspaceImports:
                             project_id=project.id, key=key, kind=kind, evidence=evidence
                         )
                     )
+                covered = set()
+                if row.stage == "epics" and any(s["number"] is None for s in result.suggestions):
+                    # An admin can add an Epic in another tab while the model is answering.
+                    covered = {
+                        gap_identity(title)
+                        for title in session.scalars(
+                            select(ProjectEpic.title).where(
+                                ProjectEpic.project_id == project.id,
+                                ProjectEpic.archived_at.is_(None),
+                            )
+                        )
+                    }
                 for suggestion in result.suggestions:
+                    if suggestion["identity"] in covered:
+                        continue
                     session.add(
                         WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)
                     )
@@ -231,11 +257,13 @@ class WorkspaceImports:
         models: Models | None,
         provider: str | None,
         model: str | None,
+        *,
+        all_epics: bool = False,
     ) -> dict[str, Any]:
-        row = await asyncio.to_thread(self._claim, name, version, provider, model)
+        row = await asyncio.to_thread(self._claim, name, version, provider, model, all_epics)
         try:
             if row.stage in KINDS:
-                progress, suggestions = await self.review.propose(row, models)
+                progress, suggestions = await self.review.propose(row, models, all_epics=all_epics)
                 result = Update(row.stage, progress, suggestions=suggestions)
             elif row.stage == "analysis":
                 result = await self._analyze(row, models)

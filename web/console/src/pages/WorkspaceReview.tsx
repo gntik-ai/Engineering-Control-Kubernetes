@@ -32,6 +32,7 @@ export function WorkspaceReview({
   saved: (state: ImportState) => void;
 }) {
   const [edits, setEdits] = useState<Record<string, Edit>>({});
+  const [bulkResult, setBulkResult] = useState('');
   const active = useRef(true);
   useEffect(() => {
     active.current = true;
@@ -55,6 +56,7 @@ export function WorkspaceReview({
     setEdits((previous) => ({ ...previous, [c.id]: { ...c, ...patch } }));
   const generate = useSubmit(
     async () => {
+      setBulkResult('');
       let next = state;
       do {
         next = await postJson<ImportState>(
@@ -67,14 +69,37 @@ export function WorkspaceReview({
     },
     () => undefined,
   );
+  const generateAllEpics = useSubmit(
+    () => {
+      setBulkResult('');
+      return postJson<ImportState>(
+        path + '/advance',
+        { version: state.version, ...model, all_epics: true },
+        { quiet: true },
+      );
+    },
+    (next) => {
+      if (!active.current || !next.review) return;
+      saved(next);
+      const added = next.review.candidates.length - review.candidates.length;
+      if (added > 0) {
+        setBulkResult(`${added} new Epic proposal${added === 1 ? '' : 's'} ready for review.`);
+      } else {
+        setBulkResult(next.review.mode === 'review'
+          ? 'No additional Epics found.'
+          : 'No Epics were proposed. You can add an Epic in the Epics tab.');
+      }
+    },
+  );
   const approve = useSubmit(
     () => postJson<ImportState>(path + '/review', { version: state.version, choices }),
     saved,
   );
-  const working = generate.pending || approve.pending || state.busy;
+  const working = generate.pending || generateAllEpics.pending || approve.pending || state.busy;
   return (
     <div className="grid min-w-0 gap-4">
       {generate.problem && <Alert tone="destructive" title={generate.problem} />}
+      {generateAllEpics.problem && <Alert tone="destructive" title={generateAllEpics.problem} />}
       {approve.problem && <Alert tone="destructive" title={approve.problem} />}
       {review.mode === 'existing' ? (
         <div>
@@ -93,7 +118,16 @@ export function WorkspaceReview({
               ? 'Save the selected proposals as local drafts. Approve each draft in Issues to synchronize it.'
               : 'Approving saves the selected records and closes their open planning issues on GitHub.'}
           </p>
-          <div>
+          <div className="flex flex-wrap gap-2">
+            {state.stage === 'epics' && (
+              <Button
+                loading={generateAllEpics.pending}
+                disabled={!model || working}
+                onClick={() => void generateAllEpics.submit()}
+              >
+                Generate all remaining Epics
+              </Button>
+            )}
             <Button
               variant="secondary"
               loading={generate.pending}
@@ -103,6 +137,7 @@ export function WorkspaceReview({
               Generate next {label}
             </Button>
           </div>
+          {bulkResult && <p role="status" className="text-sm text-muted-foreground">{bulkResult}</p>}
         </>
       )}
       {review.candidates.map((record, i) => {

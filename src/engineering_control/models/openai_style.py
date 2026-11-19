@@ -148,6 +148,7 @@ async def complete(
     strict: bool = False,
     effort: str | None = None,
     model_prefix: str = "",
+    retry: bool = True,
 ) -> Wire:
     body = body_of(
         model=model,
@@ -163,7 +164,7 @@ async def complete(
     try:
         response = await _send(http, name, "POST", url, key, seconds, json=body)
     except WireError as error:
-        if not (strict and error.kind == "invalid"):
+        if not (retry and strict and error.kind == "invalid"):
             raise
         # A provider that will not take the shape as it is written (a rejected request
         # costs nothing) is asked once more for a JSON object: the shape is in the

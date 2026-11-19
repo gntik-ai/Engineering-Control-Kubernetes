@@ -771,6 +771,35 @@ async def test_a_refused_key_a_busy_provider_and_a_wrong_request_are_told_apart(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 400, 401, 429])
+async def test_single_request_uses_no_format_retry_or_alternate_account(
+    asked: Asked, status: int
+) -> None:
+    asked.account("OpenAI one", "openai")
+    asked.account("OpenAI two", "openai")
+    response = (
+        said({"wrong": "format"})
+        if status == 200
+        else httpx.Response(status, json={"error": {"message": "unavailable"}})
+    )
+    asked.provider.answers = [response]
+    with pytest.raises(ModelError):
+        await asked.models.ask(question(("openai", "model-a")), retry=False)
+    assert len(asked.provider.asked) == 1 and not asked.waited
+    await asked.http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_single_request_disables_anthropic_library_retries(asked: Asked) -> None:
+    asked.account("Anthropic", "anthropic", key=ANTHROPIC_KEY)
+    asked.anthropic.answers = [refusal(503, "api_error", "unavailable")]
+    with pytest.raises(ModelError):
+        await asked.models.ask(question(("anthropic", "claude-opus-5-5")), retry=False)
+    assert len(asked.anthropic.asked) == 1 and not asked.waited
+    await asked.http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_catalog_response_for_a_replaced_key_is_discarded(asked: Asked) -> None:
     account = asked.account("OpenAI", "openai")
 

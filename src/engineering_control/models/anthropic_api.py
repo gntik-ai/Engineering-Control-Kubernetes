@@ -35,13 +35,13 @@ HttpFactory = Callable[[], httpx2.AsyncClient]
 
 
 def _client(
-    key: str, base_url: str, seconds: float, http: HttpFactory | None
+    key: str, base_url: str, seconds: float, http: HttpFactory | None, *, retry: bool = True
 ) -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(
         api_key=key,
         base_url=base_url,
         timeout=seconds,
-        max_retries=RETRIES,
+        max_retries=RETRIES if retry else 0,
         http_client=http() if http is not None else None,
     )
 
@@ -163,6 +163,7 @@ async def complete(
     keep: tuple[int, ...] = (),
     hour: bool = False,
     loose: bool = False,
+    retry: bool = True,
 ) -> Wire:
     request = request_of(
         model=model,
@@ -176,7 +177,7 @@ async def complete(
         hour=hour,
         loose=loose,
     )
-    client = _client(key, base_url, seconds, http)
+    client = _client(key, base_url, seconds, http, retry=retry)
     try:
         if model in FALLBACK_MODELS:
             async with client.beta.messages.stream(
