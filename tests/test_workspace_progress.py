@@ -251,6 +251,14 @@ def test_single_and_bulk_decisions_preserve_other_rows_links_and_outbox(tmp_path
                 client, f"planning/{kind}/decisions", ids=keys, version=state()["version"], **extra
             )
 
+        assert (
+            client.post(
+                BASE + "planning/epics/decisions",
+                json={"csrf_token": "x" * 40, "ids": [str(uuid4())]},
+            ).status_code
+            == 403
+        )
+        assert post(client, "planning/epics/decisions", ids=[]).status_code == 422
         advance()
         candidates = advance(all_epics=True)["review"]["candidates"]
         first, rest = candidates[0], candidates[1:]
