@@ -31,6 +31,7 @@ from engineering_control.dashboard.workspace_review import (
     KINDS,
     WorkspaceReview,
     gap_identity,
+    known_issue_titles,
     review_state,
     settle_stories,
 )
@@ -213,13 +214,15 @@ class WorkspaceImports:
                     job = {"action": "existing", "state": "interrupted"}
                 elif not job and not busy and mode != "existing":
                     job = {"action": "existing", "state": "completed"}
+            preview = progress.get("found", 0) if busy else 0
             status = {
                 "stage": row.stage if row else "new",
                 "version": row.version if row else 0,
                 "busy": busy,
                 "activity": progress.get("activity", default_action) if busy else None,
                 "operation": job,
-                "found": proposals + (progress.get("found", 0) if busy else 0),
+                "found": proposals + preview,
+                "run_found": (job or {}).get("added", 0) + preview,
                 "checked": _reviewed_issues(session, row)
                 + (progress.get("checked", 0) if busy else 0),
             }
@@ -285,7 +288,9 @@ class WorkspaceImports:
             if bulk_stage and (
                 row.stage != bulk_stage or row.progress.get("review_mode") not in ("gaps", "review")
             ):
-                label = "Epics" if bulk_stage == "epics" else "User Stories"
+                label = {"epics": "Epics", "stories": "User Stories", "issues": "Technical Issues"}[
+                    bulk_stage
+                ]
                 raise ProjectConflict(
                     f"Finish reviewing existing GitHub issues in the {label} stage first"
                 )
@@ -310,6 +315,13 @@ class WorkspaceImports:
                 raise ProjectConflict(
                     "User Story generation is complete. Review the proposals in the table."
                 )
+            if (
+                row.stage == "issues"
+                and bulk_stage is None
+                and row.progress.get("review_mode") == "review"
+                and review_state(session, row)["bulk_complete"]
+            ):
+                raise ProjectConflict("Technical issue generation is complete. Review the drafts.")
             if row.stage in KINDS:
                 mode = row.progress.get("review_mode", "existing")
                 action = "existing" if mode == "existing" else ("all" if bulk_stage else "next")
@@ -321,6 +333,8 @@ class WorkspaceImports:
                     "found": 0,
                     "operation": None,
                 }
+                if bulk_stage == "issues":
+                    row.progress["issue_partial_batches"] = 0
                 if background:
                     row.progress = {
                         **row.progress,
@@ -374,6 +388,8 @@ class WorkspaceImports:
                             )
                         )
                     }
+                if generating and row.stage == "issues":
+                    covered.update(gap_identity(t) for t in known_issue_titles(session, project.id))
                 if generating:
                     covered.update(
                         session.scalars(
@@ -383,7 +399,8 @@ class WorkspaceImports:
                             )
                         )
                     )
-                if generating and row.stage == "stories":
+                if generating and row.stage in ("stories", "issues"):
+                    parent_model = ProjectEpic if row.stage == "stories" else ProjectUserStory
                     linked = {
                         UUID(parent)
                         for s in result.suggestions
@@ -391,15 +408,18 @@ class WorkspaceImports:
                         for parent in s["parents"]
                     }
                     active = session.scalars(
-                        select(ProjectEpic.id).where(
-                            ProjectEpic.project_id == project.id,
-                            ProjectEpic.archived_at.is_(None),
-                            ProjectEpic.id.in_(linked),
+                        select(parent_model.id).where(
+                            parent_model.project_id == project.id,
+                            parent_model.archived_at.is_(None),
+                            parent_model.closed_at.is_(None),
+                            parent_model.id.in_(linked),
                         )
                     )
                     if linked != set(active):
+                        parent_label = "Epic" if row.stage == "stories" else "User Story"
                         raise ProjectConflict(
-                            "An Epic changed during generation. Retry with the current Epic list."
+                            f"A parent {parent_label} changed during generation. "
+                            "Retry with the current list."
                         )
                 for suggestion in result.suggestions:
                     if suggestion["identity"] in covered:
@@ -479,11 +499,11 @@ class WorkspaceImports:
                     )
                     or (
                         job["action"] == "all"
-                        and row.stage == "stories"
+                        and row.stage in ("stories", "issues")
                         and result.progress["review_mode"] == "gaps"
                     )
                 ):
-                    # Keep the same lease while the next page or story batch is generated.
+                    # Hold the same lease across review pages and generation batches.
                     row.progress = {**row.progress, "operation": job, "checked": 0, "found": 0}
                     session.flush()
                     session.expunge(row)
@@ -587,20 +607,25 @@ class WorkspaceImports:
         *,
         all_epics: bool = False,
         all_stories: bool = False,
+        all_issues: bool = False,
         background: bool = False,
     ) -> dict[str, Any]:
-        if all_epics and all_stories:
+        requested = [
+            k for k, flag in zip(KINDS, (all_epics, all_stories, all_issues), strict=True) if flag
+        ]
+        if len(requested) > 1:
             raise ProjectInvalid("Choose one planning stage for generation")
-        bulk_stage = "epics" if all_epics else "stories" if all_stories else None
+        bulk_stage = next(iter(requested), None)
+        batched = all_stories or all_issues
         row = await asyncio.to_thread(
-            self._claim, name, version, provider, model, bulk_stage, background or all_stories
+            self._claim, name, version, provider, model, bulk_stage, background or batched
         )
         if background:
             task = asyncio.create_task(self._run_review(name, row, models))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             return await asyncio.to_thread(self.status, name)
-        if all_stories:
+        if batched:
             await self._run_review(name, row, models, propagate=True)
             return await asyncio.to_thread(self.status, name)
         try:

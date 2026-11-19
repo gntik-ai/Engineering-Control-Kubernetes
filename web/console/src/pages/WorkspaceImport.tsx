@@ -27,6 +27,7 @@ export interface ImportState {
   activity: ReviewActivity | null;
   operation?: { action: ReviewActivity; state: 'running' | 'completed' | 'failed' | 'interrupted'; added?: number; detail?: string } | null;
   found: number;
+  run_found: number;
   checked: number;
   provider: string | null;
   model: string | null;

@@ -42,7 +42,7 @@ from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
-from engineering_control.dashboard.planning import IssueView, Kind
+from engineering_control.dashboard.planning import IssueView, Kind, PlanningState
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -81,6 +81,7 @@ from engineering_control.dashboard.schemas import (
     ItemRouteInput,
     ItemStateInput,
     PlainChangeInput,
+    PlanningStateInput,
     ProjectApplicationInput,
     ProjectArchiveInput,
     ProjectCommandsInput,
@@ -941,6 +942,7 @@ def create_app(
                 body.model,
                 all_epics=body.all_epics,
                 all_stories=body.all_stories,
+                all_issues=body.all_issues,
                 background=body.background,
             ),
             event="workspace.import_advanced",
@@ -1200,6 +1202,7 @@ def create_app(
         record: UUID | None = None,
         connected: str = Query("", max_length=32),
         issue_state: IssueView | None = None,
+        state: PlanningState | None = None,
     ) -> Response:
         try:
             return JSONResponse(
@@ -1214,6 +1217,7 @@ def create_app(
                     record,
                     connected,
                     issue_state,
+                    state,
                 )
             )
         except ProjectNotFound:
@@ -1221,11 +1225,17 @@ def create_app(
 
     @app.get("/api/dashboard/projects/{name}/planning/{kind}/pending")
     async def pending_planning(
-        name: str, kind: Kind, request: Request, issue_state: IssueView | None = None
+        name: str,
+        kind: Kind,
+        request: Request,
+        issue_state: IssueView | None = None,
+        state: PlanningState | None = None,
     ) -> Response:
         try:
             return JSONResponse(
-                await asyncio.to_thread(repo(request).planning.pending, name, kind, issue_state)
+                await asyncio.to_thread(
+                    repo(request).planning.pending, name, kind, issue_state, state
+                )
             )
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
@@ -1289,6 +1299,20 @@ def create_app(
             PlainChangeInput,
             lambda _: asyncio.to_thread(repo(request).planning.remove, name, kind, key),
             event="workspace.planning_removed",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/state")
+    async def change_planning_state(
+        name: str, kind: Literal["epics", "stories"], key: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            PlanningStateInput,
+            lambda body: asyncio.to_thread(
+                repo(request).planning.set_state, name, kind, key, body.state
+            ),
+            event="workspace.planning_state_changed",
             subject=name,
         )
 

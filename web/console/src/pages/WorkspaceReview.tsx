@@ -16,12 +16,13 @@ export interface Candidate {
 }
 export interface StageReview {
   mode: 'existing' | 'gaps' | 'review';
+  bulk_complete?: boolean;
   can_continue: boolean;
   candidates: Candidate[];
   parents: { id: string; title: string }[];
 }
 export type ReviewActivity = 'existing' | 'next' | 'all';
-type Progress = Pick<ImportState, 'stage' | 'version' | 'activity' | 'busy' | 'found' | 'checked'>;
+type Progress = Pick<ImportState, 'stage' | 'version' | 'activity' | 'busy' | 'found' | 'run_found' | 'checked'>;
 
 function useReviewProgress(path: string, state: ImportState, watching: boolean, reload: () => void) {
   const [progress, setProgress] = useState<Progress | null>(null);
@@ -92,6 +93,7 @@ export function WorkspaceReview({
           version: state.version, ...model, background: true,
           all_epics: which === 'all' && stage === 'epics',
           all_stories: which === 'all' && stage === 'stories',
+          all_issues: which === 'all' && stage === 'issues',
         },
         { quiet: true },
       );
@@ -115,6 +117,8 @@ export function WorkspaceReview({
   function actionButton(which: ReviewActivity, idle: string, busy: string) {
     const loading = current === which;
     const completed = job?.state === 'completed' && job.action === which;
+    const bulkIssues = stage === 'issues' && which === 'all';
+    const retryLabel = which === 'existing' ? 'Resume GitHub issue review' : bulkIssues ? 'Resume generating Issues' : 'Retry generation';
     return (
       <Button
         className="h-auto min-h-9 max-w-full whitespace-normal py-2"
@@ -124,11 +128,11 @@ export function WorkspaceReview({
         disabled={!model || watching || finish.pending}
         onClick={() => void generate(which)}
       >
-        {loading ? busy : stopped && job.action === which ? (which === 'existing' ? 'Resume GitHub issue review' : 'Retry generation') : idle}
+        {loading ? busy : stopped && job.action === which ? retryLabel : idle}
         {loading ? (
           <span className="tabular-nums" aria-live="polite" aria-atomic="true">
             {which === 'existing' ? ` · ${progress.checked} checked` : ''}
-            {' · '}{progress.found} found
+            {' · '}{bulkIssues ? (progress.busy ? progress.run_found : 0) : progress.found} found
           </span>
         ) : completed && job.added !== undefined && <span className="tabular-nums"> · {job.added} new</span>}
       </Button>
@@ -142,12 +146,15 @@ export function WorkspaceReview({
           ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
           : stage === 'stories' && review.mode === 'review' && !watching ? (
             <span role="status" className="text-sm">Generation complete. {pending ? 'Review the remaining proposals to continue to Issues.' : 'All Epics are covered.'}</span>
+          ) : stage === 'issues' && review.bulk_complete && !watching ? (
+            <span role="status" className="text-sm">All open User Stories have been checked for missing technical issues.</span>
           ) : <>
               {stage === 'epics' && actionButton('all', 'Generate all remaining Epics', 'Generating Epics')}
               {stage === 'stories' && actionButton('all', 'Generate all new User Stories', 'Generating User Stories')}
+              {stage === 'issues' && actionButton('all', 'Generate all remaining Issues', 'Generating Issues')}
               {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
             </>}
-        <Button variant="ghost" onClick={() => setQuery({ tab: stage })}>
+        <Button variant="ghost" onClick={() => setQuery({ tab: stage, state: null, issue_state: null, search: null, page: null, record: null, epic: null })}>
           View {table}{pending > 0 ? ` (${pending} proposal${pending === 1 ? '' : 's'})` : ''}
         </Button>
         {!watching && job?.state === 'completed' && job.action === 'existing' && (

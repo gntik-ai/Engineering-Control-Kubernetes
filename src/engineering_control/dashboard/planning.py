@@ -49,6 +49,7 @@ from engineering_control.db.models import (
 )
 
 Kind = Literal["epics", "stories", "issues"]
+PlanningState = Literal["open", "closed"]
 IssueView = Literal["open", "closed", "draft"]
 
 
@@ -188,6 +189,7 @@ def coverage_problem(session: Session, project: UUID, stage: str) -> str | None:
         .where(
             parent.project_id == project,
             parent.archived_at.is_(None),
+            parent.closed_at.is_(None),
             parent.id.not_in(select(foreign_key).where(links.project_id == project)),
         )
     )
@@ -211,6 +213,9 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceCandidate.parents,
             WorkspaceCandidate.number,
             WorkspaceSource.evidence["state"].as_string().label("github_state"),
+            literal("open").label("local_state")
+            if kind != "issues"
+            else null().label("local_state"),
         )
         .outerjoin(
             WorkspaceSource,
@@ -237,6 +242,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             null(),
             BacklogItem.issue_number,
             BacklogItem.issue_state,
+            null(),
         ).where(
             BacklogItem.project_id == project,
             _visible_issues(project),
@@ -260,11 +266,14 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             null(),
             null(),
             null(),
+            case((model.closed_at.is_(None), "open"), else_="closed"),
         ).where(model.project_id == project, model.archived_at.is_(None))
     return union_all(proposals, saved).subquery()
 
 
-def _issue_bucket(rows: Subquery) -> ColumnElement[str]:
+def _state_bucket(rows: Subquery, kind: Kind) -> ColumnElement[str]:
+    if kind != "issues":
+        return rows.c.local_state
     return case(
         (rows.c.number.is_(None), "draft"), else_=func.coalesce(rows.c.github_state, "open")
     )
@@ -332,6 +341,7 @@ class PlanningRecords:
         record: UUID | None = None,
         connected: str = "",
         issue_state: IssueView | None = None,
+        state: PlanningState | None = None,
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -352,23 +362,18 @@ class PlanningRecords:
                     & rows.c.id.in_(connected_records(project.id, kind, connected, exact=True))
                 )
             scope: ColumnElement[bool] = true()
-            issue_counts: dict[str, int] = {}
-            if kind == "issues":
-                bucket = _issue_bucket(rows)
-                issue_counts = {
-                    key: count
-                    for key, count in session.execute(
-                        select(bucket, func.count()).select_from(rows).group_by(bucket)
-                    )
-                }
-                if focus and issue_state:
-                    issue_state = (
-                        session.scalar(select(bucket).select_from(rows).where(rows.c.id == focus))
-                        or issue_state
-                    )
-                if issue_state:
-                    scope = bucket == issue_state
-                    matches = matches & scope
+            view = issue_state if kind == "issues" else state
+            bucket = _state_bucket(rows, kind)
+            state_counts = dict(
+                session.execute(select(bucket, func.count()).select_from(rows).group_by(bucket))
+                .tuples()
+                .all()
+            )
+            if focus and view:
+                view = session.scalar(select(bucket).where(rows.c.id == focus)) or view
+            if view:
+                scope = bucket == view
+                matches = matches & scope
             ordering = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             # Stage progression covers every view. Bulk approval covers the selected state.
             total, pending, proposed = session.execute(
@@ -488,8 +493,10 @@ class PlanningRecords:
             current = review is not None and review.stage == kind
             return {
                 "items": items,
-                "issue_state": issue_state,
-                "issue_counts": issue_counts,
+                "state": view,
+                "state_counts": state_counts,
+                "issue_state": view if kind == "issues" else None,
+                "issue_counts": state_counts if kind == "issues" else {},
                 "total": total,
                 "page": page,
                 "page_size": page_size,
@@ -535,7 +542,11 @@ class PlanningRecords:
             return dict(session.execute(counts).mappings().one())
 
     def pending(
-        self, name: str, kind: Kind, issue_state: IssueView | None = None
+        self,
+        name: str,
+        kind: Kind,
+        issue_state: IssueView | None = None,
+        state: PlanningState | None = None,
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -545,8 +556,9 @@ class PlanningRecords:
                 .where(rows.c.review.in_(("proposal", "pending")))
                 .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             )
-            if kind == "issues" and issue_state:
-                query = query.where(_issue_bucket(rows) == issue_state)
+            view = issue_state if kind == "issues" else state
+            if view:
+                query = query.where(_state_bucket(rows, kind) == view)
             pending = session.execute(query).all()
             result = {
                 "ids": [str(r.id) for r in pending],
@@ -628,13 +640,20 @@ class PlanningRecords:
             )
             return {
                 "epics": [
-                    {"id": str(e.id), "title": e.title, "description": e.description} for e in epics
+                    {
+                        "id": str(e.id),
+                        "title": e.title,
+                        "description": e.description,
+                        "local_state": "closed" if e.closed_at else "open",
+                    }
+                    for e in epics
                 ],
                 "stories": [
                     {
                         "id": str(s.id),
                         "title": s.title,
                         "description": s.description,
+                        "local_state": "closed" if s.closed_at else "open",
                         "epic_ids": epic_ids[s.id],
                     }
                     for s in stories
@@ -669,6 +688,26 @@ class PlanningRecords:
             project = active_project(session, name, lock=True)
             identifier = save_record(session, project, kind, title, description, parents, key)
             return {"project": name, "id": str(identifier)}
+
+    def set_state(
+        self, name: str, kind: Literal["epics", "stories"], key: UUID, state: PlanningState
+    ) -> dict[str, str]:
+        with self.sessions.begin() as session:
+            project = active_project(session, name, lock=True)
+            model = ProjectEpic if kind == "epics" else ProjectUserStory
+            row = session.scalar(
+                select(model).where(
+                    model.project_id == project.id, model.id == key, model.archived_at.is_(None)
+                )
+            )
+            if row is None:
+                raise ProjectNotFound(str(key))
+            record = cast(ProjectEpic | ProjectUserStory, row)
+            if (record.closed_at is None) != (state == "open"):
+                now = datetime.now(UTC)
+                record.closed_at = now if state == "closed" else None
+                record.updated_at = now
+            return {"id": str(key), "state": state}
 
     def remove(self, name: str, kind: Literal["epics", "stories"], key: UUID) -> dict[str, str]:
         with self.sessions.begin() as session:

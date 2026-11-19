@@ -11,10 +11,89 @@ from engineering_control.db.models import (
     ProjectRecord,
     WorkspaceCandidate,
     WorkspaceImport,
+    WorkspaceSource,
 )
 from tests.test_dashboard_web import _authenticated_client
 
 BASE = "/api/dashboard/projects/falcone/planning/"
+
+
+def test_local_lifecycle_preserves_links_and_resolves_closed_deep_links(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        epic = repo.planning.save("falcone", "epics", "Runtime", None, [])["id"]
+        story = repo.planning.save("falcone", "stories", "Call a function", None, [UUID(epic)])[
+            "id"
+        ]
+        task = repo.planning.save("falcone", "issues", "Send a request", None, [UUID(story)])["id"]
+        csrf = client.get("/api/dashboard/session").json()["csrf_token"]
+
+        def change(kind: str, key: str, state: str):
+            return client.post(
+                BASE + kind + "/" + key + "/state", json={"csrf_token": csrf, "state": state}
+            )
+
+        with repo.sessions.begin() as db:
+            project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+            db.add(
+                WorkspaceImport(
+                    project_id=project.id,
+                    repository=project.source_repository,
+                    branch="main",
+                    stage="epics",
+                )
+            )
+            db.flush()
+            db.add(
+                WorkspaceSource(
+                    project_id=project.id,
+                    kind="issue",
+                    key="issue:11",
+                    evidence={"state": "closed"},
+                )
+            )
+            proposal = WorkspaceCandidate(
+                project_id=project.id,
+                kind="epics",
+                identity="issue:11",
+                number=11,
+                title="Runtime proposal",
+                parents=[],
+            )
+            db.add(proposal)
+            db.flush()
+            proposal_id = str(proposal.id)
+        assert change("epics", proposal_id, "closed").status_code == 404
+        assert change("issues", task, "closed").status_code == 422
+        other = repo.planning.save("llmwiki", "epics", "Elsewhere", None, [])["id"]
+        assert change("epics", other, "closed").status_code == 404
+        for kind, key in (("epics", epic), ("stories", story)):
+            assert change(kind, key, "closed").status_code == 200
+            assert change(kind, key, "closed").status_code == 200
+            assert client.get(BASE + kind + "/pending?state=closed").json()["ids"] == []
+            closed = client.get(BASE + kind, params={"state": "closed", "search": "Runtime"}).json()
+            assert [r["id"] for r in closed["items"]] == [key]
+            assert (
+                closed["items"][0]["local_state"] == "closed"
+                and closed["state_counts"]["closed"] == 1
+            )
+            focus = "epic" if kind == "epics" else "record"
+            deep = client.get(BASE + kind, params={"state": "open", focus: key}).json()
+            assert deep["state"] == "closed" and deep["total"] == 1
+        assert closed["items"][0]["epic_ids"] == [epic]
+        assert closed["parents"][epic] == "Runtime"
+        opened = client.get(BASE + "epics?state=open").json()
+        assert opened["total"] == 1 and opened["items"][0]["id"] == proposal_id
+        assert opened["items"][0]["github_state"] == "closed" and opened["pending"] == 1
+        assert client.get(BASE + "issues?issue_state=draft").json()["items"][0]["story_ids"] == [
+            story
+        ]
+        for kind, key in (("stories", story), ("epics", epic)):
+            assert change(kind, key, "open").status_code == 200
+            assert client.get(BASE + kind + "?state=closed").json()["items"] == []
+        assert client.get("/api/dashboard/projects/falcone/synchronization").json()["items"] == []
+    finally:
+        client.__exit__(None, None, None)
 
 
 def test_search_matches_text_numbers_and_parents_before_paging(tmp_path: Path) -> None:

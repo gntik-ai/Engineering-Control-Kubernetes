@@ -3,6 +3,7 @@ import {
   EmptyState,
   Link,
   Logo,
+  Page,
   Skeleton,
   SidebarLayout,
   NavList,
@@ -101,7 +102,7 @@ export function ProjectWorkspace({
         </div>
       }
     >
-      <div className="grid min-w-0 gap-5">
+      <Page width="wide">
         {notice}
         <LoadError resource={projects} />
         {project ? (
@@ -138,7 +139,7 @@ export function ProjectWorkspace({
             }
           />
         )}
-      </div>
+      </Page>
       <NewProjectDialog
         open={creating}
         onOpenChange={setCreating}

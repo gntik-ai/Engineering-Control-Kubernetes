@@ -261,6 +261,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/planning/{kind}",
         "/api/dashboard/projects/{name}/planning/{kind}/{key}/update",
         "/api/dashboard/projects/{name}/planning/{kind}/{key}/remove",
+        "/api/dashboard/projects/{name}/planning/{kind}/{key}/state",
         "/api/dashboard/projects/{name}/sections",
         "/api/dashboard/projects/{name}/sections/{key}/update",
         "/api/dashboard/projects/{name}/sections/{key}/remove",
