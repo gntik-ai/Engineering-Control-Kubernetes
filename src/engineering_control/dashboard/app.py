@@ -903,6 +903,7 @@ def create_app(
                 body.provider,
                 body.model,
                 all_epics=body.all_epics,
+                all_stories=body.all_stories,
                 background=body.background,
             ),
             event="workspace.import_advanced",

@@ -332,6 +332,7 @@ class WorkspaceImportStep(PlainChangeInput):
     provider: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=200)
     all_epics: bool = False
+    all_stories: bool = False
     background: bool = False
 
 

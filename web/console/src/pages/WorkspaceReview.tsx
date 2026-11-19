@@ -88,7 +88,11 @@ export function WorkspaceReview({
     try {
       const next = await postJson<ImportState>(
         path + '/advance',
-        { version: state.version, ...model, background: true, all_epics: which === 'all' },
+        {
+          version: state.version, ...model, background: true,
+          all_epics: which === 'all' && stage === 'epics',
+          all_stories: which === 'all' && stage === 'stories',
+        },
         { quiet: true },
       );
       if (mounted.current) saved(next);
@@ -138,6 +142,7 @@ export function WorkspaceReview({
           ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
           : <>
               {stage === 'epics' && actionButton('all', 'Generate all remaining Epics', 'Generating Epics')}
+              {stage === 'stories' && actionButton('all', 'Generate all new User Stories', 'Generating User Stories')}
               {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
             </>}
         <Button variant="ghost" onClick={() => setQuery({ tab: stage })}>
