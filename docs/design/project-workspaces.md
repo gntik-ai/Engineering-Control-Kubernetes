@@ -33,6 +33,16 @@ The acceptance suite exercises a repository with no planning issues and a reposi
 The Home charts use UTC days. The daily figures table shows estimated amounts and exchange-rate dates. [Estimated project cost and optional finalized billing](../../deploy/README.md#estimated-project-cost)
 
 
+## Automatic planning reviews
+
+Adding an Epic, User Story or technical Issue queues a project review in the same transaction as the record. The first import of a technical GitHub issue and approval of a planning proposal also enter this workflow. A repeated sync uses the existing identity. Releasing this feature starts with new additions. Existing planning can supply context immediately.
+
+In **Home → Automatic planning reviews**, the project uses its repository-analysis model until the administrator selects another model from Accounts. The worker records usage against this project and keeps its place across sign-outs and restarts. Projects without a selection keep their work queued. The source row and Home history show questions, parent matches and links to resulting proposals.
+
+The review checks the source text and looks for missing work across the project's Epics. It considers saved and proposed work, including closed technical Issues. A Story or draft Issue submitted without parents appears as a proposal while its parents are identified. Inspect ambiguous matches in the table, edit the record or its links, and the review resumes. The administrator can retry a review after addressing a failure.
+
+Generated Stories and Issues show their reason and parents in the existing tables. Approving a generated Story triggers its technical Issue review. A generated Issue ends the chain with a text and parent check. GitHub publication uses the existing explicit approval and synchronization process.
+
 ## Project connections
 
 Open Settings → Connections in the project sidebar. Dashboard opens the five project tabs. The shell uses the gntik-ui sidebar rail, collapsible Settings group and mobile drawer. A project can depend on several projects and act as a dependency for others. Each connection appears in both projects. Disconnect archives the relationship and retains its decision history.

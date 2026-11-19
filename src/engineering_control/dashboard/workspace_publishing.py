@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.planning_queue import queue_review
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectNotFound,
@@ -79,6 +80,7 @@ def approve_issue(session: Session, project: ProjectRecord, key: UUID) -> UUID |
         return None
     if item.workspace_review not in ("pending", "publishing"):
         raise ProjectConflict("This issue has no pending workspace approval")
+    queue_review(session, project.id, "issues", item.id, item.title)
     if item.issue_number:
         item.workspace_review = "publishing"
         return enqueue(

@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Select,
@@ -30,6 +30,11 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import connected_records, finding_links
+from engineering_control.dashboard.planning_queue import (
+    queue_review,
+    record_changed,
+    review_results,
+)
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -38,6 +43,7 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.db.models import (
     BacklogItem,
+    PlanningReview,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
@@ -99,6 +105,9 @@ def save_record(
     description: str | None,
     parents: list[UUID],
     key: UUID | None = None,
+    *,
+    review_scope: str = "full",
+    new_id: UUID | None = None,
 ) -> UUID:
     row: ProjectEpic | ProjectUserStory | BacklogItem
     if kind == "issues":
@@ -130,6 +139,8 @@ def save_record(
             if saved is None:
                 raise ProjectNotFound(str(key))
             row = cast(ProjectEpic | ProjectUserStory, saved)
+    if new_id is not None:
+        row.id = new_id
     row.updated_at = datetime.now(UTC)
     row.title = clean_title(title)
     row.description = clean_description(description)
@@ -137,6 +148,10 @@ def save_record(
     session.flush()
     if kind != "epics":
         replace_parents(session, kind, project.id, row.id, parents)
+    if key is None:
+        queue_review(session, project.id, kind, row.id, row.title, review_scope)
+    else:
+        record_changed(session, project.id, kind, row.id, row.title)
     return row.id
 
 
@@ -201,6 +216,16 @@ def coverage_problem(session: Session, project: UUID, stage: str) -> str | None:
     return None
 
 
+def _approvable(rows: Subquery, kind: Kind) -> ColumnElement[bool]:
+    pending = rows.c.review.in_(("proposal", "pending"))
+    if kind == "epics":
+        return pending
+    eligible = ~rows.c.proposal | rows.c.parents[0].as_string().is_not(None)
+    if kind == "issues":
+        eligible = eligible | rows.c.number.is_not(None)
+    return cast(ColumnElement[bool], pending & eligible)
+
+
 def _table_rows(project: UUID, kind: Kind) -> Subquery:
     proposals = (
         select(
@@ -227,7 +252,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceCandidate.project_id == project,
             WorkspaceCandidate.kind == kind,
             WorkspaceCandidate.decision == "pending",
-            (WorkspaceImport.stage == kind) | (WorkspaceCandidate.origin == "connection"),
+            (WorkspaceImport.stage == kind) | (WorkspaceCandidate.origin != "import"),
         )
     )
     saved: Select[Any]
@@ -369,6 +394,25 @@ class PlanningRecords:
                 .tuples()
                 .all()
             )
+            if (
+                kind == "issues"
+                and record
+                and not session.scalar(select(rows.c.id).where(rows.c.id == record))
+            ):
+                # During its import stage a reviewable GitHub candidate can represent
+                # the same numbered source as a saved technical Issue in this table.
+                number = session.scalar(
+                    select(BacklogItem.issue_number).where(
+                        BacklogItem.project_id == project.id, BacklogItem.id == record
+                    )
+                )
+                if number is not None:
+                    focus = (
+                        session.scalar(
+                            select(rows.c.id).where(rows.c.number == number, rows.c.proposal)
+                        )
+                        or record
+                    )
             if focus and view:
                 view = session.scalar(select(bucket).where(rows.c.id == focus)) or view
             if view:
@@ -379,7 +423,7 @@ class PlanningRecords:
             total, pending, proposed = session.execute(
                 select(
                     func.count().filter(matches),
-                    func.count().filter(scope & rows.c.review.in_(("proposal", "pending"))),
+                    func.count().filter(scope & _approvable(rows, kind)),
                     func.count().filter(rows.c.proposal),
                 ).select_from(rows)
             ).one()
@@ -396,9 +440,7 @@ class PlanningRecords:
                     .where(scope)
                     .subquery()
                 )
-                position = session.scalar(
-                    select(ranked.c.position).where(ranked.c.id == focus, ~ranked.c.proposal)
-                )
+                position = session.scalar(select(ranked.c.position).where(ranked.c.id == focus))
                 if position is not None:
                     page = (position - 1) // page_size + 1
 
@@ -458,8 +500,35 @@ class PlanningRecords:
             )
             for uid, badge in finding_links(session, project.id, kind, connection_keys):
                 external[uid].append(badge)
+            row_ids = [item["id"] for item in items]
+            reviews = review_results(
+                session,
+                project.id,
+                session.scalars(
+                    select(PlanningReview).where(
+                        PlanningReview.project_id == project.id,
+                        PlanningReview.kind == kind,
+                        PlanningReview.record_id.in_(row_ids + list(mirror_ids.values())),
+                    )
+                ).all(),
+            )
+            reasons = dict(
+                session.execute(
+                    select(WorkspaceCandidate.id, WorkspaceCandidate.review_reason).where(
+                        WorkspaceCandidate.project_id == project.id,
+                        WorkspaceCandidate.id.in_(row_ids),
+                        WorkspaceCandidate.review_reason.is_not(None),
+                    )
+                )
+                .tuples()
+                .all()
+            )
             for item in items:
                 key = item["id"]
+                item["automatic_review"] = reviews.get(
+                    mirror_ids.get(item["number"], key) if item["proposal"] else key
+                )
+                item["review_reason"] = reasons.get(key)
                 item["connections"] = external[
                     mirror_ids.get(item["number"], key) if item["proposal"] else key
                 ]
@@ -553,7 +622,7 @@ class PlanningRecords:
             rows = _table_rows(project.id, kind)
             query = (
                 select(rows.c.id, rows.c.number, rows.c.github_state)
-                .where(rows.c.review.in_(("proposal", "pending")))
+                .where(_approvable(rows, kind))
                 .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             )
             view = issue_state if kind == "issues" else state
@@ -586,6 +655,7 @@ class PlanningRecords:
             if item is None:
                 raise ProjectNotFound(str(key))
             replace_parents(db, "issues", project.id, key, stories)
+            record_changed(db, project.id, "issues", key, item.title)
             item.facts = {**(item.facts or {}), "manual_story_links": True}
             item.updated_at = datetime.now(UTC)
             return {"id": str(key)}
@@ -686,7 +756,24 @@ class PlanningRecords:
     ) -> dict[str, str]:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
-            identifier = save_record(session, project, kind, title, description, parents, key)
+            if key is None and kind != "epics" and not parents:
+                identifier = uuid4()
+                cleaned = clean_title(title)
+                session.add(
+                    WorkspaceCandidate(
+                        id=identifier,
+                        project_id=project.id,
+                        kind=kind,
+                        title=cleaned,
+                        description=clean_description(description),
+                        parents=[],
+                        identity=f"intake:{identifier}",
+                        origin="intake",
+                    )
+                )
+                queue_review(session, project.id, kind, identifier, cleaned, "intake")
+            else:
+                identifier = save_record(session, project, kind, title, description, parents, key)
             return {"project": name, "id": str(identifier)}
 
     def set_state(
@@ -751,4 +838,7 @@ class PlanningRecords:
                     )
                 )
             cast(ProjectEpic | ProjectUserStory, row).archived_at = datetime.now(UTC)
+            job = session.get(PlanningReview, (project.id, kind, key))
+            if job:
+                job.status, job.lease = "dismissed", None
             return {"project": name, "id": str(key)}

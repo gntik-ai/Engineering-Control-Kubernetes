@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description
+from engineering_control.dashboard.planning_queue import queue_review, record_changed
 from engineering_control.dashboard.project_records import ProjectConflict, active_project
 from engineering_control.db.models import (
     BacklogItem,
@@ -107,6 +108,7 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
     """Called under the project lock. A real issue keeps one row and its original number."""
     if not issues:
         return
+    wizard = db.get(WorkspaceImport, project.id)
     numbers = {i["number"] for i in issues}
     repo = project.source_repository
     items = {
@@ -166,22 +168,74 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
         n, date = issue["number"], _time(issue.get("updated_at"))
         key = f"issue:{n}"
         src = sources.get(key)
+        previous_evidence = src.evidence if src else None
         old_date = _time(src.evidence.get("updated_at")) if src else None
         if src and old_date and (date is None or old_date > date):
             issue, date = src.evidence, old_date
         elif src:
             src.evidence = issue
         else:
-            db.add(WorkspaceSource(project_id=project.id, key=key, kind="issue", evidence=issue))
+            source = WorkspaceSource(project_id=project.id, key=key, kind="issue", evidence=issue)
+            db.add(source)
+            sources[key] = source
         kind = planning_kind(issue)
         cand = candidates.get(n)
         item = items.get(n)
         if cand and cand.kind != (kind or "issues") and cand.decision == "pending":
             cand.decision, cand.number = "dismissed", None
         if kind:
+            # A newly discovered planning issue can arrive after its wizard stage has
+            # finished. Surface it for approval with its original GitHub identity.
+            past_stage = wizard and (
+                wizard.stage == "complete"
+                or (
+                    wizard.stage == kind
+                    and (
+                        wizard.progress.get("review_mode", "existing") != "existing"
+                        or key <= wizard.progress.get("review_after", "")
+                    )
+                )
+                or (kind == "epics" and wizard.stage in ("stories", "issues"))
+                or (kind == "stories" and wizard.stage == "issues")
+            )
+            if src is None and cand is None and past_stage:
+                proposal = WorkspaceCandidate(
+                    project_id=project.id,
+                    kind=kind,
+                    number=n,
+                    identity=key,
+                    origin="intake",
+                    title=(issue.get("title") or f"Issue {n}")[:300],
+                    description=clean_description(issue.get("body")),
+                    parents=[],
+                )
+                db.add(proposal)
+                candidates[n] = proposal
+                db.flush()
+                queue_review(db, project.id, kind, proposal.id, proposal.title, "intake")
+            elif (
+                cand
+                and cand.kind == kind
+                and cand.origin == "intake"
+                and cand.decision == "pending"
+                and previous_evidence
+            ):
+                prior = (
+                    (previous_evidence.get("title") or f"Issue {n}")[:300],
+                    clean_description(previous_evidence.get("body")),
+                )
+                fresh = (
+                    (issue.get("title") or f"Issue {n}")[:300],
+                    clean_description(issue.get("body")),
+                )
+                if prior != fresh and prior == (cand.title, cand.description):
+                    cand.title, cand.description = fresh
+                    record_changed(db, project.id, kind, cand.id, cand.title)
             if item:
                 item.workspace_review = "planning"
             continue
+        entering = item is None or item.workspace_review in (None, "planning")
+        previous_text = (item.title, item.description) if item else None
         if item is None:
             item = BacklogItem(
                 project_id=project.id,
@@ -192,6 +246,7 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
                 workspace_review="pending",
             )
             db.add(item)
+            items[n] = item
         elif date and item.issue_updated_at and item.issue_updated_at.replace(tzinfo=UTC) > date:
             continue
         elif item.workspace_review == "planning":
@@ -213,6 +268,11 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
             item.done_at = item.github_closed_at
         elif previous_state == "closed" and item.state == "done":
             item.state = "proposed"
+        if entering:
+            db.flush()
+            queue_review(db, project.id, "issues", item.id, item.title)
+        elif previous_text != (item.title, item.description):
+            record_changed(db, project.id, "issues", item.id, item.title)
         if item.facts.get("manual_story_links"):
             continue
         refs = {stories[n] for n in _story_numbers(issue, repo) if n in stories}
