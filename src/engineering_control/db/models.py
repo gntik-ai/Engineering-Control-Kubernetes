@@ -486,6 +486,7 @@ class WorkspaceImport(Timestamps, Base):
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
     )
     stage: Mapped[str] = mapped_column(String(24), default="inventory")
+    issues_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=0)
     repository: Mapped[str] = mapped_column(String(140))
     branch: Mapped[str] = mapped_column(String(100))

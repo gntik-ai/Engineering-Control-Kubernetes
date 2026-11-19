@@ -415,7 +415,7 @@ class GitHubApp:
             raise GitHubAppError("GitHub returned an unreadable file") from error
 
     async def workspace_history(
-        self, repository: str, page: int
+        self, repository: str, page: int, *, since: str | None = None
     ) -> tuple[list[dict[str, Any]], bool]:
         """Page through creation order, including closed issues and excluding pull requests."""
         if not REPOSITORY_NAME.fullmatch(repository) or page < 1:
@@ -428,6 +428,7 @@ class GitHubApp:
                 "state": "all",
                 "sort": "created",
                 "direction": "asc",
+                **({"since": since} if since else {}),
                 "per_page": PAGE_SIZE,
                 "page": page,
             },

@@ -399,6 +399,10 @@ class StoryInput(EpicInput):
     epic_ids: list[UUID] = Field(min_length=1)
 
 
+class WorkspaceIssueStories(PlainChangeInput):
+    story_ids: list[UUID] = Field(min_length=1)
+
+
 class WorkspaceIssueInput(EpicInput):
     story_ids: list[UUID] = Field(min_length=1)
 

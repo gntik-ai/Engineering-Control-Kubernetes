@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Subquery,
     Uuid,
+    case,
     delete,
     false,
     func,
@@ -44,9 +45,11 @@ from engineering_control.db.models import (
     ProjectUserStory,
     WorkspaceCandidate,
     WorkspaceImport,
+    WorkspaceSource,
 )
 
 Kind = Literal["epics", "stories", "issues"]
+IssueView = Literal["open", "closed", "draft"]
 
 
 def replace_parents(
@@ -207,7 +210,12 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             literal("proposal").label("review"),
             WorkspaceCandidate.parents,
             WorkspaceCandidate.number,
-            null().label("github_state"),
+            WorkspaceSource.evidence["state"].as_string().label("github_state"),
+        )
+        .outerjoin(
+            WorkspaceSource,
+            (WorkspaceSource.project_id == WorkspaceCandidate.project_id)
+            & (WorkspaceSource.key == WorkspaceCandidate.identity),
         )
         .outerjoin(WorkspaceImport, WorkspaceImport.project_id == WorkspaceCandidate.project_id)
         .where(
@@ -229,7 +237,17 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             null(),
             BacklogItem.issue_number,
             BacklogItem.issue_state,
-        ).where(BacklogItem.project_id == project, _visible_issues(project))
+        ).where(
+            BacklogItem.project_id == project,
+            _visible_issues(project),
+            BacklogItem.workspace_review.is_distinct_from("planning"),
+            BacklogItem.issue_number.is_(None)
+            | BacklogItem.issue_number.not_in(
+                proposals.with_only_columns(WorkspaceCandidate.number).where(
+                    WorkspaceCandidate.number.is_not(None)
+                )
+            ),
+        )
     else:
         model = ProjectEpic if kind == "epics" else ProjectUserStory
         saved = select(
@@ -244,6 +262,12 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             null(),
         ).where(model.project_id == project, model.archived_at.is_(None))
     return union_all(proposals, saved).subquery()
+
+
+def _issue_bucket(rows: Subquery) -> ColumnElement[str]:
+    return case(
+        (rows.c.number.is_(None), "draft"), else_=func.coalesce(rows.c.github_state, "open")
+    )
 
 
 def _search_matches(
@@ -307,6 +331,7 @@ class PlanningRecords:
         epic: UUID | None = None,
         record: UUID | None = None,
         connected: str = "",
+        issue_state: IssueView | None = None,
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -326,12 +351,30 @@ class PlanningRecords:
                     & ~rows.c.proposal
                     & rows.c.id.in_(connected_records(project.id, kind, connected, exact=True))
                 )
+            scope: ColumnElement[bool] = true()
+            issue_counts: dict[str, int] = {}
+            if kind == "issues":
+                bucket = _issue_bucket(rows)
+                issue_counts = {
+                    key: count
+                    for key, count in session.execute(
+                        select(bucket, func.count()).select_from(rows).group_by(bucket)
+                    )
+                }
+                if focus and issue_state:
+                    issue_state = (
+                        session.scalar(select(bucket).select_from(rows).where(rows.c.id == focus))
+                        or issue_state
+                    )
+                if issue_state:
+                    scope = bucket == issue_state
+                    matches = matches & scope
             ordering = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
-            # Approval and stage progression always refer to the entire table.
+            # Stage progression covers every view. Bulk approval covers the selected state.
             total, pending, proposed = session.execute(
                 select(
                     func.count().filter(matches),
-                    func.count().filter(rows.c.review.in_(("proposal", "pending"))),
+                    func.count().filter(scope & rows.c.review.in_(("proposal", "pending"))),
                     func.count().filter(rows.c.proposal),
                 ).select_from(rows)
             ).one()
@@ -385,17 +428,44 @@ class PlanningRecords:
                         for uid, title in session.execute(options.where(parent_model.id.in_(ids)))
                     }
             external: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
-            for uid, badge in finding_links(
-                session, project.id, kind, [i["id"] for i in items if not i["proposal"]]
-            ):
+            mirror_ids = (
+                {
+                    number: key
+                    for number, key in session.execute(
+                        select(BacklogItem.issue_number, BacklogItem.id).where(
+                            BacklogItem.project_id == project.id,
+                            BacklogItem.repository == project.source_repository,
+                            BacklogItem.issue_number.in_(
+                                [i["number"] for i in items if i["proposal"] and i["number"]]
+                            ),
+                        )
+                    )
+                }
+                if kind == "issues"
+                else {}
+            )
+            connection_keys = [i["id"] for i in items if not i["proposal"]] + list(
+                mirror_ids.values()
+            )
+            for uid, badge in finding_links(session, project.id, kind, connection_keys):
                 external[uid].append(badge)
             for item in items:
                 key = item["id"]
-                item["connections"] = external[key]
+                item["connections"] = external[
+                    mirror_ids.get(item["number"], key) if item["proposal"] else key
+                ]
                 rels = item.pop("parents")
                 item.pop("created_at")
                 if kind != "epics":
-                    item["epic_ids" if kind == "stories" else "story_ids"] = rels or linked[key]
+                    ids_for_row = [v for v in (rels or linked[key]) if v in parents]
+                    item["epic_ids" if kind == "stories" else "story_ids"] = ids_for_row
+                    if kind == "issues":
+                        item["orphan"] = not ids_for_row and not any(
+                            link["kind"] == "stories"
+                            and link["record"]
+                            and link["status"] == "approved"
+                            for link in item["connections"]
+                        )
                 item["id"] = str(key)
                 item["url"] = (
                     f"https://github.com/{project.source_repository}/issues/{item['number']}"
@@ -414,6 +484,8 @@ class PlanningRecords:
             current = review is not None and review.stage == kind
             return {
                 "items": items,
+                "issue_state": issue_state,
+                "issue_counts": issue_counts,
                 "total": total,
                 "page": page,
                 "page_size": page_size,
@@ -458,22 +530,49 @@ class PlanningRecords:
             )
             return dict(session.execute(counts).mappings().one())
 
-    def pending(self, name: str, kind: Kind) -> dict[str, Any]:
-        # Open the bulk confirmation with just the IDs currently awaiting approval.
+    def pending(
+        self, name: str, kind: Kind, issue_state: IssueView | None = None
+    ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
             rows = _table_rows(project.id, kind)
-            ids = session.scalars(
-                select(rows.c.id)
+            query = (
+                select(rows.c.id, rows.c.number, rows.c.github_state)
                 .where(rows.c.review.in_(("proposal", "pending")))
                 .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             )
-            return {
-                "ids": [str(key) for key in ids],
+            if kind == "issues" and issue_state:
+                query = query.where(_issue_bucket(rows) == issue_state)
+            pending = session.execute(query).all()
+            result = {
+                "ids": [str(r.id) for r in pending],
                 "version": session.scalar(
                     select(WorkspaceImport.version).where(WorkspaceImport.project_id == project.id)
                 ),
             }
+            if kind in ("epics", "stories"):
+                closing = [r.number for r in pending if r.number and r.github_state == "open"]
+                if closing:
+                    result["close_numbers"] = closing
+            return result
+
+    def link_stories(self, name: str, key: UUID, stories: list[UUID]) -> dict[str, str]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            item = db.scalar(
+                select(BacklogItem).where(
+                    BacklogItem.id == key,
+                    BacklogItem.project_id == project.id,
+                    BacklogItem.issue_number.is_not(None),
+                    BacklogItem.workspace_review.is_distinct_from("planning"),
+                )
+            )
+            if item is None:
+                raise ProjectNotFound(str(key))
+            replace_parents(db, "issues", project.id, key, stories)
+            item.facts = {**(item.facts or {}), "manual_story_links": True}
+            item.updated_at = datetime.now(UTC)
+            return {"id": str(key)}
 
     def parents(self, name: str, kind: Kind) -> list[dict[str, str]]:
         with self.sessions() as session:

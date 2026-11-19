@@ -18,7 +18,6 @@ from engineering_control.dashboard.backlog_items import clean_description, clean
 from engineering_control.dashboard.planning import (
     Kind,
     coverage_problem,
-    replace_parents,
     save_record,
 )
 from engineering_control.dashboard.project_records import (
@@ -28,6 +27,11 @@ from engineering_control.dashboard.project_records import (
     active_project,
 )
 from engineering_control.dashboard.workspace_costs import record_model_usage
+from engineering_control.dashboard.workspace_issues import (
+    add_story_links,
+    import_issues,
+    planning_kind,
+)
 from engineering_control.dashboard.workspace_publishing import approve_issue, enqueue
 from engineering_control.db.models import (
     BacklogItem,
@@ -95,10 +99,6 @@ def gap_identity(title: str) -> str:
     return "gap:" + hashlib.sha256(clean_title(title).casefold().encode()).hexdigest()
 
 
-def _date(value: Any) -> datetime | None:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
-
-
 def _records(session: Session, project: UUID, kind: str) -> list[dict[str, str]]:
     cls = ProjectEpic if kind == "epics" else ProjectUserStory
     return [
@@ -125,10 +125,14 @@ def _candidates(session: Session, project: UUID, kind: str) -> list[WorkspaceCan
     )
 
 
-def _parents(values: list[str], valid: set[str], kind: str) -> list[UUID]:
+def _parents(values: list[str], valid: set[str], kind: str, *, orphan: bool = False) -> list[UUID]:
     if kind == "epics":
         return []
-    if not values or len(values) != len(set(values)) or any(p not in valid for p in values):
+    if (
+        (not values and not orphan)
+        or len(values) != len(set(values))
+        or any(p not in valid for p in values)
+    ):
         raise ProjectInvalid("Choose at least one distinct, active parent from this project")
     return [UUID(p) for p in values]
 
@@ -254,12 +258,17 @@ def _observe_records(
                 if number not in supplied or number in checked:
                     continue
                 checked.add(number)
-                if not item["include"]:
+                if not item["include"] and kind != "issues":
                     continue
             try:
                 identity = gap_identity(item["title"])
                 description = clean_description(item["description"])
-                _parents(item.get("parents", []), valid, kind)
+                _parents(
+                    item.get("parents", []),
+                    valid,
+                    kind,
+                    orphan=field == "records" and kind == "issues",
+                )
             except ProjectInvalid:
                 continue
             if bulk and (identity in covered or identity in titles or not description):
@@ -404,7 +413,7 @@ class WorkspaceReview:
                         WorkspaceSource.project_id == row.project_id,
                         WorkspaceSource.kind == "issue",
                         WorkspaceSource.key > row.progress.get("review_after", ""),
-                        WorkspaceSource.key.not_in(claimed),
+                        *([] if row.stage == "issues" else [WorkspaceSource.key.not_in(claimed)]),
                     )
                     .order_by(WorkspaceSource.key)
                     .limit(PAGE + 1)
@@ -471,6 +480,14 @@ class WorkspaceReview:
             progress["review_mode"] = "gaps"
             return progress, []
         candidates = state["candidates"]
+        if mode == "existing":
+            progress["review_after"] = batch[-1].key
+            progress["reviewed_issues"] = progress.get("reviewed_issues", 0) + len(batch)
+            if len(sources) <= PAGE:
+                progress["review_mode"] = "gaps"
+            batch = [s for s in batch if (planning_kind(s.evidence) or "issues") == row.stage]
+            if not batch:
+                return progress, []
         records = (
             [
                 {
@@ -508,7 +525,9 @@ class WorkspaceReview:
             schema = EXISTING
             task = (
                 "Review every supplied GitHub issue. Return one decision per supplied number. "
-                "Include only valid records of this stage. Use actual parent IDs."
+                "Use actual parent IDs. For technical issues keep every issue and link only "
+                "clearly corresponding User Stories. Return empty parents when there is no "
+                "match. A reference to another repository is not a same-number local Story."
             )
         elif bulk:
             schema = BULK_SCHEMAS[row.stage]
@@ -582,23 +601,21 @@ class WorkspaceReview:
                 raise ProjectInvalid(
                     "The model did not review every supplied issue; retry this step"
                 )
-            progress["review_after"] = batch[-1].key
-            progress["reviewed_issues"] = progress.get("reviewed_issues", 0) + len(supplied)
-            if len(sources) <= PAGE:
-                progress["review_mode"] = "gaps"
-            for r in responses:
-                if r["include"]:
-                    _parents(r["parents"], valid, row.stage)
-                    title = clean_title(r["title"])
-                    suggestions.append(
-                        {
-                            "number": r["number"],
-                            "identity": f"issue:{r['number']}",
-                            "title": title,
-                            "description": clean_description(r["description"]),
-                            "parents": r["parents"] if row.stage != "epics" else [],
-                        }
-                    )
+            evidence = {source.evidence["number"]: source.evidence for source in batch}
+            for record in responses:
+                original = evidence[record["number"]]
+                parents = list(dict.fromkeys(p for p in record["parents"] if p in valid))
+                # The model can suggest a relationship. It cannot drop a technical issue
+                # or promote one to a planning record.
+                suggestions.append(
+                    {
+                        "number": record["number"],
+                        "identity": f"issue:{record['number']}",
+                        "title": original["title"],
+                        "description": clean_description(original.get("body")),
+                        "parents": parents if row.stage != "epics" and record["include"] else [],
+                    }
+                )
         else:
             progress["review_mode"], suggestions = _gap_proposals(
                 reply.data,
@@ -645,47 +662,20 @@ class WorkspaceReview:
             raise ProjectConflict(
                 "The reviewed issue could not be found in the repository snapshot"
             )
+        if evidence is not None and (planning_kind(evidence.evidence) or "issues") != kind:
+            raise ProjectConflict(
+                "The GitHub issue has a different type. Refresh the issue inventory."
+            )
         if kind == "issues" and evidence is not None:
-            src = evidence.evidence
-            item = session.scalar(
+            import_issues(session, project, [evidence.evidence])
+            item = session.scalars(
                 select(BacklogItem).where(
                     BacklogItem.project_id == project.id,
                     BacklogItem.repository == project.source_repository,
                     BacklogItem.issue_number == candidate.number,
                 )
-            )
-            if item is not None and item.workspace_review in ("approved", "publishing"):
-                links = session.scalars(
-                    select(ProjectIssueStory.story_id).where(
-                        ProjectIssueStory.project_id == project.id,
-                        ProjectIssueStory.item_id == item.id,
-                    )
-                )
-                replace_parents(session, kind, project.id, item.id, list(set(links).union(parents)))
-                return item.id
-            if item is None:
-                item = BacklogItem(
-                    project_id=project.id,
-                    source="github",
-                    repository=project.source_repository,
-                    issue_number=candidate.number,
-                    state="done" if src["state"] == "closed" else "proposed",
-                    title=title,
-                )
-                session.add(item)
-            item.title = clean_title(title)
-            item.description = clean_description(body)
-            item.issue_state = src["state"]
-            item.github_closed_at = _date(src.get("closed_at"))
-            if item.issue_state == "closed" and item.state in ("proposed", "accepted", "done"):
-                item.state = "done"
-                item.done_at = item.github_closed_at
-            item.issue_url = src.get("html_url")
-            item.issue_labels = src.get("labels") or []
-            item.issue_updated_at = _date(src.get("updated_at"))
-            item.workspace_review = "pending"
-            session.flush()
-            replace_parents(session, kind, project.id, item.id, parents)
+            ).one()
+            add_story_links(session, project.id, item.id, set(parents))
             return item.id
         key = save_record(session, project, kind, title, body, parents)
         if evidence is not None:
@@ -694,15 +684,15 @@ class WorkspaceReview:
                 enqueue(
                     session, project.id, "close", key, project.source_repository, candidate.number
                 )
-            item = session.scalar(
+            prior_item = session.scalar(
                 select(BacklogItem).where(
                     BacklogItem.project_id == project.id,
                     BacklogItem.repository == project.source_repository,
                     BacklogItem.issue_number == candidate.number,
                 )
             )
-            if item is not None:
-                item.workspace_review = "planning"
+            if prior_item is not None:
+                prior_item.workspace_review = "planning"
         return key
 
     @staticmethod
@@ -764,7 +754,10 @@ class WorkspaceReview:
             candidate.parents = [
                 str(p)
                 for p in _parents(
-                    [str(p) for p in parents], self._active_parents(session, project.id, kind), kind
+                    [str(p) for p in parents],
+                    self._active_parents(session, project.id, kind),
+                    kind,
+                    orphan=kind == "issues" and candidate.number is not None,
                 )
             ]
             if row is not None and candidate.origin == "import":
@@ -810,7 +803,12 @@ class WorkspaceReview:
                 if dismiss:
                     candidate.decision, candidate.number = "dismissed", None
                     continue
-                parents = _parents(candidate.parents, valid, kind)
+                parents = _parents(
+                    candidate.parents,
+                    valid,
+                    kind,
+                    orphan=kind == "issues" and candidate.number is not None,
+                )
                 candidate.local_id = self._materialize(
                     session, project, candidate, candidate.title, candidate.description, parents
                 )
@@ -874,7 +872,12 @@ class WorkspaceReview:
                     continue
                 if not str(edit["title"]).strip():
                     raise ProjectInvalid("Each included proposal needs a title")
-                parents = _parents([str(p) for p in edit["parents"]], valid, stage)
+                parents = _parents(
+                    [str(p) for p in edit["parents"]],
+                    valid,
+                    stage,
+                    orphan=stage == "issues" and c.number is not None,
+                )
                 c.title = clean_title(edit["title"])
                 c.description = clean_description(edit["description"])
                 c.parents = [str(p) for p in parents]

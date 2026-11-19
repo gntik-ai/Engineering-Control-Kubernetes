@@ -41,6 +41,8 @@ const sections = {
 };
 const singular = { epics: 'Epic', stories: 'User Story', issues: 'Issue' };
 type Kind = keyof typeof singular;
+type IssueView = 'open' | 'closed' | 'draft';
+const issueViews = { open: 'Open', closed: 'Closed', draft: 'Drafts' } as const;
 export interface PlanRow {
   id: string;
   title: string;
@@ -49,6 +51,7 @@ export interface PlanRow {
   story_ids?: string[];
   review?: string | null;
   proposal?: boolean;
+  orphan?: boolean;
   github_state?: string | null;
   number?: number | null;
   url?: string | null;
@@ -61,6 +64,8 @@ interface PlanningPage extends Paged<PlanRow> {
   epic: string | null;
   record: string | null;
   connected: string;
+  issue_state: IssueView | null;
+  issue_counts: Partial<Record<IssueView, number>>;
   pending: number;
   parents: Record<string, string>;
   has_parents: boolean;
@@ -68,7 +73,7 @@ interface PlanningPage extends Paged<PlanRow> {
   busy: boolean;
   can_continue: boolean;
 }
-type PendingSnapshot = { ids: string[]; version: number | null };
+type PendingSnapshot = { ids: string[]; version: number | null; close_numbers?: number[] };
 const pageSizes = [10, 25, 50, 100];
 const pageParam = (page: number) => page > 1 ? String(page) : null;
 
@@ -99,6 +104,27 @@ function ParentChoices({ path, kind, parents, setParents }: {
       ))}
     </fieldset>
   );
+}
+
+function LinkStories({ path, issue, saved, close }: {
+  path: string; issue: PlanRow; saved: () => void; close: () => void;
+}) {
+  const [stories, setStories] = useState(issue.story_ids ?? []);
+  const save = useSubmit(() => postJson(path + '/' + issue.id + '/stories', { story_ids: stories }), () => { saved(); close(); });
+  return <Dialog open onOpenChange={open => { if (!open) close(); }}>
+    <DialogContent size="md">
+      <DialogHeader><DialogTitle>Link User Stories to #{issue.number}</DialogTitle></DialogHeader>
+      <DialogBody className="grid gap-3">
+        <p>{issue.title}</p>
+        <ParentChoices path={path} kind="issues" parents={stories} setParents={setStories} />
+        {save.problem && <Alert tone="destructive" title={save.problem} />}
+      </DialogBody>
+      <DialogFooter>
+        <Button variant="ghost" onClick={close}>Cancel</Button>
+        <Button disabled={!stories.length || save.pending} loading={save.pending} onClick={() => void save.submit()}>Save links</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>;
 }
 
 function RecordEditor({
@@ -231,12 +257,24 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   // An Epic link locates the row even after other records have moved it to a different page.
   const page = !focus && Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
   const pageSize = pageSizes.includes(Number(sizeValue)) ? Number(sizeValue) : 10;
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected }), 4000, { keepPreviousData: true });
+  const requestedState = query.get('issue_state');
+  const issueState: IssueView | null = kind !== 'issues' ? null : requestedState === 'closed' || requestedState === 'draft' ? requestedState : 'open';
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, issue_state: issueState }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected;
+  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && (kind !== 'issues' || data.issue_state === issueState);
   const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
   const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
+  useEffect(() => {
+    if (kind !== 'issues' || !data || (data.record ?? null) !== recordId) return;
+    if (recordId && data.issue_state && data.issue_state !== issueState) {
+      setQuery({ issue_state: data.issue_state, page: null });
+    } else if (!recordId && issueState === 'draft' && data.issue_state === 'draft' && !data.issue_counts?.draft) {
+      setQuery({ issue_state: null, page: null });
+    }
+  }, [kind, recordId, issueState, data]);
+  const [linking, setLinking] = useState<PlanRow | null>(null);
+  const refreshIssues = useSubmit(() => postJson('projects/' + encodeURIComponent(project) + '/backlog/sync', {}), reload);
   useEffect(() => {
     if (!data || changingPage) return;
     const nextPage = pageParam(data.page);
@@ -272,7 +310,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
   const selectAll = useSubmit(
-    () => getJson<PendingSnapshot>(apiUrl(path + '/pending'), new AbortController().signal),
+    () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { issue_state: issueState }), new AbortController().signal),
     (snapshot) => { if (snapshot.ids.length) setApproving(snapshot); else reload(); },
   );
   const locked = Boolean(changingPage || data?.busy);
@@ -307,6 +345,10 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       className: 'max-w-xs whitespace-normal align-top',
       cell: (record) => (
         <ul>
+          {kind === 'issues' && record.connections?.filter(link => link.kind === 'stories' && link.status === 'approved' && link.record).map(link =>
+            <li key={link.connection + link.record}><Link href={recordUrl(link.project, 'stories', link.record!)}>{link.display_name} · {link.title ?? 'User Story'}</Link></li>
+          )}
+          {kind === 'issues' && record.orphan && <li><span className="rounded bg-warning/15 px-2 py-1 text-sm font-medium">Orphan · No linked User Story</span></li>}
           {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
             <li key={id}>
               {kind === 'stories' && data?.parents[id] ? (
@@ -343,6 +385,8 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
       cell: (record) => (
         <div className="flex justify-end gap-1">
+          {kind === 'issues' && Boolean(record.number) && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
+            onClick={() => setLinking(record)}>Link User Stories</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
           {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
             <Button size="sm" variant="ghost" disabled={rowLocked(record)} aria-label={'Edit ' + record.title}
@@ -350,7 +394,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           )}
           {(record.proposal || record.review === 'pending') && (
             <Button size="sm" variant="secondary" disabled={rowLocked(record)} aria-label={'Approve ' + record.title}
-              onClick={() => setApproving({ ids: [record.id], title: record.title, version: data?.version ?? null })}>Approve</Button>
+              onClick={() => setApproving({ ids: [record.id], title: record.title, close_numbers: kind !== 'issues' && record.number && record.github_state === 'open' ? [record.number] : [], version: data?.version ?? null })}>Approve</Button>
           )}
           {(record.proposal || kind !== 'issues') && (
             <Button size="sm" variant="ghost" disabled={rowLocked(record)}
@@ -365,16 +409,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const empty = needsParents
     ? kind === 'stories' ? 'Add an Epic before creating a User Story.' : 'Add a User Story before creating an Issue.'
     : 'No ' + sections[kind] + ' yet.';
-  return (
-    <section className="grid min-w-0 gap-4">
-      <h2 className="text-xl font-semibold">{sections[kind]}</h2>
-      <LoadError resource={plan} />
-      {focus && currentFilter && !foundEpic && (
-        <p role="status" className="text-sm text-muted-foreground">This {singular[kind]} is unavailable in this project.</p>
-      )}
-      {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
-      {finish.problem && <Alert tone="destructive" title={finish.problem} />}
-      {plan.error && <div><RefreshButton resource={plan} /></div>}
+  const table = (
       <DataTable
         className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
         caption={sections[kind]}
@@ -384,10 +419,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         labels={{ quickFilter: (caption) => 'Search ' + caption }}
         toolbar={
           <div className="ms-auto flex flex-wrap gap-2">
-            {kind === 'issues' && <ConnectionFilter project={project} value={connected}/>}
+            {kind === 'issues' && <>
+              <ConnectionFilter project={project} value={connected}/>
+              <Button size="sm" variant="secondary" disabled={refreshIssues.pending} loading={refreshIssues.pending} onClick={() => void refreshIssues.submit()}>Refresh from GitHub</Button>
+            </>}
             {data && data.pending > 0 && (
               <Button size="sm" variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
-                Approve all {sections[kind]}{search ? ' in project' : ''} ({data.pending})
+                Approve all {sections[kind]}{kind === 'issues' && issueState ? ' in ' + issueViews[issueState] : search ? ' in project' : ''} ({data.pending})
               </Button>
             )}
             {data?.can_continue && !locked && (
@@ -410,18 +448,47 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         filtered={Boolean(search)}
         noResultsState={<p role="status" className="text-sm text-muted-foreground">No {sections[kind]} match “{search}”.</p>}
       />
+  );
+  return (
+    <section className="grid min-w-0 gap-4">
+      <h2 className="text-xl font-semibold">{sections[kind]}</h2>
+      <LoadError resource={plan} />
+      {focus && currentFilter && !foundEpic && (
+        <p role="status" className="text-sm text-muted-foreground">This {singular[kind]} is unavailable in this project.</p>
+      )}
+      {refreshIssues.problem && <Alert tone="destructive" title={refreshIssues.problem} />}
+      {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
+      {finish.problem && <Alert tone="destructive" title={finish.problem} />}
+      {plan.error && <div><RefreshButton resource={plan} /></div>}
+      {kind === 'issues' && issueState ? (
+        <Tabs value={issueState} onValueChange={v => setQuery({ issue_state: v === 'open' ? null : String(v), page: null, record: null })}>
+          <TabsList aria-label="Issue state">
+            {(Object.keys(issueViews) as IssueView[]).filter(v => v !== 'draft' || Boolean(data?.issue_counts?.draft)).map(v =>
+              <TabsTab key={v} value={v} count={data?.issue_counts?.[v] ?? 0}>{issueViews[v]}</TabsTab>)}
+          </TabsList>
+          <TabsPanel value={issueState} className="pt-3">{table}</TabsPanel>
+        </Tabs>
+      ) : table}
+      {linking && <LinkStories path={path} issue={linking} close={() => setLinking(null)} saved={reload} />}
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
           title={approving.title ? `Approve ${singular[kind]}?` : `Approve all ${approving.ids.length} ${sections[kind]}?`}
-          about={(approving.title ? approving.title + '. ' : search ? 'Approval includes all pending proposals in this table, including those hidden by the search. ' : 'Approval applies across all pages of this table. ') + (kind === 'issues'
-            ? 'Create generated Issues in GitHub and link existing Issues in their current state.'
-            : 'Save the approved records. Any corresponding open planning issues will be closed on GitHub.')}
+          about={(approving.title ? approving.title + '. ' : 'Approval applies across all pages in this view. ') + (
+            kind === 'issues' ? (issueState === 'draft' ? 'Publish these drafts as new GitHub issues.' : 'Link these GitHub issues in their current state.')
+            : approving.close_numbers?.length ? 'Save the planning records and close the ' + approving.close_numbers.length + ' GitHub source ' + (approving.close_numbers.length === 1 ? 'issue shown below.' : 'issues shown below.')
+            : 'Save the planning records in Engineering Control.')}
           action={approving.title ? 'Approve' : 'Approve all'}
           run={() => postJson(path + '/decisions', { ids: approving.ids, version: approving.version })}
           onDone={afterDecision}
           onClose={() => setApproving(null)}
-        />
+        >
+          {Boolean(approving.close_numbers?.length) && (
+            <p aria-label="GitHub issues to close" className="max-h-40 overflow-y-auto break-words text-sm">
+              {approving.close_numbers?.map(n => '#' + n).join(', ')}
+            </p>
+          )}
+        </Confirm>
       )}
       {editor && (
         <RecordEditor
@@ -465,7 +532,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, issue_state: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {

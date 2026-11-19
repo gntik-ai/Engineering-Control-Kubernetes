@@ -22,6 +22,11 @@ from engineering_control.dashboard.project_records import (
     active_project,
 )
 from engineering_control.dashboard.workspace_costs import record_model_usage
+from engineering_control.dashboard.workspace_issues import (
+    add_story_links,
+    import_issues,
+    planning_kind,
+)
 from engineering_control.dashboard.workspace_review import (
     KINDS,
     WorkspaceReview,
@@ -30,7 +35,9 @@ from engineering_control.dashboard.workspace_review import (
     settle_stories,
 )
 from engineering_control.db.models import (
+    BacklogItem,
     ProjectEpic,
+    ProjectIssueStory,
     ProjectRecord,
     ProjectUserStory,
     ProviderAccount,
@@ -345,7 +352,10 @@ class WorkspaceImports:
             job = row.progress.get("operation")
             added = 0
             if result is not None:
+                import_issues(session, project, [e for _, k, e in result.sources if k == "issue"])
                 for key, kind, evidence in result.sources:
+                    if kind == "issue":
+                        continue
                     session.merge(
                         WorkspaceSource(
                             project_id=project.id, key=key, kind=kind, evidence=evidence
@@ -394,6 +404,63 @@ class WorkspaceImports:
                 for suggestion in result.suggestions:
                     if suggestion["identity"] in covered:
                         continue
+                    number = suggestion["number"]
+                    if number is not None:
+                        source = session.get(WorkspaceSource, (project.id, f"issue:{number}"))
+                        if (
+                            source is None
+                            or (planning_kind(source.evidence) or "issues") != row.stage
+                        ):
+                            continue
+                        if row.stage == "issues":
+                            import_issues(session, project, [source.evidence])
+                            item = session.scalars(
+                                select(BacklogItem).where(
+                                    BacklogItem.project_id == project.id,
+                                    BacklogItem.repository == project.source_repository,
+                                    BacklogItem.issue_number == number,
+                                )
+                            ).one()
+                            story_ids = set(
+                                session.scalars(
+                                    select(ProjectUserStory.id).where(
+                                        ProjectUserStory.project_id == project.id,
+                                        ProjectUserStory.archived_at.is_(None),
+                                        ProjectUserStory.id.in_(
+                                            [UUID(v) for v in suggestion["parents"]]
+                                        ),
+                                    )
+                                )
+                            )
+                            if not (item.facts or {}).get("manual_story_links"):
+                                add_story_links(session, project.id, item.id, story_ids)
+                            suggestion["parents"] = [
+                                str(uid)
+                                for uid in session.scalars(
+                                    select(ProjectIssueStory.story_id)
+                                    .join(
+                                        ProjectUserStory,
+                                        ProjectUserStory.id == ProjectIssueStory.story_id,
+                                    )
+                                    .where(
+                                        ProjectIssueStory.project_id == project.id,
+                                        ProjectIssueStory.item_id == item.id,
+                                        ProjectUserStory.archived_at.is_(None),
+                                    )
+                                )
+                            ]
+                        prior = session.scalar(
+                            select(WorkspaceCandidate).where(
+                                WorkspaceCandidate.project_id == project.id,
+                                (WorkspaceCandidate.number == number)
+                                | (
+                                    (WorkspaceCandidate.kind == row.stage)
+                                    & (WorkspaceCandidate.identity == suggestion["identity"])
+                                ),
+                            )
+                        )
+                        if prior is not None:
+                            continue
                     added += 1
                     session.add(
                         WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)

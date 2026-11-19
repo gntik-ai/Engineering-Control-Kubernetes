@@ -42,7 +42,7 @@ from engineering_control.dashboard.backlog_items import STATES as BACKLOG_STATES
 from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
-from engineering_control.dashboard.planning import Kind
+from engineering_control.dashboard.planning import IssueView, Kind
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -118,6 +118,7 @@ from engineering_control.dashboard.schemas import (
     WorkspaceDescription,
     WorkspaceImportStep,
     WorkspaceIssueInput,
+    WorkspaceIssueStories,
     WorkspaceReviewInput,
 )
 from engineering_control.dashboard.service import DashboardService
@@ -1198,6 +1199,7 @@ def create_app(
         epic: UUID | None = None,
         record: UUID | None = None,
         connected: str = Query("", max_length=32),
+        issue_state: IssueView | None = None,
     ) -> Response:
         try:
             return JSONResponse(
@@ -1211,15 +1213,20 @@ def create_app(
                     epic,
                     record,
                     connected,
+                    issue_state,
                 )
             )
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
     @app.get("/api/dashboard/projects/{name}/planning/{kind}/pending")
-    async def pending_planning(name: str, kind: Kind, request: Request) -> Response:
+    async def pending_planning(
+        name: str, kind: Kind, request: Request, issue_state: IssueView | None = None
+    ) -> Response:
         try:
-            return JSONResponse(await asyncio.to_thread(repo(request).planning.pending, name, kind))
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).planning.pending, name, kind, issue_state)
+            )
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
@@ -1229,6 +1236,18 @@ def create_app(
             return JSONResponse(await asyncio.to_thread(repo(request).planning.parents, name, kind))
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/planning/issues/{key}/stories")
+    async def link_issue_stories(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceIssueStories,
+            lambda body: asyncio.to_thread(
+                repo(request).planning.link_stories, name, key, body.story_ids
+            ),
+            event="workspace.issue_stories_linked",
+            subject=name,
+        )
 
     async def save_planning(name: str, kind: Kind, key: UUID | None, request: Request) -> Response:
         schema = {"epics": EpicInput, "stories": StoryInput, "issues": WorkspaceIssueInput}[kind]
@@ -2423,7 +2442,7 @@ def create_app(
             installed = github(request)
             if installed is None:
                 raise ProjectConflict("The GitHub App is not configured, so issues cannot be read")
-            return await service(request).sync_backlog(name, installed)
+            return await service(request).sync_backlog(name, installed, full_history=True)
 
         return await project_change(
             request,

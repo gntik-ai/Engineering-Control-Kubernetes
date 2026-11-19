@@ -1123,10 +1123,13 @@ class DashboardService:
     async def backlog_status(self, project: str) -> dict[str, object] | None:
         return await asyncio.to_thread(self.repository.backlog.sync_status, project)
 
-    async def sync_backlog(self, project: str, github: GitHubApp) -> dict[str, object]:
+    async def sync_backlog(
+        self, project: str, github: GitHubApp, *, full_history: bool = False
+    ) -> dict[str, object]:
         """Read the open issues of the project's repository and bring its items in step."""
         repository = await asyncio.to_thread(self.repository.backlog.repository, project)
         try:
+            await self.repository.issue_inventory.refresh(project, github, full=full_history)
             issues, complete = await github.open_issues(repository)
             closed = {}
             if complete:
