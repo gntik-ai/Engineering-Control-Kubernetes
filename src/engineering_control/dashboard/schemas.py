@@ -332,6 +332,7 @@ class WorkspaceImportStep(PlainChangeInput):
     provider: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=200)
     all_epics: bool = False
+    background: bool = False
 
 
 class WorkspaceDescription(PlainChangeInput):
@@ -350,6 +351,19 @@ class WorkspaceChoice(DashboardModel):
 class WorkspaceReviewInput(PlainChangeInput):
     version: int = Field(ge=0)
     choices: list[WorkspaceChoice]
+
+
+class ProposalDecisions(PlainChangeInput):
+    ids: list[UUID] = Field(min_length=1)
+    version: int | None = Field(default=None, ge=0)
+    dismiss: bool = False
+
+
+class ProposalEdit(PlainChangeInput):
+    version: int = Field(ge=0)
+    title: str = Field(min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=40000)
+    parents: list[UUID] = Field(default_factory=list)
 
 
 class EpicInput(PlainChangeInput):

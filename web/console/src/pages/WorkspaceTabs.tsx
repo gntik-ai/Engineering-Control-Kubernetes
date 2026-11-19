@@ -29,9 +29,9 @@ import { apiUrl, postJson, useResource, type ProjectSummary } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
 import { setQuery, useLocation } from '../router';
-import { WorkspaceSync } from './WorkspaceReview';
+import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
-import { WorkspaceImport } from './WorkspaceImport';
+import { WorkspaceImport, type ImportState } from './WorkspaceImport';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = {
@@ -50,6 +50,7 @@ export interface PlanRow {
   epic_ids?: string[];
   story_ids?: string[];
   review?: string | null;
+  proposal?: boolean;
   github_state?: string | null;
   number?: number | null;
   url?: string | null;
@@ -61,6 +62,7 @@ function RecordEditor({
   path,
   row,
   choices,
+  version,
   close,
   saved,
 }: {
@@ -68,6 +70,7 @@ function RecordEditor({
   path: string;
   row?: PlanRow;
   choices: PlanRow[];
+  version?: number;
   close: () => void;
   saved: () => void;
 }) {
@@ -77,10 +80,10 @@ function RecordEditor({
   const label = singular[kind];
   const save = useSubmit(
     () =>
-      postJson(row ? path + '/' + row.id + '/update' : path, {
+      postJson(row ? path + '/' + row.id + (row.proposal ? '/proposal' : '/update') : path, {
         title,
         description,
-        ...(kind === 'stories' ? { epic_ids: parents } : kind === 'issues' ? { story_ids: parents } : {}),
+        ...(row?.proposal ? { version, parents } : kind === 'stories' ? { epic_ids: parents } : kind === 'issues' ? { story_ids: parents } : {}),
       }),
     () => {
       saved();
@@ -156,25 +159,55 @@ function RecordEditor({
   );
 }
 
-function Records({ kind, project }: { kind: Kind; project: string }) {
+function Records({ kind, project, repository }: { kind: Kind; project: string; repository: string }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning';
-  const plan = useResource<Plan>(apiUrl(path));
-  const [editor, setEditor] = useState<{ row?: PlanRow } | null>(null);
-  const [approving, setApproving] = useState<PlanRow | null>(null);
+  const plan = useResource<Plan>(apiUrl(path), 12000);
+  const importPath = 'projects/' + encodeURIComponent(project) + '/import';
+  const workflow = useResource<ImportState>(apiUrl(importPath), 4000);
+  const state = workflow.data;
+  const review = state?.stage === kind ? state.review : null;
+  const locked = Boolean(state?.busy && review);
+  const reload = () => { plan.reload(); workflow.reload(); };
+  const finish = useSubmit(
+    () => postJson(importPath + '/review', { version: state?.version, choices: [] }),
+    () => { reload(); setQuery({ tab: null }); },
+  );
+  const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
+  const [approving, setApproving] = useState<{ rows: PlanRow[]; version?: number; bulk?: boolean } | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
   const choices = (kind === 'stories' ? plan.data?.epics : plan.data?.stories) ?? [];
   const names = new Map(choices.map((p) => [p.id, p.title]));
-  const rows = plan.data?.[kind];
+  const proposals: PlanRow[] = (review?.candidates ?? []).filter(c => c.decision === 'pending').map(c => ({
+    id: c.id, title: c.title, description: c.description, proposal: true, review: 'proposal',
+    ...(kind === 'stories' ? { epic_ids: c.parents } : kind === 'issues' ? { story_ids: c.parents } : {}),
+    number: c.number, url: c.number ? repository + '/issues/' + c.number : null,
+  }));
+  const rows = plan.data && state && [...proposals, ...plan.data[kind]];
+  const pending = rows?.filter(r => r.proposal || r.review === 'pending') ?? [];
   const needsParents = kind !== 'epics' && !choices.length;
   return (
     <section className="grid min-w-0 gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-xl font-semibold">{sections[kind]}</h2>
-        <Button disabled={!rows || needsParents} onClick={() => setEditor({})}>
-          New {singular[kind]}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          {pending.length > 0 && (
+            <Button variant="secondary" disabled={locked} onClick={() => setApproving({ rows: pending, version: state?.version, bulk: true })}>
+              Approve all {sections[kind]} ({pending.length})
+            </Button>
+          )}
+          {review?.can_continue && !locked && (
+            <Button variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
+              {nextStageLabel[kind]}
+            </Button>
+          )}
+          <Button disabled={!rows || needsParents} onClick={() => setEditor({})}>
+            New {singular[kind]}
+          </Button>
+        </div>
       </div>
       <LoadError resource={plan} />
+      <LoadError resource={workflow} />
+      {finish.problem && <Alert tone="destructive" title={finish.problem} />}
       {plan.error && (
         <div>
           <RefreshButton resource={plan} />
@@ -197,7 +230,7 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
                 <TableRow>
                   <TableHead>Title</TableHead>
                   {kind !== 'epics' && <TableHead>{kind === 'stories' ? 'Epics' : 'User Stories'}</TableHead>}
-                  {kind === 'issues' && <TableHead>Status</TableHead>}
+                  <TableHead>Status</TableHead>
                   <TableHead>
                     <span className="sr-only">Actions</span>
                   </TableHead>
@@ -223,45 +256,45 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
                         </ul>
                       </TableCell>
                     )}
-                    {kind === 'issues' && (
-                      <TableCell className="align-top">
+                    <TableCell className="align-top">
                         <span>
-                          {record.review === 'pending' ? 'Pending approval' : (record.review ?? 'Linked')}
+                          {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
                         </span>
                         {record.url && (
                           <div>
                             <Link href={record.url} target="_blank" rel="noreferrer">
-                              #{record.number} · {record.github_state}
+                              #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
                             </Link>
                           </div>
                         )}
-                      </TableCell>
-                    )}
+                    </TableCell>
                     <TableCell className="align-top">
                       <div className="flex justify-end gap-1">
-                        {(kind !== 'issues' || record.review === 'pending') && (
+                        {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
                           <Button
                             size="sm"
                             variant="ghost"
+                            disabled={record.proposal && locked}
                             aria-label={'Edit ' + record.title}
-                            onClick={() => setEditor({ row: record })}
+                            onClick={() => setEditor({ row: record, version: state?.version })}
                           >
                             Edit
                           </Button>
                         )}
-                        {kind === 'issues' && record.review === 'pending' && (
-                          <Button size="sm" variant="secondary" onClick={() => setApproving(record)}>
+                        {(record.proposal || record.review === 'pending') && (
+                          <Button size="sm" variant="secondary" disabled={record.proposal && locked} aria-label={'Approve ' + record.title} onClick={() => setApproving({ rows: [record], version: state?.version })}>
                             Approve
                           </Button>
                         )}
-                        {kind !== 'issues' && (
+                        {(record.proposal || kind !== 'issues') && (
                           <Button
                             size="sm"
                             variant="ghost"
-                            aria-label={'Delete ' + record.title}
+                            disabled={record.proposal && locked}
+                            aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title}
                             onClick={() => setRemoving(record)}
                           >
-                            Delete
+                            {record.proposal ? 'Dismiss' : 'Delete'}
                           </Button>
                         )}
                       </div>
@@ -275,15 +308,13 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
-          title="Approve technical Issue?"
-          about={
-            approving.number
-              ? 'Link this proposal to GitHub issue #' + approving.number + ' and preserve its current state.'
-              : 'Create a new GitHub issue for ' + approving.title + '.'
-          }
-          action="Approve and sync"
-          run={() => postJson(path + '/issues/' + approving.id + '/approve')}
-          onDone={plan.reload}
+          title={approving.bulk ? `Approve all ${approving.rows.length} ${sections[kind]}?` : `Approve ${singular[kind]}?`}
+          about={(approving.bulk ? '' : approving.rows[0]!.title + '. ') + (kind === 'issues'
+            ? 'Create generated Issues in GitHub and link existing Issues in their current state.'
+            : 'Save the approved records. Any corresponding open planning issues will be closed on GitHub.')}
+          action={approving.bulk ? 'Approve all' : 'Approve'}
+          run={() => postJson(path + '/' + kind + '/decisions', { ids: approving.rows.map(r => r.id), version: approving.version })}
+          onDone={reload}
           onClose={() => setApproving(null)}
         />
       )}
@@ -293,18 +324,21 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
           path={path + '/' + kind}
           row={editor.row}
           choices={choices}
+          version={editor.version}
           close={() => setEditor(null)}
-          saved={plan.reload}
+          saved={reload}
         />
       )}
       {removing && (
         <Confirm
-          title={'Delete ' + singular[kind] + '?'}
+          title={(removing.proposal ? 'Dismiss ' : 'Delete ') + singular[kind] + '?'}
           about={removing.title}
-          action="Delete"
+          action={removing.proposal ? 'Dismiss' : 'Delete'}
           destructive
-          run={() => postJson(path + '/' + kind + '/' + removing.id + '/remove')}
-          onDone={plan.reload}
+          run={() => removing.proposal
+            ? postJson(path + '/' + kind + '/decisions', { ids: [removing.id], version: state?.version, dismiss: true })
+            : postJson(path + '/' + kind + '/' + removing.id + '/remove')}
+          onDone={reload}
           onClose={() => setRemoving(null)}
         />
       )}
@@ -358,7 +392,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (
           <TabsPanel key={kind} value={kind} className="pt-5">
-            {tab === kind && <Records kind={kind} project={project.project} />}
+            {tab === kind && <Records kind={kind} project={project.project} repository={project.repository_url} />}
           </TabsPanel>
         ))}
         <TabsPanel value="architecture" />
