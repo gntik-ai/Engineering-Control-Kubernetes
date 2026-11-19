@@ -89,6 +89,7 @@ function QueueList({ project }: { project: string }) {
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState('');
   const data = overview.data;
+  const hasDraft = queues.data?.items.some((q) => q.state === 'draft');
   const plan = () => {
     setBusy(true);
     setProblem('');
@@ -129,6 +130,11 @@ function QueueList({ project }: { project: string }) {
               Prepare execution plan
             </Button>
           </div>
+          {data && data.epics.length === 0 && (
+            <p className="text-sm">
+              Add or approve an open Epic in <Link href={workspaceUrl(project) + '?tab=epics'}>Epics</Link> to prepare a plan.
+            </p>
+          )}
           {epic && <EpicPreview key={epic} project={project} epic={epic} />}
           {data?.model && <p className="text-sm text-muted-foreground">Planning model · {data.model}</p>}
           {problem && <Alert tone="destructive" title={problem} />}
@@ -158,6 +164,7 @@ function QueueList({ project }: { project: string }) {
                   <TableHead>Queue</TableHead>
                   <TableHead>State</TableHead>
                   <TableHead>Progress</TableHead>
+                  {hasDraft && <TableHead>Action</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -170,6 +177,15 @@ function QueueList({ project }: { project: string }) {
                       <QueueState queue={q} />
                     </TableCell>
                     <TableCell>{progress(q.counts)}</TableCell>
+                    {hasDraft && (
+                      <TableCell>
+                        {q.state === 'draft' && (
+                          <Link href={queueUrl(project, q.id)} aria-label={'Review and start ' + q.name}>
+                            Review and start
+                          </Link>
+                        )}
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
                 {queues.data?.items.length === 0 && (
@@ -201,6 +217,9 @@ function EpicPreview({ project, epic }: { project: string; epic: string }) {
             {p.stories} open {p.stories === 1 ? 'Story' : 'Stories'} · {p.issues} technical{' '}
             {p.issues === 1 ? 'Issue' : 'Issues'}
           </p>
+          {p.issues === 0 && (
+            <p>To prepare this plan, link an open technical Issue to an open User Story in this Epic.</p>
+          )}
           {p.proposals.length > 0 && (
             <details>
               <summary>{p.proposals.length} Issue proposals awaiting approval</summary>
@@ -263,6 +282,11 @@ export function ExecutionEditor({
       {plan && (
         <>
           <Link href={recordUrl(project, 'epics', plan.epic)}>View Epic</Link>
+          {queue.state === 'draft' && ['queued', 'analyzing', 'failed'].includes(plan.status) && (
+            <div>
+              <Button disabled>Start execution</Button>
+            </div>
+          )}
           {plan.status === 'queued' || plan.status === 'analyzing' ? (
             <Button variant="secondary" disabled loading>
               Analyzing · {plan.processed} of {plan.issues.length} Issues reviewed
@@ -360,6 +384,49 @@ function ReviewOrder({
   return (
     <div className="grid gap-4">
       {plan.detail && <Alert tone="warning" title={plan.detail} />}
+      {queue.state !== 'finished' && (
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Execution controls">
+          {draft && (
+            <Button
+              loading={pending === 'start'}
+              disabled={!!pending || dirty || unconfirmed.length > 0}
+              onClick={() => change('start')}
+            >
+              Start execution
+            </Button>
+          )}
+          {dirty && (
+            <Button variant="secondary" disabled={!!pending} onClick={() => change('save', { ...edit })}>
+              Save order and prerequisites
+            </Button>
+          )}
+          {!!unconfirmed.length && (
+            <Button
+              variant="secondary"
+              disabled={!!pending || dirty || unconfirmed.some((i) => !types[i.id] && !i.type)}
+              onClick={() =>
+                change('classify', {
+                  types: Object.fromEntries(unconfirmed.map((i) => [i.id, types[i.id] ?? i.type])),
+                })
+              }
+            >
+              Confirm all classifications ({unconfirmed.length})
+            </Button>
+          )}
+          {draft && (
+            <Button variant="ghost" disabled={!!pending} onClick={() => change('refresh')}>
+              Refresh plan
+            </Button>
+          )}
+        </div>
+      )}
+      {draft && (dirty || unconfirmed.length > 0) && (
+        <p className="text-sm text-muted-foreground">
+          {dirty
+            ? 'Save your order and prerequisites before starting execution.'
+            : 'Confirm each Issue as a bug or enhancement to start execution. This applies its label on GitHub once the Issue is published.'}
+        </p>
+      )}
       <details open={draft}>
         <summary className="font-medium">User Story order · {plan.stories.length}</summary>
         <ol className="mt-2 grid gap-2">
@@ -552,41 +619,6 @@ function ReviewOrder({
             Next
           </Button>
         </div>
-      )}
-      {editable && (
-        <div className="flex flex-wrap gap-2">
-          <Button variant="secondary" disabled={!dirty} onClick={() => change('save', { ...edit })}>
-            Save order and prerequisites
-          </Button>
-          {!!unconfirmed.length && (
-            <Button
-              variant="secondary"
-              disabled={dirty || unconfirmed.some((i) => !types[i.id] && !i.type)}
-              onClick={() =>
-                change('classify', {
-                  types: Object.fromEntries(unconfirmed.map((i) => [i.id, types[i.id] ?? i.type])),
-                })
-              }
-            >
-              Confirm all classifications ({unconfirmed.length})
-            </Button>
-          )}
-          {draft && (
-            <>
-              <Button disabled={dirty || unconfirmed.length > 0} onClick={() => change('start')}>
-                Start execution
-              </Button>
-              <Button variant="ghost" onClick={() => change('refresh')}>
-                Refresh plan
-              </Button>
-            </>
-          )}
-        </div>
-      )}
-      {draft && (
-        <p className="text-xs text-muted-foreground">
-          Confirming a type syncs its label to GitHub. Draft Issues receive the label when published.
-        </p>
       )}
     </div>
   );

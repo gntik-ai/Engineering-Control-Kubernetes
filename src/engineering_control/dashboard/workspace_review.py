@@ -215,7 +215,7 @@ def _gap_proposals(
                 "retrying."
             )
         return "review", suggestions
-    return ("review" if bulk and seen else "gaps"), suggestions
+    return ("review" if bulk else "gaps"), suggestions
 
 
 # These are the only top-level arrays returned by review models. Decode whole objects
@@ -320,6 +320,16 @@ def _linked_parents(session: Session, project: UUID, stage: str) -> set[str]:
     return linked
 
 
+def epic_generation_complete(row: WorkspaceImport) -> bool:
+    if row.stage != "epics" or row.progress.get("review_mode") not in ("gaps", "review"):
+        return False
+    # Older background runs recorded their successful operation without a completion flag.
+    job = row.progress.get("operation") or {}
+    return row.progress.get("epics_bulk_complete") is True or (
+        job.get("action") == "all" and job.get("state") == "completed"
+    )
+
+
 def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
     mode = row.progress.get("review_mode", "existing")
     parents = (
@@ -333,7 +343,9 @@ def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
         )
     )
     candidates = _candidates(session, row.project_id, row.stage)
-    bulk_complete = False
+    bulk_complete = epic_generation_complete(row)
+    if bulk_complete:
+        mode = "review"
     if row.stage == "issues" and mode == "review" and "issue_checked_stories" in row.progress:
         linked = _linked_parents(session, row.project_id, row.stage)
         for c in candidates:
@@ -380,11 +392,27 @@ def next_stage(row: WorkspaceImport) -> None:
     row.version += 1
 
 
-def settle_stories(session: Session, row: WorkspaceImport) -> None:
-    """Finish a bulk generation only when the administrator has accepted enough local stories."""
-    if row.stage != "stories":
+def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
+    """Advance a completed generation only after the required local records are approved."""
+    if row.stage not in ("epics", "stories"):
         return
     if row.lease and row.lease_until and row.lease_until.replace(tzinfo=UTC) > datetime.now(UTC):
+        return
+    if row.stage == "epics":
+        if not epic_generation_complete(row):
+            return
+        pending_epic = session.scalar(
+            select(WorkspaceCandidate.id)
+            .where(
+                WorkspaceCandidate.project_id == row.project_id,
+                WorkspaceCandidate.kind == "epics",
+                WorkspaceCandidate.origin == "import",
+                WorkspaceCandidate.decision == "pending",
+            )
+            .limit(1)
+        )
+        if pending_epic is None and not coverage_problem(session, row.project_id, "epics"):
+            next_stage(row)
         return
     job = row.progress.get("operation") or {}
     mode = row.progress.get("review_mode")
@@ -730,6 +758,8 @@ class WorkspaceReview:
                 [p for p in state["uncovered"] if not focus or p in focus],
                 bulk=bulk,
             )
+            if bulk and row.stage == "epics":
+                progress["epics_bulk_complete"] = True
             if focus:
                 focused = set(focus)
                 needs_coverage = focused.intersection(state["uncovered"])
@@ -970,7 +1000,7 @@ class WorkspaceReview:
                 if changed:
                     row.version += 1
                 session.flush()
-                settle_stories(session, row)
+                settle_bulk_review(session, row)
             return {
                 "stage": row.stage if row else None,
                 "advanced_to": row.stage if row and row.stage != stage_before else None,

@@ -325,8 +325,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   );
   const afterDecision = (result: unknown) => {
     reload();
-    if (kind==='stories' && result && typeof result==='object' && 'advanced_to' in result && result.advanced_to==='issues')
-      setQuery({tab:null, page:null, search:null, epic:null, record:null, connected:null});
+    if (
+      result && typeof result === 'object' && 'advanced_to' in result &&
+      ((kind === 'epics' && result.advanced_to === 'stories') ||
+        (kind === 'stories' && result.advanced_to === 'issues'))
+    ) {
+      setQuery({ tab: null, page: null, search: null, epic: null, record: null, connected: null });
+    }
   };
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);

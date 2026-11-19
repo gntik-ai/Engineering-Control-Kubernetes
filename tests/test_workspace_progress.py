@@ -282,12 +282,9 @@ def test_single_and_bulk_decisions_preserve_other_rows_links_and_outbox(tmp_path
         assert (
             post(client, "import/review", version=state()["version"], choices=[]).status_code == 409
         )
-        assert decide("epics", [rest[-1]["id"]], dismiss=True).status_code == 200
-        assert decide("epics", [r["id"] for r in rest[:-1]]).status_code == 200
-        assert (
-            post(client, "import/review", version=state()["version"], choices=[]).json()["stage"]
-            == "stories"
-        )
+        assert decide("epics", [rest[-1]["id"]], dismiss=True).json()["advanced_to"] is None
+        assert decide("epics", [r["id"] for r in rest[:-1]]).json()["advanced_to"] == "stories"
+        assert state()["stage"] == "stories" and state()["review"]["mode"] == "existing"
         for kind in ("stories", "issues"):
             advance()
             one = advance()["review"]["candidates"][0]
@@ -656,6 +653,95 @@ def test_bulk_story_generation_has_a_finite_pass_even_when_model_always_wants_mo
         client.__exit__(None, None, None)
 
 
+@pytest.mark.parametrize("has_open_epic", [True, False])
+def test_bulk_epics_handoff_requires_an_approved_open_epic(
+    tmp_path: Path, has_open_epic: bool
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    epic = UUID(repo.planning.save("falcone", "epics", "Runtime", None, [])["id"])
+    if not has_open_epic:
+        repo.planning.set_state("falcone", "epics", epic, "closed")
+    calls = []
+
+    class Covered(ReviewModel):
+        async def ask(self, question: Question, *, retry: bool = True) -> Reply:
+            calls.append(question.system)
+            # An already covered initiative and an empty result both add zero proposals.
+            proposals = [{"title": "Runtime", "description": "Existing"}] if has_open_epic else []
+            return Reply(
+                {"complete": True, "epics": proposals},
+                "",
+                "fixture",
+                "analysis",
+                uuid4(),
+                "Fixture",
+                {},
+                0.1,
+                1,
+            )
+
+    client.app.state.models = Covered()
+    args = {"provider": "fixture", "model": "analysis"}
+    try:
+        first = post(client, "import/advance", version=1, **args).json()
+        result = post(client, "import/advance", version=first["version"], all_epics=True, **args)
+        assert result.status_code == 200, result.text
+        current = result.json()
+        if not has_open_epic:
+            assert current["stage"] == "epics" and current["review"]["bulk_complete"]
+            assert not current["review"]["can_continue"] and not current["review"]["candidates"]
+            assert (
+                post(client, "import/review", version=current["version"], choices=[]).status_code
+                == 409
+            )
+            assert (
+                post(
+                    client, "import/advance", version=current["version"], all_epics=True, **args
+                ).json()
+                == current
+            )
+            repo.planning.set_state("falcone", "epics", epic, "open")
+            repo.workspace_imports.settle_existing_reviews()
+            current = client.get(BASE + "import").json()
+        assert current["stage"] == "stories" and current["review"]["mode"] == "existing"
+        assert len(calls) == 1
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "active_lease", "stage"),
+    [
+        ("all", "completed", False, "stories"),
+        ("next", "completed", False, "epics"),
+        ("all", "failed", False, "epics"),
+        ("all", "interrupted", False, "epics"),
+        ("all", "running", True, "epics"),
+    ],
+)
+def test_reconcile_saved_epic_runs_without_model_calls(
+    tmp_path: Path, action: str, status: str, active_lease: bool, stage: str
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    seed(repo, 0)
+    repo.planning.save("falcone", "epics", "Runtime", None, [])
+    with repo.sessions.begin() as db:
+        row = db.scalars(select(WorkspaceImport)).one()
+        row.progress = {"review_mode": "review", "operation": {"action": action, "state": status}}
+        if active_lease:
+            row.lease = uuid4()
+            row.lease_until = datetime.now(UTC) + timedelta(minutes=1)
+    try:
+        repo.workspace_imports.settle_existing_reviews()
+        repo.workspace_imports.settle_existing_reviews()
+        result = client.get(BASE + "import").json()
+        assert result["stage"] == stage and result["version"] == (2 if stage == "stories" else 1)
+        assert result["busy"] == active_lease
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_legacy_completed_bulk_stories_advance_without_new_model_usage(tmp_path: Path) -> None:
     client, repo = _authenticated_client(tmp_path)
     seed(repo, 0)
@@ -670,8 +756,8 @@ def test_legacy_completed_bulk_stories_advance_without_new_model_usage(tmp_path:
             "operation": {"action": "all", "state": "completed", "added": 0},
         }
     try:
-        repo.workspace_imports.settle_existing_stories()
-        repo.workspace_imports.settle_existing_stories()
+        repo.workspace_imports.settle_existing_reviews()
+        repo.workspace_imports.settle_existing_reviews()
         current = client.get(BASE + "import").json()
         assert current["stage"] == "issues" and current["review"]["mode"] == "existing"
         assert current["version"] == 2

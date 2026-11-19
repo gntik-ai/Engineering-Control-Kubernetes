@@ -338,12 +338,12 @@ def create_app(
             await asyncio.sleep(30)
 
     async def analyze_connections(records: DashboardRepository, models: Models | None) -> None:
-        next_story_check = 0.0
+        next_review_check = 0.0
         while True:
             try:
-                if asyncio.get_running_loop().time() >= next_story_check:
-                    await asyncio.to_thread(records.workspace_imports.settle_existing_stories)
-                    next_story_check = asyncio.get_running_loop().time() + 60
+                if asyncio.get_running_loop().time() >= next_review_check:
+                    await asyncio.to_thread(records.workspace_imports.settle_existing_reviews)
+                    next_review_check = asyncio.get_running_loop().time() + 60
                 worked = await records.connection_analysis.tick(models)
             except Exception as error:  # noqa: BLE001 - the durable lease makes a failed pass retryable
                 log_failure("connection-review", "Project connection review could not run", error)

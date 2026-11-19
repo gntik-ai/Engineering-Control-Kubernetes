@@ -148,7 +148,6 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
                 )
             ],
         },
-        {"complete": True, "epics": []},
     ]
 
     def provider(request: httpx.Request) -> httpx.Response:
@@ -273,10 +272,12 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
         }
         assert client.get(base + "synchronization").json()["items"] == [] and not remote.closed
 
-        empty = advance(done["version"]).json()
-        assert empty["review"] == done["review"] and len(requests) == 4
+        assert done["review"]["bulk_complete"]
+        for bulk in (True, False):
+            assert advance(done["version"], bulk=bulk).json() == done
+        assert len(requests) == 3
         assert (
-            sum(d["tokens"] for d in repo.workspace_metrics.daily("falcone", 7)["series"]) == 5120
+            sum(d["tokens"] for d in repo.workspace_metrics.daily("falcone", 7)["series"]) == 3840
         )
         choices = [
             {k: c[k] for k in ("id", "title", "description", "parents")}
@@ -287,7 +288,7 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
         selected["title"] = "Custom exports"
         approved = client.post(
             base + "import/review",
-            json={"csrf_token": csrf, "version": empty["version"], "choices": choices},
+            json={"csrf_token": csrf, "version": done["version"], "choices": choices},
         ).json()
         assert approved["stage"] == "stories"
         assert {c["title"] for c in client.get(base + "planning").json()["epics"]} == {
@@ -295,7 +296,7 @@ def test_bulk_epics_use_one_request_and_remain_reviewable(tmp_path: Path) -> Non
             "Alerts",
             "Custom exports",
         }
-        assert advance(approved["version"]).status_code == 409 and len(requests) == 4
+        assert advance(approved["version"]).status_code == 409 and len(requests) == 3
     finally:
         client.__exit__(None, None, None)
 
