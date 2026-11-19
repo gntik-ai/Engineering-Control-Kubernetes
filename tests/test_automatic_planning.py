@@ -88,9 +88,8 @@ class Model:
         assert question.choices == (("fixture", "chosen"),) and not retry
         context = json.loads(question.prompt)
         self.calls.append(context)
-        return Reply(
-            self.answer(context), "", "fixture", "chosen", uuid4(), "Test", {"tokens": 25}, 0.2, 1
-        )
+        answer = {"matches": []} if "imported_issues" in context else self.answer(context)
+        return Reply(answer, "", "fixture", "chosen", uuid4(), "Test", {"tokens": 25}, 0.2, 1)
 
 
 def drain(worker: PlanningAnalysis, model: Any) -> None:
@@ -202,11 +201,12 @@ def test_creation_coverage_across_epics_follow_up_and_explicit_publication(works
         post(client, "planning/issues/decisions", ids=[r["id"] for r in drafts]).status_code == 200
     )
     drain(repo.planning_analysis, model)
-    assert len(model.calls) == 4
+    assert len([c for c in model.calls if "source" in c]) == 4
+    assert any("imported_issues" in c for c in model.calls)
     with repo.sessions() as db:
         assert db.scalar(select(func.count()).select_from(WorkspaceCandidate)) == 3
         assert list(db.scalars(select(WorkspaceAction.operation))) == ["create", "create"]
-        assert db.scalar(select(func.count()).select_from(WorkspaceModelUsage)) == 4
+        assert db.scalar(select(func.count()).select_from(WorkspaceModelUsage)) == len(model.calls)
 
 
 def test_intake_needs_input_then_resumes_after_correction(workspace: Any) -> None:

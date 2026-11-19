@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -15,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
+from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.planning import (
     Kind,
     coverage_problem,
@@ -99,7 +101,8 @@ INSTRUCTIONS = {
 
 
 def gap_identity(title: str) -> str:
-    return "gap:" + hashlib.sha256(clean_title(title).casefold().encode()).hexdigest()
+    normalized = " ".join(unicodedata.normalize("NFC", title).split()).casefold()
+    return "gap:" + hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def known_issue_titles(session: Session, project: UUID) -> list[str]:
@@ -128,17 +131,15 @@ def _records(
     ]
 
 
-def _candidates(session: Session, project: UUID, kind: str) -> list[WorkspaceCandidate]:
+def _candidates(session: Session, row: WorkspaceImport) -> list[WorkspaceCandidate]:
+    query = select(WorkspaceCandidate).where(
+        WorkspaceCandidate.project_id == row.project_id,
+        WorkspaceCandidate.kind == row.stage,
+    )
+    if coverage_run_state(row) not in ("running", "waiting"):
+        query = query.where(WorkspaceCandidate.origin == "import")
     return list(
-        session.scalars(
-            select(WorkspaceCandidate)
-            .where(
-                WorkspaceCandidate.project_id == project,
-                WorkspaceCandidate.kind == kind,
-                WorkspaceCandidate.origin == "import",
-            )
-            .order_by(WorkspaceCandidate.created_at, WorkspaceCandidate.id)
-        )
+        session.scalars(query.order_by(WorkspaceCandidate.created_at, WorkspaceCandidate.id))
     )
 
 
@@ -278,7 +279,7 @@ def _observe_records(
                 if not item["include"] and kind != "issues":
                     continue
             try:
-                identity = gap_identity(item["title"])
+                identity = gap_identity(clean_title(item["title"]) if bulk else item["title"])
                 description = clean_description(item["description"])
                 _parents(
                     item.get("parents", []),
@@ -342,7 +343,7 @@ def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
             open_only=mode != "existing",
         )
     )
-    candidates = _candidates(session, row.project_id, row.stage)
+    candidates = _candidates(session, row)
     bulk_complete = epic_generation_complete(row)
     if bulk_complete:
         mode = "review"
@@ -376,6 +377,17 @@ def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
     }
 
 
+def coverage_run_state(row: WorkspaceImport) -> str | None:
+    return (row.progress.get("coverage_run") or {}).get("state")
+
+
+def set_coverage_state(row: WorkspaceImport, state: str, detail: str | None = None) -> None:
+    run = row.progress.get("coverage_run")
+    if run and (run.get("state"), run.get("detail")) != (state, detail):
+        row.progress = {**row.progress, "coverage_run": {**run, "state": state, "detail": detail}}
+        row.version += 1
+
+
 def next_stage(row: WorkspaceImport) -> None:
     row.stage = {"epics": "stories", "stories": "issues", "issues": "complete"}[row.stage]
     row.progress = {
@@ -390,6 +402,8 @@ def next_stage(row: WorkspaceImport) -> None:
     }
     row.lease = row.lease_until = None
     row.version += 1
+    if coverage_run_state(row) in ("running", "waiting"):
+        set_coverage_state(row, "completed" if row.stage == "complete" else "running")
 
 
 def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
@@ -398,18 +412,18 @@ def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
         return
     if row.lease and row.lease_until and row.lease_until.replace(tzinfo=UTC) > datetime.now(UTC):
         return
+    pending_query = select(WorkspaceCandidate.parents).where(
+        WorkspaceCandidate.project_id == row.project_id,
+        WorkspaceCandidate.kind == row.stage,
+        WorkspaceCandidate.decision == "pending",
+    )
+    if coverage_run_state(row) not in ("running", "waiting"):
+        pending_query = pending_query.where(WorkspaceCandidate.origin == "import")
     if row.stage == "epics":
         if not epic_generation_complete(row):
             return
         pending_epic = session.scalar(
-            select(WorkspaceCandidate.id)
-            .where(
-                WorkspaceCandidate.project_id == row.project_id,
-                WorkspaceCandidate.kind == "epics",
-                WorkspaceCandidate.origin == "import",
-                WorkspaceCandidate.decision == "pending",
-            )
-            .limit(1)
+            pending_query.with_only_columns(WorkspaceCandidate.id).limit(1)
         )
         if pending_epic is None and not coverage_problem(session, row.project_id, "epics"):
             next_stage(row)
@@ -421,16 +435,7 @@ def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
         return
     if not (row.progress.get("stories_bulk") or legacy):
         return
-    pending = list(
-        session.scalars(
-            select(WorkspaceCandidate.parents).where(
-                WorkspaceCandidate.project_id == row.project_id,
-                WorkspaceCandidate.kind == "stories",
-                WorkspaceCandidate.origin == "import",
-                WorkspaceCandidate.decision == "pending",
-            )
-        )
-    )
+    pending = list(session.scalars(pending_query))
     linked = _linked_parents(session, row.project_id, "stories")
     for ids in pending:
         linked.update(ids)
@@ -529,6 +534,15 @@ class WorkspaceReview:
             state["uncovered"] = [p["id"] for p in state["parents"] if p["id"] not in linked]
             return state, sources
 
+    def _story_page(self, project: UUID, after: str | None) -> list[str]:
+        with self.sessions() as db:
+            query = select(ProjectUserStory.id).where(
+                ProjectUserStory.project_id == project, ProjectUserStory.archived_at.is_(None)
+            )
+            if after:
+                query = query.where(ProjectUserStory.id > UUID(after))
+            return [str(s) for s in db.scalars(query.order_by(ProjectUserStory.id).limit(PAGE + 1))]
+
     def _progress(self, row: WorkspaceImport, checked: int, found: int) -> None:
         with self.sessions.begin() as session:
             # Only the owner of the current step can publish provisional counts.
@@ -541,45 +555,98 @@ class WorkspaceReview:
             )
 
     async def propose(
-        self, row: WorkspaceImport, models: Models | None
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        self, name: str, row: WorkspaceImport, models: Models | None
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], Coverage | None]:
         if not models or not row.provider or not row.model:
             raise ProjectInvalid("Choose a configured model for planning")
-        state, sources = await asyncio.to_thread(self._context, row)
+        provider, model = row.provider, row.model
+
+        def owner(db: Session) -> None:
+            current = db.get(WorkspaceImport, row.project_id)
+            if not current or current.lease != row.lease:
+                raise ProjectConflict("This issue review was resumed in another session")
+
+        async def check(targets: set[str], *, historical: bool = False) -> Coverage:
+            try:
+                return await IssueCoverage(self.sessions).check(
+                    name,
+                    row.project_id,
+                    targets,
+                    provider,
+                    model,
+                    models,
+                    owner,
+                    historical=historical,
+                )
+            except ModelError as error:
+                raise ProjectConflict(
+                    f"The imported issue comparison could not finish: {error}"
+                ) from error
+
         progress = dict(row.progress)
+        run = progress.get("coverage_run") or {}
+        if run.get("match_existing"):
+            # Link existing work even when new Epic or Story proposals will need a human decision.
+            story_page = await asyncio.to_thread(
+                self._story_page, row.project_id, run.get("match_after")
+            )
+            group = story_page[:PAGE]
+            prior = await check(set(group), historical=True) if group else None
+            progress["coverage_run"] = {
+                **run,
+                "match_after": group[-1] if group else None,
+                "match_existing": len(story_page) > PAGE,
+            }
+            return progress, [], prior
+
+        state, sources = await asyncio.to_thread(self._context, row)
         bulk = progress.get("activity") == "all"
         mode = state["mode"]
         focus: list[str] = []
+        coverage: Coverage | None = None
         if bulk and row.stage in ("stories", "issues"):
             stories = row.stage == "stories"
             if stories:
                 progress["stories_bulk"] = True
             if (stories and mode == "review") or state["bulk_complete"]:
-                return progress, []
+                return progress, [], coverage
             ids = [p["id"] for p in state["parents"]]
             if not ids:
                 if stories:
                     raise ProjectInvalid("Approve an open Epic before generating User Stories")
                 progress.update(review_mode="review", issue_checked_stories=[])
-                return progress, []
+                return progress, [], coverage
             checkpoint = "story_checked_epics" if stories else "issue_checked_stories"
             checked = set(progress.get(checkpoint, [])).difference(state["uncovered"])
             focus = sorted(set(ids) - checked)[:8]
             if not focus:
                 progress["review_mode"] = "review"
-                return progress, []
+                return progress, [], coverage
             if not stories and progress.get("issue_partial_batches", 0) >= 3:
                 raise ProjectConflict(
                     "The model reported more work for this group after three batches. "
                     "The drafts are saved. Retry to continue with these User Stories."
                 )
+        if row.stage == "issues" and mode != "existing":
+            targets = set(focus) if bulk else {p["id"] for p in state["parents"]}
+            coverage = await check(targets)
+            # Account for the matched issues in the gap prompt. Their links commit
+            # before any new draft, under the same project lock.
+            state, sources = await asyncio.to_thread(self._context, row)
+            state["uncovered"] = [s for s in state["uncovered"] if not coverage.matches.get(s)]
+            if targets and targets <= coverage.full:
+                if bulk:
+                    checked.update(targets)
+                    progress[checkpoint] = sorted(checked)
+                progress["review_mode"] = "review" if not bulk or set(ids) <= checked else "gaps"
+                return progress, [], coverage
         if mode == "review":
             mode = "gaps"
             progress["review_mode"] = mode
         batch = sources[:PAGE]
         if mode == "existing" and not batch:
             progress["review_mode"] = "gaps"
-            return progress, []
+            return progress, [], coverage
         candidates = state["candidates"]
         if mode == "existing":
             progress["review_after"] = batch[-1].key
@@ -588,7 +655,24 @@ class WorkspaceReview:
                 progress["review_mode"] = "gaps"
             batch = [s for s in batch if (planning_kind(s.evidence) or "issues") == row.stage]
             if not batch:
-                return progress, []
+                return progress, [], coverage
+            if row.stage == "issues" and coverage_run_state(row) == "running":
+                # Mirror historic sources before the Story-by-Story coverage check.
+                # Already imported issues keep their identity and review decision.
+                return (
+                    progress,
+                    [
+                        {
+                            "number": s.evidence["number"],
+                            "identity": s.key,
+                            "title": s.evidence["title"],
+                            "description": clean_description(s.evidence.get("body")),
+                            "parents": [],
+                        }
+                        for s in batch
+                    ],
+                    coverage,
+                )
         records = (
             [
                 {
@@ -622,6 +706,9 @@ class WorkspaceReview:
             ],
             "github_issues": records,
         }
+        if coverage:
+            context["imported_issue_coverage"] = coverage.matches
+            context["fully_covered_stories"] = sorted(coverage.full)
         if mode == "existing":
             if row.stage == "issues":
                 # Only the current issues and their possible parent Stories are needed for mapping.
@@ -685,8 +772,8 @@ class WorkspaceReview:
                     "technical work still required, considering existing open and closed issues "
                     "and pending drafts. Skip equivalent work even when its title differs. "
                     "Give each issue a precise title, implementation scope and a verifiable "
-                    "outcome. Link it to at least one Story in this batch and include other "
-                    "applicable approved Story IDs. Prioritize uncovered Stories. Return up to "
+                    "outcome. Link it to the applicable approved Stories in this batch only. "
+                    "Prioritize uncovered Stories. Return up to "
                     "20 new issues. Set complete true when no further evidenced work remains "
                     "for this batch, including when existing issues already cover it."
                 )
@@ -695,6 +782,14 @@ class WorkspaceReview:
             task = (
                 "Propose one missing record. Prefer uncovered parents. Set complete true only "
                 "when evidence and coverage justify ending generation. Use actual parent IDs."
+            )
+        if coverage:
+            task += (
+                " Use imported_issue_coverage before proposing work. The linked open and closed "
+                "issues can jointly cover a Story. Closed not_planned issues are historical "
+                "relationships only. Propose only remaining acceptance criteria. Omit fully "
+                "covered Stories. If all criteria are covered, return "
+                "complete true."
             )
         valid = {p["id"] for p in state["parents"]}
         supplied = {s.evidence["number"] for s in batch}
@@ -758,6 +853,15 @@ class WorkspaceReview:
                 [p for p in state["uncovered"] if not focus or p in focus],
                 bulk=bulk,
             )
+            if coverage:
+                for suggestion in suggestions:
+                    assessed = [s for s in suggestion["parents"] if s in coverage.revisions]
+                    if not assessed:
+                        raise ProjectInvalid(
+                            "Each generated issue must link to a Story in this batch"
+                        )
+                    suggestion["parents"] = [s for s in assessed if s not in coverage.full]
+                suggestions = [s for s in suggestions if s["parents"]]
             if bulk and row.stage == "epics":
                 progress["epics_bulk_complete"] = True
             if focus:
@@ -773,10 +877,6 @@ class WorkspaceReview:
                     )
                     progress["story_continuation"] = focus if overflow else []
                 else:
-                    if any(focused.isdisjoint(s["parents"]) for s in suggestions):
-                        raise ProjectInvalid(
-                            "Each generated issue must link to a Story in this batch"
-                        )
                     overflow = not reply.data["complete"]
                     if (overflow and not suggestions) or (
                         not overflow and needs_coverage and uncovered == needs_coverage
@@ -792,7 +892,7 @@ class WorkspaceReview:
                     checked.update(focused - uncovered)
                 progress[checkpoint] = sorted(checked)
                 progress["review_mode"] = "review" if set(ids) <= checked else "gaps"
-        return progress, suggestions
+        return progress, suggestions, coverage
 
     @staticmethod
     def _materialize(
@@ -874,6 +974,8 @@ class WorkspaceReview:
     def _editable(row: WorkspaceImport | None, kind: str, version: int | None) -> None:
         if row is None or row.stage != kind or row.version != version:
             raise ProjectConflict("Reload the table to review the current proposals")
+        if coverage_run_state(row) == "running":
+            raise ProjectConflict("The project is still checking coverage.")
         if (
             row.lease
             and row.lease_until
@@ -1001,6 +1103,11 @@ class WorkspaceReview:
                     row.version += 1
                 session.flush()
                 settle_bulk_review(session, row)
+                if (
+                    coverage_run_state(row) == "waiting"
+                    and row.progress.get("review_mode") == "gaps"
+                ):
+                    set_coverage_state(row, "running")
             return {
                 "stage": row.stage if row else None,
                 "advanced_to": row.stage if row and row.stage != stage_before else None,
@@ -1021,12 +1128,14 @@ class WorkspaceReview:
                 )
                 or row.progress.get("review_mode", "existing") == "existing"
                 or (decisions and row.progress.get("review_mode") != "review")
+                or coverage_run_state(row) == "running"
+                or (coverage_run_state(row) == "waiting" and decisions)
             ):
                 raise ProjectConflict(
                     "Finish checking existing issues and missing coverage before approval"
                 )
             stage = row.stage
-            candidates = _candidates(session, project.id, stage)
+            candidates = _candidates(session, row)
             edits = {str(d["id"]): d for d in decisions}
             pending = [c for c in candidates if c.decision == "pending"]
             if len(edits) != len(decisions) or set(edits) not in (

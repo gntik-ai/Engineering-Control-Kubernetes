@@ -792,7 +792,7 @@ def test_generate_all_issues_checks_each_story_and_leaves_local_drafts(tmp_path:
 
     class Model(ReviewModel):
         async def ask(self, q: Question, *, retry: bool = True) -> Reply:
-            if "records" in q.schema["properties"]:
+            if "records" in q.schema["properties"] or "matches" in q.schema["properties"]:
                 return await super().ask(q, retry=retry)
             assert not retry and q.choices == (("fixture", "analysis"),)
             ctx = json.loads(q.prompt)

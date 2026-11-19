@@ -696,6 +696,24 @@ class ProjectUserStory(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class StoryIssueCoverage(Base):
+    """Checkpoint the imported issue inventory examined for an approved Story."""
+
+    __tablename__ = "story_issue_coverage"
+    project_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    story_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    revision: Mapped[str] = mapped_column(String(64))
+    checked: Mapped[int] = mapped_column(Integer)
+    matches: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "story_id"],
+            ["project_user_stories.project_id", "project_user_stories.id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+
 class ProjectStoryEpic(Base):
     __tablename__ = "project_story_epics"
     project_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)

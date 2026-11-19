@@ -249,6 +249,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/archive",
         "/api/dashboard/projects/{name}/import/start",
         "/api/dashboard/projects/{name}/import/advance",
+        "/api/dashboard/projects/{name}/import/coverage",
         "/api/dashboard/projects/{name}/import/description",
         "/api/dashboard/projects/{name}/import/review",
         "/api/dashboard/projects/{name}/planning/issues/{key}/approve",

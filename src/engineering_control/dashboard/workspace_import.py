@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.issue_coverage import Coverage, technical_items
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -30,10 +31,13 @@ from engineering_control.dashboard.workspace_issues import (
 from engineering_control.dashboard.workspace_review import (
     KINDS,
     WorkspaceReview,
+    coverage_run_state,
     epic_generation_complete,
     gap_identity,
     known_issue_titles,
+    next_stage,
     review_state,
+    set_coverage_state,
     settle_bulk_review,
 )
 from engineering_control.db.models import (
@@ -105,6 +109,7 @@ class Update:
     commit: str | None = None
     description: str | None = None
     suggestions: list[dict[str, Any]] = field(default_factory=list)
+    coverage: Coverage | None = None
 
 
 def _file_key(path: str) -> str:
@@ -220,6 +225,7 @@ class WorkspaceImports:
                 "stage": row.stage if row else "new",
                 "version": row.version if row else 0,
                 "busy": busy,
+                "coverage_run": progress.get("coverage_run"),
                 "activity": progress.get("activity", default_action) if busy else None,
                 "operation": job,
                 "found": proposals + preview,
@@ -231,7 +237,9 @@ class WorkspaceImports:
                 return status
             return {
                 **status,
-                "models": self.model_choices() if row and row.stage in ("analysis", *KINDS) else [],
+                "models": self.model_choices()
+                if row and row.stage in ("analysis", *KINDS, "complete")
+                else [],
                 "review": review_state(session, row) if row and row.stage in KINDS else None,
                 "project": name,
                 "commit": row.commit_sha if row else None,
@@ -268,6 +276,110 @@ class WorkspaceImports:
                 )
         return self.status(name)
 
+    def start_coverage(
+        self, name: str, version: int, provider: str | None, model: str | None
+    ) -> dict[str, Any]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.get(WorkspaceImport, project.id)
+            if project.paused_at:
+                raise ProjectConflict("Resume the project to run its coverage check.")
+            if not row or row.stage not in (*KINDS, "complete"):
+                raise ProjectConflict(
+                    "Approve the repository description before checking project coverage."
+                )
+            if coverage_run_state(row) not in ("running", "waiting"):
+                if row.version != version or (
+                    row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC)
+                ):
+                    raise ProjectConflict("Another review is in progress. Reload the project.")
+                if not provider and not model:
+                    provider, model = (
+                        (project.planning_provider, project.planning_model)
+                        if project.planning_model
+                        else (row.provider, row.model)
+                    )
+                if {"provider": provider, "model": model} not in self.model_choices():
+                    raise ProjectInvalid(
+                        "Choose an available Accounts model for the coverage check."
+                    )
+                if row.progress.get("usage_daily") and "legacy_price_model" not in row.progress:
+                    row.progress = {
+                        **row.progress,
+                        "legacy_price_model": {"provider": row.provider, "model": row.model},
+                    }
+                row.provider, row.model = provider, model
+                if coverage_run_state(row) == "failed":
+                    set_coverage_state(row, "running")
+                else:
+                    # Revisit the inventory while preserving repository evidence, metering,
+                    # saved records, pending proposals and every administrator decision.
+                    review_keys = {
+                        "epics_bulk_complete",
+                        "stories_bulk",
+                        "story_checked_epics",
+                        "story_continuation",
+                        "issue_checked_stories",
+                        "issue_partial_batches",
+                        "operation",
+                        "activity",
+                        "found",
+                        "checked",
+                    }
+                    row.stage = "epics"
+                    row.draft = project.description or row.draft
+                    row.progress = {
+                        **{k: v for k, v in row.progress.items() if k not in review_keys},
+                        "review_mode": "existing",
+                        "review_after": "",
+                        "reviewed_issues": 0,
+                        "coverage_run": {
+                            "state": "running",
+                            "epics": 0,
+                            "stories": 0,
+                            "issues": 0,
+                            "links": 0,
+                            "match_existing": True,
+                        },
+                    }
+                    row.version += 1
+                row.lease = row.lease_until = None
+        return self.status(name)
+
+    def _due_coverage(self) -> tuple[str, int, str | None, str | None, str | None] | None:
+        with self.sessions() as db:
+            pair = db.execute(
+                select(ProjectRecord.name, WorkspaceImport)
+                .join(WorkspaceImport, WorkspaceImport.project_id == ProjectRecord.id)
+                .where(
+                    ProjectRecord.archived_at.is_(None),
+                    ProjectRecord.paused_at.is_(None),
+                    WorkspaceImport.stage.in_(KINDS),
+                    WorkspaceImport.progress["coverage_run"]["state"].as_string() == "running",
+                    WorkspaceImport.lease.is_(None)
+                    | (WorkspaceImport.lease_until <= datetime.now(UTC)),
+                )
+                .order_by(WorkspaceImport.updated_at, ProjectRecord.name)
+                .limit(1)
+            ).first()
+            if not pair:
+                return None
+            name, row = pair
+            bulk = None if row.progress.get("review_mode", "existing") == "existing" else row.stage
+            return name, row.version, row.provider, row.model, bulk
+
+    async def tick_coverage(self, models: Models) -> bool:
+        due = await asyncio.to_thread(self._due_coverage)
+        if not due:
+            return False
+        try:
+            row = await asyncio.to_thread(self._claim, *due, background=True, automatic=True)
+        except ProjectConflict:
+            return False  # Another worker claimed or advanced this run.
+        if row:
+            self._launch_review(due[0], row, models)
+        return True
+
     def _claim(
         self,
         name: str,
@@ -276,6 +388,7 @@ class WorkspaceImports:
         model: str | None,
         bulk_stage: str | None,
         background: bool = False,
+        automatic: bool = False,
     ) -> WorkspaceImport | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -284,6 +397,13 @@ class WorkspaceImports:
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
+            run_state = coverage_run_state(row)
+            if automatic and run_state != "running":
+                raise ProjectConflict("The project coverage run has changed.")
+            if not automatic and run_state == "failed":
+                row.progress = {k: v for k, v in row.progress.items() if k != "coverage_run"}
+            if not automatic and run_state in ("waiting", "running"):
+                raise ProjectConflict("Use the project coverage check to continue this run.")
             if background and row.stage not in KINDS:
                 raise ProjectConflict("Only a planning review can run in the background")
             if bulk_stage and (
@@ -369,8 +489,16 @@ class WorkspaceImports:
                 raise ProjectConflict("This step has been resumed in another session")
             job = row.progress.get("operation")
             added = 0
+            linked_issues = 0
+            generated = 0
+            stage_before = row.stage
             if result is not None:
-                import_issues(session, project, [e for _, k, e in result.sources if k == "issue"])
+                if result.coverage:
+                    result.coverage.validate(session, project, generating=row.stage == "issues")
+                    linked_issues += result.coverage.link(session, project)
+                linked_issues += import_issues(
+                    session, project, [e for _, k, e in result.sources if k == "issue"]
+                )
                 for key, kind, evidence in result.sources:
                     if kind == "issue":
                         continue
@@ -437,7 +565,7 @@ class WorkspaceImports:
                         ):
                             continue
                         if row.stage == "issues":
-                            import_issues(session, project, [source.evidence])
+                            linked_issues += import_issues(session, project, [source.evidence])
                             item = session.scalars(
                                 select(BacklogItem).where(
                                     BacklogItem.project_id == project.id,
@@ -457,7 +585,11 @@ class WorkspaceImports:
                                 )
                             )
                             if not (item.facts or {}).get("manual_story_links"):
-                                add_story_links(session, project.id, item.id, story_ids)
+                                linked_issues += add_story_links(
+                                    session, project.id, item.id, story_ids
+                                )
+                            if coverage_run_state(row) == "running":
+                                continue
                             suggestion["parents"] = [
                                 str(uid)
                                 for uid in session.scalars(
@@ -486,6 +618,7 @@ class WorkspaceImports:
                         if prior is not None:
                             continue
                     added += 1
+                    generated += int(number is None)
                     session.add(
                         WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)
                     )
@@ -494,6 +627,16 @@ class WorkspaceImports:
                 if result.description is not None:
                     row.draft = result.description
                 row.version += 1
+                if coverage_run_state(row) == "running":
+                    run = row.progress["coverage_run"]
+                    row.progress = {
+                        **row.progress,
+                        "coverage_run": {
+                            **run,
+                            stage_before: run.get(stage_before, 0) + generated,
+                            "links": run["links"] + linked_issues,
+                        },
+                    }
             if job and job["state"] == "running":
                 job = {**job, "added": job["added"] + added}
                 if result and (
@@ -524,12 +667,37 @@ class WorkspaceImports:
             row.lease = row.lease_until = None
             session.flush()
             settle_bulk_review(session, row)
+            if coverage_run_state(row) == "running":
+                if error:
+                    set_coverage_state(row, "failed", error)
+                elif (
+                    result
+                    and row.stage == stage_before
+                    and row.progress.get("review_mode") == "review"
+                ):
+                    if row.stage == "issues":
+                        if review_state(session, row)["can_continue"]:
+                            next_stage(row)
+                        run = row.progress["coverage_run"]
+                        row.progress = {
+                            **row.progress,
+                            "coverage_run": {
+                                **run,
+                                "orphans": sum(
+                                    1 for _ in technical_items(session, project, unlinked=True)
+                                ),
+                            },
+                        }
+                        set_coverage_state(row, "completed")
+                    else:
+                        set_coverage_state(row, "waiting")
             return None
 
     def settle_existing_reviews(self) -> None:
         progress = WorkspaceImport.progress
         legacy_stories = (WorkspaceImport.stage == "stories") & (
-            progress["activity"].as_string() == "all"
+            (progress["activity"].as_string() == "all")
+            | (progress["coverage_run"]["state"].as_string() == "waiting")
         )
         pending_epic = (
             select(WorkspaceCandidate.id)
@@ -570,6 +738,11 @@ class WorkspaceImports:
                 row = db.get(WorkspaceImport, project.id)
                 if row:
                     settle_bulk_review(db, row)
+                    if (
+                        coverage_run_state(row) == "waiting"
+                        and row.progress.get("review_mode") == "gaps"
+                    ):
+                        set_coverage_state(row, "running")
 
     def _renew(self, row: WorkspaceImport) -> None:
         with self.sessions.begin() as session:
@@ -594,8 +767,8 @@ class WorkspaceImports:
         row: WorkspaceImport | None = first
         try:
             while row is not None:
-                progress, suggestions = await self.review.propose(row, models)
-                result = Update(row.stage, progress, suggestions=suggestions)
+                progress, suggestions, coverage = await self.review.propose(name, row, models)
+                result = Update(row.stage, progress, suggestions=suggestions, coverage=coverage)
                 row = await asyncio.to_thread(self._release, name, first.lease, result)
         except asyncio.CancelledError:
             await asyncio.to_thread(self._release, name, first.lease, None)
@@ -617,6 +790,11 @@ class WorkspaceImports:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+
+    def _launch_review(self, name: str, row: WorkspaceImport, models: Models | None) -> None:
+        task = asyncio.create_task(self._run_review(name, row, models))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
     async def stop_reviews(self) -> None:
         tasks = list(self.tasks)
@@ -651,17 +829,15 @@ class WorkspaceImports:
         if row is None:
             return await asyncio.to_thread(self.status, name)
         if background:
-            task = asyncio.create_task(self._run_review(name, row, models))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
+            self._launch_review(name, row, models)
             return await asyncio.to_thread(self.status, name)
         if batched:
             await self._run_review(name, row, models, propagate=True)
             return await asyncio.to_thread(self.status, name)
         try:
             if row.stage in KINDS:
-                progress, suggestions = await self.review.propose(row, models)
-                result = Update(row.stage, progress, suggestions=suggestions)
+                progress, suggestions, coverage = await self.review.propose(name, row, models)
+                result = Update(row.stage, progress, suggestions=suggestions, coverage=coverage)
             elif row.stage == "analysis":
                 result = await self._analyze(row, models)
             elif github is None:
@@ -677,10 +853,13 @@ class WorkspaceImports:
                         result = await self._files(row, github, token)
                 finally:
                     await github.revoke(token)
+            await asyncio.to_thread(self._release, name, row.lease, result)
         except BaseException:
-            await asyncio.shield(asyncio.to_thread(self._release, name, row.lease, None))
+            try:
+                await asyncio.shield(asyncio.to_thread(self._release, name, row.lease, None))
+            except ProjectConflict:
+                pass  # Another worker owns the step.
             raise
-        await asyncio.to_thread(self._release, name, row.lease, result)
         return await asyncio.to_thread(self.status, name)
 
     async def _inventory(self, row: WorkspaceImport, github: GitHubApp, token: str) -> Update:

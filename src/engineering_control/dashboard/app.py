@@ -119,6 +119,7 @@ from engineering_control.dashboard.schemas import (
     TaskInput,
     TriggerInput,
     TriggerUpdateInput,
+    WorkspaceCoverageInput,
     WorkspaceDescription,
     WorkspaceImportStep,
     WorkspaceIssueInput,
@@ -353,11 +354,12 @@ def create_app(
     async def review_new_planning(records: DashboardRepository, available: Models) -> None:
         while True:
             try:
-                planned, reviewed = await asyncio.gather(
+                planned, reviewed, coverage = await asyncio.gather(
                     records.execution_plans.tick(available),
                     records.planning_analysis.tick(available),
+                    records.workspace_imports.tick_coverage(available),
                 )
-                worked = planned or reviewed
+                worked = planned or reviewed or coverage
             except Exception as error:  # noqa: BLE001 - an expired lease is resumed on the next pass
                 log_failure("planning-review", "Automatic planning review could not run", error)
                 worked = False
@@ -945,6 +947,22 @@ def create_app(
             PlainChangeInput,
             lambda _: asyncio.to_thread(repo(request).workspace_imports.start, name),
             event="workspace.import_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/import/coverage")
+    async def start_project_coverage(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceCoverageInput,
+            lambda body: asyncio.to_thread(
+                repo(request).workspace_imports.start_coverage,
+                name,
+                body.version,
+                body.provider,
+                body.model,
+            ),
+            event="workspace.coverage_requested",
             subject=name,
         )
 

@@ -231,6 +231,15 @@ def _approvable(rows: Subquery, kind: Kind) -> ColumnElement[bool]:
 
 
 def _table_rows(project: UUID, kind: Kind) -> Subquery:
+    awaiting_stage = (
+        (WorkspaceImport.stage != kind)
+        & (WorkspaceCandidate.origin == "import")
+        & (
+            WorkspaceImport.progress["coverage_run"]["state"]
+            .as_string()
+            .in_(("running", "waiting", "failed"))
+        )
+    )
     proposals = (
         select(
             WorkspaceCandidate.id,
@@ -238,7 +247,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceCandidate.description,
             WorkspaceCandidate.created_at,
             true().label("proposal"),
-            literal("proposal").label("review"),
+            case((awaiting_stage, "awaiting_stage"), else_="proposal").label("review"),
             WorkspaceCandidate.parents,
             WorkspaceCandidate.number,
             WorkspaceSource.evidence["state"].as_string().label("github_state"),
@@ -256,7 +265,9 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceCandidate.project_id == project,
             WorkspaceCandidate.kind == kind,
             WorkspaceCandidate.decision == "pending",
-            (WorkspaceImport.stage == kind) | (WorkspaceCandidate.origin != "import"),
+            (WorkspaceImport.stage == kind)
+            | (WorkspaceCandidate.origin != "import")
+            | awaiting_stage,
         )
     )
     saved: Select[Any]
@@ -581,6 +592,7 @@ class PlanningRecords:
                     WorkspaceImport.lease,
                     WorkspaceImport.lease_until,
                     WorkspaceImport.progress["review_mode"].as_string().label("mode"),
+                    WorkspaceImport.progress["coverage_run"]["state"].as_string().label("coverage"),
                 ).where(WorkspaceImport.project_id == project.id)
             ).one_or_none()
             current = review is not None and review.stage == kind
@@ -606,13 +618,19 @@ class PlanningRecords:
                 "busy": bool(
                     current
                     and review
-                    and review.lease
-                    and review.lease_until
-                    and review.lease_until.replace(tzinfo=UTC) > datetime.now(UTC)
+                    and (
+                        review.coverage == "running"
+                        or (
+                            review.lease
+                            and review.lease_until
+                            and review.lease_until.replace(tzinfo=UTC) > datetime.now(UTC)
+                        )
+                    )
                 ),
                 "can_continue": bool(
                     current
                     and review
+                    and review.coverage != "running"
                     and review.mode in ("gaps", "review")
                     and not proposed
                     and not coverage_problem(session, project.id, kind)
@@ -681,6 +699,16 @@ class PlanningRecords:
             replace_parents(db, "issues", project.id, key, stories)
             record_changed(db, project.id, "issues", key, item.title)
             item.facts = {**(item.facts or {}), "manual_story_links": True}
+            mirror = db.scalar(
+                select(WorkspaceCandidate).where(
+                    WorkspaceCandidate.project_id == project.id,
+                    WorkspaceCandidate.kind == "issues",
+                    WorkspaceCandidate.number == item.issue_number,
+                    WorkspaceCandidate.decision == "pending",
+                )
+            )
+            if mirror:
+                mirror.parents = sorted({str(story) for story in stories})
             item.updated_at = datetime.now(UTC)
             return {"id": str(key)}
 
