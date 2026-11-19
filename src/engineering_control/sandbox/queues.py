@@ -33,6 +33,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.db.models import (
     BacklogItem,
     Budget,
+    EpicExecutionPlan,
     ProjectRecord,
     ProjectSection,
     ProviderAccount,
@@ -43,6 +44,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.flow_library import WORK_KINDS
 from engineering_control.sandbox.deliver import toolchain_for
+from engineering_control.sandbox.execution_order import QueueChanged
 from engineering_control.sandbox.runs import Runs
 
 UNDER_WAY: Final = ("draft", "running", "paused")
@@ -274,6 +276,10 @@ class Queues:
             "state": queue.state,
             "at_once": queue.at_once,
             "proposed_by": queue.proposed_by,
+            "epic_plan": session.scalar(
+                select(EpicExecutionPlan.queue_id).where(EpicExecutionPlan.queue_id == queue.id)
+            )
+            is not None,
             "reason": queue.reason,
             "pause_reason": queue.pause_reason,
             "counts": self._counts(session, queue.id),
@@ -322,6 +328,12 @@ class Queues:
             .where(WorkQueue.id == queue_id, ProjectRecord.archived_at.is_(None))
         )
         if lock:
+            session.scalar(
+                select(ProjectRecord.id)
+                .join(WorkQueue)
+                .where(WorkQueue.id == queue_id)
+                .with_for_update(of=ProjectRecord)
+            )
             query = query.with_for_update(of=WorkQueue)
         row = session.execute(query).first()
         if row is None:
@@ -494,9 +506,9 @@ class Queues:
             raise ProjectInvalid("A queue needs at least one item")
         with self.sessions.begin() as session:
             record = session.scalar(
-                select(ProjectRecord).where(
-                    ProjectRecord.name == project, ProjectRecord.archived_at.is_(None)
-                )
+                select(ProjectRecord)
+                .where(ProjectRecord.name == project, ProjectRecord.archived_at.is_(None))
+                .with_for_update()
             )
             if record is None:
                 raise ProjectNotFound(project)
@@ -514,9 +526,15 @@ class Queues:
             session.flush()
             return self._detail(session, queue, record)
 
+    @staticmethod
+    def _manual_queue(session: Session, queue: WorkQueue) -> None:
+        if session.get(EpicExecutionPlan, queue.id):
+            raise ProjectConflict("Edit the Epic execution plan from the project Queue.")
+
     def add_items(self, queue_id: UUID, item_ids: list[UUID]) -> dict[str, Any]:
         with self.sessions.begin() as session:
             queue, project = self._one(session, queue_id, lock=True)
+            self._manual_queue(session, queue)
             self._add(session, queue, item_ids)
             session.flush()
             return self._detail(session, queue, project)
@@ -524,6 +542,7 @@ class Queues:
     def remove_item(self, queue_id: UUID, item_id: UUID) -> dict[str, Any]:
         with self.sessions.begin() as session:
             queue, project = self._one(session, queue_id, lock=True)
+            self._manual_queue(session, queue)
             entry = session.scalar(
                 select(WorkQueueEntry).where(
                     WorkQueueEntry.queue_id == queue.id, WorkQueueEntry.item_id == item_id
@@ -542,6 +561,7 @@ class Queues:
         once; items that ran or are running keep their place ahead of them."""
         with self.sessions.begin() as session:
             queue, project = self._one(session, queue_id, lock=True)
+            self._manual_queue(session, queue)
             entries = session.scalars(
                 select(WorkQueueEntry)
                 .where(WorkQueueEntry.queue_id == queue.id)
@@ -571,6 +591,7 @@ class Queues:
             if name is not None:
                 queue.name = self._name(name)
             if at_once is not None:
+                self._manual_queue(session, queue)
                 queue.at_once = self._at_once(at_once)
             session.flush()
             return self._detail(session, queue, project)
@@ -579,11 +600,25 @@ class Queues:
         """Start a draft, or resume a paused queue."""
         with self.sessions.begin() as session:
             queue, project = self._one(session, queue_id, lock=True)
+            plan = session.get(EpicExecutionPlan, queue.id)
+            if plan and plan.status != "approved":
+                raise ProjectConflict("Review and start the Epic from the project Queue.")
             if queue.state not in ("draft", "paused"):
                 raise ProjectConflict(
                     "The queue is already running"
                     if queue.state == "running"
                     else "The queue has finished"
+                )
+            others = select(WorkQueue.id).where(
+                WorkQueue.project_id == project.id,
+                WorkQueue.id != queue_id,
+                WorkQueue.state == "running",
+            )
+            if not plan:
+                others = others.join(EpicExecutionPlan)
+            if session.scalar(others.limit(1)):
+                raise ProjectConflict(
+                    "Pause or finish this project's active execution queue first."
                 )
             if not self._counts(session, queue.id)["waiting"]:
                 raise ProjectInvalid("No item of the queue waits to be worked on")
@@ -683,16 +718,28 @@ class Queues:
                 if run is None:
                     entry.state, entry.detail = "failed", "Its run is no longer there."
                 elif run.state == "waiting":
-                    entry.state, entry.detail = "done", "A change waits for your decision."
+                    entry.detail = "Awaiting approval"
+                    continue
                 elif run.state == "succeeded":
                     entry.state, entry.detail = "done", None
                 elif run.state in ("failed", "cancelled"):
                     entry.state = "failed"
                     entry.detail = _words(run.detail or run.outcome or run.state, 300)
                 else:
+                    entry.detail = None
                     continue
                 concluded = True
             if queue.state != "running":
+                if (
+                    concluded
+                    and queue.state == "paused"
+                    and all(e.state not in ("waiting", "running") for e in entries)
+                ):
+                    queue.state, queue.finished_at, queue.pause_reason = (
+                        "finished",
+                        datetime.now(UTC),
+                        None,
+                    )
                 return 0
             ended = [entry for entry in entries if entry.state in ("done", "failed")]
             if (
@@ -716,29 +763,34 @@ class Queues:
             room = queue.at_once - running
             candidates = [(entry.id, entry.item_id) for entry in waiting[: max(room, 0)]]
             project_id, project_name = project.id, project.name
+            planned = session.get(EpicExecutionPlan, queue_id) is not None
         started = 0
         for entry_id, item_id in candidates:
             with self.sessions() as session:
                 refusal = self.budgets.refusal(session, project_id)
             if refusal is not None:
                 break
-            run_id: UUID | None = None
-            detail: str | None = None
             try:
-                begun = self.runs.start_item(
-                    item_id, toolchain=toolchain_for(project_name).as_dict()
+                self.runs.start_item(
+                    item_id, toolchain=toolchain_for(project_name).as_dict(), queue_entry=entry_id
                 )
+            except QueueChanged:
+                continue
             except (ProjectInvalid, ProjectConflict, ProjectNotFound) as error:
-                state, detail = "skipped", str(error) or "The item is gone."
+                with self.sessions.begin() as session:
+                    waiting_entry = session.get(WorkQueueEntry, entry_id, with_for_update=True)
+                    if waiting_entry is not None and waiting_entry.state == "waiting":
+                        item = session.get(BacklogItem, item_id)
+                        if (
+                            not planned
+                            or not item
+                            or item.issue_state == "closed"
+                            or item.state == "done"
+                        ):
+                            waiting_entry.state = "skipped"
+                        waiting_entry.detail = _words(str(error) or "The item is gone.", 300)
             else:
-                state, run_id = "running", UUID(begun["id"])
                 started += 1
-            with self.sessions.begin() as session:
-                waiting_entry = session.get(WorkQueueEntry, entry_id)
-                if waiting_entry is not None:
-                    waiting_entry.state = state
-                    waiting_entry.run_id = run_id
-                    waiting_entry.detail = _words(detail, 300)
         return started
 
     def inbox(self) -> list[dict[str, Any]]:

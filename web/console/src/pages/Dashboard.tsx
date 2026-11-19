@@ -19,13 +19,12 @@ import {
   TableHeader,
   TableRow,
 } from '@gntik-ai/ui';
-import { Bot, ChartColumn, ListOrdered, Table2 } from '@gntik-ai/icons';
+import { Bot, ChartColumn, Table2 } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { apiUrl, useResource, type Overview } from '../api';
 import { ColumnChart, longDay, type DayValue } from '../chart';
 import { LoadError, RefreshButton, When, mono } from '../parts';
 import { BASE, setQuery, useLocation } from '../router';
-import { QueueState, progress } from './Queues';
 import { KINDS, RunState } from './Runs';
 
 const PERIODS = [
@@ -200,7 +199,6 @@ export function DashboardPage() {
   const today = data?.series[data.series.length - 1];
   const spending = data?.series.filter((entry) => entry.cost > 0).length ?? 0;
   const runs = data?.runs;
-  const queues = data?.queues;
   const period = `in the last ${days} days`;
   return (
     <Page
@@ -323,58 +321,6 @@ export function DashboardPage() {
                   </p>
                 ) : null}
               </div>
-            )}
-          </ListCard>
-          <ListCard
-            title="Queues"
-            count={
-              queues ? (
-                <Badge tone={queues.not_finished ? 'info' : 'neutral'} size="sm">
-                  {queues.not_finished.toLocaleString('en')} not finished
-                </Badge>
-              ) : null
-            }
-            more={`${BASE}/queues`}
-            moreLabel="All queues"
-          >
-            {!queues ? (
-              overview.loading ? (
-                <Loading />
-              ) : null
-            ) : queues.items.length === 0 ? (
-              <EmptyState
-                icon={ListOrdered}
-                size="sm"
-                title="No queue yet."
-                description="Select items in the backlog and queue them."
-              />
-            ) : (
-              <Table>
-                <TableCaption className="sr-only">Queues, the ones under way first</TableCaption>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Queue</TableHead>
-                    <TableHead>State</TableHead>
-                    <TableHead>Progress</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {queues.items.map((queue) => (
-                    <TableRow key={queue.id}>
-                      <TableCell className="max-w-xs">
-                        <Link href={`${BASE}/queue?id=${queue.id}`} className="font-medium">
-                          {queue.name}
-                        </Link>
-                        <div className={mono}>{queue.project}</div>
-                      </TableCell>
-                      <TableCell>
-                        <QueueState queue={queue} />
-                      </TableCell>
-                      <TableCell className="text-[13px]">{progress(queue.counts)}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
             )}
           </ListCard>
         </div>

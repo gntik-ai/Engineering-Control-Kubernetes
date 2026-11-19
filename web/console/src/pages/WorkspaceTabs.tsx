@@ -53,6 +53,8 @@ export interface PlanRow {
   review?: string | null;
   proposal?: boolean;
   orphan?: boolean;
+  execution_type?: 'bug' | 'enhancement' | null;
+  type_confirmed?: boolean;
   automatic_review?: ReviewResult | null;
   review_reason?: string | null;
   github_state?: string | null;
@@ -393,6 +395,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       cell: (record) => (
         <>
           {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
+          {record.execution_type && <div className="mt-1 text-xs font-medium">{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'}{record.type_confirmed ? ' · Confirmed' : ' · Suggested'}</div>}
           {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
             id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} /></div>}
           {record.url && (

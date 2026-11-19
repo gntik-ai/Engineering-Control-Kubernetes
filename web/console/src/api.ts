@@ -729,6 +729,7 @@ export interface QueueEntry {
 
 /** Items of one project to be worked on in order. A draft until it is started. */
 export interface Queue {
+  epic_plan: boolean;
   id: string;
   name: string;
   project: string;

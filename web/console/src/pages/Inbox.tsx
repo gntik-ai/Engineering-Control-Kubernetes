@@ -13,7 +13,7 @@ import {
 import type { ComponentType } from 'react';
 import { apiUrl, useResource, type Inbox, type InboxEntry } from '../api';
 import { LoadError, RefreshButton } from '../parts';
-import { BASE, RouterLink } from '../router';
+import { BASE, RouterLink, queueUrl } from '../router';
 import { Proposal } from '../supervisor';
 
 const plural = (count: number, one: string, many: string) => `${count.toLocaleString('en')} ${count === 1 ? one : many}`;
@@ -79,7 +79,7 @@ function shown(entry: InboxEntry): Shown {
         title: `The supervisor proposed the queue ${entry.queue ?? ''} for ${entry.project_name}`,
         detail: `${plural(entry.count, 'item', 'items')}. ${entry.detail ?? ''} Nothing runs until you start it.`,
         action: 'Open the queue',
-        href: `${BASE}/queue?id=${entry.queue_id}`,
+        href: entry.project ? queueUrl(entry.project, entry.queue_id) : `${BASE}/queue?id=${entry.queue_id}`,
       };
     case 'queue_paused':
       return {
@@ -89,7 +89,7 @@ function shown(entry: InboxEntry): Shown {
         title: `The queue ${entry.queue ?? ''} of ${entry.project_name} is paused`,
         detail: entry.detail ?? 'It starts nothing further until you resume it.',
         action: 'Open the queue',
-        href: `${BASE}/queue?id=${entry.queue_id}`,
+        href: entry.project ? queueUrl(entry.project, entry.queue_id) : `${BASE}/queue?id=${entry.queue_id}`,
       };
     case 'project_paused':
       return {

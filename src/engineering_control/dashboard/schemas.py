@@ -327,6 +327,18 @@ class PlainChangeInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
 
 
+class EpicQueueInput(PlainChangeInput):
+    epic: UUID
+
+
+class ExecutionPlanInput(PlainChangeInput):
+    version: int = Field(ge=1)
+    types: dict[str, Literal["bug", "enhancement"]] = Field(default_factory=dict)
+    stories: list[str] | None = None
+    order: list[str] | None = None
+    requires: dict[str, list[str]] | None = None
+
+
 class ConnectionInput(PlainChangeInput):
     other: str = Field(min_length=1, max_length=32)
     relation: Literal["depends_on", "used_by", "related"]

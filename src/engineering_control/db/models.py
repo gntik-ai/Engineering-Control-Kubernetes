@@ -20,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -816,6 +817,9 @@ class BacklogItem(UUIDPrimaryKey, Timestamps, Base):
     issue_state: Mapped[str | None] = mapped_column(String(16))
     github_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     issue_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    execution_type: Mapped[str | None] = mapped_column(String(16))
+    classification_reason: Mapped[str | None] = mapped_column(Text)
+    type_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     issue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # When the item was done (migration 0047): merged by a run, closed on GitHub or marked
     # by the administrator. Empty for as long as it is not, and again if it is reopened.
@@ -1892,6 +1896,24 @@ class WorkQueue(UUIDPrimaryKey, Timestamps, Base):
         CheckConstraint("state IN ('draft', 'running', 'paused', 'finished')", name="state"),
         CheckConstraint("at_once BETWEEN 1 AND 4", name="at_once"),
     )
+
+
+class EpicExecutionPlan(Timestamps, Base):
+    __tablename__ = "epic_execution_plans"
+    queue_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("work_queues.id", ondelete="CASCADE"), primary_key=True
+    )
+    epic_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("project_epics.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    detail: Mapped[str | None] = mapped_column(String(400))
+    __table_args__ = (Index("ix_epic_execution_due", "status", "due_at"),)
 
 
 class WorkQueueEntry(UUIDPrimaryKey, Timestamps, Base):

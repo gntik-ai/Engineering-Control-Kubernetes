@@ -60,7 +60,7 @@ import {
 } from '../api';
 import { Confirm } from '../confirm';
 import { FilterSelect, IssueRef, LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
-import { BASE, navigate, setQuery, useLocation } from '../router';
+import { BASE, navigate, queueUrl, setQuery, useLocation } from '../router';
 import { ItemBadges, ItemDialog } from './ItemDialog';
 import { QueueDialog } from './QueueDialog';
 import { RunState } from './Runs';
@@ -514,7 +514,7 @@ function ItemRow({
         ) : null}
         {item.queue ? (
           <div className="mt-1 text-[12px]">
-            In the queue <Link href={`${BASE}/queue?id=${item.queue.id}`}>{item.queue.name}</Link>
+            In the queue <Link href={queueUrl(item.project, item.queue.id)}>{item.queue.name}</Link>
           </div>
         ) : null}
       </TableCell>

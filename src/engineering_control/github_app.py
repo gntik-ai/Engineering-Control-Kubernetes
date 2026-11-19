@@ -487,6 +487,56 @@ class GitHubApp:
             raise GitHubAppError("GitHub returned a different record for this issue")
         return data
 
+    async def classify_workspace_issue(
+        self, repository: str, number: int, category: str, *, token: str
+    ) -> list[str]:
+        """Change only the two mutually exclusive labels on a verified Issue."""
+        if category not in ("bug", "enhancement"):
+            raise GitHubAppError("Invalid Issue classification")
+        await self.workspace_issue(repository, number)
+        root = f"/repos/{repository}"
+        path = f"{root}/issues/{number}/labels"
+        opposite = "enhancement" if category == "bug" else "bug"
+
+        def names(data: Any) -> list[str]:
+            if not isinstance(data, list):
+                raise GitHubAppError("GitHub did not return Issue labels")
+            return [
+                row["name"]
+                for row in data
+                if isinstance(row, dict) and isinstance(row.get("name"), str)
+            ]
+
+        try:
+            labels = names(
+                await self._request("POST", path, token=token, json={"labels": [category]})
+            )
+        except GitHubAppError as error:
+            if str(error) != "GitHub answered 422":
+                raise
+            labels = []
+        if category not in {name.casefold() for name in labels}:
+            # Repositories are allowed to have removed their default labels.
+            try:
+                await self._request(
+                    "POST",
+                    root + "/labels",
+                    token=token,
+                    json={"name": category, "color": "d73a4a" if category == "bug" else "a2eeef"},
+                )
+            except GitHubAppError:
+                await self._request("GET", f"{root}/labels/{category}", token=token)
+            labels = names(
+                await self._request("POST", path, token=token, json={"labels": [category]})
+            )
+        if opposite in {name.casefold() for name in labels}:
+            labels = names(await self._request("DELETE", f"{path}/{opposite}", token=token))
+        if category not in {name.casefold() for name in labels} or opposite in {
+            name.casefold() for name in labels
+        }:
+            raise GitHubAppError("GitHub has not confirmed the Issue classification")
+        return labels
+
     async def close_workspace_issue(self, repository: str, number: int, *, token: str) -> None:
         if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
             raise GitHubAppError("Invalid issue reference")

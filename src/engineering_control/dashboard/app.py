@@ -70,7 +70,9 @@ from engineering_control.dashboard.schemas import (
     ConnectionInput,
     ConnectionLinkInput,
     EpicInput,
+    EpicQueueInput,
     EvaluationInput,
+    ExecutionPlanInput,
     FlowCheckInput,
     FlowCreateInput,
     FlowDraftInput,
@@ -163,6 +165,7 @@ CONSOLE_VIEWS = frozenset(
         "run",
         "supervisor",
         "queues",
+        "budgets",
         "queue",
         "flows",
         "flow",
@@ -350,7 +353,11 @@ def create_app(
     async def review_new_planning(records: DashboardRepository, available: Models) -> None:
         while True:
             try:
-                worked = await records.planning_analysis.tick(available)
+                planned, reviewed = await asyncio.gather(
+                    records.execution_plans.tick(available),
+                    records.planning_analysis.tick(available),
+                )
+                worked = planned or reviewed
             except Exception as error:  # noqa: BLE001 - an expired lease is resumed on the next pass
                 log_failure("planning-review", "Automatic planning review could not run", error)
                 worked = False
@@ -1505,6 +1512,122 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse(await service(request).inbox())
+
+    @app.get("/api/dashboard/projects/{name}/execution")
+    async def execution_overview(name: str, request: Request) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).execution_plans.overview, name)
+            )
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Project not found"}, status_code=404)
+
+    @app.get("/api/dashboard/projects/{name}/execution/{epic}")
+    async def preview_execution_epic(name: str, epic: UUID, request: Request) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).execution_plans.preview, name, epic)
+            )
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Open Epic not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/plans")
+    async def plan_epic(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            EpicQueueInput,
+            lambda b: asyncio.to_thread(repo(request).execution_plans.create, name, b.epic),
+            event="queue.epic_selected",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/plans/{key}")
+    async def execution_plan(name: str, key: UUID, request: Request) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).execution_plans.detail, name, key)
+            )
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Plan not found"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/plans/{key}/{operation}")
+    async def edit_execution(name: str, key: UUID, operation: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ExecutionPlanInput,
+            lambda b: asyncio.to_thread(
+                repo(request).execution_plans.change,
+                name,
+                key,
+                b.version,
+                operation,
+                types=b.types,
+                stories=b.stories,
+                order=b.order,
+                requires=b.requires,
+            ),
+            event="queue.plan_updated",
+            subject=name,
+            max_bytes=2_000_000,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/queues")
+    async def project_queues(name: str, request: Request) -> Response:
+        return JSONResponse(await service(request).queues(project=name))
+
+    @app.get("/api/dashboard/projects/{name}/queues/{key}")
+    async def project_queue(name: str, key: UUID, request: Request) -> Response:
+        try:
+            result = await service(request).queue(key)
+            if result["project"] != name:
+                raise ProjectNotFound(str(key))
+            return JSONResponse(result)
+        except ProjectNotFound:
+            return JSONResponse({"detail": "Queue not found in this project"}, status_code=404)
+
+    @app.post("/api/dashboard/projects/{name}/queues/{key}/{operation}")
+    async def scoped_queue_change(
+        name: str, key: UUID, operation: str, request: Request
+    ) -> Response:
+        allowed = {
+            "start": PlainChangeInput,
+            "pause": PlainChangeInput,
+            "discard": PlainChangeInput,
+            "order": QueueItemsInput,
+            "update": QueueUpdateInput,
+        }
+        if operation not in allowed:
+            return JSONResponse({"detail": "Unknown queue action"}, status_code=404)
+
+        async def change(body: Any) -> dict[str, object]:
+            if (await service(request).queue(key))["project"] != name:
+                raise ProjectNotFound(str(key))
+            return await service(request).change_queue(
+                key, operation, **body.model_dump(exclude={"csrf_token"})
+            )
+
+        return await project_change(
+            request, allowed[operation], change, event="queue.changed", subject=name
+        )
+
+    @app.post("/api/dashboard/projects/{name}/queues/{key}/items/{item}/{operation}")
+    async def scoped_queue_item(
+        name: str, key: UUID, item: UUID, operation: str, request: Request
+    ) -> Response:
+        async def change(_: Any) -> dict[str, Any]:
+            if (await service(request).queue(key))["project"] != name:
+                raise ProjectNotFound(str(key))
+            if operation == "retry":
+                return await asyncio.to_thread(
+                    repo(request).queues.requeue, key, item, "Administrator requested a retry"
+                )
+            if operation == "remove":
+                return await service(request).change_queue(key, "remove", item=item)
+            raise ProjectNotFound(operation)
+
+        return await project_change(
+            request, PlainChangeInput, change, event="queue.item_changed", subject=name
+        )
 
     @app.get("/api/dashboard/queues")
     async def queues_api(request: Request, project: str | None = None) -> Response:
@@ -2936,7 +3059,7 @@ def _console_view(view: str) -> bool:
     return view in CONSOLE_VIEWS or (
         view.startswith("workspace/")
         and PROJECT_NAME.fullmatch(
-            view.removeprefix("workspace/").removesuffix("/settings/connections")
+            re.sub(r"/(?:settings/connections|queue)$", "", view.removeprefix("workspace/"))
         )
         is not None
     )

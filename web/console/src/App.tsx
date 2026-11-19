@@ -22,7 +22,7 @@ import { NotFoundPage } from './pages/NotFound';
 import { ProjectPage } from './pages/Project';
 import { BacklogPage } from './pages/Backlog';
 import { ProjectsPage } from './pages/Projects';
-import { QueuePage, QueuesPage } from './pages/Queues';
+import { BudgetsPage, LegacyQueue } from './pages/Queues';
 import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { ProjectWorkspace } from './pages/Workspace';
@@ -45,7 +45,7 @@ const navigation = (waiting: number): NavGroup[] => [
       },
       { label: 'Projects', href: `${BASE}/projects`, icon: FolderKanban },
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
-      { label: 'Queues', href: `${BASE}/queues`, icon: ListOrdered },
+      { label: 'Budgets', href: `${BASE}/budgets`, icon: ListOrdered },
       { label: 'Runs', href: `${BASE}/runs`, icon: Bot },
       { label: 'Flows', href: `${BASE}/flows`, icon: Workflow },
       { label: 'Supervisor', href: `${BASE}/supervisor`, icon: Sparkles },
@@ -61,8 +61,7 @@ const ADMIN_VIEWS: Record<string, { title: string; Page: ComponentType }> = {
   [`${BASE}/project`]: { title: 'Project', Page: ProjectPage },
   [`${BASE}/backlog`]: { title: 'Backlog', Page: BacklogPage },
   [`${BASE}/accounts`]: { title: 'Accounts', Page: AccountsPage },
-  [`${BASE}/queues`]: { title: 'Queues', Page: QueuesPage },
-  [`${BASE}/queue`]: { title: 'Queue', Page: QueuePage },
+  [`${BASE}/budgets`]: { title: 'Budgets', Page: BudgetsPage },
   [`${BASE}/runs`]: { title: 'Runs', Page: RunsPage },
   [`${BASE}/run`]: { title: 'Run', Page: RunPage },
   [`${BASE}/flows`]: { title: 'Flows', Page: FlowsPage },
@@ -72,7 +71,6 @@ const ADMIN_VIEWS: Record<string, { title: string; Page: ComponentType }> = {
 
 const DETAIL_PARENTS: Record<string, string> = {
   [`${BASE}/project`]: `${BASE}/projects`,
-  [`${BASE}/queue`]: `${BASE}/queues`,
   [`${BASE}/run`]: `${BASE}/runs`,
   [`${BASE}/flow`]: `${BASE}/flows`,
 };
@@ -169,9 +167,11 @@ export default function App() {
   if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
     const [name = '', ...rest] = current.slice(WORKSPACE.length + 1).split('/');
     const connections = rest.join('/') === 'settings/connections';
-    if (rest.length && !connections) return <NotFoundPage />;
-    return <ProjectWorkspace name={name} connections={connections} actions={actions} notice={notice} />;
+    const queue = rest.join('/') === 'queue';
+    if (rest.length && !connections && !queue) return <NotFoundPage />;
+    return <ProjectWorkspace name={name} queue={queue} connections={connections} actions={actions} notice={notice} />;
   }
+  if (current === `${BASE}/queues` || current === `${BASE}/queue`) return <LegacyQueue />;
   const view = ADMIN_VIEWS[current];
   if (!view) return <NotFoundPage />;
   return (
