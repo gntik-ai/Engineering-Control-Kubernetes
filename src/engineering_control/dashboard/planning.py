@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import Select, Subquery, delete, false, func, literal, null, select, true, union_all
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.project_records import (
@@ -24,6 +27,8 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectStoryEpic,
     ProjectUserStory,
+    WorkspaceCandidate,
+    WorkspaceImport,
 )
 
 Kind = Literal["epics", "stories", "issues"]
@@ -115,9 +120,245 @@ def save_record(
     return row.id
 
 
+def _visible_issues(project: UUID) -> ColumnElement[bool]:
+    return BacklogItem.workspace_review.in_(
+        ("pending", "publishing", "approved")
+    ) | BacklogItem.id.in_(
+        select(ProjectIssueStory.item_id).where(ProjectIssueStory.project_id == project)
+    )
+
+
+def _parent_options(project: UUID, kind: str) -> Select[tuple[UUID, str]]:
+    parent = ProjectEpic if kind == "stories" else ProjectUserStory
+    return (
+        select(parent.id, parent.title)
+        .where(parent.project_id == project, parent.archived_at.is_(None))
+        .order_by(parent.created_at, parent.id)
+    )
+
+
+def coverage_problem(session: Session, project: UUID, stage: str) -> str | None:
+    if stage == "epics":
+        if not session.scalar(
+            select(ProjectEpic.id)
+            .where(ProjectEpic.project_id == project, ProjectEpic.archived_at.is_(None))
+            .limit(1)
+        ):
+            return "Approve or add an Epic before generating User Stories"
+        return None
+    parent, links, foreign_key = (
+        (ProjectEpic, ProjectStoryEpic, ProjectStoryEpic.epic_id)
+        if stage == "stories"
+        else (ProjectUserStory, ProjectIssueStory, ProjectIssueStory.story_id)
+    )
+    missing = session.scalar(
+        select(func.count())
+        .select_from(parent)
+        .where(
+            parent.project_id == project,
+            parent.archived_at.is_(None),
+            parent.id.not_in(select(foreign_key).where(links.project_id == project)),
+        )
+    )
+    if missing:
+        label = "Epic" if stage == "stories" else "User Story"
+        return (
+            f"{missing} {label} records still need coverage. Add proposals or adjust their links."
+        )
+    return None
+
+
+def _table_rows(project: UUID, kind: Kind) -> Subquery:
+    proposals = (
+        select(
+            WorkspaceCandidate.id,
+            WorkspaceCandidate.title,
+            WorkspaceCandidate.description,
+            WorkspaceCandidate.created_at,
+            true().label("proposal"),
+            literal("proposal").label("review"),
+            WorkspaceCandidate.parents,
+            WorkspaceCandidate.number,
+            null().label("github_state"),
+        )
+        .join(WorkspaceImport, WorkspaceImport.project_id == WorkspaceCandidate.project_id)
+        .where(
+            WorkspaceCandidate.project_id == project,
+            WorkspaceCandidate.kind == kind,
+            WorkspaceCandidate.decision == "pending",
+            WorkspaceImport.stage == kind,
+        )
+    )
+    if kind == "issues":
+        saved = select(
+            BacklogItem.id,
+            BacklogItem.title,
+            BacklogItem.description,
+            BacklogItem.created_at,
+            false(),
+            BacklogItem.workspace_review,
+            null(),
+            BacklogItem.issue_number,
+            BacklogItem.issue_state,
+        ).where(BacklogItem.project_id == project, _visible_issues(project))
+    else:
+        model = ProjectEpic if kind == "epics" else ProjectUserStory
+        saved = select(
+            model.id,
+            model.title,
+            model.description,
+            model.created_at,
+            false(),
+            literal("approved"),
+            null(),
+            null(),
+            null(),
+        ).where(model.project_id == project, model.archived_at.is_(None))
+    return union_all(proposals, saved).subquery()
+
+
 class PlanningRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+
+    @contextmanager
+    def _snapshot(self) -> Iterator[Session]:
+        # Counts, version and rows must describe the same instant when an approval
+        # moves a candidate into the saved records while a page is being fetched.
+        with self.sessions() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            elif session.get_bind().dialect.name == "sqlite":
+                # sqlite3's legacy transaction mode does not start a transaction on SELECT.
+                session.connection().exec_driver_sql("BEGIN")
+            yield session
+
+    def page(self, name: str, kind: Kind, page: int, page_size: int) -> dict[str, Any]:
+        with self._snapshot() as session:
+            project = active_project(session, name)
+            rows = _table_rows(project.id, kind)
+            total, pending, proposed = session.execute(
+                select(
+                    func.count(),
+                    func.count().filter(rows.c.review.in_(("proposal", "pending"))),
+                    func.count().filter(rows.c.proposal),
+                ).select_from(rows)
+            ).one()
+            pages = max(1, (total + page_size - 1) // page_size)
+            requested_page = page
+            page = min(page, pages)
+            items = [
+                dict(record)
+                for record in session.execute(
+                    select(rows)
+                    .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                ).mappings()
+            ]
+            linked: dict[UUID, list[str]] = defaultdict(list)
+            parents: dict[str, str] = {}
+            has_parents = False
+            if kind != "epics":
+                options = _parent_options(project.id, kind)
+                has_parents = session.execute(options.limit(1)).first() is not None
+                child, parent, link = (
+                    (ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id, ProjectStoryEpic)
+                    if kind == "stories"
+                    else (ProjectIssueStory.item_id, ProjectIssueStory.story_id, ProjectIssueStory)
+                )
+                saved_ids = [item["id"] for item in items if not item["proposal"]]
+                if saved_ids:
+                    for child_id, parent_id in session.execute(
+                        select(child, parent)
+                        .where(link.project_id == project.id, child.in_(saved_ids))
+                        .order_by(parent)
+                    ):
+                        linked[child_id].append(str(parent_id))
+                ids = {
+                    UUID(uid) for item in items for uid in (item["parents"] or linked[item["id"]])
+                }
+                if ids:
+                    parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
+                    parents = {
+                        str(uid): title
+                        for uid, title in session.execute(options.where(parent_model.id.in_(ids)))
+                    }
+            for item in items:
+                key = item["id"]
+                rels = item.pop("parents")
+                item.pop("created_at")
+                if kind != "epics":
+                    item["epic_ids" if kind == "stories" else "story_ids"] = rels or linked[key]
+                item["id"] = str(key)
+                item["url"] = (
+                    f"https://github.com/{project.source_repository}/issues/{item['number']}"
+                    if item["number"]
+                    else None
+                )
+            review = session.execute(
+                select(
+                    WorkspaceImport.version,
+                    WorkspaceImport.stage,
+                    WorkspaceImport.lease,
+                    WorkspaceImport.lease_until,
+                    WorkspaceImport.progress["review_mode"].as_string().label("mode"),
+                ).where(WorkspaceImport.project_id == project.id)
+            ).one_or_none()
+            current = review is not None and review.stage == kind
+            return {
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "requested_page": requested_page,
+                "pages": pages,
+                "pending": pending,
+                "parents": parents,
+                "has_parents": has_parents,
+                "version": review.version if review else None,
+                "busy": bool(
+                    current
+                    and review
+                    and review.lease
+                    and review.lease_until
+                    and review.lease_until.replace(tzinfo=UTC) > datetime.now(UTC)
+                ),
+                "can_continue": bool(
+                    current
+                    and review
+                    and review.mode in ("gaps", "review")
+                    and not proposed
+                    and not coverage_problem(session, project.id, kind)
+                ),
+            }
+
+    def pending(self, name: str, kind: Kind) -> dict[str, Any]:
+        # Open the bulk confirmation with just the IDs currently awaiting approval.
+        with self._snapshot() as session:
+            project = active_project(session, name)
+            rows = _table_rows(project.id, kind)
+            ids = session.scalars(
+                select(rows.c.id)
+                .where(rows.c.review.in_(("proposal", "pending")))
+                .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+            )
+            return {
+                "ids": [str(key) for key in ids],
+                "version": session.scalar(
+                    select(WorkspaceImport.version).where(WorkspaceImport.project_id == project.id)
+                ),
+            }
+
+    def parents(self, name: str, kind: Kind) -> list[dict[str, str]]:
+        with self.sessions() as session:
+            project = active_project(session, name)
+            if kind == "epics":
+                return []
+            return [
+                {"id": str(uid), "title": title}
+                for uid, title in session.execute(_parent_options(project.id, kind))
+            ]
 
     def listing(self, name: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -153,12 +394,7 @@ class PlanningRecords:
                 select(BacklogItem)
                 .where(
                     BacklogItem.project_id == project.id,
-                    (BacklogItem.workspace_review.in_(("pending", "publishing", "approved")))
-                    | BacklogItem.id.in_(
-                        select(ProjectIssueStory.item_id).where(
-                            ProjectIssueStory.project_id == project.id
-                        )
-                    ),
+                    _visible_issues(project.id),
                 )
                 .order_by(BacklogItem.created_at, BacklogItem.id)
             )

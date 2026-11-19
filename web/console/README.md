@@ -13,9 +13,10 @@ npm run build
 
 | Package | Version | Used for |
 | --- | --- | --- |
-| `@gntik-ai/ui` | 0.13.0 | every component and layout |
-| `@gntik-ai/tokens` | 0.4.0 | colours, type and the page baseline (`base.css`); the version `ui` requires |
+| `@gntik-ai/ui` | 0.15.0 | every component and layout |
+| `@gntik-ai/tokens` | 0.5.0 | colours, type and the page baseline (`base.css`); the version `ui` requires |
 | `@gntik-ai/icons` | 0.5.0 | icons |
+| `@gntik-ai/flow` | 0.14.0 | flow designer |
 
 `gntik-ui.json` is the configuration of the kit's command line (`npx @gntik-ai/cli`), which
 adds components and copies blocks or page templates into `src/components/`.
@@ -48,10 +49,13 @@ Rules the console keeps:
 From 0.11.0 to 0.13.0 no migration applied. Taken from those releases: `KitProvider`,
 `SearchField`, character counters, document titles and the page baseline.
 
+The upgrade from 0.13.0 to 0.15.0 required no codemods. Epics, User Stories and Issues
+use the kit’s `pagination-footer` block with server-side paging. The footer displays the
+visible range and offers 10, 25, 50 or 100 rows per page.
+
 Blocks worth copying in when their page is next worked on: `error-panel` (load errors with
 a retry), `confirm-destructive` (removal dialogs), `page-header` (breadcrumbs on the project
 and execution pages) and `data-table` (the backlog, with row selection). The shell blocks
 (`app-sidebar`, `app-topbar`) are made for products with workspaces and user accounts; the
 console has one administrator and uses the layout they are built on directly. Not needed
-yet: `@gntik-ai/charts` (usage and budgets), `@gntik-ai/flow` and `@gntik-ai/editor` (the
-flow designer), `@gntik-ai/chat` (talking to the supervisor in the console).
+yet: `@gntik-ai/charts` (usage and budgets), `@gntik-ai/editor`, `@gntik-ai/chat` (talking to the supervisor in the console).

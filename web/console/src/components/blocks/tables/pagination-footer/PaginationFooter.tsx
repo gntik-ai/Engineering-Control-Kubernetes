@@ -1,0 +1,123 @@
+import { cn, Pagination, SimpleSelect, useI18n } from '@gntik-ai/ui';
+import { useState } from 'react';
+
+export interface PaginationFooterLabels {
+  rowsPerPage: string;
+  rowsPerPageLabel: string;
+  rangeSummary: (from: number, to: number, total: number) => string;
+  paginationNav: (noun: string) => string;
+  previous: string;
+  next: string;
+  page: (page: number) => string;
+}
+
+export interface PaginationFooterProps {
+  /** Per-key overrides; omitted keys retain the existing provider translations and defaults. */
+  labels?: Partial<PaginationFooterLabels>;
+  /** Total number of rows. */
+  total?: number;
+  /** Current page, 1-based (controlled). */
+  page?: number;
+  defaultPage?: number;
+  onPageChange?: (page: number) => void;
+  /** Rows per page (controlled). */
+  pageSize?: number;
+  defaultPageSize?: number;
+  onPageSizeChange?: (pageSize: number) => void;
+  pageSizeOptions?: readonly number[];
+  /** Show the rows-per-page label and select (default true). */
+  showPageSize?: boolean;
+  /** What the rows are, for the accessible names ("Deployments"). */
+  noun?: string;
+  locale?: string;
+  className?: string;
+}
+
+/** Table footer: rows-per-page Select, a "1–10 of 97" summary and numbered Pagination. Stacks on small screens. */
+export function PaginationFooter({
+  total = 97,
+  page: pageProp,
+  defaultPage = 1,
+  onPageChange,
+  pageSize: sizeProp,
+  defaultPageSize = 10,
+  onPageSizeChange,
+  pageSizeOptions = [10, 25, 50, 100],
+  showPageSize = true,
+  noun: nounProp,
+  locale: localeProp,
+  className,
+  labels,
+}: PaginationFooterProps) {
+  const { t, locale: providerLocale } = useI18n();
+  const locale = localeProp ?? providerLocale;
+  const noun = nounProp ?? t('table.rows');
+  const [innerPage, setInnerPage] = useState(defaultPage);
+  const [innerSize, setInnerSize] = useState(defaultPageSize);
+  const pageSize = sizeProp ?? innerSize;
+  const pageCount = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
+  const page = Math.min(Math.max(1, pageProp ?? innerPage), pageCount);
+  const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const to = Math.min(page * pageSize, total);
+  const fmt = (n: number) => n.toLocaleString(locale);
+
+  const goTo = (next: number) => {
+    setInnerPage(next);
+    onPageChange?.(next);
+  };
+  const resize = (value: string | null) => {
+    const next = Number(value);
+    if (!next || next === pageSize) return;
+    setInnerSize(next);
+    onPageSizeChange?.(next);
+    // Keep the first visible row on screen.
+    const nextPage = Math.floor((from - 1) / next) + 1;
+    if (nextPage !== page) goTo(Math.max(1, nextPage));
+  };
+
+  return (
+    <div className={cn('flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between', className)}>
+      {showPageSize && (
+        <div className="flex items-center gap-2.5">
+          <span className="text-[12.5px] text-muted-foreground" aria-hidden>
+            {labels?.rowsPerPage ?? t('table.rowsPerPage')}
+          </span>
+          <SimpleSelect
+            aria-label={labels?.rowsPerPageLabel ?? t('table.rowsPerPage')}
+            size="sm"
+            className="w-[76px] font-mono"
+            value={String(pageSize)}
+            onValueChange={resize}
+            items={pageSizeOptions.map((n) => ({ value: String(n), label: String(n) }))}
+          />
+        </div>
+      )}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+        <p className="text-[12.5px] text-muted-foreground tabular-nums" aria-live="polite">
+          {labels?.rangeSummary ? (
+            labels.rangeSummary(from, to, total)
+          ) : (
+            <>
+              <span className="font-mono text-foreground">
+                {fmt(from)}–{fmt(to)}
+              </span>{' '}
+              {t('pagination.of')} <span className="font-mono text-foreground">{fmt(total)}</span>
+            </>
+          )}
+        </p>
+        <Pagination
+          page={page}
+          pageCount={pageCount}
+          onPageChange={goTo}
+          size="sm"
+          labels={{
+            nav: labels?.paginationNav?.(noun) ?? t('table.pagination', { noun }),
+            previous: labels?.previous,
+            next: labels?.next,
+            page: labels?.page,
+          }}
+        />
+      </div>
+    </div>
+  );
+}

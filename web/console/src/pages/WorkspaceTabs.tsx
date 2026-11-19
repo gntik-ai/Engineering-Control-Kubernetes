@@ -24,14 +24,15 @@ import {
   TabsTab,
   Textarea,
 } from '@gntik-ai/ui';
-import { useState } from 'react';
-import { apiUrl, postJson, useResource, type ProjectSummary } from '../api';
+import { useEffect, useState } from 'react';
+import { apiUrl, getJson, postJson, useResource, type Paged, type ProjectSummary } from '../api';
+import { PaginationFooter } from '../components/blocks/tables/pagination-footer/PaginationFooter';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
 import { setQuery, useLocation } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
-import { WorkspaceImport, type ImportState } from './WorkspaceImport';
+import { WorkspaceImport } from './WorkspaceImport';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = {
@@ -55,13 +56,53 @@ export interface PlanRow {
   number?: number | null;
   url?: string | null;
 }
-export type Plan = Record<Kind, PlanRow[]>;
+interface PlanningPage extends Paged<PlanRow> {
+  page_size: number;
+  requested_page: number;
+  pending: number;
+  parents: Record<string, string>;
+  has_parents: boolean;
+  version: number | null;
+  busy: boolean;
+  can_continue: boolean;
+}
+type PendingSnapshot = { ids: string[]; version: number | null };
+const pageSizes = [10, 25, 50, 100];
+const pageParam = (page: number) => page > 1 ? String(page) : null;
+
+function ParentChoices({ path, kind, parents, setParents }: {
+  path: string;
+  kind: Kind;
+  parents: string[];
+  setParents: (parents: string[]) => void;
+}) {
+  const choices = useResource<{ id: string; title: string }[]>(apiUrl(path + '/parents'));
+  return (
+    <fieldset className="grid gap-2">
+      <legend className="mb-2 text-sm font-medium">
+        {kind === 'stories' ? 'Epics' : 'User Stories'} (choose at least one)
+      </legend>
+      <LoadError resource={choices} />
+      {choices.error && <RefreshButton resource={choices} />}
+      {choices.loading && !choices.data && <Skeleton className="h-8 w-full" />}
+      {choices.data?.map((p) => (
+        <label key={p.id} className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={parents.includes(p.id)}
+            onChange={(e) => setParents(e.target.checked ? [...parents, p.id] : parents.filter((id) => id !== p.id))}
+          />
+          {p.title}
+        </label>
+      ))}
+    </fieldset>
+  );
+}
 
 function RecordEditor({
   kind,
   path,
   row,
-  choices,
   version,
   close,
   saved,
@@ -69,7 +110,6 @@ function RecordEditor({
   kind: Kind;
   path: string;
   row?: PlanRow;
-  choices: PlanRow[];
   version?: number;
   close: () => void;
   saved: () => void;
@@ -120,25 +160,7 @@ function RecordEditor({
               <Textarea value={description} onValueChange={setDescription} maxLength={40000} rows={4} />
             </Field>
             {kind !== 'epics' && (
-              <fieldset className="grid gap-2">
-                <legend className="mb-2 text-sm font-medium">
-                  {kind === 'stories' ? 'Epics' : 'User Stories'} (choose at least one)
-                </legend>
-                {choices.map((p) => (
-                  <label key={p.id} className="flex items-start gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={parents.includes(p.id)}
-                      onChange={(e) =>
-                        setParents(
-                          e.target.checked ? [...parents, p.id] : parents.filter((id) => id !== p.id),
-                        )
-                      }
-                    />
-                    {p.title}
-                  </label>
-                ))}
-              </fieldset>
+              <ParentChoices path={path} kind={kind} parents={parents} setParents={setParents} />
             )}
           </DialogBody>
           <DialogFooter>
@@ -159,43 +181,51 @@ function RecordEditor({
   );
 }
 
-function Records({ kind, project, repository }: { kind: Kind; project: string; repository: string }) {
-  const path = 'projects/' + encodeURIComponent(project) + '/planning';
-  const plan = useResource<Plan>(apiUrl(path), 12000);
+function Records({ kind, project }: { kind: Kind; project: string }) {
+  const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
-  const workflow = useResource<ImportState>(apiUrl(importPath), 4000);
-  const state = workflow.data;
-  const review = state?.stage === kind ? state.review : null;
-  const locked = Boolean(state?.busy && review);
-  const reload = () => { plan.reload(); workflow.reload(); };
+  const { query } = useLocation();
+  const pageValue = query.get('page');
+  const sizeValue = query.get('page_size');
+  const requested = Number(pageValue);
+  const page = Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
+  const pageSize = pageSizes.includes(Number(sizeValue)) ? Number(sizeValue) : 10;
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize }), 4000, { keepPreviousData: true });
+  const data = plan.data;
+  const changingPage = data && (data.requested_page !== page || data.page_size !== pageSize);
+  const rows = data?.items;
+  const reload = plan.reload;
+  useEffect(() => {
+    if (!data || changingPage) return;
+    const nextPage = pageParam(data.page);
+    const nextSize = data.page_size === 10 ? null : String(data.page_size);
+    if (pageValue !== nextPage || sizeValue !== nextSize) setQuery({ page: nextPage, page_size: nextSize });
+  }, [data, changingPage, pageValue, sizeValue]);
   const finish = useSubmit(
-    () => postJson(importPath + '/review', { version: state?.version, choices: [] }),
-    () => { reload(); setQuery({ tab: null }); },
+    () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
+    () => { reload(); setQuery({ tab: null, page: null }); },
   );
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
-  const [approving, setApproving] = useState<{ rows: PlanRow[]; version?: number; bulk?: boolean } | null>(null);
+  const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
-  const choices = (kind === 'stories' ? plan.data?.epics : plan.data?.stories) ?? [];
-  const names = new Map(choices.map((p) => [p.id, p.title]));
-  const proposals: PlanRow[] = (review?.candidates ?? []).filter(c => c.decision === 'pending').map(c => ({
-    id: c.id, title: c.title, description: c.description, proposal: true, review: 'proposal',
-    ...(kind === 'stories' ? { epic_ids: c.parents } : kind === 'issues' ? { story_ids: c.parents } : {}),
-    number: c.number, url: c.number ? repository + '/issues/' + c.number : null,
-  }));
-  const rows = plan.data && state && [...proposals, ...plan.data[kind]];
-  const pending = rows?.filter(r => r.proposal || r.review === 'pending') ?? [];
-  const needsParents = kind !== 'epics' && !choices.length;
+  const selectAll = useSubmit(
+    () => getJson<PendingSnapshot>(apiUrl(path + '/pending'), new AbortController().signal),
+    (snapshot) => { if (snapshot.ids.length) setApproving(snapshot); else reload(); },
+  );
+  const locked = Boolean(changingPage || data?.busy);
+  const rowLocked = (row: PlanRow) => Boolean(changingPage || (row.proposal && data?.busy));
+  const needsParents = kind !== 'epics' && !data?.has_parents;
   return (
     <section className="grid min-w-0 gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-xl font-semibold">{sections[kind]}</h2>
         <div className="flex flex-wrap gap-2">
-          {pending.length > 0 && (
-            <Button variant="secondary" disabled={locked} onClick={() => setApproving({ rows: pending, version: state?.version, bulk: true })}>
-              Approve all {sections[kind]} ({pending.length})
+          {data && data.pending > 0 && (
+            <Button variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
+              Approve all {sections[kind]} ({data.pending})
             </Button>
           )}
-          {review?.can_continue && !locked && (
+          {data?.can_continue && !locked && (
             <Button variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
               {nextStageLabel[kind]}
             </Button>
@@ -206,7 +236,7 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
         </div>
       </div>
       <LoadError resource={plan} />
-      <LoadError resource={workflow} />
+      {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
       {finish.problem && <Alert tone="destructive" title={finish.problem} />}
       {plan.error && (
         <div>
@@ -224,8 +254,8 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
               : 'No ' + sections[kind] + ' yet.'}
           </p>
         ) : (
-          <div className="overflow-x-auto">
-            <Table>
+          <div className="overflow-x-auto" aria-busy={Boolean(changingPage && plan.loading)}>
+            <Table aria-label={sections[kind]}>
               <TableHeader>
                 <TableRow>
                   <TableHead>Title</TableHead>
@@ -251,7 +281,7 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
                       <TableCell className="align-top">
                         <ul>
                           {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
-                            <li key={id}>{names.get(id)}</li>
+                            <li key={id}>{data?.parents[id]}</li>
                           ))}
                         </ul>
                       </TableCell>
@@ -274,15 +304,15 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
                           <Button
                             size="sm"
                             variant="ghost"
-                            disabled={record.proposal && locked}
+                            disabled={rowLocked(record)}
                             aria-label={'Edit ' + record.title}
-                            onClick={() => setEditor({ row: record, version: state?.version })}
+                            onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}
                           >
                             Edit
                           </Button>
                         )}
                         {(record.proposal || record.review === 'pending') && (
-                          <Button size="sm" variant="secondary" disabled={record.proposal && locked} aria-label={'Approve ' + record.title} onClick={() => setApproving({ rows: [record], version: state?.version })}>
+                          <Button size="sm" variant="secondary" disabled={rowLocked(record)} aria-label={'Approve ' + record.title} onClick={() => setApproving({ ids: [record.id], title: record.title, version: data?.version ?? null })}>
                             Approve
                           </Button>
                         )}
@@ -290,7 +320,7 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
                           <Button
                             size="sm"
                             variant="ghost"
-                            disabled={record.proposal && locked}
+                            disabled={rowLocked(record)}
                             aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title}
                             onClick={() => setRemoving(record)}
                           >
@@ -305,15 +335,27 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
             </Table>
           </div>
         ))}
+      {data && data.total > 0 && (
+        <PaginationFooter
+          noun={sections[kind]}
+          total={data.total}
+          page={data.page}
+          pageSize={data.page_size}
+          pageSizeOptions={pageSizes}
+          onPageChange={(next) => setQuery({ page: pageParam(next) })}
+          onPageSizeChange={(size) => setQuery({ page_size: size === 10 ? null : String(size) })}
+          className="min-w-0"
+        />
+      )}
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
-          title={approving.bulk ? `Approve all ${approving.rows.length} ${sections[kind]}?` : `Approve ${singular[kind]}?`}
-          about={(approving.bulk ? '' : approving.rows[0]!.title + '. ') + (kind === 'issues'
+          title={approving.title ? `Approve ${singular[kind]}?` : `Approve all ${approving.ids.length} ${sections[kind]}?`}
+          about={(approving.title ? approving.title + '. ' : 'Approval applies across all pages of this table. ') + (kind === 'issues'
             ? 'Create generated Issues in GitHub and link existing Issues in their current state.'
             : 'Save the approved records. Any corresponding open planning issues will be closed on GitHub.')}
-          action={approving.bulk ? 'Approve all' : 'Approve'}
-          run={() => postJson(path + '/' + kind + '/decisions', { ids: approving.rows.map(r => r.id), version: approving.version })}
+          action={approving.title ? 'Approve' : 'Approve all'}
+          run={() => postJson(path + '/decisions', { ids: approving.ids, version: approving.version })}
           onDone={reload}
           onClose={() => setApproving(null)}
         />
@@ -321,9 +363,8 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
       {editor && (
         <RecordEditor
           kind={kind}
-          path={path + '/' + kind}
+          path={path}
           row={editor.row}
-          choices={choices}
           version={editor.version}
           close={() => setEditor(null)}
           saved={reload}
@@ -336,8 +377,8 @@ function Records({ kind, project, repository }: { kind: Kind; project: string; r
           action={removing.proposal ? 'Dismiss' : 'Delete'}
           destructive
           run={() => removing.proposal
-            ? postJson(path + '/' + kind + '/decisions', { ids: [removing.id], version: state?.version, dismiss: true })
-            : postJson(path + '/' + kind + '/' + removing.id + '/remove')}
+            ? postJson(path + '/decisions', { ids: [removing.id], version: data?.version, dismiss: true })
+            : postJson(path + '/' + removing.id + '/remove')}
           onDone={reload}
           onClose={() => setRemoving(null)}
         />
@@ -354,7 +395,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value) })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {Object.entries(sections).map(([id, label]) => (
@@ -392,7 +433,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (
           <TabsPanel key={kind} value={kind} className="pt-5">
-            {tab === kind && <Records kind={kind} project={project.project} repository={project.repository_url} />}
+            {tab === kind && <Records kind={kind} project={project.project} />}
           </TabsPanel>
         ))}
         <TabsPanel value="architecture" />
