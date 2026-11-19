@@ -73,6 +73,8 @@ export function WorkspaceReview({
   const label = stage === 'epics' ? 'Epic' : stage === 'stories' ? 'User Story' : 'Issue';
   const table = stage === 'epics' ? 'Epics' : stage === 'stories' ? 'User Stories' : 'Issues';
   const pending = review.candidates.filter(c => c.decision === 'pending').length;
+  const proposalLabel = pending === 1 ? 'proposal' : 'proposals';
+  const reviewEpics = stage === 'epics' && review.bulk_complete && pending > 0;
   const [action, setAction] = useState<ReviewActivity | null>(null);
   const [problem, setProblem] = useState('');
   const submitting = useRef(false);
@@ -144,7 +146,13 @@ export function WorkspaceReview({
       <div className="flex flex-wrap items-center gap-2">
         {review.mode === 'existing' || current === 'existing'
           ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
-          : stage === 'stories' && review.mode === 'review' && !watching ? (
+          : stage === 'epics' && review.bulk_complete && !watching ? (
+            <span role="status" className="text-sm">
+              Epic generation is complete. {pending
+                ? 'Review the Epic proposals to continue to User Stories.'
+                : !review.can_continue && 'Add or reopen an Epic to continue to User Stories.'}
+            </span>
+          ) : stage === 'stories' && review.mode === 'review' && !watching ? (
             <span role="status" className="text-sm">Generation complete. {pending ? 'Review the remaining proposals to continue to Issues.' : 'All Epics are covered.'}</span>
           ) : stage === 'issues' && review.bulk_complete && !watching ? (
             <span role="status" className="text-sm">All open User Stories have been checked for missing technical issues.</span>
@@ -155,7 +163,8 @@ export function WorkspaceReview({
               {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
             </>}
         <Button variant="ghost" onClick={() => setQuery({ tab: stage, state: null, issue_state: null, search: null, page: null, record: null, epic: null })}>
-          View {table}{pending > 0 ? ` (${pending} proposal${pending === 1 ? '' : 's'})` : ''}
+          {reviewEpics ? `Review ${pending} Epic ${proposalLabel}` : `View ${table}`}
+          {!reviewEpics && pending > 0 && ` (${pending} ${proposalLabel})`}
         </Button>
         {!watching && job?.state === 'completed' && job.action === 'existing' && (
           <span role="status" className="text-sm text-muted-foreground">GitHub review complete</span>

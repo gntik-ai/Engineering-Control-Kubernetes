@@ -354,7 +354,7 @@ export function QueuePage({project,id}: {project: string; id: string}) {
                 disabled={pending !== null || waiting.length === 0}
                 onClick={() => change('start', 'start')}
               >
-                {data.state === 'draft' ? 'Start' : 'Resume'}
+                {data.state === 'draft' ? 'Start execution' : 'Resume'}
               </Button>
             ) : null}
             {data.state === 'running' ? (

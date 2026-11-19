@@ -30,10 +30,11 @@ from engineering_control.dashboard.workspace_issues import (
 from engineering_control.dashboard.workspace_review import (
     KINDS,
     WorkspaceReview,
+    epic_generation_complete,
     gap_identity,
     known_issue_titles,
     review_state,
-    settle_stories,
+    settle_bulk_review,
 )
 from engineering_control.db.models import (
     BacklogItem,
@@ -275,7 +276,7 @@ class WorkspaceImports:
         model: str | None,
         bulk_stage: str | None,
         background: bool = False,
-    ) -> WorkspaceImport:
+    ) -> WorkspaceImport | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             row = session.get(WorkspaceImport, project.id)
@@ -294,6 +295,9 @@ class WorkspaceImports:
                 raise ProjectConflict(
                     f"Finish reviewing existing GitHub issues in the {label} stage first"
                 )
+            if epic_generation_complete(row):
+                settle_bulk_review(session, row)
+                return None
             if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
                 if {"provider": provider, "model": model} not in self.model_choices():
                     raise ProjectInvalid(
@@ -519,20 +523,44 @@ class WorkspaceImports:
             }
             row.lease = row.lease_until = None
             session.flush()
-            settle_stories(session, row)
+            settle_bulk_review(session, row)
             return None
 
-    def settle_existing_stories(self) -> None:
+    def settle_existing_reviews(self) -> None:
+        progress = WorkspaceImport.progress
+        legacy_stories = (WorkspaceImport.stage == "stories") & (
+            progress["activity"].as_string() == "all"
+        )
+        pending_epic = (
+            select(WorkspaceCandidate.id)
+            .where(
+                WorkspaceCandidate.project_id == WorkspaceImport.project_id,
+                WorkspaceCandidate.kind == "epics",
+                WorkspaceCandidate.origin == "import",
+                WorkspaceCandidate.decision == "pending",
+            )
+            .exists()
+        )
+        completed_epics = (
+            (WorkspaceImport.stage == "epics")
+            & ~pending_epic
+            & (
+                progress["epics_bulk_complete"].as_boolean().is_(True)
+                | (
+                    (progress["operation"]["action"].as_string() == "all")
+                    & (progress["operation"]["state"].as_string() == "completed")
+                )
+            )
+        )
         with self.sessions.begin() as db:
             names = list(
                 db.scalars(
                     select(ProjectRecord.name)
                     .join(WorkspaceImport, WorkspaceImport.project_id == ProjectRecord.id)
                     .where(
-                        WorkspaceImport.stage == "stories",
                         ProjectRecord.archived_at.is_(None),
-                        WorkspaceImport.progress["review_mode"].as_string().in_(("review", "gaps")),
-                        WorkspaceImport.progress["activity"].as_string() == "all",
+                        progress["review_mode"].as_string().in_(("review", "gaps")),
+                        legacy_stories | completed_epics,
                     )
                 )
             )
@@ -541,7 +569,7 @@ class WorkspaceImports:
                 project = active_project(db, name, lock=True)
                 row = db.get(WorkspaceImport, project.id)
                 if row:
-                    settle_stories(db, row)
+                    settle_bulk_review(db, row)
 
     def _renew(self, row: WorkspaceImport) -> None:
         with self.sessions.begin() as session:
@@ -620,6 +648,8 @@ class WorkspaceImports:
         row = await asyncio.to_thread(
             self._claim, name, version, provider, model, bulk_stage, background or batched
         )
+        if row is None:
+            return await asyncio.to_thread(self.status, name)
         if background:
             task = asyncio.create_task(self._run_review(name, row, models))
             self.tasks.add(task)

@@ -188,10 +188,14 @@ def coverage_problem(session: Session, project: UUID, stage: str) -> str | None:
     if stage == "epics":
         if not session.scalar(
             select(ProjectEpic.id)
-            .where(ProjectEpic.project_id == project, ProjectEpic.archived_at.is_(None))
+            .where(
+                ProjectEpic.project_id == project,
+                ProjectEpic.archived_at.is_(None),
+                ProjectEpic.closed_at.is_(None),
+            )
             .limit(1)
         ):
-            return "Approve or add an Epic before generating User Stories"
+            return "Approve, add or reopen an Epic before generating User Stories"
         return None
     parent, links, foreign_key = (
         (ProjectEpic, ProjectStoryEpic, ProjectStoryEpic.epic_id)
