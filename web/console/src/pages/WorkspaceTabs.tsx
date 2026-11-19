@@ -11,25 +11,21 @@ import {
   FieldLabel,
   Input,
   Link,
+  linkVariants,
   Skeleton,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
   Tabs,
   TabsList,
   TabsPanel,
   TabsTab,
   Textarea,
 } from '@gntik-ai/ui';
-import { useEffect, useState } from 'react';
-import { apiUrl, getJson, postJson, useResource, type Paged, type ProjectSummary } from '../api';
-import { PaginationFooter } from '../components/blocks/tables/pagination-footer/PaginationFooter';
+import { useEffect, useRef, useState } from 'react';
+import { CHANGED, apiUrl, getJson, postJson, useResource, type Paged, type ProjectSummary } from '../api';
+import { DataTable } from '../components/blocks/tables/data-table/DataTable';
+import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
-import { setQuery, useLocation } from '../router';
+import { setQuery, useLocation, workspaceUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { WorkspaceImport } from './WorkspaceImport';
@@ -59,6 +55,8 @@ export interface PlanRow {
 interface PlanningPage extends Paged<PlanRow> {
   page_size: number;
   requested_page: number;
+  search: string;
+  epic: string | null;
   pending: number;
   parents: Record<string, string>;
   has_parents: boolean;
@@ -181,30 +179,67 @@ function RecordEditor({
   );
 }
 
+function DescriptionPreview({ record, onRead }: { record: PlanRow; onRead: (record: PlanRow) => void }) {
+  const text = (record.description ?? '').trim().replace(/\s+/gu, ' ');
+  // Keep the preview on a word boundary when possible and preserve the original in the dialog.
+  const preview = text.match(/^.{1,140}(?=\s|$)|^.{1,140}/u)?.[0] ?? '';
+  const shortened = preview.length < text.length;
+  return (
+    <p className="mt-1 break-words text-sm text-muted-foreground">
+      {preview}{shortened && <>…{' '}
+        <button type="button" aria-haspopup="dialog" aria-label={'Read More about ' + record.title}
+          className={linkVariants({ underline: 'always' }).root()} onClick={() => onRead(record)}>Read More</button>
+      </>}
+    </p>
+  );
+}
+
 function Records({ kind, project }: { kind: Kind; project: string }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
   const { query } = useLocation();
   const pageValue = query.get('page');
   const sizeValue = query.get('page_size');
+  const epic = kind === 'epics' ? query.get('epic')?.toLowerCase() || null : null;
+  const searchValue = query.get('search') ?? '';
+  const search = epic ? '' : searchValue.trim().slice(0, 200);
   const requested = Number(pageValue);
-  const page = Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
+  // An Epic link locates the row even after other records have moved it to a different page.
+  const page = !epic && Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
   const pageSize = pageSizes.includes(Number(sizeValue)) ? Number(sizeValue) : 10;
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize }), 4000, { keepPreviousData: true });
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const changingPage = data && (data.requested_page !== page || data.page_size !== pageSize);
-  const rows = data?.items;
+  const currentFilter = data?.search === search && data.epic === epic;
+  const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
+  const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
   useEffect(() => {
     if (!data || changingPage) return;
     const nextPage = pageParam(data.page);
     const nextSize = data.page_size === 10 ? null : String(data.page_size);
-    if (pageValue !== nextPage || sizeValue !== nextSize) setQuery({ page: nextPage, page_size: nextSize });
-  }, [data, changingPage, pageValue, sizeValue]);
+    if (pageValue !== nextPage || sizeValue !== nextSize || searchValue !== search) {
+      setQuery({ page: nextPage, page_size: nextSize, search });
+    }
+  }, [data, changingPage, pageValue, sizeValue, searchValue, search]);
+
+  const linkedTitle = useRef<HTMLSpanElement>(null);
+  const foundEpic = Boolean(epic && rows?.some((row) => row.id === epic && !row.proposal));
+  useEffect(() => {
+    if (foundEpic) {
+      linkedTitle.current?.focus({ preventScroll: true });
+      linkedTitle.current?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    }
+  }, [epic, foundEpic]);
+  const epicUrl = (id: string) => {
+    const target = new URLSearchParams({ tab: 'epics', epic: id });
+    if (pageSize !== 10) target.set('page_size', String(pageSize));
+    return workspaceUrl(project) + '?' + target.toString();
+  };
   const finish = useSubmit(
     () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
-    () => { reload(); setQuery({ tab: null, page: null }); },
+    () => { reload(); setQuery({ tab: null, page: null, search: null, epic: null }); },
   );
+  const [reading, setReading] = useState<PlanRow | null>(null);
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
@@ -215,143 +250,140 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
   const locked = Boolean(changingPage || data?.busy);
   const rowLocked = (row: PlanRow) => Boolean(changingPage || (row.proposal && data?.busy));
   const needsParents = kind !== 'epics' && !data?.has_parents;
+  const columns: DataTableColumn<PlanRow>[] = [
+    {
+      id: 'title', header: 'Title', sortable: false, accessor: (record) => record.title,
+      className: 'min-w-40 max-w-lg whitespace-normal align-top',
+      cell: (record) => {
+        const targeted = foundEpic && !record.proposal && record.id === epic;
+        return (
+          <>
+            <span ref={targeted ? linkedTitle : undefined} tabIndex={targeted ? -1 : undefined}
+              aria-current={targeted ? 'location' : undefined}
+              className="rounded-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">
+              {record.title}
+            </span>
+            {record.description && <DescriptionPreview record={record} onRead={setReading} />}
+          </>
+        );
+      },
+    },
+  ];
+  if (kind !== 'epics') {
+    columns.push({
+      id: 'parents', header: kind === 'stories' ? 'Epics' : 'User Stories', sortable: false,
+      className: 'max-w-xs whitespace-normal align-top',
+      cell: (record) => (
+        <ul>
+          {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
+            <li key={id}>
+              {kind === 'stories' && data?.parents[id] ? (
+                <Link href={epicUrl(id)} underline="always">{data.parents[id]}</Link>
+              ) : data?.parents[id] ?? (kind === 'stories' ? 'Unavailable Epic' : 'Unavailable User Story')}
+            </li>
+          ))}
+        </ul>
+      ),
+    });
+  }
+  columns.push(
+    {
+      id: 'status', header: 'Status', sortable: false, className: 'align-top',
+      cell: (record) => (
+        <>
+          {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
+          {record.url && (
+            <div><Link href={record.url} target="_blank" rel="noreferrer">
+              #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
+            </Link></div>
+          )}
+        </>
+      ),
+    },
+    {
+      id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
+      cell: (record) => (
+        <div className="flex justify-end gap-1">
+          {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
+            <Button size="sm" variant="ghost" disabled={rowLocked(record)} aria-label={'Edit ' + record.title}
+              onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>Edit</Button>
+          )}
+          {(record.proposal || record.review === 'pending') && (
+            <Button size="sm" variant="secondary" disabled={rowLocked(record)} aria-label={'Approve ' + record.title}
+              onClick={() => setApproving({ ids: [record.id], title: record.title, version: data?.version ?? null })}>Approve</Button>
+          )}
+          {(record.proposal || kind !== 'issues') && (
+            <Button size="sm" variant="ghost" disabled={rowLocked(record)}
+              aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title} onClick={() => setRemoving(record)}>
+              {record.proposal ? 'Dismiss' : 'Delete'}
+            </Button>
+          )}
+        </div>
+      ),
+    },
+  );
+  const empty = needsParents
+    ? kind === 'stories' ? 'Add an Epic before creating a User Story.' : 'Add a User Story before creating an Issue.'
+    : 'No ' + sections[kind] + ' yet.';
   return (
     <section className="grid min-w-0 gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-xl font-semibold">{sections[kind]}</h2>
-        <div className="flex flex-wrap gap-2">
-          {data && data.pending > 0 && (
-            <Button variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
-              Approve all {sections[kind]} ({data.pending})
-            </Button>
-          )}
-          {data?.can_continue && !locked && (
-            <Button variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
-              {nextStageLabel[kind]}
-            </Button>
-          )}
-          <Button disabled={!rows || needsParents} onClick={() => setEditor({})}>
-            New {singular[kind]}
-          </Button>
-        </div>
-      </div>
+      <h2 className="text-xl font-semibold">{sections[kind]}</h2>
       <LoadError resource={plan} />
+      {epic && currentFilter && !foundEpic && (
+        <p role="status" className="text-sm text-muted-foreground">This Epic is unavailable in this project.</p>
+      )}
       {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
       {finish.problem && <Alert tone="destructive" title={finish.problem} />}
-      {plan.error && (
-        <div>
-          <RefreshButton resource={plan} />
-        </div>
-      )}
-      {!rows && plan.loading && <Skeleton className="h-20 w-full" />}
-      {rows &&
-        (rows.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            {needsParents
-              ? kind === 'stories'
-                ? 'Add an Epic before creating a User Story.'
-                : 'Add a User Story before creating an Issue.'
-              : 'No ' + sections[kind] + ' yet.'}
-          </p>
-        ) : (
-          <div className="overflow-x-auto" aria-busy={Boolean(changingPage && plan.loading)}>
-            <Table aria-label={sections[kind]}>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Title</TableHead>
-                  {kind !== 'epics' && <TableHead>{kind === 'stories' ? 'Epics' : 'User Stories'}</TableHead>}
-                  <TableHead>Status</TableHead>
-                  <TableHead>
-                    <span className="sr-only">Actions</span>
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rows.map((record) => (
-                  <TableRow key={record.id}>
-                    <TableCell className="min-w-40 max-w-lg whitespace-normal align-top">
-                      <span className="font-medium">{record.title}</span>
-                      {record.description && (
-                        <p className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">
-                          {record.description}
-                        </p>
-                      )}
-                    </TableCell>
-                    {kind !== 'epics' && (
-                      <TableCell className="align-top">
-                        <ul>
-                          {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
-                            <li key={id}>{data?.parents[id]}</li>
-                          ))}
-                        </ul>
-                      </TableCell>
-                    )}
-                    <TableCell className="align-top">
-                        <span>
-                          {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
-                        </span>
-                        {record.url && (
-                          <div>
-                            <Link href={record.url} target="_blank" rel="noreferrer">
-                              #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
-                            </Link>
-                          </div>
-                        )}
-                    </TableCell>
-                    <TableCell className="align-top">
-                      <div className="flex justify-end gap-1">
-                        {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            disabled={rowLocked(record)}
-                            aria-label={'Edit ' + record.title}
-                            onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}
-                          >
-                            Edit
-                          </Button>
-                        )}
-                        {(record.proposal || record.review === 'pending') && (
-                          <Button size="sm" variant="secondary" disabled={rowLocked(record)} aria-label={'Approve ' + record.title} onClick={() => setApproving({ ids: [record.id], title: record.title, version: data?.version ?? null })}>
-                            Approve
-                          </Button>
-                        )}
-                        {(record.proposal || kind !== 'issues') && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            disabled={rowLocked(record)}
-                            aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title}
-                            onClick={() => setRemoving(record)}
-                          >
-                            {record.proposal ? 'Dismiss' : 'Delete'}
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+      {plan.error && <div><RefreshButton resource={plan} /></div>}
+      <DataTable
+        className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
+        caption={sections[kind]}
+        rows={rows ?? []} columns={columns}
+        selectionMode="none" showColumnMenu={false} showDensityToggle={false}
+        showQuickFilter quickFilter={search} quickFilterDebounceMs={350}
+        labels={{ quickFilter: (caption) => 'Search ' + caption }}
+        toolbar={
+          <div className="ms-auto flex flex-wrap gap-2">
+            {data && data.pending > 0 && (
+              <Button size="sm" variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
+                Approve all {sections[kind]}{search ? ' in project' : ''} ({data.pending})
+              </Button>
+            )}
+            {data?.can_continue && !locked && (
+              <Button size="sm" variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
+                {nextStageLabel[kind]}
+              </Button>
+            )}
+            <Button size="sm" disabled={!rows || needsParents} onClick={() => setEditor({})}>New {singular[kind]}</Button>
           </div>
-        ))}
-      {data && data.total > 0 && (
-        <PaginationFooter
-          noun={sections[kind]}
-          total={data.total}
-          page={data.page}
-          pageSize={data.page_size}
-          pageSizeOptions={pageSizes}
-          onPageChange={(next) => setQuery({ page: pageParam(next) })}
-          onPageSizeChange={(size) => setQuery({ page_size: size === 10 ? null : String(size) })}
-          className="min-w-0"
-        />
+        }
+        paginationMode="server" paginated={Boolean(currentFilter && data.total)}
+        rowCount={currentFilter ? data.total : 0}
+        page={data?.page ?? page} pageSize={data?.page_size ?? pageSize} pageSizeOptions={pageSizes}
+        onQueryChange={(next) => setQuery({
+          search: (next.quickFilter ?? '').trim().slice(0, 200),
+          page: pageParam(next.page), page_size: next.pageSize === 10 ? null : String(next.pageSize), epic: null,
+        })}
+        loading={!rows && plan.loading ? true : changingPage && plan.loading ? 'refresh' : false}
+        emptyState={<p role="status" className="text-sm text-muted-foreground">{empty}</p>}
+        filtered={Boolean(search)}
+        noResultsState={<p role="status" className="text-sm text-muted-foreground">No {sections[kind]} match “{search}”.</p>}
+      />
+      {reading && (
+        <Dialog open onOpenChange={(open) => { if (!open) setReading(null); }}>
+          <DialogContent size="lg" showClose closeLabel="Close description">
+            <DialogHeader><DialogTitle>{reading.title}</DialogTitle></DialogHeader>
+            <DialogBody role="region" aria-label="Full description" tabIndex={0} className="max-h-[65dvh] overflow-y-auto">
+              <p className="whitespace-pre-wrap break-words">{reading.description}</p>
+            </DialogBody>
+          </DialogContent>
+        </Dialog>
       )}
       {kind === 'issues' && <WorkspaceSync project={project} onSynced={plan.reload} />}
       {approving && (
         <Confirm
           title={approving.title ? `Approve ${singular[kind]}?` : `Approve all ${approving.ids.length} ${sections[kind]}?`}
-          about={(approving.title ? approving.title + '. ' : 'Approval applies across all pages of this table. ') + (kind === 'issues'
+          about={(approving.title ? approving.title + '. ' : search ? 'Approval includes all pending proposals in this table, including those hidden by the search. ' : 'Approval applies across all pages of this table. ') + (kind === 'issues'
             ? 'Create generated Issues in GitHub and link existing Issues in their current state.'
             : 'Save the approved records. Any corresponding open planning issues will be closed on GitHub.')}
           action={approving.title ? 'Approve' : 'Approve all'}
@@ -388,6 +420,11 @@ function Records({ kind, project }: { kind: Kind; project: string }) {
 }
 
 export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary; onApproved: () => void }) {
+  const counts = useResource<Record<Kind, number>>(apiUrl('projects/' + encodeURIComponent(project.project) + '/planning/counts'), 5000);
+  useEffect(() => {
+    window.addEventListener(CHANGED, counts.reload);
+    return () => window.removeEventListener(CHANGED, counts.reload);
+  }, [counts.reload]);
   const requested = useLocation().query.get('tab') ?? 'home';
   const tab = Object.hasOwn(sections, requested) ? requested : 'home';
   return (
@@ -395,14 +432,18 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
-            {Object.entries(sections).map(([id, label]) => (
-              <TabsTab key={id} value={id}>
-                {label}
-              </TabsTab>
-            ))}
+            {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {
+              const count = id === 'home' || id === 'architecture' ? undefined : counts.data?.[id];
+              return (
+                <TabsTab key={id} value={id} count={count} aria-label={sections[id]}
+                  aria-description={count === undefined ? undefined : count + (count === 1 ? ' record' : ' records')}>
+                  {sections[id]}
+                </TabsTab>
+              );
+            })}
           </TabsList>
         </div>
         <TabsPanel value="home" className="grid gap-5 pt-5">

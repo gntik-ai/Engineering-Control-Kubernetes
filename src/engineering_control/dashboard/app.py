@@ -1030,6 +1030,13 @@ def create_app(
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
+    @app.get("/api/dashboard/projects/{name}/planning/counts")
+    async def planning_counts(name: str, request: Request) -> Response:
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).planning.counts, name))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
     @app.get("/api/dashboard/projects/{name}/planning/{kind}")
     async def planning_page(
         name: str,
@@ -1037,10 +1044,14 @@ def create_app(
         request: Request,
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),
+        search: str = Query(default="", max_length=200, pattern=r"^[^\x00]*$"),
+        epic: UUID | None = None,
     ) -> Response:
         try:
             return JSONResponse(
-                await asyncio.to_thread(repo(request).planning.page, name, kind, page, page_size)
+                await asyncio.to_thread(
+                    repo(request).planning.page, name, kind, page, page_size, search, epic
+                )
             )
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None

@@ -1,0 +1,92 @@
+import type { PaginationFooterLabels } from '../pagination-footer/PaginationFooter';
+
+/** Per-instance table chrome, including the composed PaginationFooter. Caller data stays caller-owned. */
+export interface DataTableLabels extends PaginationFooterLabels {
+  filterColumn?: (header: string) => string;
+  filtered?: string;
+  applyFilter?: string;
+  filterAny?: string;
+  clearFilter?: string;
+  filterSearch?: string;
+  filterFrom?: string;
+  filterTo?: string;
+  /** Quick filter field and collapsed button name; receives the caller caption. */
+  quickFilter?: (caption: string) => string;
+  /** Polite status after a quick filter term applies. */
+  quickFilterResults?: (count: number) => string;
+  export?: string;
+  exportAll?: (count: number) => string;
+  exportPage?: string;
+  exportSelected?: (count: number) => string;
+  copySelected?: string;
+  copiedToClipboard?: string;
+  copyFailed?: string;
+  booleanTrue: string;
+  booleanFalse: string;
+  /** Non-virtual table overflow region; virtualized regions keep the caller caption. */
+  scrollRegion: string;
+  selectionCount: (count: number) => string;
+  pageSelected: (count: number) => string;
+  selectAllMatching: (count: number) => string;
+  allMatchingSelected: (count: number) => string;
+  clearSelection: string;
+  columns: string;
+  visibleColumns: string;
+  pinColumns: string;
+  pinnedLeft: string;
+  pinnedRight: string;
+  pinLeft: string;
+  pinRight: string;
+  unpinned: string;
+  density: string;
+  comfortable: string;
+  compact: string;
+  resizeColumn: (label: string) => string;
+  columnWidth: (width: number) => string;
+  defaultView: string;
+  defaultViewOption: string;
+  modified: string;
+  views: string;
+  saveChanges: string;
+  saveAs: string;
+  renameView: string;
+  deleteView: string;
+  resetChanges: string;
+  saveViewTitle: string;
+  renameViewTitle: string;
+  viewName: string;
+  cancel: string;
+  saveView: string;
+  rename: string;
+  closeDialog: string;
+  selection: string;
+  selectAll: string;
+  selectRow: (label: string) => string;
+  selectGroup: (group: string) => string;
+  groupRows: (count: number) => string;
+  noGroup: string;
+  actions: string;
+  details?: string;
+  rowDetails?: (label: string) => string;
+  rowActions: (label: string) => string;
+  emptyTitle: string;
+  emptyDescription: string;
+  loading: (caption: string) => string;
+  /** Refresh status announcement and progress bar name; receives the original caller caption. */
+  updating?: (caption: string) => string;
+  addRow?: string;
+  deleteRow?: string;
+  deleteRowTitle?: (label: string) => string;
+  deleteRowDescription?: (label: string) => string;
+  rowsChanged?: (count: number) => string;
+  saveAll?: string;
+  discardAll?: string;
+  editRow?: (label: string) => string;
+  saveRow?: string;
+  editHint: string;
+  editLabel: (column: string, row: string) => string;
+  editError: string;
+  enterNumber: string;
+  minimumValue: (min: number) => string;
+  maximumValue: (max: number) => string;
+}

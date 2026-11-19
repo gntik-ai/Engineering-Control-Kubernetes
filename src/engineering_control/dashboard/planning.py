@@ -9,8 +9,22 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import Select, Subquery, delete, false, func, literal, null, select, true, union_all
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import (
+    Select,
+    String,
+    Subquery,
+    Uuid,
+    delete,
+    false,
+    func,
+    literal,
+    null,
+    select,
+    true,
+    union_all,
+)
+from sqlalchemy import cast as sql_cast
+from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
@@ -128,6 +142,18 @@ def _visible_issues(project: UUID) -> ColumnElement[bool]:
     )
 
 
+def _parent_links(
+    kind: Kind,
+) -> tuple[
+    InstrumentedAttribute[UUID],
+    InstrumentedAttribute[UUID],
+    type[ProjectStoryEpic] | type[ProjectIssueStory],
+]:
+    if kind == "stories":
+        return ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id, ProjectStoryEpic
+    return ProjectIssueStory.item_id, ProjectIssueStory.story_id, ProjectIssueStory
+
+
 def _parent_options(project: UUID, kind: str) -> Select[tuple[UUID, str]]:
     parent = ProjectEpic if kind == "stories" else ProjectUserStory
     return (
@@ -218,6 +244,41 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
     return union_all(proposals, saved).subquery()
 
 
+def _search_matches(
+    session: Session, rows: Subquery, project: UUID, kind: Kind, search: str
+) -> ColumnElement[bool]:
+    if not search:
+        return true()
+    match = (
+        rows.c.title.icontains(search, autoescape=True)
+        | rows.c.description.icontains(search, autoescape=True)
+        | (sql_cast(rows.c.number, String) == search.removeprefix("#"))
+    )
+    if kind == "epics":
+        return match
+
+    parent = ProjectEpic if kind == "stories" else ProjectUserStory
+    parents = select(parent.id).where(
+        parent.project_id == project,
+        parent.archived_at.is_(None),
+        parent.title.icontains(search, autoescape=True),
+    )
+    child, parent_id, link = _parent_links(kind)
+    saved = select(child).where(link.project_id == project, parent_id.in_(parents))
+
+    # Saved records have link rows. Pending import proposals still carry a JSON array
+    # of UUID strings. Match both against active parents before paging the results.
+    if session.get_bind().dialect.name == "postgresql":
+        entries = func.json_array_elements_text(rows.c.parents).table_valued("value")
+        value: ColumnElement[Any] = sql_cast(entries.c.value, Uuid)
+    else:
+        entries = func.json_each(rows.c.parents).table_valued("value")
+        # SQLAlchemy stores SQLite UUID columns as 32 hex digits without hyphens.
+        value = func.replace(entries.c.value, "-", "")
+    proposed = select(1).select_from(entries).where(value.in_(parents)).correlate(rows).exists()
+    return match | (~rows.c.proposal & rows.c.id.in_(saved)) | (rows.c.proposal & proposed)
+
+
 class PlanningRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -234,13 +295,26 @@ class PlanningRecords:
                 session.connection().exec_driver_sql("BEGIN")
             yield session
 
-    def page(self, name: str, kind: Kind, page: int, page_size: int) -> dict[str, Any]:
+    def page(
+        self,
+        name: str,
+        kind: Kind,
+        page: int,
+        page_size: int,
+        search: str = "",
+        epic: UUID | None = None,
+    ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
             rows = _table_rows(project.id, kind)
+            epic = epic if kind == "epics" else None
+            search = "" if epic else search.strip()
+            matches = _search_matches(session, rows, project.id, kind, search)
+            ordering = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+            # Approval and stage progression always refer to the entire table.
             total, pending, proposed = session.execute(
                 select(
-                    func.count(),
+                    func.count().filter(matches),
                     func.count().filter(rows.c.review.in_(("proposal", "pending"))),
                     func.count().filter(rows.c.proposal),
                 ).select_from(rows)
@@ -248,11 +322,24 @@ class PlanningRecords:
             pages = max(1, (total + page_size - 1) // page_size)
             requested_page = page
             page = min(page, pages)
+            if epic:
+                ranked = select(
+                    rows.c.id,
+                    rows.c.proposal,
+                    func.row_number().over(order_by=ordering).label("position"),
+                ).subquery()
+                position = session.scalar(
+                    select(ranked.c.position).where(ranked.c.id == epic, ~ranked.c.proposal)
+                )
+                if position is not None:
+                    page = (position - 1) // page_size + 1
+
             items = [
                 dict(record)
                 for record in session.execute(
                     select(rows)
-                    .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+                    .where(matches)
+                    .order_by(*ordering)
                     .offset((page - 1) * page_size)
                     .limit(page_size)
                 ).mappings()
@@ -263,11 +350,7 @@ class PlanningRecords:
             if kind != "epics":
                 options = _parent_options(project.id, kind)
                 has_parents = session.execute(options.limit(1)).first() is not None
-                child, parent, link = (
-                    (ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id, ProjectStoryEpic)
-                    if kind == "stories"
-                    else (ProjectIssueStory.item_id, ProjectIssueStory.story_id, ProjectIssueStory)
-                )
+                child, parent, link = _parent_links(kind)
                 saved_ids = [item["id"] for item in items if not item["proposal"]]
                 if saved_ids:
                     for child_id, parent_id in session.execute(
@@ -313,6 +396,8 @@ class PlanningRecords:
                 "page": page,
                 "page_size": page_size,
                 "requested_page": requested_page,
+                "search": search,
+                "epic": str(epic) if epic else None,
                 "pages": pages,
                 "pending": pending,
                 "parents": parents,
@@ -333,6 +418,21 @@ class PlanningRecords:
                     and not coverage_problem(session, project.id, kind)
                 ),
             }
+
+    def counts(self, name: str) -> dict[str, int]:
+        with self._snapshot() as session:
+            project = active_project(session, name)
+            kinds: tuple[Kind, ...] = ("epics", "stories", "issues")
+            counts = select(
+                *(
+                    select(func.count())
+                    .select_from(_table_rows(project.id, kind))
+                    .scalar_subquery()
+                    .label(kind)
+                    for kind in kinds
+                )
+            )
+            return dict(session.execute(counts).mappings().one())
 
     def pending(self, name: str, kind: Kind) -> dict[str, Any]:
         # Open the bulk confirmation with just the IDs currently awaiting approval.

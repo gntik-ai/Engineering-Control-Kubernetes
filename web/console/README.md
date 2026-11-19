@@ -50,8 +50,9 @@ From 0.11.0 to 0.13.0 no migration applied. Taken from those releases: `KitProvi
 `SearchField`, character counters, document titles and the page baseline.
 
 The upgrade from 0.13.0 to 0.15.0 required no codemods. Epics, User Stories and Issues
-use the kit’s `pagination-footer` block with server-side paging. The footer displays the
-visible range and offers 10, 25, 50 or 100 rows per page.
+use the kit’s `data-table` block with its search toolbar and numbered pagination footer in
+server mode. The footer offers 10, 25, 50 or 100 rows per page. Tab badges show unfiltered
+project totals. The copied block uses Vite’s development flags for its development-only diagnostics.
 
 Blocks worth copying in when their page is next worked on: `error-panel` (load errors with
 a retry), `confirm-destructive` (removal dialogs), `page-header` (breadcrumbs on the project

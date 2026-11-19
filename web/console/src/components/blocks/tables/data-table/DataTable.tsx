@@ -1,0 +1,976 @@
+import { useFilterModel, EMPTY_FILTER_MODEL } from './use-filter-model';
+import { QuickFilter } from './quick-filter-field';
+import { useQuickFilter } from './use-quick-filter';
+import {
+  Checkbox,
+  cn,
+  DensityProvider,
+  Table,
+  TableCaption,
+  TableHead,
+  TableHeader,
+  TableRow,
+  type TableDensity,
+  type QueryGroup,
+  type QueryCondition,
+  useDensity,
+  useI18n,
+} from '@gntik-ai/ui';
+import { useId, useRef, useState } from 'react';
+import { PaginationFooter } from '../pagination-footer/PaginationFooter';
+import { ColumnVisibilityMenu } from './column-menu';
+import {
+  clampColumnWidth,
+  columnWidthOf,
+  orderColumns,
+  pinSideOf,
+  setColumnPin,
+  stickyTint,
+  tableLayout,
+  widthBounds,
+  type ColumnWidths,
+  type PinnedColumns,
+} from './column-sizing';
+import { DataTableBody, flattenBody, type DataTableBodyGroup } from './data-table-body';
+import type { DataTableProps, DataTableQuery } from './data-table-props';
+import {
+  groupKeyOf,
+  groupRows,
+  paginate,
+  selectionState,
+  sortRows,
+  toggleAll,
+  toggleOne,
+  type DataTableColumn,
+  type DataTableGroupBy,
+  type SortState,
+} from './data-table-utils';
+import { DensityToggle } from './density-toggle';
+import { DEPLOYMENT_COLUMNS, DEPLOYMENT_ROWS } from './fixtures';
+import { DataTableHeadCell } from './header-cell';
+import { SelectionGroup, useSingleSelection, useSingleSelectionWarnings } from './single-selection';
+import { SelectionStrip } from './selection-strip';
+import { useControllable, useTableViews } from './use-table-views';
+import { useMultipleSelection } from './use-multiple-selection';
+import { useVirtualRows } from './use-virtual-rows';
+import { ViewSwitcher, type DataTableViewState } from './views';
+import { ExportMenu } from './export-menu';
+import { useTableExport } from './use-table-export';
+import { AddRowButton, NewRow } from './new-row';
+import { useRowDeletion } from './row-delete';
+import { RowEditBar } from './row-edit-bar';
+import { useRowEdits } from './use-row-edits';
+import { useDetailRows, useDetailVirtualizationWarning } from './use-detail-rows';
+import { useAutoPageSize } from './use-auto-page-size';
+import { RefreshIndicator } from './refresh-indicator';
+import { useRefreshStatus } from './use-refresh-status';
+
+export type { DataTableLabels } from './labels';
+export type {
+  DataTableProps,
+  DataTableQuery,
+  DataTableCsvExportOptions,
+  DataTableExportRequest,
+} from './data-table-props';
+
+const defaultRowId = (row: unknown): string => {
+  const id = (row as { id?: unknown }).id;
+  return typeof id === 'string' || typeof id === 'number' ? String(id) : '';
+};
+const EMPTY_PINNED: PinnedColumns = {};
+const EMPTY_WIDTHS: ColumnWidths = {};
+const ROW_HEIGHT: Record<TableDensity, number> = { comfortable: 44, compact: 36 };
+
+/**
+ * Generic data table on the kit Table: typed columns, sortable headers (aria-sort), row selection
+ * with select-all / indeterminate, column visibility menu, density toggle, row actions, loading
+ * and empty states, client-side sort + pagination, optional collapsible row groups (`groupBy`),
+ * column resize and pinning, row virtualization, inline cell editing and saved views.
+ */
+export function DataTable<T = (typeof DEPLOYMENT_ROWS)[number]>({
+  rows = DEPLOYMENT_ROWS as unknown as readonly T[],
+  columns = DEPLOYMENT_COLUMNS as unknown as ReadonlyArray<DataTableColumn<T>>,
+  getRowId = defaultRowId,
+  getRowLabel,
+  caption: captionProp,
+  showCaption = false,
+  selectable: selectableProp = true,
+  selectionMode,
+  selectionName,
+  legend,
+  'aria-label': ariaLabel,
+  'aria-labelledby': ariaLabelledBy,
+  selectedId,
+  defaultSelectedId,
+  onSelectedIdChange,
+  isRowDisabled,
+  selectedIds,
+  defaultSelectedIds = [],
+  onSelectionChange,
+  preserveSelection,
+  selectAllMatching = false,
+  hideSelectAll = false,
+  selectionModel,
+  onSelectionModelChange,
+  bulkActions,
+  selectionSummary = true,
+  rowActions,
+  renderDetail,
+  hasDetail,
+  expandedDetailIds,
+  defaultExpandedDetailIds,
+  onExpandedDetailIdsChange,
+  detailExpandMode,
+  detailOnRowClick,
+  sort: sortProp,
+  defaultSort = null,
+  onSortChange,
+  onQueryChange,
+  manualSorting = false,
+  paginated: paginatedProp,
+  paginationMode = 'client',
+  rowCount,
+  page: controlledPage,
+  defaultPage = 1,
+  pageSize: controlledPageSize,
+  onPageChange,
+  onPageSizeChange,
+  defaultPageSize = 10,
+  autoPageSize = false,
+  pageSizeOptions = [10, 25, 50],
+  density: densityProp,
+  defaultDensity,
+  onDensityChange,
+  showDensityToggle = true,
+  showColumnMenu = true,
+  loading = false,
+  loadingRows = 5,
+  emptyState,
+  noResultsState,
+  filtered = false,
+  groupBy,
+  groupLabel,
+  collapsibleGroups = true,
+  collapsedGroups: collapsedProp,
+  defaultCollapsedGroups = [],
+  onCollapsedGroupsChange,
+  onGroupByChange,
+  hiddenColumns: hiddenProp,
+  onHiddenColumnsChange,
+  resizable = false,
+  columnWidths: widthsProp,
+  defaultColumnWidths = EMPTY_WIDTHS,
+  onColumnWidthsChange,
+  pinnedColumns: pinnedProp,
+  defaultPinnedColumns = EMPTY_PINNED,
+  onPinnedColumnsChange,
+  showPinMenu,
+  virtualize = 'auto',
+  virtualizeThreshold = 100,
+  rowHeight: rowHeightProp,
+  virtualContainerClassName = 'max-h-[32rem]',
+  onCellEdit,
+  editMode = 'cell',
+  editingRowIds,
+  defaultEditingRowIds,
+  onEditingRowIdsChange,
+  onRowSave,
+  onRowsSave,
+  onRowAdd,
+  newRowPosition = 'top',
+  newRowDefaults,
+  onRowDelete,
+  views: viewsProp,
+  defaultViews,
+  onViewsChange,
+  activeViewId,
+  defaultActiveViewId,
+  onActiveViewChange,
+  showViewSwitcher,
+  filters,
+  filterModel,
+  defaultFilterModel,
+  onFilterModelChange,
+  onFiltersChange,
+  quickFilter,
+  defaultQuickFilter = '',
+  onQuickFilterChange,
+  showQuickFilter = false,
+  quickFilterDebounceMs = 300,
+  toolbar,
+  csvExport = false,
+  onExport,
+  className,
+  labels,
+}: DataTableProps<T>) {
+  const caption = captionProp ?? 'Deployments';
+  const { t, formatNumber, locale } = useI18n();
+  const details = useDetailRows({
+    renderDetail,
+    hasDetail,
+    expandedDetailIds,
+    defaultExpandedDetailIds,
+    onExpandedDetailIdsChange,
+    detailExpandMode,
+    detailOnRowClick,
+  });
+  const addRowRef = useRef<HTMLButtonElement>(null);
+  const rowEdits = useRowEdits({
+    columns,
+    getRowId,
+    editingRowIds,
+    defaultEditingRowIds,
+    onEditingRowIdsChange,
+    onRowSave,
+    onRowsSave,
+    onRowAdd,
+    newRowDefaults,
+    labels,
+    genericError: labels?.editError ?? t('table.editSaveError'),
+  });
+  const singleMode = selectionMode === 'single';
+  const serverMode = paginationMode === 'server';
+  const sortingEnabled = !serverMode || onSortChange != null || onQueryChange != null;
+  const selectable = selectionMode === undefined ? selectableProp : selectionMode === 'multiple';
+  const selectionColumn = selectable || singleMode;
+  const paginated = paginatedProp ?? (serverMode || !singleMode);
+  const autoSizing = !serverMode && paginated && autoPageSize;
+  const editHintId = useId();
+  const tableRef = useRef<HTMLTableElement>(null);
+  const autoSizeViewport = useRef<HTMLDivElement>(null);
+  const pageCheckboxRef = useRef<HTMLElement>(null);
+  // A view active at mount seeds the initial state.
+  const [initialView] = useState(() =>
+    (viewsProp ?? defaultViews ?? []).find((v) => v.id === (activeViewId ?? defaultActiveViewId)),
+  );
+  const [initialFilters] = useState(() => filters);
+  const seed = initialView?.state ?? {};
+  const defaultHidden = columns.filter((c) => c.defaultHidden).map((c) => c.id);
+
+  const [innerSort, setInnerSort] = useState<SortState | null>(seed.sort !== undefined ? seed.sort : defaultSort);
+  const [innerDensity, setInnerDensity] = useState<TableDensity | null>(defaultDensity ?? null);
+  const contextDensity = useDensity();
+  const [hiddenList, setHiddenList] = useControllable<readonly string[]>(
+    hiddenProp,
+    () => seed.hiddenColumns ?? defaultHidden,
+    (ids) => onHiddenColumnsChange?.([...ids]),
+  );
+  const [widths, setWidths] = useControllable<ColumnWidths>(
+    widthsProp,
+    () => seed.columnWidths ?? defaultColumnWidths,
+    (w) => onColumnWidthsChange?.({ ...w }),
+  );
+  const [pinned, setPinned] = useControllable<PinnedColumns>(
+    pinnedProp,
+    () => seed.pinnedColumns ?? defaultPinnedColumns,
+    onPinnedColumnsChange,
+  );
+  // `undefined`: follow the groupBy prop; a string or null: set by a saved view.
+  const [groupOverride, setGroupOverride] = useState<string | null | undefined>(seed.groupBy);
+  const [page, setPage] = useControllable(
+    serverMode ? undefined : controlledPage,
+    defaultPage,
+    serverMode ? undefined : onPageChange,
+  );
+  const [pageSize, setPageSize] = useControllable(
+    serverMode || autoSizing ? undefined : controlledPageSize,
+    defaultPageSize,
+    serverMode ? undefined : onPageSizeChange,
+  );
+
+  const hidden: ReadonlySet<string> = new Set(hiddenList);
+  const effectiveGroupBy: DataTableGroupBy<T> | undefined =
+    groupOverride === undefined ? groupBy : ((groupOverride ?? undefined) as DataTableGroupBy<T> | undefined);
+  const sort = sortProp === undefined ? innerSort : sortProp;
+  const filtering = useFilterModel({
+    rows,
+    columns,
+    model: filterModel,
+    initial: seed.filterModel ?? defaultFilterModel,
+    onChange: onFilterModelChange,
+    serverMode,
+    onExternalChange: () => {
+      if (serverMode) {
+        if ((controlledPage ?? 1) !== 1) onPageChange?.(1);
+      } else if (page !== 1) setPage(1);
+    },
+  });
+  const quick = useQuickFilter({
+    value: quickFilter,
+    defaultValue: defaultQuickFilter,
+    onChange: onQuickFilterChange,
+    rows: filtering.rows,
+    columns,
+    hidden: hiddenList,
+    serverMode,
+    locale,
+    booleanLabels: [labels?.booleanTrue ?? t('common.yes'), labels?.booleanFalse ?? t('common.no')],
+    onExternalChange: () => {
+      if (!serverMode && page !== 1) setPage(1);
+    },
+  });
+  const filteredRows = quick.rows;
+  const enabledIds = filteredRows.filter((row) => !isRowDisabled?.(row)).map(getRowId);
+  const {
+    selected,
+    selectedList,
+    setSelected,
+    model,
+    selectedCount,
+    allMatchingSelected,
+    clearForFilterModel,
+    selectAllMatching: selectMatching,
+    clear,
+  } = useMultipleSelection({
+    // Rows the quick filter hides stay selected, so reports keep them.
+    rowIds: filtering.rows.map(getRowId),
+    selectedIds,
+    defaultSelectedIds,
+    onSelectionChange,
+    preserveSelection: preserveSelection ?? serverMode,
+    enabledIds,
+    selectionModel,
+    onSelectionModelChange,
+    serverMode,
+    selectAllMatching: selectable && selectAllMatching,
+    total: rowCount ?? filteredRows.length,
+    filters,
+    filterModel: filtering.model,
+  });
+  const density = densityProp ?? innerDensity ?? contextDensity;
+  const visibleColumns = orderColumns(
+    columns.filter((c) => !hidden.has(c.id)),
+    pinned,
+  );
+  const labelOf =
+    getRowLabel ??
+    ((row: T) => {
+      const first = columns[0];
+      const value = first?.accessor?.(row);
+      return value == null ? getRowId(row) : String(value);
+    });
+
+  const [innerCollapsed, setInnerCollapsed] = useState<ReadonlySet<string>>(() => new Set(defaultCollapsedGroups));
+  const collapsed: ReadonlySet<string> = collapsedProp ? new Set(collapsedProp) : innerCollapsed;
+
+  const sortedRows = serverMode ? rows : manualSorting ? [...filteredRows] : sortRows(filteredRows, columns, sort);
+  const allGroups = effectiveGroupBy ? groupRows(sortedRows, effectiveGroupBy, filteredRows) : null;
+  const sorted = allGroups ? allGroups.flatMap((g) => g.rows) : sortedRows;
+  const clientPage = Math.min(Math.max(1, page), Math.max(1, Math.ceil(sorted.length / Math.max(1, pageSize))));
+  const pageRows = serverMode ? rows : paginated ? paginate(sorted, clientPage, pageSize) : sorted;
+  const refresh = useRefreshStatus(loading, pageRows.length > 0);
+  const deletion = useRowDeletion({
+    rows: sorted,
+    getRowId,
+    getRowLabel: labelOf,
+    rowActions,
+    onRowDelete: onRowDelete
+      ? async (row: T) => {
+          await onRowDelete(row);
+          rowEdits.cancel(row, false);
+        }
+      : undefined,
+    tableRef,
+    labels,
+  });
+  const hasActions = deletion.actions != null || editMode === 'row' || onRowAdd != null;
+  // Rows in collapsed groups are hidden, so select-all leaves them alone.
+  const pageIds = (
+    effectiveGroupBy ? pageRows.filter((row) => !collapsed.has(groupKeyOf(row, effectiveGroupBy))) : pageRows
+  )
+    .filter((row) => !isRowDisabled?.(row))
+    .map(getRowId);
+  const header = selectionState(pageIds, selected);
+  const queryPage = serverMode ? (controlledPage ?? 1) : clientPage;
+  const queryPageSize = serverMode ? (controlledPageSize ?? defaultPageSize) : pageSize;
+  const reportQuery = (cause: DataTableQuery['cause'], next: Partial<DataTableQuery>) => {
+    refresh.markRequested();
+    onQueryChange?.({
+      page: queryPage,
+      pageSize: queryPageSize,
+      sort,
+      filters,
+      ...(filtering.model !== EMPTY_FILTER_MODEL ? { filterModel: filtering.model } : {}),
+      ...(quick.term !== '' ? { quickFilter: quick.term } : {}),
+      ...next,
+      cause,
+    });
+  };
+  // A resize that moves the page finishes in the footer's synchronous changePage
+  // callback, so one query follows the legacy callbacks without scheduling or batching.
+  const resizingTo = useRef<number | undefined>(undefined);
+  const changePage = (next: number) => {
+    if (serverMode) onPageChange?.(next);
+    else setPage(next);
+    const nextSize = resizingTo.current;
+    resizingTo.current = undefined;
+    reportQuery(nextSize === undefined ? 'page' : 'pageSize', {
+      page: next,
+      pageSize: nextSize ?? queryPageSize,
+    });
+  };
+  const changePageSize = (next: number) => {
+    const total = serverMode ? (rowCount ?? 0) : filteredRows.length;
+    const pageCount = Math.max(1, Math.ceil(total / Math.max(1, queryPageSize)));
+    const displayedPage = Math.min(Math.max(1, queryPage), pageCount);
+    const from = total === 0 ? 0 : (displayedPage - 1) * queryPageSize + 1;
+    // Match the footer's comparison before goTo clamps the page (empty results yield 0).
+    const nextPage = Math.floor((from - 1) / next) + 1;
+    if (serverMode) onPageSizeChange?.(next);
+    else setPageSize(next);
+    if (nextPage !== displayedPage) resizingTo.current = next;
+    else reportQuery('pageSize', { page: nextPage, pageSize: next });
+    return nextPage;
+  };
+  const changeSort = (columnId: string, direction: SortState['direction']) => {
+    if (!sortingEnabled) return;
+    const next: SortState = { columnId, direction: sort?.columnId === columnId ? direction : 'ascending' };
+    setInnerSort(next);
+    onSortChange?.(next);
+    if (serverMode) {
+      if (queryPage !== 1) onPageChange?.(1);
+    } else if (page !== 1) setPage(1);
+    reportQuery('sort', { page: 1, sort: next });
+  };
+  const changeFilter = (next: QueryGroup) => {
+    filtering.setModel(next);
+    if (allMatchingSelected) clearForFilterModel(next);
+    if (serverMode) {
+      if (queryPage !== 1) onPageChange?.(1);
+    } else if (page !== 1) setPage(1);
+    reportQuery('filter', { page: 1, filterModel: next });
+  };
+  const changeQuickFilter = (next: string) => {
+    if (!quick.apply(next)) return;
+    if (serverMode) {
+      if (queryPage !== 1) onPageChange?.(1);
+    } else if (page !== 1) setPage(1);
+    reportQuery('quickFilter', { page: 1, quickFilter: next });
+  };
+  const toggleGroup = (key: string) => {
+    const next = new Set(collapsed);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setInnerCollapsed(next);
+    onCollapsedGroupsChange?.([...next]);
+  };
+  const nameOf = (key: string) => key || (labels?.noGroup ?? 'No group');
+  const bodyGroups: Array<DataTableBodyGroup<T>> | undefined =
+    effectiveGroupBy && allGroups
+      ? allGroups
+          .map((g) => ({
+            key: g.key,
+            label: groupLabel ? groupLabel(g.key, g.rows) : nameOf(g.key),
+            name: nameOf(g.key),
+            rows: pageRows.filter((row) => groupKeyOf(row, effectiveGroupBy) === g.key),
+            ids: g.rows.map(getRowId),
+            selectableIds: g.rows.filter((row) => !isRowDisabled?.(row)).map(getRowId),
+          }))
+          .filter((g) => g.rows.length > 0)
+      : undefined;
+  const groupsForBody = bodyGroups && bodyGroups.length > 0 ? bodyGroups : undefined;
+  const singleSelection = useSingleSelection({
+    selectionName,
+    selectedId,
+    defaultSelectedId,
+    onSelectedIdChange,
+    getRowId,
+    getRowLabel: labelOf,
+    isRowDisabled,
+    rows:
+      !singleMode || refresh.skeleton
+        ? []
+        : pageRows.filter((row) => !effectiveGroupBy || !collapsed.has(groupKeyOf(row, effectiveGroupBy))),
+  });
+  useSingleSelectionWarnings({
+    single: singleMode,
+    selectionName,
+    hasLabel:
+      Boolean(legend || ariaLabel?.trim() || ariaLabelledBy?.trim()) ||
+      typeof legend === 'number' ||
+      typeof legend === 'bigint',
+  });
+
+  const changeDensity = (next: TableDensity) => {
+    setInnerDensity(next);
+    onDensityChange?.(next);
+  };
+  const toggleColumn = (id: string, visible: boolean) =>
+    setHiddenList(visible ? hiddenList.filter((c) => c !== id) : [...hiddenList, id]);
+  const resizeColumn = (column: DataTableColumn<T>, width: number) =>
+    setWidths({ ...widths, [column.id]: clampColumnWidth(column, width) });
+
+  // Saved views.
+  const groupName = (g: DataTableGroupBy<T> | undefined): string | null => (typeof g === 'string' ? g : null);
+  const currentState: DataTableViewState = {
+    ...(filtering.model !== EMPTY_FILTER_MODEL ? { filterModel: filtering.model } : {}),
+    filters,
+    sort,
+    hiddenColumns: hiddenList,
+    columnWidths: widths,
+    pinnedColumns: pinned,
+    groupBy: groupOverride === undefined ? groupName(groupBy) : groupOverride,
+  };
+  const defaultState: DataTableViewState = {
+    ...(defaultFilterModel ? { filterModel: defaultFilterModel } : {}),
+    filters: initialFilters,
+    sort: defaultSort,
+    hiddenColumns: defaultHidden,
+    columnWidths: defaultColumnWidths,
+    pinnedColumns: defaultPinnedColumns,
+    groupBy: groupName(groupBy),
+  };
+  const applyState = (state: DataTableViewState) => {
+    const nextModel = state.filterModel ?? defaultFilterModel ?? EMPTY_FILTER_MODEL;
+    const filterChanged = JSON.stringify(nextModel) !== JSON.stringify(filtering.model);
+    if (filterChanged) {
+      filtering.setModel(nextModel);
+      if (allMatchingSelected) clearForFilterModel(nextModel);
+    }
+    const nextSort = state.sort ?? null;
+    setInnerSort(nextSort);
+    const sortChanged =
+      sortingEnabled && (sort?.columnId !== nextSort?.columnId || sort?.direction !== nextSort?.direction);
+    if (nextSort && (!serverMode || sortChanged)) onSortChange?.(nextSort);
+    setHiddenList(state.hiddenColumns ?? defaultHidden);
+    setWidths(state.columnWidths ?? defaultColumnWidths);
+    setPinned(state.pinnedColumns ?? defaultPinnedColumns);
+    const nextGroup = state.groupBy ?? null;
+    setGroupOverride(nextGroup === groupName(groupBy) && typeof groupBy !== 'function' ? undefined : nextGroup);
+    if (nextGroup !== currentState.groupBy) onGroupByChange?.(nextGroup);
+    if (state.filters !== filters) onFiltersChange?.(state.filters);
+    if (!serverMode) {
+      if (page !== 1) setPage(1);
+    } else if ((sortChanged || filterChanged) && queryPage !== 1) onPageChange?.(1);
+    reportQuery('view', {
+      page: !serverMode || sortChanged || filterChanged ? 1 : queryPage,
+      sort: nextSort,
+      filters: state.filters,
+      ...(nextModel !== EMPTY_FILTER_MODEL || filtering.model !== EMPTY_FILTER_MODEL ? { filterModel: nextModel } : {}),
+    });
+  };
+  const viewsApi = useTableViews({
+    views: viewsProp,
+    defaultViews,
+    onViewsChange,
+    activeViewId,
+    defaultActiveViewId,
+    onActiveViewChange,
+    current: currentState,
+    defaults: defaultState,
+    apply: applyState,
+  });
+  const updatingText = labels?.updating
+    ? labels.updating(caption)
+    : t('table.updating', { caption: caption.toLowerCase() });
+  const bodySpan =
+    visibleColumns.length + (details ? 1 : 0) + (selectionColumn ? 1 : 0) + (hasActions || deletion.actions ? 1 : 0);
+  const showViews = showViewSwitcher ?? (viewsProp != null || defaultViews != null || onViewsChange != null);
+
+  const pinning =
+    showPinMenu ?? (pinnedProp != null || defaultPinnedColumns !== EMPTY_PINNED || onPinnedColumnsChange != null);
+  const layout = tableLayout({
+    columns: visibleColumns,
+    widths,
+    pinned,
+    sized: resizable || widthsProp != null || defaultColumnWidths !== EMPTY_WIDTHS,
+    lead: selectionColumn,
+    detail: details != null,
+    trail: hasActions,
+  });
+
+  const items = refresh.skeleton || pageRows.length === 0 ? 0 : flattenBody(pageRows, groupsForBody, collapsed).length;
+  useDetailVirtualizationWarning(details != null && virtualize === true);
+  const virtualOn =
+    !details &&
+    !singleMode &&
+    !refresh.skeleton &&
+    (virtualize === true || (virtualize === 'auto' && items > virtualizeThreshold));
+  const rowHeight = rowHeightProp ?? ROW_HEIGHT[density];
+  useAutoPageSize({
+    enabled: autoSizing,
+    viewportRef: autoSizeViewport,
+    tableRef,
+    rowHeight,
+    pageSize,
+    defaultPageSize,
+    showCaption,
+    onResize: (next) => {
+      const nextPage = changePageSize(next);
+      if (nextPage !== clientPage) changePage(Math.max(1, nextPage));
+    },
+  });
+  const virtual = useVirtualRows({ enabled: virtualOn, count: items, rowHeight, tableRef, viewportHeight: 512 });
+
+  const exportSelectedIds = singleMode
+    ? singleSelection.selectedId == null
+      ? []
+      : [singleSelection.selectedId]
+    : selectable
+      ? selectedList
+      : [];
+  const exportSelectedCount = singleMode ? exportSelectedIds.length : selectable ? selectedCount : 0;
+  const exportApi = useTableExport({
+    csvExport,
+    onExport,
+    serverMode,
+    caption: captionProp ?? '',
+    columns: visibleColumns,
+    sortedRows,
+    pageRows,
+    selectedIds: exportSelectedIds,
+    getRowId,
+    sort,
+    filters,
+    labels,
+  });
+  const hasSelection = selectable && selectedCount > 0 && (selectionSummary || bulkActions != null);
+  const showToolbar =
+    onRowAdd != null ||
+    toolbar != null ||
+    showQuickFilter !== false ||
+    showDensityToggle ||
+    showColumnMenu ||
+    showViews ||
+    hasSelection ||
+    exportApi.enabled;
+  const anyEditable = onCellEdit != null && columns.some((c) => c.editable);
+  const showSelectionStrip =
+    selectable &&
+    selectAllMatching &&
+    (!serverMode || !!onSelectionModelChange) &&
+    (header.checked || model.type === 'exclude' || (!serverMode && allMatchingSelected)) &&
+    (serverMode ? (rowCount ?? 0) > rows.length : enabledIds.length > pageIds.length);
+  const allMatching = serverMode ? model.type === 'exclude' : allMatchingSelected;
+  const matchingCount = serverMode ? selectedCount : enabledIds.length;
+  const stripMessage = allMatching
+    ? (labels?.allMatchingSelected?.(matchingCount) ??
+      t('table.allMatchingSelected', { count: formatNumber(matchingCount) }))
+    : (labels?.pageSelected?.(pageIds.length) ?? t('table.pageSelected', { count: formatNumber(pageIds.length) }));
+  const selectionCount = labels?.selectionCount ? labels.selectionCount(selectedCount) : <>{selectedCount} selected</>;
+
+  const tableContent = (
+    <SelectionGroup single={singleMode} legend={legend} aria-label={ariaLabel} aria-labelledby={ariaLabelledBy}>
+      <DensityProvider density={density}>
+        <Table
+          ref={tableRef}
+          tabIndex={selectable && selectAllMatching ? -1 : undefined}
+          aria-busy={refresh.skeleton || refresh.refreshing || undefined}
+          aria-rowcount={virtual ? items + 1 : undefined}
+          stickyHeader={virtualOn || autoSizing}
+          containerClassName={autoSizing ? 'h-full' : virtualOn ? virtualContainerClassName : undefined}
+          containerLabel={virtualOn ? caption : labels?.scrollRegion}
+          // Keep resize handles inside single-mode and expandable cells. Overflow at
+          // the final column adds a scroll stop and moves sticky detail panels past
+          // their containing cell at the end of the horizontal scroll range.
+          className={cn(
+            layout.tableClassName,
+            selectable && selectAllMatching && 'focus-visible:outline-2 focus-visible:outline-focus-ring',
+            (singleMode || details != null) && '[&_[data-column-resizer]]:end-0 [&_[data-column-resizer]]:justify-end',
+          )}
+          style={layout.tableStyle}
+          data-virtualized={virtualOn || undefined}
+        >
+          <TableCaption srOnly={!showCaption}>{caption}</TableCaption>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent" aria-rowindex={virtual ? 1 : undefined}>
+              {selectionColumn && (
+                <TableHead
+                  className={cn(
+                    'w-10 pe-0',
+                    layout.lead.className,
+                    layout.lead.pinned && 'z-sticky-pinned bg-card',
+                    stickyTint(layout.lead, { head: true }),
+                  )}
+                  style={layout.lead.style}
+                >
+                  {(singleMode || hideSelectAll) && (
+                    <span className="sr-only">{labels?.selection ?? t('table.selection')}</span>
+                  )}
+                  {selectable && !hideSelectAll && (
+                    <Checkbox
+                      ref={pageCheckboxRef}
+                      aria-label={labels?.selectAll ?? t('table.selectAllPage')}
+                      checked={header.checked}
+                      indeterminate={header.indeterminate}
+                      disabled={refresh.skeleton || pageIds.length === 0}
+                      onCheckedChange={() => setSelected(toggleAll(pageIds, selected))}
+                    />
+                  )}
+                </TableHead>
+              )}
+              {details && (
+                <TableHead
+                  className={cn(
+                    'w-10',
+                    layout.detail?.className,
+                    layout.detail?.pinned && 'z-sticky-pinned bg-card',
+                    stickyTint(layout.detail, { head: true }),
+                  )}
+                  style={layout.detail?.style}
+                >
+                  <span className="sr-only">{labels?.details ?? t('table.details')}</span>
+                </TableHead>
+              )}
+              {visibleColumns.map((c) => {
+                const bounds = widthBounds(c);
+                return (
+                  <DataTableHeadCell
+                    labels={labels}
+                    key={c.id}
+                    column={sortingEnabled ? c : { ...c, sortable: false }}
+                    layout={layout.columns.get(c.id)}
+                    sortDirection={sortingEnabled && sort?.columnId === c.id ? sort.direction : 'none'}
+                    onSortChange={(dir) => changeSort(c.id, dir)}
+                    filterCondition={filtering.model.children.find(
+                      (node): node is QueryCondition => node.type === 'condition' && node.field === c.id,
+                    )}
+                    onFilterApply={(value) => changeFilter(filtering.edit(c.id, value))}
+                    resize={
+                      resizable && c.resizable !== false
+                        ? {
+                            width: columnWidthOf(c, widths),
+                            min: bounds.min,
+                            max: bounds.max,
+                            onResize: (w) => resizeColumn(c, w),
+                          }
+                        : undefined
+                    }
+                  />
+                );
+              })}
+              {hasActions && (
+                <TableHead
+                  className={cn(
+                    'w-12',
+                    layout.trail.className,
+                    layout.trail.pinned && 'z-sticky-pinned bg-card',
+                    stickyTint(layout.trail, { head: true }),
+                  )}
+                  style={layout.trail.style}
+                >
+                  <span className="sr-only">{labels?.actions ?? t('table.actions')}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          {onRowAdd && newRowPosition === 'top' && (
+            <NewRow
+              edits={rowEdits}
+              columns={visibleColumns}
+              selectionColumn={selectionColumn}
+              detailColumn={details != null}
+              labels={labels}
+            />
+          )}
+          {refresh.refreshing && <RefreshIndicator label={updatingText} span={bodySpan} />}
+          <DataTableBody
+            details={details}
+            labels={labels}
+            rows={pageRows}
+            columns={visibleColumns}
+            getRowId={getRowId}
+            getRowLabel={labelOf}
+            selectable={selectable}
+            isRowDisabled={isRowDisabled}
+            selected={selected}
+            singleSelection={singleMode ? singleSelection : undefined}
+            onToggleRow={(id) => setSelected(toggleOne(id, selected))}
+            rowActions={deletion.actions}
+            loading={refresh.skeleton ? true : refresh.refreshing ? 'refresh' : false}
+            loadingRows={loadingRows}
+            emptyState={emptyState}
+            noResultsState={noResultsState}
+            filtered={filtered || quick.term.trim() !== ''}
+            groups={groupsForBody}
+            collapsedGroups={collapsed}
+            collapsibleGroups={collapsibleGroups}
+            onToggleGroup={toggleGroup}
+            onToggleGroupRows={(ids) => setSelected(toggleAll(ids, selected))}
+            layout={layout}
+            hasNewRow={rowEdits.newRow !== null}
+            hasRowActions={hasActions}
+            rowEdits={editMode === 'row' ? rowEdits : undefined}
+            onCellEdit={editMode === 'cell' ? onCellEdit : undefined}
+            editHintId={anyEditable ? editHintId : undefined}
+            virtual={virtual}
+          />
+          {onRowAdd && newRowPosition === 'bottom' && (
+            <NewRow
+              edits={rowEdits}
+              columns={visibleColumns}
+              selectionColumn={selectionColumn}
+              detailColumn={details != null}
+              labels={labels}
+            />
+          )}
+        </Table>
+      </DensityProvider>
+    </SelectionGroup>
+  );
+
+  return (
+    <div
+      className={cn(
+        'overflow-hidden rounded-xl border border-border bg-card shadow-sm',
+        autoSizing && 'flex h-full min-h-0 flex-col',
+        className,
+      )}
+      onKeyDown={exportApi.enabled ? exportApi.onCopyKeyDown : undefined}
+    >
+      <div
+        className={cn(
+          !showToolbar && 'sr-only',
+          autoSizing && 'shrink-0',
+          'flex min-h-12 flex-wrap items-center gap-2 border-b border-border px-3 py-2 transition-colors motion-reduce:transition-none',
+          hasSelection ? 'bg-primary/8' : 'bg-secondary/30',
+        )}
+      >
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          {/* Outside the selection swap below, so selecting rows never unmounts the field or its focus. */}
+          {showQuickFilter !== false && (
+            <QuickFilter
+              mode={showQuickFilter}
+              caption={caption}
+              term={quick.term}
+              count={serverMode ? (rowCount ?? rows.length) : filteredRows.length}
+              debounceMs={quickFilterDebounceMs}
+              onApply={changeQuickFilter}
+              labels={labels}
+            />
+          )}
+          {/* Matching selection needs a mounted announcer; default tables retain their published surface. */}
+          {selectable && (selectAllMatching || (hasSelection && selectionSummary)) && (
+            <span
+              className={
+                hasSelection && selectionSummary && !showSelectionStrip
+                  ? 'text-[12.5px] font-semibold text-foreground'
+                  : 'sr-only'
+              }
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {showSelectionStrip ? stripMessage : hasSelection && selectionSummary ? selectionCount : null}
+            </span>
+          )}
+          {hasSelection ? (
+            <>
+              {selectionSummary && showSelectionStrip && (
+                <span className="text-[12.5px] font-semibold text-foreground">{selectionCount}</span>
+              )}
+              {selectionSummary && bulkActions && <span aria-hidden className="h-4 w-px bg-border" />}
+              {bulkActions?.(selectedList, model)}
+            </>
+          ) : (
+            toolbar
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {onRowAdd && <AddRowButton edits={rowEdits} labels={labels} buttonRef={addRowRef} />}
+          {exportApi.enabled && (
+            <ExportMenu
+              count={rowCount ?? filteredRows.length}
+              selectedCount={serverMode ? exportSelectedCount : exportApi.selectedRowCount}
+              scopes={exportApi.scopes}
+              busy={exportApi.busy}
+              onExport={exportApi.exportRows}
+              onCopy={serverMode ? undefined : exportApi.copySelected}
+              labels={labels}
+            />
+          )}
+          {showViews && (
+            <ViewSwitcher
+              labels={labels}
+              views={viewsApi.views}
+              activeId={viewsApi.activeId}
+              dirty={viewsApi.dirty}
+              onSelect={viewsApi.select}
+              onSaveAs={viewsApi.saveAs}
+              onSave={viewsApi.save}
+              onRename={viewsApi.rename}
+              onDelete={viewsApi.remove}
+              onReset={viewsApi.reset}
+            />
+          )}
+          {showDensityToggle && <DensityToggle labels={labels} value={density} onChange={changeDensity} />}
+          {showColumnMenu && (
+            <ColumnVisibilityMenu
+              labels={labels}
+              columns={columns}
+              hidden={hidden}
+              onToggle={toggleColumn}
+              pinOf={pinning ? (id) => pinSideOf(id, pinned) : undefined}
+              onPin={pinning ? (id, side) => setPinned(setColumnPin(pinned, id, side)) : undefined}
+            />
+          )}
+        </div>
+      </div>
+      {showSelectionStrip && (
+        <SelectionStrip
+          labels={labels}
+          all={allMatching}
+          message={stripMessage}
+          total={serverMode ? (rowCount ?? 0) : enabledIds.length}
+          onSelectAll={selectMatching}
+          onClear={() => {
+            // Restore focus before clearing removes the strip and its focused button.
+            const target = hideSelectAll || refresh.skeleton || pageIds.length === 0 ? tableRef : pageCheckboxRef;
+            target.current?.focus();
+            clear();
+          }}
+        />
+      )}
+      {deletion.dialog}
+      {exportApi.enabled && (
+        <span role="status" aria-live="polite" className="sr-only">
+          {exportApi.announcement}
+        </span>
+      )}
+      {anyEditable && (
+        <span id={editHintId} className="sr-only">
+          {labels?.editHint ?? 'Press Enter or F2 to edit.'}
+        </span>
+      )}
+      {autoSizing ? (
+        <div className="min-h-0 flex-1">
+          {/* A zero-width percentage-height probe has no intrinsic height. In a content-sized
+              parent it stays zero, so row count cannot feed back into the measurement. */}
+          <div
+            ref={autoSizeViewport}
+            data-auto-page-size-viewport
+            aria-hidden
+            className="pointer-events-none float-left h-full w-0"
+          />
+          {tableContent}
+        </div>
+      ) : (
+        tableContent
+      )}
+      {editMode === 'row' && onRowsSave && <RowEditBar edits={rowEdits} labels={labels} />}
+      {refresh.skeleton && (
+        <p role="status" className="sr-only">
+          {labels?.loading ? labels.loading(caption) : <>Loading {caption.toLowerCase()}…</>}
+        </p>
+      )}
+      {refresh.refreshing && (
+        <p role="status" aria-live="polite" className="sr-only">
+          {refresh.announcing ? updatingText : null}
+        </p>
+      )}
+      {paginated && !refresh.skeleton && (serverMode || rows.length > 0) && (
+        <PaginationFooter
+          labels={labels}
+          className={cn('border-t border-border px-4 py-3', autoSizing && 'shrink-0')}
+          showPageSize={!autoSizing}
+          total={serverMode ? rowCount : filteredRows.length}
+          page={serverMode ? controlledPage : clientPage}
+          onPageChange={changePage}
+          pageSize={serverMode ? controlledPageSize : pageSize}
+          onPageSizeChange={changePageSize}
+          pageSizeOptions={pageSizeOptions}
+          noun={caption}
+        />
+      )}
+    </div>
+  );
+}
