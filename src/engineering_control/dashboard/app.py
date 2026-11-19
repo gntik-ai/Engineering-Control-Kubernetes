@@ -65,6 +65,7 @@ from engineering_control.dashboard.schemas import (
     BudgetInput,
     CacheTrialInput,
     ConnectionAnalysisInput,
+    ConnectionBulkLinksInput,
     ConnectionDecisionInput,
     ConnectionInput,
     ConnectionLinkInput,
@@ -1151,6 +1152,18 @@ def create_app(
                 b.reason,
             ),
             event="connection.linked",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/links/approve-all")
+    async def connect_all_issues(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ConnectionBulkLinksInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.connect_all_issues, name, key, b.through
+            ),
+            event="connection.issue_links_reviewed",
             subject=name,
         )
 

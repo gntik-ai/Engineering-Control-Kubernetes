@@ -65,9 +65,11 @@ type Detail = Connection & {
   page: number;
   pages: number;
   total_findings: number;
+  pending_issue_links: { count: number; through: string | null };
   history: { at: string; message: string }[];
 };
 type Listing = { items: Connection[]; models: Model[] };
+type LinkResult = { connected: number; stale: number; newer: number };
 const kinds = { epics: 'Epic', stories: 'User Story', issues: 'Issue' };
 const relations: Record<string, string> = {
   depends_on: 'Depends on',
@@ -339,16 +341,19 @@ function FindingRow({
   path,
   reload,
   archived,
+  connecting,
 }: {
   f: Finding;
   path: string;
   reload: () => void;
   archived: boolean;
+  connecting: boolean;
 }) {
   const [busy, setBusy] = useState(false),
     [problem, setProblem] = useState('');
+  const locked = busy || (connecting && f.action === 'link');
   async function decide(accept: boolean) {
-    if (busy) return;
+    if (locked) return;
     setBusy(true);
     setProblem('');
     try {
@@ -401,21 +406,21 @@ function FindingRow({
       {problem && <Alert tone="destructive" title={problem} />}
       {!archived && f.status === 'pending' && (
         <div className="flex gap-2">
-          <Button size="sm" loading={busy} onClick={() => void decide(true)}>
+          <Button size="sm" loading={busy} disabled={locked} onClick={() => void decide(true)}>
             {f.action === 'create'
               ? 'Send to project as proposal'
               : f.action === 'edit'
                 ? 'Approve local edit'
                 : 'Approve link'}
           </Button>
-          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void decide(false)}>
+          <Button size="sm" variant="ghost" disabled={locked} onClick={() => void decide(false)}>
             Dismiss
           </Button>
         </div>
       )}
       {!archived && f.action === 'link' && f.status === 'approved' && (
         <div>
-          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void decide(false)}>
+          <Button size="sm" variant="ghost" disabled={locked} onClick={() => void decide(false)}>
             Remove link
           </Button>
         </div>
@@ -447,11 +452,26 @@ function ConnectionDetail({
     [model, setModel] = useState('');
   const data = useResource<Detail>(apiUrl(path, { status, page }), 4000);
   const c = data.data;
+  const issueLinks = c?.pending_issue_links;
+  const [linkResult, setLinkResult] = useState<LinkResult | null>(null);
   const [editor, setEditor] = useState<'settings' | 'link' | 'disconnect' | null>(issue ? 'link' : null);
   const reload = () => {
     data.reload();
     refresh();
   };
+  const connectAll = useSubmit(
+    () => {
+      setLinkResult(null);
+      return postJson<LinkResult>(path + '/links/approve-all', {
+        through: issueLinks?.through,
+      });
+    },
+    (result) => {
+      setLinkResult(result);
+      if (status === 'pending') setPage(1);
+      reload();
+    },
+  );
   const selected = model || (c?.provider && c.model ? JSON.stringify([c.provider, c.model]) : '');
   const analyze = useSubmit(() => {
     const chosen = selected ? (JSON.parse(selected) as [string, string]) : null;
@@ -557,16 +577,44 @@ function ConnectionDetail({
                 setPage(1);
               }}
             />
+            {!c.archived && (!status || status === 'pending') && issueLinks && issueLinks.count > 0 && (
+              <Button
+                size="sm"
+                title="Connect pending issue links on every page of this connection"
+                loading={connectAll.pending}
+                disabled={connectAll.pending}
+                onClick={() => void connectAll.submit()}
+              >
+                Connect all issue links ({issueLinks.count})
+              </Button>
+            )}
             {!c.archived && (
-              <Button size="sm" onClick={() => setEditor('link')}>
+              <Button size="sm" variant="secondary" onClick={() => setEditor('link')}>
                 Link an issue
               </Button>
             )}
           </div>
+          {connectAll.problem && <Alert tone="destructive" title={connectAll.problem} />}
+          {linkResult && (
+            <p role="status" className="text-sm">
+              Connected {linkResult.connected} issue {linkResult.connected === 1 ? 'link.' : 'links.'}
+              {linkResult.stale > 0 &&
+                ` Evidence changed for ${linkResult.stale} ${linkResult.stale === 1 ? 'link' : 'links'}. Run Analyze connection to review again.`}
+              {linkResult.newer > 0 &&
+                ` ${linkResult.newer} new or updated ${linkResult.newer === 1 ? 'link is' : 'links are'} pending review.`}
+            </p>
+          )}
           {c.findings.length ? (
             <ul>
               {c.findings.map((f) => (
-                <FindingRow key={f.id} f={f} path={path} reload={reload} archived={c.archived} />
+                <FindingRow
+                  key={f.id}
+                  f={f}
+                  path={path}
+                  reload={reload}
+                  archived={c.archived}
+                  connecting={connectAll.pending}
+                />
               ))}
             </ul>
           ) : (

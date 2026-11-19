@@ -254,6 +254,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/connections/{key}/disconnect",
         "/api/dashboard/projects/{name}/connections/{key}/analyze",
         "/api/dashboard/projects/{name}/connections/{key}/links",
+        "/api/dashboard/projects/{name}/connections/{key}/links/approve-all",
         "/api/dashboard/projects/{name}/connections/{key}/findings/{finding}",
         "/api/dashboard/projects/{name}/planning/{kind}/decisions",
         "/api/dashboard/projects/{name}/planning/{kind}/{key}/proposal",
