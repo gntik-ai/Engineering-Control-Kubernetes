@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -14,6 +14,7 @@ from engineering_control.dashboard.backlog_items import clean_description, clean
 from engineering_control.dashboard.connection_records import (
     KINDS,
     RECORD_MODELS,
+    Catalog,
     Item,
     catalog,
     counterpart,
@@ -70,7 +71,17 @@ def _get(
     )
     if not archived:
         query = query.where(ProjectConnection.archived_at.is_(None))
-    row = session.scalar(query.with_for_update() if lock else query)
+    if lock and session.get_bind().dialect.name == "sqlite":
+        # SQLite ignores FOR UPDATE. Acquire its write lock before reading decisions,
+        # without changing the connection timestamp observed by the analysis worker.
+        row = session.scalar(
+            update(ProjectConnection)
+            .where(ProjectConnection.id.in_(query.with_only_columns(ProjectConnection.id)))
+            .values(updated_at=ProjectConnection.updated_at)
+            .returning(ProjectConnection)
+        )
+    else:
+        row = session.scalar(query.with_for_update() if lock else query)
     if row is None:
         raise ProjectNotFound(str(key))
     return row
@@ -148,6 +159,57 @@ def _finding(
         "version": f.fingerprint,
         "proposal": str(f.proposal_id) if f.proposal_id else None,
     }
+
+
+def _pending_issue_links(key: UUID) -> Select[tuple[ConnectionFinding]]:
+    f = ConnectionFinding
+    return select(f).where(
+        f.connection_id == key,
+        f.status == "pending",
+        f.action == "link",
+        (f.source_kind == "issues")
+        | (f.target_kind == "issues")
+        | (f.target_kind.is_(None) & f.target_number.is_not(None)),
+    )
+
+
+def _reviewed_endpoints(
+    f: ConnectionFinding, sources: Catalog, targets: Catalog
+) -> tuple[Item, Item | None]:
+    source = sources.find(f.source_id, f.source_number)
+    target = targets.find(f.target_id, f.target_number)
+    if not source or (f.target_id and (not target or not target.approved)):
+        raise ProjectConflict("A referenced record has changed. Run the analysis again.")
+    if f.action == "link":
+        if (f.source_id and source.id != f.source_id) or (
+            f.target_id and target and target.id != f.target_id
+        ):
+            raise ProjectConflict("A referenced record has changed. Run the analysis again.")
+        if f.origin == "model" and (
+            not target
+            or f.evidence.get("input_version") != digest([source.summary(), target.summary()])
+        ):
+            raise ProjectConflict("A linked record changed. Run the analysis again.")
+        if (
+            f.origin == "reference"
+            and f.target_number
+            and explicit_references(source, targets.project.source_repository).get(f.target_number)
+            != f.evidence.get("reason")
+        ):
+            raise ProjectConflict("The GitHub reference changed. Run the analysis again.")
+    return source, target
+
+
+def _record_decision(
+    db: Session, row: ProjectConnection, f: ConnectionFinding, decision: str
+) -> None:
+    f.status = decision
+    audit(
+        db,
+        row,
+        f"{decision.capitalize()} {f.action} from {f.evidence.get('source_title', 'record')} "
+        f"to {f.evidence.get('target_title') or f.target_kind or 'project'}.",
+    )
 
 
 def store_link(
@@ -333,6 +395,13 @@ class Connections:
                 .limit(25)
             )
             projects = {p.id: p, peer.id: peer}
+            # The button covers all pages. Its cutoff keeps later or revised suggestions
+            # pending, including when the same request is retried after a lost response.
+            link_count, through = db.execute(
+                _pending_issue_links(key).with_only_columns(
+                    func.count(ConnectionFinding.id), func.max(ConnectionFinding.updated_at)
+                )
+            ).one()
             events = db.scalars(
                 select(ConnectionEvent)
                 .where(ConnectionEvent.connection_id == key)
@@ -346,6 +415,7 @@ class Connections:
                 "page": page,
                 "pages": pages,
                 "total_findings": total,
+                "pending_issue_links": {"count": link_count, "through": instant(through)},
                 "history": [{"at": instant(e.recorded_at), "message": e.message} for e in events],
             }
 
@@ -434,6 +504,44 @@ class Connections:
             )
             return {"id": str(f.id)}
 
+    def connect_all_issues(self, name: str, key: UUID, through: datetime) -> dict[str, int]:
+        through = through.astimezone(UTC)
+        if through > datetime.now(UTC):
+            raise ProjectInvalid("Use the review time returned by this connection")
+        with self.sessions.begin() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, lock=True)
+            peer = _peer(db, row, p.id)
+            pending = _pending_issue_links(key)
+            newer = (
+                db.scalar(
+                    pending.with_only_columns(func.count(ConnectionFinding.id)).where(
+                        ConnectionFinding.updated_at > through
+                    )
+                )
+                or 0
+            )
+            links = db.scalars(
+                pending.where(ConnectionFinding.updated_at <= through)
+                .order_by(ConnectionFinding.id)
+                .with_for_update()
+            ).all()
+            if not links:
+                return {"connected": 0, "stale": 0, "newer": newer}
+            catalogs = {project.id: catalog(db, project) for project in (p, peer)}
+            connected = stale = 0
+            for f in links:
+                try:
+                    _reviewed_endpoints(
+                        f, catalogs[f.source_project], catalogs[counterpart(row, f.source_project)]
+                    )
+                except ProjectConflict:
+                    stale += 1
+                    continue
+                _record_decision(db, row, f, "approved")
+                connected += 1
+            return {"connected": connected, "stale": stale, "newer": newer}
+
     def decide(
         self, name: str, key: UUID, finding: UUID, version: str, accept: bool
     ) -> dict[str, str]:
@@ -454,32 +562,8 @@ class Connections:
             if accept:
                 source_project = p if f.source_project == p.id else peer
                 owner = peer if source_project == p else p
-                source = catalog(db, source_project).find(f.source_id, f.source_number)
                 targets = catalog(db, owner)
-                target = targets.find(f.target_id, f.target_number)
-                if not source or (f.target_id and (not target or not target.approved)):
-                    raise ProjectConflict(
-                        "A referenced record has changed. Run the analysis again."
-                    )
-                if f.action == "link":
-                    if (
-                        f.origin == "model"
-                        and target
-                        and f.evidence.get("input_version")
-                        != digest([source.summary(), target.summary()])
-                    ):
-                        raise ProjectConflict("A linked record changed. Run the analysis again.")
-                    if (
-                        f.origin == "reference"
-                        and f.target_number
-                        and explicit_references(source, owner.source_repository).get(
-                            f.target_number
-                        )
-                        != f.evidence.get("reason")
-                    ):
-                        raise ProjectConflict(
-                            "The GitHub reference changed. Run the analysis again."
-                        )
+                source, target = _reviewed_endpoints(f, catalog(db, source_project), targets)
                 if f.action in ("create", "edit"):
                     proposal = f.evidence
                     if proposal.get("source_version") != digest(source.summary()):
@@ -523,12 +607,5 @@ class Connections:
                         db.add(candidate)
                         db.flush()
                         f.proposal_id = candidate.id
-            f.status = decision
-            audit(
-                db,
-                row,
-                f"{decision.capitalize()} {f.action} "
-                f"from {f.evidence.get('source_title', 'record')} "
-                f"to {f.evidence.get('target_title') or f.target_kind or 'project'}.",
-            )
+            _record_decision(db, row, f, decision)
             return {"id": str(f.id)}

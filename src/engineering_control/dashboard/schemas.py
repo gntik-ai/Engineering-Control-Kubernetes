@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from engineering_control.projects import PROJECT_ALTERNATION
 
@@ -348,6 +348,10 @@ class ConnectionLinkInput(PlainChangeInput):
 class ConnectionDecisionInput(PlainChangeInput):
     version: str = Field(min_length=64, max_length=64)
     accept: bool
+
+
+class ConnectionBulkLinksInput(PlainChangeInput):
+    through: AwareDatetime
 
 
 class WorkspaceImportStep(PlainChangeInput):
