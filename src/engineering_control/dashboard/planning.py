@@ -28,6 +28,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
+from engineering_control.dashboard.connection_records import connected_records, finding_links
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -125,6 +126,7 @@ def save_record(
             if saved is None:
                 raise ProjectNotFound(str(key))
             row = cast(ProjectEpic | ProjectUserStory, saved)
+    row.updated_at = datetime.now(UTC)
     row.title = clean_title(title)
     row.description = clean_description(description)
     session.add(row)
@@ -207,12 +209,12 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             WorkspaceCandidate.number,
             null().label("github_state"),
         )
-        .join(WorkspaceImport, WorkspaceImport.project_id == WorkspaceCandidate.project_id)
+        .outerjoin(WorkspaceImport, WorkspaceImport.project_id == WorkspaceCandidate.project_id)
         .where(
             WorkspaceCandidate.project_id == project,
             WorkspaceCandidate.kind == kind,
             WorkspaceCandidate.decision == "pending",
-            WorkspaceImport.stage == kind,
+            (WorkspaceImport.stage == kind) | (WorkspaceCandidate.origin == "connection"),
         )
     )
     saved: Select[Any]
@@ -303,13 +305,27 @@ class PlanningRecords:
         page_size: int,
         search: str = "",
         epic: UUID | None = None,
+        record: UUID | None = None,
+        connected: str = "",
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
             rows = _table_rows(project.id, kind)
             epic = epic if kind == "epics" else None
-            search = "" if epic else search.strip()
+            focus = record or epic
+            search = "" if focus else search.strip()
             matches = _search_matches(session, rows, project.id, kind, search)
+            if search:
+                matches = matches | (
+                    ~rows.c.proposal
+                    & rows.c.id.in_(connected_records(project.id, kind, search, exact=False))
+                )
+            if connected and not focus:
+                matches = (
+                    matches
+                    & ~rows.c.proposal
+                    & rows.c.id.in_(connected_records(project.id, kind, connected, exact=True))
+                )
             ordering = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             # Approval and stage progression always refer to the entire table.
             total, pending, proposed = session.execute(
@@ -322,14 +338,14 @@ class PlanningRecords:
             pages = max(1, (total + page_size - 1) // page_size)
             requested_page = page
             page = min(page, pages)
-            if epic:
+            if focus:
                 ranked = select(
                     rows.c.id,
                     rows.c.proposal,
                     func.row_number().over(order_by=ordering).label("position"),
                 ).subquery()
                 position = session.scalar(
-                    select(ranked.c.position).where(ranked.c.id == epic, ~ranked.c.proposal)
+                    select(ranked.c.position).where(ranked.c.id == focus, ~ranked.c.proposal)
                 )
                 if position is not None:
                     page = (position - 1) // page_size + 1
@@ -368,8 +384,14 @@ class PlanningRecords:
                         str(uid): title
                         for uid, title in session.execute(options.where(parent_model.id.in_(ids)))
                     }
+            external: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
+            for uid, badge in finding_links(
+                session, project.id, kind, [i["id"] for i in items if not i["proposal"]]
+            ):
+                external[uid].append(badge)
             for item in items:
                 key = item["id"]
+                item["connections"] = external[key]
                 rels = item.pop("parents")
                 item.pop("created_at")
                 if kind != "epics":
@@ -398,6 +420,8 @@ class PlanningRecords:
                 "requested_page": requested_page,
                 "search": search,
                 "epic": str(epic) if epic else None,
+                "record": str(record) if record else None,
+                "connected": connected,
                 "pages": pages,
                 "pending": pending,
                 "parents": parents,

@@ -13,6 +13,8 @@ from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
+from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
+from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
@@ -93,6 +95,8 @@ class DashboardRepository:
         self.passwords = password_service or PasswordService()
         self.redactor = SecretRedactor()
         self.projects = ProjectRecords(self.sessions)
+        self.connections = Connections(self.sessions)
+        self.connection_analysis = ConnectionAnalysis(self.sessions)
         self.planning = PlanningRecords(self.sessions)
         self.workspace_imports = WorkspaceImports(self.sessions)
         self.publishing = WorkspacePublishing(self.sessions)

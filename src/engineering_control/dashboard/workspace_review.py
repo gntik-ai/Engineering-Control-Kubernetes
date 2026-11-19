@@ -31,6 +31,7 @@ from engineering_control.dashboard.workspace_costs import record_model_usage
 from engineering_control.dashboard.workspace_publishing import approve_issue, enqueue
 from engineering_control.db.models import (
     BacklogItem,
+    ConnectionFinding,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
@@ -114,7 +115,11 @@ def _candidates(session: Session, project: UUID, kind: str) -> list[WorkspaceCan
     return list(
         session.scalars(
             select(WorkspaceCandidate)
-            .where(WorkspaceCandidate.project_id == project, WorkspaceCandidate.kind == kind)
+            .where(
+                WorkspaceCandidate.project_id == project,
+                WorkspaceCandidate.kind == kind,
+                WorkspaceCandidate.origin == "import",
+            )
             .order_by(WorkspaceCandidate.created_at, WorkspaceCandidate.id)
         )
     )
@@ -182,15 +187,13 @@ def _gap_proposals(
         )
         seen.add(identity)
     if bulk and kind == "stories":
-        remaining = set(uncovered).difference(p for story in suggestions for p in story["parents"])
-        if answer["complete"] and not remaining:
-            return "review", suggestions
-        if not suggestions:
+        covered = {p for story in suggestions for p in story["parents"]}
+        if uncovered and not covered.intersection(uncovered):
             raise ProjectConflict(
-                "The model found no new User Stories to cover the remaining work. "
-                "Review the Epic links or retry generation."
+                "No uncovered Epic gained a User Story. Review its links or add a story before "
+                "retrying."
             )
-        return "gaps", suggestions
+        return "review", suggestions
     return ("review" if bulk and seen else "gaps"), suggestions
 
 
@@ -309,6 +312,79 @@ def review_state(session: Session, row: WorkspaceImport) -> dict[str, Any]:
     }
 
 
+def next_stage(row: WorkspaceImport) -> None:
+    row.stage = {"epics": "stories", "stories": "issues", "issues": "complete"}[row.stage]
+    row.progress = {
+        **row.progress,
+        "review_mode": "existing",
+        "review_after": "",
+        "reviewed_issues": 0,
+        "operation": None,
+        "activity": "existing",
+        "found": 0,
+        "checked": 0,
+    }
+    row.lease = row.lease_until = None
+    row.version += 1
+
+
+def settle_stories(session: Session, row: WorkspaceImport) -> None:
+    """Finish a bulk generation only when the administrator has accepted enough local stories."""
+    if row.stage != "stories":
+        return
+    if row.lease and row.lease_until and row.lease_until.replace(tzinfo=UTC) > datetime.now(UTC):
+        return
+    job = row.progress.get("operation") or {}
+    mode = row.progress.get("review_mode")
+    legacy = "stories_bulk" not in row.progress and job.get("action") == "all"
+    if mode != "review" and not (legacy and mode == "gaps"):
+        return
+    if not (row.progress.get("stories_bulk") or legacy):
+        return
+    pending = list(
+        session.scalars(
+            select(WorkspaceCandidate.parents).where(
+                WorkspaceCandidate.project_id == row.project_id,
+                WorkspaceCandidate.kind == "stories",
+                WorkspaceCandidate.origin == "import",
+                WorkspaceCandidate.decision == "pending",
+            )
+        )
+    )
+    linked = _linked_parents(session, row.project_id, "stories")
+    for ids in pending:
+        linked.update(ids)
+    parents = {
+        str(i)
+        for i in session.scalars(
+            select(ProjectEpic.id).where(
+                ProjectEpic.project_id == row.project_id, ProjectEpic.archived_at.is_(None)
+            )
+        )
+    }
+    if legacy and mode == "gaps":
+        if not parents or parents - linked:
+            return
+        row.progress = {
+            **row.progress,
+            "stories_bulk": True,
+            "review_mode": "review",
+            "operation": {**job, "state": "completed", "detail": None},
+        }
+        row.version += 1
+    row.lease = row.lease_until = None
+    if parents - linked:
+        row.progress = {
+            **row.progress,
+            "review_mode": "gaps",
+            "story_checked_epics": sorted(parents & linked),
+            "story_continuation": [],
+        }
+        row.version += 1
+    elif parents and not pending and not coverage_problem(session, row.project_id, "stories"):
+        next_stage(row)
+
+
 class WorkspaceReview:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -374,6 +450,19 @@ class WorkspaceReview:
         progress = dict(row.progress)
         bulk = progress.get("activity") == "all"
         mode = state["mode"]
+        focus: list[str] = []
+        if bulk and row.stage == "stories":
+            progress["stories_bulk"] = True
+            if mode == "review":
+                return progress, []
+            ids = [p["id"] for p in state["parents"]]
+            if not ids:
+                raise ProjectInvalid("Approve an Epic before generating User Stories")
+            checked = set(progress.get("story_checked_epics", [])).difference(state["uncovered"])
+            focus = sorted(set(ids) - checked)[:8]
+            if not focus:
+                progress["review_mode"] = "review"
+                return progress, []
         if mode == "review":
             mode = "gaps"
             progress["review_mode"] = mode
@@ -437,8 +526,10 @@ class WorkspaceReview:
                     "Set complete true only if the entire set fits in this answer."
                 )
             else:
+                context["epics_for_this_batch"] = focus
                 task = (
-                    "Identify all remaining distinct User Stories supported by the repository "
+                    "Review only epics_for_this_batch. Identify all remaining distinct User "
+                    "Stories supported by the repository "
                     "evidence and approved Epics. Exclude outcomes already in existing or proposed "
                     "stories, including equivalent outcomes under different names. For each new "
                     "story give a concise title, the actor, goal and benefit in its description, "
@@ -514,9 +605,25 @@ class WorkspaceReview:
                 row.stage,
                 context["existing"],
                 valid,
-                state["uncovered"],
+                [p for p in state["uncovered"] if not focus or p in focus],
                 bulk=bulk,
             )
+            if focus:
+                uncovered = set(state["uncovered"]) - {
+                    p for story in suggestions for p in story["parents"]
+                }
+                # A model may always ask for more. Each group gets at most one overflow pass,
+                # and a pass over uncovered Epics must cover at least one of them.
+                overflow = (
+                    not reply.data["complete"]
+                    and suggestions
+                    and progress.get("story_continuation") != focus
+                )
+                progress["story_continuation"] = focus if overflow else []
+                if not overflow:
+                    checked.update(set(focus) - uncovered)
+                progress["story_checked_epics"] = sorted(checked)
+                progress["review_mode"] = "review" if set(ids) <= checked else "gaps"
         return progress, suggestions
 
     @staticmethod
@@ -635,7 +742,7 @@ class WorkspaceReview:
         name: str,
         kind: Kind,
         key: UUID,
-        version: int,
+        version: int | None,
         title: str,
         description: str | None,
         parents: list[UUID],
@@ -643,10 +750,11 @@ class WorkspaceReview:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             row = session.get(WorkspaceImport, project.id)
-            self._editable(row, kind, version)
             candidate = session.get(WorkspaceCandidate, key)
             if not candidate or candidate.project_id != project.id or candidate.kind != kind:
                 raise ProjectNotFound(str(key))
+            if candidate.origin == "import":
+                self._editable(row, kind, version)
             if candidate.decision != "pending":
                 raise ProjectConflict("Only a pending proposal can be edited")
             candidate.title, candidate.description = (
@@ -659,12 +767,12 @@ class WorkspaceReview:
                     [str(p) for p in parents], self._active_parents(session, project.id, kind), kind
                 )
             ]
-            assert row is not None
-            row.version += 1
+            if row is not None and candidate.origin == "import":
+                row.version += 1
 
     def decide(
         self, name: str, kind: Kind, keys: list[UUID], version: int | None, *, dismiss: bool = False
-    ) -> None:
+    ) -> dict[str, str | None]:
         # The submitted IDs are the rows the administrator saw when selecting Approve all.
         # The local records, decisions and GitHub outbox entries commit together.
         if not keys or len(set(keys)) != len(keys):
@@ -682,6 +790,7 @@ class WorkspaceReview:
                     )
                 )
             }
+            stage_before = row.stage if row else None
             changed = False
             valid = self._active_parents(session, project.id, kind) if candidates else set()
             for key in keys:
@@ -695,8 +804,9 @@ class WorkspaceReview:
                     continue
                 if candidate.decision != "pending":
                     raise ProjectConflict("This proposal already has a different decision")
-                self._editable(row, kind, version)
-                changed = True
+                if candidate.origin == "import":
+                    self._editable(row, kind, version)
+                    changed = True
                 if dismiss:
                     candidate.decision, candidate.number = "dismissed", None
                     continue
@@ -705,10 +815,25 @@ class WorkspaceReview:
                     session, project, candidate, candidate.title, candidate.description, parents
                 )
                 candidate.decision = "approved"
+                if candidate.origin == "connection":
+                    finding = session.scalar(
+                        select(ConnectionFinding).where(
+                            ConnectionFinding.proposal_id == candidate.id
+                        )
+                    )
+                    if finding:
+                        finding.target_id = candidate.local_id
                 if kind == "issues":
                     approve_issue(session, project, candidate.local_id)
-            if changed and row is not None:
-                row.version += 1
+            if row is not None:
+                if changed:
+                    row.version += 1
+                session.flush()
+                settle_stories(session, row)
+            return {
+                "stage": row.stage if row else None,
+                "advanced_to": row.stage if row and row.stage != stage_before else None,
+            }
 
     def apply(self, name: str, version: int, decisions: list[dict[str, Any]]) -> str:
         with self.sessions.begin() as session:
@@ -759,14 +884,5 @@ class WorkspaceReview:
             problem = coverage_problem(session, project.id, stage)
             if problem:
                 raise ProjectConflict(problem)
-            row.stage = {"epics": "stories", "stories": "issues", "issues": "complete"}[stage]
-            row.progress = {
-                **row.progress,
-                "review_mode": "existing",
-                "review_after": "",
-                "reviewed_issues": 0,
-                "operation": None,
-            }
-            row.lease = row.lease_until = None
-            row.version += 1
+            next_stage(row)
             return row.stage

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 import httpx
 from sqlalchemy import select
@@ -43,16 +44,22 @@ async def ecb_rates(client: httpx.AsyncClient) -> dict[date, Decimal]:
 
 
 def record_model_usage(sessions: sessionmaker[Session], row: WorkspaceImport, reply: Reply) -> None:
+    record_project_usage(sessions, row.project_id, row.model, reply)
+
+
+def record_project_usage(
+    sessions: sessionmaker[Session], project: UUID, model: str | None, reply: Reply
+) -> None:
     # Save the metered response independently of a later proposal validation or stage retry.
     with sessions.begin() as session:
         session.add(
             WorkspaceModelUsage(
-                project_id=row.project_id,
+                project_id=project,
                 usage={
                     **reply.usage,
                     "provider": reply.provider,
                     "account_id": str(reply.account_id),
-                    "requested_model": row.model,
+                    "requested_model": model,
                     "model": reply.model,
                 },
             )

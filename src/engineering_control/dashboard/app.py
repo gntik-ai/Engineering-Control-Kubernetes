@@ -64,6 +64,10 @@ from engineering_control.dashboard.schemas import (
     BacklogSyncInput,
     BudgetInput,
     CacheTrialInput,
+    ConnectionAnalysisInput,
+    ConnectionDecisionInput,
+    ConnectionInput,
+    ConnectionLinkInput,
     EpicInput,
     EvaluationInput,
     FlowCheckInput,
@@ -327,6 +331,19 @@ def create_app(
                 log_failure("workspace-sync", "workspace publication retry failed", error)
             await asyncio.sleep(30)
 
+    async def analyze_connections(records: DashboardRepository, models: Models | None) -> None:
+        next_story_check = 0.0
+        while True:
+            try:
+                if asyncio.get_running_loop().time() >= next_story_check:
+                    await asyncio.to_thread(records.workspace_imports.settle_existing_stories)
+                    next_story_check = asyncio.get_running_loop().time() + 60
+                worked = await records.connection_analysis.tick(models)
+            except Exception as error:  # noqa: BLE001 - the durable lease makes a failed pass retryable
+                log_failure("connection-review", "Project connection review could not run", error)
+                worked = False
+            await asyncio.sleep(0.2 if worked else 5)
+
     async def keep_model_catalogs_current(available: Models) -> None:
         while True:
             try:
@@ -406,6 +423,9 @@ def create_app(
         # The process itself, not an app a test made: it says how it is doing to the
         # cluster, and keeps its own record within its time.
         if repository is None:
+            keepers.append(
+                asyncio.create_task(analyze_connections(resolved_repository, app.state.models))
+            )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
             if app.state.models.sealing_key is not None:
@@ -1030,6 +1050,119 @@ def create_app(
             subject=name,
         )
 
+    @app.get("/api/dashboard/projects/{name}/connections")
+    async def connections_list(name: str, request: Request) -> Response:
+        try:
+            records = repo(request)
+            result = await asyncio.to_thread(records.connections.listing, name)
+            result["models"] = await asyncio.to_thread(records.workspace_imports.model_choices)
+            return JSONResponse(result)
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/connections/{key}")
+    async def connection_details(
+        name: str,
+        key: UUID,
+        request: Request,
+        page: int = Query(1, ge=1),
+        status: Literal["", "pending", "approved", "dismissed", "outdated"] = "",
+    ) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).connections.detail, name, key, page, status)
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Connection not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/connections/{key}/options")
+    async def connection_options(
+        name: str,
+        key: UUID,
+        request: Request,
+        kind: Kind,
+        side: Literal["source", "target"],
+        search: str = Query("", max_length=200),
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).connections.options, name, key, side, kind, search, page
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Connection not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/connections")
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/update")
+    async def save_connection(name: str, request: Request, key: UUID | None = None) -> Response:
+        return await project_change(
+            request,
+            ConnectionInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.save, name, b.other, b.relation, b.purpose, key
+            ),
+            event="connection.saved",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/disconnect")
+    async def disconnect_connection(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).connections.disconnect, name, key),
+            event="connection.disconnected",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/analyze")
+    async def analyze_connection(name: str, key: UUID, request: Request) -> Response:
+        async def start(body: ConnectionAnalysisInput) -> dict[str, str]:
+            records = repo(request)
+            if body.provider or body.model:
+                choices = await asyncio.to_thread(records.workspace_imports.model_choices)
+                if {"provider": body.provider, "model": body.model} not in choices:
+                    raise ProjectInvalid("Choose an available model from Accounts")
+            return await asyncio.to_thread(
+                records.connections.analyze, name, key, body.provider, body.model
+            )
+
+        return await project_change(
+            request, ConnectionAnalysisInput, start, event="connection.queued", subject=name
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/links")
+    async def add_connection_link(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ConnectionLinkInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.manual,
+                name,
+                key,
+                b.source_id,
+                b.target_kind,
+                b.target_id,
+                b.reason,
+            ),
+            event="connection.linked",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/findings/{finding}")
+    async def decide_connection(name: str, key: UUID, finding: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ConnectionDecisionInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.decide, name, key, finding, b.version, b.accept
+            ),
+            event="connection.reviewed",
+            subject=name,
+        )
+
     @app.get("/api/dashboard/projects/{name}/statistics")
     async def workspace_statistics(name: str, request: Request, days: int = 7) -> Response:
         try:
@@ -1063,11 +1196,21 @@ def create_app(
         page_size: int = Query(10, ge=1, le=100),
         search: str = Query(default="", max_length=200, pattern=r"^[^\x00]*$"),
         epic: UUID | None = None,
+        record: UUID | None = None,
+        connected: str = Query("", max_length=32),
     ) -> Response:
         try:
             return JSONResponse(
                 await asyncio.to_thread(
-                    repo(request).planning.page, name, kind, page, page_size, search, epic
+                    repo(request).planning.page,
+                    name,
+                    kind,
+                    page,
+                    page_size,
+                    search,
+                    epic,
+                    record,
+                    connected,
                 )
             )
         except ProjectNotFound:
@@ -2681,7 +2824,10 @@ def _valid_csrf(authenticated: AuthenticatedSession, supplied: str | None) -> bo
 def _console_view(view: str) -> bool:
     return view in CONSOLE_VIEWS or (
         view.startswith("workspace/")
-        and PROJECT_NAME.fullmatch(view.removeprefix("workspace/")) is not None
+        and PROJECT_NAME.fullmatch(
+            view.removeprefix("workspace/").removesuffix("/settings/connections")
+        )
+        is not None
     )
 
 

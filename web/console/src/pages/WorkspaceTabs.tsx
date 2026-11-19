@@ -12,6 +12,7 @@ import {
   Input,
   Link,
   linkVariants,
+  SimpleSelect,
   Skeleton,
   Tabs,
   TabsList,
@@ -25,7 +26,7 @@ import { DataTable } from '../components/blocks/tables/data-table/DataTable';
 import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
-import { setQuery, useLocation, workspaceUrl } from '../router';
+import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { WorkspaceImport } from './WorkspaceImport';
@@ -51,12 +52,15 @@ export interface PlanRow {
   github_state?: string | null;
   number?: number | null;
   url?: string | null;
+  connections?: {connection: string; project: string; display_name: string; kind: string | null; record: string | null; status: string; title: string | null}[];
 }
 interface PlanningPage extends Paged<PlanRow> {
   page_size: number;
   requested_page: number;
   search: string;
   epic: string | null;
+  record: string | null;
+  connected: string;
   pending: number;
   parents: Record<string, string>;
   has_parents: boolean;
@@ -203,6 +207,14 @@ function DescriptionPreview({ title, text, onRead }: DescriptionContent & { onRe
   );
 }
 
+function ConnectionFilter({project,value}:{project:string;value:string}) {
+  const result = useResource<{items:{archived:boolean;peer:{name:string;label:string}}[]}>(apiUrl('projects/'+encodeURIComponent(project)+'/connections'));
+  const peers = (result.data?.items??[]).filter(c=>!c.archived);
+  if (!peers.length && !value) return null;
+  return <SimpleSelect aria-label="Filter by connected project" value={value||'all'} items={[{value:'all',label:'All connected projects'},...peers.map(c=>({value:c.peer.name,label:c.peer.label}))]}
+    onValueChange={v=>setQuery({connected:v==='all'?null:v,page:null,record:null,epic:null})}/>;
+}
+
 function Records({ kind, project, onRead }: { kind: Kind; project: string; onRead: ReadDescription }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
@@ -210,15 +222,18 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const pageValue = query.get('page');
   const sizeValue = query.get('page_size');
   const epic = kind === 'epics' ? query.get('epic')?.toLowerCase() || null : null;
+  const recordId = query.get('record')?.toLowerCase() || null;
+  const focus = recordId || epic;
+  const connected = query.get('connected') ?? '';
   const searchValue = query.get('search') ?? '';
-  const search = epic ? '' : searchValue.trim().slice(0, 200);
+  const search = focus ? '' : searchValue.trim().slice(0, 200);
   const requested = Number(pageValue);
   // An Epic link locates the row even after other records have moved it to a different page.
-  const page = !epic && Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
+  const page = !focus && Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
   const pageSize = pageSizes.includes(Number(sizeValue)) ? Number(sizeValue) : 10;
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic }), 4000, { keepPreviousData: true });
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const currentFilter = data?.search === search && data.epic === epic;
+  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected;
   const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
   const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
@@ -232,13 +247,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   }, [data, changingPage, pageValue, sizeValue, searchValue, search]);
 
   const linkedTitle = useRef<HTMLSpanElement>(null);
-  const foundEpic = Boolean(epic && rows?.some((row) => row.id === epic && !row.proposal));
+  const foundEpic = Boolean(focus && rows?.some((row) => row.id === focus && !row.proposal));
   useEffect(() => {
     if (foundEpic) {
       linkedTitle.current?.focus({ preventScroll: true });
       linkedTitle.current?.scrollIntoView({ block: 'center', inline: 'nearest' });
     }
-  }, [epic, foundEpic]);
+  }, [focus, foundEpic]);
   const epicUrl = (id: string) => {
     const target = new URLSearchParams({ tab: 'epics', epic: id });
     if (pageSize !== 10) target.set('page_size', String(pageSize));
@@ -246,8 +261,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   };
   const finish = useSubmit(
     () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
-    () => { reload(); setQuery({ tab: null, page: null, search: null, epic: null }); },
+    () => { reload(); setQuery({ tab: null, page: null, search: null, epic: null, record: null, connected: null }); },
   );
+  const afterDecision = (result: unknown) => {
+    reload();
+    if (kind==='stories' && result && typeof result==='object' && 'advanced_to' in result && result.advanced_to==='issues')
+      setQuery({tab:null, page:null, search:null, epic:null, record:null, connected:null});
+  };
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
@@ -263,7 +283,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       id: 'title', header: 'Title', sortable: false, accessor: (record) => record.title,
       className: 'min-w-40 max-w-lg whitespace-normal align-top',
       cell: (record) => {
-        const targeted = foundEpic && !record.proposal && record.id === epic;
+        const targeted = foundEpic && !record.proposal && record.id === focus;
         return (
           <>
             <span ref={targeted ? linkedTitle : undefined} tabIndex={targeted ? -1 : undefined}
@@ -298,6 +318,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       ),
     });
   }
+  if (kind === 'issues' || rows?.some(r => r.connections?.length)) {
+    columns.push({ id: 'connections', header: 'Connected projects', sortable: false, className: 'min-w-32 whitespace-normal align-top',
+      cell: row => <ul className="grid gap-1">{(row.connections??[]).map((l,i) =>
+        <li key={l.connection + i}><Link className="rounded bg-accent px-2 py-0.5 text-xs" href={connectionsUrl(project,l.connection)}>{l.display_name}</Link>
+          {l.kind && l.record && <div><Link underline="always" href={recordUrl(l.project,l.kind,l.record)}>{l.title || 'View linked record'}</Link></div>}
+          {l.status==='pending' && <span className="text-xs text-muted-foreground">Pending review</span>}</li>)}</ul> });
+  }
   columns.push(
     {
       id: 'status', header: 'Status', sortable: false, className: 'align-top',
@@ -316,6 +343,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
       cell: (record) => (
         <div className="flex justify-end gap-1">
+          {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
           {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
             <Button size="sm" variant="ghost" disabled={rowLocked(record)} aria-label={'Edit ' + record.title}
               onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>Edit</Button>
@@ -341,8 +369,8 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     <section className="grid min-w-0 gap-4">
       <h2 className="text-xl font-semibold">{sections[kind]}</h2>
       <LoadError resource={plan} />
-      {epic && currentFilter && !foundEpic && (
-        <p role="status" className="text-sm text-muted-foreground">This Epic is unavailable in this project.</p>
+      {focus && currentFilter && !foundEpic && (
+        <p role="status" className="text-sm text-muted-foreground">This {singular[kind]} is unavailable in this project.</p>
       )}
       {selectAll.problem && <Alert tone="destructive" title={selectAll.problem} />}
       {finish.problem && <Alert tone="destructive" title={finish.problem} />}
@@ -356,6 +384,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         labels={{ quickFilter: (caption) => 'Search ' + caption }}
         toolbar={
           <div className="ms-auto flex flex-wrap gap-2">
+            {kind === 'issues' && <ConnectionFilter project={project} value={connected}/>}
             {data && data.pending > 0 && (
               <Button size="sm" variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
                 Approve all {sections[kind]}{search ? ' in project' : ''} ({data.pending})
@@ -374,7 +403,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         page={data?.page ?? page} pageSize={data?.page_size ?? pageSize} pageSizeOptions={pageSizes}
         onQueryChange={(next) => setQuery({
           search: (next.quickFilter ?? '').trim().slice(0, 200),
-          page: pageParam(next.page), page_size: next.pageSize === 10 ? null : String(next.pageSize), epic: null,
+          page: pageParam(next.page), page_size: next.pageSize === 10 ? null : String(next.pageSize), epic: null, record: null,
         })}
         loading={!rows && plan.loading ? true : changingPage && plan.loading ? 'refresh' : false}
         emptyState={<p role="status" className="text-sm text-muted-foreground">{empty}</p>}
@@ -390,7 +419,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             : 'Save the approved records. Any corresponding open planning issues will be closed on GitHub.')}
           action={approving.title ? 'Approve' : 'Approve all'}
           run={() => postJson(path + '/decisions', { ids: approving.ids, version: approving.version })}
-          onDone={reload}
+          onDone={afterDecision}
           onClose={() => setApproving(null)}
         />
       )}
@@ -413,7 +442,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           run={() => removing.proposal
             ? postJson(path + '/decisions', { ids: [removing.id], version: data?.version, dismiss: true })
             : postJson(path + '/' + removing.id + '/remove')}
-          onDone={reload}
+          onDone={afterDecision}
           onClose={() => setRemoving(null)}
         />
       )}
@@ -436,7 +465,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {

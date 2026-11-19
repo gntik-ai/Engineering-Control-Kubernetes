@@ -140,7 +140,9 @@ export function WorkspaceReview({
       <div className="flex flex-wrap items-center gap-2">
         {review.mode === 'existing' || current === 'existing'
           ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
-          : <>
+          : stage === 'stories' && review.mode === 'review' && !watching ? (
+            <span role="status" className="text-sm">Generation complete. {pending ? 'Review the remaining proposals to continue to Issues.' : 'All Epics are covered.'}</span>
+          ) : <>
               {stage === 'epics' && actionButton('all', 'Generate all remaining Epics', 'Generating Epics')}
               {stage === 'stories' && actionButton('all', 'Generate all new User Stories', 'Generating User Stories')}
               {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
