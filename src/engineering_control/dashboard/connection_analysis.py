@@ -531,7 +531,12 @@ class ConnectionAnalysis:
                     retry=False,
                 )
                 await asyncio.to_thread(
-                    record_project_usage, self.sessions, b.owner, b.model, reply
+                    record_project_usage,
+                    self.sessions,
+                    b.owner,
+                    b.model,
+                    reply,
+                    "connection_review",
                 )
                 await asyncio.to_thread(self.apply, b, reply.data["suggestions"])
         except (ValueError, ModelError) as error:

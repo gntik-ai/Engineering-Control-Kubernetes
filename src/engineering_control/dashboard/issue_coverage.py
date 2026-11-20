@@ -171,6 +171,14 @@ class Inventory:
             return {i["id"]: self.issue_versions[i["id"]] for i in self.issues[: cache.checked]}
         return {}
 
+    def eligible(self, story: str) -> set[str]:
+        """Manual links are authoritative. Only eligible pairs need a model decision."""
+        return {
+            issue["id"]
+            for issue in self.issues
+            if issue["manual_stories"] is None or story in issue["manual_stories"]
+        }
+
     def checkpoints(self, db: Session, pid: UUID) -> dict[str, StoryIssueCoverage]:
         return {
             str(c.story_id): c
@@ -273,6 +281,21 @@ class Page:
     story_versions: dict[str, str]
     issue_versions: dict[str, str]
 
+    def prompt(self) -> str:
+        # Only send parent IDs that the model may cite in this particular batch.
+        stories = set(self.story_versions)
+        issues = []
+        for row in self.issues:
+            item = {k: v for k, v in row.items() if v is not None}
+            if row["manual_stories"] is not None:
+                item["manual_stories"] = [s for s in row["manual_stories"] if s in stories]
+            issues.append(item)
+        return json.dumps(
+            {"stories": self.stories, "imported_issues": issues},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
 
 class IssueCoverage:
     def __init__(self, sessions: sessionmaker[Session]):
@@ -302,10 +325,9 @@ class IssueCoverage:
             for s, c in cache.items():
                 if c.story_revision is None and c.revision == data.revisions[s]:
                     c.story_revision, c.issue_versions = data.story_versions[s], known[s]
-            first = next(
-                (s for s, versions in known.items() if len(versions) < len(data.issues)), None
-            )
-            if first is None:
+            eligible = {s: data.eligible(s) for s in known}
+            pending = {s: eligible[s].difference(versions) for s, versions in known.items()}
+            if not any(pending.values()):
                 return Coverage(
                     provider,
                     model,
@@ -313,9 +335,21 @@ class IssueCoverage:
                     {s: [m for m in c.matches if m["id"] in known[s]] for s, c in cache.items()},
                     draft_revision(db, project.id),
                 )
-            issues = [i for i in data.issues if i["id"] not in known[first]][:ISSUE_PAGE]
+            # Compare common issues together. A manually restricted issue must not force
+            # the same unrestricted descriptions to be resent for separate story groups.
+            counts: dict[str, int] = defaultdict(int)
+            for outstanding in pending.values():
+                for issue in outstanding:
+                    counts[issue] += 1
+            pivot = max(counts, key=lambda i: (counts[i], i))
+            group = [s for s in pending if pivot in pending[s]][:STORY_PAGE]
+            # Pack restricted issues alongside unrestricted ones when there is room.
+            # The prompt's manual parent list masks ineligible pairs in this rectangle.
+            wanted = set.union(*(pending[s] for s in group))
+            already_checked = set.union(*(eligible[s] - pending[s] for s in group))
+            candidates = wanted - already_checked
+            issues = [i for i in data.issues if i["id"] in candidates][:ISSUE_PAGE]
             ids = {i["id"] for i in issues}
-            group = [s for s in known if ids.isdisjoint(known[s])][:STORY_PAGE]
             return Page(
                 [data.stories[s] for s in group],
                 issues,
@@ -368,7 +402,10 @@ class IssueCoverage:
                     cache = StoryIssueCoverage(project_id=project.id, story_id=story_id)
                     db.add(cache)
                 matches_by_id.update({i: m for i, m in per_story[s].items() if i not in known})
-                known.update(page.issue_versions)
+                allowed = data.eligible(s)
+                known.update(
+                    {i: version for i, version in page.issue_versions.items() if i in allowed}
+                )
                 cache.story_revision, cache.issue_versions = revision, known
                 cache.revision, cache.checked, cache.matches = (
                     data.revisions[s],
@@ -387,6 +424,7 @@ class IssueCoverage:
         guard: Guard,
         *,
         historical: bool = False,
+        workflow: str = "issue_linking",
     ) -> Coverage:
         while True:
             page = await asyncio.to_thread(
@@ -398,17 +436,16 @@ class IssueCoverage:
                 Question(
                     choices=((provider, model),),
                     system=INSTRUCTION,
-                    prompt=json.dumps(
-                        {"stories": page.stories, "imported_issues": page.issues},
-                        ensure_ascii=False,
-                    ),
+                    prompt=page.prompt(),
                     schema=MATCHES,
                     max_tokens=6000,
                     seconds=150,
                 ),
                 retry=False,
             )
-            await asyncio.to_thread(record_project_usage, self.sessions, pid, model, reply)
+            await asyncio.to_thread(
+                record_project_usage, self.sessions, pid, model, reply, workflow
+            )
             await asyncio.to_thread(
                 self.persist, name, provider, model, page, reply.data["matches"], guard
             )

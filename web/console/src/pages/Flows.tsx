@@ -48,9 +48,8 @@ import {
 } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
-import { BASE, navigate, setQuery, useLocation } from '../router';
+import { BASE, currentAutomationUrl, projectScope, navigate, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
-import { AgentsTab } from './Agents';
 import { TasksTab } from './Tasks';
 
 export const versionName = (version: number | null) =>
@@ -89,16 +88,16 @@ function NewFlowDialog({
   const finalKey = keyEdited ? key : suggestKey(name);
   const { pending, problem, submit, reset } = useSubmit(
     () =>
-      postJson<FlowVersionShown>('flows', {
+      postJson<FlowVersionShown & { flow: string }>('flows', {
         key: finalKey,
         name: name.trim(),
         summary: summary.trim(),
         copy_of: from === NOTHING || from === PART ? null : from,
         part: from === PART,
       }),
-    () => {
+    (made) => {
       onOpenChange(false);
-      navigate(`${BASE}/flow?key=${finalKey}`);
+      navigate(currentAutomationUrl('flow', made.flow));
     },
   );
   useEffect(() => {
@@ -111,7 +110,7 @@ function NewFlowDialog({
     reset();
     // Only when it opens: the form starts clean each time.
   }, [open]);
-  const taken = flows.some((flow) => flow.key === finalKey);
+  const taken = flows.some((flow) => (flow.owner ?? undefined) === projectScope() && flow.key === finalKey);
   const ready = name.trim() !== '' && KEY.test(finalKey) && !taken;
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -202,7 +201,7 @@ function BringIn({ onProblem }: { onProblem: (problem: string | null) => void })
     file
       .text()
       .then((text) => postJson<FlowVersionShown & { flow: string }>('flows', { document: JSON.parse(text) as unknown }))
-      .then((made) => navigate(`${BASE}/flow?key=${made.flow}`))
+      .then((made) => navigate(currentAutomationUrl('flow', made.flow)))
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') return;
         onProblem(
@@ -357,7 +356,9 @@ function UsageCard() {
 }
 
 export function FlowsPage() {
-  const flows = useResource<FlowLibrary>(apiUrl('flows'));
+  const owner = projectScope();
+  const flows = useResource<FlowLibrary>(apiUrl('flows', { include_shared: owner ? 'true' : undefined }));
+  const owned = flows.data?.items.filter((flow) => (flow.owner ?? undefined) === owner) ?? [];
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<FlowListed | null>(null);
@@ -371,7 +372,7 @@ export function FlowsPage() {
       .catch((error: unknown) => setFailed(error instanceof Error ? error.message : 'The request failed.'));
   };
   const wanted = useLocation().query.get('tab');
-  const tab = wanted === 'tasks' || wanted === 'agents' ? wanted : 'flows';
+  const tab = !owner && wanted === 'tasks' ? wanted : 'flows';
   return (
     <Page
       title="Flows"
@@ -419,18 +420,14 @@ export function FlowsPage() {
       ) : null}
       <Tabs
         value={tab}
-        onValueChange={(value) => setQuery({ tab: value === 'tasks' || value === 'agents' ? value : null })}
+        onValueChange={(value) => setQuery({ tab: value === 'tasks' ? value : null })}
       >
-        <TabsList aria-label="Flows, the tasks they are built from, and who does them">
+        <TabsList aria-label="Flow library">
           <TabsTab value="flows">Flows</TabsTab>
-          <TabsTab value="tasks">Tasks</TabsTab>
-          <TabsTab value="agents">Agents</TabsTab>
+          {!owner && <TabsTab value="tasks">Tasks</TabsTab>}
         </TabsList>
         <TabsPanel value="tasks" className="pt-4">
           {tab === 'tasks' ? <TasksTab /> : null}
-        </TabsPanel>
-        <TabsPanel value="agents" className="pt-4">
-          {tab === 'agents' ? <AgentsTab /> : null}
         </TabsPanel>
         <TabsPanel value="flows" className="pt-4">
           <div className="grid gap-6">
@@ -464,14 +461,14 @@ export function FlowsPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  <Rows resource={flows} columns={6} empty="There are no flows">
+                  <Rows resource={{...flows, data: flows.data ? {...flows.data, items: owned} : null}} columns={6} empty="There are no flows">
                     {(items) =>
                       items.map((flow) => (
                         <TableRow key={flow.key}>
                           <TableCell className="max-w-xl">
                             {flow.engine ? (
                               <span className="flex flex-wrap items-center gap-2">
-                                <Link href={`${BASE}/flow?key=${flow.key}`} className="font-medium">
+                                <Link href={currentAutomationUrl("flow", flow.key)} className="font-medium">
                                   {flow.name}
                                 </Link>
                                 {flow.engine.part ? (
@@ -581,7 +578,7 @@ export function FlowsPage() {
                 </CardBody>
               </Card>
             ) : null}
-            <UsageCard />
+            {!owner && <UsageCard />}
           </div>
         </TabsPanel>
       </Tabs>

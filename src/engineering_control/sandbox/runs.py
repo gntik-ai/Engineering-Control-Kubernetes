@@ -14,7 +14,7 @@ from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, object_session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -176,6 +176,11 @@ def commands_of_project(project: ProjectRecord, toolchain: dict[str, Any]) -> di
     administrator wrote on the project's page when there are any, in place of the ones
     of the platform's file that the caller read."""
     own = project.toolchain
+    if own is None and (session := object_session(project)) is not None:
+        from engineering_control.dashboard.command_profiles import selection
+
+        profile = selection(session, project)
+        own = profile.commands if profile else None
     if not isinstance(own, dict):
         return toolchain
     try:
@@ -383,7 +388,9 @@ class Runs:
                 raise ProjectInvalid("The item is not open any more")
             if section is None:
                 raise ProjectInvalid("Route the item to a section first")
-            plan = plan_for_item(session, section.flow_key, produced=is_produced(item))
+            plan = plan_for_item(
+                session, section.flow_key, produced=is_produced(item), version=section.flow_version
+            )
             if plan is None:
                 raise ProjectInvalid(
                     f"The section {section.name} has no flow that can run here. Assign "
@@ -403,7 +410,9 @@ class Runs:
             if busy:
                 raise ProjectConflict("A run for this item is already under way")
             flow, mode = plan
-            found_flow = document_in_force(session, flow)
+            found_flow = document_in_force(
+                session, flow, section.flow_version if flow == section.flow_key else None
+            )
             if found_flow is None:  # ``plan_for_item`` names only flows that are in force
                 raise ProjectInvalid(f"The flow {flow} is not in force")
             document, flow_version = found_flow
@@ -612,7 +621,11 @@ class Runs:
             )
             if found is None:
                 raise ProjectNotFound(section)
-            in_force_now = document_in_force(session, found.flow_key) if found.flow_key else None
+            in_force_now = (
+                document_in_force(session, found.flow_key, found.flow_version)
+                if found.flow_key
+                else None
+            )
             if in_force_now is None or section_action(in_force_now[0]) is None:
                 raise ProjectInvalid(
                     f"The section {found.name} has no flow that produces items by itself"

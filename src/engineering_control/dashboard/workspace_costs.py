@@ -44,11 +44,15 @@ async def ecb_rates(client: httpx.AsyncClient) -> dict[date, Decimal]:
 
 
 def record_model_usage(sessions: sessionmaker[Session], row: WorkspaceImport, reply: Reply) -> None:
-    record_project_usage(sessions, row.project_id, row.model, reply)
+    record_project_usage(sessions, row.project_id, row.model, reply, "repository_review")
 
 
 def record_project_usage(
-    sessions: sessionmaker[Session], project: UUID, model: str | None, reply: Reply
+    sessions: sessionmaker[Session],
+    project: UUID,
+    model: str | None,
+    reply: Reply,
+    workflow: str = "project_planning",
 ) -> None:
     # Save the metered response independently of a later proposal validation or stage retry.
     with sessions.begin() as session:
@@ -57,6 +61,7 @@ def record_project_usage(
                 project_id=project,
                 usage={
                     **reply.usage,
+                    "workflow": workflow,
                     "provider": reply.provider,
                     "account_id": str(reply.account_id),
                     "requested_model": model,

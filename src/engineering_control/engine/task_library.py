@@ -186,6 +186,7 @@ class TaskLibrary:
         label, kind = _label(name), _kind(task)
         settings, words = clean_settings(kind, params), clean_wording(kind, wording)
         with self.sessions.begin() as session:
+            FlowRecords.check_task_scope(session, settings)
             if session.scalar(select(SavedTask.id).where(SavedTask.name == label)) is not None:
                 raise ProjectConflict(f"There is a task {label} already")
             if (session.scalar(select(func.count()).select_from(SavedTask)) or 0) >= MAX_SAVED:
@@ -212,6 +213,7 @@ class TaskLibrary:
                 raise ProjectNotFound(str(saved_id))
             kind = _kind(row.task)
             settings, words = clean_settings(kind, params), clean_wording(kind, wording)
+            FlowRecords.check_task_scope(session, settings)
             taken = session.scalar(
                 select(SavedTask.id).where(SavedTask.name == label, SavedTask.id != saved_id)
             )

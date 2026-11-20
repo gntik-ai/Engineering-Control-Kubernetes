@@ -451,3 +451,51 @@ def test_story_and_issue_check_other_epics_and_reject_foreign_parents(workspace:
     drain(repo.planning_analysis, Model(lambda _: pytest.fail("Unexpected model call")))
     with repo.sessions() as db:
         assert db.get(PlanningReview, (pid, "epics", UUID(blank))).status == "needs_input"
+
+
+def test_intake_screens_only_possible_parents_and_meters_the_review(workspace: Any) -> None:
+    client, repo = workspace
+    configure(repo, client)
+    pid = repo.projects.identity_of("falcone")
+    with repo.sessions.begin() as db:
+        epic = ProjectEpic(project_id=pid, title="Release", description="Release safely.")
+        story = ProjectUserStory(
+            project_id=pid,
+            title="Verify a release",
+            description="As the maintainer I verify each release.",
+        )
+        db.add_all([epic, story])
+        for i in range(200):
+            db.add(
+                BacklogItem(
+                    project_id=pid,
+                    title=f"Technical item {i}",
+                    description="Work for a different intake.",
+                    state="proposed",
+                    source="github",
+                    issue_number=i + 1,
+                    workspace_review="approved",
+                )
+            )
+        db.flush()
+        eid = str(epic.id)
+        db.add(
+            PlanningReview(
+                project_id=pid,
+                kind="stories",
+                record_id=story.id,
+                scope="verify",
+                title=story.title,
+            )
+        )
+    prompts = []
+
+    def answer(ctx: dict[str, Any]) -> dict[str, Any]:
+        prompts.append(ctx)
+        return empty(parents=[eid])
+
+    drain(repo.planning_analysis, Model(answer))
+    assert len(prompts) == 1
+    assert [row["id"] for row in prompts[0]["records"]] == [eid]
+    assert repo.planning_analysis.status("falcone", 1)["usage_24h"]["requests"] == 1
+    assert repo.planning_analysis.active_counts() == []

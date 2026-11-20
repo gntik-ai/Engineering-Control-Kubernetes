@@ -21,6 +21,7 @@ const labels: Record<string, string> = {
   covered: 'Already covered', proposals: 'Proposals created', matched: 'Ready for approval',
 };
 type ReviewPage = {
+  usage_24h?: { requests: number; tokens: number };
   paused: boolean; counts: Record<string, number>; page: number; pages: number;
   provider: string | null; model: string | null; models: { provider: string; model: string }[];
   items: (RecordLink & ReviewResult)[];
@@ -80,6 +81,7 @@ export function PlanningReviews({ project }: { project: string }) {
         onClick={() => void queue.submit()}>{data.paused ? 'Resume automatic reviews' : 'Stop automatic reviews'}</Button>}
     </div>
     {queue.problem && <Alert tone="warning" title={queue.problem} />}
+    {data?.usage_24h && <p className="text-sm text-muted-foreground">Automatic review in the last 24 hours · {data.usage_24h.requests.toLocaleString()} recorded model calls · {data.usage_24h.tokens.toLocaleString()} tokens</p>}
     {data?.paused && <p role="status" className="text-sm">Stopped · {(data.counts.queued ?? 0).toLocaleString()} queued for this project.</p>}
     <LoadError resource={resource} />
     {data && <>

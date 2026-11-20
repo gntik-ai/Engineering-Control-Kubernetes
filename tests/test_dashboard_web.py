@@ -164,6 +164,13 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
     post_routes = {route.path for route in app.routes if "POST" in getattr(route, "methods", set())}
     assert post_routes == {
         # Deleting what is not wanted: each one typed, named and recorded like any change.
+        "/api/dashboard/operations",
+        "/api/dashboard/operations/{key}/update",
+        "/api/dashboard/operations/{key}/remove",
+        "/api/dashboard/command-profiles",
+        "/api/dashboard/command-profiles/{profile_id}/update",
+        "/api/dashboard/command-profiles/{profile_id}/remove",
+        "/api/dashboard/projects/{name}/command-profile",
         "/api/dashboard/flows/{key}/remove",
         "/api/dashboard/flows/{key}/put-back",
         "/api/dashboard/items/{item_id}/remove",

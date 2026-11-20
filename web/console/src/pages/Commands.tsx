@@ -71,7 +71,7 @@ const HOW =
 
 /** How a project is installed and how its tests are run: what the tasks Install the project,
  * Run the tests and Test and scan run for it. */
-export function CommandsCard({ project }: { project: string }) {
+export function CommandsCard({ project, onChanged }: { project: string; onChanged?: () => void }) {
   const commands = useResource<ProjectCommands>(apiUrl(`projects/${project}/commands`));
   const stored = commands.data;
   const [install, setInstall] = useState<string[]>([]);
@@ -85,6 +85,7 @@ export function CommandsCard({ project }: { project: string }) {
   const done = () => {
     setPassword('');
     commands.reload();
+    onChanged?.();
   };
   const save = useSubmit(
     () => postJson(`projects/${project}/commands`, { install, tests, current_password: password }),
@@ -109,7 +110,7 @@ export function CommandsCard({ project }: { project: string }) {
         <div className="ml-auto flex items-center gap-2">
           {stored ? (
             <Badge tone={stored.own ? 'info' : 'neutral'} size="sm">
-              {stored.own ? 'Written here' : 'The platform’s own'}
+              {stored.profile ? stored.profile.name : stored.own ? 'Project override' : 'Platform commands'}
             </Badge>
           ) : null}
         </div>

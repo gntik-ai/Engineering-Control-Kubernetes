@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,11 +20,14 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    active_project,
 )
 from engineering_control.db.models import (
+    AgentRecord,
     Evaluation,
     EvaluationCase,
     FlowVersion,
+    ProjectFlow,
     ProjectRecord,
     ProjectSection,
     RemovedFlow,
@@ -184,6 +187,7 @@ class FlowRecords:
                 raise ProjectInvalid(wrong[0])
             words = {str(k): str(v) for k, v in wording.items() if str(v).strip()}
         with self.sessions.begin() as session:
+            self.check_task_scope(session, settings)
             row = session.scalar(select(SavedTask).where(SavedTask.name == label))
             if row is None:
                 if (session.scalar(select(func.count()).select_from(SavedTask)) or 0) >= 60:
@@ -203,6 +207,74 @@ class FlowRecords:
             session.delete(row)
             return gone
 
+    def owners(self) -> dict[str, str]:
+        with self.sessions() as db:
+            return dict(
+                db.execute(
+                    select(ProjectFlow.flow_key, ProjectRecord.name).join(
+                        ProjectRecord, ProjectRecord.id == ProjectFlow.project_id
+                    )
+                )
+                .tuples()
+                .all()
+            )
+
+    def owner(self, key: str) -> str | None:
+        with self.sessions() as db:
+            return db.scalar(
+                select(ProjectRecord.name)
+                .join(ProjectFlow, ProjectFlow.project_id == ProjectRecord.id)
+                .where(ProjectFlow.flow_key == key)
+            )
+
+    def import_key(self, key: str, project: str | None) -> str | None:
+        """Resolve an imported public key only inside the destination library."""
+        with self.sessions() as db:
+            own = db.get(ProjectFlow, key)
+            if project is None:
+                if own:
+                    raise ProjectInvalid("Import the project flow with a new global key.")
+                return key if self.exists(key) else None
+            pid = active_project(db, project).id
+            if own:
+                if own.project_id != pid:
+                    raise ProjectInvalid("Choose a key from this project's library.")
+                return key
+            return db.scalar(
+                select(ProjectFlow.flow_key).where(
+                    ProjectFlow.project_id == pid, ProjectFlow.local_key == key
+                )
+            )
+
+    @staticmethod
+    def check_dependencies(db: Session, document: Document, project_id: UUID | None) -> None:
+        for key in flow_parts.calls(document):
+            owner = db.get(ProjectFlow, key)
+            if owner and owner.project_id != project_id:
+                raise ProjectInvalid("A flow can use a shared part or one from its own project.")
+        for node in document.nodes:
+            FlowRecords.check_task_scope(db, node.params, project_id)
+
+    @staticmethod
+    def check_task_scope(
+        db: Session, params: dict[str, Any], project_id: UUID | None = None
+    ) -> None:
+        if params.get("agent"):
+            agent = str(params["agent"])
+            try:
+                agent_id = UUID(agent)
+            except ValueError:
+                return  # The normal task validator reports invalid identifiers.
+            record = db.get(AgentRecord, agent_id)
+            if record and record.project_id and record.project_id != project_id:
+                raise ProjectInvalid("A flow can use a shared agent or one from its own project.")
+
+    def validate_scope(self, document: Document, project: str | None) -> None:
+        with self.sessions() as db:
+            self.check_dependencies(
+                db, document, active_project(db, project).id if project else None
+            )
+
     def exists(self, key: str) -> bool:
         with self.sessions() as session:
             if key in BUILTIN:
@@ -213,16 +285,35 @@ class FlowRecords:
                 is not None
             )
 
-    def create(self, raw: Any, *, note: str | None = None) -> dict[str, Any]:
+    def create(
+        self, raw: Any, *, note: str | None = None, project: str | None = None
+    ) -> dict[str, Any]:
         """A new flow of the library, as the draft of a key nothing has yet."""
         try:
             document = parse(raw)
         except FlowInvalid as error:
             raise ProjectInvalid(str(error)) from error
+        local_key = document.key
+        if project is not None:
+            document = parse(
+                {**document.as_dict(), "key": f"p-{uuid4().hex}-{local_key[:22].rstrip('-')}"}
+            )
         if self.exists(document.key):
             raise ProjectConflict(f"There is a flow {document.key} already")
         found = validate.problems(document)
         with self.sessions.begin() as session:
+            pid = active_project(session, project, lock=True).id if project else None
+            if pid:
+                if session.scalar(
+                    select(ProjectFlow.flow_key).where(
+                        ProjectFlow.project_id == pid, ProjectFlow.local_key == local_key
+                    )
+                ):
+                    raise ProjectConflict(
+                        f"This project already has a flow with the key {local_key}."
+                    )
+                session.add(ProjectFlow(flow_key=document.key, local_key=local_key, project_id=pid))
+            self.check_dependencies(session, document, pid)
             if is_removed(session, document.key):
                 if document.key in BUILTIN:
                     raise ProjectConflict(
@@ -243,7 +334,7 @@ class FlowRecords:
             )
             session.add(row)
             session.flush()
-            return {**_row(row), "problems": found}
+            return {**_row(row), "flow": document.key, "problems": found}
 
     def keys(self) -> list[str]:
         """Every flow the platform can run: its own, and the ones made here."""
@@ -376,6 +467,8 @@ class FlowRecords:
         if not self.exists(key):
             raise ProjectNotFound(key)
         with self.sessions.begin() as session:
+            owner = session.get(ProjectFlow, key)
+            self.check_dependencies(session, document, owner.project_id if owner else None)
             row = session.scalar(
                 select(FlowVersion)
                 .where(FlowVersion.flow_key == key, FlowVersion.state == "draft")
@@ -489,7 +582,9 @@ class FlowRecords:
                 if record.archived_at is None
             ]
             session.execute(
-                update(ProjectSection).where(ProjectSection.flow_key == key).values(flow_key=None)
+                update(ProjectSection)
+                .where(ProjectSection.flow_key == key)
+                .values(flow_key=None, flow_version=None)
             )
             tried = list(session.scalars(select(Evaluation.id).where(Evaluation.flow_key == key)))
             if tried:
@@ -500,6 +595,7 @@ class FlowRecords:
             versions = len(rows)
             for row in rows:
                 session.delete(row)
+            session.execute(delete(ProjectFlow).where(ProjectFlow.flow_key == key))
             if own or named:
                 session.add(RemovedFlow(flow_key=key))
             return {
@@ -550,6 +646,8 @@ class FlowRecords:
                     f"The draft cannot be published: {wrong[0]['text']}"
                     + (f" (and {len(wrong) - 1} more)" if len(wrong) > 1 else "")
                 )
+            ownership = session.get(ProjectFlow, key)
+            self.check_dependencies(session, document, ownership.project_id if ownership else None)
             current = document_in_force(session, key)
             if current is not None and current[0].as_dict() == document.as_dict():
                 # A draft that only draws the flow another way is still a version.

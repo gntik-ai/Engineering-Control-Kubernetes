@@ -145,8 +145,9 @@ def plan(
     baseline = row.progress.get("coverage_baseline")
     changed = changes(current, baseline)
     saved = data.checkpoints(db, project.id)
-    reused = sum(len(data.known(s, saved.get(s))) for s in data.stories)
-    pairs = len(data.issues) * len(data.stories)
+    eligible = {s: data.eligible(s) for s in data.stories}
+    reused = sum(len(ids.intersection(data.known(s, saved.get(s)))) for s, ids in eligible.items())
+    pairs = sum(len(ids) for ids in eligible.values())
     required = stages(changed, bool(baseline))
     if not required and pairs > reused:
         required = ["issues"]
@@ -158,6 +159,7 @@ def plan(
         "issues": len(data.issues),
         "reusable": reused,
         "remaining": pairs - reused,
+        "excluded_by_manual_links": len(data.issues) * len(data.stories) - pairs,
         "provider": provider,
         "model": model,
     }

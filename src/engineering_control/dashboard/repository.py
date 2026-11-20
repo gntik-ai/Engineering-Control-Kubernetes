@@ -97,6 +97,9 @@ class DashboardRepository:
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.passwords = password_service or PasswordService()
         self.redactor = SecretRedactor()
+        from engineering_control.dashboard.command_profiles import CommandProfiles
+
+        self.command_profiles = CommandProfiles(self.sessions)
         self.projects = ProjectRecords(self.sessions)
         self.connections = Connections(self.sessions)
         self.connection_analysis = ConnectionAnalysis(self.sessions)

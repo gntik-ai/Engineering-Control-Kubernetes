@@ -128,7 +128,7 @@ class DashboardService:
             return {
                 **self.repository.summaries.state(project),
                 "accounts": accounts,
-                "agents": self.repository.agents.names(),
+                "agents": self.repository.agents.names(project),
             }
 
         return await asyncio.to_thread(read)
@@ -163,6 +163,7 @@ class DashboardService:
                 )
             except FlowInvalid as error:
                 raise ProjectInvalid(str(error)) from error
+            self.repository.flows.validate_scope(document, project)
             wrong = validate_flow.errors(document)
             if wrong:
                 raise ProjectInvalid(wrong[0]["text"])
@@ -277,8 +278,10 @@ class DashboardService:
     async def remove_section(self, project: str, key: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.sections.remove, project, key)
 
-    async def assign_flow(self, project: str, key: str, flow: str | None) -> dict[str, object]:
-        return await asyncio.to_thread(self.repository.sections.assign, project, key, flow)
+    async def assign_flow(
+        self, project: str, key: str, flow: str | None, version: int | None = None
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.sections.assign, project, key, flow, version)
 
     async def items(
         self,
@@ -557,7 +560,9 @@ class DashboardService:
 
     # --- flows -----------------------------------------------------------------------------
 
-    async def flows(self) -> dict[str, object]:
+    async def flows(
+        self, project: str | None = None, include_shared: bool = False
+    ) -> dict[str, object]:
         """The library of flows. One that runs on this platform says so under ``engine``:
         its version in force, its draft, what it consists of."""
         running = {
@@ -577,7 +582,16 @@ class DashboardService:
             for key, row in running.items()
         ]
         # The platform's own that were deleted: they can be put back.
-        return {"items": listed, "removed": removed}
+        owners = await asyncio.to_thread(self.repository.flows.owners)
+        return {
+            "items": [
+                {**row, "owner": owners.get(row["key"])}
+                for row in listed
+                if owners.get(row["key"]) == project
+                or (include_shared and row["key"] not in owners)
+            ],
+            "removed": removed if project is None else [],
+        }
 
     async def remove_flow(self, key: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.flows.remove, key)
@@ -585,8 +599,9 @@ class DashboardService:
     async def put_flow_back(self, key: str) -> dict[str, object]:
         return await asyncio.to_thread(self.repository.flows.put_back, key)
 
-    async def flow_catalogue(self) -> dict[str, object]:
+    async def flow_catalogue(self, project: str | None = None) -> dict[str, object]:
         """What a flow can be built from: the tasks, the prompts and the budgets."""
+        owners = await asyncio.to_thread(self.repository.flows.owners)
         return {
             "format": FLOW_FORMAT,
             "tasks": task_catalogue(),
@@ -599,13 +614,17 @@ class DashboardService:
             "conditions": condition_catalogue(),
             "saved": await asyncio.to_thread(self.repository.tasks.saved),
             # The agents a task can name, and the flows a new flow can be started from.
-            "agents": await asyncio.to_thread(self.repository.agents.names),
+            "agents": await asyncio.to_thread(self.repository.agents.names, project),
             "starters": [
                 {"key": key, "name": flow.name, "summary": flow.summary, "part": flow.part}
                 for key, flow in STARTERS.items()
             ],
             # The parts a flow can run: the flows marked as parts that are in force.
-            "parts": await asyncio.to_thread(self.repository.flows.parts_in_force),
+            "parts": [
+                part
+                for part in await asyncio.to_thread(self.repository.flows.parts_in_force)
+                if owners.get(part["key"]) in (None, project)
+            ],
             # The platform's kinds of task that are not offered in the designer's list.
             "hidden": await asyncio.to_thread(self.repository.tasks.hidden),
         }
@@ -657,17 +676,17 @@ class DashboardService:
 
     # --- agents and skills ---------------------------------------------------------------
 
-    async def agents(self) -> dict[str, object]:
+    async def agents(self, project: str | None = None) -> dict[str, object]:
         """The agents and the skills, with the flows that name each agent."""
-        return await asyncio.to_thread(self.repository.agents.listing)
+        return await asyncio.to_thread(self.repository.agents.listing, project)
 
     async def save_agent(self, agent_id: UUID | None, **fields: Any) -> dict[str, object]:
         return await asyncio.to_thread(
             lambda: self.repository.agents.save_agent(agent_id, **fields)
         )
 
-    async def remove_agent(self, agent_id: UUID) -> dict[str, object]:
-        return await asyncio.to_thread(self.repository.agents.remove_agent, agent_id)
+    async def remove_agent(self, agent_id: UUID, project: str | None = None) -> dict[str, object]:
+        return await asyncio.to_thread(self.repository.agents.remove_agent, agent_id, project)
 
     async def save_skill(self, skill_id: UUID | None, **fields: Any) -> dict[str, object]:
         return await asyncio.to_thread(
@@ -680,12 +699,15 @@ class DashboardService:
     async def hide_task(self, task: str, *, hidden: bool) -> dict[str, object]:
         return await asyncio.to_thread(lambda: self.repository.tasks.hide(task, hidden=hidden))
 
-    async def check_flow(self, document: dict[str, Any]) -> dict[str, object]:
+    async def check_flow(
+        self, document: dict[str, Any], project: str | None = None
+    ) -> dict[str, object]:
         """What the rules say about a flow as it is in the editor. Nothing is stored."""
         try:
             flow = parse_flow(document)
         except FlowInvalid as error:
             raise ProjectInvalid(str(error)) from error
+        await asyncio.to_thread(self.repository.flows.validate_scope, flow, project)
         return described(flow)
 
     async def save_task(
@@ -740,6 +762,7 @@ class DashboardService:
         version: int | None,
         document: dict[str, Any] | None,
         part: bool = False,
+        project: str | None = None,
     ) -> dict[str, object]:
         """A new flow of the library: a document that is brought in, a copy of a flow
         that exists, or a flow with nothing in it yet. It starts as a draft."""
@@ -748,7 +771,9 @@ class DashboardService:
             flows = self.repository.flows
             if document is not None:
                 raw = dict(document)
-                if flows.exists(str(raw.get("key") or "")):
+                destination = flows.import_key(str(raw.get("key") or ""), project)
+                if destination:
+                    raw["key"] = destination
                     # A document of a flow that is here already becomes its draft.
                     saved = flows.save_draft(str(raw["key"]), raw, note="Brought in")
                     return {**flows.shown(str(raw["key"]), saved["version"]), "flow": raw["key"]}
@@ -756,6 +781,8 @@ class DashboardService:
                 # A flow to begin from: its tasks, to be told which model or agent to ask.
                 raw = {**STARTERS[copy_of].as_dict(), "key": key, "name": name, "summary": summary}
             elif copy_of is not None:
+                if flows.owner(copy_of) not in (None, project):
+                    raise ProjectNotFound(copy_of)
                 wanted = flows.version_in_force(copy_of) if version is None else version
                 found = flows.document(
                     copy_of, wanted if wanted is not None else flows.draft(copy_of) or 0
@@ -784,8 +811,10 @@ class DashboardService:
                     "start": "prepare",
                     "tasks": [{"id": "prepare", "task": "workspace.clone"}],
                 }
-            made = flows.create(raw, note="Brought in" if document is not None else None)
-            flow_key = str(raw.get("key"))
+            made = flows.create(
+                raw, note="Brought in" if document is not None else None, project=project
+            )
+            flow_key = str(made["flow"])
             return {**flows.shown(flow_key, made["version"]), "flow": flow_key}
 
         return await asyncio.to_thread(create)
@@ -824,12 +853,16 @@ class DashboardService:
                 if found is None:
                     raise ProjectNotFound(f"{key} version {wanted}")
                 flow = found
+            owner = flows.owner(key)
+            flows.validate_scope(flow, owner)
             told = dict(outcomes)
             of_run = None
             given, listed = scope, entries
             knew: dict[str, Any] = {}
             if run_id is not None:
                 run = self.repository.runs.get(run_id)
+                if owner and (run["data"] or {}).get("project") != owner:
+                    raise ProjectNotFound(str(run_id))
                 told = {**recorded(run["steps"], run["data"]), **told}
                 of_run = {
                     "id": run["id"],

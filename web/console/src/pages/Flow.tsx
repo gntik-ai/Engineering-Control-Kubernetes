@@ -1,3 +1,4 @@
+import { currentAutomationUrl } from '../router';
 import {
   Alert,
   AlertDialog,
@@ -49,7 +50,7 @@ import {
 } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError, TableFrame, When, mono } from '../parts';
-import { BASE, RouterLink, navigate, setQuery, useLocation } from '../router';
+import { RouterLink, navigate, setQuery, useLocation } from '../router';
 import { Designer } from './FlowDesigner';
 import { EvaluationLab, TryOnPaper } from './FlowLab';
 import { Setting, WHERE, copy, same, settingName } from './FlowParts';
@@ -556,7 +557,7 @@ function Editor({
       description={saved.document.summary}
       actions={
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="ghost" size="sm" icon={ArrowLeft} render={<RouterLink href={`${BASE}/flows`} />}>
+          <Button variant="ghost" size="sm" icon={ArrowLeft} render={<RouterLink href={currentAutomationUrl("flows")} />}>
             All flows
           </Button>
           {detail.draft && !dirty ? (
@@ -604,7 +605,7 @@ function Editor({
               destructive
               run={() => postJson(`flows/${flowKey}/remove`)}
               onClose={() => setDeleting(false)}
-              onDone={() => navigate(`${BASE}/flows`)}
+              onDone={() => navigate(currentAutomationUrl("flows"))}
             />
           ) : null}
         </div>
@@ -791,7 +792,7 @@ export function FlowPage() {
           icon={Workflow}
           title="No flow is named in the address"
           description="Open a flow from the list of flows."
-          primaryAction={<Button render={<RouterLink href={`${BASE}/flows`} />}>All flows</Button>}
+          primaryAction={<Button render={<RouterLink href={currentAutomationUrl("flows")} />}>All flows</Button>}
         />
       </Page>
     );

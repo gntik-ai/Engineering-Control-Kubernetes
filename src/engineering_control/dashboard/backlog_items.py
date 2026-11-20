@@ -97,7 +97,7 @@ def _starts(item: BacklogItem, section: ProjectSection | None) -> str | None:
     if session is None or section is None or not section.flow_key:
         return None
     produced = item.source_run_id is not None or bool((item.facts or {}).get("kind"))
-    plan = plan_for_item(session, section.flow_key, produced=produced)
+    plan = plan_for_item(session, section.flow_key, produced=produced, version=section.flow_version)
     return plan[1] if plan else None
 
 
@@ -115,6 +115,7 @@ def serialize(
             "key": section.key,
             "name": section.name,
             "flow": section.flow_key,
+            "flow_version": section.flow_version,
             "starts": _starts(item, section),
         }
         if section

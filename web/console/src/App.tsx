@@ -8,13 +8,10 @@ import {
   ListTodo,
   LogOut,
   Sparkles,
-  Workflow,
 } from '@gntik-ai/icons';
 import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
 import { DashboardPage } from './pages/Dashboard';
-import { FlowPage } from './pages/Flow';
-import { FlowsPage } from './pages/Flows';
 import { InboxPage } from './pages/Inbox';
 import { NotFoundPage } from './pages/NotFound';
 import { ProjectPage } from './pages/Project';
@@ -25,7 +22,7 @@ import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { ProjectWorkspace } from './pages/Workspace';
 import { usePageTitle } from './parts';
-import { ACCOUNTS, ADMIN, BASE, WORKSPACE, useLocation } from './router';
+import { ACCOUNTS, ADMIN, BASE, WORKSPACE, isAutomation, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -45,7 +42,6 @@ const navigation = (waiting: number): NavGroup[] => [
       { label: 'Backlog', href: `${BASE}/backlog`, icon: ListTodo },
       { label: 'Budgets', href: `${BASE}/budgets`, icon: ListOrdered },
       { label: 'Runs', href: `${BASE}/runs`, icon: Bot },
-      { label: 'Flows', href: `${BASE}/flows`, icon: Workflow },
       { label: 'Supervisor', href: `${BASE}/supervisor`, icon: Sparkles },
     ],
   },
@@ -60,15 +56,12 @@ const ADMIN_VIEWS: Record<string, { title: string; Page: ComponentType }> = {
   [`${BASE}/budgets`]: { title: 'Budgets', Page: BudgetsPage },
   [`${BASE}/runs`]: { title: 'Runs', Page: RunsPage },
   [`${BASE}/run`]: { title: 'Run', Page: RunPage },
-  [`${BASE}/flows`]: { title: 'Flows', Page: FlowsPage },
-  [`${BASE}/flow`]: { title: 'Flow', Page: FlowPage },
   [`${BASE}/supervisor`]: { title: 'Supervisor', Page: SupervisorPage },
 };
 
 const DETAIL_PARENTS: Record<string, string> = {
   [`${BASE}/project`]: `${BASE}/projects`,
   [`${BASE}/run`]: `${BASE}/runs`,
-  [`${BASE}/flow`]: `${BASE}/flows`,
 };
 
 function SignOut({ onError }: { onError: (message: string) => void }) {
@@ -160,12 +153,19 @@ export default function App() {
     <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
   ) : null;
 
+  const settings = current.startsWith(BASE + '/settings/') ? current.slice((BASE + '/settings/').length) : '';
+  if (isAutomation(settings) && settings !== 'assignments') {
+    return <ProjectWorkspace name={query.get('project') ?? ''} view={settings} global actions={actions} notice={notice} />;
+  }
   if (current === ACCOUNTS) {
-    return <ProjectWorkspace name={query.get('project') ?? ''} view="accounts" actions={actions} notice={notice} />;
+    return <ProjectWorkspace name={query.get('project') ?? ''} view="accounts" global actions={actions} notice={notice} />;
   }
   if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
     const [name = '', ...rest] = current.slice(WORKSPACE.length + 1).split('/');
     const subpath = rest.join('/');
+    if (rest[0] === 'automation' && rest.length === 2 && isAutomation(rest[1] ?? '')) {
+      return <ProjectWorkspace name={name} view={rest[1] as import('./router').AutomationView} actions={actions} notice={notice} />;
+    }
     if (subpath !== '' && subpath !== 'queue' && subpath !== 'settings/connections') return <NotFoundPage />;
     const view = subpath === 'settings/connections' ? 'connections' : subpath || 'dashboard';
     return <ProjectWorkspace name={name} view={view} actions={actions} notice={notice} />;
