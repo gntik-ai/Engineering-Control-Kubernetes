@@ -11,6 +11,7 @@ resources:
   - network-policy.yaml
   - postgres.yaml
   - bootstrap-jobs.yaml
+  - pause-serverless-coverage.yaml
   - console.yaml
   - launcher.yaml
   - egress.yaml
