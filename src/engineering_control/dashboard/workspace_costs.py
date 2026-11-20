@@ -63,43 +63,54 @@ def record_project_usage(
 ) -> None:
     # Save the metered response independently of a later proposal validation or stage retry.
     with sessions.begin() as session:
-        tokens = reply.usage.get("tokens")
-        if tokens is None and all(
-            type(reply.usage.get(k)) is int and reply.usage[k] >= 0 for k in ("input", "output")
-        ):
-            tokens = reply.usage["input"] + reply.usage["output"]
-        if reserved and type(tokens) is int and tokens >= 0:
-            budget = ProjectReviewBudget
-            session.execute(
-                update(budget)
-                .where(budget.project_id == project)
-                .values(
-                    used=budget.used + tokens,
-                    reserved=budget.reserved - reserved,
-                    required=case(
-                        (
-                            (budget.required.is_(None))
-                            & (budget.used + tokens >= budget.token_limit),
-                            1,
-                        ),
-                        else_=budget.required,
+        add_project_usage(session, project, model, reply, workflow, reserved, run_id)
+
+
+def add_project_usage(
+    session: Session,
+    project: UUID,
+    model: str | None,
+    reply: Reply,
+    workflow: str,
+    reserved: int,
+    run_id: UUID | None,
+) -> None:
+    tokens = reply.usage.get("tokens")
+    if tokens is None and all(
+        type(reply.usage.get(k)) is int and reply.usage[k] >= 0 for k in ("input", "output")
+    ):
+        tokens = reply.usage["input"] + reply.usage["output"]
+    if reserved and type(tokens) is int and tokens >= 0:
+        budget = ProjectReviewBudget
+        session.execute(
+            update(budget)
+            .where(budget.project_id == project)
+            .values(
+                used=budget.used + tokens,
+                reserved=budget.reserved - reserved,
+                required=case(
+                    (
+                        (budget.required.is_(None)) & (budget.used + tokens >= budget.token_limit),
+                        1,
                     ),
-                )
-            )
-        session.add(
-            WorkspaceModelUsage(
-                project_id=project,
-                review_run_id=run_id,
-                usage={
-                    **reply.usage,
-                    "workflow": workflow,
-                    "provider": reply.provider,
-                    "account_id": str(reply.account_id),
-                    "requested_model": model,
-                    "model": reply.model,
-                },
+                    else_=budget.required,
+                ),
             )
         )
+    session.add(
+        WorkspaceModelUsage(
+            project_id=project,
+            review_run_id=run_id,
+            usage={
+                **reply.usage,
+                "workflow": workflow,
+                "provider": reply.provider,
+                "account_id": str(reply.account_id),
+                "requested_model": model,
+                "model": reply.model,
+            },
+        )
+    )
 
 
 class AccountPrices:

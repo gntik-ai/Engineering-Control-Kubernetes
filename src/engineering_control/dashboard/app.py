@@ -31,7 +31,7 @@ from fastapi.responses import (
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
-from engineering_control.dashboard import review_budget, review_flows, stats
+from engineering_control.dashboard import review_budget, review_evidence, review_flows, stats
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_COOKIE,
@@ -75,6 +75,9 @@ from engineering_control.dashboard.schemas import (
     EpicInput,
     EpicQueueInput,
     EvaluationInput,
+    EvidenceControlInput,
+    EvidencePreviewInput,
+    EvidenceRunInput,
     ExecutionPlanInput,
     FlowCheckInput,
     FlowCreateInput,
@@ -466,6 +469,15 @@ def create_app(
             )
             keepers.append(
                 asyncio.create_task(review_new_planning(resolved_repository, app.state.models))
+            )
+            keepers.append(
+                asyncio.create_task(
+                    review_evidence.worker(
+                        resolved_repository.sessions,
+                        app.state.models,
+                        lambda: resolved_repository.workspace_metrics.exchange_rates,
+                    )
+                )
             )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
@@ -1746,6 +1758,68 @@ def create_app(
             lambda _body: service(request).remove_section(name, key),
             event="dashboard.section_removed",
             subject=f"{name}/{key}",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/evidence")
+    async def evidence_status(name: str, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            value = await asyncio.to_thread(review_evidence.status, repo(request).sessions, name)
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+        return JSONResponse(value)
+
+    @app.post("/api/dashboard/projects/{name}/evidence/preview")
+    async def evidence_preview(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            EvidencePreviewInput,
+            lambda b: asyncio.to_thread(
+                review_evidence.preview,
+                repo(request).sessions,
+                name,
+                b.document,
+                b.provider,
+                b.model,
+                b.page,
+                b.search,
+            ),
+            event="project.evidence_preview",
+            subject=name,
+            max_bytes=300_000,
+            record=False,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/evidence/runs")
+    async def evidence_start(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            EvidenceRunInput,
+            lambda b: asyncio.to_thread(
+                review_evidence.start,
+                repo(request).sessions,
+                name,
+                b.request_id,
+                b.provider,
+                b.model,
+                b.token_cap,
+            ),
+            event="project.evidence_run_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/evidence/control")
+    async def evidence_control(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            EvidenceControlInput,
+            lambda b: asyncio.to_thread(
+                review_evidence.control, repo(request).sessions, name, b.run_id, b.action
+            ),
+            event="project.evidence_run_controlled",
+            subject=name,
         )
 
     @app.get("/api/dashboard/projects/{name}/review-flows")

@@ -1,0 +1,126 @@
+import { Alert, Button, Input } from '@gntik-ai/ui';
+import { useEffect, useState } from 'react';
+import { apiUrl, postJson, useResource, type FlowDocument } from '../api';
+import { useProjects } from '../parts';
+import { projectScope } from '../router';
+import { DataTable } from '../components/blocks/tables/data-table/DataTable';
+import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
+
+type Model = { provider: string; model: string };
+type Step = { id: string; task: string; selected?: number; reusable?: number; pages?: number; records?: number };
+type Source = { title: string; repository: string; number: number | null; revision: string; state: string; body: string; epics: string[]; card?: { text: string; partial: boolean } };
+type Pair = { id: string; issue: Source; story: Source; reason: string; decision: string };
+type Preview = { flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
+type Run = { id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
+  arms: {arm: string; scope: string; evidence: string; tokens: number; input: number; output: number; eur: string | null}[] };
+type Status = { paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
+const keyOf = (m: Model) => JSON.stringify([m.provider, m.model]);
+const active = ['queued','calling','held','stopping','paused'];
+const labels: Record<string,string> = {
+  'evidence.relationships':'Read project relationships','evidence.candidates':'Find related records','evidence.reuse':'Reuse review decisions',
+  'evidence.wiki':'Read wiki evidence','evidence.compare':'Compare original and wiki evidence',
+};
+const optionsClass = 'rounded-md border border-border bg-background px-2 py-1 text-sm';
+
+function Passage({ row }: { row: Source }) {
+  return <details className="min-w-40 max-w-lg whitespace-normal">
+    <summary className="cursor-pointer text-primary">{row.title}</summary>
+    <p className="my-1 text-xs text-muted-foreground">{row.repository}{row.number ? ' #' + row.number : ''} · {row.state} · {row.revision.slice(0,12)}</p>
+    {!!row.epics.length && <p className="mt-1 text-xs">Epics · {row.epics.join(', ')}</p>}
+    {row.card && <p className="my-2 whitespace-pre-wrap">{row.card.text}</p>}
+    <details><summary className="cursor-pointer">Original source</summary><p className="my-2 whitespace-pre-wrap">{row.body}</p></details>
+  </details>;
+}
+const columns: DataTableColumn<Pair>[] = [
+  {id:'issue',header:'Technical issue',accessor:r=>r.issue.title,sortable:false,cell:r=><Passage row={r.issue}/>},
+  {id:'story',header:'User Story',accessor:r=>r.story.title,sortable:false,cell:r=><Passage row={r.story}/>},
+  {id:'reason',header:'Why selected',accessor:r=>r.reason,sortable:false},
+  {id:'decision',header:'Saved decision',accessor:r=>r.decision,sortable:false},
+];
+
+export function EvidencePanel({project, draft}: {project:string; draft?: FlowDocument}) {
+  const path='projects/'+encodeURIComponent(project)+'/evidence';
+  const [poll,setPoll]=useState(false);
+  const status=useResource<Status>(apiUrl(path),poll ? 2500 : null);
+  const data=status.data;
+  const run=data?.run;
+  useEffect(()=>setPoll(!!run && ['queued','calling','stopping'].includes(run.state)),[run?.state]);
+  const [pick,setPick]=useState('');
+  const fallback=data?.models.find(m=>data.configured && keyOf(m)===keyOf(data.configured)) ?? data?.models.find(m=>m.provider==='anthropic') ?? data?.models[0];
+  const chosen=data?.models.find(m=>keyOf(m)===pick) ?? fallback;
+  const [cap,setCap]=useState('12000');
+  const [view,setView]=useState<Preview|null>(null);
+  const [query,setQuery]=useState<{page:number;search:string;nonce:number}|null>(null);
+  const [waiting,setWaiting]=useState(false);
+  const [busy,setBusy]=useState(false);
+  const [problem,setProblem]=useState('');
+  useEffect(()=>{setView(null);setQuery(null);setProblem('');},[draft,project,pick]);
+  useEffect(()=>{
+    if(!query)return;
+    let alive=true;
+    setWaiting(true);
+    postJson<Preview>(path+'/preview',{document:draft,provider:chosen?.provider,model:chosen?.model,page:query.page,search:query.search},{quiet:true})
+      .then(value=>{if(alive){setView(value);setProblem('');}})
+      .catch(e=>{if(alive)setProblem(e instanceof Error?e.message:'Preview failed.');})
+      .finally(()=>{if(alive)setWaiting(false);});
+    return ()=>{alive=false;};
+  },[path,query,draft,chosen?.provider,chosen?.model]);
+  const [attempt,setAttempt]=useState(()=>crypto.randomUUID());
+  async function change(action?:string){
+    if(busy)return;
+    setBusy(true);setProblem('');
+    try {
+      if(action) await postJson(path+'/control',{run_id:run?.id,action});
+      else {
+        await postJson(path+'/runs',{request_id:attempt,provider:chosen?.provider,model:chosen?.model,token_cap:Number(cap)});
+        setAttempt(crypto.randomUUID());
+      }
+      status.reload();
+    } catch(e){setProblem(e instanceof Error?e.message:'Evidence review failed.');}
+    finally{setBusy(false);}
+  }
+  return <section aria-label="Review evidence" className="grid gap-3 rounded-xl border border-border bg-card p-5">
+    <h2 className="text-lg font-semibold">{draft ? 'Preview this flow' : 'Review related work'}</h2>
+    {data && <div className="flex flex-wrap items-end gap-3">
+      {!!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
+        {data.models.map(m=><option key={keyOf(m)} value={keyOf(m)}>{m.provider} · {m.model}</option>)}</select></label>}
+      <Button variant="secondary" size="sm" loading={waiting} disabled={waiting} onClick={()=>setQuery({page:1,search:'',nonce:Date.now()})}>Preview related records</Button>
+      {!draft && !(run && active.includes(run.state)) && <>
+        {data.paid && <label className="grid gap-1 text-sm">Pilot token cap<Input aria-label="Pilot token cap" type="number" min="1" max="2000000" value={cap} onChange={e=>setCap(e.target.value)} /></label>}
+        <Button size="sm" disabled={busy || (data.paid && (!chosen || Number(cap)<=0 || Number(cap)>2000000))} loading={busy}
+          onClick={()=>void change()}>{data.paid?'Run paired comparison':'Run evidence flow'}</Button>
+      </>}
+    </div>}
+    {status.error && <Alert tone="warning" title={status.error}/>}
+    {problem && <Alert tone="warning" title={problem}/>}
+    {view && <>
+      <p className="text-sm">{view.flow} · {view.selected.toLocaleString()} selected of {view.eligible.toLocaleString()} eligible pairs · {view.reusable} reusable · {view.external} across projects · 0 model calls</p>
+      <p className="text-xs text-muted-foreground">{view.steps.map(s=>labels[s.task]).join(' → ')}</p>
+      <DataTable caption="Related records" rows={view.items} columns={columns} getRowId={r=>r.id}
+        selectionMode="none" showQuickFilter showColumnMenu={false} quickFilter={query?.search??''} quickFilterDebounceMs={350}
+        paginationMode="server" paginated={view.total>0} page={view.page} pageSize={10} pageSizeOptions={[10]} rowCount={view.total}
+        loading={waiting} labels={{quickFilter:()=>'Search issues or Stories'}} emptyState="No related records." noResultsState="No matching records."
+        onQueryChange={q=>setQuery(prev=>prev?.page===q.page && prev.search===(q.quickFilter??'')?prev:{page:q.page,search:(q.quickFilter??'').slice(0,200),nonce:Date.now()})}/>
+    </>}
+    {!draft && run && <div className="grid gap-2 border-t border-border pt-3 text-sm" aria-live="polite">
+      <p><strong>{run.flow}</strong> · v{run.version} · {run.state} · {run.spent.toLocaleString()} tokens used / {run.cap.toLocaleString()} cap{run.reserved>0?' · '+run.reserved.toLocaleString()+' reserved':''}</p>
+      {run.cached_from && <p>Reused both answers from a completed comparison. The arm totals below are from that run.</p>}
+      {run.detail && <p>{run.detail}</p>}{run.sample && <p>{run.sample.join(' → ')}</p>}
+      {run.steps.length>0 && <p>{run.steps.map(s=>labels[s.task]).join(' → ')}</p>}
+      {run.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'}</strong> · {a.scope} · {a.input} input / {a.output} output tokens · {a.eur===null?'EUR estimate unavailable':'€'+a.eur} · {a.evidence}</p>)}
+      <div className="flex gap-2">{['queued','calling'].includes(run.state) && <Button size="sm" variant="secondary" disabled={busy} onClick={()=>void change('stop')}>Stop</Button>}
+        {['paused','held'].includes(run.state) && <><Button size="sm" disabled={busy} onClick={()=>void change('resume')}>Resume</Button><Button size="sm" variant="secondary" disabled={busy} onClick={()=>void change('end')}>End run</Button></>}</div>
+    </div>}
+  </section>;
+}
+
+export function DesignerEvidence({draft}: {draft:FlowDocument}) {
+  const list=useProjects();
+  const [project,setProject]=useState('');
+  const owner=projectScope();
+  const target=owner || project || list.data?.default_project || list.data?.items[0]?.project;
+  return <div className="mt-4 grid gap-2">{!owner && list.data && <label className="flex items-center gap-2 text-sm">Preview project
+    <select className={optionsClass} value={target??''} onChange={e=>setProject(e.target.value)}>
+      {list.data.items.map(p=><option key={p.project} value={p.project}>{p.display_name}</option>)}</select></label>}
+    {target && <EvidencePanel key={target} project={target} draft={draft}/>}</div>;
+}

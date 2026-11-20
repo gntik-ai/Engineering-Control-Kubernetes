@@ -31,6 +31,7 @@ import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { WorkspaceImport } from './WorkspaceImport';
 import { PlanningReviews, RecordReview, type ReviewResult } from './PlanningReviews';
+import { EvidencePanel } from './ReviewEvidence';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = {
@@ -597,6 +598,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
               </dd>
             </div>
           </dl>
+          {tab === 'home' && <EvidencePanel key={'evidence-'+project.project} project={project.project} />}
           {tab === 'home' && <PlanningReviews key={project.project} project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
           {tab === 'home' && (

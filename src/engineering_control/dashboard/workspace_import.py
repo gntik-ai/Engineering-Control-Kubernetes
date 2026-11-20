@@ -46,7 +46,6 @@ from engineering_control.db.models import (
     ProjectIssueStory,
     ProjectRecord,
     ProjectUserStory,
-    ProviderAccount,
     ReviewFlowRun,
     WorkspaceCandidate,
     WorkspaceImport,
@@ -278,16 +277,7 @@ class WorkspaceImports:
 
     def model_choices(self) -> list[dict[str, str]]:
         with self.sessions() as session:
-            fields = session.execute(
-                select(ProviderAccount.provider, ProviderAccount.models).where(
-                    ProviderAccount.archived_at.is_(None),
-                    ProviderAccount.paused.is_(False),
-                    ProviderAccount.sealed_key.is_not(None),
-                    ProviderAccount.state.in_(("ready", "unchecked", "limited")),
-                )
-            )
-            choices = {(p, m) for p, models in fields for m in (models or []) if isinstance(m, str)}
-        return [{"provider": p, "model": m} for p, m in sorted(choices)]
+            return review_flows.model_choices(session)
 
     def start(self, name: str) -> dict[str, Any]:
         with self.sessions.begin() as session:

@@ -17,6 +17,7 @@ from engineering_control.db.models import (
     PlanningReview,
     ProjectConnection,
     ProjectFlow,
+    ProviderAccount,
     ReviewFlowAssignment,
     ReviewFlowRun,
     WorkspaceImport,
@@ -115,13 +116,16 @@ def start(
     document, version = resolve(db, pid, action)
     if old and old.finished_at is None:
         finish(db, owner, "cancelled")
+    policy = Policy.from_document(document).settings()
+    if policy.get("evidence_nodes"):
+        policy["document"] = document.as_dict()
     row = ReviewFlowRun(
         project_id=pid,
         flow_key=document.key,
         flow_name=document.name,
         action=action,
         version=version,
-        settings=Policy.from_document(document).settings(),
+        settings=policy,
     )
     db.add(row)
     db.flush()
@@ -169,3 +173,16 @@ def effective_settings(
 
 def matching_revision(db: Session, pid: UUID, action: str, run_id: UUID | None = None) -> str:
     return wording(effective_settings(db, pid, action, run_id), "matching")
+
+
+def model_choices(session: Session) -> list[dict[str, str]]:
+    fields = session.execute(
+        select(ProviderAccount.provider, ProviderAccount.models).where(
+            ProviderAccount.archived_at.is_(None),
+            ProviderAccount.paused.is_(False),
+            ProviderAccount.sealed_key.is_not(None),
+            ProviderAccount.state.in_(("ready", "unchecked", "limited")),
+        )
+    )
+    choices = {(p, m) for p, models in fields for m in (models or []) if isinstance(m, str)}
+    return [{"provider": p, "model": m} for p, m in sorted(choices)]

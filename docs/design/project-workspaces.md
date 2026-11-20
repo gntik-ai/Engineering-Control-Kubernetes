@@ -135,6 +135,14 @@ An issue review can start with **Read project relationships → Find related rec
 
 A global template connects the task types in a working order. Project copies can change the shortlist size, include an approved connection, bypass wiki evidence, or insert source expansion. Administrators publish and assign versions under the existing global and project Flows sections. A project can assign different flows to manual Epic, Story and issue reviews, coverage, automatic reviews and connection review. The Home buttons run the assigned flow. Preview follows its deterministic steps and shows fresh comparisons, reusable results and expected token ranges before paid work.
 
+#### Running the evidence flow
+
+Open **Project Home → Review related work** and choose **Preview related records** for a zero-token preview. The searchable table explains the selection, shows the existing decision for each pair and opens cited passages and original source text. In **Global Settings → Flows → Review related work**, the Designer previews an edited draft against a selected project. Project Flow assignments select the published version used for an actual run.
+
+**Run paired comparison** takes its model from Accounts and a separate token cap. It selects one unchecked pair in stable hash order whose original and wiki requests fit the cap, then sends at most one original request and one wiki request. The project budget also applies. The run pins its source, task settings and version. Stop allows an admitted request to settle before pausing. An interrupted request with unconfirmed usage retains its reservation for reconciliation. Results and usage stay in the evidence run and Global Settings → Stats. A repeat with identical inputs reuses the saved comparison. Extractive pages are keyed by source revision and extraction settings.
+
+Coverage, technical issue and automatic review flows can put relationship, ranking and decision-reuse tasks ahead of matching. These tasks prioritize the selected local pairs and preserve the exhaustive fallback. Cross-project recommendations continue through Connections. The paired comparison evaluates evidence quality separately from the approvals governing project records and GitHub.
+
 #### Revised development phases
 
 Phases 15–21 replace the earlier 15–20 proposal. The graph and wiki share task contracts and a reference set from the first phase. Phases 9–14 above cover the delivered Flows and Stats foundation.

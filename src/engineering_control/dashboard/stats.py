@@ -20,6 +20,7 @@ from engineering_control.db.models import (
     ProjectConnection,
     ProjectRecord,
     ProviderAccount,
+    ReviewEvidenceJob,
     ReviewFlowRun,
     SandboxRun,
     SandboxStep,
@@ -433,6 +434,9 @@ def live(sessions: sessionmaker[Session], *, now: datetime | None = None) -> Row
             select(WorkspaceImport.review_run_id)
             .where(WorkspaceImport.lease.is_not(None), WorkspaceImport.lease_until > stamp)
             .union_all(
+                select(ReviewEvidenceJob.run_id).where(
+                    ReviewEvidenceJob.state.in_(("calling", "stopping"))
+                ),
                 select(PlanningReview.review_run_id).where(
                     PlanningReview.lease.is_not(None), PlanningReview.due_at > stamp
                 ),
