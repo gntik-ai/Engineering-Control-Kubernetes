@@ -12,7 +12,7 @@ from engineering_control.db.models import PlanningReview, WorkspaceCandidate
 
 
 def reset_review(job: PlanningReview) -> None:
-    job.status, job.lease, job.attempts = "queued", None, 0
+    job.status, job.lease, job.attempts = "paused" if job.status == "paused" else "queued", None, 0
     job.progress = {}
     job.result = {"proposals": job.result["proposals"]} if job.result.get("proposals") else {}
     job.due_at = datetime.now(UTC)
@@ -37,10 +37,14 @@ def record_changed(db: Session, project: UUID, kind: str, key: UUID, title: str)
     job = db.get(PlanningReview, (project, kind, key))
     if job:
         job.title = title
-        if job.status in ("needs_input", "failed", "queued", "running") or (
+        if job.status in ("needs_input", "failed", "queued", "running", "paused") or (
             job.scope == "intake" and job.status == "matched"
         ):
             reset_review(job)
+
+
+def review_id(job: PlanningReview) -> str:
+    return f"{job.record_id}:{job.updated_at.isoformat()}"
 
 
 def review_results(
@@ -76,6 +80,7 @@ def review_results(
                 )
         results[job.record_id] = {
             "status": job.status,
+            "control_id": review_id(job),
             "id": str(job.record_id),
             "scanned": job.progress.get("scanned", 0),
             **job.result,

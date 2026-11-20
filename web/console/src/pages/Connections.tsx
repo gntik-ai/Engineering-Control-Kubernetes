@@ -45,6 +45,7 @@ type Finding = {
 };
 type Connection = {
   id: string;
+  control_id: string;
   peer: Peer;
   relation: string;
   purpose: string;
@@ -473,6 +474,9 @@ function ConnectionDetail({
     },
   );
   const selected = model || (c?.provider && c.model ? JSON.stringify([c.provider, c.model]) : '');
+  const pause = useSubmit(() => postJson(path + '/pause', {
+    control_id: c?.control_id, paused: c?.status !== 'paused',
+  }), reload);
   const analyze = useSubmit(() => {
     const chosen = selected ? (JSON.parse(selected) as [string, string]) : null;
     return postJson(path + '/analyze', chosen ? { provider: chosen[0], model: chosen[1] } : {});
@@ -523,8 +527,8 @@ function ConnectionDetail({
                   Last checked {new Date(c.checked).toLocaleString()}
                 </p>
               )}
-              {(analyze.problem || c.detail) && (
-                <Alert tone="warning" title={analyze.problem || c.detail || ''} />
+              {(pause.problem || analyze.problem || c.detail) && (
+                <Alert tone="warning" title={pause.problem || analyze.problem || c.detail || ''} />
               )}
               {!c.archived && (
                 <div className="flex flex-wrap items-end gap-2">
@@ -545,12 +549,16 @@ function ConnectionDetail({
                     size="sm"
                     variant="secondary"
                     loading={analyze.pending || c.status === 'running'}
-                    disabled={c.status === 'queued'}
+                    disabled={['queued','running','paused'].includes(c.status)}
                     onClick={() => void analyze.submit()}
                   >
                     Analyze connection
                   </Button>
                 </div>
+              )}
+              {!c.archived && ['queued','running','paused'].includes(c.status) && (
+                <Button className="justify-self-start" size="sm" variant="secondary" loading={pause.pending}
+                  disabled={pause.pending} onClick={() => void pause.submit()}>{c.status === 'paused' ? 'Resume' : 'Stop'}</Button>
               )}
               {selected && (
                 <p className="text-xs text-muted-foreground">

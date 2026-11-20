@@ -4,6 +4,7 @@ import { CHANGED, apiUrl, getJson, postJson, useResource } from '../api';
 import { setQuery } from '../router';
 import { LoadError } from '../parts';
 import { useSubmit } from './ProjectDialogs';
+import { ReviewControl } from './ReviewControls';
 import type { ImportState } from './WorkspaceImport';
 
 export interface Candidate {
@@ -144,7 +145,10 @@ export function WorkspaceReview({
     <div className="grid min-w-0 gap-3">
       {(problem || job?.detail || finish.problem) && <Alert tone="destructive" title={problem || job?.detail || finish.problem || ''} />}
       <div className="flex flex-wrap items-center gap-2">
-        {review.mode === 'existing' || current === 'existing'
+        {state.control_id && (state.busy || job?.state === 'paused') && <ReviewControl path={path} id={state.control_id}
+          paused={job?.state === 'paused'} saved={saved} reload={reload} />}
+        {job?.state === 'paused' ? <span role="status">Review stopped. Completed batches are saved.</span>
+          : review.mode === 'existing' || current === 'existing'
           ? actionButton('existing', 'Review existing GitHub issues', 'Reviewing GitHub issues')
           : stage === 'epics' && review.bulk_complete && !watching ? (
             <span role="status" className="text-sm">
@@ -169,7 +173,7 @@ export function WorkspaceReview({
         {!watching && job?.state === 'completed' && job.action === 'existing' && (
           <span role="status" className="text-sm text-muted-foreground">GitHub review complete</span>
         )}
-        {!watching && review.can_continue && (
+        {!watching && job?.state !== 'paused' && review.can_continue && (
           <Button variant="secondary" loading={finish.pending} disabled={finish.pending} onClick={() => void finish.submit()}>
             {nextStageLabel[stage]}
           </Button>

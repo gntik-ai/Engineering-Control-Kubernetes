@@ -83,6 +83,7 @@ from engineering_control.dashboard.schemas import (
     ItemEditInput,
     ItemRouteInput,
     ItemStateInput,
+    ManagedCoverageInput,
     PlainChangeInput,
     PlanningStateInput,
     ProjectApplicationInput,
@@ -97,8 +98,10 @@ from engineering_control.dashboard.schemas import (
     QueueCreateInput,
     QueueItemsInput,
     QueueUpdateInput,
+    RecordPauseInput,
     RecordsApplyInput,
     RecordsInput,
+    ReviewPauseInput,
     RunDecisionInput,
     RunsRemoveInput,
     SavedTaskInput,
@@ -119,7 +122,7 @@ from engineering_control.dashboard.schemas import (
     TaskInput,
     TriggerInput,
     TriggerUpdateInput,
-    WorkspaceCoverageInput,
+    WorkspaceControlInput,
     WorkspaceDescription,
     WorkspaceImportStep,
     WorkspaceIssueInput,
@@ -950,17 +953,58 @@ def create_app(
             subject=name,
         )
 
+    @app.get("/api/dashboard/projects/{name}/import/coverage/preview")
+    async def preview_project_coverage(
+        name: str, request: Request, provider: str | None = None, model: str | None = None
+    ) -> Response:
+        try:
+            value = await asyncio.to_thread(
+                repo(request).workspace_imports.preview_coverage, name, provider, model
+            )
+            return JSONResponse(value)
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+        except ProjectConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        except ProjectInvalid as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.post("/api/dashboard/projects/{name}/import/stop")
+    async def stop_workspace_review(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceControlInput,
+            lambda body: repo(request).workspace_imports.control(
+                name, body.control_id, models_of(request), resume=False
+            ),
+            event="workspace.review_stopped",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/import/resume")
+    async def resume_workspace_review(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            WorkspaceControlInput,
+            lambda body: repo(request).workspace_imports.control(
+                name, body.control_id, models_of(request), resume=True
+            ),
+            event="workspace.review_resumed",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/import/coverage")
     async def start_project_coverage(name: str, request: Request) -> Response:
         return await project_change(
             request,
-            WorkspaceCoverageInput,
+            ManagedCoverageInput,
             lambda body: asyncio.to_thread(
                 repo(request).workspace_imports.start_coverage,
                 name,
                 body.version,
                 body.provider,
                 body.model,
+                body.links_only,
             ),
             event="workspace.coverage_requested",
             subject=name,
@@ -1158,6 +1202,18 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/pause")
+    async def pause_connection_analysis(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            RecordPauseInput,
+            lambda body: asyncio.to_thread(
+                repo(request).connections.pause_analysis, name, key, body.control_id, body.paused
+            ),
+            event="connection.analysis_pause_changed",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/connections/{key}/analyze")
     async def analyze_connection(name: str, key: UUID, request: Request) -> Response:
         async def start(body: ConnectionAnalysisInput) -> dict[str, str]:
@@ -1235,6 +1291,35 @@ def create_app(
             return JSONResponse(result)
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/planning-reviews/pause")
+    async def pause_planning_queue(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ReviewPauseInput,
+            lambda body: asyncio.to_thread(
+                repo(request).planning_analysis.pause_queue, name, body.paused
+            ),
+            event="planning.review_queue_pause_changed",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/planning-reviews/{kind}/{key}/pause")
+    async def pause_planning_record(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            RecordPauseInput,
+            lambda body: asyncio.to_thread(
+                repo(request).planning_analysis.control_record,
+                name,
+                kind,
+                key,
+                body.control_id,
+                body.paused,
+            ),
+            event="planning.review_pause_changed",
+            subject=name,
+        )
 
     @app.post("/api/dashboard/projects/{name}/planning-reviews/model")
     async def planning_review_model(name: str, request: Request) -> Response:

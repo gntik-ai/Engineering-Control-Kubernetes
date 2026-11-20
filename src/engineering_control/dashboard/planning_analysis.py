@@ -18,7 +18,7 @@ from engineering_control.dashboard.backlog_items import clean_description, clean
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.planning import replace_parents
-from engineering_control.dashboard.planning_queue import reset_review, review_results
+from engineering_control.dashboard.planning_queue import reset_review, review_id, review_results
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -210,6 +210,7 @@ class PlanningAnalysis:
                     ),
                     ProjectRecord.archived_at.is_(None),
                     ProjectRecord.paused_at.is_(None),
+                    ProjectRecord.planning_reviews_paused_at.is_(None),
                     func.coalesce(ProjectRecord.planning_model, WorkspaceImport.model).is_not(None),
                 )
                 .order_by(j.due_at, j.created_at, j.record_id)
@@ -219,7 +220,11 @@ class PlanningAnalysis:
                 return None
             pid, kind, key, name = first
             project = active_project(db, name, lock=True)
-            if project.paused_at or db.scalar(occupied.where(j.project_id == pid).limit(1)):
+            if (
+                project.paused_at
+                or project.planning_reviews_paused_at
+                or db.scalar(occupied.where(j.project_id == pid).limit(1))
+            ):
                 return None
             token = uuid4()
             changed = db.scalar(
@@ -244,7 +249,7 @@ class PlanningAnalysis:
                 return None
             wizard = db.get(WorkspaceImport, project.id)
             provider, model = selection(project, wizard)
-            if not provider or not model or project.paused_at:
+            if not provider or not model or project.paused_at or project.planning_reviews_paused_at:
                 reset_review(job)
                 return None
             rows = records(db, project.id)
@@ -477,6 +482,11 @@ class PlanningAnalysis:
             job.due_at = datetime.now(UTC) + timedelta(seconds=30 * job.attempts)
             job.result = {**job.result, "detail": message[:400]}
 
+    def owns(self, key: Key, token: UUID) -> bool:
+        with self.sessions() as db:
+            job = db.get(PlanningReview, key)
+            return bool(job and job.lease == token)
+
     async def tick(self, models: Models) -> bool:
         claimed = await asyncio.to_thread(self.claim)
         if not claimed:
@@ -508,6 +518,10 @@ class PlanningAnalysis:
                     if work.screen
                     else GUIDANCE
                 )
+                # Coverage may have taken several pages. Re-check the lease before
+                # starting a second, separately billed request.
+                if not await asyncio.to_thread(self.owns, key, token):
+                    return True
                 reply = await models.ask(
                     Question(
                         choices=((work.provider, work.model),),
@@ -565,6 +579,7 @@ class PlanningAnalysis:
             return {
                 "provider": provider,
                 "model": model,
+                "paused": bool(p.planning_reviews_paused_at),
                 "counts": counts,
                 "page": page,
                 "pages": pages,
@@ -599,6 +614,41 @@ class PlanningAnalysis:
                 )
             )
             return {"provider": provider, "model": model}
+
+    def pause_queue(self, name: str, paused: bool) -> dict[str, bool]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            if paused and not project.planning_reviews_paused_at:
+                project.planning_reviews_paused_at = datetime.now(UTC)
+                db.execute(
+                    update(PlanningReview)
+                    .where(
+                        PlanningReview.project_id == project.id, PlanningReview.status == "running"
+                    )
+                    .values(status="queued", lease=None, due_at=datetime.now(UTC))
+                )
+            elif not paused:
+                project.planning_reviews_paused_at = None
+            return {"paused": paused}
+
+    def control_record(
+        self, name: str, kind: str, key: UUID, control_id: str, pause: bool
+    ) -> dict[str, str]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            job = db.get(PlanningReview, (project.id, kind, key))
+            if not job:
+                raise ProjectNotFound(str(key))
+            if review_id(job) != control_id or job.status not in (
+                ("running", "queued") if pause else ("paused",)
+            ):
+                raise ProjectConflict("This planning review has changed. Refresh its status.")
+            job.status, job.lease, job.due_at = (
+                "paused" if pause else "queued",
+                None,
+                datetime.now(UTC),
+            )
+            return {"status": job.status}
 
     def retry(self, name: str, kind: str, key: UUID) -> dict[str, str]:
         with self.sessions.begin() as db:
