@@ -366,7 +366,13 @@ def question(j: ReviewEvidenceJob, src: Row, result: Row, pair: Row, arm: str) -
     docs = {}
     for k in ("issue", "story"):
         row = records[pair[k]]
-        body = excerpt(row["body"]) if arm == "original" else result["cards"][pair[k]]["text"]
+        if arm == "original":
+            # Older paused comparisons must resume with the same prompt and reservation.
+            body = (
+                row["body"] if src.get("matching_evidence") == "full_text" else excerpt(row["body"])
+            )
+        else:
+            body = result["cards"][pair[k]]["text"]
         docs[k] = {
             "title": row["title"],
             "state": row["state"],

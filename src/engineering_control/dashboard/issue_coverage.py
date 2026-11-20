@@ -7,6 +7,7 @@ import json
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 from uuid import UUID
 
@@ -33,6 +34,10 @@ from engineering_control.models.service import Models, Question
 
 ISSUE_PAGE = 12
 STORY_PAGE = 6
+EXCERPT_CHARACTERS = 3600
+# Keep ordinary batches within the previous evidence envelope. A larger single pair
+# travels on its own and is still subject to the project's normal budget admission.
+MATCH_PAGE_BYTES = (ISSUE_PAGE + STORY_PAGE) * EXCERPT_CHARACTERS
 Row = dict[str, Any]
 Guard = Callable[[Session], None]
 MATCH_FIELDS = {
@@ -73,7 +78,7 @@ INSTRUCTION = (
 
 def excerpt(text: str | None) -> str:
     body = text or ""
-    return body if len(body) <= 3600 else body[:2400] + " … " + body[-1180:]
+    return body if len(body) <= EXCERPT_CHARACTERS else body[:2400] + " … " + body[-1180:]
 
 
 @dataclass
@@ -159,6 +164,16 @@ class Inventory:
     revisions: dict[str, str]
     story_versions: dict[str, str]
     issue_versions: dict[str, str]
+    context: tuple[str, str, str]
+    policy: str
+
+    @cached_property
+    def legacy_common(self) -> str:
+        # Only a pre-0061 positional checkpoint needs the old inventory ordering and
+        # digest. A short pair can still be proved compatible in a mixed-size project.
+        rows = [{**i, "description": excerpt(i["description"])} for i in self.issues]
+        common = digest([*self.context, rows])
+        return digest([common, self.policy]) if self.policy else common
 
     def known(self, story: str, cache: StoryIssueCoverage | None) -> dict[str, str]:
         if cache is None:
@@ -169,9 +184,20 @@ class Inventory:
                 for i, v in (cache.issue_versions or {}).items()
                 if self.issue_versions.get(i) == v
             }
-        if cache.story_revision is None and cache.revision == self.revisions[story]:
-            # Older releases checked a stable prefix of this exact ordered inventory.
-            return {i["id"]: self.issue_versions[i["id"]] for i in self.issues[: cache.checked]}
+        if cache.story_revision is None:
+            allowed = self.eligible(story)
+            prefix = [i for i in self.issues[: cache.checked] if i["id"] in allowed]
+            if cache.revision == self.revisions[story]:
+                return {i["id"]: self.issue_versions[i["id"]] for i in prefix}
+            row = self.stories[story]
+            if len(row["description"]) <= EXCERPT_CHARACTERS and cache.revision == digest(
+                [self.legacy_common, row]
+            ):
+                return {
+                    i["id"]: self.issue_versions[i["id"]]
+                    for i in prefix
+                    if len(i["description"]) <= EXCERPT_CHARACTERS
+                }
         return {}
 
     def eligible(self, story: str) -> set[str]:
@@ -232,7 +258,7 @@ def inventory(
         str(key): {
             "id": str(key),
             "title": title,
-            "description": excerpt(body),
+            "description": body or "",
             "state": "closed" if closed else "open",
         }
         for key, title, body, closed in db.execute(
@@ -263,7 +289,7 @@ def inventory(
                 "id": str(issue.id),
                 "number": issue.issue_number,
                 "title": issue.title,
-                "description": excerpt(issue.description),
+                "description": issue.description or "",
                 "state": issue.issue_state or "open",
                 "state_reason": facts.get("github_state_reason")
                 if issue.issue_state == "closed"
@@ -271,8 +297,10 @@ def inventory(
                 "manual_stories": manual[issue.id] if facts.get("manual_story_links") else None,
             }
         )
-    common = digest([project.source_repository, provider, model, issues])
-    scope = digest([project.source_repository, provider, model, INSTRUCTION, MATCHES])
+    context = (project.source_repository, provider, model)
+    issue_versions = {i["id"]: digest(i) for i in issues}
+    common = digest([*context, list(issue_versions.values())])
+    scope = digest([*context, INSTRUCTION, MATCHES])
     if policy:
         common, scope = digest([common, policy]), digest([scope, policy])
     return Inventory(
@@ -280,7 +308,9 @@ def inventory(
         issues,
         {s: digest([common, row]) for s, row in stories.items()},
         {s: digest([scope, row]) for s, row in stories.items()},
-        {i["id"]: digest(i) for i in issues},
+        issue_versions,
+        context,
+        policy,
     )
 
 
@@ -293,19 +323,44 @@ class Page:
 
     policy: str = ""
 
-    def prompt(self) -> str:
+    @staticmethod
+    def render(story_rows: list[Row], issue_rows: list[Row]) -> str:
         # Only send parent IDs that the model may cite in this particular batch.
-        stories = set(self.story_versions)
+        stories = {s["id"] for s in story_rows}
         issues = []
-        for row in self.issues:
+        for row in issue_rows:
             item = {k: v for k, v in row.items() if v is not None}
             if row["manual_stories"] is not None:
                 item["manual_stories"] = [s for s in row["manual_stories"] if s in stories]
             issues.append(item)
         return json.dumps(
-            {"stories": self.stories, "imported_issues": issues},
+            {"stories": story_rows, "imported_issues": issues},
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    def prompt(self) -> str:
+        return self.render(self.stories, self.issues)
+
+    @classmethod
+    def for_batch(cls, data: Inventory, group: list[str], issues: list[Row], policy: str) -> Page:
+        stories = [data.stories[s] for s in group]
+        # The cache key and the reviewer must see the same complete sources, including
+        # the middle of a document. Larger documents share a batch with fewer records.
+        while len(issues) > 1 and len(cls.render(stories, issues).encode()) > MATCH_PAGE_BYTES:
+            issues.pop()
+        if len(issues) == 1 and len(cls.render(stories, issues).encode()) > MATCH_PAGE_BYTES:
+            allowed = issues[0]["manual_stories"]
+            if allowed is not None:
+                stories = [s for s in stories if s["id"] in allowed]
+            while len(stories) > 1 and len(cls.render(stories, issues).encode()) > MATCH_PAGE_BYTES:
+                stories.pop()
+        return cls(
+            stories,
+            issues,
+            {s["id"]: data.story_versions[s["id"]] for s in stories},
+            {i["id"]: data.issue_versions[i["id"]] for i in issues},
+            policy,
         )
 
 
@@ -337,8 +392,10 @@ class IssueCoverage:
             cache = data.checkpoints(db, project.id)
             known = {s: data.known(s, cache.get(s)) for s in sorted(targets)}
             for s, c in cache.items():
-                if c.story_revision is None and c.revision == data.revisions[s]:
+                if c.story_revision is None:
                     c.story_revision, c.issue_versions = data.story_versions[s], known[s]
+                    c.revision, c.checked = data.revisions[s], len(known[s])
+                    c.matches = [m for m in c.matches if m["id"] in known[s]]
             eligible = {s: data.eligible(s) for s in known}
             pending = {s: eligible[s].difference(versions) for s, versions in known.items()}
             if not any(pending.values()):
@@ -368,14 +425,7 @@ class IssueCoverage:
             already_checked = set.union(*(eligible[s] - pending[s] for s in group))
             candidates = wanted - already_checked
             issues = [i for i in data.issues if i["id"] in candidates][:ISSUE_PAGE]
-            ids = {i["id"] for i in issues}
-            return Page(
-                [data.stories[s] for s in group],
-                issues,
-                {s: data.story_versions[s] for s in group},
-                {i: data.issue_versions[i] for i in ids},
-                policy,
-            )
+            return Page.for_batch(data, group, issues, policy)
 
     def persist(
         self, name: str, provider: str, model: str, page: Page, matches: list[Row], guard: Guard

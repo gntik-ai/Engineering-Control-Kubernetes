@@ -14,7 +14,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from engineering_control.dashboard.connection_records import catalog, counterpart, digest
-from engineering_control.dashboard.issue_coverage import excerpt, inventory, technical_items
+from engineering_control.dashboard.issue_coverage import (
+    EXCERPT_CHARACTERS,
+    excerpt,
+    inventory,
+    technical_items,
+)
 from engineering_control.dashboard.workspace_issues import STORY_LINE, STORY_REF
 from engineering_control.db.models import (
     ConnectionFinding,
@@ -202,14 +207,19 @@ def snapshot(
     if provider and model and local_stories:
         data = inventory(db, project, local_stories, provider, model, policy)
         for s, c in data.checkpoints(db, project.id).items():
-            valid = data.known(s, c)
             key = source_key(project.id, "stories", UUID(s))
+            # The graph can display a GitHub fallback body for a Story with no local
+            # description. Only carry a matching decision for the evidence it reviewed.
+            if records[key]["body"] != data.stories[s]["description"]:
+                continue
+            valid = data.known(s, c)
             cached[key] = {
                 "checked": sorted(valid),
                 "matches": [m["id"] for m in c.matches if m["id"] in valid],
             }
     return {
         "home": str(project.id),
+        "matching_evidence": "full_text",
         "projects": len(projects),
         "records": records,
         "decisions": dict(decisions),
@@ -352,13 +362,18 @@ def node_result(
         for pair in result["pairs"]:
             issue = src["records"][pair["issue"]]
             checked, positive = known.get(pair["story"], (set(), set()))
-            # Legacy decisions hash excerpts. A wiki can surface criteria outside them.
+            # Earlier frozen runs recorded excerpt-based decisions for long documents.
             story = src["records"][pair["story"]]
             if (
                 issue["project"] == src["home"]
                 and issue["local"] in checked
-                and len(issue["body"]) <= 3600
-                and len(story["body"]) <= 3600
+                and (
+                    src.get("matching_evidence") == "full_text"
+                    or (
+                        len(issue["body"]) <= EXCERPT_CHARACTERS
+                        and len(story["body"]) <= EXCERPT_CHARACTERS
+                    )
+                )
             ):
                 pair["decision"] = "matched" if issue["local"] in positive else "no match"
                 count += 1

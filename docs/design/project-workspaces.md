@@ -41,6 +41,10 @@ If a request cannot fit, the workers wait at their saved checkpoints. The Home t
 
 If an issue comparison returns an unknown issue ID, unknown Story ID or blank evidence, coverage records the condition and batch reference. It checkpoints supported matches and unaffected comparisons. Resuming retries unresolved pairs, and the normal approval process still governs proposals.
 
+Technical issue matching checks the full text of each issue and Story before reusing a decision. Editing a Story reopens its eligible issue comparisons, including prior negative results. Editing one imported issue reopens its comparisons with eligible Stories. **Project Home → Preview changes** shows the number of reusable and outstanding pairs before starting a review.
+
+The matcher sends the complete source for outstanding pairs. It groups fewer records when their text is long. A single pair larger than the usual batch travels on its own under the existing project token budget. On upgrade, a previous decision based on clipped text appears as outstanding in the preview. The matcher reuses compatible decisions based on complete text when the review starts or resumes. New paired pilots also use the complete source for their original read and include it in budget admission. Earlier frozen pilots resume with the evidence format they started with.
+
 ## Automatic planning reviews
 
 Adding an Epic, User Story or technical Issue queues a project review in the same transaction as the record. The first import of a technical GitHub issue and approval of a planning proposal also enter this workflow. A repeated sync uses the existing identity. Releasing this feature starts with new additions. Existing planning can supply context immediately.
