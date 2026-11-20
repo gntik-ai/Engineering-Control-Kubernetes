@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.connection_records import (
     KINDS,
     RECORD_MODELS,
@@ -28,7 +29,6 @@ from engineering_control.dashboard.connection_records import (
     watermark,
 )
 from engineering_control.dashboard.connections import audit, store_link
-from engineering_control.dashboard.workspace_costs import record_project_usage
 from engineering_control.dashboard.workspace_review import shape
 from engineering_control.db.models import (
     ConnectionFinding,
@@ -196,6 +196,7 @@ class ConnectionAnalysis:
                 .where(
                     ProjectConnection.archived_at.is_(None),
                     ProjectConnection.status != "paused",
+                    ProjectConnection.owner_id.not_in(review_budget.held_projects()),
                     ProjectConnection.due_at <= now,
                 )
                 .order_by(ProjectConnection.due_at, ProjectConnection.id)
@@ -489,6 +490,17 @@ class ConnectionAnalysis:
                 row.detail = detail[:400]
                 row.progress = {**row.progress, "watermark": row.progress.get("references_mark")}
 
+    def defer_for_budget(self, key: UUID, token: UUID) -> None:
+        with self.sessions.begin() as db:
+            db.execute(
+                update(ProjectConnection)
+                .where(
+                    ProjectConnection.id == key,
+                    ProjectConnection.lease == token,
+                )
+                .values(status="queued", lease=None, due_at=datetime.now(UTC))
+            )
+
     async def tick(self, models: Models | None) -> bool:
         claimed = await asyncio.to_thread(self.claim)
         if not claimed:
@@ -506,7 +518,10 @@ class ConnectionAnalysis:
                         for i, near, _ in b.rows
                     ],
                 }
-                reply = await models.ask(
+                reply = await review_budget.ask_review(
+                    self.sessions,
+                    b.owner,
+                    models,
                     Question(
                         choices=((b.provider, b.model),),
                         system=(
@@ -528,17 +543,11 @@ class ConnectionAnalysis:
                         seconds=120,
                         max_tokens=5000,
                     ),
-                    retry=False,
-                )
-                await asyncio.to_thread(
-                    record_project_usage,
-                    self.sessions,
-                    b.owner,
-                    b.model,
-                    reply,
                     "connection_review",
                 )
                 await asyncio.to_thread(self.apply, b, reply.data["suggestions"])
+        except review_budget.ReviewBudgetHeld:
+            await asyncio.to_thread(self.defer_for_budget, key, token)
         except (ValueError, ModelError) as error:
             await asyncio.to_thread(self.failed, key, token, str(error))
         except Exception:  # noqa: BLE001 - keep the durable job available for retry

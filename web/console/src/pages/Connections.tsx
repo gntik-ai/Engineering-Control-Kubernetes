@@ -46,6 +46,7 @@ type Finding = {
 type Connection = {
   id: string;
   control_id: string;
+  budget_held?: boolean;
   peer: Peer;
   relation: string;
   purpose: string;
@@ -513,7 +514,7 @@ function ConnectionDetail({
             <CardBody className="grid gap-3">
               <h3 className="font-semibold">Analysis</h3>
               <p role="status">
-                {states[c.status] ?? c.status}
+                {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status}
                 {c.total > 0 && c.model ? ' · ' + c.processed + ' / ' + c.total + ' records reviewed' : ''}
               </p>
               {Object.entries(c.readiness).map(([p, counts]) => (
@@ -548,17 +549,18 @@ function ConnectionDetail({
                   <Button
                     size="sm"
                     variant="secondary"
-                    loading={analyze.pending || c.status === 'running'}
-                    disabled={['queued','running','paused'].includes(c.status)}
+                    loading={analyze.pending || (c.status === 'running' && !c.budget_held)}
+                    disabled={c.budget_held || ['queued','running','paused'].includes(c.status)}
                     onClick={() => void analyze.submit()}
                   >
                     Analyze connection
                   </Button>
                 </div>
               )}
-              {!c.archived && ['queued','running','paused'].includes(c.status) && (
+              {c.budget_held && <p role="status" className="text-sm">Model analysis is on hold under the owning project’s Review token budget.</p>}
+              {!c.archived && (c.model || ['queued','running','paused'].includes(c.status)) && (
                 <Button className="justify-self-start" size="sm" variant="secondary" loading={pause.pending}
-                  disabled={pause.pending} onClick={() => void pause.submit()}>{c.status === 'paused' ? 'Resume' : 'Stop'}</Button>
+                  disabled={pause.pending || (c.status === 'paused' && c.budget_held)} onClick={() => void pause.submit()}>{c.status === 'paused' ? 'Resume' : 'Stop'}</Button>
               )}
               {selected && (
                 <p className="text-xs text-muted-foreground">
@@ -749,7 +751,7 @@ export function ConnectionsPage({
                     {relations[c.relation]} {c.peer.label}
                   </Link>
                   <p className="text-sm">
-                    {states[c.status] ?? c.status} · {c.counts.approved ?? 0} approved ·{' '}
+                    {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status} · {c.counts.approved ?? 0} approved ·{' '}
                     {c.counts.pending ?? 0} pending review
                   </p>
                   {c.purpose && <p className="line-clamp-2 text-sm text-muted-foreground">{c.purpose}</p>}

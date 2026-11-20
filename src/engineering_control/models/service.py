@@ -103,9 +103,12 @@ class ModelError(Exception):
     """No answer. ``later`` says whether asking again later can help: no account is
     ready right now, or every provider was busy."""
 
-    def __init__(self, label: str, detail: str, *, later: bool = False) -> None:
+    def __init__(
+        self, label: str, detail: str, *, later: bool = False, metered: Reply | None = None
+    ) -> None:
         super().__init__(detail)
         self.label = label
+        self.metered = metered
         self.detail = detail
         self.later = later
 
@@ -385,19 +388,20 @@ class Models:
                             if data is None
                             else shape.problem(question.schema, data) or ""
                         )
-                        if not why and data is not None:
+                        reply = Reply(
+                            data=data if data is not None and not why else {},
+                            text="" if why else wire.text,
+                            provider=provider,
+                            model=wire.model,
+                            account_id=held.id,
+                            account=held.name,
+                            usage=usage_of(held, model, wire.model, used, question),
+                            seconds=round(time.monotonic() - started, 1),
+                            asked=asked,
+                        )
+                        if not why:
                             await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
-                            return Reply(
-                                data=data,
-                                text=wire.text,
-                                provider=provider,
-                                model=wire.model,
-                                account_id=held.id,
-                                account=held.name,
-                                usage=usage_of(held, model, wire.model, used, question),
-                                seconds=round(time.monotonic() - started, 1),
-                                asked=asked,
-                            )
+                            return reply
                         prompt = complaint(base, why)
                 except WireError as error:
                     if error.kind == "refused":
@@ -422,6 +426,7 @@ class Models:
                     "no_answer",
                     f"{held.provider.name} ({model}) gave no answer of the asked shape"
                     f"{' twice' if retry else ''}: {why}.",
+                    metered=reply,
                 )
         if busy:
             raise ModelError("busy", busy[-1], later=True)

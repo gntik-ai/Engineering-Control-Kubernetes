@@ -31,6 +31,7 @@ from fastapi.responses import (
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_COOKIE,
@@ -103,6 +104,7 @@ from engineering_control.dashboard.schemas import (
     RecordPauseInput,
     RecordsApplyInput,
     RecordsInput,
+    ReviewBudgetInput,
     ReviewPauseInput,
     RunDecisionInput,
     RunsRemoveInput,
@@ -1302,6 +1304,22 @@ def create_app(
             return JSONResponse(result)
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/review-budget")
+    async def authorize_review_budget(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ReviewBudgetInput,
+            lambda body: asyncio.to_thread(
+                review_budget.authorize,
+                repo(request).sessions,
+                name,
+                body.expected_limit,
+                body.token_limit,
+            ),
+            event="project.review_budget_authorized",
+            subject=name,
+        )
 
     @app.post("/api/dashboard/projects/{name}/planning-reviews/pause")
     async def pause_planning_queue(name: str, request: Request) -> Response:

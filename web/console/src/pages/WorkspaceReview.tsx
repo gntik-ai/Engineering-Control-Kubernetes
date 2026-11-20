@@ -128,7 +128,7 @@ export function WorkspaceReview({
         variant={which === 'next' ? 'secondary' : 'primary'}
         loading={loading}
         focusableWhenDisabled={false}
-        disabled={!model || watching || finish.pending}
+        disabled={state.budget_held || !model || watching || finish.pending}
         onClick={() => void generate(which)}
       >
         {loading ? busy : stopped && job.action === which ? retryLabel : idle}

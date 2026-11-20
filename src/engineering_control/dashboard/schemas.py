@@ -377,6 +377,11 @@ class ConnectionBulkLinksInput(PlainChangeInput):
     through: AwareDatetime
 
 
+class ReviewBudgetInput(PlainChangeInput):
+    expected_limit: int | None = Field(ge=0, le=9_007_199_254_740_991, strict=True)
+    token_limit: int = Field(ge=0, le=9_007_199_254_740_991, strict=True)
+
+
 class ReviewPauseInput(PlainChangeInput):
     paused: bool
 
