@@ -154,6 +154,33 @@ class Inventory:
     stories: dict[str, Row]
     issues: list[Row]
     revisions: dict[str, str]
+    story_versions: dict[str, str]
+    issue_versions: dict[str, str]
+
+    def known(self, story: str, cache: StoryIssueCoverage | None) -> dict[str, str]:
+        if cache is None:
+            return {}
+        if cache.story_revision == self.story_versions[story]:
+            return {
+                i: v
+                for i, v in (cache.issue_versions or {}).items()
+                if self.issue_versions.get(i) == v
+            }
+        if cache.story_revision is None and cache.revision == self.revisions[story]:
+            # Older releases checked a stable prefix of this exact ordered inventory.
+            return {i["id"]: self.issue_versions[i["id"]] for i in self.issues[: cache.checked]}
+        return {}
+
+    def checkpoints(self, db: Session, pid: UUID) -> dict[str, StoryIssueCoverage]:
+        return {
+            str(c.story_id): c
+            for c in db.scalars(
+                select(StoryIssueCoverage).where(
+                    StoryIssueCoverage.project_id == pid,
+                    StoryIssueCoverage.story_id.in_([UUID(s) for s in self.stories]),
+                )
+            )
+        }
 
 
 def technical_items(
@@ -212,7 +239,7 @@ def inventory(
         .order_by(ProjectIssueStory.story_id)
     ):
         manual[item].append(str(story))
-    issues = []
+    issues: list[Row] = []
     for issue in technical_items(db, project):
         facts = issue.facts or {}
         issues.append(
@@ -229,15 +256,22 @@ def inventory(
             }
         )
     common = digest([project.source_repository, provider, model, issues])
-    return Inventory(stories, issues, {s: digest([common, row]) for s, row in stories.items()})
+    scope = digest([project.source_repository, provider, model, INSTRUCTION, MATCHES])
+    return Inventory(
+        stories,
+        issues,
+        {s: digest([common, row]) for s, row in stories.items()},
+        {s: digest([scope, row]) for s, row in stories.items()},
+        {i["id"]: digest(i) for i in issues},
+    )
 
 
 @dataclass
 class Page:
-    offset: int
     stories: list[Row]
     issues: list[Row]
-    revisions: dict[str, str]
+    story_versions: dict[str, str]
+    issue_versions: dict[str, str]
 
 
 class IssueCoverage:
@@ -263,32 +297,30 @@ class IssueCoverage:
                 raise ProjectConflict(
                     "A User Story changed before the coverage check. Retry the review."
                 )
-            cache = {
-                str(c.story_id): c
-                for c in db.scalars(
-                    select(StoryIssueCoverage).where(
-                        StoryIssueCoverage.project_id == project.id,
-                        StoryIssueCoverage.story_id.in_([UUID(s) for s in targets]),
-                    )
-                )
-                if c.revision == data.revisions[str(c.story_id)]
-            }
-            offsets = {s: cache[s].checked if s in cache else 0 for s in sorted(targets)}
-            offset = min(offsets.values(), default=len(data.issues))
-            if offset >= len(data.issues):
+            cache = data.checkpoints(db, project.id)
+            known = {s: data.known(s, cache.get(s)) for s in sorted(targets)}
+            for s, c in cache.items():
+                if c.story_revision is None and c.revision == data.revisions[s]:
+                    c.story_revision, c.issue_versions = data.story_versions[s], known[s]
+            first = next(
+                (s for s, versions in known.items() if len(versions) < len(data.issues)), None
+            )
+            if first is None:
                 return Coverage(
                     provider,
                     model,
                     data.revisions,
-                    {s: c.matches for s, c in cache.items()},
+                    {s: [m for m in c.matches if m["id"] in known[s]] for s, c in cache.items()},
                     draft_revision(db, project.id),
                 )
-            group = [s for s in offsets if offsets[s] == offset][:STORY_PAGE]
+            issues = [i for i in data.issues if i["id"] not in known[first]][:ISSUE_PAGE]
+            ids = {i["id"] for i in issues}
+            group = [s for s in known if ids.isdisjoint(known[s])][:STORY_PAGE]
             return Page(
-                offset,
                 [data.stories[s] for s in group],
-                data.issues[offset : offset + ISSUE_PAGE],
-                {s: data.revisions[s] for s in group},
+                issues,
+                {s: data.story_versions[s] for s in group},
+                {i: data.issue_versions[i] for i in ids},
             )
 
     def persist(
@@ -297,8 +329,10 @@ class IssueCoverage:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             guard(db)
-            data = inventory(db, project, set(page.revisions), provider, model)
-            if data.revisions != page.revisions:
+            data = inventory(db, project, set(page.story_versions), provider, model)
+            if data.story_versions != page.story_versions or any(
+                data.issue_versions.get(i) != v for i, v in page.issue_versions.items()
+            ):
                 raise ProjectConflict(
                     "The imported issue inventory changed. Resume the coverage check."
                 )
@@ -307,7 +341,7 @@ class IssueCoverage:
             for match in matches:
                 s, i = match["story"], match["issue"]
                 evidence = match["evidence"].strip()
-                if s not in page.revisions or i not in issues or not evidence:
+                if s not in page.story_versions or i not in issues or not evidence:
                     raise ProjectInvalid(
                         "The coverage response must cite a supplied issue, Story and evidence."
                     )
@@ -323,22 +357,24 @@ class IssueCoverage:
                     "full": match["full"] and issue["state_reason"] != "not_planned",
                     "evidence": evidence[:600],
                 }
-            for s, revision in page.revisions.items():
+            for s, revision in page.story_versions.items():
                 story_id = UUID(s)
                 cache = db.get(StoryIssueCoverage, (project.id, story_id))
-                if cache is None or cache.revision != revision:
-                    if page.offset:
-                        raise ProjectConflict(
-                            "An issue coverage checkpoint changed. Retry the review."
-                        )
-                    if cache is None:
-                        cache = StoryIssueCoverage(project_id=project.id, story_id=story_id)
-                        db.add(cache)
-                    cache.revision, cache.checked, cache.matches = revision, 0, []
-                if cache.checked != page.offset:
-                    continue  # A concurrent review already saved this page.
-                cache.matches = [*cache.matches, *per_story[s].values()]
-                cache.checked += len(page.issues)
+                known = data.known(s, cache)
+                matches_by_id = (
+                    {m["id"]: m for m in cache.matches if m["id"] in known} if cache else {}
+                )
+                if cache is None:
+                    cache = StoryIssueCoverage(project_id=project.id, story_id=story_id)
+                    db.add(cache)
+                matches_by_id.update({i: m for i, m in per_story[s].items() if i not in known})
+                known.update(page.issue_versions)
+                cache.story_revision, cache.issue_versions = revision, known
+                cache.revision, cache.checked, cache.matches = (
+                    data.revisions[s],
+                    len(known),
+                    list(matches_by_id.values()),
+                )
 
     async def check(
         self,

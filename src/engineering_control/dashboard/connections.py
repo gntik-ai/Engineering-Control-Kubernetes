@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -115,6 +115,7 @@ def _connection(
         else "used_by",
         "purpose": c.purpose,
         "status": c.status,
+        "control_id": str(c.progress.get("run_id") or c.updated_at.isoformat()),
         "detail": c.detail,
         "checked": instant(c.last_checked),
         "archived": bool(c.archived_at),
@@ -356,7 +357,8 @@ class Connections:
                 )
                 row.purpose = purpose.strip()
                 row.archived_at = None
-                schedule(row)
+                if row.status != "paused":
+                    schedule(row)
                 db.flush()
                 audit(
                     db,
@@ -426,12 +428,33 @@ class Connections:
             p = active_project(db, name)
             row = _get(db, p.id, key, lock=True)
             _peer(db, row, p.id)
+            if row.status == "paused":
+                raise ProjectConflict("Resume the stopped connection analysis first.")
             if provider and model:
                 row.provider, row.model = provider, model
             if row.status != "running":
                 schedule(row)
-                row.progress = {**row.progress, "watermark": None}
+                row.progress = {**row.progress, "watermark": None, "run_id": str(uuid4())}
             return {"id": str(key)}
+
+    def pause_analysis(self, name: str, key: UUID, control_id: str, paused: bool) -> dict[str, str]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name)
+            row = _get(db, project.id, key, lock=True)
+            _peer(db, row, project.id)
+            if (
+                row.archived_at
+                or str(row.progress.get("run_id") or row.updated_at.isoformat()) != control_id
+            ):
+                raise ProjectConflict("This connection analysis has changed. Reload its status.")
+            if row.status not in (("running", "queued") if paused else ("paused",)):
+                raise ProjectConflict("The connection analysis is no longer in that state.")
+            if paused:
+                row.status, row.lease = "paused", None
+            else:
+                schedule(row)
+            row.progress = {**row.progress, "run_id": str(uuid4())}
+            return {"status": row.status}
 
     def options(
         self, name: str, key: UUID, side: str, kind: str, search: str, page: int

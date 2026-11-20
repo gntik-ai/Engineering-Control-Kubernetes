@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
+from engineering_control.dashboard.coverage_preview import proposal_version, remember_proposal
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.planning import (
     Kind,
@@ -408,7 +409,11 @@ def next_stage(row: WorkspaceImport) -> None:
 
 def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
     """Advance a completed generation only after the required local records are approved."""
-    if row.stage not in ("epics", "stories"):
+    if (
+        row.stage not in ("epics", "stories")
+        or coverage_run_state(row) == "paused"
+        or (row.progress.get("operation") or {}).get("state") == "paused"
+    ):
         return
     if row.lease and row.lease_until and row.lease_until.replace(tzinfo=UTC) > datetime.now(UTC):
         return
@@ -475,6 +480,12 @@ def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
 class WorkspaceReview:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+
+    def _verify_owner(self, row: WorkspaceImport) -> None:
+        with self.sessions() as db:
+            current = db.get(WorkspaceImport, row.project_id)
+            if not current or current.lease != row.lease:
+                raise ProjectConflict("This review was stopped or resumed in another session.")
 
     def _context(self, row: WorkspaceImport) -> tuple[dict[str, Any], list[WorkspaceSource]]:
         with self.sessions() as session:
@@ -803,6 +814,7 @@ class WorkspaceReview:
                 row.stage,
                 lambda checked, found: self._progress(row, checked, found),
             )
+        await asyncio.to_thread(self._verify_owner, row)
         try:
             reply = await models.ask(
                 Question(
@@ -1071,8 +1083,11 @@ class WorkspaceReview:
                 if candidate.origin == "import":
                     self._editable(row, kind, version)
                     changed = True
+                previous_proposal = proposal_version(candidate)
                 if dismiss:
                     candidate.decision, candidate.number = "dismissed", None
+                    if row and candidate.origin == "import":
+                        remember_proposal(row, candidate, prior=previous_proposal)
                     if candidate.origin == "intake":
                         job = session.get(PlanningReview, (project.id, kind, candidate.id))
                         if job:
@@ -1088,6 +1103,8 @@ class WorkspaceReview:
                     session, project, candidate, candidate.title, candidate.description, parents
                 )
                 candidate.decision = "approved"
+                if row and candidate.origin == "import":
+                    remember_proposal(row, candidate, prior=previous_proposal)
                 if candidate.origin == "connection":
                     finding = session.scalar(
                         select(ConnectionFinding).where(
@@ -1128,7 +1145,8 @@ class WorkspaceReview:
                 )
                 or row.progress.get("review_mode", "existing") == "existing"
                 or (decisions and row.progress.get("review_mode") != "review")
-                or coverage_run_state(row) == "running"
+                or coverage_run_state(row) in ("running", "paused")
+                or (row.progress.get("operation") or {}).get("state") == "paused"
                 or (coverage_run_state(row) == "waiting" and decisions)
             ):
                 raise ProjectConflict(

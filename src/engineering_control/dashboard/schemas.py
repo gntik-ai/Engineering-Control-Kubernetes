@@ -366,10 +366,26 @@ class ConnectionBulkLinksInput(PlainChangeInput):
     through: AwareDatetime
 
 
+class ReviewPauseInput(PlainChangeInput):
+    paused: bool
+
+
+class RecordPauseInput(ReviewPauseInput):
+    control_id: str = Field(min_length=1, max_length=100)
+
+
+class WorkspaceControlInput(PlainChangeInput):
+    control_id: str = Field(min_length=1, max_length=80)
+
+
 class WorkspaceCoverageInput(PlainChangeInput):
     version: int = Field(ge=0)
     provider: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=200)
+
+
+class ManagedCoverageInput(WorkspaceCoverageInput):
+    links_only: bool = False
 
 
 class WorkspaceImportStep(WorkspaceCoverageInput):

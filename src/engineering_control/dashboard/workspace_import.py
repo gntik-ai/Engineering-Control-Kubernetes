@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import coverage_preview
 from engineering_control.dashboard.issue_coverage import Coverage, technical_items
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -173,11 +174,24 @@ def _reviewed_issues(session: Session, row: WorkspaceImport | None) -> int:
     )
 
 
+def review_control(row: WorkspaceImport) -> str | None:
+    run = row.progress.get("coverage_run") or {}
+    if run.get("state") in ("running", "waiting", "paused", "failed"):
+        return str(run.get("id") or f"coverage-{row.project_id}")
+    job = row.progress.get("operation") or {}
+    if job.get("state") in ("running", "paused"):
+        return str(job.get("id") or row.lease or f"review-{row.version}")
+    if row.stage in PHASES and row.progress.get("scan_state") in ("running", "paused"):
+        return row.progress.get("scan_id")
+    return str(row.lease) if row.lease else None
+
+
 class WorkspaceImports:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
         self.review = WorkspaceReview(sessions)
         self.tasks: set[asyncio.Task[None]] = set()
+        self.scan_requests: dict[UUID, asyncio.Task[Any]] = {}
 
     def status(self, name: str, *, progress_only: bool = False) -> dict[str, Any]:
         with self.sessions() as session:
@@ -226,8 +240,10 @@ class WorkspaceImports:
                 "version": row.version if row else 0,
                 "busy": busy,
                 "coverage_run": progress.get("coverage_run"),
+                "control_id": review_control(row) if row else None,
+                "scan_state": progress.get("scan_state") if row and row.stage in PHASES else None,
                 "activity": progress.get("activity", default_action) if busy else None,
-                "operation": job,
+                "operation": {k: v for k, v in job.items() if k != "id"} if job else job,
                 "found": proposals + preview,
                 "run_found": (job or {}).get("added", 0) + preview,
                 "checked": _reviewed_issues(session, row)
@@ -276,8 +292,45 @@ class WorkspaceImports:
                 )
         return self.status(name)
 
+    def _coverage_model(
+        self, project: ProjectRecord, row: WorkspaceImport, provider: str | None, model: str | None
+    ) -> tuple[str, str]:
+        if not provider and not model:
+            provider, model = (
+                (project.planning_provider, project.planning_model)
+                if project.planning_model
+                else (row.provider, row.model)
+            )
+        if (
+            not provider
+            or not model
+            or {"provider": provider, "model": model} not in self.model_choices()
+        ):
+            raise ProjectInvalid("Choose an available Accounts model for the coverage check.")
+        return provider, model
+
+    def preview_coverage(
+        self, name: str, provider: str | None, model: str | None
+    ) -> dict[str, Any]:
+        with self.sessions() as db:
+            project = active_project(db, name)
+            row = db.get(WorkspaceImport, project.id)
+            if not row or row.stage not in (*KINDS, "complete"):
+                raise ProjectConflict(
+                    "Approve the repository description before previewing coverage."
+                )
+            _, preview = coverage_preview.plan(
+                db, project, row, *self._coverage_model(project, row, provider, model)
+            )
+            return preview
+
     def start_coverage(
-        self, name: str, version: int, provider: str | None, model: str | None
+        self,
+        name: str,
+        version: int,
+        provider: str | None,
+        model: str | None,
+        links_only: bool = False,
     ) -> dict[str, Any]:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
@@ -288,29 +341,48 @@ class WorkspaceImports:
                 raise ProjectConflict(
                     "Approve the repository description before checking project coverage."
                 )
+            if (
+                coverage_run_state(row) == "paused"
+                or (row.progress.get("operation") or {}).get("state") == "paused"
+            ):
+                raise ProjectConflict("Resume the stopped review to continue.")
             if coverage_run_state(row) not in ("running", "waiting"):
                 if row.version != version or (
                     row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC)
                 ):
                     raise ProjectConflict("Another review is in progress. Reload the project.")
-                if not provider and not model:
-                    provider, model = (
-                        (project.planning_provider, project.planning_model)
-                        if project.planning_model
-                        else (row.provider, row.model)
-                    )
-                if {"provider": provider, "model": model} not in self.model_choices():
-                    raise ProjectInvalid(
-                        "Choose an available Accounts model for the coverage check."
-                    )
+                provider, model = self._coverage_model(project, row, provider, model)
+                resume_failure = coverage_run_state(row) == "failed" and (provider, model) == (
+                    row.provider,
+                    row.model,
+                )
                 if row.progress.get("usage_daily") and "legacy_price_model" not in row.progress:
                     row.progress = {
                         **row.progress,
                         "legacy_price_model": {"provider": row.provider, "model": row.model},
                     }
                 row.provider, row.model = provider, model
-                if coverage_run_state(row) == "failed":
+                if resume_failure:
+                    row.progress = {
+                        **row.progress,
+                        "coverage_run": {**row.progress["coverage_run"], "id": str(uuid4())},
+                    }
                     set_coverage_state(row, "running")
+                elif links_only:
+                    row.progress = {
+                        **row.progress,
+                        "coverage_run": {
+                            "id": str(uuid4()),
+                            "state": "running",
+                            "links_only": True,
+                            "match_existing": True,
+                            "links": 0,
+                            "epics": 0,
+                            "stories": 0,
+                            "issues": 0,
+                        },
+                    }
+                    row.version += 1
                 else:
                     # Revisit the inventory while preserving repository evidence, metering,
                     # saved records, pending proposals and every administrator decision.
@@ -326,25 +398,136 @@ class WorkspaceImports:
                         "found",
                         "checked",
                     }
-                    row.stage = "epics"
+                    current, preview = coverage_preview.plan(db, project, row, provider, model)
+                    stages = preview["stages"]
+                    # Leave the current stage and its approval gates in place on a no-change run.
+                    if stages:
+                        row.stage = stages[0]
                     row.draft = project.description or row.draft
                     row.progress = {
-                        **{k: v for k, v in row.progress.items() if k not in review_keys},
-                        "review_mode": "existing",
-                        "review_after": "",
-                        "reviewed_issues": 0,
+                        **(
+                            {k: v for k, v in row.progress.items() if k not in review_keys}
+                            if stages
+                            else row.progress
+                        ),
+                        **(
+                            {
+                                "coverage_inputs": current,
+                                "review_mode": "existing",
+                                "review_after": "",
+                                "reviewed_issues": 0,
+                            }
+                            if stages
+                            else {}
+                        ),
                         "coverage_run": {
-                            "state": "running",
+                            "id": str(uuid4()),
+                            "state": "running" if stages else "completed",
                             "epics": 0,
                             "stories": 0,
                             "issues": 0,
                             "links": 0,
-                            "match_existing": True,
+                            "match_existing": bool(stages),
+                            **(
+                                {
+                                    "orphans": sum(
+                                        1 for _ in technical_items(db, project, unlinked=True)
+                                    )
+                                }
+                                if not stages
+                                else {}
+                            ),
                         },
                     }
                     row.version += 1
                 row.lease = row.lease_until = None
         return self.status(name)
+
+    def _change_review(
+        self, name: str, control_id: str, *, resume: bool
+    ) -> tuple[UUID | None, bool]:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.get(WorkspaceImport, project.id, with_for_update=True)
+            if not row or review_control(row) != control_id:
+                raise ProjectConflict("This review has changed. Reload its current status.")
+            run = row.progress.get("coverage_run") or {}
+            job = row.progress.get("operation") or {}
+            managed = run.get("state") in ("running", "waiting", "paused", "failed")
+            scan = row.stage in PHASES
+            state = (
+                run.get("state")
+                if managed
+                else (row.progress.get("scan_state") if scan else job.get("state"))
+            )
+            if resume and project.paused_at:
+                raise ProjectConflict("Resume the project before resuming this review.")
+            if resume and state != "paused":
+                raise ProjectConflict("Only a stopped review can be resumed.")
+            if not resume and state == "paused":
+                return None, False
+            if not resume and state not in ("running", "waiting") and not (scan and row.lease):
+                raise ProjectConflict("This review has already finished.")
+            lease = row.lease
+            progress = {
+                k: v for k, v in row.progress.items() if k not in ("activity", "checked", "found")
+            }
+            next_id = str(uuid4()) if resume else control_id
+            if managed:
+                progress["coverage_run"] = {
+                    **run,
+                    "id": next_id,
+                    "state": run.get("resume_state", "running") if resume else "paused",
+                    "resume_state": state if not resume else None,
+                    "detail": None,
+                }
+                if job.get("state") == "running":
+                    progress["operation"] = {**job, "state": "interrupted"}
+            elif scan:
+                progress.update(scan_state="ready" if resume else "paused", scan_id=next_id)
+            elif resume:
+                # The normal claim takes the lease and resumes the recorded action atomically.
+                return None, True
+            else:
+                progress["operation"] = {**job, "id": control_id, "state": "paused"}
+            row.progress = progress
+            row.lease = row.lease_until = None
+            row.version += 1
+            if resume and managed and run.get("resume_state") == "waiting":
+                settle_bulk_review(db, row)
+                if row.progress.get("review_mode") == "gaps":
+                    set_coverage_state(row, "running")
+            return lease, False
+
+    async def control(
+        self, name: str, control_id: str, models: Models | None, *, resume: bool
+    ) -> dict[str, Any]:
+        lease, standalone = await asyncio.to_thread(
+            self._change_review, name, control_id, resume=resume
+        )
+        if lease:
+            scan_request = self.scan_requests.get(lease)
+            if scan_request:
+                scan_request.cancel()
+            for task in tuple(self.tasks):
+                if task.get_name() == str(lease):
+                    task.cancel()
+        if standalone:
+            current = await asyncio.to_thread(self.status, name)
+            job = current["operation"]
+            row = await asyncio.to_thread(
+                self._claim,
+                name,
+                current["version"],
+                current["provider"],
+                current["model"],
+                current["stage"] if job["action"] == "all" else None,
+                background=True,
+                resume_id=control_id,
+            )
+            if row:
+                self._launch_review(name, row, models)
+        return await asyncio.to_thread(self.status, name)
 
     def _due_coverage(self) -> tuple[str, int, str | None, str | None, str | None] | None:
         with self.sessions() as db:
@@ -354,7 +537,7 @@ class WorkspaceImports:
                 .where(
                     ProjectRecord.archived_at.is_(None),
                     ProjectRecord.paused_at.is_(None),
-                    WorkspaceImport.stage.in_(KINDS),
+                    WorkspaceImport.stage.in_((*KINDS, "complete")),
                     WorkspaceImport.progress["coverage_run"]["state"].as_string() == "running",
                     WorkspaceImport.lease.is_(None)
                     | (WorkspaceImport.lease_until <= datetime.now(UTC)),
@@ -389,17 +572,47 @@ class WorkspaceImports:
         bulk_stage: str | None,
         background: bool = False,
         automatic: bool = False,
+        resume_id: str | None = None,
     ) -> WorkspaceImport | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             row = session.get(WorkspaceImport, project.id)
-            if row is None or row.version != version or row.stage not in (*PHASES, *KINDS):
+            links_only = bool(
+                automatic and row and (row.progress.get("coverage_run") or {}).get("links_only")
+            )
+            if (
+                row is None
+                or row.version != version
+                or (row.stage not in (*PHASES, *KINDS) and not links_only)
+            ):
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
             run_state = coverage_run_state(row)
+            previous = row.progress.get("operation") or {}
+            if resume_id and (
+                previous.get("state") != "paused" or review_control(row) != resume_id
+            ):
+                raise ProjectConflict("This review has already changed.")
+            if (
+                run_state == "paused"
+                or row.progress.get("scan_state") == "paused"
+                or (previous.get("state") == "paused" and not resume_id and not automatic)
+            ):
+                raise ProjectConflict("Resume the stopped review to continue.")
+            if row.stage in PHASES:
+                row.progress = {
+                    **row.progress,
+                    "scan_state": "running",
+                    "scan_id": row.progress.get("scan_id") or str(uuid4()),
+                }
             if automatic and run_state != "running":
                 raise ProjectConflict("The project coverage run has changed.")
+            if links_only:
+                row.lease, row.lease_until = uuid4(), datetime.now(UTC) + timedelta(seconds=90)
+                session.flush()
+                session.expunge(row)
+                return row
             if not automatic and run_state == "failed":
                 row.progress = {k: v for k, v in row.progress.items() if k != "coverage_run"}
             if not automatic and run_state in ("waiting", "running"):
@@ -457,12 +670,17 @@ class WorkspaceImports:
                     "found": 0,
                     "operation": None,
                 }
-                if bulk_stage == "issues":
+                if bulk_stage == "issues" and not resume_id:
                     row.progress["issue_partial_batches"] = 0
                 if background:
                     row.progress = {
                         **row.progress,
-                        "operation": {"state": "running", "action": action, "added": 0},
+                        "operation": {
+                            "id": str(uuid4()),
+                            "state": "running",
+                            "action": action,
+                            "added": previous.get("added", 0) if resume_id else 0,
+                        },
                     }
                     row.version += 1
             row.lease, row.lease_until = (
@@ -487,6 +705,27 @@ class WorkspaceImports:
             row = session.get(WorkspaceImport, project.id)
             if row is None or row.lease != lease:
                 raise ProjectConflict("This step has been resumed in another session")
+            run = row.progress.get("coverage_run") or {}
+            if run.get("links_only") and run.get("state") == "running":
+                if result:
+                    new_links = 0
+                    if result.coverage:
+                        result.coverage.validate(session, project, generating=False)
+                        new_links = result.coverage.link(session, project)
+                    run = {**result.progress["coverage_run"], "links": run["links"] + new_links}
+                    if not run["match_existing"]:
+                        run.update(
+                            state="completed",
+                            orphans=sum(
+                                1 for _ in technical_items(session, project, unlinked=True)
+                            ),
+                        )
+                    row.progress = {**row.progress, "coverage_run": run}
+                elif error:
+                    set_coverage_state(row, "failed", error)
+                row.lease = row.lease_until = None
+                row.version += 1
+                return None
             job = row.progress.get("operation")
             added = 0
             linked_issues = 0
@@ -553,6 +792,7 @@ class WorkspaceImports:
                             f"A parent {parent_label} changed during generation. "
                             "Retry with the current list."
                         )
+                new_proposals = []
                 for suggestion in result.suggestions:
                     if suggestion["identity"] in covered:
                         continue
@@ -619,10 +859,16 @@ class WorkspaceImports:
                             continue
                     added += 1
                     generated += int(number is None)
-                    session.add(
-                        WorkspaceCandidate(project_id=project.id, kind=row.stage, **suggestion)
+                    candidate = WorkspaceCandidate(
+                        project_id=project.id, kind=row.stage, **suggestion
                     )
+                    session.add(candidate)
+                    new_proposals.append(candidate)
                 row.stage, row.progress = result.stage, result.progress
+                if new_proposals and row.progress.get("coverage_inputs"):
+                    session.flush()
+                    for candidate in new_proposals:
+                        coverage_preview.remember_proposal(row, candidate)
                 row.commit_sha = result.commit or row.commit_sha
                 if result.description is not None:
                     row.draft = result.description
@@ -689,6 +935,11 @@ class WorkspaceImports:
                             },
                         }
                         set_coverage_state(row, "completed")
+                        if row.progress.get("coverage_inputs"):
+                            row.progress = {
+                                **{k: v for k, v in row.progress.items() if k != "coverage_inputs"},
+                                "coverage_baseline": row.progress["coverage_inputs"],
+                            }
                     else:
                         set_coverage_state(row, "waiting")
             return None
@@ -744,26 +995,33 @@ class WorkspaceImports:
                     ):
                         set_coverage_state(row, "running")
 
-    def _renew(self, row: WorkspaceImport) -> None:
+    def _renew(self, row: WorkspaceImport) -> bool:
         with self.sessions.begin() as session:
-            session.execute(
-                update(WorkspaceImport)
-                .where(
-                    WorkspaceImport.project_id == row.project_id,
-                    WorkspaceImport.lease == row.lease,
+            return (
+                session.scalar(
+                    update(WorkspaceImport)
+                    .where(
+                        WorkspaceImport.project_id == row.project_id,
+                        WorkspaceImport.lease == row.lease,
+                    )
+                    .values(lease_until=datetime.now(UTC) + timedelta(seconds=90))
+                    .returning(WorkspaceImport.project_id)
                 )
-                .values(lease_until=datetime.now(UTC) + timedelta(seconds=90))
+                is not None
             )
 
-    async def _heartbeat(self, row: WorkspaceImport) -> None:
+    async def _heartbeat(self, row: WorkspaceImport, owner: asyncio.Task[Any] | None) -> None:
         while True:
-            await asyncio.sleep(20)
-            await asyncio.to_thread(self._renew, row)
+            await asyncio.sleep(10)
+            if not await asyncio.to_thread(self._renew, row):
+                if owner:
+                    owner.cancel()
+                return
 
     async def _run_review(
         self, name: str, first: WorkspaceImport, models: Models | None, *, propagate: bool = False
     ) -> None:
-        heartbeat = asyncio.create_task(self._heartbeat(first))
+        heartbeat = asyncio.create_task(self._heartbeat(first, asyncio.current_task()))
         row: WorkspaceImport | None = first
         try:
             while row is not None:
@@ -771,7 +1029,10 @@ class WorkspaceImports:
                 result = Update(row.stage, progress, suggestions=suggestions, coverage=coverage)
                 row = await asyncio.to_thread(self._release, name, first.lease, result)
         except asyncio.CancelledError:
-            await asyncio.to_thread(self._release, name, first.lease, None)
+            try:
+                await asyncio.to_thread(self._release, name, first.lease, None)
+            except ProjectConflict:
+                pass  # The stop request has already revoked this lease.
             raise
         except Exception as exc:
             message = (
@@ -792,7 +1053,7 @@ class WorkspaceImports:
             await asyncio.gather(heartbeat, return_exceptions=True)
 
     def _launch_review(self, name: str, row: WorkspaceImport, models: Models | None) -> None:
-        task = asyncio.create_task(self._run_review(name, row, models))
+        task = asyncio.create_task(self._run_review(name, row, models), name=str(row.lease))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
@@ -834,6 +1095,9 @@ class WorkspaceImports:
         if batched:
             await self._run_review(name, row, models, propagate=True)
             return await asyncio.to_thread(self.status, name)
+        request = asyncio.current_task()
+        if row.stage in PHASES and row.lease and request:
+            self.scan_requests[row.lease] = request
         try:
             if row.stage in KINDS:
                 progress, suggestions, coverage = await self.review.propose(name, row, models)
@@ -854,12 +1118,21 @@ class WorkspaceImports:
                 finally:
                     await github.revoke(token)
             await asyncio.to_thread(self._release, name, row.lease, result)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(asyncio.to_thread(self._release, name, row.lease, None))
+            except ProjectConflict:
+                return await asyncio.to_thread(self.status, name)
+            raise
         except BaseException:
             try:
                 await asyncio.shield(asyncio.to_thread(self._release, name, row.lease, None))
             except ProjectConflict:
                 pass  # Another worker owns the step.
             raise
+        finally:
+            if row.lease:
+                self.scan_requests.pop(row.lease, None)
         return await asyncio.to_thread(self.status, name)
 
     async def _inventory(self, row: WorkspaceImport, github: GitHubApp, token: str) -> Update:

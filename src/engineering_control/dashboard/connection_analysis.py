@@ -193,7 +193,11 @@ class ConnectionAnalysis:
         with self.sessions.begin() as db:
             key = db.scalar(
                 select(ProjectConnection.id)
-                .where(ProjectConnection.archived_at.is_(None), ProjectConnection.due_at <= now)
+                .where(
+                    ProjectConnection.archived_at.is_(None),
+                    ProjectConnection.status != "paused",
+                    ProjectConnection.due_at <= now,
+                )
                 .order_by(ProjectConnection.due_at, ProjectConnection.id)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -205,6 +209,7 @@ class ConnectionAnalysis:
                 update(ProjectConnection)
                 .where(
                     ProjectConnection.id == key,
+                    ProjectConnection.status != "paused",
                     ProjectConnection.due_at <= now,
                     ProjectConnection.archived_at.is_(None),
                 )
@@ -267,6 +272,7 @@ class ConnectionAnalysis:
             active = {k for idx in search for k in idx.items}
             done = {k: v for k, v in c.progress.get("done", {}).items() if k in active}
             c.progress = {
+                "run_id": c.progress.get("run_id") or str(uuid4()),
                 "references_mark": mark,
                 "readiness": readiness,
                 "total": total,

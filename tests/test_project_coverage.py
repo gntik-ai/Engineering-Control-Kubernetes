@@ -324,19 +324,53 @@ def test_dashboard_checks_orphans_then_resumes_after_each_approval(
             assert db.scalar(select(func.count()).select_from(WorkspaceAction)) == 0
             assert db.scalar(select(func.count()).select_from(ProjectIssueStory)) == 5
         assert summary["orphans"] == 1
-        old_checks = len(model.comparisons)
-        assert post(client, "import/coverage", version=done["version"]).status_code == 200
+        old_checks, old_drafts = len(model.comparisons), model.issue_drafts
+        preview = client.get(BASE + "import/coverage/preview").json()
+        assert preview["baseline"] and preview["stages"] == []
+        assert preview["remaining"] == 0
+        assert (
+            post(client, "import/coverage", version=done["version"]).json()["coverage_run"]["state"]
+            == "completed"
+        )
         in_progress = repo.planning.page("falcone", "issues", 1, 10, issue_state="draft")
         assert [(d["title"], d["review"]) for d in in_progress["items"]] == [
-            ("Notify the on-call operator", "awaiting_stage")
+            ("Notify the on-call operator", "proposal")
         ]
-        assert in_progress["pending"] == 0
-        assert not repo.planning.pending("falcone", "issues", issue_state="draft")["ids"]
+        assert in_progress["pending"] == 1
+        assert len(repo.planning.pending("falcone", "issues", issue_state="draft")["ids"]) == 1
         again = drive()["coverage_run"]
         assert again["state"] == "completed" and all(
             again[k] == 0 for k in ("links", "epics", "stories", "issues")
         )
-        assert len(model.comparisons) == old_checks
+        assert (len(model.comparisons), model.issue_drafts) == (old_checks, old_drafts)
+        with repo.sessions.begin() as db:
+            project = db.get(ProjectRecord, ids["project"])
+            import_issues(
+                db,
+                project,
+                [
+                    {
+                        "number": 93,
+                        "title": "New runtime task",
+                        "body": "Audit.",
+                        "labels": [],
+                        "state": "open",
+                    }
+                ],
+            )
+        changed = client.get(BASE + "import/coverage/preview").json()
+        assert changed["stages"] == ["issues"] and changed["remaining"] == changed["stories"]
+        started = post(client, "import/coverage", version=state()["version"]).json()
+        assert started["stage"] == "issues" and started["coverage_run"]["state"] == "running"
+        # A concurrent edit to an earlier stage must stay visible in the next preview.
+        with repo.sessions.begin() as db:
+            db.get(ProjectEpic, ids["epic"]).description = "A revised scope that needs review."
+        assert drive()["coverage_run"]["state"] == "completed"
+        assert client.get(BASE + "import/coverage/preview").json()["stages"] == [
+            "epics",
+            "stories",
+            "issues",
+        ]
     finally:
         client.__exit__(None, None, None)
 

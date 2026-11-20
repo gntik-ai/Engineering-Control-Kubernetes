@@ -441,6 +441,7 @@ class ProjectRecord(UUIDPrimaryKey, Timestamps, Base):
     architecture: Mapped[str | None] = mapped_column(Text)
     planning_provider: Mapped[str | None] = mapped_column(String(16))
     planning_model: Mapped[str | None] = mapped_column(String(200))
+    planning_reviews_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_repository: Mapped[str] = mapped_column(String(140))
     deployment_repository: Mapped[str] = mapped_column(String(140))
     default_branch: Mapped[str] = mapped_column(String(100), default="main")
@@ -704,6 +705,8 @@ class StoryIssueCoverage(Base):
     story_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     revision: Mapped[str] = mapped_column(String(64))
     checked: Mapped[int] = mapped_column(Integer)
+    story_revision: Mapped[str | None] = mapped_column(String(64))
+    issue_versions: Mapped[dict[str, str] | None] = mapped_column(JSON)
     matches: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     __table_args__ = (
         ForeignKeyConstraint(

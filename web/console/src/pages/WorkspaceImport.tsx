@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { accountsUrl, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
+import { CoveragePreview, ReviewControl } from './ReviewControls';
 import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity } from './WorkspaceReview';
 
 export interface ImportState {
@@ -24,9 +25,11 @@ export interface ImportState {
   description: string | null;
   counts: Record<string, number>;
   busy: boolean;
+  control_id?: string | null;
+  scan_state?: 'running' | 'ready' | 'paused' | null;
   activity: ReviewActivity | null;
-  coverage_run?: { state: 'running' | 'waiting' | 'failed' | 'completed'; epics: number; stories: number; issues: number; links: number; orphans?: number; match_existing?: boolean; detail?: string } | null;
-  operation?: { action: ReviewActivity; state: 'running' | 'completed' | 'failed' | 'interrupted'; added?: number; detail?: string } | null;
+  coverage_run?: { state: 'running' | 'waiting' | 'paused' | 'failed' | 'completed'; epics: number; stories: number; issues: number; links: number; orphans?: number; match_existing?: boolean; detail?: string } | null;
+  operation?: { action: ReviewActivity; state: 'running' | 'completed' | 'paused' | 'failed' | 'interrupted'; added?: number; detail?: string } | null;
   found: number;
   run_found: number;
   checked: number;
@@ -69,6 +72,7 @@ export function WorkspaceImport({
   const [auto] = useState(useLocation().query.get('import') === '1');
   const active = useRef(true);
   const submitted = useRef(false);
+  const scanAttempt = useRef(0);
   const started = useRef(false);
   const state =
     latest && (!persisted.data || latest.version > persisted.data.version) ? latest : persisted.data;
@@ -81,15 +85,20 @@ export function WorkspaceImport({
   const coverage = state?.coverage_run;
   const eligible = !!state && ['epics', 'stories', 'issues', 'complete'].includes(state.stage);
   const managed = coverage?.state === 'running' || coverage?.state === 'waiting';
+  const pausedCoverage = coverage?.state === 'paused';
+  const saved = (value: ImportState) => { setLatest(value); persisted.reload(); };
+  const linksOnly = useSubmit(
+    () => postJson<ImportState>(path + '/coverage', { version: state?.version, ...model, links_only: true }), saved,
+  );
   const checkCoverage = useSubmit(
     () => postJson<ImportState>(path + '/coverage', { version: state?.version, ...model }),
     value => { setLatest(value); persisted.reload(); },
   );
   useEffect(() => {
-    if (coverage?.state !== 'running') return;
-    const timer = window.setInterval(persisted.reload, 2000);
+    if (coverage?.state !== 'running' && !running) return;
+    const timer = window.setInterval(persisted.reload, running ? 650 : 2000);
     return () => window.clearInterval(timer);
-  }, [coverage?.state, persisted.reload]);
+  }, [coverage?.state, running, persisted.reload]);
   const refreshModels = useSubmit(
     () => {
       setRefreshNote('');
@@ -115,35 +124,36 @@ export function WorkspaceImport({
     };
   }, []);
   async function advance(initial: ImportState) {
-    if (submitted.current) return;
+    if (submitted.current || initial.scan_state === 'paused') return;
+    const attempt = ++scanAttempt.current;
+    const current = () => active.current && scanAttempt.current === attempt;
     submitted.current = true;
     setRunning(true);
     setError('');
     try {
       let next = initial;
       if (next.stage === 'new') next = await postJson<ImportState>(path + '/start');
-      while (active.current && scanning(next)) {
+      while (current() && scanning(next)) {
         if (next.stage === 'analysis' && !model) break;
         next = await postJson<ImportState>(
           path + '/advance',
           { version: next.version, ...(next.stage === 'analysis' ? model : {}) },
           { quiet: true },
         );
-        if (active.current) setLatest(next);
+        if (current()) setLatest(next);
       }
-      if (active.current) setLatest(next);
+      if (current()) setLatest(next);
     } catch (e) {
-      if (active.current) {
+      if (current()) {
         setError(e instanceof Error ? e.message : 'The import was interrupted.');
         persisted.reload();
       }
     } finally {
-      submitted.current = false;
-      if (active.current) setRunning(false);
+      if (current()) { submitted.current = false; setRunning(false); }
     }
   }
   useEffect(() => {
-    if (auto && state && !started.current && (state.stage === 'new' || state.stage === 'inventory')) {
+    if (auto && state && state.scan_state !== 'paused' && !started.current && (state.stage === 'new' || state.stage === 'inventory')) {
       started.current = true;
       setQuery({ import: null });
       void advance(state);
@@ -185,7 +195,12 @@ export function WorkspaceImport({
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-lg font-semibold">{labels[state.stage]}</h2>
-        {(scanning(state) || state.stage === 'new') && (
+        {scanning(state) && state.control_id && <div className="flex items-center gap-2">
+          {state.scan_state === 'paused' && <span role="status">Repository analysis stopped</span>}
+          <ReviewControl path={path} id={state.control_id} paused={state.scan_state === 'paused'} reload={persisted.reload}
+            beforeStop={() => { scanAttempt.current++; submitted.current = false; setRunning(false); }} saved={value => { saved(value); if (value.scan_state === 'ready') void advance(value); }} />
+        </div>}
+        {(scanning(state) || state.stage === 'new') && state.scan_state !== 'paused' && (
           <Button
             size="sm"
             loading={analyzing}
@@ -198,17 +213,26 @@ export function WorkspaceImport({
         )}
       </div>
       <section aria-label="Project coverage" className="grid justify-items-start gap-2">
-        <Button
+        <div className="flex flex-wrap items-center gap-2">
+        {!pausedCoverage && <Button
           loading={coverage?.state === 'running' || checkCoverage.pending}
-          disabled={!eligible || !model || state.busy || checkCoverage.pending || coverage?.state === 'running' || coverage?.state === 'waiting'}
+          disabled={!eligible || !model || state.busy || linksOnly.pending || state.operation?.state === 'paused' || checkCoverage.pending || coverage?.state === 'running' || coverage?.state === 'waiting'}
           onClick={() => void checkCoverage.submit()}
         >
           {coverage?.state === 'running' ? 'Checking project coverage'
             : coverage?.state === 'failed' ? 'Resume project coverage check' : 'Check project coverage'}
-        </Button>
+        </Button>}
+        {eligible && !managed && !pausedCoverage && coverage?.state !== 'failed' && <Button size="sm" variant="secondary"
+          loading={linksOnly.pending} disabled={!model || state.busy || linksOnly.pending || checkCoverage.pending || state.operation?.state === 'paused'}
+          onClick={() => void linksOnly.submit()}>Link existing issues only</Button>}
+        {state.control_id && (managed || pausedCoverage) && <ReviewControl path={path} id={state.control_id}
+          paused={pausedCoverage} saved={saved} reload={persisted.reload} />}
+        </div>
+        {eligible && !managed && <CoveragePreview path={path} version={state.version} model={model} disabled={state.busy} />}
         {coverage ? (
           <div role="status" className="text-sm">
             {coverage.state === 'running' && <p>{coverage.match_existing ? 'Matching imported issues to existing User Stories' : labels[state.stage]}</p>}
+            {pausedCoverage && <p>Project coverage stopped. Resume from the last saved batch.</p>}
             {coverage.state === 'completed' && <p>Coverage check complete.{coverage.orphans !== undefined && (
               coverage.orphans === 0 ? ' All imported technical issues are linked.' :
                 ` ${coverage.orphans} imported ${coverage.orphans === 1 ? 'issue still needs' : 'issues still need'} a User Story.`
@@ -238,6 +262,7 @@ export function WorkspaceImport({
             )}
           </div>
         )}
+        {linksOnly.problem && <Alert tone="warning" title={linksOnly.problem} />}
         {(checkCoverage.problem || (coverage?.state === 'failed' && coverage.detail)) &&
           <Alert tone="destructive" title={checkCoverage.problem || coverage?.detail || 'Coverage check interrupted'} />}
       </section>
@@ -300,7 +325,7 @@ export function WorkspaceImport({
           {refreshModels.problem && <Alert tone="destructive" title={refreshModels.problem} />}
         </>
       )}
-      {state.review && !managed && (
+      {state.review && !managed && !pausedCoverage && (
         <WorkspaceReview
           key={state.stage}
           path={path}
