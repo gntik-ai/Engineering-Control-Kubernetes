@@ -41,6 +41,7 @@ from engineering_control.models.service import Models, Question
 
 ISSUE_PAGE = 12
 STORY_PAGE = 6
+MATCH_PAGE_PAIRS = ISSUE_PAGE * STORY_PAGE
 EXCERPT_CHARACTERS = 3600
 # Keep ordinary batches within the previous evidence envelope. A larger single pair
 # travels on its own and is still subject to the project's normal budget admission.
@@ -421,6 +422,8 @@ class IssueCoverage:
         historical: bool,
         policy: str = "",
         priority: dict[str, set[str]] | None = None,
+        *,
+        eight_story_batches: bool = False,
     ) -> Coverage | Page:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
@@ -461,13 +464,15 @@ class IssueCoverage:
                 for issue in outstanding:
                     counts[issue] += 1
             pivot = max(counts, key=lambda i: (counts[i], i))
-            group = [s for s in pending if pivot in pending[s]][:STORY_PAGE]
+            story_limit = 8 if eight_story_batches else STORY_PAGE
+            group = [s for s in pending if pivot in pending[s]][:story_limit]
             # Pack restricted issues alongside unrestricted ones when there is room.
             # The prompt's manual parent list masks ineligible pairs in this rectangle.
             wanted = set.union(*(pending[s] for s in group))
             already_checked = set.union(*(eligible[s] - pending[s] for s in group))
             candidates = wanted - already_checked
-            issues = [i for i in data.issues if i["id"] in candidates][:ISSUE_PAGE]
+            issue_limit = min(ISSUE_PAGE, MATCH_PAGE_PAIRS // len(group))
+            issues = [i for i in data.issues if i["id"] in candidates][:issue_limit]
             return Page.for_batch(data, group, issues, policy)
 
     def persist(
@@ -572,7 +577,10 @@ class IssueCoverage:
         run_id: UUID | None = None,
     ) -> Coverage:
         with self.sessions() as db:
-            policy = review_flows.matching_revision(db, pid, "coverage", run_id) if run_id else ""
+            settings = (
+                review_flows.effective_settings(db, pid, "coverage", run_id) if run_id else {}
+            )
+        policy = review_flows.wording(settings, "matching")
         from engineering_control.dashboard.review_evidence import matching_priority
 
         priority = (
@@ -582,7 +590,16 @@ class IssueCoverage:
         )
         while True:
             page = await asyncio.to_thread(
-                self.page, name, targets, provider, model, guard, historical, policy, priority
+                self.page,
+                name,
+                targets,
+                provider,
+                model,
+                guard,
+                historical,
+                policy,
+                priority,
+                eight_story_batches=settings.get("eight_story_batches") is True,
             )
             if isinstance(page, Coverage):
                 return page

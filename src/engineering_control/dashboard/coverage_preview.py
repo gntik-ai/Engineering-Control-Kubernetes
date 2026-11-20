@@ -79,7 +79,10 @@ def snapshot(
     pid = project.id
     policy = review_flows.effective_settings(db, pid, "coverage", row.review_run_id, active=True)
     if policy["instructions"] or policy["max_output"]:
-        scope["context"]["review_settings"] = digest(policy)
+        # Grouping changes how many complete records share a call, not the review criteria.
+        scope["context"]["review_settings"] = digest(
+            {k: v for k, v in policy.items() if k != "eight_story_batches"}
+        )
     parents: dict[UUID, list[str]] = defaultdict(list)
     for story, epic in db.execute(
         select(ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id).where(

@@ -169,6 +169,7 @@ class Policy:
     instructions: tuple[tuple[str, str], ...]
     max_output: int | None
     nodes: tuple[dict[str, Any], ...] = ()
+    eight_story_batches: bool = False
 
     @classmethod
     def from_document(cls, document: Document) -> Policy:
@@ -186,7 +187,13 @@ class Policy:
                     {"id": node.id, "task": node.task, "version": 1, "params": dict(node.params)}
                 )
             elif node.task != "review.guidance":
-                return cls(tuple(steps), node.params.get("max_output"), tuple(nodes))
+                return cls(
+                    tuple(steps),
+                    node.params.get("max_output"),
+                    tuple(nodes),
+                    node.task == "review.coverage"
+                    and node.params.get("eight_story_batches") is True,
+                )
             node = document.node(str(node.next["ok"]))
         raise ValueError("The review flow has no terminal task.")
 
@@ -195,4 +202,5 @@ class Policy:
             "instructions": list(self.instructions),
             "max_output": self.max_output,
             **({"evidence_nodes": list(self.nodes)} if self.nodes else {}),
+            **({"eight_story_batches": True} if self.eight_story_batches else {}),
         }
