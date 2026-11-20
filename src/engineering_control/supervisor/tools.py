@@ -117,9 +117,9 @@ class Intent:
     confirm: str | None = None
 
 
-def _text(value: Any) -> str:
+def _text(value: Any, *, bounded: bool = True) -> str:
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-    if len(text) > MAX_ANSWER:
+    if bounded and len(text) > MAX_ANSWER:
         return text[:MAX_ANSWER] + " […cut: narrow the question]"
     return text
 
@@ -212,7 +212,8 @@ class Toolbox:
                 await asyncio.to_thread(
                     lambda: self._record(run_id, name, "read", arguments, "read")
                 )
-                return Outcome(_text(answer))
+                # This finite, platform-defined catalogue must remain valid JSON as tasks grow.
+                return Outcome(_text(answer, bounded=name != "list_tasks"))
             return await asyncio.to_thread(
                 lambda: self._change(run_id, name, tool.kind, choice, arguments)
             )

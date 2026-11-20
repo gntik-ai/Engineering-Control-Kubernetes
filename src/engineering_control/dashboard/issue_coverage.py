@@ -322,6 +322,7 @@ class IssueCoverage:
         guard: Guard,
         historical: bool,
         policy: str = "",
+        priority: dict[str, set[str]] | None = None,
     ) -> Coverage | Page:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
@@ -349,6 +350,10 @@ class IssueCoverage:
                     draft_revision(db, project.id),
                     policy,
                 )
+            if priority:
+                first = {s: ids & priority.get(s, set()) for s, ids in pending.items()}
+                if any(first.values()):
+                    pending = first
             # Compare common issues together. A manually restricted issue must not force
             # the same unrestricted descriptions to be resent for separate story groups.
             counts: dict[str, int] = defaultdict(int)
@@ -475,9 +480,16 @@ class IssueCoverage:
     ) -> Coverage:
         with self.sessions() as db:
             policy = review_flows.matching_revision(db, pid, "coverage", run_id) if run_id else ""
+        from engineering_control.dashboard.review_evidence import matching_priority
+
+        priority = (
+            await asyncio.to_thread(matching_priority, self.sessions, pid, run_id, provider, model)
+            if run_id
+            else None
+        )
         while True:
             page = await asyncio.to_thread(
-                self.page, name, targets, provider, model, guard, historical, policy
+                self.page, name, targets, provider, model, guard, historical, policy, priority
             )
             if isinstance(page, Coverage):
                 return page

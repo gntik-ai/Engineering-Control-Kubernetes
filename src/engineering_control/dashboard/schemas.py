@@ -377,6 +377,26 @@ class ConnectionBulkLinksInput(PlainChangeInput):
     through: AwareDatetime
 
 
+class EvidencePreviewInput(PlainChangeInput):
+    document: dict[str, Any] | None = None
+    provider: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=200)
+    page: int = Field(default=1, ge=1, le=10_000_000)
+    search: str = Field(default="", max_length=200)
+
+
+class EvidenceRunInput(PlainChangeInput):
+    request_id: UUID
+    provider: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=200)
+    token_cap: int = Field(ge=0, le=2_000_000, strict=True)
+
+
+class EvidenceControlInput(PlainChangeInput):
+    run_id: UUID
+    action: Literal["stop", "resume", "end"]
+
+
 class ReviewBudgetInput(PlainChangeInput):
     expected_limit: int | None = Field(ge=0, le=9_007_199_254_740_991, strict=True)
     token_limit: int = Field(ge=0, le=9_007_199_254_740_991, strict=True)

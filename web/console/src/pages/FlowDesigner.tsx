@@ -52,8 +52,15 @@ function TaskList({
   const wanted = search.trim().toLowerCase();
   const fits = (...texts: string[]) => !wanted || texts.some((text) => text.toLowerCase().includes(wanted));
   // A kind of task that was left out of the list on the Tasks page is not offered here.
-  const offered = catalogue.tasks.filter((task) => !catalogue.hidden?.includes(task.key)
-    && (!reviewTask || task.key === reviewTask || task.key === "review.guidance"));
+  const offered = catalogue.tasks.filter((task) => {
+    if (catalogue.hidden?.includes(task.key)) return false;
+    if (!reviewTask) return !task.key.startsWith('evidence.');
+    if (task.key === reviewTask || task.key === 'review.guidance') return true;
+    if (!task.key.startsWith('evidence.')) return false;
+    if (reviewTask === 'review.evidence') return true;
+    return ['review.coverage','review.issues','review.automatic'].includes(reviewTask)
+      && !['evidence.compare','evidence.wiki'].includes(task.key);
+  });
   const groups = [...new Set(offered.map((task) => task.group))];
   const types = taskTypes(catalogue);
   const drag = (carried: Carried) => (event: DragEvent) => {

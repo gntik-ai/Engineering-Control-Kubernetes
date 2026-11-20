@@ -725,11 +725,46 @@ class ReviewFlowRun(UUIDPrimaryKey, Base):
     flow_name: Mapped[str] = mapped_column(String(100))
     version: Mapped[int] = mapped_column(Integer)
     settings: Mapped[dict[str, Any]] = mapped_column(JSON)
+    evidence_trace: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), index=True, default=lambda: datetime.now(UTC)
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     outcome: Mapped[str | None] = mapped_column(String(16))
+
+
+class ReviewWikiPage(Base):
+    __tablename__ = "review_wiki_pages"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(120), index=True)
+    page: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ReviewEvidenceJob(Base):
+    """Immutable source snapshot, task checkpoints and separate pilot admission per run."""
+
+    __tablename__ = "review_evidence_jobs"
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("review_flow_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    provider: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(200))
+    token_cap: Mapped[int] = mapped_column(Integer)
+    comparison_signature: Mapped[str | None] = mapped_column(String(64), index=True)
+    spent: Mapped[int] = mapped_column(Integer, default=0)
+    reserved: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    lease: Mapped[UUID | None] = mapped_column(Uuid)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProjectReviewBudget(Base):

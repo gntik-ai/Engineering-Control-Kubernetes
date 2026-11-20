@@ -1137,6 +1137,84 @@ TASKS: Final = {
 
 # Typed review tasks are executed by the durable project review workers.
 
+for task_key, title, summary, needs, produces, params in (
+    (
+        reviews.GRAPH,
+        "Read project relationships",
+        "Read planning records, declared parents and active project connections.",
+        (),
+        ("relationships",),
+        (
+            Param(
+                "connected",
+                "bool",
+                True,
+                "Include issues and Stories from directly connected projects.",
+            ),
+        ),
+    ),
+    (
+        reviews.RANK,
+        "Find related records",
+        "Keep known links, rank other Stories by text, and flag weak evidence.",
+        ("relationships",),
+        ("candidates",),
+        (
+            Param(
+                "limit",
+                "int",
+                8,
+                "Ranked Stories per issue, in addition to existing links.",
+                low=1,
+                high=32,
+            ),
+        ),
+    ),
+    (
+        reviews.REUSE,
+        "Reuse review decisions",
+        "Find positive and negative comparisons with current source and model revisions.",
+        ("candidates",),
+        ("decisions",),
+        (),
+    ),
+    (
+        reviews.WIKI,
+        "Read wiki evidence",
+        "Extract cited criteria and source passages for each candidate.",
+        ("candidates",),
+        ("evidence_pages",),
+        (
+            Param(
+                "characters",
+                "int",
+                850,
+                "Target length for verbatim evidence passages.",
+                low=250,
+                high=2400,
+            ),
+        ),
+    ),
+    (
+        reviews.COMPARE,
+        "Compare original and wiki evidence",
+        "Compare the same sample twice with an Accounts model under an explicit pilot cap.",
+        ("evidence_pages",),
+        ("comparison",),
+        (),
+    ),
+):
+    TASKS[task_key] = TaskType(
+        task_key,
+        "Review evidence",
+        title,
+        summary,
+        "review",
+        needs=needs,
+        produces=produces,
+        params=params,
+    )
+
 TASKS["review.guidance"] = TaskType(
     "review.guidance",
     "Reviews",

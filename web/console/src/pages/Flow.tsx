@@ -52,6 +52,7 @@ import { Confirm } from '../confirm';
 import { LoadError, TableFrame, When, mono } from '../parts';
 import { RouterLink, navigate, setQuery, useLocation } from '../router';
 import { Designer } from './FlowDesigner';
+import { DesignerEvidence } from './ReviewEvidence';
 import { EvaluationLab, TryOnPaper } from './FlowLab';
 import { Setting, WHERE, copy, same, settingName } from './FlowParts';
 import { FlowProposalPage } from './FlowProposal';
@@ -720,6 +721,7 @@ function Editor({
               />
             ) : null}
           </TabsPanel>
+          {tab === 'design' && document.tasks.some(n=>n.task.startsWith('evidence.')) && <DesignerEvidence draft={document} />}
           <TabsPanel value="tasks" className="pt-4">
             <Tasks document={document} catalogue={catalogue} problems={problems} change={setDocument} />
           </TabsPanel>
