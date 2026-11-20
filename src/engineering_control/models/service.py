@@ -104,11 +104,18 @@ class ModelError(Exception):
     ready right now, or every provider was busy."""
 
     def __init__(
-        self, label: str, detail: str, *, later: bool = False, metered: Reply | None = None
+        self,
+        label: str,
+        detail: str,
+        *,
+        later: bool = False,
+        metered: Reply | None = None,
+        provider_ref: str | None = None,
     ) -> None:
         super().__init__(detail)
         self.label = label
         self.metered = metered
+        self.provider_ref = provider_ref
         self.detail = detail
         self.later = later
 
@@ -377,7 +384,13 @@ class Models:
                 try:
                     attempts = (2,) if earlier else ((1, 2) if retry else (1,))
                     for responses, asked in enumerate(attempts, start=1):
-                        wire = await self._patient(held, model, question, prompt, retry=retry)
+                        stopped = None
+                        try:
+                            wire = await self._patient(held, model, question, prompt, retry=retry)
+                        except WireError as exc:
+                            if exc.metered is None:
+                                raise
+                            stopped, wire = exc, exc.metered
                         used["input"] += wire.read
                         used["output"] += wire.written
                         used["cached"] += wire.cached
@@ -397,11 +410,17 @@ class Models:
                             account=held.name,
                             usage={
                                 **usage_of(held, model, wire.model, used, question),
+                                **(
+                                    {"provider_ref": wire.provider_ref} if wire.provider_ref else {}
+                                ),
                                 **({"responses": responses} if responses > 1 else {}),
                             },
                             seconds=round(time.monotonic() - started, 1),
                             asked=asked,
                         )
+                        if stopped:
+                            await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
+                            raise ModelError(stopped.kind, stopped.detail, metered=reply)
                         if not why:
                             await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
                             return reply
@@ -420,9 +439,13 @@ class Models:
                     else:
                         # Another account cannot repair a declined or truncated request.
                         await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
-                        raise ModelError(error.kind, error.detail) from error
+                        raise ModelError(
+                            error.kind, error.detail, provider_ref=error.provider_ref
+                        ) from error
                     if not retry:
-                        raise ModelError(error.kind, error.detail, later=True) from error
+                        raise ModelError(
+                            error.kind, error.detail, later=True, provider_ref=error.provider_ref
+                        ) from error
                     continue
                 await asyncio.to_thread(self._learn, held.id, state="ready", used=True)
                 raise ModelError(

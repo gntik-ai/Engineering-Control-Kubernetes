@@ -10,6 +10,7 @@ request is then answered by the model Anthropic names for that case.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Final
 
 import anthropic
@@ -126,25 +127,47 @@ def request_of(
     }
 
 
-def read(message: Any, model: str, max_tokens: int) -> Wire:
+def read(message: Any, model: str, max_tokens: int, provider_ref: str | None = None) -> Wire:
     """What a message of the API says, or why it is no answer."""
+    provider_ref = provider_ref or getattr(message, "id", None)
+    usage = getattr(message, "usage", None)
+    read_tokens = getattr(usage, "input_tokens", None)
+    written = getattr(usage, "output_tokens", None)
+    # A message_start snapshot can contain a provisional output count. Only a
+    # terminal message with both provider counters supplies a usage receipt.
+    if (
+        not message.stop_reason
+        or type(read_tokens) is not int
+        or read_tokens < 0
+        or type(written) is not int
+        or written < 0
+    ):
+        raise WireError(
+            "unconfirmed", "Claude returned no final usage receipt.", provider_ref=provider_ref
+        )
+    kept = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    receipt = Wire(
+        text="",
+        model=str(message.model or model),
+        read=read_tokens + kept,
+        written=written,
+        cached=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        cache_written=kept,
+        provider_ref=provider_ref,
+    )
     if message.stop_reason == "refusal":
         details = getattr(message, "stop_details", None)
         why = said(getattr(details, "explanation", "") or getattr(details, "category", ""))
-        raise WireError("declined", f"The model declined to answer{': ' + why if why else '.'}")
+        raise WireError(
+            "declined", f"The model declined to answer{': ' + why if why else '.'}", metered=receipt
+        )
     if message.stop_reason == "max_tokens":
-        raise WireError("cut", f"The answer was longer than the {max_tokens:,} tokens it may have.")
-    text = "".join(block.text for block in message.content if block.type == "text")
-    usage = message.usage
-    kept = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    return Wire(
-        text=text,
-        model=str(message.model or model),
-        read=int(usage.input_tokens or 0) + kept,
-        written=int(usage.output_tokens or 0),
-        cached=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
-        cache_written=kept,
-    )
+        raise WireError(
+            "cut",
+            f"The answer was longer than the {max_tokens:,} tokens it may have.",
+            metered=receipt,
+        )
+    return replace(receipt, text="".join(b.text for b in message.content if b.type == "text"))
 
 
 async def complete(
@@ -179,6 +202,7 @@ async def complete(
         loose=loose,
     )
     client = _client(key, base_url, seconds, http, retry=retry)
+    provider_ref = None
     try:
         stream_request = (
             client.beta.messages.stream(**request, betas=[FALLBACK_BETA], fallbacks="default")
@@ -186,18 +210,33 @@ async def complete(
             else client.messages.stream(**request)
         )
         async with stream_request as stream:
+            provider_ref = stream.request_id
             if on_text is not None:
                 await on_text("")
                 text = ""
                 async for delta in stream.text_stream:
                     text += delta
                     await on_text(text)
-            message = await stream.get_final_message()
+            try:
+                message = await stream.get_final_message()
+            except AssertionError as error:
+                # The SDK has no final snapshot when the stream ends before message_start.
+                raise WireError(
+                    "unconfirmed",
+                    "Claude's stream ended before its receipt.",
+                    provider_ref=provider_ref,
+                ) from error
     except anthropic.APIError as error:
-        raise _failure(error) from error
+        failure = _failure(error)
+        failure.provider_ref = provider_ref or getattr(error, "request_id", None)
+        raise failure from error
+    except httpx2.TransportError as error:
+        raise WireError(
+            "unconfirmed", "Claude's response stream was interrupted.", provider_ref=provider_ref
+        ) from error
     finally:
         await client.close()
-    return read(message, model, max_tokens)
+    return read(message, model, max_tokens, provider_ref)
 
 
 # --- batches ---------------------------------------------------------------------------------

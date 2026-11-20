@@ -107,6 +107,7 @@ def summary(job: ReviewEvidenceJob, run: ReviewFlowRun) -> Row:
         "steps": outcome.get("steps", []),
         "arms": outcome.get("arms", []),
         "detail": outcome.get("detail", ""),
+        "failed_request": outcome.get("failed_request"),
         "sample": outcome.get("sample_names"),
         "cached_from": outcome.get("cached_from"),
         "model": job.model,
@@ -117,26 +118,26 @@ def summary(job: ReviewEvidenceJob, run: ReviewFlowRun) -> Row:
     }
 
 
+def passage(src: Row, result: Row, key: str) -> Row:
+    records = src["records"]
+    row = records[key]
+    return {
+        k: row[k]
+        for k in ("title", "repository", "kind", "number", "state", "parents", "revision", "body")
+    } | {
+        "card": result.get("cards", {}).get(key),
+        "epics": [
+            records[k]["title"]
+            for k in row["parents"]
+            if k in records and records[k]["kind"] == "epics"
+        ],
+    }
+
+
 def selection(src: Row, result: Row, page: int, search: str) -> Row:
     pairs = result.get("pairs", [])
     records = src["records"]
-    cards = result.get("cards", {})
     q = search.strip().casefold()
-
-    def info(key: str) -> Row:
-        r = records[key]
-        return {
-            k: r[k]
-            for k in ("title", "repository", "kind", "number", "state", "parents", "revision")
-        } | {
-            "body": r["body"],
-            "card": cards.get(key),
-            "epics": [
-                records[k]["title"]
-                for k in r["parents"]
-                if k in records and records[k]["kind"] == "epics"
-            ],
-        }
 
     def fits(p: Row) -> bool:
         for kind in ("issue", "story"):
@@ -159,8 +160,8 @@ def selection(src: Row, result: Row, page: int, search: str) -> Row:
         "items": [
             {
                 "id": p["issue"] + "::" + p["story"],
-                "issue": info(p["issue"]),
-                "story": info(p["story"]),
+                "issue": passage(src, result, p["issue"]),
+                "story": passage(src, result, p["story"]),
                 "reason": p["why"],
                 "decision": p["decision"],
             }
@@ -494,6 +495,7 @@ def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Cal
         return None
     if budget:
         budget.reserved += needed
+    result.pop("failed_request", None)
     j.lease, j.claimed_at, j.state, j.reserved = uuid4(), datetime.now(UTC), "calling", needed
     j.result = {**result, "detail": ""}
     return Call(j.run_id, j.lease, arm, q, needed if budget else 0)
@@ -538,6 +540,7 @@ def settle(
     reply: Reply | None,
     error: str = "",
     rates: dict[date, Decimal] | None = None,
+    provider_ref: str | None = None,
 ) -> None:
     with sessions.begin() as db:
         j = lock_job(db, call.run)
@@ -546,6 +549,15 @@ def settle(
         r = db.get_one(ReviewFlowRun, j.run_id)
         late = j.state == "uncertain"
         stopped = j.state == "stopping"
+        if error:
+            j.result = {
+                **j.result,
+                "failed_request": {
+                    "arm": call.arm,
+                    "reason": error,
+                    "provider_ref": reply.usage.get("provider_ref") if reply else provider_ref,
+                },
+            }
         if reply is None:
             if error in ("no_key", "no_account"):
                 budget = review_budget.locked_budget(db, j.project_id)
@@ -562,9 +574,6 @@ def settle(
                     "Provider usage is unconfirmed. Reservation retained for reconciliation.",
                 )
             return
-        add_project_usage(
-            db, j.project_id, j.model, reply, "evidence_" + call.arm, call.project_reserved, r.id
-        )
         usage = reply.usage
         tokens = usage.get("tokens")
         if tokens is None and all(
@@ -579,6 +588,9 @@ def settle(
                 "The provider returned no usable token count. Reservation retained.",
             )
             return
+        add_project_usage(
+            db, j.project_id, j.model, reply, "evidence_" + call.arm, call.project_reserved, r.id
+        )
         j.spent += tokens
         j.reserved = 0
         j.lease = None
@@ -595,7 +607,8 @@ def settle(
         )
         item = {
             "arm": call.arm,
-            "scope": reply.data.get("scope"),
+            "scope": None if error else reply.data.get("scope"),
+            "provider_ref": usage.get("provider_ref"),
             "evidence": str(reply.data.get("evidence") or "")[:1200],
             "tokens": tokens,
             "input": usage.get("input"),
@@ -615,8 +628,16 @@ def settle(
             )
             return
         if error:
+            reasons = {
+                "cut": "The output limit was reached.",
+                "declined": "The model declined the request.",
+            }
             finish(
-                j, r, "failed", "The model response could not be validated. Its usage was recorded."
+                j,
+                r,
+                "failed",
+                reasons.get(error, "The model response could not be validated.")
+                + " Usage was recorded.",
             )
             return
         if call.arm == "wiki":
@@ -701,7 +722,9 @@ async def tick(
         try:
             reply = await models.ask(call.question, retry=False)
         except ModelError as exc:
-            await asyncio.to_thread(settle, sessions, call, exc.metered, exc.label, rates)
+            await asyncio.to_thread(
+                settle, sessions, call, exc.metered, exc.label, rates, exc.provider_ref
+            )
         except Exception:
             await asyncio.to_thread(settle, sessions, call, None, "transport")
             raise

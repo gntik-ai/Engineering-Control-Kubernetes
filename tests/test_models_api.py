@@ -804,6 +804,43 @@ async def test_single_request_uses_no_format_retry_or_alternate_account(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("stop", "label"), [("max_tokens", "cut"), ("refusal", "declined")])
+async def test_terminal_claude_error_keeps_the_receipt_without_a_verdict(
+    asked: Asked, stop: str, label: str
+) -> None:
+    asked.account("Anthropic", "anthropic", key=ANTHROPIC_KEY)
+    response = streamed("partial output", stop=stop)
+    response.headers["request-id"] = "req_fixture"
+    asked.anthropic.answers = [response]
+    with pytest.raises(ModelError) as failure:
+        await asked.models.ask(question(("anthropic", "claude-opus-5-5")), retry=False)
+    assert failure.value.label == label
+    meter = failure.value.metered
+    assert meter and meter.data == {} and not meter.text and meter.asked == 1
+    assert (meter.usage["input"], meter.usage["output"], meter.usage["cached"]) == (1000, 60, 300)
+    assert meter.usage["provider_ref"] == "req_fixture" and len(asked.anthropic.asked) == 1
+    await asked.http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_claude_stream_does_not_settle_start_counters(asked: Asked) -> None:
+    asked.account("Anthropic", "anthropic", key=ANTHROPIC_KEY)
+    partial = streamed("partial").content.split(b"event: message_delta")[0]
+    asked.anthropic.answers = [
+        httpx2.Response(
+            200,
+            content=partial,
+            headers={"content-type": "text/event-stream", "request-id": "req_incomplete"},
+        )
+    ]
+    with pytest.raises(ModelError) as failure:
+        await asked.models.ask(question(("anthropic", "claude-opus-5-5")), retry=False)
+    assert failure.value.label == "unconfirmed" and failure.value.metered is None
+    assert failure.value.provider_ref == "req_incomplete" and len(asked.anthropic.asked) == 1
+    await asked.http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_single_request_disables_anthropic_library_retries(asked: Asked) -> None:
     asked.account("Anthropic", "anthropic", key=ANTHROPIC_KEY)
     asked.anthropic.answers = [refusal(503, "api_error", "unavailable")]
