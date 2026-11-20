@@ -177,7 +177,7 @@ def _reviewed_issues(session: Session, row: WorkspaceImport | None) -> int:
 def review_control(row: WorkspaceImport) -> str | None:
     run = row.progress.get("coverage_run") or {}
     if run.get("state") in ("running", "waiting", "paused", "failed"):
-        return str(run.get("id") or row.lease or f"coverage-{row.version}")
+        return str(run.get("id") or f"coverage-{row.project_id}")
     job = row.progress.get("operation") or {}
     if job.get("state") in ("running", "paused"):
         return str(job.get("id") or row.lease or f"review-{row.version}")
@@ -363,6 +363,10 @@ class WorkspaceImports:
                     }
                 row.provider, row.model = provider, model
                 if resume_failure:
+                    row.progress = {
+                        **row.progress,
+                        "coverage_run": {**row.progress["coverage_run"], "id": str(uuid4())},
+                    }
                     set_coverage_state(row, "running")
                 elif links_only:
                     row.progress = {
@@ -704,11 +708,11 @@ class WorkspaceImports:
             run = row.progress.get("coverage_run") or {}
             if run.get("links_only") and run.get("state") == "running":
                 if result:
-                    linked = 0
+                    new_links = 0
                     if result.coverage:
                         result.coverage.validate(session, project, generating=False)
-                        linked = result.coverage.link(session, project)
-                    run = {**result.progress["coverage_run"], "links": run["links"] + linked}
+                        new_links = result.coverage.link(session, project)
+                    run = {**result.progress["coverage_run"], "links": run["links"] + new_links}
                     if not run["match_existing"]:
                         run.update(
                             state="completed",

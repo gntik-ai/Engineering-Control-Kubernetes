@@ -239,7 +239,7 @@ def inventory(
         .order_by(ProjectIssueStory.story_id)
     ):
         manual[item].append(str(story))
-    issues = []
+    issues: list[Row] = []
     for issue in technical_items(db, project):
         facts = issue.facts or {}
         issues.append(
