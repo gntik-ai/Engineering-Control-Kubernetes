@@ -67,7 +67,7 @@ def eligible(
     db: Session,
     item: BacklogItem,
     section: ProjectSection | None,
-    flows: dict[tuple[str | None, bool], bool] | None = None,
+    flows: dict[tuple[str | None, int | None, bool], bool] | None = None,
 ) -> str | None:
     if item.issue_state == "closed" or item.state == "done":
         return "The Issue has been closed."
@@ -80,9 +80,11 @@ def eligible(
     key = section.flow_key if section else None
     produced = item.source_run_id is not None or bool((item.facts or {}).get("kind"))
     cache = flows if flows is not None else {}
-    if (key, produced) not in cache:
-        cache[key, produced] = bool(plan_for_item(db, key, produced=produced))
-    if not cache[key, produced]:
+    version = section.flow_version if section else None
+    cache_key = (key, version, produced)
+    if cache_key not in cache:
+        cache[cache_key] = bool(plan_for_item(db, key, produced=produced, version=version))
+    if not cache[cache_key]:
         return "Assign an administrator-defined workflow to the project section."
     return None
 

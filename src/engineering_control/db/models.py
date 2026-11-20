@@ -21,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     false,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -786,6 +787,8 @@ class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
     kind: Mapped[str] = mapped_column(String(8))
     position: Mapped[int] = mapped_column(Integer)
     flow_key: Mapped[str | None] = mapped_column(String(80))
+    flow_version: Mapped[int | None] = mapped_column(Integer)
+    operation_key: Mapped[str | None] = mapped_column(String(40))
     __table_args__ = (
         UniqueConstraint("project_id", "key", name="uq_project_sections_project_key"),
         CheckConstraint("kind IN ('core', 'custom')", name="kind"),
@@ -988,6 +991,52 @@ class SandboxStep(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class ProjectFlow(Base):
+    """A private library key, independent of other projects' display keys."""
+
+    __tablename__ = "project_flows"
+    flow_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
+    local_key: Mapped[str] = mapped_column(String(64))
+    __table_args__ = (UniqueConstraint("project_id", "local_key"),)
+
+
+class OperationDefinition(Base):
+    __tablename__ = "operation_definitions"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    guide: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class CommandProfile(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "command_profiles"
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    commands: Mapped[dict[str, Any]] = mapped_column(JSON)
+    __table_args__ = (
+        UniqueConstraint("project_id", "name"),
+        Index(
+            "uq_global_command_profile",
+            "name",
+            unique=True,
+            sqlite_where=text("project_id IS NULL"),
+            postgresql_where=text("project_id IS NULL"),
+        ),
+    )
+
+
+class ProjectCommandSelection(Base):
+    __tablename__ = "project_command_selections"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    profile_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("command_profiles.id", ondelete="RESTRICT")
+    )
+
+
 class FlowVersion(UUIDPrimaryKey, Timestamps, Base):
     """One version of a flow other than the platform's own (migration 0036).
 
@@ -1177,7 +1226,20 @@ class AgentRecord(UUIDPrimaryKey, Timestamps, Base):
     what holds for it, stays the task's."""
 
     __tablename__ = "agents"
-    name: Mapped[str] = mapped_column(String(80), unique=True)
+    project_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    __table_args__ = (
+        UniqueConstraint("project_id", "name"),
+        Index(
+            "uq_global_agent_name",
+            "name",
+            unique=True,
+            sqlite_where=text("project_id IS NULL"),
+            postgresql_where=text("project_id IS NULL"),
+        ),
+    )
     description: Mapped[str | None] = mapped_column(Text)
     instructions: Mapped[str] = mapped_column(Text)
     settings: Mapped[dict[str, Any]] = mapped_column(JSON)

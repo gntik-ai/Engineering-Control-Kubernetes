@@ -21,7 +21,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import ProjectRecord, ProjectSettings, WorkspaceImport
+from engineering_control.db.models import (
+    ProjectCommandSelection,
+    ProjectRecord,
+    ProjectSettings,
+    WorkspaceImport,
+)
 from engineering_control.projects import DEFAULT_BRANCH, PROJECT_REPOSITORIES, PROJECTS
 
 # The name is an identifier: it appears in addresses, filters and records.
@@ -328,6 +333,11 @@ class ProjectRecords:
         with self.sessions() as session:
             record = self._active(session, name)
             own = record.toolchain if isinstance(record.toolchain, dict) else None
+            from engineering_control.dashboard.command_profiles import selection, shown
+
+            profile = selection(session, record) if own is None else None
+            if profile:
+                return {**profile.commands, "own": False, "note": None, "profile": shown(profile)}
         if own is not None:
             return {
                 "install": [str(line) for line in own.get("install") or []],
@@ -345,19 +355,14 @@ class ProjectRecords:
 
     def set_commands(self, name: str, *, install: Any, tests: Any) -> dict[str, Any]:
         """Write the project's own commands. They are run from the next run on."""
-        from engineering_control.sandbox import deliver
+        from engineering_control.dashboard.command_profiles import checked_commands
 
-        lines: dict[str, list[str]] = {}
-        for part, given in (("install", install), ("tests", tests)):
-            listed = [str(line).strip() for line in given or [] if str(line).strip()]
-            try:
-                deliver.commands_of(listed)
-            except ValueError as error:
-                where = "To install" if part == "install" else "To test"
-                raise ProjectInvalid(f"{where}: {error}") from error
-            lines[part] = listed
+        lines = checked_commands(install, tests)
         with self.sessions() as session:
             record = self._active(session, name)
+            selected = session.get(ProjectCommandSelection, record.id)
+            if selected:
+                session.delete(selected)
             record.toolchain = lines
             session.commit()
         return {"project": name, **self.commands(name)}
@@ -366,6 +371,9 @@ class ProjectRecords:
         """Go back to the commands of the platform's own file for the project."""
         with self.sessions() as session:
             record = self._active(session, name)
+            selected = session.get(ProjectCommandSelection, record.id)
+            if selected:
+                session.delete(selected)
             record.toolchain = None
             session.commit()
         return {"project": name, **self.commands(name)}

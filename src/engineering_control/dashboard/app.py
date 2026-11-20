@@ -20,7 +20,7 @@ from uuid import UUID
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -64,6 +64,8 @@ from engineering_control.dashboard.schemas import (
     BacklogSyncInput,
     BudgetInput,
     CacheTrialInput,
+    CommandProfileInput,
+    CommandSelectionInput,
     ConnectionAnalysisInput,
     ConnectionBulkLinksInput,
     ConnectionDecisionInput,
@@ -355,8 +357,17 @@ def create_app(
             await asyncio.sleep(0.2 if worked else 5)
 
     async def review_new_planning(records: DashboardRepository, available: Models) -> None:
+        report_at = 0.0
         while True:
             try:
+                if asyncio.get_running_loop().time() >= report_at:
+                    report_at = asyncio.get_running_loop().time() + 900
+                    LOGGER.info(
+                        "Automatic review queues %s",
+                        json.dumps(
+                            await asyncio.to_thread(records.planning_analysis.active_counts)
+                        ),
+                    )
                 planned, reviewed, coverage = await asyncio.gather(
                     records.execution_plans.tick(available),
                     records.planning_analysis.tick(available),
@@ -1494,14 +1505,40 @@ def create_app(
             subject=name,
         )
 
-    @app.get("/api/dashboard/flows")
+    def scope(request: Request) -> str | None:
+        return request.query_params.get("scope_project")
+
+    async def verify_scope(request: Request) -> None:
+        project = scope(request)
+        if project is None:
+            return
+        if isinstance(await require_session(request, api=True), Response):
+            raise HTTPException(401, "authentication required")
+        try:
+            await asyncio.to_thread(repo(request).projects.identity_of, project)
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+
+    async def flow_access(key: str, request: Request) -> None:
+        await verify_scope(request)
+        if isinstance(await require_session(request, api=True), Response):
+            raise HTTPException(401, "authentication required")
+        owner = await asyncio.to_thread(repo(request).flows.owner, key)
+        if owner != scope(request) and not (request.method == "GET" and owner is None):
+            raise HTTPException(404, "Flow not found in this library.")
+
+    @app.get("/api/dashboard/flows", dependencies=[Depends(verify_scope)])
     async def flows_api(request: Request) -> Response:
         """The flows a section can be assigned, and for those that run here, the version
         in force and whether a draft is being worked on."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse(await service(request).flows())
+        return JSONResponse(
+            await service(request).flows(
+                scope(request), request.query_params.get("include_shared") == "true"
+            )
+        )
 
     @app.get("/api/dashboard/projects/{name}")
     async def project_api(name: str, request: Request) -> Response:
@@ -1533,6 +1570,120 @@ def create_app(
             avoid_when=body.avoid_when,
             labels=body.labels,
             examples=body.examples,
+        )
+
+    @app.get("/api/dashboard/operations")
+    async def shared_operations(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse({"items": await asyncio.to_thread(repo(request).sections.operations)})
+
+    @app.get("/api/dashboard/command-profiles")
+    async def command_profiles(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            items = await asyncio.to_thread(repo(request).command_profiles.listing, scope(request))
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+        return JSONResponse({"items": items})
+
+    @app.post("/api/dashboard/operations")
+    async def create_operation(request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionCreateInput,
+            lambda b: asyncio.to_thread(
+                repo(request).sections.save_operation, None, b.name, guide(b)
+            ),
+            event="dashboard.operation_created",
+            entity="key",
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/operations/{key}/update")
+    async def edit_operation(key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionCreateInput,
+            lambda b: asyncio.to_thread(
+                repo(request).sections.save_operation, key, b.name, guide(b)
+            ),
+            event="dashboard.operation_changed",
+            subject=key,
+        )
+
+    @app.post("/api/dashboard/operations/{key}/remove")
+    async def delete_operation(key: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionRemoveInput,
+            lambda b: asyncio.to_thread(repo(request).sections.remove_operation, key),
+            event="dashboard.operation_removed",
+            subject=key,
+        )
+
+    @app.post("/api/dashboard/command-profiles")
+    async def create_commands(request: Request) -> Response:
+        return await project_change(
+            request,
+            CommandProfileInput,
+            lambda b: asyncio.to_thread(
+                repo(request).command_profiles.save,
+                scope(request),
+                None,
+                b.name,
+                b.install,
+                b.tests,
+            ),
+            event="dashboard.command_profile_created",
+            entity="id",
+            password=True,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/command-profiles/{profile_id}/update")
+    async def edit_commands(profile_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            CommandProfileInput,
+            lambda b: asyncio.to_thread(
+                repo(request).command_profiles.save,
+                scope(request),
+                profile_id,
+                b.name,
+                b.install,
+                b.tests,
+            ),
+            event="dashboard.command_profile_changed",
+            subject=str(profile_id),
+            password=True,
+        )
+
+    @app.post("/api/dashboard/command-profiles/{profile_id}/remove")
+    async def delete_commands(profile_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            CommandSelectionInput,
+            lambda b: asyncio.to_thread(
+                repo(request).command_profiles.remove, scope(request), profile_id
+            ),
+            event="dashboard.command_profile_removed",
+            subject=str(profile_id),
+            password=True,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/command-profile")
+    async def select_commands(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            CommandSelectionInput,
+            lambda b: asyncio.to_thread(repo(request).command_profiles.choose, name, b.profile_id),
+            event="dashboard.command_profile_selected",
+            subject=name,
+            password=True,
         )
 
     @app.post("/api/dashboard/projects/{name}/sections", status_code=201)
@@ -1573,7 +1724,7 @@ def create_app(
         return await project_change(
             request,
             SectionFlowInput,
-            lambda body: service(request).assign_flow(name, key, body.flow),
+            lambda body: service(request).assign_flow(name, key, body.flow, body.version),
             event="dashboard.section_flow_assigned",
             subject=f"{name}/{key}",
         )
@@ -2159,13 +2310,13 @@ def create_app(
 
     # --- flows -----------------------------------------------------------------------------
 
-    @app.get("/api/dashboard/flows/catalogue")
+    @app.get("/api/dashboard/flows/catalogue", dependencies=[Depends(verify_scope)])
     async def flow_catalogue_api(request: Request) -> Response:
         """What a flow can be built from: tasks, prompts and budgets."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse(await service(request).flow_catalogue())
+        return JSONResponse(await service(request).flow_catalogue(scope(request)))
 
     @app.get("/api/dashboard/tasks")
     async def tasks_api(request: Request) -> Response:
@@ -2232,13 +2383,13 @@ def create_app(
 
     # --- agents and skills -----------------------------------------------------------------
 
-    @app.get("/api/dashboard/agents")
+    @app.get("/api/dashboard/agents", dependencies=[Depends(verify_scope)])
     async def agents_api(request: Request) -> Response:
         """The agents and the skills the administrator defined."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse(await service(request).agents())
+        return JSONResponse(await service(request).agents(scope(request)))
 
     def agent_fields(body: AgentInput) -> dict[str, Any]:
         return {
@@ -2254,7 +2405,9 @@ def create_app(
         return await project_change(
             request,
             AgentInput,
-            lambda body: service(request).save_agent(None, **agent_fields(body)),
+            lambda body: service(request).save_agent(
+                None, project=scope(request), **agent_fields(body)
+            ),
             event="dashboard.agent_created",
             status_code=201,
             entity="agent",
@@ -2265,7 +2418,9 @@ def create_app(
         return await project_change(
             request,
             AgentInput,
-            lambda body: service(request).save_agent(agent_id, **agent_fields(body)),
+            lambda body: service(request).save_agent(
+                agent_id, project=scope(request), **agent_fields(body)
+            ),
             event="dashboard.agent_changed",
             entity="agent",
         )
@@ -2275,7 +2430,7 @@ def create_app(
         return await project_change(
             request,
             PlainChangeInput,
-            lambda _body: service(request).remove_agent(agent_id),
+            lambda _body: service(request).remove_agent(agent_id, scope(request)),
             event="dashboard.agent_removed",
             entity="agent",
         )
@@ -2326,7 +2481,7 @@ def create_app(
             entity="saved",
         )
 
-    @app.get("/api/dashboard/flows/{key}")
+    @app.get("/api/dashboard/flows/{key}", dependencies=[Depends(flow_access)])
     async def flow_api(key: str, request: Request) -> Response:
         """One flow: the version in force, the draft when there is one, and its versions."""
         authenticated = await require_session(request, api=True)
@@ -2337,7 +2492,7 @@ def create_app(
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
 
-    @app.get("/api/dashboard/flows/{key}/versions/{version}")
+    @app.get("/api/dashboard/flows/{key}/versions/{version}", dependencies=[Depends(flow_access)])
     async def flow_version_api(key: str, version: int, request: Request) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
@@ -2347,7 +2502,9 @@ def create_app(
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
 
-    @app.get("/api/dashboard/flows/{key}/versions/{version}/export")
+    @app.get(
+        "/api/dashboard/flows/{key}/versions/{version}/export", dependencies=[Depends(flow_access)]
+    )
     async def flow_export_api(key: str, version: int, request: Request) -> Response:
         """A version of a flow as a file: to keep, or to bring in elsewhere."""
         authenticated = await require_session(request, api=True)
@@ -2380,6 +2537,7 @@ def create_app(
                 version=body.version,
                 document=body.document,
                 part=body.part,
+                project=scope(request),
             ),
             event="dashboard.flow_created",
             status_code=201,
@@ -2393,7 +2551,7 @@ def create_app(
         return await project_change(
             request,
             FlowCheckInput,
-            lambda body: service(request).check_flow(body.document),
+            lambda body: service(request).check_flow(body.document, scope(request)),
             event="dashboard.flow_checked",
             entity="flow",
             max_bytes=FLOW_BYTES,
@@ -2424,7 +2582,7 @@ def create_app(
             entity="saved",
         )
 
-    @app.post("/api/dashboard/flows/{key}/draft")
+    @app.post("/api/dashboard/flows/{key}/draft", dependencies=[Depends(flow_access)])
     async def flow_draft_api(key: str, request: Request) -> Response:
         """Keep a changed flow as its draft. A draft runs nothing."""
         return await project_change(
@@ -2437,7 +2595,7 @@ def create_app(
             max_bytes=FLOW_BYTES,
         )
 
-    @app.post("/api/dashboard/flows/{key}/draft/discard")
+    @app.post("/api/dashboard/flows/{key}/draft/discard", dependencies=[Depends(flow_access)])
     async def flow_draft_discard_api(key: str, request: Request) -> Response:
         return await project_change(
             request,
@@ -2448,7 +2606,7 @@ def create_app(
             entity="flow",
         )
 
-    @app.post("/api/dashboard/flows/{key}/remove")
+    @app.post("/api/dashboard/flows/{key}/remove", dependencies=[Depends(flow_access)])
     async def flow_remove_api(key: str, request: Request) -> Response:
         """Delete a flow: its versions, its draft and its evaluations. Sections that have
         it are left without one. One of the platform's own can be put back."""
@@ -2460,7 +2618,7 @@ def create_app(
             entity="flow",
         )
 
-    @app.post("/api/dashboard/flows/{key}/put-back")
+    @app.post("/api/dashboard/flows/{key}/put-back", dependencies=[Depends(flow_access)])
     async def flow_put_back_api(key: str, request: Request) -> Response:
         """Have a deleted flow of the platform's own back, as the platform made it."""
         return await project_change(
@@ -2471,7 +2629,7 @@ def create_app(
             entity="flow",
         )
 
-    @app.post("/api/dashboard/flows/{key}/publish")
+    @app.post("/api/dashboard/flows/{key}/publish", dependencies=[Depends(flow_access)])
     async def flow_publish_api(key: str, request: Request) -> Response:
         """Put the draft in force: every run that starts afterwards follows it. It asks
         for the password."""
@@ -2485,7 +2643,7 @@ def create_app(
             entity="flow",
         )
 
-    @app.post("/api/dashboard/flows/{key}/simulate")
+    @app.post("/api/dashboard/flows/{key}/simulate", dependencies=[Depends(flow_access)])
     async def flow_simulate_api(key: str, request: Request) -> Response:
         """Go through a flow on paper. Nothing runs and nothing is stored."""
         return await project_change(
@@ -2508,7 +2666,7 @@ def create_app(
             record=False,
         )
 
-    @app.get("/api/dashboard/flows/{key}/evaluations")
+    @app.get("/api/dashboard/flows/{key}/evaluations", dependencies=[Depends(flow_access)])
     async def evaluations_api(key: str, request: Request) -> Response:
         """The evaluations of a flow, and the runs that can be gone through again: its
         own, or with ``?of=`` those of another flow of the same sort."""
@@ -2521,7 +2679,7 @@ def create_app(
         except ProjectNotFound:
             return JSONResponse({"detail": "not found"}, status_code=404)
 
-    @app.post("/api/dashboard/flows/{key}/evaluations")
+    @app.post("/api/dashboard/flows/{key}/evaluations", dependencies=[Depends(flow_access)])
     async def start_evaluation_api(key: str, request: Request) -> Response:
         """Try a version of the flow on the work of runs that happened. The runs use the
         subscriptions like any other and leave nothing behind."""
@@ -3071,6 +3229,24 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         view: str = request.path_params.get("view", "").removesuffix("/")
+        if view in ("flow", "flows"):
+            params = dict(request.query_params)
+            owner = (
+                await asyncio.to_thread(repo(request).flows.owner, params.get("key", ""))
+                if view == "flow"
+                else None
+            )
+            dest = "agents" if view == "flows" and params.get("tab") == "agents" else view
+            if dest == "agents":
+                params.pop("tab", None)
+            url = request.url.replace(
+                path=f"/console/workspace/{owner}/automation/{dest}"
+                if owner
+                else f"/console/settings/{dest}"
+            ).replace_query_params(**params)
+            return RedirectResponse(
+                url.path + ("?" + url.query if url.query else ""), status_code=303
+            )
         if view == "accounts":
             query = f"?{request.url.query}" if request.url.query else ""
             return RedirectResponse(f"/console/settings/accounts{query}", status_code=303)
@@ -3162,12 +3338,20 @@ def _valid_csrf(authenticated: AuthenticatedSession, supplied: str | None) -> bo
 
 
 def _console_view(view: str) -> bool:
-    return view in CONSOLE_VIEWS or (
-        view.startswith("workspace/")
-        and PROJECT_NAME.fullmatch(
-            re.sub(r"/(?:settings/connections|queue)$", "", view.removeprefix("workspace/"))
+    return (
+        view in CONSOLE_VIEWS
+        or view in {f"settings/{v}" for v in ("flow", "flows", "operations", "agents", "commands")}
+        or (
+            view.startswith("workspace/")
+            and PROJECT_NAME.fullmatch(
+                re.sub(
+                    r"/(?:settings/connections|queue|automation/(?:flow|flows|operations|assignments|agents|commands))$",
+                    "",
+                    view.removeprefix("workspace/"),
+                )
+            )
+            is not None
         )
-        is not None
     )
 
 

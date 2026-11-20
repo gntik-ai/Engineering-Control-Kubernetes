@@ -197,7 +197,10 @@ class Evaluations:
         if mine is None or mine.part:
             return []
         listed = []
+        owners = self.flows.owners()
         for other in [key, *(name for name in self.flows.keys() if name != key)]:
+            if owners.get(other) not in (None, owners.get(key)):
+                continue
             theirs = mine if other == key else self._in_force(other)
             if theirs is None or theirs.part or sort_of(theirs) != sort_of(mine):
                 continue
@@ -214,8 +217,13 @@ class Evaluations:
         flow ``of``."""
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
+        owner = self.flows.owner(key)
+        if owner:
+            if project not in (None, owner):
+                return []
+            project = owner
         if of and of != key:
-            if not self.flows.exists(of):
+            if self.flows.owner(of) not in (None, owner) or not self.flows.exists(of):
                 raise ProjectNotFound(of)
             key = of
         kind = kind_of(key)
@@ -274,7 +282,8 @@ class Evaluations:
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
         source = of if of and of != key else key
-        if not self.flows.exists(source):
+        owner = self.flows.owner(key)
+        if self.flows.owner(source) not in (None, owner) or not self.flows.exists(source):
             raise ProjectNotFound(source)
         kind = kind_of(source)
         document = self.flows.document(key, version)
@@ -315,10 +324,20 @@ class Evaluations:
                 raise ProjectInvalid(
                     "That version is the one in force: the runs already show how it does"
                 )
+            pid = (
+                session.scalar(select(ProjectRecord.id).where(ProjectRecord.name == owner))
+                if owner
+                else None
+            )
             past: list[SandboxRun] = []
             for run_id in chosen:
                 run = session.get(SandboxRun, run_id)
-                if run is None or run.kind != kind or not _follows(run, source):
+                if (
+                    run is None
+                    or (owner and run.project_id != pid)
+                    or run.kind != kind
+                    or not _follows(run, source)
+                ):
                     raise ProjectInvalid(
                         "One of those runs is not a run of this flow"
                         if source == key

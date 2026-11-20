@@ -36,14 +36,14 @@ def removed_keys(session: Session) -> set[str]:
     return set(session.scalars(select(RemovedFlow.flow_key)))
 
 
-def document_in_force(session: Session, key: str) -> tuple[Document, int] | None:
+def document_in_force(
+    session: Session, key: str, version: int | None = None
+) -> tuple[Document, int] | None:
     """The flow's document that runs started now follow, with its version."""
-    row = session.scalar(
-        select(FlowVersion)
-        .where(FlowVersion.flow_key == key, FlowVersion.state == "published")
-        .order_by(FlowVersion.version.desc())
-        .limit(1)
-    )
+    query = select(FlowVersion).where(FlowVersion.flow_key == key, FlowVersion.state == "published")
+    if version is not None:
+        query = query.where(FlowVersion.version == version)
+    row = session.scalar(query.order_by(FlowVersion.version.desc()).limit(1))
     if row is not None:
         try:
             found = parse(row.document)
@@ -51,7 +51,7 @@ def document_in_force(session: Session, key: str) -> tuple[Document, int] | None
             return None
         # A part runs only inside the flows that run it: for a section it is no flow.
         return None if found.part else (found, row.version)
-    if key in BUILTIN and not is_removed(session, key):
+    if version in (None, 0) and key in BUILTIN and not is_removed(session, key):
         return BUILTIN[key], 0
     return None
 
@@ -78,14 +78,20 @@ def section_action(document: Document) -> str | None:
     return document.action or f"Run {document.name}"
 
 
-def describe(session: Session, key: str | None) -> dict[str, Any] | None:
+def describe(
+    session: Session, key: str | None, version: int | None = None
+) -> dict[str, Any] | None:
     """A flow as its section shows it."""
     if not key:
         return None
-    found = document_in_force(session, key)
+    found = document_in_force(session, key, version)
     if found is None:
         named = FLOWS.get(key)
-        return named.as_dict() if named is not None and not is_removed(session, key) else None
+        return (
+            named.as_dict()
+            if version is None and named is not None and not is_removed(session, key)
+            else None
+        )
     document, version = found
     return {
         "key": key,
@@ -98,11 +104,13 @@ def describe(session: Session, key: str | None) -> dict[str, Any] | None:
     }
 
 
-def plan_for_item(session: Session, key: str | None, *, produced: bool) -> tuple[str, str] | None:
+def plan_for_item(
+    session: Session, key: str | None, *, produced: bool, version: int | None = None
+) -> tuple[str, str] | None:
     """What starting an item of a section with that flow runs: the flow to run, and
     whether the item is what is worked on ("item") or names where to look ("scope").
     None when nothing can run."""
-    found = document_in_force(session, key) if key else None
+    found = document_in_force(session, key, version) if key else None
     if found is None or key is None:
         return None
     document, _version = found

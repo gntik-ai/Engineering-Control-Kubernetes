@@ -140,20 +140,21 @@ def test_preview_and_link_only_remember_unchanged_positive_and_negative_pairs(
         return imports.status("falcone")
 
     try:
-        assert preview()["remaining"] == 15 and preview()["reusable"] == 0
+        assert preview()["remaining"] == 13 and preview()["reusable"] == 0
+        assert preview()["excluded_by_manual_links"] == 2
         assert not model.comparisons and imports.status("falcone")["version"] == 7
         first = link()
         assert first["stage"] == "complete" and first["coverage_run"]["state"] == "completed"
         assert first["coverage_run"]["links"] and model.issue_drafts == 0
-        assert preview()["reusable"] == 15 and preview()["remaining"] == 0
+        assert preview()["reusable"] == 13 and preview()["remaining"] == 0
         # A compatible pre-upgrade positional checkpoint can be promoted without a model call.
         with repo.sessions.begin() as db:
             legacy = db.get(StoryIssueCoverage, (ids["project"], ids["Audit executions"]))
             legacy.story_revision, legacy.issue_versions = None, None
             legacy.checked = 3
-        assert preview()["reusable"] == 13
+        assert preview()["reusable"] == 12
         link()
-        assert model.comparisons[-1] == [44, 45]
+        assert model.comparisons[-1] == [45]
         with repo.sessions.begin() as db:
             project = db.get(ProjectRecord, ids["project"])
             import_issues(
@@ -169,7 +170,7 @@ def test_preview_and_link_only_remember_unchanged_positive_and_negative_pairs(
                     }
                 ],
             )
-        assert preview()["remaining"] == 3 and preview()["reusable"] == 15
+        assert preview()["remaining"] == 3 and preview()["reusable"] == 13
         link()
         assert model.comparisons[-1] == [55]
         with repo.sessions.begin() as db:
@@ -181,7 +182,7 @@ def test_preview_and_link_only_remember_unchanged_positive_and_negative_pairs(
                     BacklogItem.project_id == ids["project"], BacklogItem.issue_number == 42
                 )
             ).description = "Changed issue"
-        assert preview()["remaining"] == 8 and preview()["reusable"] == 10
+        assert preview()["remaining"] == 8 and preview()["reusable"] == 8
         link()
         calls = len(model.comparisons)
         link()

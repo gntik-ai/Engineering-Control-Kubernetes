@@ -190,7 +190,11 @@ class Triggers:
     @staticmethod
     def _fits(session: Session, section: ProjectSection, kind: str) -> None:
         """Whether the section's flow is one that kind of trigger can start."""
-        found = document_in_force(session, section.flow_key) if section.flow_key else None
+        found = (
+            document_in_force(session, section.flow_key, section.flow_version)
+            if section.flow_key
+            else None
+        )
         if found is None:
             raise ProjectInvalid(f"The section {section.name} has no flow that runs here")
         by_itself = section_action(found[0]) is not None

@@ -36,7 +36,15 @@ from engineering_control.dashboard.project_records import (
     ProjectInvalid,
     ProjectNotFound,
 )
-from engineering_control.db.models import FlowVersion, ProjectRecord, ProjectSection
+from engineering_control.db.models import (
+    BacklogItem,
+    FlowTrigger,
+    FlowVersion,
+    OperationDefinition,
+    ProjectFlow,
+    ProjectRecord,
+    ProjectSection,
+)
 from engineering_control.engine.library import describe, document_in_force, is_removed
 from engineering_control.flow_library import FLOWS
 
@@ -223,30 +231,55 @@ def section_key(name: str) -> str:
     return key
 
 
+GUIDE_FIELDS = ("description", "use_when", "avoid_when", "labels", "examples")
+
+
+def operation_definitions(session: Session) -> dict[str, dict[str, Any]]:
+    definitions: dict[str, dict[str, Any]] = {}
+    for core in CORE_SECTIONS:
+        definitions[core.key] = {
+            "key": core.key,
+            "name": core.name,
+            "description": core.description,
+            "use_when": core.use_when,
+            "avoid_when": core.avoid_when,
+            "labels": list(core.labels),
+            "examples": list(core.examples),
+        }
+    for row in session.scalars(select(OperationDefinition).order_by(OperationDefinition.key)):
+        definitions[row.key] = {"key": row.key, "name": row.name, **row.guide}
+    return definitions
+
+
 def ensure_core_sections(session: Session, project: ProjectRecord) -> int:
-    """Give ``project`` the core sections it lacks. Returns how many were added."""
-    existing = set(
-        session.scalars(select(ProjectSection.key).where(ProjectSection.project_id == project.id))
+    """Materialize shared operations while keeping project row IDs and assignments stable."""
+    sections = list(
+        session.scalars(select(ProjectSection).where(ProjectSection.project_id == project.id))
     )
+    existing = {row.key for row in sections}
+    position = max((row.position for row in sections), default=-1) + 1
+    registry = {core.key: core.registry_flow for core in CORE_SECTIONS}
     added = 0
-    for position, core in enumerate(CORE_SECTIONS):
-        if core.key in existing:
+    for key, values in operation_definitions(session).items():
+        if key in existing:
             continue
-        session.add(
-            ProjectSection(
-                project_id=project.id,
-                key=core.key,
-                name=core.name,
-                description=core.description,
-                use_when=core.use_when,
-                avoid_when=core.avoid_when,
-                labels=list(core.labels),
-                examples=list(core.examples),
-                kind="core",
-                position=position,
-                flow_key=core.registry_flow if project.origin == "registry" else None,
-            )
+        section = ProjectSection(
+            project_id=project.id,
+            **values,
+            operation_key=key,
+            kind="core" if key in CORE_KEYS else "custom",
+            position=position + added,
+            flow_key=registry.get(key) if project.origin == "registry" else None,
         )
+        SectionRecords._apply(
+            section, Guide(**{k: values[k] for k in GUIDE_FIELDS}), others=sections
+        )
+        if any(other.name.casefold() == section.name.casefold() for other in sections):
+            raise ProjectConflict(
+                f"{project.display_name} already has an operation named {section.name}."
+            )
+        sections.append(section)
+        session.add(section)
         added += 1
     return added
 
@@ -255,7 +288,7 @@ def _flow(section: ProjectSection) -> dict[str, Any] | None:
     """The section's flow as it is in force now, or as the library names it."""
     session = object_session(section)
     if session is not None:
-        return describe(session, section.flow_key)
+        return describe(session, section.flow_key, section.flow_version)
     named = FLOWS.get(section.flow_key) if section.flow_key else None
     return named.as_dict() if named else None
 
@@ -271,6 +304,9 @@ def serialize(section: ProjectSection) -> dict[str, Any]:
         "labels": list(section.labels or []),
         "examples": list(section.examples or []),
         "kind": section.kind,
+        **({"operation_key": section.operation_key} if section.operation_key else {}),
+        **({"flow_key": section.flow_key} if section.flow_key else {}),
+        **({"flow_version": section.flow_version} if section.flow_version is not None else {}),
         "flow": flow,
     }
 
@@ -312,6 +348,130 @@ class SectionRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
 
+    def operations(self) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            return [
+                {
+                    **v,
+                    "kind": "core" if k in CORE_KEYS else "custom",
+                    "operation_key": k,
+                    "flow": None,
+                }
+                for k, v in operation_definitions(session).items()
+            ]
+
+    def save_operation(self, key: str | None, name: str, guide: Guide) -> dict[str, Any]:
+        clean = _clean_text(name, label="operation name", maximum=NAME_MAX, required=True)
+        with self.sessions.begin() as db:
+            definitions = operation_definitions(db)
+            chosen = key or section_key(clean)
+            previous = definitions.get(chosen)
+            if key is not None and previous is None:
+                raise ProjectNotFound(key)
+            if (
+                not key
+                and previous
+                or any(
+                    v["name"].casefold() == clean.casefold() and k != chosen
+                    for k, v in definitions.items()
+                )
+            ):
+                raise ProjectConflict(f"A global operation already uses {clean}.")
+            draft = ProjectSection(
+                **(
+                    previous
+                    or {
+                        "key": chosen,
+                        "description": "",
+                        "labels": [],
+                        "examples": [],
+                        "use_when": "",
+                        "avoid_when": "",
+                    }
+                )
+            )
+            draft.name = clean
+            self._apply(
+                draft,
+                guide,
+                others=[ProjectSection(**v) for k, v in definitions.items() if k != chosen],
+            )
+            fields = {field: getattr(draft, field) for field in GUIDE_FIELDS}
+            template = db.get(OperationDefinition, chosen, with_for_update=True)
+            if template:
+                template.name, template.guide = clean, fields
+            else:
+                db.add(OperationDefinition(key=chosen, name=clean, guide=fields))
+            db.flush()
+            for project in db.scalars(
+                select(ProjectRecord).order_by(ProjectRecord.id).with_for_update()
+            ):
+                rows = self._sections(db, project)
+                row = next((r for r in rows if r.key == chosen), None)
+                if row is None:
+                    ensure_core_sections(db, project)
+                    continue
+                if row.operation_key != chosen:
+                    raise ProjectConflict(
+                        f"{project.display_name} already uses {chosen} for a local operation."
+                    )
+                others = [r for r in rows if r.id != row.id]
+                if previous:
+                    if row.name == previous["name"]:
+                        if any(other.name.casefold() == clean.casefold() for other in others):
+                            raise ProjectConflict(
+                                f"{project.display_name} already uses the name {clean}."
+                            )
+                        row.name = clean
+                    inherited = {
+                        field: fields[field]
+                        for field in GUIDE_FIELDS
+                        if getattr(row, field) == previous[field]
+                    }
+                    self._apply(row, Guide(**inherited), others=others)
+            return {"key": chosen, "name": clean, **fields}
+
+    def remove_operation(self, key: str) -> dict[str, Any]:
+        if key in CORE_KEYS:
+            raise ProjectConflict(
+                "Core operations are used by the controller and must stay available."
+            )
+        with self.sessions.begin() as db:
+            template = db.get(OperationDefinition, key, with_for_update=True)
+            if template is None:
+                raise ProjectNotFound(key)
+            for row in db.scalars(
+                select(ProjectSection).where(ProjectSection.operation_key == key)
+            ):
+                used = (
+                    row.flow_key
+                    or db.scalar(
+                        select(BacklogItem.id).where(BacklogItem.section_id == row.id).limit(1)
+                    )
+                    or db.scalar(
+                        select(FlowTrigger.id)
+                        .where(
+                            FlowTrigger.project_id == row.project_id,
+                            FlowTrigger.section_key == row.key,
+                        )
+                        .limit(1)
+                    )
+                )
+                customized = row.name != template.name or any(
+                    getattr(row, field) != template.guide[field] for field in GUIDE_FIELDS
+                )
+                if customized:
+                    raise ProjectConflict(
+                        "Restore the customized project guide before removing this operation."
+                    )
+                if used:
+                    raise ProjectConflict(
+                        "This operation has an assignment, item or trigger in a project."
+                    )
+                db.delete(row)
+            db.delete(template)
+            return {"key": key}
+
     def sync_core(self) -> int:
         """Every active project has its core sections. Returns how many were added."""
         with self.sessions() as session:
@@ -348,7 +508,13 @@ class SectionRecords:
                 for section in sections
             ):
                 raise ProjectConflict(f"The project already has a section named {clean_name}")
-            if sum(section.kind == "custom" for section in sections) >= MAX_CUSTOM_SECTIONS:
+            if (
+                sum(
+                    section.kind == "custom" and section.operation_key is None
+                    for section in sections
+                )
+                >= MAX_CUSTOM_SECTIONS
+            ):
                 raise ProjectConflict(
                     f"A project can have {MAX_CUSTOM_SECTIONS} sections of its own at most"
                 )
@@ -463,13 +629,25 @@ class SectionRecords:
             section = self._section(session, record, key)
             if section.kind == "core":
                 raise ProjectConflict("A core section cannot be removed; leave it without a flow")
+            if section.operation_key:
+                raise ProjectConflict("Manage this shared operation in Global Settings.")
             removed = serialize(section)
             session.delete(section)
             session.commit()
             return removed
 
-    def assign(self, project: str, key: str, flow: str | None) -> dict[str, Any]:
+    def assign(
+        self, project: str, key: str, flow: str | None, version: int | None = None
+    ) -> dict[str, Any]:
         with self.sessions() as session:
+            record = self._project(session, project)
+            owner = session.get(ProjectFlow, flow) if flow else None
+            if owner and owner.project_id != record.id:
+                raise ProjectInvalid("Choose a global flow or one owned by this project.")
+            if version is not None and (
+                not flow or document_in_force(session, flow, version) is None
+            ):
+                raise ProjectInvalid("Choose a published version of this flow.")
             if flow is not None and is_removed(session, flow):
                 raise ProjectInvalid("That flow was deleted: put it back first, on the Flows page")
             if flow is not None and flow not in FLOWS and document_in_force(session, flow) is None:
@@ -481,8 +659,8 @@ class SectionRecords:
                         "That is a part: it runs only inside the flows that run it"
                     )
                 raise ProjectInvalid("That flow is not in the library, or was never put in force")
-            record = self._project(session, project)
             section = self._section(session, record, key)
+            section.flow_version = version
             section.flow_key = flow
             session.commit()
             return serialize(section)

@@ -37,6 +37,7 @@ from engineering_control.db.models import (
     ProjectUserStory,
     WorkspaceCandidate,
     WorkspaceImport,
+    WorkspaceModelUsage,
 )
 from engineering_control.models.service import ModelError, Models, Question
 
@@ -266,6 +267,12 @@ class PlanningAnalysis:
                 job.status, job.lease, job.progress = "needs_input", None, {}
                 job.result = {**job.result, "questions": [question]}
                 return None
+            scope = "verify" if src["state"] == "closed" and job.kind != "issues" else job.scope
+            if scope in ("verify", "intake"):
+                # These reviews can only validate text and match parents. Other records
+                # cannot appear in a valid response, even when the project is very large.
+                parent_kind = {"issues": "stories", "stories": "epics"}.get(job.kind)
+                rows = {k: r for k, r in rows.items() if r["saved"] and r["kind"] == parent_kind}
             revision = source_revision(src, project, provider, model)
             progress = job.progress if job.progress.get("revision") == revision else {}
             cursor = progress.get("cursor", "")
@@ -277,10 +284,9 @@ class PlanningAnalysis:
             page = remaining[:PAGE]
             selected.update(page if screen else ([] if progress.get("screened") else remaining))
             selected.update(i for i in src["parents"] if i in rows)
-            if not screen:
+            if not screen and scope not in ("intake", "verify"):
                 selected.update(p for i in list(selected) for p in rows[i]["parents"] if p in rows)
             notes = (wizard.progress or {}).get("evidence_notes", []) if wizard else []
-            scope = "verify" if src["state"] == "closed" and job.kind != "issues" else job.scope
             prompt = {
                 "project": project.display_name,
                 "description": (project.description or "")[:4000],
@@ -507,7 +513,14 @@ class PlanningAnalysis:
                         job.due_at = datetime.now(UTC) + timedelta(minutes=6)
 
                     work.coverage = await IssueCoverage(self.sessions).check(
-                        name, key[0], targets, work.provider, work.model, models, owner
+                        name,
+                        key[0],
+                        targets,
+                        work.provider,
+                        work.model,
+                        models,
+                        owner,
+                        workflow="automatic_review_linking",
                     )
                     work.prompt["imported_issue_coverage"] = work.coverage.matches
                     work.prompt["fully_covered_stories"] = sorted(work.coverage.full)
@@ -526,7 +539,7 @@ class PlanningAnalysis:
                     Question(
                         choices=((work.provider, work.model),),
                         system=instruction,
-                        prompt=json.dumps(work.prompt, ensure_ascii=False),
+                        prompt=json.dumps(work.prompt, ensure_ascii=False, separators=(",", ":")),
                         schema=SCREEN if work.screen else REVIEW,
                         max_tokens=2500 if work.screen else 8000,
                         seconds=150,
@@ -534,7 +547,12 @@ class PlanningAnalysis:
                     retry=False,
                 )
                 await asyncio.to_thread(
-                    record_project_usage, self.sessions, key[0], work.model, reply
+                    record_project_usage,
+                    self.sessions,
+                    key[0],
+                    work.model,
+                    reply,
+                    "automatic_review_screen" if work.screen else "automatic_review",
                 )
                 await asyncio.to_thread(self.apply, work, reply.data)
         except ModelError as exc:
@@ -551,6 +569,41 @@ class PlanningAnalysis:
                 self.fail, key, name, token, "Review interrupted. Retry from the project.", True
             )
         return True
+
+    def active_counts(self) -> list[dict[str, Any]]:
+        """Read-only worker telemetry, including projects paused with queued work."""
+        with self.sessions() as db:
+            jobs = PlanningReview
+            rows = db.execute(
+                select(
+                    ProjectRecord.name,
+                    ProjectRecord.planning_reviews_paused_at,
+                    ProjectRecord.paused_at,
+                    jobs.status,
+                    func.count(jobs.record_id),
+                )
+                .join(jobs, jobs.project_id == ProjectRecord.id)
+                .where(ProjectRecord.archived_at.is_(None), jobs.status.in_(("queued", "running")))
+                .group_by(
+                    ProjectRecord.name,
+                    ProjectRecord.planning_reviews_paused_at,
+                    ProjectRecord.paused_at,
+                    jobs.status,
+                )
+            )
+            counts: dict[str, dict[str, Any]] = {}
+            for project, review_pause, project_pause, state, total in rows:
+                entry = counts.setdefault(
+                    project,
+                    {
+                        "project": project,
+                        "paused": bool(review_pause or project_pause),
+                        "running": 0,
+                        "queued": 0,
+                    },
+                )
+                entry[state] = total
+            return list(counts.values())
 
     def status(self, name: str, page: int) -> dict[str, Any]:
         with self.sessions() as db:
@@ -576,11 +629,29 @@ class PlanningAnalysis:
                 .offset((page - 1) * 10)
             ).all()
             results = review_results(db, p.id, jobs)
+            usage = {"requests": 0, "tokens": 0}
+            for measured in db.scalars(
+                select(WorkspaceModelUsage.usage).where(
+                    WorkspaceModelUsage.project_id == p.id,
+                    WorkspaceModelUsage.recorded_at >= datetime.now(UTC) - timedelta(hours=24),
+                    WorkspaceModelUsage.usage["workflow"]
+                    .as_string()
+                    .in_(
+                        ("automatic_review", "automatic_review_screen", "automatic_review_linking")
+                    ),
+                )
+            ):
+                usage["requests"] += 1
+                usage["tokens"] += int(
+                    measured.get("tokens")
+                    or ((measured.get("input") or 0) + (measured.get("output") or 0))
+                )
             return {
                 "provider": provider,
                 "model": model,
                 "paused": bool(p.planning_reviews_paused_at),
                 "counts": counts,
+                "usage_24h": usage,
                 "page": page,
                 "pages": pages,
                 "items": [

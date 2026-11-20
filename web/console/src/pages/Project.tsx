@@ -7,13 +7,7 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  Badge,
   Button,
-  Card,
-  CardBody,
-  CardDescription,
-  CardHeader,
-  CardTitle,
   Dialog,
   DialogBody,
   DialogContent,
@@ -27,36 +21,28 @@ import {
   FieldLabel,
   Input,
   Link,
-  MoreMenu,
   Page,
-  SimpleSelect,
   Skeleton,
   Textarea,
   TokenInput,
 } from '@gntik-ai/ui';
-import { ArrowLeft, Bot, FolderKanban, Pause, Pencil, Play, Plus, Trash2 } from '@gntik-ai/icons';
+import { ArrowLeft, FolderKanban, Pause } from '@gntik-ai/icons';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   apiUrl,
   postJson,
   useResource,
-  type Flow,
-  type FlowListed,
-  type Listing,
   type ProjectDetail,
   type Run,
   type Section,
 } from '../api';
 import { LoadError, RefreshButton } from '../parts';
-import { BASE, RouterLink, navigate, useLocation } from '../router';
+import { BASE, automationUrl, RouterLink, navigate, useLocation } from '../router';
 import { BringOverDialog } from './BringOverDialog';
 import { ApplicationCard } from './Application';
-import { CommandsCard } from './Commands';
 import { SummariesCard } from './Summaries';
-import { TriggersCard } from './Triggers';
 
 const NAME = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
-const NO_FLOW = '__none__';
 
 function message(error: unknown): string | null {
   if (error instanceof DOMException && error.name === 'AbortError') return null;
@@ -64,7 +50,7 @@ function message(error: unknown): string | null {
 }
 
 /** Add a section (no `section`) or change one. A core section keeps its name. */
-function SectionDialog({
+export function SectionDialog({
   project,
   section,
   open,
@@ -96,7 +82,7 @@ function SectionDialog({
     setProblem(null);
     // Only when it opens: the form starts from the section as it is.
   }, [open]);
-  const core = section?.kind === 'core';
+  const core = Boolean(project) && section?.kind === 'core';
   const ready = name.trim() !== '' && description.trim() !== '';
   const guide = () => ({
     description,
@@ -115,12 +101,12 @@ function SectionDialog({
     setProblem(null);
     try {
       if (section) {
-        await postJson(`projects/${project}/sections/${section.key}/update`, {
+        await postJson(project ? `projects/${project}/sections/${section.key}/update` : `operations/${section.key}/update`, {
           ...(core ? {} : { name }),
           ...guide(),
         });
       } else {
-        await postJson(`projects/${project}/sections`, { name, ...guide() });
+        await postJson(project ? `projects/${project}/sections` : "operations", { name, ...guide() });
       }
       onSaved();
       onOpenChange(false);
@@ -135,7 +121,7 @@ function SectionDialog({
       <DialogContent size="md">
         <form onSubmit={submit} noValidate>
           <DialogHeader>
-            <DialogTitle>{section ? `Edit ${section.name}` : 'Add a section'}</DialogTitle>
+            <DialogTitle>{section ? `Edit ${section.name}` : 'Add an operation'}</DialogTitle>
             <DialogDescription>
               A section is one kind of work on the project. These texts are its routing guide: what the supervisor
               reads to decide whether a piece of work belongs here.
@@ -223,7 +209,7 @@ function SectionDialog({
   );
 }
 
-function RemoveSectionDialog({
+export function RemoveSectionDialog({
   project,
   section,
   onOpenChange,
@@ -241,7 +227,7 @@ function RemoveSectionDialog({
     if (!section) return;
     setPending(true);
     try {
-      await postJson(`projects/${project}/sections/${section.key}/remove`);
+      await postJson(project ? `projects/${project}/sections/${section.key}/remove` : `operations/${section.key}/remove`);
       onSaved();
       onOpenChange(false);
     } catch (error) {
@@ -256,7 +242,7 @@ function RemoveSectionDialog({
         <AlertDialogHeader tone="destructive">
           <AlertDialogTitle>Remove the section {section?.name}?</AlertDialogTitle>
           <AlertDialogDescription>
-            The section and its flow assignment are removed from this project. The flow itself stays in the library.
+            {project ? "Remove this project operation and its assignment." : "Remove this shared operation from every project where it is unused."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {problem ? <Alert tone="destructive" title={problem} /> : null}
@@ -271,109 +257,11 @@ function RemoveSectionDialog({
   );
 }
 
-function SectionCard({
-  project,
-  section,
-  flows,
-  onChanged,
-  onEdit,
-  onRemove,
-}: {
-  project: string;
-  section: Section;
-  flows: Flow[];
-  onChanged: () => void;
-  onEdit: () => void;
-  onRemove: () => void;
-}) {
-  const [pending, setPending] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const assign = async (value: string | null) => {
-    const flow = !value || value === NO_FLOW ? null : value;
-    if (flow === (section.flow?.key ?? null)) return;
-    setPending(true);
-    setProblem(null);
-    try {
-      await postJson(`projects/${project}/sections/${section.key}/flow`, { flow });
-      onChanged();
-    } catch (error) {
-      setProblem(message(error));
-    } finally {
-      setPending(false);
-    }
-  };
-  const custom = section.kind === 'custom';
-  return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <CardTitle as="h2">{section.name}</CardTitle>
-              <Badge tone="neutral" size="sm">
-                {custom ? 'Yours' : 'Core'}
-              </Badge>
-            </div>
-            <CardDescription className="mt-1">{section.description}</CardDescription>
-            {section.labels.length ? (
-              <div className="mt-2 flex flex-wrap gap-1" aria-label={`Labels of ${section.name}`}>
-                {section.labels.map((label) => (
-                  <Badge key={label} tone="neutral" size="sm">
-                    {label}
-                  </Badge>
-                ))}
-              </div>
-            ) : null}
-          </div>
-          <MoreMenu
-            label={`Actions for ${section.name}`}
-            size="sm"
-            align="end"
-            items={[
-              { label: custom ? 'Edit' : 'Edit guide', icon: Pencil, onSelect: onEdit },
-              ...(custom ? [{ label: 'Remove', icon: Trash2, destructive: true, onSelect: onRemove }] : []),
-            ]}
-          />
-        </div>
-      </CardHeader>
-      <CardBody className="grid gap-2">
-        <SimpleSelect
-          aria-label={`Flow of ${section.name}`}
-          size="sm"
-          className="w-full"
-          disabled={pending}
-          items={[{ value: NO_FLOW, label: 'No flow' }, ...flows.map((flow) => ({ value: flow.key, label: flow.name }))]}
-          value={section.flow?.key ?? NO_FLOW}
-          onValueChange={(next) => void assign(next)}
-        />
-        <p className="text-[12px] text-muted-foreground">
-          {section.flow ? section.flow.summary : 'Nothing runs for this section until a flow is assigned.'}
-        </p>
-        {section.flow && section.flow.runs_items === false && !section.flow.section_action ? (
-          <p className="text-[12px] text-muted-foreground">This flow cannot run on this platform yet.</p>
-        ) : null}
-        {section.flow?.section_action ? (
-          <div>
-            <Button size="sm" variant="secondary" icon={Play} onClick={() => setRunning(true)}>
-              {section.flow.section_action}
-            </Button>
-          </div>
-        ) : null}
-        {problem ? <Alert tone="destructive" title={problem} /> : null}
-      </CardBody>
-      {section.flow?.section_action ? (
-        <SectionRunDialog project={project} section={section} open={running} onOpenChange={setRunning} />
-      ) : null}
-    </Card>
-  );
-}
-
 /**
  * Start what a section runs by itself to produce items: an audit of the code, or a search
  * for enhancements. What to look at can be narrowed in a few words.
  */
-function SectionRunDialog({
+export function SectionRunDialog({
   project,
   section,
   open,
@@ -452,7 +340,7 @@ function SectionRunDialog({
 }
 
 /** The text the supervisor is given for this project, exactly as assembled from the sections. */
-function SupervisorBrief({ project }: { project: string }) {
+export function SupervisorBrief({ project }: { project: string }) {
   const brief = useResource<{ brief: string }>(apiUrl(`projects/${project}/routing`));
   if (brief.error) return <LoadError resource={brief} />;
   if (!brief.data) return <Skeleton className="h-64 w-full" />;
@@ -465,16 +353,6 @@ function SupervisorBrief({ project }: { project: string }) {
 
 function Detail({ name }: { name: string }) {
   const detail = useResource<ProjectDetail>(apiUrl(`projects/${name}`));
-  const flows = useResource<Listing<FlowListed>>(apiUrl('flows'));
-  // A flow made here that was never put in force cannot be given to a section.
-  // Nor can a part: it runs only inside the flows that run it.
-  const assignable = (flows.data?.items ?? []).filter(
-    (flow) => !flow.engine || (flow.engine.version !== null && !flow.engine.part),
-  );
-  const [adding, setAdding] = useState(false);
-  const [editing, setEditing] = useState<Section | null>(null);
-  const [removing, setRemoving] = useState<Section | null>(null);
-  const [reading, setReading] = useState(false);
   const [moving, setMoving] = useState(false);
   const [pausing, setPausing] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
@@ -522,18 +400,12 @@ function Detail({ name }: { name: string }) {
               Pause the project
             </Button>
           ) : null}
-          <Button variant="secondary" icon={Bot} size="sm" disabled={!sections} onClick={() => setReading(true)}>
-            What the supervisor reads
-          </Button>
-          <Button icon={Plus} size="sm" disabled={!sections} onClick={() => setAdding(true)}>
-            Add section
-          </Button>
+          <Link href={automationUrl("assignments", name)}>Project flow assignments</Link>
         </div>
       }
     >
       <div className="grid gap-4">
         <LoadError resource={detail} />
-        <LoadError resource={flows} />
         {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
         {work?.paused ? (
           <Alert
@@ -571,21 +443,6 @@ function Detail({ name }: { name: string }) {
             </button>
           </p>
         ) : null}
-        <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-          {sections
-            ? sections.map((section) => (
-                <SectionCard
-                  key={section.key}
-                  project={name}
-                  section={section}
-                  flows={assignable}
-                  onChanged={detail.reload}
-                  onEdit={() => setEditing(section)}
-                  onRemove={() => setRemoving(section)}
-                />
-              ))
-            : !detail.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-40 w-full" />)}
-        </div>
         {sections ? (
           <ApplicationCard
             project={name}
@@ -594,50 +451,9 @@ function Detail({ name }: { name: string }) {
             onChanged={detail.reload}
           />
         ) : null}
-        {sections ? <CommandsCard project={name} /> : null}
         {sections ? <SummariesCard project={name} /> : null}
-        {sections ? <TriggersCard project={name} sections={sections} /> : null}
       </div>
-      <SectionDialog
-        project={name}
-        section={null}
-        open={adding}
-        onOpenChange={setAdding}
-        onSaved={detail.reload}
-      />
-      <SectionDialog
-        project={name}
-        section={editing}
-        open={editing !== null}
-        onOpenChange={(open) => !open && setEditing(null)}
-        onSaved={detail.reload}
-      />
-      <Dialog open={reading} onOpenChange={setReading}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle>What the supervisor reads</DialogTitle>
-            <DialogDescription>
-              Assembled from the sections of this project as they are now. This is how the supervisor decides which
-              section, and so which flow, a piece of work goes to. Edit a section's guide to change it.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogBody>
-            <SupervisorBrief project={name} />
-          </DialogBody>
-          <DialogFooter>
-            <Button type="button" onClick={() => setReading(false)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
       <BringOverDialog project={name} open={moving} onOpenChange={setMoving} onDone={detail.reload} />
-      <RemoveSectionDialog
-        project={name}
-        section={removing}
-        onOpenChange={(open) => !open && setRemoving(null)}
-        onSaved={detail.reload}
-      />
     </Page>
   );
 }

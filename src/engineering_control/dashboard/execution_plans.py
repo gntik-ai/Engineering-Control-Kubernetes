@@ -312,7 +312,7 @@ class ExecutionPlans:
             )
             external = external_links(db, p.id, data["order"])
             items = {}
-            flows: dict[tuple[str | None, bool], bool] = {}
+            flows: dict[tuple[str | None, int | None, bool], bool] = {}
             for _, item, assigned, action in entries:
                 k = str(item.id)
                 parents = current.get(k, {}).get("stories", data.get("parents", {}).get(k, []))
@@ -470,7 +470,12 @@ class ExecutionPlans:
                 retry=False,
             )
             await asyncio.to_thread(
-                record_project_usage, self.sessions, work["project"], work["model"], answer
+                record_project_usage,
+                self.sessions,
+                work["project"],
+                work["model"],
+                answer,
+                "execution_planning",
             )
             await asyncio.to_thread(self._apply, work, answer.data)
         except Exception as exc:  # noqa: BLE001 - expired or interrupted work is recoverable

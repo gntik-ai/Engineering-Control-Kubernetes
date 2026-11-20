@@ -1,3 +1,4 @@
+import { projectScope } from './router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 /** Rows of the read-only dashboard API (src/engineering_control/dashboard). */
@@ -57,6 +58,7 @@ export interface FlowEngine {
 
 /** A flow of the library, with what the engine knows of it when it runs here. */
 export interface FlowListed extends Flow {
+  owner?: string | null;
   engine: FlowEngine | null;
 }
 
@@ -154,7 +156,9 @@ export interface SavedTask {
 }
 
 /** How a project is installed and how its tests are run, as command lines. */
+export interface CommandProfile { id: string; name: string; global: boolean; install: string[]; tests: string[]; }
 export interface ProjectCommands {
+  profile?: CommandProfile;
   install: string[];
   tests: string[];
   /** Whether the administrator wrote them; else they are the platform's own file's. */
@@ -543,6 +547,9 @@ export interface RunUsage {
  * supervisor reads to decide whether a piece of work belongs here.
  */
 export interface Section {
+  flow_version?: number | null;
+  operation_key?: string | null;
+  flow_key?: string | null;
   key: string;
   name: string;
   description: string;
@@ -1173,6 +1180,8 @@ export type Params = Record<string, string | number | null | undefined>;
 
 export function apiUrl(path: string, params: Params = {}): string {
   const query = new URLSearchParams();
+  const owner = projectScope();
+  if (owner && /^(flows|agents|command-profiles)(\/|$)/.test(path)) query.set('scope_project', owner);
   for (const [key, value] of Object.entries(params)) {
     if (value !== null && value !== undefined && value !== '') query.set(key, String(value));
   }

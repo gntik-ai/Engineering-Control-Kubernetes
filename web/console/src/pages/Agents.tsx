@@ -432,7 +432,7 @@ function RemoveDialog({
   );
 }
 
-export function AgentsTab() {
+export function AgentsTab({ project }: { project?: string } = {}) {
   const listing = useResource<AgentsListing>(apiUrl('agents'));
   const [agent, setAgent] = useState<AgentShown | 'new' | null>(null);
   const [skill, setSkill] = useState<SkillShown | 'new' | null>(null);
@@ -554,7 +554,7 @@ export function AgentsTab() {
           )}
         </CardBody>
       </Card>
-      <Card>
+      {!project && <Card>
         <CardHeader className="flex flex-row items-center justify-between gap-3">
           <CardTitle>Skills</CardTitle>
           <Button icon={Plus} size="sm" disabled={!listing.data} onClick={() => setSkill('new')}>
@@ -623,7 +623,7 @@ export function AgentsTab() {
             <p className="text-[13px]">No skills yet.</p>
           ) : null}
         </CardBody>
-      </Card>
+      </Card>}
       <AgentDialog
         agent={agent === 'new' ? null : agent}
         skills={skills}

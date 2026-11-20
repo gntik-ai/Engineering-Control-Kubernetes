@@ -24,6 +24,7 @@ from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.agent_models import problem as model_problem
@@ -31,6 +32,7 @@ from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
+    active_project,
 )
 from engineering_control.db.models import AgentRecord, Skill
 from engineering_control.engine.catalogue import (
@@ -197,13 +199,16 @@ class Agents:
                 )
         return found
 
-    def listing(self) -> dict[str, Any]:
+    def listing(self, project: str | None = None) -> dict[str, Any]:
         uses = self._uses()
         with self.sessions() as session:
+            pid = active_project(session, project).id if project else None
             skills = session.scalars(select(Skill).order_by(func.lower(Skill.name))).all()
             names = {str(skill.id): skill.name for skill in skills}
             agents = session.scalars(
-                select(AgentRecord).order_by(func.lower(AgentRecord.name))
+                select(AgentRecord)
+                .where(AgentRecord.project_id == pid)
+                .order_by(func.lower(AgentRecord.name))
             ).all()
             held: dict[str, list[str]] = {}
             for agent in agents:
@@ -220,11 +225,14 @@ class Agents:
                 ],
             }
 
-    def names(self) -> list[dict[str, str]]:
+    def names(self, project: str | None = None) -> list[dict[str, str]]:
         """The agents a task can name, for the designer's list."""
         with self.sessions() as session:
+            pid = active_project(session, project).id if project else None
             rows = session.execute(
-                select(AgentRecord.id, AgentRecord.name).order_by(func.lower(AgentRecord.name))
+                select(AgentRecord.id, AgentRecord.name)
+                .where((AgentRecord.project_id == pid) | AgentRecord.project_id.is_(None))
+                .order_by(func.lower(AgentRecord.name))
             ).all()
             return [{"id": str(agent_id), "name": name} for agent_id, name in rows]
 
@@ -297,6 +305,7 @@ class Agents:
         instructions: Any,
         settings: Any,
         skills: Any,
+        project: str | None = None,
     ) -> dict[str, Any]:
         label, text, how = (
             _label(name, "agent"),
@@ -304,38 +313,52 @@ class Agents:
             clean_settings(settings),
         )
         with self.sessions.begin() as session:
+            pid = active_project(session, project, lock=True).id if project else None
             taken = session.scalar(
-                select(AgentRecord.id).where(func.lower(AgentRecord.name) == label.lower())
+                select(AgentRecord.id).where(
+                    AgentRecord.project_id == pid, func.lower(AgentRecord.name) == label.lower()
+                )
             )
             if taken is not None and taken != agent_id:
                 raise ProjectConflict(f"There is an agent {label} already")
             held = self._checked(session, skills)
             if agent_id is None:
                 if (
-                    session.scalar(select(func.count()).select_from(AgentRecord)) or 0
+                    session.scalar(
+                        select(func.count())
+                        .select_from(AgentRecord)
+                        .where(AgentRecord.project_id == pid)
+                    )
+                    or 0
                 ) >= MAX_AGENTS:
                     raise ProjectConflict(
                         f"There are {MAX_AGENTS} agents already: remove one first"
                     )
-                row = AgentRecord(name=label, instructions=text, settings=how, skills=held)
+                row = AgentRecord(
+                    project_id=pid, name=label, instructions=text, settings=how, skills=held
+                )
                 session.add(row)
             else:
                 found = session.get(AgentRecord, agent_id, with_for_update=True)
-                if found is None:
+                if found is None or found.project_id != pid:
                     raise ProjectNotFound(str(agent_id))
                 row = found
                 row.name, row.instructions, row.settings, row.skills = label, text, how, held
                 row.updated_at = datetime.now(UTC)
             row.description = _description(description)
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError as error:
+                raise ProjectConflict(f"There is an agent {label} already") from error
             names = {str(skill.id): skill.name for skill in session.scalars(select(Skill)).all()}
             return self._agent(row, names)
 
-    def remove_agent(self, agent_id: UUID) -> dict[str, Any]:
+    def remove_agent(self, agent_id: UUID, project: str | None = None) -> dict[str, Any]:
         """Remove an agent. A flow that names it has to name another before it runs."""
         with self.sessions.begin() as session:
+            pid = active_project(session, project, lock=True).id if project else None
             row = session.get(AgentRecord, agent_id)
-            if row is None:
+            if row is None or row.project_id != pid:
                 raise ProjectNotFound(str(agent_id))
             gone = self._agent(row, {})
             session.delete(row)

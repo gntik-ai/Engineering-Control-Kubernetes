@@ -839,7 +839,10 @@ class Toolbox:
                 raise ProjectInvalid("The item has no section yet: route it first")
             with self.sessions() as session:
                 plan = plan_for_item(
-                    session, item["section"]["flow"], produced=bool(item["facts"].get("kind"))
+                    session,
+                    item["section"]["flow"],
+                    produced=bool(item["facts"].get("kind")),
+                    version=item["section"].get("flow_version"),
                 )
             if plan is None:
                 raise ProjectInvalid(

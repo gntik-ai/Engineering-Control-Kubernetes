@@ -11,6 +11,19 @@ export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent
 export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');
 export const connectionsUrl = (name: string, id?: string) => workspaceUrl(name) + '/settings/connections' + (id ? '?connection=' + encodeURIComponent(id) : '');
 export const recordUrl = (name: string, kind: string, id: string) => workspaceUrl(name) + '?' + new URLSearchParams({ tab: kind, record: id }).toString();
+export const automationViews = ['flows', 'flow', 'operations', 'assignments', 'agents', 'commands'] as const;
+export type AutomationView = typeof automationViews[number];
+export const isAutomation = (value: string): value is AutomationView => automationViews.some((v) => v === value);
+export const projectScope = () => window.location.pathname.match(/^\/console\/workspace\/([^/]+)\/automation\//)?.[1];
+export function automationUrl(view: AutomationView, project?: string, context?: string, params = new URLSearchParams()) {
+  if (!project && context) params.set('project', context);
+  const base = project ? workspaceUrl(project) + '/automation/' : BASE + '/settings/';
+  return base + view + (params.size ? '?' + params : '');
+}
+export function currentAutomationUrl(view: AutomationView, key?: string) {
+  return automationUrl(view, projectScope(), new URLSearchParams(window.location.search).get('project') ?? undefined,
+    key ? new URLSearchParams({ key }) : undefined);
+}
 const NAV_EVENT = 'console:navigate';
 
 const subscribe = (onChange: () => void) => {
@@ -30,6 +43,7 @@ export function useLocation(): { path: string; query: URLSearchParams } {
 }
 
 export function navigate(to: string, { replace = false } = {}) {
+  if (/^\/console\/flows?(?:\?|$)/.test(to)) { window.location.assign(to); return; }
   if (to === window.location.pathname + window.location.search) return;
   if (replace) window.history.replaceState(null, '', to);
   else window.history.pushState(null, '', to);

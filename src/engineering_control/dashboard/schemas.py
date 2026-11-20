@@ -83,6 +83,7 @@ class SectionFlowInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     # None leaves the section without a flow.
     flow: str | None = Field(default=None, max_length=80)
+    version: int | None = Field(default=None, ge=0)
 
 
 class ItemCreateInput(DashboardModel):
@@ -133,6 +134,16 @@ class ProjectCommandsInput(DashboardModel):
     install: list[str] = Field(default_factory=list, max_length=12)
     tests: list[str] = Field(default_factory=list, max_length=12)
     platform: bool = False
+
+
+class CommandProfileInput(ProjectCommandsInput):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class CommandSelectionInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    current_password: str = Field(min_length=1, max_length=128)
+    profile_id: UUID | None = None
 
 
 class ProjectPauseInput(DashboardModel):

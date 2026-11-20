@@ -508,7 +508,9 @@ def test_combined_partial_coverage_and_abandoned_history(tmp_path: Path) -> None
             if "imported_issues" in ctx:
                 reply = await super().ask(q, retry=retry)
                 for issue in ctx["imported_issues"]:
-                    if issue["number"] in (46, 47):
+                    if issue["number"] in (46, 47) and any(
+                        s["id"] == str(ids["Respond to failures"]) for s in ctx["stories"]
+                    ):
                         reply.data["matches"].append(
                             {
                                 "issue": issue["id"],

@@ -10,24 +10,28 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
-import { ADMIN, BASE, RouterLink, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl } from '../router';
+import { ADMIN, BASE, RouterLink, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl } from '../router';
 import { AccountsPage } from './Accounts';
 import { ConnectionsPage } from './Connections';
 import { NewProjectDialog } from './ProjectDialogs';
 import { ProjectQueue } from './ProjectQueue';
+import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
 
+const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignments', agents: 'Agents', commands: 'Commands' };
 export function ProjectWorkspace({
   name,
   view,
+  global = false,
   actions,
   notice,
 }: {
   name: string;
-  view: 'dashboard' | 'queue' | 'connections' | 'accounts';
+  view: 'dashboard' | 'queue' | 'connections' | 'accounts' | AutomationView;
+  global?: boolean;
   actions: ReactNode;
   notice: ReactNode;
 }) {
@@ -35,10 +39,10 @@ export function ProjectWorkspace({
   const [creating, setCreating] = useState(false);
   const items = projects.data?.items ?? [];
   const defaultName = projects.data?.default_project;
-  const project = items.find((item) => item.project === name) ?? (view === 'accounts'
+  const project = items.find((item) => item.project === name) ?? (global
     ? items.find((item) => item.project === defaultName) ?? items[0]
     : undefined);
-  const context = view === 'accounts' ? project?.project : name;
+  const context = global ? project?.project : name;
   const dashboardHref = context ? workspaceUrl(context) : BASE;
   const accountHref = accountsUrl(context);
   const projectTitle = project?.display_name ?? name;
@@ -47,9 +51,13 @@ export function ProjectWorkspace({
     queue: 'Queue · ' + projectTitle,
     connections: 'Connections · ' + projectTitle,
     accounts: 'Accounts · Global settings',
+    ...automationTitles,
   };
   usePageTitle(titles[view]);
 
+  const menu = (owner?: string) => (['flows', 'operations', 'assignments', 'agents', 'commands'] as const)
+    .filter((v) => owner || v !== 'assignments')
+    .map((v) => ({ label: automationTitles[v], href: automationUrl(v, owner, context), icon: { flows: Workflow, operations: ListTodo, assignments: Network, agents: Bot, commands: Terminal }[v] }));
   const primary: NavGroup = { items: [{ label: 'Dashboard', href: dashboardHref, icon: LayoutDashboard }] };
   const groups = [primary];
   if (context) {
@@ -59,7 +67,7 @@ export function ProjectWorkspace({
       label: 'Project settings',
       collapsible: true,
       defaultOpen: true,
-      items: [{ label: 'Connections', href: connectionsUrl(context), icon: Network }],
+      items: [{ label: 'Connections', href: connectionsUrl(context), icon: Network }, ...menu(context)],
     });
   }
   groups.push({
@@ -67,9 +75,9 @@ export function ProjectWorkspace({
     label: 'Global settings',
     collapsible: true,
     defaultOpen: true,
-    items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }],
+    items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }, ...menu()],
   });
-  const currentHref = {
+  const currentHref = isAutomation(view) ? automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : name, context) : {
     dashboard: dashboardHref,
     queue: queueUrl(name),
     connections: connectionsUrl(name),
@@ -109,7 +117,7 @@ export function ProjectWorkspace({
                   name: item.display_name,
                   meta: item.project === defaultName ? 'Default project' : item.source_repository,
                 }))}
-                onSelect={(item) => navigate(view === 'accounts' ? accountsUrl(item.id)
+                onSelect={(item) => navigate(isAutomation(view) ? automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : item.id, item.id) : view === 'accounts' ? accountsUrl(item.id)
                   : view === 'queue' ? queueUrl(item.id) : workspaceUrl(item.id))}
                 onCreate={() => setCreating(true)}
               />
@@ -130,7 +138,7 @@ export function ProjectWorkspace({
       }
     >
       {notice && <div className="px-6 pt-4">{notice}</div>}
-      {view === 'accounts' ? <AccountsPage /> : (
+      {view === 'accounts' ? <AccountsPage /> : isAutomation(view) && (global || project) ? <AutomationPage key={(global ? 'global' : name) + '/' + view} view={view} project={global ? undefined : name} /> : (
         <Page width="wide">
           <LoadError resource={projects} />
           {project ? (

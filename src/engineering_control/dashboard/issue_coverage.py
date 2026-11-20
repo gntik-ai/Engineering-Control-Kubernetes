@@ -171,6 +171,14 @@ class Inventory:
             return {i["id"]: self.issue_versions[i["id"]] for i in self.issues[: cache.checked]}
         return {}
 
+    def eligible(self, story: str) -> set[str]:
+        """Manual links are authoritative. Only eligible pairs need a model decision."""
+        return {
+            issue["id"]
+            for issue in self.issues
+            if issue["manual_stories"] is None or story in issue["manual_stories"]
+        }
+
     def checkpoints(self, db: Session, pid: UUID) -> dict[str, StoryIssueCoverage]:
         return {
             str(c.story_id): c
@@ -302,9 +310,8 @@ class IssueCoverage:
             for s, c in cache.items():
                 if c.story_revision is None and c.revision == data.revisions[s]:
                     c.story_revision, c.issue_versions = data.story_versions[s], known[s]
-            first = next(
-                (s for s, versions in known.items() if len(versions) < len(data.issues)), None
-            )
+            pending = {s: data.eligible(s).difference(versions) for s, versions in known.items()}
+            first = next((s for s in known if pending[s]), None)
             if first is None:
                 return Coverage(
                     provider,
@@ -313,9 +320,17 @@ class IssueCoverage:
                     {s: [m for m in c.matches if m["id"] in known[s]] for s, c in cache.items()},
                     draft_revision(db, project.id),
                 )
-            issues = [i for i in data.issues if i["id"] not in known[first]][:ISSUE_PAGE]
+            # Compare common issues together. A manually restricted issue must not force
+            # the same unrestricted descriptions to be resent for separate story groups.
+            counts: dict[str, int] = defaultdict(int)
+            for outstanding in pending.values():
+                for issue in outstanding:
+                    counts[issue] += 1
+            pivot = max(counts, key=lambda i: (counts[i], i))
+            group = [s for s in pending if pivot in pending[s]][:STORY_PAGE]
+            common = set.intersection(*(pending[s] for s in group))
+            issues = [i for i in data.issues if i["id"] in common][:ISSUE_PAGE]
             ids = {i["id"] for i in issues}
-            group = [s for s in known if ids.isdisjoint(known[s])][:STORY_PAGE]
             return Page(
                 [data.stories[s] for s in group],
                 issues,
@@ -387,6 +402,7 @@ class IssueCoverage:
         guard: Guard,
         *,
         historical: bool = False,
+        workflow: str = "issue_linking",
     ) -> Coverage:
         while True:
             page = await asyncio.to_thread(
@@ -401,6 +417,7 @@ class IssueCoverage:
                     prompt=json.dumps(
                         {"stories": page.stories, "imported_issues": page.issues},
                         ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                     schema=MATCHES,
                     max_tokens=6000,
@@ -408,7 +425,9 @@ class IssueCoverage:
                 ),
                 retry=False,
             )
-            await asyncio.to_thread(record_project_usage, self.sessions, pid, model, reply)
+            await asyncio.to_thread(
+                record_project_usage, self.sessions, pid, model, reply, workflow
+            )
             await asyncio.to_thread(
                 self.persist, name, provider, model, page, reply.data["matches"], guard
             )
