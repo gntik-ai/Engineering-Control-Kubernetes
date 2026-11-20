@@ -883,6 +883,8 @@ def plus(*used: dict[str, Any] | None) -> dict[str, Any] | None:
     # Preserve coverage when priced and unpriced calls share one step. A multi-model
     # aggregate cannot later be priced using the last model's tariff.
     if len(given) > 1:
+        # Keep each metered contribution so reporting can attribute multi-account steps.
+        total["components"] = [part for entry in given for part in entry.get("components", [entry])]
         identities = {
             (
                 e.get("account_id") or e.get("account"),

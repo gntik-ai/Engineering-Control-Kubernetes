@@ -29,7 +29,7 @@ from typing import Any, Final
 from uuid import UUID
 
 from engineering_control.agent_models import problem as model_problem
-from engineering_control.engine import conditions
+from engineering_control.engine import conditions, reviews
 from engineering_control.engine import parts as flow_parts
 from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import KEY, Document, Node
@@ -354,6 +354,8 @@ def problems(document: Document) -> list[Problem]:
 
 def _problems(document: Document) -> list[Problem]:
     found: list[Problem] = []
+    if reason := reviews.invalid(document):
+        found.append(_problem("review", reason))
     nodes = {node.id: node for node in document.nodes}
     if document.start not in nodes:
         found.append(

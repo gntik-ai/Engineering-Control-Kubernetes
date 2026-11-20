@@ -19,6 +19,7 @@ from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, parse
+from engineering_control.engine.reviews import action_of
 from engineering_control.flow_library import FLOWS
 
 # The flow an item is delivered by when its section's flow only produces items.
@@ -37,7 +38,7 @@ def removed_keys(session: Session) -> set[str]:
 
 
 def document_in_force(
-    session: Session, key: str, version: int | None = None
+    session: Session, key: str, version: int | None = None, *, review: bool = False
 ) -> tuple[Document, int] | None:
     """The flow's document that runs started now follow, with its version."""
     query = select(FlowVersion).where(FlowVersion.flow_key == key, FlowVersion.state == "published")
@@ -50,9 +51,9 @@ def document_in_force(
         except FlowInvalid:
             return None
         # A part runs only inside the flows that run it: for a section it is no flow.
-        return None if found.part else (found, row.version)
+        return None if found.part or bool(action_of(found)) != review else (found, row.version)
     if version in (None, 0) and key in BUILTIN and not is_removed(session, key):
-        return BUILTIN[key], 0
+        return (BUILTIN[key], 0) if bool(action_of(BUILTIN[key])) == review else None
     return None
 
 

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, literal, or_, select, union_all, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.project_records import (
@@ -31,11 +31,12 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectSection,
     RemovedFlow,
+    ReviewFlowAssignment,
     SandboxRun,
     SavedTask,
 )
 from engineering_control.engine import parts as flow_parts
-from engineering_control.engine import validate
+from engineering_control.engine import reviews, validate
 from engineering_control.engine.builtin import BUILTIN, FLOW_OF_KIND
 from engineering_control.engine.catalogue import TASKS, budget
 from engineering_control.engine.document import Document, FlowInvalid, parse
@@ -47,7 +48,7 @@ from engineering_control.engine.library import (
     traits,
 )
 from engineering_control.engine.prompts import CONTRACTS
-from engineering_control.flow_library import FLOWS
+from engineering_control.flow_library import FLOWS, BuiltInFlow
 
 
 def _when(value: datetime | None) -> str | None:
@@ -360,11 +361,106 @@ class FlowRecords:
             except FlowInvalid:
                 return None
 
-    def summary(self) -> list[dict[str, Any]]:
+    def page(self, project: str | None, page: int, size: int, search: str) -> dict[str, Any]:
+        """Page the visible library before opening any documents or calculating traits."""
+        base: dict[str, BuiltInFlow | Document] = {**FLOWS, **BUILTIN}
+        static = union_all(
+            *(
+                select(
+                    literal(key).label("key"),
+                    literal(doc.name).label("name"),
+                    literal(doc.summary).label("summary"),
+                )
+                for key, doc in base.items()
+            )
+        ).cte("platform")
+        versions = (
+            select(
+                FlowVersion.flow_key.label("key"),
+                FlowVersion.state,
+                FlowVersion.document["name"].as_string().label("name"),
+                FlowVersion.document["summary"].as_string().label("summary"),
+                func.row_number()
+                .over(
+                    partition_by=FlowVersion.flow_key,
+                    order_by=(
+                        case((FlowVersion.state == "published", 0), else_=1),
+                        FlowVersion.version.desc(),
+                    ),
+                )
+                .label("rank"),
+            )
+            .where(FlowVersion.state.in_(("published", "draft")))
+            .cte("versions")
+        )
+        keys = select(static.c.key).union(select(versions.c.key)).cte("keys")
+        visible = (
+            select(
+                keys.c.key,
+                or_(versions.c.key.is_not(None), keys.c.key.in_(BUILTIN.keys())).label("runnable"),
+                case(
+                    (versions.c.state == "published", versions.c.name),
+                    else_=func.coalesce(static.c.name, versions.c.name),
+                ).label("name"),
+                case(
+                    (versions.c.state == "published", versions.c.summary),
+                    else_=func.coalesce(static.c.summary, versions.c.summary),
+                ).label("summary"),
+            )
+            .select_from(keys)
+            .outerjoin(static, static.c.key == keys.c.key)
+            .outerjoin(versions, (versions.c.key == keys.c.key) & (versions.c.rank == 1))
+            .outerjoin(ProjectFlow, ProjectFlow.flow_key == keys.c.key)
+            .outerjoin(ProjectRecord, ProjectRecord.id == ProjectFlow.project_id)
+            .where(
+                keys.c.key.not_in(select(RemovedFlow.flow_key)),
+                ProjectRecord.name == project if project else ProjectFlow.project_id.is_(None),
+            )
+            .subquery()
+        )
+        result = select(visible)
+        if search:
+            result = result.where(
+                or_(
+                    *(
+                        func.lower(col).contains(search.lower(), autoescape=True)
+                        for col in (visible.c.name, visible.c.key, visible.c.summary)
+                    )
+                )
+            )
+        with self.sessions() as db:
+            total = db.scalar(select(func.count()).select_from(result.subquery())) or 0
+            page = max(1, min(page, (total + size - 1) // size))
+            rows = db.execute(
+                result.order_by(func.lower(visible.c.name), visible.c.key)
+                .offset((page - 1) * size)
+                .limit(size)
+            ).all()
+        engine = {
+            row["key"]: row for row in self.summary([row.key for row in rows if row.runnable])
+        }
+        return {
+            "items": [
+                {
+                    "key": row.key,
+                    "name": row.name,
+                    "summary": row.summary,
+                    "engine": engine.get(row.key),
+                    "owner": project,
+                }
+                for row in rows
+            ],
+            "removed": [] if project else self.removed(),
+            "page": page,
+            "page_size": size,
+            "total": total,
+        }
+
+    def summary(self, keys: list[str] | None = None) -> list[dict[str, Any]]:
         """Every flow in a line: what it is, which version is in force, and whether a
         draft is being worked on."""
         listed = []
-        for key in self.keys():
+        for key in self.keys() if keys is None else keys:
             version = self.version_in_force(key)
             draft = self.draft(key)
             # A flow that was never put in force is what its draft says.
@@ -382,6 +478,7 @@ class FlowRecords:
                     "builtin": key in BUILTIN,
                     # A part runs only inside the flows that run it.
                     "part": document.part,
+                    "review_action": reviews.action_of(document),
                     "section_action": section_action(document),
                     "publishes": traits(document)["publishes"],
                     "tasks": len(document.nodes),
@@ -532,6 +629,10 @@ class FlowRecords:
 
         Refused while a run that follows it has not ended, and while another flow runs
         it as a part: those would be left with nothing to follow."""
+        if key in BUILTIN and reviews.action_of(BUILTIN[key]):
+            raise ProjectConflict(
+                "Projects inherit this default review flow. Edit it or assign another flow."
+            )
         own, named = key in BUILTIN, key in FLOWS
         # Asked before anything is changed: it reads every flow's document.
         callers = [use for use in self._runs_part_safely(key) if use["flow"] != key]
@@ -549,6 +650,14 @@ class FlowRecords:
             else:
                 newest = max(rows, key=lambda row: row.version)
                 name = str((newest.document or {}).get("name") or key)
+            if session.scalar(
+                select(ReviewFlowAssignment.flow_key)
+                .where(ReviewFlowAssignment.flow_key == key)
+                .limit(1)
+            ):
+                raise ProjectConflict(
+                    "Change the project review assignment before deleting this flow."
+                )
             if callers:
                 raise ProjectConflict(
                     f"{', '.join(use['name'] for use in callers)} "
@@ -648,7 +757,13 @@ class FlowRecords:
                 )
             ownership = session.get(ProjectFlow, key)
             self.check_dependencies(session, document, ownership.project_id if ownership else None)
-            current = document_in_force(session, key)
+            review_action = reviews.action_of(document)
+            current = document_in_force(session, key, review=bool(review_action))
+            previous = current or document_in_force(session, key, review=not bool(review_action))
+            if previous and reviews.action_of(previous[0]) != review_action:
+                raise ProjectInvalid(
+                    "A published flow must keep its execution type and review action."
+                )
             if current is not None and current[0].as_dict() == document.as_dict():
                 # A draft that only draws the flow another way is still a version.
                 raise ProjectConflict("The draft says the same as the version in force")

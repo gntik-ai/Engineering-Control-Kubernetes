@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
@@ -166,6 +166,7 @@ class Work:
     cursor: str
     last: bool
     scanned: int
+    run_id: UUID | None = None
     coverage: Coverage | None = None
 
 
@@ -254,9 +255,11 @@ class PlanningAnalysis:
             if not provider or not model or project.paused_at or project.planning_reviews_paused_at:
                 reset_review(job)
                 return None
+            run_id = review_flows.start(db, job, project.id, "automatic")
             rows = records(db, project.id)
             src = rows.pop(str(job.record_id), None)
             if not src or src["state"] == "dismissed":
+                review_flows.finish(db, job, "cancelled")
                 job.status, job.lease = "dismissed", None
                 return None
             if not src["description"].strip():
@@ -265,6 +268,7 @@ class PlanningAnalysis:
                     "stories": "Who needs this Story, and what outcome would they accept?",
                     "issues": "What technical change is required, and how will you verify it?",
                 }[job.kind]
+                review_flows.finish(db, job, "succeeded")
                 job.status, job.lease, job.progress = "needs_input", None, {}
                 job.result = {**job.result, "questions": [question]}
                 return None
@@ -310,6 +314,7 @@ class PlanningAnalysis:
                 page[-1] if page else cursor,
                 len(remaining) <= PAGE,
                 progress.get("scanned", 0) + len(page),
+                run_id=run_id,
             )
 
     def apply(self, work: Work, answer: dict[str, Any]) -> None:
@@ -353,6 +358,7 @@ class PlanningAnalysis:
             if work.coverage:
                 work.coverage.validate(db, project)
             self.save_result(db, project, job, work, src, rows, answer)
+            review_flows.finish(db, job, "succeeded")
             job.lease, job.progress = None, {}
 
     @staticmethod
@@ -486,6 +492,8 @@ class PlanningAnalysis:
             job.attempts += 1
             job.lease = None
             job.status = "queued" if transient and job.attempts < 3 else "failed"
+            if job.status == "failed":
+                review_flows.finish(db, job, "failed")
             job.due_at = datetime.now(UTC) + timedelta(seconds=30 * job.attempts)
             job.result = {**job.result, "detail": message[:400]}
 
@@ -535,6 +543,7 @@ class PlanningAnalysis:
                         models,
                         owner,
                         workflow="automatic_review_linking",
+                        run_id=work.run_id,
                     )
                     work.prompt["imported_issue_coverage"] = work.coverage.matches
                     work.prompt["fully_covered_stories"] = sorted(work.coverage.full)
@@ -562,6 +571,8 @@ class PlanningAnalysis:
                         seconds=150,
                     ),
                     "automatic_review_screen" if work.screen else "automatic_review",
+                    run_id=work.run_id,
+                    stage="screening" if work.screen else work.key[1],
                 )
                 await asyncio.to_thread(self.apply, work, reply.data)
         except review_budget.ReviewBudgetHeld:

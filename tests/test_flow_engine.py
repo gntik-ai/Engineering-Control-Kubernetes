@@ -64,6 +64,14 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
         "code-clean",
         "ui-audit",
         "ux-audit",
+        "review-description",
+        "review-epics",
+        "review-stories",
+        "review-issues",
+        "review-coverage",
+        "review-automatic",
+        "review-connections",
+        "review-execution",
     }
     for key, document in BUILTIN.items():
         assert validate.problems(document) == [], key
@@ -109,7 +117,7 @@ def test_every_task_of_the_catalogue_says_what_it_is() -> None:
     listed = {task["key"]: task for task in catalogue()}
     assert set(listed) == set(TASKS)
     for task in TASKS.values():
-        assert task.where in ("sandbox", "bench", "model", "platform", "control", "part")
+        assert task.where in ("sandbox", "bench", "model", "platform", "control", "part", "review")
         # A task that runs a part ends the ways the part is left, which the part says.
         assert task.outcomes or task.where == "part"
         # A task that asks a model over an API has no agent of a subscription in it,
@@ -307,14 +315,7 @@ def test_a_prompt_is_fixed_parts_and_editable_parts_in_order() -> None:
 
 def test_a_changed_flow_is_a_draft_until_it_is_published(world: Any) -> None:  # noqa: F811
     flows = FlowRecords(world.sessions)
-    assert flows.keys() == [
-        "deliver-issue",
-        "audit-code",
-        "discover-enhancements",
-        "code-clean",
-        "ui-audit",
-        "ux-audit",
-    ]
+    assert flows.keys() == list(BUILTIN)
     assert flows.version_in_force("deliver-issue") == 0 and flows.draft("deliver-issue") is None
     assert [v["version"] for v in flows.versions("deliver-issue")] == [0]
     with pytest.raises(ProjectNotFound):

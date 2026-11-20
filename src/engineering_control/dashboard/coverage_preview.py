@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from engineering_control.dashboard import review_flows
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import INSTRUCTION, MATCHES, Inventory, inventory
 from engineering_control.dashboard.workspace_issues import planning_kind
@@ -76,6 +77,9 @@ def snapshot(
         )
     }
     pid = project.id
+    policy = review_flows.effective_settings(db, pid, "coverage", row.review_run_id, active=True)
+    if policy["instructions"] or policy["max_output"]:
+        scope["context"]["review_settings"] = digest(policy)
     parents: dict[UUID, list[str]] = defaultdict(list)
     for story, epic in db.execute(
         select(ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id).where(
@@ -92,7 +96,14 @@ def snapshot(
             scope[kind][str(key)] = record_version(
                 title, description, bool(closed), parents[key] if kind == "stories" else []
             )
-    data = inventory(db, project, set(scope["stories"]), provider, model)
+    data = inventory(
+        db,
+        project,
+        set(scope["stories"]),
+        provider,
+        model,
+        review_flows.wording(policy, "matching"),
+    )
     scope["issues"].update(data.issue_versions)
     for item in db.scalars(
         select(BacklogItem).where(

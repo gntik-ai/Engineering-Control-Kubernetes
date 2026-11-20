@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from engineering_control.engine import reviews
 from engineering_control.engine.document import FORMAT, Document, parse
 
 _PROVIDERS: Final = ["chatgpt", "claude"]
@@ -315,6 +316,7 @@ _UX: Final = _application_audit(
 BUILTIN: Final[dict[str, Document]] = {
     str(raw["key"]): parse(raw) for raw in (_DELIVER, _AUDIT, _DISCOVER, _CLEAN, _UI, _UX)
 }
+BUILTIN.update(reviews.defaults())
 # The kind of run each of the platform's flows is recorded as, and the flow of a run
 # that was started before runs said which flow they follow.
 KIND_OF: Final = {

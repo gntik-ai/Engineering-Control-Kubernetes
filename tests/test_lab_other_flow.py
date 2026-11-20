@@ -44,8 +44,9 @@ FILE = "packages/billing/src/money.ts"
 def test_flows_are_of_two_sorts_and_only_one_sort_is_put_next_to_each_other() -> None:
     sorts = {key: sort_of(flow) for key, flow in BUILTIN.items()}
     assert sorts.pop("deliver-issue") == "item"
-    # Every other flow of the platform is started for a section and produces items.
-    assert set(sorts.values()) == {"section"} and len(sorts) == 5
+    assert sum(sort == "review" for sort in sorts.values()) == 8
+    assert sum(sort == "section" for sort in sorts.values()) == 5
+    assert set(sorts.values()) == {"review", "section"}
     # A flow in which a model writes the change works on an item like Deliver issue.
     assert {sort_of(flow) for flow in STARTERS.values()} == {"item"}
     # Files both changes touch are counted only when both changed any.

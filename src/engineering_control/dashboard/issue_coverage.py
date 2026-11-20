@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -83,6 +83,7 @@ class Coverage:
     revisions: dict[str, str]
     matches: dict[str, list[Row]]
     drafts: str
+    policy: str = ""
 
     @property
     def full(self) -> set[str]:
@@ -112,7 +113,9 @@ class Coverage:
         return added
 
     def validate(self, db: Session, project: ProjectRecord, *, generating: bool = True) -> None:
-        current = inventory(db, project, set(self.revisions), self.provider, self.model)
+        current = inventory(
+            db, project, set(self.revisions), self.provider, self.model, self.policy
+        )
         if current.revisions != self.revisions or (
             generating and draft_revision(db, project.id) != self.drafts
         ):
@@ -218,7 +221,12 @@ def technical_items(
 
 
 def inventory(
-    db: Session, project: ProjectRecord, targets: set[str], provider: str, model: str
+    db: Session,
+    project: ProjectRecord,
+    targets: set[str],
+    provider: str,
+    model: str,
+    policy: str = "",
 ) -> Inventory:
     stories = {
         str(key): {
@@ -265,6 +273,8 @@ def inventory(
         )
     common = digest([project.source_repository, provider, model, issues])
     scope = digest([project.source_repository, provider, model, INSTRUCTION, MATCHES])
+    if policy:
+        common, scope = digest([common, policy]), digest([scope, policy])
     return Inventory(
         stories,
         issues,
@@ -280,6 +290,8 @@ class Page:
     issues: list[Row]
     story_versions: dict[str, str]
     issue_versions: dict[str, str]
+
+    policy: str = ""
 
     def prompt(self) -> str:
         # Only send parent IDs that the model may cite in this particular batch.
@@ -309,11 +321,12 @@ class IssueCoverage:
         model: str,
         guard: Guard,
         historical: bool,
+        policy: str = "",
     ) -> Coverage | Page:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             guard(db)
-            data = inventory(db, project, targets, provider, model)
+            data = inventory(db, project, targets, provider, model, policy)
             if set(data.stories) != targets or (
                 not historical and any(s["state"] == "closed" for s in data.stories.values())
             ):
@@ -334,6 +347,7 @@ class IssueCoverage:
                     data.revisions,
                     {s: [m for m in c.matches if m["id"] in known[s]] for s, c in cache.items()},
                     draft_revision(db, project.id),
+                    policy,
                 )
             # Compare common issues together. A manually restricted issue must not force
             # the same unrestricted descriptions to be resent for separate story groups.
@@ -355,6 +369,7 @@ class IssueCoverage:
                 issues,
                 {s: data.story_versions[s] for s in group},
                 {i: data.issue_versions[i] for i in ids},
+                policy,
             )
 
     def persist(
@@ -363,7 +378,7 @@ class IssueCoverage:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             guard(db)
-            data = inventory(db, project, set(page.story_versions), provider, model)
+            data = inventory(db, project, set(page.story_versions), provider, model, page.policy)
             if data.story_versions != page.story_versions or any(
                 data.issue_versions.get(i) != v for i, v in page.issue_versions.items()
             ):
@@ -456,10 +471,13 @@ class IssueCoverage:
         *,
         historical: bool = False,
         workflow: str = "issue_linking",
+        run_id: UUID | None = None,
     ) -> Coverage:
+        with self.sessions() as db:
+            policy = review_flows.matching_revision(db, pid, "coverage", run_id) if run_id else ""
         while True:
             page = await asyncio.to_thread(
-                self.page, name, targets, provider, model, guard, historical
+                self.page, name, targets, provider, model, guard, historical, policy
             )
             if isinstance(page, Coverage):
                 return page
@@ -476,6 +494,8 @@ class IssueCoverage:
                     seconds=150,
                 ),
                 workflow,
+                run_id=run_id,
+                stage="matching",
             )
             await asyncio.to_thread(
                 self.persist, name, provider, model, page, reply.data["matches"], guard

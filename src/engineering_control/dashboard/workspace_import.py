@@ -16,14 +16,13 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import coverage_preview, review_budget
+from engineering_control.dashboard import coverage_preview, review_budget, review_flows
 from engineering_control.dashboard.issue_coverage import Coverage, technical_items
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     active_project,
 )
-from engineering_control.dashboard.workspace_costs import record_model_usage
 from engineering_control.dashboard.workspace_issues import (
     add_story_links,
     import_issues,
@@ -48,6 +47,7 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectUserStory,
     ProviderAccount,
+    ReviewFlowRun,
     WorkspaceCandidate,
     WorkspaceImport,
     WorkspaceSource,
@@ -241,6 +241,16 @@ class WorkspaceImports:
                 "busy": busy,
                 "budget_held": bool(review_budget.status(session, project.id)["required"]),
                 "coverage_run": progress.get("coverage_run"),
+                "review_flow": {
+                    "key": pinned.flow_key,
+                    "name": pinned.flow_name,
+                    "version": pinned.version,
+                    "id": str(pinned.id),
+                }
+                if row
+                and row.review_run_id
+                and (pinned := session.get(ReviewFlowRun, row.review_run_id))
+                else None,
                 "control_id": review_control(row) if row else None,
                 "scan_state": progress.get("scan_state") if row and row.stage in PHASES else None,
                 "activity": progress.get("activity", default_action) if busy else None,
@@ -442,6 +452,11 @@ class WorkspaceImports:
                         },
                     }
                     row.version += 1
+                review_flows.start(
+                    db, row, project.id, "coverage", fresh=not resume_failure, resume=resume_failure
+                )
+                if coverage_run_state(row) == "completed":
+                    review_flows.finish(db, row, "succeeded")
                 row.lease = row.lease_until = None
         return self.status(name)
 
@@ -615,6 +630,8 @@ class WorkspaceImports:
                 }
             if automatic and run_state != "running":
                 raise ProjectConflict("The project coverage run has changed.")
+            if automatic:
+                review_flows.start(session, row, project.id, "coverage")
             if links_only:
                 row.lease, row.lease_until = uuid4(), datetime.now(UTC) + timedelta(seconds=90)
                 session.flush()
@@ -690,6 +707,17 @@ class WorkspaceImports:
                         },
                     }
                     row.version += 1
+            if not automatic and row.stage in ("analysis", *KINDS):
+                action = "description" if row.stage == "analysis" else row.stage
+                review_flows.start(
+                    session,
+                    row,
+                    project.id,
+                    action,
+                    fresh=row.stage in KINDS
+                    and not (resume_id or row.lease or previous.get("state") == "interrupted"),
+                    resume=bool(resume_id),
+                )
             row.lease, row.lease_until = (
                 uuid4(),
                 datetime.now(UTC)
@@ -732,6 +760,8 @@ class WorkspaceImports:
                     set_coverage_state(row, "failed", error)
                 row.lease = row.lease_until = None
                 row.version += 1
+                if coverage_run_state(row) in ("completed", "failed"):
+                    review_flows.finish(session, row, "failed" if error else "succeeded")
                 return None
             job = row.progress.get("operation")
             added = 0
@@ -930,7 +960,7 @@ class WorkspaceImports:
                 ):
                     if row.stage == "issues":
                         if review_state(session, row)["can_continue"]:
-                            next_stage(row)
+                            next_stage(session, row)
                         run = row.progress["coverage_run"]
                         row.progress = {
                             **row.progress,
@@ -949,6 +979,14 @@ class WorkspaceImports:
                             }
                     else:
                         set_coverage_state(row, "waiting")
+            final_state = coverage_run_state(row)
+            if error or final_state == "failed":
+                review_flows.finish(session, row, "failed")
+            elif result and (
+                final_state == "completed"
+                or (final_state not in ("running", "waiting", "paused") and row.stage != "analysis")
+            ):
+                review_flows.finish(session, row, "succeeded")
             return None
 
     def settle_existing_reviews(self) -> None:
@@ -1298,7 +1336,10 @@ class WorkspaceImports:
             ensure_ascii=False,
         )
         try:
-            reply = await models.ask(
+            reply = await review_budget.ask_review(
+                self.sessions,
+                row.project_id,
+                models,
                 Question(
                     choices=((row.provider, row.model),),
                     system="Write the description for a Superadmin reviewing this repository. "
@@ -1310,11 +1351,15 @@ class WorkspaceImports:
                     schema=DESCRIPTION_SHAPE,
                     max_tokens=1100,
                     seconds=90,
-                )
+                ),
+                "repository_review",
+                run_id=row.review_run_id,
+                stage="description",
+                retry=True,
+                budgeted=False,
             )
         except ModelError as error:
             raise ProjectConflict(f"The model could not complete this step: {error}") from error
-        await asyncio.to_thread(record_model_usage, self.sessions, row, reply)
         value = str(reply.data["description"]).strip()
         if not value:
             raise ProjectConflict("The model returned an empty description")

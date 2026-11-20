@@ -272,6 +272,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/connections/{key}/findings/{finding}",
         "/api/dashboard/projects/{name}/planning-reviews/model",
         "/api/dashboard/projects/{name}/review-budget",
+        "/api/dashboard/projects/{name}/review-flows/{action}",
         "/api/dashboard/projects/{name}/planning-reviews/pause",
         "/api/dashboard/projects/{name}/planning-reviews/{kind}/{key}/pause",
         "/api/dashboard/projects/{name}/connections/{key}/pause",

@@ -15,7 +15,7 @@ from uuid import UUID
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.coverage_preview import proposal_version, remember_proposal
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
@@ -389,7 +389,7 @@ def set_coverage_state(row: WorkspaceImport, state: str, detail: str | None = No
         row.version += 1
 
 
-def next_stage(row: WorkspaceImport) -> None:
+def next_stage(session: Session, row: WorkspaceImport) -> None:
     row.stage = {"epics": "stories", "stories": "issues", "issues": "complete"}[row.stage]
     row.progress = {
         **row.progress,
@@ -405,6 +405,8 @@ def next_stage(row: WorkspaceImport) -> None:
     row.version += 1
     if coverage_run_state(row) in ("running", "waiting"):
         set_coverage_state(row, "completed" if row.stage == "complete" else "running")
+        if row.stage == "complete":
+            review_flows.finish(session, row, "succeeded")
 
 
 def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
@@ -431,7 +433,7 @@ def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
             pending_query.with_only_columns(WorkspaceCandidate.id).limit(1)
         )
         if pending_epic is None and not coverage_problem(session, row.project_id, "epics"):
-            next_stage(row)
+            next_stage(session, row)
         return
     job = row.progress.get("operation") or {}
     mode = row.progress.get("review_mode")
@@ -474,7 +476,7 @@ def settle_bulk_review(session: Session, row: WorkspaceImport) -> None:
         }
         row.version += 1
     elif parents and not pending and not coverage_problem(session, row.project_id, "stories"):
-        next_stage(row)
+        next_stage(session, row)
 
 
 class WorkspaceReview:
@@ -588,6 +590,7 @@ class WorkspaceReview:
                     models,
                     owner,
                     historical=historical,
+                    run_id=row.review_run_id,
                 )
             except ModelError as error:
                 raise ProjectConflict(
@@ -832,6 +835,8 @@ class WorkspaceReview:
                 ),
                 "project_coverage" if run.get("state") == "running" else "repository_review",
                 retry=not bulk,
+                run_id=row.review_run_id,
+                stage=row.stage,
             )
         except ModelError as error:
             raise ProjectConflict(
@@ -1190,5 +1195,5 @@ class WorkspaceReview:
             problem = coverage_problem(session, project.id, stage)
             if problem:
                 raise ProjectConflict(problem)
-            next_stage(row)
+            next_stage(session, row)
             return row.stage

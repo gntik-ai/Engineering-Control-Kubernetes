@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import Select, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_flows
 from engineering_control.dashboard.project_records import ProjectConflict, active_project
 from engineering_control.dashboard.workspace_costs import record_project_usage
 from engineering_control.db.models import ProjectReviewBudget
@@ -99,8 +100,19 @@ async def ask_review(
     workflow: str,
     *,
     retry: bool = False,
+    run_id: UUID | None = None,
+    stage: str = "all",
+    budgeted: bool = True,
 ) -> Reply:
-    reserved = await asyncio.to_thread(reserve, sessions, project_id, reservation_size(question))
+    if run_id:
+        question = await asyncio.to_thread(
+            review_flows.question_for_run, sessions, project_id, run_id, stage, question
+        )
+    reserved = (
+        await asyncio.to_thread(reserve, sessions, project_id, reservation_size(question))
+        if budgeted
+        else 0
+    )
     reply = None
     try:
         reply = await models.ask(question, retry=retry and not reserved)
@@ -121,6 +133,7 @@ async def ask_review(
                 reply,
                 workflow,
                 reserved,
+                run_id,
             )
 
 

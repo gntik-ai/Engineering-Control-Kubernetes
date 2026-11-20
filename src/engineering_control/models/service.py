@@ -376,7 +376,7 @@ class Models:
                 prompt, why = (complaint(base, earlier), earlier) if earlier else (base, "")
                 try:
                     attempts = (2,) if earlier else ((1, 2) if retry else (1,))
-                    for asked in attempts:
+                    for responses, asked in enumerate(attempts, start=1):
                         wire = await self._patient(held, model, question, prompt, retry=retry)
                         used["input"] += wire.read
                         used["output"] += wire.written
@@ -395,7 +395,10 @@ class Models:
                             model=wire.model,
                             account_id=held.id,
                             account=held.name,
-                            usage=usage_of(held, model, wire.model, used, question),
+                            usage={
+                                **usage_of(held, model, wire.model, used, question),
+                                **({"responses": responses} if responses > 1 else {}),
+                            },
                             seconds=round(time.monotonic() - started, 1),
                             asked=asked,
                         )

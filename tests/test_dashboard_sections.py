@@ -85,7 +85,9 @@ def test_the_flow_library_and_assigning_a_flow(tmp_path: Path) -> None:
     client, _repository = _authenticated_client(tmp_path)
     try:
         library = client.get("/api/dashboard/flows").json()["items"]
-        assert [flow["key"] for flow in library] == list(FLOWS)
+        assert [flow["key"] for flow in library] == list(FLOWS) + [
+            flow["key"] for flow in library if (flow["engine"] or {}).get("review_action")
+        ]
         assert {"deliver-issue", "audit-code", "discover-enhancements"} <= set(FLOWS)
         assert all(flow["name"] and flow["summary"] for flow in library)
 

@@ -24,6 +24,7 @@ export const WHERE: Record<TaskType['where'], string> = {
   platform: 'The platform itself',
   control: 'Chooses the way',
   part: 'The tasks of a part',
+  review: 'Project review worker',
 };
 
 /** What a setting is called on the page. */

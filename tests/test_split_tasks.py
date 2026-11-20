@@ -674,7 +674,9 @@ def test_the_task_that_was_replaced_is_listed_and_not_offered(world: Any) -> Non
     kinds = {kind["key"]: kind for kind in tasks.listing()["kinds"]}
     assert kinds["workspace.checkout"]["hidden"] is True and kinds["workspace.checkout"]["retired"]
     assert kinds["workspace.clone"]["hidden"] is False
-    assert [use["flow"] for use in kinds["workspace.clone"]["used_by"]] == list(BUILTIN)
+    assert [use["flow"] for use in kinds["workspace.clone"]["used_by"]] == [
+        key for key, doc in BUILTIN.items() if any(n.task == "workspace.clone" for n in doc.nodes)
+    ]
     assert kinds["workspace.checkout"]["used_by"] == []
     with pytest.raises(ProjectInvalid, match="took its place"):
         tasks.hide("workspace.checkout", hidden=False)

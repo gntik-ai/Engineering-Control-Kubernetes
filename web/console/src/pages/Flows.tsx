@@ -43,12 +43,12 @@ import {
   type FlowLibrary,
   type FlowListed,
   type FlowVersionShown,
-  type Usage,
-  type UsageRow,
 } from '../api';
+import { DataTable } from '../components/blocks/tables/data-table/DataTable';
+import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
-import { LoadError, RefreshButton, Rows, TableFrame, mono } from '../parts';
-import { BASE, currentAutomationUrl, projectScope, navigate, setQuery, useLocation } from '../router';
+import { LoadError, RefreshButton, TableFrame } from '../parts';
+import { currentAutomationUrl, projectScope, navigate, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
 import { TasksTab } from './Tasks';
 
@@ -73,12 +73,12 @@ const suggestKey = (name: string) =>
 function NewFlowDialog({
   open,
   onOpenChange,
-  flows,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  flows: FlowListed[];
 }) {
+  const library = useResource<FlowLibrary>(apiUrl('flows', { include_shared: 'true' }));
+  const flows = library.data?.items ?? [];
   const [name, setName] = useState('');
   const [key, setKey] = useState('');
   const [keyEdited, setKeyEdited] = useState(false);
@@ -111,7 +111,7 @@ function NewFlowDialog({
     // Only when it opens: the form starts clean each time.
   }, [open]);
   const taken = flows.some((flow) => (flow.owner ?? undefined) === projectScope() && flow.key === finalKey);
-  const ready = name.trim() !== '' && KEY.test(finalKey) && !taken;
+  const ready = !!library.data && name.trim() !== '' && KEY.test(finalKey) && !taken;
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (ready && !pending) void submit();
@@ -127,6 +127,7 @@ function NewFlowDialog({
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-4">
+            <LoadError resource={library} />
             {problem ? <Alert tone="destructive" title={problem} /> : null}
             <Field>
               <FieldLabel>Name</FieldLabel>
@@ -244,121 +245,15 @@ export function minutes(value: number): string {
   return `${value} min`;
 }
 
-function UsageCells({ row }: { row: UsageRow }) {
-  return (
-    <>
-      <TableCell className={mono}>{row.runs}</TableCell>
-      <TableCell className={mono}>
-        {row.succeeded} / {row.failed}
-      </TableCell>
-      <TableCell className={mono}>{tokens(row.tokens)}</TableCell>
-      <TableCell className={mono}>{tokens(row.cached)}</TableCell>
-      <TableCell className={mono}>{minutes(row.minutes)}</TableCell>
-    </>
-  );
-}
-
-const USAGE_HEAD = (
-  <>
-    <TableHead>Runs</TableHead>
-    <TableHead>Succeeded / failed</TableHead>
-    <TableHead>Tokens</TableHead>
-    <TableHead>Read again from cache</TableHead>
-    <TableHead>In sandboxes</TableHead>
-  </>
-);
-
-function UsageCard() {
-  const [days, setDays] = useState('30');
-  const usage = useResource<Usage>(apiUrl('usage', { days }));
-  const data = usage.data;
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>What the runs used</CardTitle>
-        <div className="ml-auto">
-          <SimpleSelect
-            aria-label="Period"
-            size="sm"
-            className="w-40"
-            items={[
-              { value: '7', label: 'Last 7 days' },
-              { value: '30', label: 'Last 30 days' },
-              { value: '90', label: 'Last 90 days' },
-            ]}
-            value={days}
-            onValueChange={(value) => setDays(value ?? '30')}
-          />
-        </div>
-      </CardHeader>
-      <CardBody className="grid gap-4">
-        <p className="text-[13px] text-muted-foreground">
-          Subscriptions are not paid by the token, so this is a measure, not a price: tokens are what the agents read
-          new and wrote, as their clients report it. It is what a flow’s budget is counted in and what versions of a
-          flow are compared by.
-        </p>
-        <LoadError resource={usage} />
-        {data && data.projects.length === 0 ? (
-          <p className="text-[13px]">Nothing ran in this period.</p>
-        ) : data ? (
-          <>
-            <TableFrame>
-              <Table>
-                <TableCaption className="sr-only">Usage by project</TableCaption>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Project</TableHead>
-                    {USAGE_HEAD}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data.projects.map((row) => (
-                    <TableRow key={row.project}>
-                      <TableCell>
-                        <Link href={`${BASE}/project?name=${row.project}`}>{row.project_name}</Link>
-                      </TableCell>
-                      <UsageCells row={row} />
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableFrame>
-            <TableFrame>
-              <Table>
-                <TableCaption className="sr-only">Usage by flow and version</TableCaption>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Flow</TableHead>
-                    {USAGE_HEAD}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data.flows.map((row) => (
-                    <TableRow key={`${row.key}/${row.version}/${row.evaluation}`}>
-                      <TableCell>
-                        <span className="font-medium">{row.key}</span>{' '}
-                        <span className="text-[12px] text-muted-foreground">
-                          {versionName(row.version).toLowerCase()}
-                          {row.evaluation ? ', in evaluations' : ''}
-                        </span>
-                      </TableCell>
-                      <UsageCells row={row} />
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableFrame>
-          </>
-        ) : null}
-      </CardBody>
-    </Card>
-  );
-}
-
 export function FlowsPage() {
   const owner = projectScope();
-  const flows = useResource<FlowLibrary>(apiUrl('flows', { include_shared: owner ? 'true' : undefined }));
-  const owned = flows.data?.items.filter((flow) => (flow.owner ?? undefined) === owner) ?? [];
+  const { query } = useLocation();
+  const search = (query.get('search') ?? '').slice(0, 200);
+  const page = Math.max(1, Number(query.get('page')) || 1);
+  const sizes = [10, 25, 50, 100];
+  const size = sizes.includes(Number(query.get('page_size'))) ? Number(query.get('page_size')) : 10;
+  const flows = useResource<FlowLibrary & {page: number; page_size: number; total: number}>(
+    apiUrl('flows', { search, page, page_size: size }));
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<FlowListed | null>(null);
@@ -371,8 +266,25 @@ export function FlowsPage() {
       .then(flows.reload)
       .catch((error: unknown) => setFailed(error instanceof Error ? error.message : 'The request failed.'));
   };
-  const wanted = useLocation().query.get('tab');
+  const wanted = query.get('tab');
   const tab = !owner && wanted === 'tasks' ? wanted : 'flows';
+  const columns: DataTableColumn<FlowListed>[] = [
+    {id: 'name', header: 'Flow', accessor: f=>f.name, sortable: false,
+      className: 'max-w-xl whitespace-normal', cell: f=><><div className="flex items-center gap-2">
+      {f.engine ? <Link href={currentAutomationUrl('flow', f.key)}>{f.name}</Link> : f.name}
+      {f.engine?.review_action && <Badge size="sm">Review</Badge>}{f.engine?.part && <Badge size="sm">Part</Badge>}
+      </div><p className="text-xs text-muted-foreground">{f.summary}</p></>},
+    {id: 'version', header: 'In force', accessor: f=>f.engine?.version ?? '', sortable: false,
+      cell: f=>f.engine ? <>{versionName(f.engine.version)} {f.engine.draft && <Badge size="sm">Draft v{f.engine.draft}</Badge>}</> : 'Library entry'},
+    {id: 'tasks', header: 'Tasks', accessor: f=>f.engine?.tasks ?? '', sortable: false,
+      cell: f=>f.engine ? f.engine.tasks+' · '+f.engine.agents+' with an agent' : '—'},
+    {id: 'rounds', header: 'Rounds', accessor: f=>f.engine?.review_action ? '—' : f.engine?.budgets.rounds ?? '—', sortable: false},
+    {id: 'changes', header: 'Changed here', accessor: f=>f.engine?.version ?? '', sortable: false,
+      cell: f=>!f.engine ? '—' : f.engine.version === null ? 'Made here' : !f.engine.version ? 'None' : f.engine.prompts_changed.join(', ') || 'Settings'},
+    {id: 'actions', header: 'Actions', sortable: false, accessor: f=>f.key,
+      cell: f=>f.engine?.review_action && f.engine.builtin ? null :
+        <Button variant="ghost" size="sm" icon={Trash2} aria-label={'Delete '+f.name} onClick={()=>setDeleting(f)}>Delete</Button>},
+  ];
   return (
     <Page
       title="Flows"
@@ -396,7 +308,7 @@ export function FlowsPage() {
           onDismiss={() => setProblem(null)}
         />
       ) : null}
-      <NewFlowDialog open={making} onOpenChange={setMaking} flows={flows.data?.items ?? []} />
+      {making && <NewFlowDialog open onOpenChange={setMaking} />}
       {deleting ? (
         <Confirm
           title={`Delete ${deleting.name}?`}
@@ -445,92 +357,15 @@ export function FlowsPage() {
                 onDismiss={() => setGone(null)}
               />
             ) : null}
-            <TableFrame>
-              <Table>
-                <TableCaption className="sr-only">Flows</TableCaption>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Flow</TableHead>
-                    <TableHead>In force</TableHead>
-                    <TableHead>Tasks</TableHead>
-                    <TableHead>Rounds</TableHead>
-                    <TableHead>Changed here</TableHead>
-                    <TableHead>
-                      <span className="sr-only">Actions</span>
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <Rows resource={{...flows, data: flows.data ? {...flows.data, items: owned} : null}} columns={6} empty="There are no flows">
-                    {(items) =>
-                      items.map((flow) => (
-                        <TableRow key={flow.key}>
-                          <TableCell className="max-w-xl">
-                            {flow.engine ? (
-                              <span className="flex flex-wrap items-center gap-2">
-                                <Link href={currentAutomationUrl("flow", flow.key)} className="font-medium">
-                                  {flow.name}
-                                </Link>
-                                {flow.engine.part ? (
-                                  <Badge tone="neutral" size="sm">
-                                    A part
-                                  </Badge>
-                                ) : null}
-                              </span>
-                            ) : (
-                              <span className="font-medium text-muted-foreground">{flow.name}</span>
-                            )}
-                            <div className="text-[12px] text-muted-foreground">{flow.summary}</div>
-                          </TableCell>
-                          {flow.engine ? (
-                            <>
-                              <TableCell>
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className="text-[13px]">{versionName(flow.engine.version)}</span>
-                                  {flow.engine.draft ? (
-                                    <Badge tone="info" size="sm">
-                                      A draft is open
-                                    </Badge>
-                                  ) : null}
-                                </div>
-                              </TableCell>
-                              <TableCell className={mono}>
-                                {flow.engine.tasks}, {flow.engine.agents} with an agent
-                              </TableCell>
-                              <TableCell className={mono}>{flow.engine.budgets.rounds ?? '—'}</TableCell>
-                              <TableCell className="text-[13px]">
-                                {flow.engine.version === null
-                                  ? 'Made here'
-                                  : flow.engine.version === 0
-                                    ? 'Nothing'
-                                    : flow.engine.prompts_changed.length
-                                      ? `Wording: ${flow.engine.prompts_changed.join(', ')}`
-                                      : 'Settings'}
-                              </TableCell>
-                            </>
-                          ) : (
-                            <TableCell colSpan={4} className="text-[13px] text-muted-foreground">
-                              Does not run on this platform yet.
-                            </TableCell>
-                          )}
-                          <TableCell className="text-right">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              icon={Trash2}
-                              aria-label={`Delete ${flow.name}`}
-                              onClick={() => setDeleting(flow)}
-                            >
-                              Delete
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    }
-                  </Rows>
-                </TableBody>
-              </Table>
-            </TableFrame>
+            <DataTable caption="Flows" rows={flows.data?.items ?? []} columns={columns} getRowId={f=>f.key}
+              selectionMode="none" showColumnMenu={false} showDensityToggle={false} showQuickFilter
+              quickFilter={search} quickFilterDebounceMs={350} labels={{quickFilter: ()=>'Search flows'}}
+              paginationMode="server" paginated={Boolean(flows.data?.total)} rowCount={flows.data?.total ?? 0}
+              page={flows.data?.page ?? page} pageSize={size} pageSizeOptions={sizes}
+              loading={flows.loading} filtered={Boolean(search)} emptyState="No flows in this library."
+              noResultsState="No flows match your search."
+              onQueryChange={next=>setQuery({search: (next.quickFilter ?? '').trim().slice(0,200) || null,
+                page: next.page>1 ? String(next.page) : null, page_size: next.pageSize===10 ? null : String(next.pageSize)})} />
             {removed.length ? (
               <Card>
                 <CardHeader>
@@ -578,7 +413,6 @@ export function FlowsPage() {
                 </CardBody>
               </Card>
             ) : null}
-            {!owner && <UsageCard />}
           </div>
         </TabsPanel>
       </Tabs>
