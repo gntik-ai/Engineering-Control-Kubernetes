@@ -26,7 +26,7 @@ from engineering_control.engine import reviews
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.document import parse
 from engineering_control.engine.validate import errors
-from engineering_control.models.service import Question, Reply
+from engineering_control.models.service import ModelError, Question, Reply
 from tests.test_automatic_planning import post
 from tests.test_dashboard_web import _authenticated_client
 from tests.test_project_coverage import seed
@@ -318,5 +318,112 @@ def test_project_hold_and_interrupted_provider_do_not_retry(tmp_path: Path) -> N
             assert j.state == "uncertain" and j.reserved > 0
             assert db.get_one(ProjectReviewBudget, data["project"]).reserved == j.reserved
         assert post(client, "evidence/control", run_id=str(run), action="resume").status_code == 409
+    finally:
+        client.close()
+
+
+def test_metered_stop_settles_once_and_keeps_explicit_failure(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        run = uuid4()
+        with repo.sessions.begin() as db:
+            db.add(
+                ProjectReviewBudget(
+                    project_id=data["project"], token_limit=30000, used=0, reserved=0
+                )
+            )
+        review_evidence.start(repo.sessions, "falcone", run, "fixture", "analysis", 12000)
+        for _ in range(4):
+            review_evidence.advance(repo.sessions, run)
+        receipt = Reply(
+            {},
+            "",
+            "fixture",
+            "analysis",
+            uuid4(),
+            "Fixture",
+            {"tokens": 30, "input": 25, "output": 5, "provider_ref": "req_example"},
+            0.1,
+            1,
+        )
+
+        class Cut:
+            async def ask(self, q: Question, *, retry: bool) -> Reply:
+                assert not retry
+                raise ModelError("cut", "Output limit reached.", metered=receipt)
+
+        assert asyncio.run(review_evidence.tick(repo.sessions, Cut()))  # type: ignore[arg-type]
+        assert not asyncio.run(review_evidence.tick(repo.sessions, Cut()))  # type: ignore[arg-type]
+        value = review_evidence.status(repo.sessions, "falcone")["run"]
+        assert value["state"] == "failed" and value["spent"] == 30 and value["reserved"] == 0
+        assert value["failed_request"] == {
+            "arm": "original",
+            "reason": "cut",
+            "provider_ref": "req_example",
+        }
+        assert value["arms"][0]["scope"] is None and value["arms"][0]["tokens"] == 30
+        with repo.sessions() as db:
+            b = db.get_one(ProjectReviewBudget, data["project"])
+            assert (b.used, b.reserved) == (30, 0)
+            assert db.scalar(select(func.count()).select_from(WorkspaceModelUsage)) == 1
+    finally:
+        client.close()
+
+
+def test_admin_can_correct_a_saved_unrelated_comparison_without_another_call(
+    tmp_path: Path,
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        seed(repo)
+        run = uuid4()
+        review_evidence.start(repo.sessions, "falcone", run, "fixture", "analysis", 12000)
+        for _ in range(4):
+            review_evidence.advance(repo.sessions, run)
+        reply = Reply(
+            {"scope": "unrelated", "evidence": "No shared criterion."},
+            "",
+            "fixture",
+            "analysis",
+            uuid4(),
+            "Fixture",
+            {"input": 10, "output": 2, "tokens": 12},
+            0.1,
+            1,
+        )
+        for arm in ("original", "wiki"):
+            call = review_evidence.advance(repo.sessions, run)
+            assert call and call.arm == arm
+            review_evidence.settle(repo.sessions, call, reply)
+        review_evidence.advance(repo.sessions, run)
+        cached = uuid4()
+        review_evidence.start(repo.sessions, "falcone", cached, "fixture", "analysis", 12000)
+        for _ in range(6):
+            assert review_evidence.advance(repo.sessions, cached) is None
+        url = "/api/dashboard/projects/falcone/evidence/reviews"
+        one = f"evidence/reviews/{run}"
+        assert client.get(url).json()["total"] == 1
+        detail = client.get(f"{url}/{run}").json()
+        assert detail["issue"]["body"] and detail["story"]["card"]["text"]
+        assert client.get(f"{url}/{cached}").status_code == 404
+        assert (
+            client.get(f"/api/dashboard/projects/other/evidence/reviews/{run}").status_code == 404
+        )
+        args = {"scope": "partial", "note": "One criterion is shared.", "expected_revision": None}
+        result = post(client, one, **args)
+        assert result.status_code == 200, result.text
+        assert post(client, one, **args).json() == result.json()
+        assert post(client, one, scope="full", expected_revision=None).status_code == 409
+        assert client.get(url).json()["total"] == 0
+        history = client.get(url + "?state=reviewed").json()
+        assert history["total"] == 1 and history["items"][0]["decision"] == "partial"
+        assert [a["scope"] for a in client.get(f"{url}/{run}").json()["arms"]] == ["unrelated"] * 2
+        assert (
+            post(client, one, scope="full", expected_revision=result.json()["revision"]).status_code
+            == 200
+        )
+        with repo.sessions() as db:
+            assert db.scalar(select(func.count()).select_from(WorkspaceModelUsage)) == 2
     finally:
         client.close()

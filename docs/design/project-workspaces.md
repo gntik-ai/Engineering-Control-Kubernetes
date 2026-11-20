@@ -141,6 +141,10 @@ Open **Project Home → Review related work** and choose **Preview related recor
 
 **Run paired comparison** takes its model from Accounts and a separate token cap. It selects one unchecked pair in stable hash order whose original and wiki requests fit the cap, then sends at most one original request and one wiki request. The project budget also applies. The run pins its source, task settings and version. Stop allows an admitted request to settle before pausing. An interrupted request with unconfirmed usage retains its reservation for reconciliation. Results and usage stay in the evidence run and Global Settings → Stats. A repeat with identical inputs reuses the saved comparison. Extractive pages are keyed by source revision and extraction settings.
 
+Project Home → Review related work → **Review model verdicts** lists saved comparisons with an Unrelated or Unclear answer or a disagreement between formats. Open a comparison to read both frozen sources and the model’s evidence, then record or revise your own judgment. Cached repeats share the original comparison’s review. This review uses zero model tokens. Project links and GitHub approvals follow their existing workflows.
+
+When Claude reaches its output limit or declines an answer with a final usage receipt, the comparison records the actual tokens and estimated cost, releases the reservation and stops. An interrupted stream without a final receipt retains its reservation. The run records the failed read, reason and provider reference when available.
+
 Coverage, technical issue and automatic review flows can put relationship, ranking and decision-reuse tasks ahead of matching. These tasks prioritize the selected local pairs and preserve the exhaustive fallback. Cross-project recommendations continue through Connections. The paired comparison evaluates evidence quality separately from the approvals governing project records and GitHub.
 
 #### Revised development phases

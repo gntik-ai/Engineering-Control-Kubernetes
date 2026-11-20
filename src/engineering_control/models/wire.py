@@ -22,6 +22,7 @@ class Wire:
     # Of the tokens read new, the ones the provider wrote to its cache on the way:
     # some providers charge more for these than for a token only read.
     cache_written: int = 0
+    provider_ref: str | None = None
 
 
 class WireError(Exception):
@@ -35,11 +36,21 @@ class WireError(Exception):
     - ``late``: asked in a batch, it was not answered before the batch ended.
     """
 
-    def __init__(self, kind: str, detail: str, *, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        *,
+        retry_after: float | None = None,
+        metered: Wire | None = None,
+        provider_ref: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.kind = kind
         self.detail = detail
         self.retry_after = retry_after
+        self.metered = metered
+        self.provider_ref = provider_ref
 
 
 def said(value: object, limit: int = 300) -> str:

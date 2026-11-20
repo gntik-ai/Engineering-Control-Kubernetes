@@ -397,6 +397,12 @@ class EvidenceControlInput(PlainChangeInput):
     action: Literal["stop", "resume", "end"]
 
 
+class EvidenceDecisionInput(PlainChangeInput):
+    scope: Literal["full", "partial", "unrelated", "unclear"]
+    note: str = Field(default="", max_length=2000)
+    expected_revision: UUID | None = None
+
+
 class ReviewBudgetInput(PlainChangeInput):
     expected_limit: int | None = Field(ge=0, le=9_007_199_254_740_991, strict=True)
     token_limit: int = Field(ge=0, le=9_007_199_254_740_991, strict=True)

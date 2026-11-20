@@ -1,5 +1,5 @@
-import { Alert, Button, Input } from '@gntik-ai/ui';
-import { useEffect, useState } from 'react';
+import { Alert, Button, Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Tabs, TabsList, TabsTab, Textarea } from '@gntik-ai/ui';
+import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource, type FlowDocument } from '../api';
 import { useProjects } from '../parts';
 import { projectScope } from '../router';
@@ -12,7 +12,8 @@ type Source = { title: string; repository: string; number: number | null; revisi
 type Pair = { id: string; issue: Source; story: Source; reason: string; decision: string };
 type Preview = { flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
 type Run = { id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
-  arms: {arm: string; scope: string; evidence: string; tokens: number; input: number; output: number; eur: string | null}[] };
+  failed_request?: {arm: string; reason: string; provider_ref?: string | null};
+  arms: {arm: string; scope: string | null; evidence: string; tokens: number; input: number; output: number; eur: string | null; provider_ref?: string | null}[] };
 type Status = { paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
 const keyOf = (m: Model) => JSON.stringify([m.provider, m.model]);
 const active = ['queued','calling','held','stopping','paused'];
@@ -107,11 +108,89 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
       {run.cached_from && <p>Reused both answers from a completed comparison. The arm totals below are from that run.</p>}
       {run.detail && <p>{run.detail}</p>}{run.sample && <p>{run.sample.join(' → ')}</p>}
       {run.steps.length>0 && <p>{run.steps.map(s=>labels[s.task]).join(' → ')}</p>}
-      {run.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'}</strong> · {a.scope} · {a.input} input / {a.output} output tokens · {a.eur===null?'EUR estimate unavailable':'€'+a.eur} · {a.evidence}</p>)}
+      {run.failed_request && <p>{run.failed_request.arm === 'wiki' ? 'Wiki excerpts' : 'Original passages'} · {run.failed_request.reason}{run.failed_request.provider_ref && ' · Provider reference '+run.failed_request.provider_ref}</p>}
+      {run.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'}</strong> · {a.scope ?? 'No verdict'} · {a.input} input / {a.output} output tokens · {a.eur===null?'EUR estimate unavailable':'€'+a.eur}{a.evidence && ' · '+a.evidence}</p>)}
       <div className="flex gap-2">{['queued','calling'].includes(run.state) && <Button size="sm" variant="secondary" disabled={busy} onClick={()=>void change('stop')}>Stop</Button>}
         {['paused','held'].includes(run.state) && <><Button size="sm" disabled={busy} onClick={()=>void change('resume')}>Resume</Button><Button size="sm" variant="secondary" disabled={busy} onClick={()=>void change('end')}>End run</Button></>}</div>
     </div>}
+    {!draft && <VerdictReviews path={path+'/reviews'} latest={run ? run.id+' '+run.state : ''}/>}
   </section>;
+}
+
+type Judgment = {scope: string; note: string; revision: string};
+type ReviewRow = {id:string; issue:string; story:string; original:string|null; wiki:string|null; decision:string|null};
+type ReviewDetail = {id:string; issue:Source; story:Source; arms:Run['arms']; decision:Judgment|null};
+const scopeText = (value: string | null) => value ? value.charAt(0).toUpperCase()+value.slice(1) : 'No verdict';
+
+function ReviewDecision({path, review, saved}: {path:string; review:ReviewDetail; saved:()=>void}) {
+  const [scope,setScope] = useState(review.decision?.scope ?? '');
+  const [note,setNote] = useState(review.decision?.note ?? '');
+  const [busy,setBusy] = useState(false);
+  const [problem,setProblem] = useState('');
+  async function save() {
+    if (!scope || busy) return;
+    setBusy(true); setProblem('');
+    try {
+      await postJson(path, {scope, note, expected_revision:review.decision?.revision ?? null});
+      saved();
+    } catch(e) {setProblem(e instanceof Error ? e.message : 'Could not save this judgment.');}
+    finally {setBusy(false);}
+  }
+  return <div className="grid gap-3">
+    <div><strong>Technical issue</strong><Passage row={review.issue}/></div>
+    <div><strong>User Story</strong><Passage row={review.story}/></div>
+    {review.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'} · {scopeText(a.scope)}</strong><br/>{a.evidence}</p>)}
+    <label className="grid gap-1">Your judgment<select className={optionsClass} value={scope} onChange={e=>setScope(e.target.value)}>
+      <option value="" disabled>Select a scope</option>
+      {['full','partial','unrelated','unclear'].map(v=><option key={v} value={v}>{scopeText(v)}</option>)}
+    </select></label>
+    <label className="grid gap-1">Evidence or criterion (optional)<Textarea value={note} onValueChange={setNote} maxLength={2000} rows={2}/></label>
+    {problem && <Alert tone="warning" title={problem}/>}
+    <div><Button size="sm" loading={busy} disabled={busy || !scope} onClick={()=>void save()}>Save judgment</Button></div>
+  </div>;
+}
+
+function ReviewDialog({path, close, saved}: {path:string; close:()=>void; saved:()=>void}) {
+  const item=useResource<ReviewDetail>(apiUrl(path));
+  return <Dialog open onOpenChange={open=>{if(!open)close();}}>
+    <DialogContent size="lg">
+      <DialogHeader><DialogTitle>Review comparison</DialogTitle>
+        <DialogDescription>Your judgment applies to these saved passages. Project links have their own approval process.</DialogDescription></DialogHeader>
+      <DialogBody>{item.error ? <Alert tone="warning" title={item.error}/> : item.data ?
+        <ReviewDecision path={path} review={item.data} saved={saved}/> : <p>Loading evidence…</p>}</DialogBody>
+    </DialogContent>
+  </Dialog>;
+}
+
+function VerdictReviews({path,latest}: {path:string; latest:string}) {
+  const [state,setState]=useState('pending');
+  const [page,setPage]=useState(1);
+  const [opened,setOpened]=useState('');
+  const list=useResource<{total:number;page:number;items:ReviewRow[]}>(apiUrl(path,{state,page}));
+  const reload=list.reload;
+  const previous=useRef(latest);
+  useEffect(()=>{if(previous.current!==latest){previous.current=latest;reload();}},[latest,reload]);
+  const columns:DataTableColumn<ReviewRow>[]=[
+    {id:'issue',header:'Technical issue',accessor:r=>r.issue,sortable:false},
+    {id:'story',header:'User Story',accessor:r=>r.story,sortable:false},
+    {id:'original',header:'Original',accessor:r=>scopeText(r.original),sortable:false},
+    {id:'wiki',header:'Wiki',accessor:r=>scopeText(r.wiki),sortable:false},
+    ...(state==='reviewed'?[{id:'decision',header:'Your judgment',accessor:(r:ReviewRow)=>scopeText(r.decision),sortable:false}]:[]),
+    {id:'review',header:'Action',sortable:false,cell:r=><Button size="sm" variant="secondary" onClick={()=>setOpened(r.id)}>Review</Button>},
+  ];
+  return <div className="grid gap-2 border-t border-border pt-3">
+    <h3 className="font-semibold">Review model verdicts</h3>
+    <p className="text-sm text-muted-foreground">Review comparisons marked Unrelated or Unclear and cases where the two readings disagree.</p>
+    <Tabs value={state} onValueChange={v=>{setState(String(v));setPage(1);}}>
+      <TabsList aria-label="Verdict review status"><TabsTab value="pending">Pending</TabsTab><TabsTab value="reviewed">Reviewed</TabsTab></TabsList>
+    </Tabs>
+    {list.error && <Alert tone="warning" title={list.error}/>}
+    {list.data && <DataTable caption="Model verdicts" rows={list.data.items} columns={columns} getRowId={r=>r.id}
+      selectionMode="none" showColumnMenu={false} paginationMode="server" paginated={list.data.total>10}
+      page={list.data.page} pageSize={10} pageSizeOptions={[10]} rowCount={list.data.total} loading={list.loading}
+      emptyState={state==='pending'?'No comparisons awaiting review.':'No reviewed comparisons.'} onQueryChange={q=>setPage(q.page)}/>}
+    {opened && <ReviewDialog key={opened} path={path+'/'+opened} close={()=>setOpened('')} saved={()=>{setOpened('');reload();}}/>}
+  </div>;
 }
 
 export function DesignerEvidence({draft}: {draft:FlowDocument}) {

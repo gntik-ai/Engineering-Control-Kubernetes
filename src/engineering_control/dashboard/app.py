@@ -31,7 +31,13 @@ from fastapi.responses import (
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
-from engineering_control.dashboard import review_budget, review_evidence, review_flows, stats
+from engineering_control.dashboard import (
+    evidence_verdicts,
+    review_budget,
+    review_evidence,
+    review_flows,
+    stats,
+)
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_COOKIE,
@@ -76,6 +82,7 @@ from engineering_control.dashboard.schemas import (
     EpicQueueInput,
     EvaluationInput,
     EvidenceControlInput,
+    EvidenceDecisionInput,
     EvidencePreviewInput,
     EvidenceRunInput,
     ExecutionPlanInput,
@@ -1790,6 +1797,61 @@ def create_app(
             subject=name,
             max_bytes=300_000,
             record=False,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/evidence/reviews")
+    async def evidence_reviews(
+        name: str,
+        request: Request,
+        state: Literal["pending", "reviewed"] = "pending",
+        page: int = Query(1, ge=1, le=10_000_000),
+    ) -> Response:
+        auth = await require_session(request, api=True)
+        if isinstance(auth, Response):
+            return auth
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    evidence_verdicts.listing,
+                    repo(request).sessions,
+                    name,
+                    state == "reviewed",
+                    page,
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/evidence/reviews/{run_id}")
+    async def evidence_review_detail(name: str, run_id: UUID, request: Request) -> Response:
+        auth = await require_session(request, api=True)
+        if isinstance(auth, Response):
+            return auth
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    evidence_verdicts.detail, repo(request).sessions, name, run_id
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Comparison not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/evidence/reviews/{run_id}")
+    async def evidence_review_decision(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            EvidenceDecisionInput,
+            lambda b: asyncio.to_thread(
+                evidence_verdicts.decide,
+                repo(request).sessions,
+                name,
+                run_id,
+                b.scope,
+                b.note,
+                b.expected_revision,
+            ),
+            event="project.evidence_verdict_reviewed",
+            subject=f"{name}/{run_id}",
         )
 
     @app.post("/api/dashboard/projects/{name}/evidence/runs")
