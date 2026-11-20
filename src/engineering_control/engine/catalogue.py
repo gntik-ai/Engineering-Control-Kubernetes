@@ -1226,6 +1226,12 @@ TASKS["review.guidance"] = TaskType(
         Param("stage", "choice", "all", "Review stage.", choices=reviews.STAGES),
     ),
 )
+_COVERAGE_BATCH = Param(
+    "eight_story_batches",
+    "bool",
+    False,
+    "Compare up to eight Stories per request using the complete issue text.",
+)
 for review_action, (review_name, review_summary) in reviews.ACTIONS.items():
     TASKS["review." + review_action] = TaskType(
         "review." + review_action,
@@ -1249,6 +1255,7 @@ for review_action, (review_name, review_summary) in reviews.ACTIONS.items():
                 low=1,
                 high=32768,
             ),
+            *((_COVERAGE_BATCH,) if review_action == "coverage" else ()),
         ),
     )
 
