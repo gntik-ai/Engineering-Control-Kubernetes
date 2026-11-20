@@ -39,7 +39,7 @@ spec:
                     values: ["aibot"]
       containers:
         - name: pause-coverage
-          image: ghcr.io/gntik-ai/engineering-control-kubernetes:88a50bb96153672ea44a441c1e4cf617952a79ad
+          image: engineering-control
           command: ["python", "-c"]
           args:
             - |
