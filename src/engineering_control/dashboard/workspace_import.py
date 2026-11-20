@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import coverage_preview
+from engineering_control.dashboard import coverage_preview, review_budget
 from engineering_control.dashboard.issue_coverage import Coverage, technical_items
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -239,6 +239,7 @@ class WorkspaceImports:
                 "stage": row.stage if row else "new",
                 "version": row.version if row else 0,
                 "busy": busy,
+                "budget_held": bool(review_budget.status(session, project.id)["required"]),
                 "coverage_run": progress.get("coverage_run"),
                 "control_id": review_control(row) if row else None,
                 "scan_state": progress.get("scan_state") if row and row.stage in PHASES else None,
@@ -335,6 +336,7 @@ class WorkspaceImports:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             row = db.get(WorkspaceImport, project.id)
+            review_budget.require_available(db, project.id)
             if project.paused_at:
                 raise ProjectConflict("Resume the project to run its coverage check.")
             if not row or row.stage not in (*KINDS, "complete"):
@@ -460,6 +462,8 @@ class WorkspaceImports:
                 if managed
                 else (row.progress.get("scan_state") if scan else job.get("state"))
             )
+            if resume and (managed or row.stage in KINDS):
+                review_budget.require_available(db, project.id)
             if resume and project.paused_at:
                 raise ProjectConflict("Resume the project before resuming this review.")
             if resume and state != "paused":
@@ -537,6 +541,7 @@ class WorkspaceImports:
                 .where(
                     ProjectRecord.archived_at.is_(None),
                     ProjectRecord.paused_at.is_(None),
+                    ProjectRecord.id.not_in(review_budget.held_projects()),
                     WorkspaceImport.stage.in_((*KINDS, "complete")),
                     WorkspaceImport.progress["coverage_run"]["state"].as_string() == "running",
                     WorkspaceImport.lease.is_(None)
@@ -588,6 +593,8 @@ class WorkspaceImports:
                 raise ProjectConflict("Reload the import to continue from its current stage")
             if row.lease and row.lease_until and _aware(row.lease_until) > datetime.now(UTC):
                 raise ProjectConflict("This import step is already running")
+            if row.stage in KINDS or links_only:
+                review_budget.require_available(session, project.id)
             run_state = coverage_run_state(row)
             previous = row.progress.get("operation") or {}
             if resume_id and (
@@ -1028,6 +1035,10 @@ class WorkspaceImports:
                 progress, suggestions, coverage = await self.review.propose(name, row, models)
                 result = Update(row.stage, progress, suggestions=suggestions, coverage=coverage)
                 row = await asyncio.to_thread(self._release, name, first.lease, result)
+        except review_budget.ReviewBudgetHeld as exc:
+            await asyncio.to_thread(self._defer_for_budget, name, first.lease, str(exc))
+            if propagate:
+                raise
         except asyncio.CancelledError:
             try:
                 await asyncio.to_thread(self._release, name, first.lease, None)
@@ -1051,6 +1062,28 @@ class WorkspaceImports:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+
+    def _defer_for_budget(self, name: str, lease: UUID | None, reason: str) -> None:
+        # Managed coverage is picked up by the scheduler after authorization. A
+        # standalone review keeps its ordinary Resume button and saved checkpoint.
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.get(WorkspaceImport, project.id)
+            if not row or row.lease != lease:
+                return
+            progress = {
+                k: v for k, v in row.progress.items() if k not in ("activity", "checked", "found")
+            }
+            job = progress.get("operation") or {}
+            if job.get("state") == "running":
+                progress["operation"] = {
+                    **job,
+                    "state": "interrupted" if coverage_run_state(row) == "running" else "paused",
+                    "detail": reason,
+                }
+            row.progress = progress
+            row.lease = row.lease_until = None
+            row.version += 1
 
     def _launch_review(self, name: str, row: WorkspaceImport, models: Models | None) -> None:
         task = asyncio.create_task(self._run_review(name, row, models), name=str(row.lease))
@@ -1118,6 +1151,9 @@ class WorkspaceImports:
                 finally:
                     await github.revoke(token)
             await asyncio.to_thread(self._release, name, row.lease, result)
+        except review_budget.ReviewBudgetHeld as exc:
+            await asyncio.to_thread(self._defer_for_budget, name, row.lease, str(exc))
+            raise
         except asyncio.CancelledError:
             try:
                 await asyncio.shield(asyncio.to_thread(self._release, name, row.lease, None))

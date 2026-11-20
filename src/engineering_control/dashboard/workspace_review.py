@@ -15,6 +15,7 @@ from uuid import UUID
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.coverage_preview import proposal_version, remember_proposal
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
@@ -30,7 +31,6 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.workspace_costs import record_model_usage
 from engineering_control.dashboard.workspace_issues import (
     add_story_links,
     import_issues,
@@ -816,7 +816,10 @@ class WorkspaceReview:
             )
         await asyncio.to_thread(self._verify_owner, row)
         try:
-            reply = await models.ask(
+            reply = await review_budget.ask_review(
+                self.sessions,
+                row.project_id,
+                models,
                 Question(
                     choices=((row.provider, row.model),),
                     system=f"Review {row.stage}. {INSTRUCTIONS[row.stage]} {task} "
@@ -827,13 +830,13 @@ class WorkspaceReview:
                     seconds=180 if bulk else 90,
                     on_text=observer,
                 ),
+                "project_coverage" if run.get("state") == "running" else "repository_review",
                 retry=not bulk,
             )
         except ModelError as error:
             raise ProjectConflict(
                 f"The model could not finish this review step: {error}"
             ) from error
-        await asyncio.to_thread(record_model_usage, self.sessions, row, reply)
         suggestions = []
         if mode == "existing":
             responses = reply.data["records"]

@@ -11,10 +11,15 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import case, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import ProviderAccount, WorkspaceImport, WorkspaceModelUsage
+from engineering_control.db.models import (
+    ProjectReviewBudget,
+    ProviderAccount,
+    WorkspaceImport,
+    WorkspaceModelUsage,
+)
 from engineering_control.models.providers import BY_KEY, cost_of
 from engineering_control.models.service import Reply
 
@@ -53,9 +58,33 @@ def record_project_usage(
     model: str | None,
     reply: Reply,
     workflow: str = "project_planning",
+    reserved: int = 0,
 ) -> None:
     # Save the metered response independently of a later proposal validation or stage retry.
     with sessions.begin() as session:
+        tokens = reply.usage.get("tokens")
+        if tokens is None and all(
+            type(reply.usage.get(k)) is int and reply.usage[k] >= 0 for k in ("input", "output")
+        ):
+            tokens = reply.usage["input"] + reply.usage["output"]
+        if reserved and type(tokens) is int and tokens >= 0:
+            budget = ProjectReviewBudget
+            session.execute(
+                update(budget)
+                .where(budget.project_id == project)
+                .values(
+                    used=budget.used + tokens,
+                    reserved=budget.reserved - reserved,
+                    required=case(
+                        (
+                            (budget.required.is_(None))
+                            & (budget.used + tokens >= budget.token_limit),
+                            1,
+                        ),
+                        else_=budget.required,
+                    ),
+                )
+            )
         session.add(
             WorkspaceModelUsage(
                 project_id=project,

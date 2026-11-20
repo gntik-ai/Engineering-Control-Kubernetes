@@ -15,6 +15,7 @@ from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.db.models import (
     BacklogItem,
     PlanningReview,
+    ProjectConnection,
     ProjectRecord,
     ProjectUserStory,
     StoryIssueCoverage,
@@ -234,16 +235,25 @@ def test_stop_automatic_queue_and_individual_reviews_preserves_progress(tmp_path
         client.__exit__(None, None, None)
 
 
-def test_connection_stop_excludes_wakeups_and_preserves_checkpoint(tmp_path: Path) -> None:
+@pytest.mark.parametrize("previous", ["queued", "failed", "ready"])
+def test_connection_stop_excludes_wakeups_and_preserves_checkpoint(
+    tmp_path: Path, previous: str
+) -> None:
     client, repo = _authenticated_client(tmp_path)
     try:
         key = write(client, F, other="falcone-serverless", relation="depends_on").json()["id"]
         path = F + "/" + key
+        with repo.sessions.begin() as db:
+            row = db.scalar(select(ProjectConnection))
+            row.status = previous
+            row.progress = {"cursor": "saved", "run_id": "existing-run"}
         c = client.get(path).json()
         assert (
             write(client, path + "/pause", paused=True, control_id=c["control_id"]).status_code
             == 200
         )
+        with repo.sessions() as db:
+            assert db.scalar(select(ProjectConnection)).progress["cursor"] == "saved"
         assert repo.connection_analysis.claim() is None
         assert write(client, path + "/analyze").status_code == 409
         c = client.get(path).json()

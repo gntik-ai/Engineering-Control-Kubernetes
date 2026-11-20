@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
@@ -25,7 +26,6 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.workspace_costs import record_project_usage
 from engineering_control.dashboard.workspace_review import FIELDS, STRING, gap_identity, shape
 from engineering_control.db.models import (
     BacklogItem,
@@ -212,6 +212,7 @@ class PlanningAnalysis:
                     ProjectRecord.archived_at.is_(None),
                     ProjectRecord.paused_at.is_(None),
                     ProjectRecord.planning_reviews_paused_at.is_(None),
+                    ProjectRecord.id.not_in(review_budget.held_projects()),
                     func.coalesce(ProjectRecord.planning_model, WorkspaceImport.model).is_not(None),
                 )
                 .order_by(j.due_at, j.created_at, j.record_id)
@@ -488,6 +489,19 @@ class PlanningAnalysis:
             job.due_at = datetime.now(UTC) + timedelta(seconds=30 * job.attempts)
             job.result = {**job.result, "detail": message[:400]}
 
+    def defer_for_budget(self, key: Key, token: UUID) -> None:
+        with self.sessions.begin() as db:
+            db.execute(
+                update(PlanningReview)
+                .where(
+                    PlanningReview.project_id == key[0],
+                    PlanningReview.kind == key[1],
+                    PlanningReview.record_id == key[2],
+                    PlanningReview.lease == token,
+                )
+                .values(status="queued", lease=None, due_at=datetime.now(UTC))
+            )
+
     def owns(self, key: Key, token: UUID) -> bool:
         with self.sessions() as db:
             job = db.get(PlanningReview, key)
@@ -535,7 +549,10 @@ class PlanningAnalysis:
                 # starting a second, separately billed request.
                 if not await asyncio.to_thread(self.owns, key, token):
                     return True
-                reply = await models.ask(
+                reply = await review_budget.ask_review(
+                    self.sessions,
+                    key[0],
+                    models,
                     Question(
                         choices=((work.provider, work.model),),
                         system=instruction,
@@ -544,17 +561,11 @@ class PlanningAnalysis:
                         max_tokens=2500 if work.screen else 8000,
                         seconds=150,
                     ),
-                    retry=False,
-                )
-                await asyncio.to_thread(
-                    record_project_usage,
-                    self.sessions,
-                    key[0],
-                    work.model,
-                    reply,
                     "automatic_review_screen" if work.screen else "automatic_review",
                 )
                 await asyncio.to_thread(self.apply, work, reply.data)
+        except review_budget.ReviewBudgetHeld:
+            await asyncio.to_thread(self.defer_for_budget, key, token)
         except ModelError as exc:
             await asyncio.to_thread(self.fail, key, name, token, str(exc), exc.later)
         except ProjectConflict as exc:
@@ -652,6 +663,7 @@ class PlanningAnalysis:
                 "paused": bool(p.planning_reviews_paused_at),
                 "counts": counts,
                 "usage_24h": usage,
+                "review_budget": review_budget.status(db, p.id),
                 "page": page,
                 "pages": pages,
                 "items": [
@@ -699,6 +711,7 @@ class PlanningAnalysis:
                     .values(status="queued", lease=None, due_at=datetime.now(UTC))
                 )
             elif not paused:
+                review_budget.require_available(db, project.id)
                 project.planning_reviews_paused_at = None
             return {"paused": paused}
 

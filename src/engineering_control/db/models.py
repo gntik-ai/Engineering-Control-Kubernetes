@@ -698,6 +698,20 @@ class ProjectUserStory(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class ProjectReviewBudget(Base):
+    """An administrator's cumulative allowance for this project's model reviews."""
+
+    __tablename__ = "project_review_budgets"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    token_limit: Mapped[int] = mapped_column(BigInteger)
+    used: Mapped[int] = mapped_column(BigInteger, default=0)
+    reserved: Mapped[int] = mapped_column(BigInteger, default=0)
+    # The size of the request that put the project on hold. Only an administrator clears it.
+    required: Mapped[int | None] = mapped_column(BigInteger)
+
+
 class StoryIssueCoverage(Base):
     """Checkpoint the imported issue inventory examined for an approved Story."""
 

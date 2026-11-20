@@ -10,6 +10,7 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import (
     KINDS,
@@ -115,6 +116,7 @@ def _connection(
         else "used_by",
         "purpose": c.purpose,
         "status": c.status,
+        "budget_held": bool(review_budget.status(session, c.owner_id)["required"]),
         "control_id": str(c.progress.get("run_id") or c.updated_at.isoformat()),
         "detail": c.detail,
         "checked": instant(c.last_checked),
@@ -428,6 +430,7 @@ class Connections:
             p = active_project(db, name)
             row = _get(db, p.id, key, lock=True)
             _peer(db, row, p.id)
+            review_budget.require_available(db, row.owner_id)
             if row.status == "paused":
                 raise ProjectConflict("Resume the stopped connection analysis first.")
             if provider and model:
@@ -447,7 +450,9 @@ class Connections:
                 or str(row.progress.get("run_id") or row.updated_at.isoformat()) != control_id
             ):
                 raise ProjectConflict("This connection analysis has changed. Reload its status.")
-            if row.status not in (("running", "queued") if paused else ("paused",)):
+            if not paused:
+                review_budget.require_available(db, row.owner_id)
+            if (row.status == "paused") == paused:
                 raise ProjectConflict("The connection analysis is no longer in that state.")
             if paused:
                 row.status, row.lease = "paused", None

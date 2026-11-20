@@ -13,13 +13,13 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     active_project,
 )
-from engineering_control.dashboard.workspace_costs import record_project_usage
 from engineering_control.dashboard.workspace_issues import add_story_links, planning_kind
 from engineering_control.db.models import (
     BacklogItem,
@@ -372,13 +372,26 @@ class IssueCoverage:
                 )
             issues = {r["id"]: r for r in page.issues}
             per_story: dict[str, dict[str, Row]] = defaultdict(dict)
-            for match in matches:
+            uncertain: dict[str, set[str]] = defaultdict(set)
+            problems: dict[str, int] = {}
+            for index, match in enumerate(matches, 1):
                 s, i = match["story"], match["issue"]
                 evidence = match["evidence"].strip()
-                if s not in page.story_versions or i not in issues or not evidence:
-                    raise ProjectInvalid(
-                        "The coverage response must cite a supplied issue, Story and evidence."
-                    )
+                errors = []
+                if i not in issues:
+                    errors.append("issue ID outside the supplied issues")
+                if s not in page.story_versions:
+                    errors.append("Story ID outside the supplied Stories")
+                if not evidence:
+                    errors.append("empty evidence")
+                if errors:
+                    for error in errors:
+                        problems.setdefault(error, index)
+                    # An unrecognizable ID could refer to any member of its dimension.
+                    # Leave those pairs undecided unless separately supported by a valid match.
+                    for story in [s] if s in page.story_versions else page.story_versions:
+                        uncertain[story].update([i] if i in issues else issues)
+                    continue
                 issue = issues[i]
                 if issue["manual_stories"] is not None and s not in issue["manual_stories"]:
                     continue
@@ -391,6 +404,7 @@ class IssueCoverage:
                     "full": match["full"] and issue["state_reason"] != "not_planned",
                     "evidence": evidence[:600],
                 }
+            remaining = 0
             for s, revision in page.story_versions.items():
                 story_id = UUID(s)
                 cache = db.get(StoryIssueCoverage, (project.id, story_id))
@@ -403,8 +417,14 @@ class IssueCoverage:
                     db.add(cache)
                 matches_by_id.update({i: m for i, m in per_story[s].items() if i not in known})
                 allowed = data.eligible(s)
+                pending = (uncertain[s] & allowed) - per_story[s].keys() - known.keys()
+                remaining += len(pending)
                 known.update(
-                    {i: version for i, version in page.issue_versions.items() if i in allowed}
+                    {
+                        i: version
+                        for i, version in page.issue_versions.items()
+                        if i in allowed and i not in pending
+                    }
                 )
                 cache.story_revision, cache.issue_versions = revision, known
                 cache.revision, cache.checked, cache.matches = (
@@ -412,6 +432,17 @@ class IssueCoverage:
                     len(known),
                     list(matches_by_id.values()),
                 )
+        # Commit grounded matches and unaffected negative comparisons before stopping.
+        # The next request uses the same per-pair checkpoint as an ordinary resume.
+        if problems and remaining:
+            batch = digest(
+                [sorted(page.story_versions.items()), sorted(page.issue_versions.items())]
+            )
+            reasons = ", ".join(f"{reason} (match {n})" for reason, n in problems.items())
+            raise ProjectInvalid(
+                f"Coverage batch {batch[:12]} received {reasons}. "
+                f"{remaining} unresolved comparisons in this batch. Resume to retry them."
+            )
 
     async def check(
         self,
@@ -432,7 +463,10 @@ class IssueCoverage:
             )
             if isinstance(page, Coverage):
                 return page
-            reply = await models.ask(
+            reply = await review_budget.ask_review(
+                self.sessions,
+                pid,
+                models,
                 Question(
                     choices=((provider, model),),
                     system=INSTRUCTION,
@@ -441,10 +475,7 @@ class IssueCoverage:
                     max_tokens=6000,
                     seconds=150,
                 ),
-                retry=False,
-            )
-            await asyncio.to_thread(
-                record_project_usage, self.sessions, pid, model, reply, workflow
+                workflow,
             )
             await asyncio.to_thread(
                 self.persist, name, provider, model, page, reply.data["matches"], guard

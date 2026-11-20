@@ -712,6 +712,9 @@ async def test_an_answer_of_another_shape_is_asked_for_once_more(asked: Asked) -
     ) as failed:
         await asked.models.ask(question(("kimi", "model-a")))
     assert (failed.value.label, failed.value.later) == ("no_answer", False)
+    metered = failed.value.metered
+    assert metered and metered.asked == 2 and metered.usage["tokens"] > 0
+    assert metered.text == "" and metered.data == {}
     assert asked.state(account)["state"] == "ready", "the account is not at fault"
     await asked.http.aclose()
 

@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import func, select
 
 from engineering_control.dashboard import issue_coverage
+from engineering_control.dashboard.project_records import ProjectInvalid
 from engineering_control.dashboard.workspace_import import WorkspaceImports
 from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.db.models import (
@@ -22,6 +23,7 @@ from engineering_control.db.models import (
     ProjectStoryEpic,
     ProjectUserStory,
     ProviderAccount,
+    StoryIssueCoverage,
     WorkspaceAction,
     WorkspaceCandidate,
     WorkspaceImport,
@@ -72,7 +74,9 @@ class CoverageModel:
                 matches.append(
                     {
                         "issue": str(uuid4()),
-                        "story": ctx["stories"][0]["id"],
+                        "story": next(
+                            s["id"] for s in ctx["stories"] if s["title"] == "Respond to failures"
+                        ),
                         "full": True,
                         "evidence": "Invalid outside this batch",
                     }
@@ -283,7 +287,7 @@ def test_dashboard_checks_orphans_then_resumes_after_each_approval(
         started = post(client, "import/coverage", version=7).json()
         assert started["coverage_run"]["state"] == "running"
         assert post(client, "import/coverage", version=7).json()["version"] == started["version"]
-        # An invalid later match must not save that page or generate any proposals.
+        # A fabricated ID leaves the affected pairs unresolved and blocks new proposals.
         model.fail_once = True
         failed = drive()
         assert failed["coverage_run"]["state"] == "failed"
@@ -584,5 +588,86 @@ def test_combined_partial_coverage_and_abandoned_history(tmp_path: Path) -> None
                 .where(ProjectIssueStory.story_id == ids["Respond to failures"])
             ).all()
             assert set(linked) == {42, 44, 46, 47}
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("bad_issue", "bad_story", "blank", "expected"),
+    [
+        (True, False, False, "issue ID outside"),
+        (False, True, False, "Story ID outside"),
+        (False, False, True, "empty evidence"),
+        (True, True, True, "empty evidence"),
+    ],
+)
+def test_bad_citation_only_retries_ambiguous_pairs(
+    tmp_path: Path, bad_issue: bool, bad_story: bool, blank: bool, expected: str
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        ids = seed(repo)
+        service = issue_coverage.IssueCoverage(repo.sessions)
+        stories = {str(ids["Audit executions"]), str(ids["Respond to failures"])}
+
+        def next_page() -> issue_coverage.Page | issue_coverage.Coverage:
+            return service.page("falcone", stories, "fixture", "analysis", lambda _: None, False)
+
+        page = next_page()
+        assert isinstance(page, issue_coverage.Page)
+        by_number = {row["number"]: row["id"] for row in page.issues}
+        audit, respond = str(ids["Audit executions"]), str(ids["Respond to failures"])
+        good = {
+            "story": audit,
+            "issue": by_number[41],
+            "evidence": "Durable audit entry",
+            "full": True,
+        }
+        invalid = {
+            "story": "redacted-foreign-story" if bad_story else respond,
+            "issue": "redacted-foreign-issue" if bad_issue else by_number[42],
+            "evidence": "   " if blank else "Redacted criteria",
+            "full": True,
+        }
+        with pytest.raises(ProjectInvalid, match=expected) as exc:
+            service.persist("falcone", "fixture", "analysis", page, [good, invalid], lambda _: None)
+        assert "match 2" in str(exc.value) and "redacted" not in str(exc.value)
+        eligible = {
+            (s, i["id"])
+            for s in stories
+            for i in page.issues
+            if i["manual_stories"] is None or s in i["manual_stories"]
+        }
+        uncertain = {
+            (s, i)
+            for s, i in eligible
+            if (bad_story or s == respond) and (bad_issue or i == by_number[42])
+        }
+        uncertain.discard((audit, by_number[41]))
+        with repo.sessions() as db:
+            checked = {
+                (str(row.story_id), i)
+                for row in db.scalars(select(StoryIssueCoverage))
+                for i in (row.issue_versions or {})
+            }
+        assert checked == eligible - uncertain
+        remaining = next_page()
+        while isinstance(remaining, issue_coverage.Page):
+            pairs = {
+                (s, i["id"])
+                for s in remaining.story_versions
+                for i in remaining.issues
+                if i["manual_stories"] is None or s in i["manual_stories"]
+            }
+            assert pairs and pairs <= uncertain
+            uncertain -= pairs
+            service.persist("falcone", "fixture", "analysis", remaining, [], lambda _: None)
+            remaining = next_page()
+        assert not uncertain
+        assert [m["number"] for m in remaining.matches[audit]] == [41]
+        with repo.sessions.begin() as db:
+            project = db.get(ProjectRecord, ids["project"])
+            assert remaining.link(db, project) == 1
+            assert remaining.link(db, project) == 0
     finally:
         client.__exit__(None, None, None)

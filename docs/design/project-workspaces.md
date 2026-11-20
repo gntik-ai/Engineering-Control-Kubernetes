@@ -1,6 +1,6 @@
 # Project workspaces
 
-The Project is the workspace for a single repository. The Superadmin signs in to the global default Project. The project sidebar provides **Global settings → Accounts** for the subscriptions and API keys shared across projects. The **Administrator Console** houses operational tools such as Flows and Budgets.
+The Project is the workspace for a single repository. The Superadmin signs in to the global default Project. The project sidebar provides **Global settings → Accounts** for the subscriptions and API keys shared across projects. Global settings also houses the shared Flows, Operations, Agents and Commands. Each project has its own automation library and flow assignments. The **Administrator Console** houses operational tools such as execution budgets.
 
 | Phase | Deliverable | Acceptance criteria |
 | --- | --- | --- |
@@ -32,6 +32,14 @@ The acceptance suite exercises a repository with no planning issues and a reposi
 
 The Home charts use UTC days. The daily figures table shows estimated amounts and exchange-rate dates. [Estimated project cost and optional finalized billing](../../deploy/README.md#estimated-project-cost)
 
+
+## Review spending and coverage recovery
+
+In **Home → Review token budget**, the administrator can authorize a cumulative token limit shared by automatic planning reviews, Epic and Story generation, technical issue linking, coverage checks and analyses of connections owned by the project. Existing projects start with their current review settings and no configured limit. Usage counts from the first authorization. Each request reserves capacity for its input and maximum output before contacting the provider. Confirmed provider usage settles the reservation. A request with unknown usage keeps its reservation.
+
+If a request cannot fit, the workers wait at their saved checkpoints. The Home tab shows metered, reserved and available tokens and the capacity needed for the next request. Authorizing a sufficient total limit releases the spending hold. Reviews stopped by an operator keep their own Resume controls. A limit of zero holds new model reviews.
+
+If an issue comparison returns an unknown issue ID, unknown Story ID or blank evidence, coverage records the condition and batch reference. It checkpoints supported matches and unaffected comparisons. Resuming retries unresolved pairs, and the normal approval process still governs proposals.
 
 ## Automatic planning reviews
 

@@ -1,4 +1,4 @@
-import { Alert, Button, Field, FieldLabel, Link, SimpleSelect } from '@gntik-ai/ui';
+import { Alert, Button, Field, FieldLabel, Input, Link, SimpleSelect } from '@gntik-ai/ui';
 import { useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
@@ -20,7 +20,9 @@ const labels: Record<string, string> = {
   paused: 'Stopped', queued: 'Queued', running: 'Reviewing', needs_input: 'Needs input', failed: 'Review interrupted',
   covered: 'Already covered', proposals: 'Proposals created', matched: 'Ready for approval',
 };
+type ReviewBudget = { limit: number | null; used: number; reserved: number; required: number | null };
 type ReviewPage = {
+  review_budget?: ReviewBudget;
   usage_24h?: { requests: number; tokens: number };
   paused: boolean; counts: Record<string, number>; page: number; pages: number;
   provider: string | null; model: string | null; models: { provider: string; model: string }[];
@@ -62,6 +64,39 @@ export function RecordReview({ project, kind, id, result, reload }: {
   </details>;
 }
 
+function TokenBudget({ project, budget, reload }: { project: string; budget: ReviewBudget; reload: () => void }) {
+  const [entry, setEntry] = useState('');
+  const [previous, setPrevious] = useState<number | null>(budget.limit);
+  const limit = Number(entry);
+  const available = Math.max(0, (budget.limit ?? 0) - budget.used - budget.reserved);
+  const save = useSubmit(() => postJson('projects/' + encodeURIComponent(project) + '/review-budget', {
+    expected_limit: previous, token_limit: limit,
+  }), () => { setEntry(''); reload(); });
+  return <section className="grid gap-2 rounded-xl border border-border bg-card p-5" aria-label="Review token budget">
+    <h3 className="font-semibold">Review token budget</h3>
+    <p className="text-sm text-muted-foreground">Automatic reviews, planning and coverage checks, and connection analysis share this project’s allowance.</p>
+    {budget.limit !== null ? <p className="text-sm">{available.toLocaleString()} tokens available of {budget.limit.toLocaleString()} · {budget.used.toLocaleString()} metered
+      {budget.reserved > 0 && <> · {budget.reserved.toLocaleString()} reserved for requests awaiting confirmed usage</>}</p>
+      : <p className="text-sm">No token limit configured.</p>}
+    {budget.required !== null && <Alert tone="warning" title="Review spending is on hold">
+      {budget.limit === 0 ? 'Authorize a positive limit to allow new model reviews.' :
+        <>Authorize capacity for at least {budget.required.toLocaleString()} more tokens to continue queued work.</>}
+    </Alert>}
+    <form className="flex flex-wrap items-end gap-2" onSubmit={event => { event.preventDefault(); if (!save.pending && entry) void save.submit(); }}>
+      <Field><FieldLabel>Total token limit</FieldLabel>
+        <Input type="number" min={0} step={1} max={Number.MAX_SAFE_INTEGER} required value={entry}
+          placeholder={budget.limit?.toString()} onChange={event => {
+            if (!entry || !event.target.value) setPrevious(budget.limit);
+            setEntry(event.target.value);
+          }} />
+      </Field>
+      <Button type="submit" size="sm" variant="secondary" loading={save.pending}
+        disabled={save.pending || !entry || !Number.isSafeInteger(limit) || limit < 0}>Authorize limit</Button>
+    </form>
+    {save.problem && <Alert tone="warning" title={save.problem} />}
+  </section>;
+}
+
 export function PlanningReviews({ project }: { project: string }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning-reviews';
   const [page, setPage] = useState(1);
@@ -74,10 +109,12 @@ export function PlanningReviews({ project }: { project: string }) {
     const [provider, model] = JSON.parse(choice) as [string, string];
     return postJson(path + '/model', { provider, model });
   }, () => { setChoice(''); resource.reload(); });
-  return <section className="grid gap-3 rounded-xl border border-border bg-card p-5">
+  return <>
+    {data?.review_budget && <TokenBudget project={project} budget={data.review_budget} reload={resource.reload} />}
+    <section className="grid gap-3 rounded-xl border border-border bg-card p-5">
     <div className="flex flex-wrap items-center justify-between gap-2">
       <h3 className="font-semibold">Automatic planning reviews</h3>
-      {data && <Button size="sm" variant="secondary" loading={queue.pending} disabled={queue.pending}
+      {data && <Button size="sm" variant="secondary" loading={queue.pending} disabled={queue.pending || (data.paused && !!data.review_budget?.required)}
         onClick={() => void queue.submit()}>{data.paused ? 'Resume automatic reviews' : 'Stop automatic reviews'}</Button>}
     </div>
     {queue.problem && <Alert tone="warning" title={queue.problem} />}
@@ -112,5 +149,5 @@ export function PlanningReviews({ project }: { project: string }) {
         </div>}
       </details>}
     </>}
-  </section>;
+  </section></>;
 }

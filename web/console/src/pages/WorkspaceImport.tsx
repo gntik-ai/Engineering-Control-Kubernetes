@@ -25,6 +25,7 @@ export interface ImportState {
   description: string | null;
   counts: Record<string, number>;
   busy: boolean;
+  budget_held?: boolean;
   control_id?: string | null;
   scan_state?: 'running' | 'ready' | 'paused' | null;
   activity: ReviewActivity | null;
@@ -95,10 +96,10 @@ export function WorkspaceImport({
     value => { setLatest(value); persisted.reload(); },
   );
   useEffect(() => {
-    if (coverage?.state !== 'running' && !running) return;
+    if ((coverage?.state !== 'running' || state?.budget_held) && !running) return;
     const timer = window.setInterval(persisted.reload, running ? 650 : 2000);
     return () => window.clearInterval(timer);
-  }, [coverage?.state, running, persisted.reload]);
+  }, [coverage?.state, state?.budget_held, running, persisted.reload]);
   const refreshModels = useSubmit(
     () => {
       setRefreshNote('');
@@ -215,23 +216,24 @@ export function WorkspaceImport({
       <section aria-label="Project coverage" className="grid justify-items-start gap-2">
         <div className="flex flex-wrap items-center gap-2">
         {!pausedCoverage && <Button
-          loading={coverage?.state === 'running' || checkCoverage.pending}
-          disabled={!eligible || !model || state.busy || linksOnly.pending || state.operation?.state === 'paused' || checkCoverage.pending || coverage?.state === 'running' || coverage?.state === 'waiting'}
+          loading={(coverage?.state === 'running' && !state.budget_held) || checkCoverage.pending}
+          disabled={state.budget_held || !eligible || !model || state.busy || linksOnly.pending || state.operation?.state === 'paused' || checkCoverage.pending || coverage?.state === 'running' || coverage?.state === 'waiting'}
           onClick={() => void checkCoverage.submit()}
         >
-          {coverage?.state === 'running' ? 'Checking project coverage'
+          {coverage?.state === 'running' ? (state.budget_held ? 'Coverage waiting for tokens' : 'Checking project coverage')
             : coverage?.state === 'failed' ? 'Resume project coverage check' : 'Check project coverage'}
         </Button>}
         {eligible && !managed && !pausedCoverage && coverage?.state !== 'failed' && <Button size="sm" variant="secondary"
-          loading={linksOnly.pending} disabled={!model || state.busy || linksOnly.pending || checkCoverage.pending || state.operation?.state === 'paused'}
+          loading={linksOnly.pending} disabled={state.budget_held || !model || state.busy || linksOnly.pending || checkCoverage.pending || state.operation?.state === 'paused'}
           onClick={() => void linksOnly.submit()}>Link existing issues only</Button>}
         {state.control_id && (managed || pausedCoverage) && <ReviewControl path={path} id={state.control_id}
           paused={pausedCoverage} saved={saved} reload={persisted.reload} />}
         </div>
         {eligible && !managed && <CoveragePreview path={path} version={state.version} model={model} disabled={state.busy} />}
+        {state.budget_held && eligible && <p role="status" className="text-sm">Model reviews are waiting for authorization under Review token budget.</p>}
         {coverage ? (
           <div role="status" className="text-sm">
-            {coverage.state === 'running' && <p>{coverage.match_existing ? 'Matching imported issues to existing User Stories' : labels[state.stage]}</p>}
+            {coverage.state === 'running' && !state.budget_held && <p>{coverage.match_existing ? 'Matching imported issues to existing User Stories' : labels[state.stage]}</p>}
             {pausedCoverage && <p>Project coverage stopped. Resume from the last saved batch.</p>}
             {coverage.state === 'completed' && <p>Coverage check complete.{coverage.orphans !== undefined && (
               coverage.orphans === 0 ? ' All imported technical issues are linked.' :
