@@ -39,10 +39,12 @@ interface Carried {
 
 function TaskList({
   catalogue,
+  reviewTask,
   onAdd,
   onRemoved,
 }: {
   catalogue: FlowCatalogue;
+  reviewTask?: string;
   onAdd: (carried: Carried) => void;
   onRemoved: () => void;
 }) {
@@ -50,7 +52,8 @@ function TaskList({
   const wanted = search.trim().toLowerCase();
   const fits = (...texts: string[]) => !wanted || texts.some((text) => text.toLowerCase().includes(wanted));
   // A kind of task that was left out of the list on the Tasks page is not offered here.
-  const offered = catalogue.tasks.filter((task) => !catalogue.hidden?.includes(task.key));
+  const offered = catalogue.tasks.filter((task) => !catalogue.hidden?.includes(task.key)
+    && (!reviewTask || task.key === reviewTask || task.key === "review.guidance"));
   const groups = [...new Set(offered.map((task) => task.group))];
   const types = taskTypes(catalogue);
   const drag = (carried: Carried) => (event: DragEvent) => {
@@ -87,7 +90,7 @@ function TaskList({
       </div>
     </li>
   );
-  const saved = catalogue.saved.filter((item) => fits(item.name, types.get(item.task)?.title ?? ''));
+  const saved = catalogue.saved.filter((item) => (!reviewTask || offered.some(t=>t.key===item.task)) && fits(item.name, types.get(item.task)?.title ?? ''));
   return (
     <div className="grid content-start gap-3">
       <Input
@@ -501,7 +504,7 @@ export function Designer({
   return (
     <div className="grid gap-4 xl:grid-cols-[16rem_minmax(0,1fr)_20rem]">
       <div className="max-h-[45rem] overflow-y-auto pr-1">
-        <TaskList catalogue={catalogue} onAdd={addAfterSelected} onRemoved={onCatalogueChanged} />
+        <TaskList catalogue={catalogue} reviewTask={document.tasks.find(n=>n.task.startsWith("review.") && n.task!=="review.guidance")?.task} onAdd={addAfterSelected} onRemoved={onCatalogueChanged} />
       </div>
       <div
         className="overflow-hidden rounded-lg border border-border"

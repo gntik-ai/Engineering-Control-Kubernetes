@@ -9,6 +9,7 @@ export const accountsUrl = (project?: string | null) =>
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
 export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');
+export const statsUrl = (project?: string | null) => BASE + '/settings/stats' + (project ? '?' + new URLSearchParams({project}) : '');
 export const connectionsUrl = (name: string, id?: string) => workspaceUrl(name) + '/settings/connections' + (id ? '?connection=' + encodeURIComponent(id) : '');
 export const recordUrl = (name: string, kind: string, id: string) => workspaceUrl(name) + '?' + new URLSearchParams({ tab: kind, record: id }).toString();
 export const automationViews = ['flows', 'flow', 'operations', 'assignments', 'agents', 'commands'] as const;

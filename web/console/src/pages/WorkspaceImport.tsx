@@ -9,6 +9,7 @@ import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity }
 
 export interface ImportState {
   review?: StageReview | null;
+  review_flow?: {key:string; name:string; version:number; id:string} | null;
   stage:
     | 'new'
     | 'inventory'
@@ -195,7 +196,9 @@ export function WorkspaceImport({
       aria-label="Repository analysis"
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold">{labels[state.stage]}</h2>
+        <div><h2 className="text-lg font-semibold">{labels[state.stage]}</h2>
+          {state.review_flow && (state.busy || state.coverage_run?.state === "paused" || state.operation?.state === "paused") && <p className="text-xs text-muted-foreground">{state.review_flow.name} · v{state.review_flow.version}</p>}
+        </div>
         {scanning(state) && state.control_id && <div className="flex items-center gap-2">
           {state.scan_state === 'paused' && <span role="status">Repository analysis stopped</span>}
           <ReviewControl path={path} id={state.control_id} paused={state.scan_state === 'paused'} reload={persisted.reload}

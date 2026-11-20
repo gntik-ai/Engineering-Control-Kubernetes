@@ -104,7 +104,7 @@ class FixtureModel:
     async def aclose(self) -> None:
         pass
 
-    async def ask(self, question: Question) -> Reply:
+    async def ask(self, question: Question, *, retry: bool = True) -> Reply:
         self.questions.append(question)
         return Reply(
             {"description": "A transit routing service."},

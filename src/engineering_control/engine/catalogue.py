@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Final
 
+from engineering_control.engine import reviews
 from engineering_control.engine.conditions import LEGACY
 from engineering_control.github_app import MERGE_METHODS
 from engineering_control.models.providers import API_KEYS, MODEL_NAME
@@ -1134,7 +1135,45 @@ TASKS: Final = {
     for task in _TASKS
 }
 
-# What a run may be granted beyond one task: rounds of correction, minutes and tokens.
+# Typed review tasks are executed by the durable project review workers.
+
+TASKS["review.guidance"] = TaskType(
+    "review.guidance",
+    "Reviews",
+    "Add review instructions",
+    "Apply these instructions to the selected stage before the review task.",
+    "review",
+    params=(
+        Param("instruction", "text", "", "Instructions for the reviewer.", high=8000),
+        Param("stage", "choice", "all", "Review stage.", choices=reviews.STAGES),
+    ),
+)
+for review_action, (review_name, review_summary) in reviews.ACTIONS.items():
+    TASKS["review." + review_action] = TaskType(
+        "review." + review_action,
+        "Reviews",
+        review_name,
+        review_summary,
+        "review",
+        params=(
+            Param(
+                "instruction",
+                "line",
+                "",
+                "Additional instructions applied to every stage.",
+                high=2000,
+            ),
+            Param(
+                "max_output",
+                "int",
+                None,
+                "Maximum output tokens per call, within the stage limit.",
+                low=1,
+                high=32768,
+            ),
+        ),
+    )
+
 BUDGETS: Final = {
     "rounds": Param(
         "rounds",

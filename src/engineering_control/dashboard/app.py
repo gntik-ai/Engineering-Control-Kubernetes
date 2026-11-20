@@ -31,7 +31,7 @@ from fastapi.responses import (
 
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows, stats
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_COOKIE,
@@ -169,6 +169,7 @@ CONSOLE_VIEWS = frozenset(
         "project",
         "backlog",
         "settings/accounts",
+        "settings/stats",
         "runs",
         "run",
         "supervisor",
@@ -1546,12 +1547,22 @@ def create_app(
             raise HTTPException(404, "Flow not found in this library.")
 
     @app.get("/api/dashboard/flows", dependencies=[Depends(verify_scope)])
-    async def flows_api(request: Request) -> Response:
+    async def flows_api(
+        request: Request, page: int | None = None, page_size: int = 10, search: str = ""
+    ) -> Response:
         """The flows a section can be assigned, and for those that run here, the version
         in force and whether a draft is being worked on."""
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
+        if page is not None:
+            if page_size not in (10, 25, 50, 100) or len(search) > 200:
+                raise HTTPException(422, "Invalid page size or search")
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).flows.page, scope(request), page, page_size, search.strip()
+                )
+            )
         return JSONResponse(
             await service(request).flows(
                 scope(request), request.query_params.get("include_shared") == "true"
@@ -1735,6 +1746,47 @@ def create_app(
             lambda _body: service(request).remove_section(name, key),
             event="dashboard.section_removed",
             subject=f"{name}/{key}",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/review-flows")
+    async def review_assignments_api(name: str, request: Request) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(review_flows.assignments, repo(request).sessions, name)
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/review-flows/{action}")
+    async def assign_review_api(name: str, action: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SectionFlowInput,
+            lambda body: asyncio.to_thread(
+                review_flows.assign, repo(request).sessions, name, action, body.flow, body.version
+            ),
+            event="project.review_flow_assigned",
+            subject=f"{name}/{action}",
+        )
+
+    @app.get("/api/dashboard/stats")
+    async def stats_api(request: Request, days: int = 30) -> Response:
+        if days not in (7, 30, 90):
+            raise HTTPException(422, "Choose a 7, 30 or 90 day period")
+        return JSONResponse(
+            await asyncio.to_thread(
+                stats.report,
+                repo(request).sessions,
+                days,
+                repo(request).workspace_metrics.exchange_rates,
+            )
+        )
+
+    @app.get("/api/dashboard/stats/live")
+    async def live_stats_api(request: Request) -> Response:
+        return JSONResponse(
+            await asyncio.to_thread(stats.live, repo(request).sessions),
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.post("/api/dashboard/projects/{name}/sections/{key}/flow")

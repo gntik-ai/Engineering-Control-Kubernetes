@@ -37,6 +37,7 @@ export interface Flow {
 
 /** What a flow that runs on this platform consists of, and which version is in force. */
 export interface FlowEngine {
+  review_action?: string | null;
   key: string;
   name: string;
   summary: string;
@@ -116,7 +117,7 @@ export interface TaskType {
   group: string;
   title: string;
   summary: string;
-  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control' | 'part';
+  where: 'sandbox' | 'bench' | 'model' | 'platform' | 'control' | 'part' | 'review';
   account: boolean;
   writes: boolean;
   publishes: boolean;

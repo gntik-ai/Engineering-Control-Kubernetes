@@ -59,6 +59,7 @@ def record_project_usage(
     reply: Reply,
     workflow: str = "project_planning",
     reserved: int = 0,
+    run_id: UUID | None = None,
 ) -> None:
     # Save the metered response independently of a later proposal validation or stage retry.
     with sessions.begin() as session:
@@ -88,6 +89,7 @@ def record_project_usage(
         session.add(
             WorkspaceModelUsage(
                 project_id=project,
+                review_run_id=run_id,
                 usage={
                     **reply.usage,
                     "workflow": workflow,

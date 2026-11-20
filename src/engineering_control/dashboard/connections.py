@@ -10,7 +10,7 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import (
     KINDS,
@@ -379,6 +379,7 @@ class Connections:
             row.archived_at = datetime.now(UTC)
             row.lease = None
             row.status = "disconnected"
+            review_flows.finish(db, row, "cancelled")
             audit(db, row, "Disconnected by the administrator.")
             return {"id": str(key)}
 
@@ -436,6 +437,7 @@ class Connections:
             if provider and model:
                 row.provider, row.model = provider, model
             if row.status != "running":
+                review_flows.finish(db, row, "cancelled")
                 schedule(row)
                 row.progress = {**row.progress, "watermark": None, "run_id": str(uuid4())}
             return {"id": str(key)}

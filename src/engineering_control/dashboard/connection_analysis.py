@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.connection_records import (
     KINDS,
     RECORD_MODELS,
@@ -103,6 +103,7 @@ class Batch:
     context: dict[str, Any]
     watermark: str
     cursor: str
+    run_id: UUID | None = None
 
 
 def project_pair(db: Session, c: ProjectConnection) -> list[ProjectRecord]:
@@ -118,9 +119,13 @@ def project_pair(db: Session, c: ProjectConnection) -> list[ProjectRecord]:
 
 
 def revision(db: Session, projects: list[ProjectRecord], c: ProjectConnection) -> str:
-    return digest(
-        [*(watermark(db, p) for p in projects), c.purpose, c.dependent_id, c.provider, c.model]
+    inputs = [*(watermark(db, p) for p in projects), c.purpose, c.dependent_id, c.provider, c.model]
+    settings = review_flows.effective_settings(
+        db, c.owner_id, "connections", c.review_run_id, active=True
     )
+    if settings["instructions"] or settings["max_output"]:
+        inputs.append(digest(settings))
+    return digest(inputs)
 
 
 def references(db: Session, c: ProjectConnection, sides: list[Catalog]) -> None:
@@ -288,6 +293,9 @@ class ConnectionAnalysis:
                 status = "needs_model"
             else:
                 rows = []
+                settings = review_flows.effective_settings(
+                    db, c.owner_id, "connections", c.review_run_id, active=True
+                )
                 for side, idx in enumerate(search):
                     for key_id, item in sorted(idx.items.items()):
                         if f"{side}:{key_id}" <= cursor:
@@ -302,6 +310,9 @@ class ConnectionAnalysis:
                                 [n.summary() for n in near],
                             ]
                         )
+                        policy = review_flows.wording(settings, "connections")
+                        if policy:
+                            fingerprint = digest([fingerprint, policy])
                         if done.get(item.key) != fingerprint:
                             rows.append((item, near, fingerprint))
                             if len(rows) >= BATCH:
@@ -325,8 +336,10 @@ class ConnectionAnalysis:
                         context,
                         mark,
                         f"{side}:{rows[-1][0].key}",
+                        review_flows.start(db, c, c.owner_id, "connections"),
                     )
             c.progress = {**c.progress, "watermark": mark}
+            review_flows.finish(db, c, "succeeded")
             self.finish(c, status, 60)
             return None
 
@@ -486,6 +499,7 @@ class ConnectionAnalysis:
                 .with_for_update()
             )
             if row:
+                review_flows.finish(db, row, "failed")
                 self.finish(row, "failed", 600)
                 row.detail = detail[:400]
                 row.progress = {**row.progress, "watermark": row.progress.get("references_mark")}
@@ -544,6 +558,8 @@ class ConnectionAnalysis:
                         max_tokens=5000,
                     ),
                     "connection_review",
+                    run_id=b.run_id,
+                    stage="connections",
                 )
                 await asyncio.to_thread(self.apply, b, reply.data["suggestions"])
         except review_budget.ReviewBudgetHeld:

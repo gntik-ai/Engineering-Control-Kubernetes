@@ -41,6 +41,7 @@ from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.library import traits
 from engineering_control.engine.records import FlowRecords, in_force
+from engineering_control.engine.reviews import action_of
 from engineering_control.flow_library import EVALUATION
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
 from engineering_control.sandbox.runs import FINISHED, Runs, delete_runs, usage_of
@@ -67,10 +68,16 @@ def _follows(run: SandboxRun, key: str) -> bool:
 def sort_of(document: Document) -> str:
     """What a flow works on: an item whose code it changes, or a section it looks at.
     Only runs of flows of one sort can be put next to each other."""
+    if action_of(document):
+        return "review"
     return "item" if traits(document)["writes"] else "section"
 
 
-_SORTS: Final = {"item": "works on an item", "section": "is started for a section"}
+_SORTS: Final = {
+    "item": "works on an item",
+    "section": "is started for a section",
+    "review": "is run by a project review worker",
+}
 
 
 def _elapsed(steps: list[SandboxStep]) -> int:
@@ -194,7 +201,7 @@ class Evaluations:
         if not self.flows.exists(key):
             raise ProjectNotFound(key)
         mine = self._latest(key)
-        if mine is None or mine.part:
+        if mine is None or mine.part or action_of(mine):
             return []
         listed = []
         owners = self.flows.owners()
@@ -202,7 +209,12 @@ class Evaluations:
             if owners.get(other) not in (None, owners.get(key)):
                 continue
             theirs = mine if other == key else self._in_force(other)
-            if theirs is None or theirs.part or sort_of(theirs) != sort_of(mine):
+            if (
+                theirs is None
+                or theirs.part
+                or action_of(theirs)
+                or sort_of(theirs) != sort_of(mine)
+            ):
                 continue
             runs = len(self.candidates(key, of=other, limit=100))
             if other == key or runs:
@@ -289,6 +301,8 @@ class Evaluations:
         document = self.flows.document(key, version)
         if document is None:
             raise ProjectNotFound(f"{key} version {version}")
+        if action_of(document):
+            raise ProjectInvalid("Review flows execute through their assigned project action.")
         if document.part:
             raise ProjectInvalid("A part does not run by itself: try a flow that runs it")
         wrong = validate.errors(document)

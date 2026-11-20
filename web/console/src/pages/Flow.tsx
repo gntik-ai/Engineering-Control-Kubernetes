@@ -499,7 +499,9 @@ function Editor({
   const [problem, setProblem] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const { query } = useLocation();
-  const tab = query.get('tab') ?? 'design';
+  const review = document.tasks.some(node=>node.task.startsWith('review.'));
+  const wanted = query.get('tab') ?? 'design';
+  const tab = review && ['lab','paper','prompts','budgets'].includes(wanted) ? 'design' : wanted;
   // The editor starts again from what is saved whenever that changes.
   useEffect(() => {
     setDocument(copy(saved.document));
@@ -586,9 +588,9 @@ function Editor({
               Take it out as a file
             </Button>
           ) : null}
-          <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setDeleting(true)}>
+          {!(review && detail.versions.some(v=>v.version === 0)) && <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setDeleting(true)}>
             Delete the flow
-          </Button>
+          </Button>}
           {deleting ? (
             <Confirm
               title={`Delete ${saved.document.name}?`}
@@ -683,7 +685,7 @@ function Editor({
           <Alert
             tone="success"
             title="The draft keeps every rule"
-            description="Try it on paper, or on past work in the evaluation lab, before you put it in force."
+            description={review ? "Publishing applies this version to new reviews that follow the latest version." : "Try it on paper, or on past work in the evaluation lab, before you put it in force."}
           />
         ) : null}
         {problems
@@ -697,10 +699,10 @@ function Editor({
             <TabsTab value="tasks" count={document.tasks.length}>
               Tasks
             </TabsTab>
-            <TabsTab value="prompts">Prompts</TabsTab>
+            {!review && <><TabsTab value="prompts">Prompts</TabsTab>
             <TabsTab value="budgets">Budgets</TabsTab>
             <TabsTab value="paper">Try on paper</TabsTab>
-            <TabsTab value="lab">Evaluation lab</TabsTab>
+            <TabsTab value="lab">Evaluation lab</TabsTab></>}
             <TabsTab value="versions" count={detail.versions.length}>
               Versions
             </TabsTab>

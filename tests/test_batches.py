@@ -540,6 +540,7 @@ def test_what_two_questions_of_a_step_used_is_added() -> None:
     second = {"tokens": 50, "input": 40, "output": 10, "cached": 0, "model": "m", "account": "A"}
     assert plus(None) is None and plus(None, second) == second
     assert plus(first, second) == {
+        "components": [first, second],
         "tokens": 150,
         "input": 120,
         "output": 30,

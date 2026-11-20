@@ -58,3 +58,48 @@ Open Settings → Connections in the project sidebar. Dashboard opens the five p
 A connection checks repository-qualified GitHub references in the retained issue history, including closed issues. It shows the original reference while planning is incomplete, then resolves it to an approved local record. The Issues table supports manual links to the other project or to a specific record, a connected-project filter and links back from the target.
 
 When both sides have approved planning, select a model from Accounts for a comparison. The worker reviews records from each project against relevant planning records from its peer. It saves progress and decisions, and checks for new evidence. Analysis usage is attributed to the project that established the connection. Administrators can accept a link or a local edit, dismiss a suggestion, or send missing work to the owning project's planning table. That table handles approval and GitHub publication even after its repository import has completed.
+
+## Flows and Stats delivery phases
+
+Phases 9–14 extend the workspace roadmap above. The project Home retains its Resolved Issues and Cost & Usage summaries.
+
+| Phase | Deliverable | Acceptance criterion |
+| --- | --- | --- |
+| 9 | Paginate the global and project Flow libraries with a searchable gntik-ui table | Search covers the entire visible library. Assignment and copy dialogs can select published definitions on any page. |
+| 10 | Add editable review definitions and project assignments | Manual planning, project coverage, automatic planning, connection analysis and execution planning honor the assigned published definition. Running and paused reviews keep their version. |
+| 11 | Attribute usage and run outcomes | Each new metered review response identifies a project and a logical run. Historical usage with incomplete identity stays visible. |
+| 12 | Add Global Settings → Stats | Show daily API and subscription consumption, a flow/version table with daily drill-down, and a project table and chart in tokens or estimated EUR. |
+| 13 | Consolidate operations reporting | Show daily starts and outcomes, executing runs, cached tokens, sandbox time, evaluations and resolved issues. Remove global reporting from the Flows and Administrator Console landing pages. |
+| 14 | Verify and release | Exercise the UI and scoped assignments with fixtures, reconcile the totals, rehearse migration and check the production rollout and existing review pauses. |
+
+## Study of lower-cost planning reviews
+
+A read-only replay on 20 November 2026 used 332 public Falcone-serverless GitHub records. The controller's classifier identified 16 Epics, 58 User Stories and 258 technical issues. Of 14,964 possible Story–issue pairs, 134 were explicitly named parent links. Another 172 explicit links in the Falcone snapshot referenced those serverless Stories. These cross-repository links were counted separately and contributed no savings to the table below. [Falcone-serverless issues](https://github.com/gntik-ai/falcone-serverless/issues) · [Falcone issues](https://github.com/gntik-ai/falcone/issues)
+
+The replay used the current evidence excerpt, matching instructions, response schema and page limits of six Stories and twelve issues. It held the text and ordering constant across variants, counted the system and user input with OpenAI's o200k_base tokenizer, and made zero provider requests. It modeled a cold inventory with no saved decisions or manual exclusions. Stable synthetic UUIDs stood in for the internal database IDs. Each page included its entire rectangle of candidates, even when that meant sending extra pairs.
+
+| Candidate selection | Pages | Input tokens | Reduction | Explicit parent links retained out of 134 |
+| --- | ---: | ---: | ---: | ---: |
+| Current cold comparison | 220 | 2,500,736 | Baseline | 134 |
+| Same pairs, reversible short IDs within each request | 220 | 2,421,182 | 3.2% | 134 |
+| Four text-ranked Stories per issue | 84 | 860,322 | 65.6% | 124 |
+| Eight text-ranked Stories per issue | 134 | 1,447,673 | 42.1% | 129 |
+| Eight text-ranked Stories plus explicit parent links | 135 | 1,451,800 | 41.9% | 134 |
+| Sixteen text-ranked Stories per issue | 187 | 2,097,253 | 16.1% | 132 |
+
+The text-ranking test used BM25 after removing parent lines, ticket identifiers and issue references from both queries and indexed records. The graph variant deliberately restored the explicit links. Recovery of those 134 links verifies preservation of declared parents. Reviewers still need to judge semantic links, additional parents and previously unlinked issues. The sidebar Stats release supplies the EUR and token measurements for that pilot.
+
+**Cost interpretation.** The graph replay removed 1,048,936 input tokens. At an uncached input tariff of €1 per million, that part alone would save about €1.05 on a cold pass. The example scales with the actual input tariff. Output length, provider prompt caching, any summarization costs and review corrections affect the total. The existing comparison cache can already make an unchanged repeat cost zero. The pilot must compare both approaches with the same cache state and provider. The study did not call a model or measure an invoice.
+
+### Proposed phases appended to the roadmap
+
+| Phase | Change | Verification and decision |
+| --- | --- | --- |
+| 15 | Establish a reference set and cost baseline | Sample approved links, dismissed matches, cross-Epic work, paraphrases, closed work and true orphans from Falcone and Falcone-serverless. Split by Epic or time and keep near-duplicates together. Measure cold imports, one edited Story and unchanged reruns using the current workflow. |
+| 16 | Build a read-only relationship graph in PostgreSQL | Reuse existing Story–Epic, issue–Story and approved project connections. Give source references, human approvals, proposed links and explicit rejections distinct evidence and revision fields. Namespace GitHub IDs by repository. Support many parents and cycle-safe traversal. A Falcone change that names a serverless Story appears as a candidate external link. A parent citation alone cannot establish complete coverage. |
+| 17 | Add a deterministic retrieval command before model review | Collect known neighbors, exact references and pending orphans. Add top-ranked text candidates across Epics and from explicitly connected projects. Use short reversible IDs and preserve the evidence-to-record map. Keep an exhaustive fallback for weak evidence, unresolved orphans and audit samples. Compare top 4, 8 and 16 in shadow mode. |
+| 18 | Make invalidation incremental | On a changed Epic, Story, issue, approved connection or review policy, queue only affected comparisons. Reuse positive and negative decisions with matching record and policy revisions. Keep unchecked pairs distinct from rejected pairs. Preview fresh comparisons and expected tokens. Verify that unchanged reruns make zero new matching calls and that edits revisit affected negative decisions. |
+| 19 | Trial source-linked summaries as an optional LLM-wiki | Start with extractive cards containing intent, acceptance criteria, affected component, source anchors and revision. Use generated summaries only where repeated reads can recover their creation and refresh cost. Open the full source on uncertainty or conflicting evidence. Compare graph alone against graph plus cards on the same reference set. Retain cards only when they reduce total cost at the agreed quality level. |
+| 20 | Run a capped project pilot and decide on rollout | Use prior human decisions for an offline comparison first. For a separately authorized pilot, run suggestions in shadow mode with an explicit project budget and Stop/Resume. Compare estimated EUR per accepted link, missed links, false links, orphan recall, cross-project recall and review time. Proposed release gates are at least 25% lower total estimated EUR, 100% preservation of explicit approved links and semantic recall within two percentage points of the current reviewer on a sufficiently large adjudicated sample. Widen retrieval or keep the current reviewer where a gate fails. |
+
+A graph can preserve an approved relationship without a model call. A wiki card earns its upkeep only when the cost of avoided reads exceeds its creation and refresh cost. Both proposals keep GitHub issue creation and closure behind the existing approval rules. The pilot does not resume either project's stopped workflows.

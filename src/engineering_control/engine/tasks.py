@@ -1862,5 +1862,5 @@ assert set(SANDBOX) | set(PLATFORM) == {  # noqa: S101 - the catalogue and the c
     # workbench carries out in ``bench_tasks``.
     key
     for key, task in TASKS.items()
-    if task.where not in ("control", "model", "bench", "part")
+    if task.where not in ("control", "model", "bench", "part", "review")
 }

@@ -130,14 +130,19 @@ function VersionPicker({ flow, value, change }: { flow: string; value: string; c
   );
 }
 
+type AssignmentTarget = Pick<Section, "key" | "name" | "flow" | "flow_key" | "flow_version">;
+type ReviewBinding = {action: string; name: string; flow: string; version: number | null; inherited: boolean};
+
 function Assignment({
   project,
   section,
   flows,
   reload,
+  review,
 }: {
   project: string;
-  section: Section;
+  section: Section | AssignmentTarget;
+  review?: ReviewBinding;
   flows: FlowListed[];
   reload: () => void;
 }) {
@@ -152,7 +157,7 @@ function Assignment({
     setPending(true);
     setError('');
     try {
-      await postJson('projects/' + project + '/sections/' + section.key + '/flow', {
+      await postJson('projects/' + project + (review ? '/review-flows/' + review.action : '/sections/' + section.key + '/flow'), {
         flow: key || null,
         version: key && version !== 'latest' ? Number(version) : null,
       });
@@ -182,7 +187,7 @@ function Assignment({
                   setVersion('latest');
                 }}
                 items={[
-                  { value: 'none', label: 'Unassigned' },
+                  { value: 'none', label: review ? 'Use global default' : 'Unassigned' },
                   ...flows.map((f) => ({ value: f.key, label: f.name + (f.owner ? ' · Project' : ' · Global') })),
                 ]}
               />
@@ -200,7 +205,7 @@ function Assignment({
         ) : (
           <>
             <p>
-              {section.flow?.name ?? 'Unassigned'}{' '}
+              {section.flow?.name ?? 'Unassigned'} {review?.inherited && <Badge size="sm">Default</Badge>}{' '}
               {section.flow && <Badge size="sm">{selected?.owner ? 'Project' : 'Global'}</Badge>}
             </p>
             {section.flow && (
@@ -217,7 +222,7 @@ function Assignment({
                 size="sm"
                 variant="secondary"
                 onClick={() => {
-                  setKey(section.flow_key ?? '');
+                  setKey(review?.inherited ? '' : section.flow_key ?? '');
                   setVersion(String(section.flow_version ?? 'latest'));
                   setError('');
                   setEditing(true);
@@ -234,7 +239,7 @@ function Assignment({
           </>
         )}
         {error && <Alert tone="destructive" title={error} />}
-        {running && (
+        {running && "kind" in section && (
           <SectionRunDialog project={project} section={section} open={running} onOpenChange={setRunning} />
         )}
       </CardBody>
@@ -245,16 +250,26 @@ function Assignment({
 function Assignments({ project }: { project: string }) {
   const detail = useResource<ProjectDetail>(apiUrl('projects/' + project));
   const flows = useResource<FlowLibrary>(apiUrl('flows', { include_shared: 'true' }));
+  const bindings = useResource<Listing<ReviewBinding>>(apiUrl("projects/" + project + "/review-flows"));
   const sections = detail.data?.sections ?? [];
   const choices = (flows.data?.items ?? []).filter((f) => f.engine && f.engine.version !== null && !f.engine.part);
   return (
     <Page title="Flow assignments" description="Choose which published flow each project operation runs.">
       <LoadError resource={detail} />
       <LoadError resource={flows} />
+      <LoadError resource={bindings} />
+      <h2 className="mb-3 text-lg font-semibold">Operations</h2>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {sections.map((s) => (
-          <Assignment key={s.key} section={s} project={project} flows={choices} reload={detail.reload} />
+          <Assignment key={s.key} section={s} project={project} flows={choices.filter(f=>!f.engine?.review_action)} reload={detail.reload} />
         ))}
+      </div>
+      <h2 className="my-3 text-lg font-semibold">Reviews and automated reviews</h2>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        {bindings.data?.items.map(b => <Assignment key={b.action} project={project} review={b}
+          flows={choices.filter(f=>f.engine?.review_action === b.action)} reload={bindings.reload}
+          section={{key:b.action, name:b.name, flow_key:b.flow, flow_version:b.version,
+            flow:choices.find(f=>f.key === b.flow) ?? {key:b.flow,name:b.name,summary:''}}} />)}
       </div>
       {detail.data && (
         <div className="mt-4">

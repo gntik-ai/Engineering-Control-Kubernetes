@@ -487,6 +487,7 @@ class WorkspaceImport(Timestamps, Base):
     """One resumable analysis of the connected repository per project."""
 
     __tablename__ = "workspace_imports"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid)
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
     )
@@ -543,6 +544,7 @@ class PlanningReview(Timestamps, Base):
     """A resumable review of one new workspace record, independent of the import wizard."""
 
     __tablename__ = "planning_reviews"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid)
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
     )
@@ -585,16 +587,21 @@ class WorkspaceModelUsage(UUIDPrimaryKey, Base):
     """One metered response from repository analysis or planning, including its price snapshot."""
 
     __tablename__ = "workspace_model_usage"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid)
     project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
     usage: Mapped[dict[str, Any]] = mapped_column(JSON)
-    __table_args__ = (Index("ix_workspace_model_usage_project_time", "project_id", "recorded_at"),)
+    __table_args__ = (
+        Index("ix_workspace_model_usage_project_time", "project_id", "recorded_at"),
+        Index("ix_workspace_model_usage_recorded_at", "recorded_at"),
+    )
 
 
 class ProjectConnection(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "project_connections"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid)
     first_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"), index=True)
     second_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"), index=True)
     owner_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id"))
@@ -696,6 +703,33 @@ class ProjectUserStory(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (
         UniqueConstraint("project_id", "id", name="uq_project_user_stories_project_story"),
     )
+
+
+class ReviewFlowAssignment(Base):
+    __tablename__ = "review_flow_assignments"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    action: Mapped[str] = mapped_column(String(24), primary_key=True)
+    flow_key: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int | None] = mapped_column(Integer)
+
+
+class ReviewFlowRun(UUIDPrimaryKey, Base):
+    __tablename__ = "review_flow_runs"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(24))
+    flow_key: Mapped[str] = mapped_column(String(64))
+    flow_name: Mapped[str] = mapped_column(String(100))
+    version: Mapped[int] = mapped_column(Integer)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, default=lambda: datetime.now(UTC)
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    outcome: Mapped[str | None] = mapped_column(String(16))
 
 
 class ProjectReviewBudget(Base):
@@ -1997,6 +2031,7 @@ class WorkQueue(UUIDPrimaryKey, Timestamps, Base):
 
 class EpicExecutionPlan(Timestamps, Base):
     __tablename__ = "epic_execution_plans"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid)
     queue_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("work_queues.id", ondelete="CASCADE"), primary_key=True
     )

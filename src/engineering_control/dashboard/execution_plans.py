@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.connection_records import finding_links
 from engineering_control.dashboard.planning_analysis import selection
 from engineering_control.dashboard.project_records import (
@@ -21,7 +22,6 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.workspace_costs import record_project_usage
 from engineering_control.dashboard.workspace_publishing import schedule_classification
 from engineering_control.dashboard.workspace_review import STRING, shape
 from engineering_control.db.models import (
@@ -436,6 +436,7 @@ class ExecutionPlans:
                 "project": p.id,
                 "name": p.name,
                 "lease": plan.lease,
+                "run_id": review_flows.start(db, plan, p.id, "execution"),
                 "provider": provider,
                 "model": model,
                 "batch": batch,
@@ -448,7 +449,10 @@ class ExecutionPlans:
             return False
         batch = work["batch"]
         try:
-            answer = await models.ask(
+            answer = await review_budget.ask_review(
+                self.sessions,
+                work["project"],
+                models,
                 Question(
                     choices=((work["provider"], work["model"]),),
                     system=(
@@ -467,15 +471,10 @@ class ExecutionPlans:
                     max_tokens=6500,
                     seconds=150,
                 ),
-                retry=False,
-            )
-            await asyncio.to_thread(
-                record_project_usage,
-                self.sessions,
-                work["project"],
-                work["model"],
-                answer,
                 "execution_planning",
+                run_id=work["run_id"],
+                stage="execution",
+                budgeted=False,
             )
             await asyncio.to_thread(self._apply, work, answer.data)
         except Exception as exc:  # noqa: BLE001 - expired or interrupted work is recoverable
@@ -498,6 +497,8 @@ class ExecutionPlans:
             if plan.lease == work["lease"]:
                 plan.attempts += 1
                 plan.status = "queued" if retry and plan.attempts < 3 else "failed"
+                if plan.status == "failed":
+                    review_flows.finish(db, plan, "failed")
                 plan.lease, plan.detail, plan.due_at = (
                     None,
                     reason[:400],
@@ -582,6 +583,7 @@ class ExecutionPlans:
                     data["order"] = preference
                     plan.detail = str(err)
                 plan.status = "review"
+                review_flows.finish(db, plan, "succeeded")
             plan.data, plan.lease, plan.attempts, plan.due_at = data, None, 0, datetime.now(UTC)
             plan.version += 1
 

@@ -157,6 +157,9 @@ export default function App() {
   if (isAutomation(settings) && settings !== 'assignments') {
     return <ProjectWorkspace name={query.get('project') ?? ''} view={settings} global actions={actions} notice={notice} />;
   }
+  if (settings === 'stats') {
+    return <ProjectWorkspace name={query.get('project') ?? ''} view="stats" global actions={actions} notice={notice} />;
+  }
   if (current === ACCOUNTS) {
     return <ProjectWorkspace name={query.get('project') ?? ''} view="accounts" global actions={actions} notice={notice} />;
   }
