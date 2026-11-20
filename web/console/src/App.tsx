@@ -3,7 +3,6 @@ import {
   Bot,
   FolderKanban,
   Inbox as InboxIcon,
-  KeyRound,
   LayoutDashboard,
   ListOrdered,
   ListTodo,
@@ -13,7 +12,6 @@ import {
 } from '@gntik-ai/icons';
 import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { CHANGED, apiUrl, signOut, useResource, type Inbox } from './api';
-import { AccountsPage } from './pages/Accounts';
 import { DashboardPage } from './pages/Dashboard';
 import { FlowPage } from './pages/Flow';
 import { FlowsPage } from './pages/Flows';
@@ -27,7 +25,7 @@ import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { ProjectWorkspace } from './pages/Workspace';
 import { usePageTitle } from './parts';
-import { ADMIN, BASE, WORKSPACE, useLocation } from './router';
+import { ACCOUNTS, ADMIN, BASE, WORKSPACE, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -49,7 +47,6 @@ const navigation = (waiting: number): NavGroup[] => [
       { label: 'Runs', href: `${BASE}/runs`, icon: Bot },
       { label: 'Flows', href: `${BASE}/flows`, icon: Workflow },
       { label: 'Supervisor', href: `${BASE}/supervisor`, icon: Sparkles },
-      { label: 'Accounts', href: `${BASE}/accounts`, icon: KeyRound },
     ],
   },
 ];
@@ -60,7 +57,6 @@ const ADMIN_VIEWS: Record<string, { title: string; Page: ComponentType }> = {
   [`${BASE}/projects`]: { title: 'Projects', Page: ProjectsPage },
   [`${BASE}/project`]: { title: 'Project', Page: ProjectPage },
   [`${BASE}/backlog`]: { title: 'Backlog', Page: BacklogPage },
-  [`${BASE}/accounts`]: { title: 'Accounts', Page: AccountsPage },
   [`${BASE}/budgets`]: { title: 'Budgets', Page: BudgetsPage },
   [`${BASE}/runs`]: { title: 'Runs', Page: RunsPage },
   [`${BASE}/run`]: { title: 'Run', Page: RunPage },
@@ -151,7 +147,7 @@ function AdministratorConsole({
 
 export default function App() {
   const [problem, setProblem] = useState<string | null>(null);
-  const { path } = useLocation();
+  const { path, query } = useLocation();
   const current = path.replace(/\/$/, '');
   const actions = (
     <>
@@ -164,12 +160,15 @@ export default function App() {
     <Alert tone="destructive" title="Could not sign out" description={problem} onDismiss={() => setProblem(null)} />
   ) : null;
 
+  if (current === ACCOUNTS) {
+    return <ProjectWorkspace name={query.get('project') ?? ''} view="accounts" actions={actions} notice={notice} />;
+  }
   if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
     const [name = '', ...rest] = current.slice(WORKSPACE.length + 1).split('/');
-    const connections = rest.join('/') === 'settings/connections';
-    const queue = rest.join('/') === 'queue';
-    if (rest.length && !connections && !queue) return <NotFoundPage />;
-    return <ProjectWorkspace name={name} queue={queue} connections={connections} actions={actions} notice={notice} />;
+    const subpath = rest.join('/');
+    if (subpath !== '' && subpath !== 'queue' && subpath !== 'settings/connections') return <NotFoundPage />;
+    const view = subpath === 'settings/connections' ? 'connections' : subpath || 'dashboard';
+    return <ProjectWorkspace name={name} view={view} actions={actions} notice={notice} />;
   }
   if (current === `${BASE}/queues` || current === `${BASE}/queue`) return <LegacyQueue />;
   const view = ADMIN_VIEWS[current];

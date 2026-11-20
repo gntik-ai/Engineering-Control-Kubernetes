@@ -25,6 +25,8 @@ def test_console_requires_a_session(tmp_path: Path) -> None:
             "/console/backlog",
             "/console/admin",
             "/console/workspace/falcone",
+            "/console/settings/accounts?project=llmwiki",
+            "/console/accounts",
             "/console/runs?project=falcone&state=running",
         ):
             page = client.get(path, follow_redirects=False)
@@ -113,6 +115,18 @@ def test_a_browser_asking_for_an_unknown_page_gets_the_console_not_found_page(
         client.__exit__(None, None, None)
 
 
+def test_old_accounts_bookmarks_redirect_to_global_settings(tmp_path: Path) -> None:
+    client, _repository = _authenticated_client(tmp_path)
+    try:
+        for suffix in ("", "/?project=llmwiki"):
+            old = client.get("/console/accounts" + suffix, follow_redirects=False)
+            assert old.status_code == 303
+            assert old.headers["location"] == "/console/settings/accounts" + suffix.lstrip("/")
+            assert client.get(old.headers["location"]).status_code == 200
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -> None:
     client, _repository = _authenticated_client(tmp_path)
     try:
@@ -123,6 +137,7 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             "/console/workspace/falcone",
             "/console/projects",
             "/console/backlog",
+            "/console/settings/accounts",
             "/console/runs",
             "/console/flow",
         ):
@@ -257,6 +272,7 @@ def test_console_opens_the_empty_workspace_without_projects(
         landed = client.get("/console", follow_redirects=True)
         assert landed.status_code == 200
         assert landed.url.path == "/console/workspace"
+        assert client.get("/console/settings/accounts", follow_redirects=False).status_code == 200
         session = client.get("/api/dashboard/session").json()
         created = client.post(
             "/api/dashboard/projects",

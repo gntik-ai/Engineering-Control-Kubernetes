@@ -869,8 +869,9 @@ export function AccountsPage() {
   const empty = accounts.data?.items.length === 0;
   return (
     <Page
+      width="wide"
       title="Accounts"
-      description="The subscriptions agents work with in sandboxes, and the API keys models are asked with directly."
+      description="All projects share these subscriptions for sandbox agents and API keys for model requests."
       actions={
         <div className="flex items-center gap-2">
           <RefreshButton resource={{ loading: accounts.loading || listing, reload: refresh }} />

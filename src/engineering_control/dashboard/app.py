@@ -161,7 +161,7 @@ CONSOLE_VIEWS = frozenset(
         "projects",
         "project",
         "backlog",
-        "accounts",
+        "settings/accounts",
         "runs",
         "run",
         "supervisor",
@@ -2986,6 +2986,9 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         view: str = request.path_params.get("view", "").removesuffix("/")
+        if view == "accounts":
+            query = f"?{request.url.query}" if request.url.query else ""
+            return RedirectResponse(f"/console/settings/accounts{query}", status_code=303)
         index = CONSOLE_ROOT / "index.html"
         if not _console_view(view) or not index.is_file():
             raise HTTPException(status_code=404, detail="page not found")

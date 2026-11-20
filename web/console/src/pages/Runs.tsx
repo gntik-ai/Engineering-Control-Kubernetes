@@ -34,7 +34,7 @@ import { apiUrl, postJson, useResource, type Listing, type Run, type RunResult, 
 import { Confirm } from '../confirm';
 import { LoadError, ProjectFilter, RefreshButton, Rows, TableFrame, When, mono } from '../parts';
 import { BatchesCard } from './Batches';
-import { BASE, RouterLink, navigate, setQuery, useLocation } from '../router';
+import { BASE, RouterLink, accountsUrl, navigate, setQuery, useLocation } from '../router';
 import { API_PROVIDER_NAMES } from './FlowParts';
 import { minutes, tokens, versionName } from './Flows';
 import { RunGraph } from './RunGraph';
@@ -232,7 +232,7 @@ export function RunsPage() {
           <EmptyState
             icon={Bot}
             title={project ? 'Nothing has run for this project yet' : 'Nothing has run yet'}
-            description="Try an account on the Accounts page, or start an item from the backlog."
+            description={<>Try an account in <Link href={accountsUrl(project)}>Global settings → Accounts</Link>, or start an item from the backlog.</>}
           />
         ) : (
           <TableFrame>

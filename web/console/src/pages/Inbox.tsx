@@ -13,7 +13,7 @@ import {
 import type { ComponentType } from 'react';
 import { apiUrl, useResource, type Inbox, type InboxEntry } from '../api';
 import { LoadError, RefreshButton } from '../parts';
-import { BASE, RouterLink, queueUrl } from '../router';
+import { BASE, RouterLink, accountsUrl, queueUrl } from '../router';
 import { Proposal } from '../supervisor';
 
 const plural = (count: number, one: string, many: string) => `${count.toLocaleString('en')} ${count === 1 ? one : many}`;
@@ -58,7 +58,7 @@ function shown(entry: InboxEntry): Shown {
         title: `The account ${entry.account ?? ''} is not signed in`,
         detail: entry.detail ?? 'No sandbox can work with it until its subscription is signed in.',
         action: 'Open the accounts',
-        href: `${BASE}/accounts`,
+        href: accountsUrl(entry.project),
       };
     case 'supervisor_action':
       // Shown with its own buttons (Proposal); this is what a list without them would say.

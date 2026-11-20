@@ -3,32 +3,31 @@ import {
   EmptyState,
   Link,
   Logo,
-  Page,
-  Skeleton,
-  SidebarLayout,
   NavList,
+  Page,
+  SidebarLayout,
+  Skeleton,
   WorkspaceSwitcher,
+  type NavGroup,
 } from '@gntik-ai/ui';
-import { FolderKanban, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
+import { FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
-import { ADMIN, RouterLink, navigate, connectionsUrl, queueUrl, workspaceUrl } from '../router';
-import { WorkspaceTabs } from './WorkspaceTabs';
-import { NewProjectDialog } from './ProjectDialogs';
-
-import { ProjectQueue } from './ProjectQueue';
+import { ADMIN, BASE, RouterLink, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl } from '../router';
+import { AccountsPage } from './Accounts';
 import { ConnectionsPage } from './Connections';
+import { NewProjectDialog } from './ProjectDialogs';
+import { ProjectQueue } from './ProjectQueue';
+import { WorkspaceTabs } from './WorkspaceTabs';
 
 export function ProjectWorkspace({
   name,
+  view,
   actions,
   notice,
-  connections,
-  queue,
 }: {
   name: string;
-  connections: boolean;
-  queue: boolean;
+  view: 'dashboard' | 'queue' | 'connections' | 'accounts';
   actions: ReactNode;
   notice: ReactNode;
 }) {
@@ -36,10 +35,46 @@ export function ProjectWorkspace({
   const [creating, setCreating] = useState(false);
   const items = projects.data?.items ?? [];
   const defaultName = projects.data?.default_project;
-  const project = items.find((item) => item.project === name);
-  usePageTitle(
-    queue ? 'Queue · ' + (project?.display_name ?? name) : connections ? 'Connections · ' + (project?.display_name ?? name) : (project?.display_name ?? 'Projects'),
-  );
+  const project = items.find((item) => item.project === name) ?? (view === 'accounts'
+    ? items.find((item) => item.project === defaultName) ?? items[0]
+    : undefined);
+  const context = view === 'accounts' ? project?.project : name;
+  const dashboardHref = context ? workspaceUrl(context) : BASE;
+  const accountHref = accountsUrl(context);
+  const projectTitle = project?.display_name ?? name;
+  const titles = {
+    dashboard: project?.display_name ?? 'Projects',
+    queue: 'Queue · ' + projectTitle,
+    connections: 'Connections · ' + projectTitle,
+    accounts: 'Accounts · Global settings',
+  };
+  usePageTitle(titles[view]);
+
+  const primary: NavGroup = { items: [{ label: 'Dashboard', href: dashboardHref, icon: LayoutDashboard }] };
+  const groups = [primary];
+  if (context) {
+    primary.items.push({ label: 'Queue', href: queueUrl(context), icon: ListOrdered });
+    groups.push({
+      id: 'project-settings',
+      label: 'Project settings',
+      collapsible: true,
+      defaultOpen: true,
+      items: [{ label: 'Connections', href: connectionsUrl(context), icon: Network }],
+    });
+  }
+  groups.push({
+    id: 'global-settings',
+    label: 'Global settings',
+    collapsible: true,
+    defaultOpen: true,
+    items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }],
+  });
+  const currentHref = {
+    dashboard: dashboardHref,
+    queue: queueUrl(name),
+    connections: connectionsUrl(name),
+    accounts: accountHref,
+  }[view];
 
   return (
     <SidebarLayout
@@ -55,20 +90,8 @@ export function ProjectWorkspace({
           collapsed={collapsed}
           onNavigate={closeDrawer}
           label="Project navigation"
-          currentHref={queue ? queueUrl(name) : connections ? connectionsUrl(name) : workspaceUrl(name)}
-          groups={
-            name
-              ? [
-                  { items: [{ label: 'Dashboard', href: workspaceUrl(name), icon: LayoutDashboard }, { label: 'Queue', href: queueUrl(name), icon: ListOrdered }] },
-                  {
-                    label: 'Settings',
-                    collapsible: true,
-                    defaultOpen: true,
-                    items: [{ label: 'Connections', href: connectionsUrl(name), icon: Network }],
-                  },
-                ]
-              : []
-          }
+          currentHref={currentHref}
+          groups={groups}
         />
       )}
       topbar={
@@ -86,7 +109,8 @@ export function ProjectWorkspace({
                   name: item.display_name,
                   meta: item.project === defaultName ? 'Default project' : item.source_repository,
                 }))}
-                onSelect={(item) => navigate(queue ? queueUrl(item.id) : workspaceUrl(item.id))}
+                onSelect={(item) => navigate(view === 'accounts' ? accountsUrl(item.id)
+                  : view === 'queue' ? queueUrl(item.id) : workspaceUrl(item.id))}
                 onCreate={() => setCreating(true)}
               />
             </div>
@@ -105,44 +129,46 @@ export function ProjectWorkspace({
         </div>
       }
     >
-      <Page width="wide">
-        {notice}
-        <LoadError resource={projects} />
-        {project ? (
-          queue ? <ProjectQueue key={name} project={name} /> : connections ? (
-            <ConnectionsPage key={project.project} project={project} projects={items} />
+      {notice && <div className="px-6 pt-4">{notice}</div>}
+      {view === 'accounts' ? <AccountsPage /> : (
+        <Page width="wide">
+          <LoadError resource={projects} />
+          {project ? (
+            view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'connections' ? (
+              <ConnectionsPage key={project.project} project={project} projects={items} />
+            ) : (
+              <WorkspaceTabs key={project.project} project={project} onApproved={projects.reload} />
+            )
+          ) : projects.loading ? (
+            <Skeleton className="h-36 w-full" />
+          ) : projects.error ? (
+            <div>
+              <RefreshButton resource={projects} />
+            </div>
+          ) : items.length ? (
+            <EmptyState
+              icon={FolderKanban}
+              title="Project unavailable"
+              description="Choose a project from the switcher."
+              primaryAction={
+                defaultName ? (
+                  <Button render={<RouterLink href={workspaceUrl(defaultName)} />}>Open default project</Button>
+                ) : undefined
+              }
+            />
           ) : (
-            <WorkspaceTabs key={project.project} project={project} onApproved={projects.reload} />
-          )
-        ) : projects.loading ? (
-          <Skeleton className="h-36 w-full" />
-        ) : projects.error ? (
-          <div>
-            <RefreshButton resource={projects} />
-          </div>
-        ) : items.length ? (
-          <EmptyState
-            icon={FolderKanban}
-            title="Project unavailable"
-            description="Choose a project from the switcher."
-            primaryAction={
-              defaultName ? (
-                <Button render={<RouterLink href={workspaceUrl(defaultName)} />}>Open default project</Button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <EmptyState
-            icon={FolderKanban}
-            title="No projects yet"
-            primaryAction={
-              <Button icon={Plus} onClick={() => setCreating(true)}>
-                New project
-              </Button>
-            }
-          />
-        )}
-      </Page>
+            <EmptyState
+              icon={FolderKanban}
+              title="No projects yet"
+              primaryAction={
+                <Button icon={Plus} onClick={() => setCreating(true)}>
+                  New project
+                </Button>
+              }
+            />
+          )}
+        </Page>
+      )}
       <NewProjectDialog
         open={creating}
         onOpenChange={setCreating}

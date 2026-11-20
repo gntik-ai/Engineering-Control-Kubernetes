@@ -421,7 +421,7 @@ class WorkspaceImports:
             if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
                 if {"provider": provider, "model": model} not in self.model_choices():
                     raise ProjectInvalid(
-                        "Choose an available model account in the Administrator Console"
+                        "Choose an available model account under Global settings → Accounts"
                     )
                 if row.progress.get("usage_daily") and "legacy_price_model" not in row.progress:
                     row.progress = {

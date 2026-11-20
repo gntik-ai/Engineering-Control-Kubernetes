@@ -3,6 +3,9 @@ import { useSyncExternalStore, type ComponentPropsWithRef, type MouseEvent } fro
 /** History routing for the console. The server resolves /console to the default project. */
 export const BASE = '/console';
 export const ADMIN = `${BASE}/admin`;
+export const ACCOUNTS = `${BASE}/settings/accounts`;
+export const accountsUrl = (project?: string | null) =>
+  project ? ACCOUNTS + '?' + new URLSearchParams({ project }).toString() : ACCOUNTS;
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
 export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');

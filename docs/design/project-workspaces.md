@@ -1,6 +1,6 @@
 # Project workspaces
 
-The Project is the workspace for a single repository. The Superadmin signs in to the global default Project. An administrator can use the existing global tools through **Administrator Console**.
+The Project is the workspace for a single repository. The Superadmin signs in to the global default Project. The project sidebar provides **Global settings → Accounts** for the subscriptions and API keys shared across projects. The **Administrator Console** houses operational tools such as Flows and Budgets.
 
 | Phase | Deliverable | Acceptance criteria |
 | --- | --- | --- |

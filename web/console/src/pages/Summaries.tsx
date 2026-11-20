@@ -15,7 +15,7 @@ import {
 import { useState } from 'react';
 import { apiUrl, postJson, useResource, type ProjectSummaries } from '../api';
 import { LoadError, When } from '../parts';
-import { BASE } from '../router';
+import { BASE, accountsUrl } from '../router';
 import { API_PROVIDER_NAMES } from './FlowParts';
 import { useSubmit } from './ProjectDialogs';
 
@@ -119,7 +119,7 @@ export function SummariesCard({ project }: { project: string }) {
           <Alert
             tone="info"
             title="An account with an API key is needed"
-            description="Summaries are written by a model asked over an API, paid by use. Add an account of that kind on the Accounts page and give it its key."
+            description={<>Summaries use a model billed through its API. Add an API account and its key in <Link href={accountsUrl(project)}>Global settings → Accounts</Link>.</>}
           />
         ) : null}
         {providers.length > 0 ? (
