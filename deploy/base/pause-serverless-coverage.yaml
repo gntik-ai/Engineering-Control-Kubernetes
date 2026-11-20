@@ -1,0 +1,142 @@
+# One-time, expiring maintenance request for the existing production coverage run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pause-falcone-serverless-coverage-20261120
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control-bootstrap
+        app.kubernetes.io/component: coverage-maintenance
+    spec:
+      restartPolicy: Never
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
+      containers:
+        - name: pause-coverage
+          image: engineering-control
+          command: ["python", "-c"]
+          args:
+            - |
+                import json
+                import os
+                from datetime import UTC, datetime
+                from sqlalchemy import create_engine, func, select
+                from sqlalchemy.orm import Session
+                from engineering_control.dashboard.workspace_review import set_coverage_state
+                from engineering_control.db.models import DashboardEvent, PlanningReview, ProjectRecord, WorkspaceImport
+
+                name = "falcone-serverless"
+                request = "workspace.coverage_pause_20261120"
+                cutoff = datetime.fromisoformat("2026-11-20T09:08:40+00:00")
+                expires = datetime.fromisoformat("2026-11-20T13:00:00+00:00")
+                now = datetime.now(UTC)
+                engine = create_engine(os.environ["ENGINEERING_DATABASE_URL"])
+                with Session(engine) as db, db.begin():
+                    project = db.scalar(select(ProjectRecord).where(
+                        ProjectRecord.name == name, ProjectRecord.archived_at.is_(None),
+                        func.lower(ProjectRecord.source_repository) == "gntik-ai/falcone-serverless",
+                    ).with_for_update())
+                    if not project or now > expires:
+                        print("No eligible project or the maintenance window has ended.")
+                        raise SystemExit(0)
+                    if db.scalar(select(DashboardEvent.id).where(
+                        DashboardEvent.event_type == request, DashboardEvent.entity_id == name,
+                    ).limit(1)):
+                        print("This pause request was already handled.")
+                        raise SystemExit(0)
+                    row = db.scalar(select(WorkspaceImport).where(
+                        WorkspaceImport.project_id == project.id,
+                    ).with_for_update())
+                    last = db.scalar(select(func.max(DashboardEvent.occurred_at)).where(
+                        DashboardEvent.event_type == "workspace.coverage_requested",
+                        DashboardEvent.entity_id == name,
+                    ))
+                    run = ((row.progress.get("coverage_run") or {}) if row else {})
+                    before = run.get("state")
+                    summary = {"project": name, "stage": row.stage if row else None, "coverage_before": before,
+                               "project_paused": bool(project.paused_at), "lease_before": bool(row and row.lease)}
+                    if last and last.replace(tzinfo=UTC) > cutoff:
+                        summary["action"] = "Skipped a newer coverage request"
+                    elif row and before in ("running", "waiting"):
+                        progress = dict(row.progress)
+                        operation = progress.get("operation") or {}
+                        reason = "Paused at the administrator's request. Resume when ready."
+                        if operation.get("state") == "running":
+                            progress["operation"] = {**operation, "state": "interrupted", "detail": reason}
+                        for key in ("activity", "checked", "found"):
+                            progress.pop(key, None)
+                        row.progress = progress
+                        # Releases through the previous token now fail. Completed pages, proposals,
+                        # manual approvals and the matching cursor remain available to Resume.
+                        row.lease = row.lease_until = None
+                        set_coverage_state(row, "failed", reason)
+                        summary["action"] = "Paused coverage at its last saved checkpoint"
+                    else:
+                        summary["action"] = "No active managed coverage run"
+                    summary["coverage_after"] = (row.progress.get("coverage_run") or {}).get("state") if row else None
+                    summary["lease_after"] = bool(row and row.lease)
+                    summary["automatic_reviews"] = dict(db.execute(select(
+                        PlanningReview.status, func.count()
+                    ).where(PlanningReview.project_id == project.id,
+                            PlanningReview.status.in_(("queued","running"))).group_by(PlanningReview.status)).all())
+                    db.add(DashboardEvent(occurred_at=now, level="INFO", event_type=request, source="gitops",
+                                          project=name, entity_type="project", entity_id=name,
+                                          message=summary["action"], metadata_json=summary))
+                print(json.dumps(summary, sort_keys=True), flush=True)
+          workingDir: /app
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: engineering-control-postgres-app
+                  key: password
+            - name: ENGINEERING_DATABASE_URL
+              value: postgresql+psycopg://$(DATABASE_USER):$(DATABASE_PASSWORD)@engineering-control-postgres-rw:5432/engineering_control
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
