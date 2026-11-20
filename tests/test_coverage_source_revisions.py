@@ -1,6 +1,7 @@
 """Full matching evidence, in-flight validation, legacy checkpoints and bounded batches."""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -14,8 +15,10 @@ from engineering_control.dashboard import (
     review_evidence,
     review_graph,
 )
+from engineering_control.dashboard.backlog_items import DESCRIPTION_MAX
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.project_records import ProjectConflict
+from engineering_control.dashboard.workspace_issues import import_issues, review_description
 from engineering_control.db.models import (
     BacklogItem,
     ProjectRecord,
@@ -27,6 +30,7 @@ from engineering_control.db.models import (
 from engineering_control.engine import reviews
 from tests.test_dashboard_web import _authenticated_client
 from tests.test_project_coverage import seed
+from tests.test_workspace_issue_inventory import snapshot
 from tests.test_workspace_progress import BASE
 
 
@@ -36,6 +40,101 @@ def long_body(criterion: str) -> str:
 
 def guard(_db: Any) -> None:
     pass
+
+
+def test_tail_only_github_import_rechecks_only_the_eligible_pair(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        ids = seed(repo)
+        pid = ids["project"]
+        parent = str(ids["Respond to failures"])
+        targets = {parent, str(ids["Audit executions"]), str(ids["Retired delivery history"])}
+        prefix = "é" * DESCRIPTION_MAX
+        raw_prefix = "\x01" + prefix[:230] + "\r" + prefix[230:]
+        matcher = issue_coverage.IssueCoverage(repo.sessions)
+
+        def sync(suffix: str) -> None:
+            with repo.sessions.begin() as db:
+                project = db.get_one(ProjectRecord, pid)
+                issue = snapshot(44, title="Locked issue", body=raw_prefix + suffix)
+                issue["html_url"] = f"https://github.com/{project.source_repository}/issues/44"
+                import_issues(db, project, [issue])
+
+        def page() -> issue_coverage.Coverage | issue_coverage.Page:
+            return matcher.page("falcone", targets, "fixture", "analysis", guard, True)
+
+        # A decision made from the old mirror is still present when full evidence arrives.
+        sync("")
+        for _ in range(14):
+            batch = page()
+            if isinstance(batch, issue_coverage.Coverage):
+                break
+            matcher.persist("falcone", "fixture", "analysis", batch, [], guard)
+        assert isinstance(batch, issue_coverage.Coverage)
+        sync("\r\nVerify the recovery log.")
+        preview = client.get(BASE + "import/coverage/preview").json()
+        assert (preview["remaining"], preview["reusable"]) == (1, 12)
+        pending = page()
+        assert isinstance(pending, issue_coverage.Page)
+        assert list(pending.story_versions) == [parent]
+        [issue] = json.loads(pending.prompt())["imported_issues"]
+        assert (issue["number"], issue["description"]) == (
+            44,
+            prefix + "\nVerify the recovery log.",
+        )
+        assert issue["manual_stories"] == [parent]
+
+        sync("\r\nVerify the signed recovery log.")
+        with pytest.raises(ProjectConflict):
+            matcher.persist("falcone", "fixture", "analysis", pending, [], guard)
+        retry = page()
+        assert isinstance(retry, issue_coverage.Page)
+        [record] = json.loads(retry.prompt())["imported_issues"]
+        assert record["description"] == prefix + "\nVerify the signed recovery log."
+        with repo.sessions() as db:
+            project = db.get_one(ProjectRecord, pid)
+            graph = review_graph.snapshot(db, project, False, "fixture", "analysis", "")
+            key = review_graph.source_key(pid, "issues", UUID(issue["id"]))
+            assert graph["records"][key]["body"] == record["description"]
+            assert db.get_one(BacklogItem, UUID(issue["id"])).description == prefix
+        matcher.persist("falcone", "fixture", "analysis", retry, [], guard)
+        sync("\r\nVerify the signed recovery log.")
+        assert isinstance(page(), issue_coverage.Coverage)
+        with repo.sessions.begin() as db:
+            db.get_one(WorkspaceImport, pid).repository = "other/repository"
+            db.flush()
+            project = db.get_one(ProjectRecord, pid)
+            assert (
+                next(
+                    body
+                    for item, body in issue_coverage.technical_sources(db, project)
+                    if item.issue_number == 44
+                )
+                == prefix
+            )
+    finally:
+        client.close()
+
+
+def test_imported_suffix_requires_matching_local_text_and_source_identity() -> None:
+    stored = "a" * DESCRIPTION_MAX
+    item = BacklogItem(
+        description=stored, issue_number=44, issue_updated_at=datetime(2026, 11, 19, 12, tzinfo=UTC)
+    )
+    evidence = snapshot(
+        44, body=stored + " acceptance", html_url="https://github.com/Org/Project/issues/44"
+    )
+    assert review_description(item, evidence, "org/project") == evidence["body"]
+    for change in (
+        {"number": 45},
+        {"html_url": "https://github.com/other/project/issues/44"},
+        {"updated_at": "2026-11-18T12:00:00Z"},
+        {"updated_at": "unknown"},
+        {"body": None},
+    ):
+        assert review_description(item, {**evidence, **change}, "org/project") == stored
+    item.description = "b" + stored[1:]
+    assert review_description(item, evidence, "org/project") == item.description
 
 
 @pytest.mark.parametrize("kind", ["issues", "stories"])
@@ -172,13 +271,18 @@ def test_mixed_legacy_cache_reuses_only_complete_evidence(tmp_path: Path, positi
                     BacklogItem.project_id == pid, BacklogItem.issue_number == 42
                 )
             ).one()
-            item.description = long_body("specific scope")
+            project = db.get_one(ProjectRecord, pid)
+            import_issues(db, project, [snapshot(42, body="a" * DESCRIPTION_MAX + "new suffix")])
             db.flush()
-            inv = issue_coverage.inventory(
-                db, db.get_one(ProjectRecord, pid), targets, "fixture", "analysis"
-            )
+            inv = issue_coverage.inventory(db, project, targets, "fixture", "analysis")
             old_issues = [
-                {**r, "description": issue_coverage.excerpt(r["description"])} for r in inv.issues
+                {
+                    **r,
+                    "description": issue_coverage.excerpt(
+                        item.description if r["number"] == 42 else r["description"]
+                    ),
+                }
+                for r in inv.issues
             ]
             context = (db.get_one(ProjectRecord, pid).source_repository, "fixture", "analysis")
             common = digest([*context, old_issues])

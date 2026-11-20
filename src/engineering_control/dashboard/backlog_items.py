@@ -60,12 +60,13 @@ def clean_title(value: str) -> str:
 DESCRIPTION_MAX = 40_000
 
 
+def normalized_description(value: str) -> str:
+    return "".join(ch for ch in value if ch in "\n\t" or ch >= " ").strip()
+
+
 def clean_description(value: str | None) -> str | None:
     """An item's own text: kept as written, without control characters, bounded."""
-    if value is None:
-        return None
-    text = "".join(ch for ch in value if ch in "\n\t" or ch >= " ").strip()
-    return text[:DESCRIPTION_MAX] or None
+    return normalized_description(value or "")[:DESCRIPTION_MAX] or None
 
 
 def route_by_labels(

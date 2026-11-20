@@ -11,17 +11,22 @@ from functools import cached_property
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard.backlog_items import DESCRIPTION_MAX
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     active_project,
 )
-from engineering_control.dashboard.workspace_issues import add_story_links, planning_kind
+from engineering_control.dashboard.workspace_issues import (
+    add_story_links,
+    planning_kind,
+    review_description,
+)
 from engineering_control.db.models import (
     BacklogItem,
     ProjectIssueStory,
@@ -29,6 +34,8 @@ from engineering_control.db.models import (
     ProjectUserStory,
     StoryIssueCoverage,
     WorkspaceCandidate,
+    WorkspaceImport,
+    WorkspaceSource,
 )
 from engineering_control.models.service import Models, Question
 
@@ -166,12 +173,19 @@ class Inventory:
     issue_versions: dict[str, str]
     context: tuple[str, str, str]
     policy: str
+    legacy_import_excerpts: dict[str, str]
 
     @cached_property
     def legacy_common(self) -> str:
         # Only a pre-0061 positional checkpoint needs the old inventory ordering and
         # digest. A short pair can still be proved compatible in a mixed-size project.
-        rows = [{**i, "description": excerpt(i["description"])} for i in self.issues]
+        rows = [
+            {
+                **i,
+                "description": self.legacy_import_excerpts.get(i["id"], excerpt(i["description"])),
+            }
+            for i in self.issues
+        ]
         common = digest([*self.context, rows])
         return digest([common, self.policy]) if self.policy else common
 
@@ -220,15 +234,33 @@ class Inventory:
         }
 
 
-def technical_items(
+def technical_sources(
     db: Session, project: ProjectRecord, *, unlinked: bool = False
-) -> Iterator[BacklogItem]:
-    query = select(BacklogItem).where(
-        BacklogItem.project_id == project.id,
-        BacklogItem.issue_number.is_not(None),
-        (func.lower(BacklogItem.repository) == project.source_repository.lower())
-        | (BacklogItem.repository.is_(None) & (BacklogItem.source == "github")),
-        BacklogItem.workspace_review.is_distinct_from("planning"),
+) -> Iterator[tuple[BacklogItem, str | None]]:
+    repository = project.source_repository.lower()
+    # Only a mirror at the import limit needs its retained GitHub body.
+    query = (
+        select(BacklogItem, WorkspaceSource.evidence)
+        .select_from(BacklogItem)
+        .outerjoin(
+            WorkspaceImport,
+            (WorkspaceImport.project_id == BacklogItem.project_id)
+            & (func.lower(WorkspaceImport.repository) == repository)
+            & (func.length(BacklogItem.description) == DESCRIPTION_MAX),
+        )
+        .outerjoin(
+            WorkspaceSource,
+            (WorkspaceSource.project_id == WorkspaceImport.project_id)
+            & (WorkspaceSource.key == "issue:" + cast(BacklogItem.issue_number, String))
+            & (WorkspaceSource.kind == "issue"),
+        )
+        .where(
+            BacklogItem.project_id == project.id,
+            BacklogItem.issue_number.is_not(None),
+            (func.lower(BacklogItem.repository) == repository)
+            | (BacklogItem.repository.is_(None) & (BacklogItem.source == "github")),
+            BacklogItem.workspace_review.is_distinct_from("planning"),
+        )
     )
     if unlinked:
         query = query.where(
@@ -239,11 +271,17 @@ def technical_items(
             )
             .exists()
         )
-    for item in db.scalars(query.order_by(BacklogItem.issue_number, BacklogItem.id)):
-        if not planning_kind(
-            {"title": item.title, "body": item.description, "labels": item.issue_labels}
-        ):
-            yield item
+    for item, evidence in db.execute(query.order_by(BacklogItem.issue_number, BacklogItem.id)):
+        body = review_description(item, evidence, repository)
+        if not planning_kind({"title": item.title, "body": body, "labels": item.issue_labels}):
+            yield item, body
+
+
+def technical_items(
+    db: Session, project: ProjectRecord, *, unlinked: bool = False
+) -> Iterator[BacklogItem]:
+    for item, _ in technical_sources(db, project, unlinked=unlinked):
+        yield item
 
 
 def inventory(
@@ -282,14 +320,18 @@ def inventory(
     ):
         manual[item].append(str(story))
     issues: list[Row] = []
-    for issue in technical_items(db, project):
+    legacy_import_excerpts: dict[str, str] = {}
+    for issue, body in technical_sources(db, project):
         facts = issue.facts or {}
+        if body != issue.description:
+            # Positional checkpoints hashed the shorter backlog mirror for the whole project.
+            legacy_import_excerpts[str(issue.id)] = excerpt(issue.description)
         issues.append(
             {
                 "id": str(issue.id),
                 "number": issue.issue_number,
                 "title": issue.title,
-                "description": issue.description or "",
+                "description": body or "",
                 "state": issue.issue_state or "open",
                 "state_reason": facts.get("github_state_reason")
                 if issue.issue_state == "closed"
@@ -311,6 +353,7 @@ def inventory(
         issue_versions,
         context,
         policy,
+        legacy_import_excerpts,
     )
 
 

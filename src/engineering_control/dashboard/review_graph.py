@@ -18,7 +18,7 @@ from engineering_control.dashboard.issue_coverage import (
     EXCERPT_CHARACTERS,
     excerpt,
     inventory,
-    technical_items,
+    technical_sources,
 )
 from engineering_control.dashboard.workspace_issues import STORY_LINE, STORY_REF
 from engineering_control.db.models import (
@@ -145,14 +145,14 @@ def snapshot(
             )
         ):
             parents[issue_id].append(source_key(p.id, "stories", story))
-        for issue in technical_items(db, p):
+        for issue, body in technical_sources(db, p):
             row = record(
                 p,
                 "issues",
                 issue.id,
                 issue.issue_number,
                 issue.title,
-                issue.description,
+                body,
                 issue.issue_state or "open",
             )
             facts = issue.facts or {}

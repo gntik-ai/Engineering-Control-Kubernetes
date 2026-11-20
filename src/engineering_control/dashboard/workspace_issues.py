@@ -12,7 +12,11 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard.backlog_items import clean_description
+from engineering_control.dashboard.backlog_items import (
+    DESCRIPTION_MAX,
+    clean_description,
+    normalized_description,
+)
 from engineering_control.dashboard.planning_queue import queue_review, record_changed
 from engineering_control.dashboard.project_records import ProjectConflict, active_project
 from engineering_control.db.models import (
@@ -77,6 +81,34 @@ def planning_kind(issue: dict[str, Any]) -> str | None:
 
 def _time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+def review_description(
+    item: BacklogItem, evidence: dict[str, Any] | None, repository: str
+) -> str | None:
+    """Recover the suffix only for the matching imported revision and exact capped prefix."""
+    stored = item.description
+    if not evidence or evidence.get("number") != item.issue_number:
+        return stored
+    url = evidence.get("html_url")
+    if url and str(url).rstrip("/").casefold() != (
+        f"https://github.com/{repository}/issues/{item.issue_number}".casefold()
+    ):
+        return stored
+    if item.issue_updated_at is not None:
+        stamp = item.issue_updated_at
+        updated = evidence.get("updated_at")
+        try:
+            observed = _time(updated) if isinstance(updated, str) else None
+        except ValueError:
+            return stored
+        if observed != (stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)):
+            return stored
+    body = evidence.get("body")
+    if not isinstance(body, str):
+        return stored
+    complete = normalized_description(body)
+    return complete if complete[:DESCRIPTION_MAX] == stored else stored
 
 
 def _story_numbers(issue: dict[str, Any], repository: str) -> set[int]:
