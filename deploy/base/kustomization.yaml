@@ -5,6 +5,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: engineering-control
 resources:
+  - hold-falcone-connection-reviews.yaml
   - namespace.yaml
   - configuration.yaml
   - access.yaml
@@ -26,7 +27,7 @@ images:
   # Deploying a new version is changing this one line.
   - name: engineering-control
     newName: ghcr.io/gntik-ai/engineering-control-kubernetes
-    newTag: 3b7f086ade2f51c27da07339e7fb1d2d07fc28af
+    newTag: 0f6d912d81399cf1dfb95428ca1ef0bfc9279df9
 # The image the sandboxes run is a setting of the launcher, not a container of a manifest,
 # so it is pinned here by a patch: always to the same commit as the image above.
 patches:
@@ -36,4 +37,4 @@ patches:
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/env/3/value
-        value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:3b7f086ade2f51c27da07339e7fb1d2d07fc28af
+        value: ghcr.io/gntik-ai/engineering-control-kubernetes-sandbox:0f6d912d81399cf1dfb95428ca1ef0bfc9279df9
