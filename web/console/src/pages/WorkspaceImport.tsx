@@ -2,7 +2,7 @@ import { Alert, Button, Field, FieldLabel, Link, SimpleSelect, Textarea } from '
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { setQuery, useLocation } from '../router';
+import { accountsUrl, setQuery, useLocation } from '../router';
 import { useSubmit } from './ProjectDialogs';
 import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity } from './WorkspaceReview';
 
@@ -101,7 +101,7 @@ export function WorkspaceImport({
       persisted.reload();
       setRefreshNote(
         unavailable
-          ? `Refreshed ${refreshed} of ${refreshed + unavailable} account catalogs. Check the accounts in the Administrator Console.`
+          ? `Refreshed ${refreshed} of ${refreshed + unavailable} account catalogs. Check Accounts under Global settings.`
           : refreshed
             ? 'Model list refreshed.'
             : 'No active API accounts with a key.',
@@ -280,7 +280,7 @@ export function WorkspaceImport({
             <Alert
               tone="info"
               title="A configured model is required"
-              description="Refresh the model list or check an API account in the Administrator Console."
+              description={<>Refresh the model list or check your API account in <Link href={accountsUrl(project)}>Global settings → Accounts</Link>.</>}
             />
           )}
           <div className="flex flex-wrap items-center gap-2">
