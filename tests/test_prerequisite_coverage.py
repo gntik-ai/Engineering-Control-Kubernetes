@@ -101,11 +101,43 @@ def test_preview_uses_current_review_and_carries_evidence_to_provider(tmp_path: 
         (citation,) = upstream["prerequisites"]
         assert citation["revision"] == target["issue"]["revision"][:16]
         assert "provides the import sequence" in citation["passage"]
+        with repo.sessions.begin() as db:
+            other_run = uuid4()
+            earlier = db.get_one(ReviewEvidenceJob, run_id)
+            db.add(
+                ReviewFlowRun(
+                    id=other_run,
+                    project_id=data["project"],
+                    flow_key="review-evidence",
+                    flow_name="Evidence",
+                    action="evidence",
+                    version=0,
+                    settings={},
+                )
+            )
+            db.flush()
+            db.add(
+                ReviewEvidenceJob(
+                    run_id=other_run,
+                    project_id=data["project"],
+                    provider="",
+                    model="",
+                    token_cap=0,
+                    state="complete",
+                    source=earlier.source,
+                    claimed_at=datetime.now(UTC),
+                    result={
+                        "sample": {"issue": ik, "story": sk},
+                        "advisory": {"scope": "partial", "status": "advisory"},
+                    },
+                )
+            )
+        assert chosen()["prerequisites"] == [citation]
         with repo.sessions() as db:
             from engineering_control.dashboard.project_records import active_project
 
             src = review_graph.snapshot(db, active_project(db, "falcone"), False, "", "", "")
-            src["reviewed_scopes"] = review_prerequisites.reviewed_scopes(
+            src["reviewed_scopes"], _ = review_prerequisites.review_history(
                 db, data["project"], src["records"]
             )
             pairs, _ = review_graph.candidates(src, 1, prerequisites=True)
@@ -177,3 +209,14 @@ def test_v2_separates_scope_from_contribution_and_v1_keeps_its_wire_format(
     assert not decisions.consistent(read()) and decisions.needs_second_opinion(read())
     del answers["contribution"]
     assert not decisions.consistent(read())
+
+
+def test_disagreement_with_an_existing_human_judgment_gets_an_independent_review() -> None:
+    positive = {"scope": "partial", "contribution": "prerequisite", "link_probability": 0.9}
+    negative = {"scope": "unrelated", "contribution": "none", "link_probability": 0.1}
+    assert decisions.needs_second_opinion(positive, "unrelated")
+    assert not decisions.needs_second_opinion(positive, "partial")
+    for first, second in ((positive, positive), (positive, negative), (negative, positive)):
+        result = decisions.advisory(first, second, "unrelated")
+        assert result["status"] == "needs_review" and result["human_scope"] == "unrelated"
+    assert decisions.advisory(negative, negative, "unrelated")["scope"] == "unrelated"

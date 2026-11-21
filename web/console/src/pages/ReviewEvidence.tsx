@@ -14,7 +14,7 @@ type Pair = { prerequisites?: Dependency[]; id: string; issue: Source; story: So
 type Preview = { second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
 type Native = {contribution?: string; scope: string; provider: string; model: string; rubric: string; link_probability: number | null; strength?: number | null; review_reason: string; cached_from?: string; eur: string | null};
 type DecisionModel = Model & {available: boolean; rates: {input:number; output:number; cached?:number; request?:number} | null; endpoint: string; rubric: string};
-type Advisory = { status: 'advisory' | 'needs_review'; scope: string | null; reason: string; existing_link?: boolean };
+type Advisory = { human_scope?: string; status: 'advisory' | 'needs_review'; scope: string | null; reason: string; existing_link?: boolean };
 type Run = { second_opinion?: Native | null; advisory?: Advisory | null; native?: Native | null; id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
   failed_request?: {arm: string; reason: string; provider_ref?: string | null};
   arms: {arm: string; scope: string | null; evidence: string; tokens: number; input: number; output: number; eur: string | null; provider_ref?: string | null}[] };
@@ -145,12 +145,12 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
 }
 
 function NativeResult({value}: {value: Native}) {
-  return <div className="grid gap-1 text-sm"><strong>{value.provider} · {value.model}</strong><span>Link probability · {value.link_probability == null ? "No answer" : (100 * value.link_probability).toFixed(1)+"%"} · Scope · {scopeText(value.scope)}{value.contribution && ' · Contribution · '+value.contribution}{value.strength != null && ` · Evidence strength ${value.strength.toFixed(2)}/2`}</span><span>{value.review_reason} · {value.cached_from ? "Reused · no new charge" : value.eur == null ? "EUR estimate unavailable" : "€"+value.eur}</span></div>;
+  return <div className="grid gap-1 text-sm"><strong>{value.provider} · {value.model}</strong><span>Link probability · {value.link_probability == null ? "No answer" : (100 * value.link_probability).toFixed(1)+"%"} · Scope · {scopeText(value.scope)}{value.contribution ? ' · Contribution · '+value.contribution : value.rubric === 'issue-story-v1' ? ' · Direct coverage check' : ''}{value.strength != null && ` · Evidence strength ${value.strength.toFixed(2)}/2`}</span><span>{value.review_reason} · {value.cached_from ? "Reused · no new charge" : value.eur == null ? "EUR estimate unavailable" : "€"+value.eur}</span></div>;
 }
 
 function DecisionResults({primary,second,advisory}: {primary?:Native|null; second?:Native|null; advisory?:Advisory|null}) {
   return <>
-    {advisory && <div><strong>{advisory.status === 'needs_review' ? 'Needs administrator review' : 'Advisory result · '+scopeText(advisory.scope)}</strong><p>{advisory.reason}</p>
+    {advisory && <div><strong>{advisory.status === 'needs_review' ? 'Needs administrator review' : 'Advisory result · '+scopeText(advisory.scope)}</strong><p>{advisory.reason}</p>{advisory.human_scope && <p>Previous administrator judgment · {scopeText(advisory.human_scope)}</p>}
       {advisory.existing_link !== undefined && <p className="text-muted-foreground">Saved issue–Story link at review time · {advisory.existing_link ? 'Linked' : 'Unlinked'}</p>}</div>}
     {primary && <NativeResult value={primary}/>}
     {second && <div><strong>Second opinion</strong><NativeResult value={second}/></div>}
