@@ -239,7 +239,7 @@ export function WorkspaceImport({
             {coverage.state === 'running' && !state.budget_held && <p>{coverage.match_existing ? 'Matching imported issues to existing User Stories' : labels[state.stage]}</p>}
             {pausedCoverage && <p>Project coverage stopped. Resume from the last saved batch.</p>}
             {coverage.state === 'completed' && <p>Coverage check complete.{coverage.orphans !== undefined && (
-              coverage.orphans === 0 ? ' All imported technical issues are linked.' :
+              coverage.orphans === 0 ? ' No imported issues need a User Story.' :
                 ` ${coverage.orphans} imported ${coverage.orphans === 1 ? 'issue still needs' : 'issues still need'} a User Story.`
             )}</p>}
             {coverage.state === 'waiting' && <p>

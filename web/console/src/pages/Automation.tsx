@@ -254,7 +254,7 @@ function Assignments({ project }: { project: string }) {
   const sections = detail.data?.sections ?? [];
   const choices = (flows.data?.items ?? []).filter((f) => f.engine && f.engine.version !== null && !f.engine.part);
   return (
-    <Page title="Flow assignments" description="Choose which published flow each project operation runs.">
+    <Page title="Flow assignment" description="Choose which published flow each project operation runs.">
       <LoadError resource={detail} />
       <LoadError resource={flows} />
       <LoadError resource={bindings} />

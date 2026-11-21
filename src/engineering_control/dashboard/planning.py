@@ -34,6 +34,7 @@ from engineering_control.dashboard.connection_records import (
     connected_story_issues,
     finding_links,
 )
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning_queue import (
     queue_review,
     record_changed,
@@ -45,6 +46,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
+from engineering_control.dashboard.workspace_publishing import confirm_classification
 from engineering_control.db.models import (
     BacklogItem,
     PlanningReview,
@@ -64,11 +66,17 @@ IssueView = Literal["open", "closed", "draft"]
 
 
 def replace_parents(
-    session: Session, kind: Kind, project: UUID, key: UUID, parents: list[UUID]
+    session: Session,
+    kind: Kind,
+    project: UUID,
+    key: UUID,
+    parents: list[UUID],
+    *,
+    allow_empty: bool = False,
 ) -> None:
     parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
     expected = set(parents)
-    if not expected or len(expected) != len(parents):
+    if (not expected and not (kind == "issues" and allow_empty)) or len(expected) != len(parents):
         raise ProjectInvalid("Choose one or more distinct parents")
     valid = set(
         session.scalars(
@@ -112,6 +120,7 @@ def save_record(
     *,
     review_scope: str = "full",
     new_id: UUID | None = None,
+    execution_type: str | None = None,
 ) -> UUID:
     row: ProjectEpic | ProjectUserStory | BacklogItem
     if kind == "issues":
@@ -150,8 +159,18 @@ def save_record(
     row.description = clean_description(description)
     session.add(row)
     session.flush()
+    if isinstance(row, BacklogItem) and execution_type:
+        confirm_classification(session, project, row, execution_type)
     if kind != "epics":
-        replace_parents(session, kind, project.id, row.id, parents)
+        optional = (
+            kind == "issues"
+            and not parents
+            and session.scalar(
+                bugs_with_optional_stories(session, project.id).where(BacklogItem.id == row.id)
+            )
+            is not None
+        )
+        replace_parents(session, kind, project.id, row.id, parents, allow_empty=optional)
     if key is None:
         queue_review(session, project.id, kind, row.id, row.title, review_scope)
     else:
@@ -230,7 +249,7 @@ def _approvable(rows: Subquery, kind: Kind) -> ColumnElement[bool]:
         return pending
     eligible = ~rows.c.proposal | rows.c.parents[0].as_string().is_not(None)
     if kind == "issues":
-        eligible = eligible | rows.c.number.is_not(None)
+        eligible = eligible | rows.c.number.is_not(None) | (rows.c.proposal_type == "bug")
     return cast(ColumnElement[bool], pending & eligible)
 
 
@@ -253,6 +272,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             true().label("proposal"),
             case((awaiting_stage, "awaiting_stage"), else_="proposal").label("review"),
             WorkspaceCandidate.parents,
+            WorkspaceCandidate.execution_type.label("proposal_type"),
             WorkspaceCandidate.number,
             WorkspaceSource.evidence["state"].as_string().label("github_state"),
             literal("open").label("local_state")
@@ -284,6 +304,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             false(),
             BacklogItem.workspace_review,
             null(),
+            null(),
             BacklogItem.issue_number,
             BacklogItem.issue_state,
             null(),
@@ -307,6 +328,7 @@ def _table_rows(project: UUID, kind: Kind) -> Subquery:
             model.created_at,
             false(),
             literal("approved"),
+            null(),
             null(),
             null(),
             null(),
@@ -516,31 +538,6 @@ class PlanningRecords:
                     .limit(page_size)
                 ).mappings()
             ]
-            linked: dict[UUID, list[str]] = defaultdict(list)
-            parents: dict[str, str] = {}
-            has_parents = False
-            if kind != "epics":
-                options = _parent_options(project.id, kind)
-                has_parents = session.execute(options.limit(1)).first() is not None
-                child, parent, link = _parent_links(kind)
-                saved_ids = [item["id"] for item in items if not item["proposal"]]
-                if saved_ids:
-                    for child_id, parent_id in session.execute(
-                        select(child, parent)
-                        .where(link.project_id == project.id, child.in_(saved_ids))
-                        .order_by(parent)
-                    ):
-                        linked[child_id].append(str(parent_id))
-                ids = {
-                    UUID(uid) for item in items for uid in (item["parents"] or linked[item["id"]])
-                }
-                if ids:
-                    parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
-                    parents = {
-                        str(uid): title
-                        for uid, title in session.execute(options.where(parent_model.id.in_(ids)))
-                    }
-            external: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
             mirror_ids = (
                 {
                     number: key
@@ -560,18 +557,49 @@ class PlanningRecords:
             connection_keys = [i["id"] for i in items if not i["proposal"]] + list(
                 mirror_ids.values()
             )
+            linked: dict[UUID, list[str]] = defaultdict(list)
+            parents: dict[str, str] = {}
+            has_parents = False
+            if kind != "epics":
+                options = _parent_options(project.id, kind)
+                has_parents = session.execute(options.limit(1)).first() is not None
+                child, parent, link = _parent_links(kind)
+                if connection_keys:
+                    for child_id, parent_id in session.execute(
+                        select(child, parent)
+                        .where(link.project_id == project.id, child.in_(connection_keys))
+                        .order_by(parent)
+                    ):
+                        linked[child_id].append(str(parent_id))
+                for item in items:
+                    key = (
+                        mirror_ids.get(item["number"], item["id"])
+                        if item["proposal"]
+                        else item["id"]
+                    )
+                    item["parents"] = list(dict.fromkeys([*(item["parents"] or []), *linked[key]]))
+                ids = {UUID(uid) for item in items for uid in item["parents"]}
+                if ids:
+                    parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
+                    parents = {
+                        str(uid): title
+                        for uid, title in session.execute(options.where(parent_model.id.in_(ids)))
+                    }
+            external: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
             for uid, badge in finding_links(session, project.id, kind, connection_keys):
                 external[uid].append(badge)
             classifications = (
                 {
-                    uid: (value, confirmed)
-                    for uid, value, confirmed in session.execute(
+                    uid: (value, confirmed, optional)
+                    for uid, value, confirmed, optional in session.execute(
                         select(
-                            BacklogItem.id, BacklogItem.execution_type, BacklogItem.type_confirmed
+                            BacklogItem.id,
+                            BacklogItem.execution_type,
+                            BacklogItem.type_confirmed,
+                            BacklogItem.id.in_(bugs_with_optional_stories(session, project.id)),
                         ).where(
                             BacklogItem.project_id == project.id,
                             BacklogItem.id.in_(connection_keys),
-                            BacklogItem.execution_type.is_not(None),
                         )
                     )
                 }
@@ -608,29 +636,36 @@ class PlanningRecords:
                     stories_count, item["issue_count"] = child_counts.get(key, (0, 0))
                     if kind == "epics":
                         item["story_count"] = stories_count
-                item["automatic_review"] = reviews.get(
-                    mirror_ids.get(item["number"], key) if item["proposal"] else key
-                )
+                mirror = mirror_ids.get(item["number"], key) if item["proposal"] else key
+                item["automatic_review"] = reviews.get(mirror)
                 item["review_reason"] = reasons.get(key)
-                item["connections"] = external[
-                    mirror_ids.get(item["number"], key) if item["proposal"] else key
-                ]
+                item["connections"] = external[mirror]
                 rels = item.pop("parents")
+                proposal_type = item.pop("proposal_type")
                 item.pop("created_at")
                 if kind != "epics":
-                    ids_for_row = [v for v in (rels or linked[key]) if v in parents]
+                    ids_for_row = [v for v in rels if v in parents]
                     item["epic_ids" if kind == "stories" else "story_ids"] = ids_for_row
                     if kind == "issues":
-                        mirror = mirror_ids.get(item["number"], key) if item["proposal"] else key
-                        item["execution_type"], item["type_confirmed"] = classifications.get(
-                            mirror, (None, False)
+                        category, confirmed, optional = classifications.get(
+                            mirror, (None, False, False)
                         )
-                        item["orphan"] = not ids_for_row and not any(
+                        if proposal_type:
+                            category, confirmed, optional = (
+                                proposal_type,
+                                True,
+                                proposal_type == "bug",
+                            )
+                        item["execution_type"], item["type_confirmed"] = category, confirmed
+                        item["story_optional"] = optional
+                        unlinked = not ids_for_row and not any(
                             link["kind"] == "stories"
                             and link["record"]
                             and link["status"] == "approved"
                             for link in item["connections"]
                         )
+                        item["orphan"] = unlinked and not optional
+                        item["standalone_bug"] = unlinked and optional
                 item["id"] = str(key)
                 item["url"] = (
                     f"https://github.com/{project.source_repository}/issues/{item['number']}"
@@ -735,26 +770,41 @@ class PlanningRecords:
                     result["close_numbers"] = closing
             return result
 
-    def link_stories(self, name: str, key: UUID, stories: list[UUID]) -> dict[str, str]:
+    def link_stories(
+        self, name: str, key: UUID, stories: list[UUID], execution_type: str | None = None
+    ) -> dict[str, str]:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             item = db.scalar(
                 select(BacklogItem).where(
                     BacklogItem.id == key,
                     BacklogItem.project_id == project.id,
-                    BacklogItem.issue_number.is_not(None),
+                    _visible_issues(project.id),
                     BacklogItem.workspace_review.is_distinct_from("planning"),
                 )
             )
             if item is None:
                 raise ProjectNotFound(str(key))
-            replace_parents(db, "issues", project.id, key, stories)
+            if execution_type:
+                confirm_classification(db, project, item, execution_type)
+            optional = (
+                db.scalar(bugs_with_optional_stories(db, project.id).where(BacklogItem.id == key))
+                is not None
+            )
+            # A reclassified standalone bug can return to the list of Issues needing a Story.
+            empty_before = execution_type == "enhancement" and not db.scalar(
+                select(ProjectIssueStory.story_id).where(ProjectIssueStory.item_id == key).limit(1)
+            )
+            replace_parents(
+                db, "issues", project.id, key, stories, allow_empty=optional or empty_before
+            )
             record_changed(db, project.id, "issues", key, item.title)
-            item.facts = {**(item.facts or {}), "manual_story_links": True}
+            item.facts = {**(item.facts or {}), "manual_story_links": bool(stories) or optional}
             mirror = db.scalar(
                 select(WorkspaceCandidate).where(
                     WorkspaceCandidate.project_id == project.id,
                     WorkspaceCandidate.kind == "issues",
+                    WorkspaceCandidate.number.is_not(None),
                     WorkspaceCandidate.number == item.issue_number,
                     WorkspaceCandidate.decision == "pending",
                 )
@@ -857,6 +907,7 @@ class PlanningRecords:
         description: str | None,
         parents: list[UUID],
         key: UUID | None = None,
+        execution_type: str | None = None,
     ) -> dict[str, str]:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -873,11 +924,21 @@ class PlanningRecords:
                         parents=[],
                         identity=f"intake:{identifier}",
                         origin="intake",
+                        execution_type=execution_type,
                     )
                 )
                 queue_review(session, project.id, kind, identifier, cleaned, "intake")
             else:
-                identifier = save_record(session, project, kind, title, description, parents, key)
+                identifier = save_record(
+                    session,
+                    project,
+                    kind,
+                    title,
+                    description,
+                    parents,
+                    key,
+                    execution_type=execution_type,
+                )
             return {"project": name, "id": str(identifier)}
 
     def set_state(
@@ -925,11 +986,14 @@ class PlanningRecords:
                     ProjectIssueStory.item_id,
                 )
             other_parents = select(child).where(links.project_id == project.id, parent != key)
-            orphan = session.scalar(
-                select(child)
-                .where(links.project_id == project.id, parent == key, child.not_in(other_parents))
-                .limit(1)
+            last_parent = select(child).where(
+                links.project_id == project.id, parent == key, child.not_in(other_parents)
             )
+            if kind == "stories":
+                last_parent = last_parent.where(
+                    child.not_in(bugs_with_optional_stories(session, project.id))
+                )
+            orphan = session.scalar(last_parent.limit(1))
             if orphan:
                 raise ProjectConflict(
                     "Reassign the linked story or issue before removing its last parent"

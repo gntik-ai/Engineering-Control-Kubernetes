@@ -1132,6 +1132,7 @@ def create_app(
                 body.title,
                 body.description,
                 body.parents,
+                body.execution_type,
             ),
             event="workspace.proposal_edited",
             subject=name,
@@ -1480,7 +1481,7 @@ def create_app(
             request,
             WorkspaceIssueStories,
             lambda body: asyncio.to_thread(
-                repo(request).planning.link_stories, name, key, body.story_ids
+                repo(request).planning.link_stories, name, key, body.story_ids, body.execution_type
             ),
             event="workspace.issue_stories_linked",
             subject=name,
@@ -1496,7 +1497,14 @@ def create_app(
                 else (body.story_ids if isinstance(body, WorkspaceIssueInput) else [])
             )
             return await asyncio.to_thread(
-                repo(request).planning.save, name, kind, body.title, body.description, parents, key
+                repo(request).planning.save,
+                name,
+                kind,
+                body.title,
+                body.description,
+                parents,
+                key,
+                body.execution_type if isinstance(body, WorkspaceIssueInput) else None,
             )
 
         return await project_change(

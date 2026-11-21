@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import coverage_preview, review_budget, review_flows
 from engineering_control.dashboard.issue_coverage import Coverage, technical_items
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -851,7 +852,15 @@ class WorkspaceImports:
                                     )
                                 )
                             )
-                            if not (item.facts or {}).get("manual_story_links"):
+                            if (
+                                story_ids
+                                and not (item.facts or {}).get("manual_story_links")
+                                and not session.scalar(
+                                    bugs_with_optional_stories(session, project.id).where(
+                                        BacklogItem.id == item.id
+                                    )
+                                )
+                            ):
                                 linked_issues += add_story_links(
                                     session, project.id, item.id, story_ids
                                 )

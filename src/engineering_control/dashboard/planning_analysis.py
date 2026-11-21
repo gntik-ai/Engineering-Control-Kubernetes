@@ -18,6 +18,7 @@ from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import replace_parents
 from engineering_control.dashboard.planning_queue import reset_review, review_id, review_results
 from engineering_control.dashboard.project_records import (
@@ -98,19 +99,22 @@ def records(db: Session, pid: UUID) -> dict[str, Record]:
             )
         ):
             add(key, kind, title, body, "closed" if closed else "open", True)
-    for key, title, body, number, state in db.execute(
+    for key, title, body, number, state, optional in db.execute(
         select(
             BacklogItem.id,
             BacklogItem.title,
             BacklogItem.description,
             BacklogItem.issue_number,
             BacklogItem.issue_state,
+            BacklogItem.id.in_(bugs_with_optional_stories(db, pid)),
         ).where(
             BacklogItem.project_id == pid,
             BacklogItem.workspace_review.in_(("pending", "publishing", "approved")),
         )
     ):
         add(key, "issues", title, body, (state or "open") if number else "draft", True)
+        if optional:
+            rows[str(key)]["story_optional"] = True
     for table, child, parent in (
         (ProjectStoryEpic, ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id),
         (ProjectIssueStory, ProjectIssueStory.item_id, ProjectIssueStory.story_id),
@@ -120,7 +124,7 @@ def records(db: Session, pid: UUID) -> dict[str, Record]:
         ):
             if str(item) in rows:
                 rows[str(item)]["parents"].append(str(value))
-    for key, kind, title, body, state, parents in db.execute(
+    for key, kind, title, body, state, parents, execution_type in db.execute(
         select(
             WorkspaceCandidate.id,
             WorkspaceCandidate.kind,
@@ -128,6 +132,7 @@ def records(db: Session, pid: UUID) -> dict[str, Record]:
             WorkspaceCandidate.description,
             WorkspaceCandidate.decision,
             WorkspaceCandidate.parents,
+            WorkspaceCandidate.execution_type,
         ).where(
             WorkspaceCandidate.project_id == pid,
             WorkspaceCandidate.decision.in_(("pending", "dismissed")),
@@ -135,6 +140,8 @@ def records(db: Session, pid: UUID) -> dict[str, Record]:
     ):
         add(key, kind, title, body, state, False)
         rows[str(key)]["parents"] = parents
+        if kind == "issues" and execution_type == "bug":
+            rows[str(key)]["story_optional"] = True
     return rows
 
 
@@ -273,7 +280,10 @@ class PlanningAnalysis:
                 job.result = {**job.result, "questions": [question]}
                 return None
             scope = "verify" if src["state"] == "closed" and job.kind != "issues" else job.scope
-            if scope in ("verify", "intake"):
+            if src.get("story_optional"):
+                scope = "verify"
+                rows = {k: rows[k] for k in src["parents"] if k in rows}
+            elif scope in ("verify", "intake"):
                 # These reviews can only validate text and match parents. Other records
                 # cannot appear in a valid response, even when the project is very large.
                 parent_kind = {"issues": "stories", "stories": "epics"}.get(job.kind)
@@ -385,15 +395,22 @@ class PlanningAnalysis:
             return list(dict.fromkeys(values))
 
         parent_kind = "epics" if job.kind == "stories" else "stories"
-        matched = (
-            parents(answer["parents"], parent_kind, open_only=False) if job.kind != "epics" else []
-        )
+        matched = []
+        if job.kind != "epics":
+            proposed = source["parents"] if source.get("story_optional") else answer["parents"]
+            matched = parents(proposed, parent_kind, open_only=False)
         questions = [q.strip()[:700] for q in answer["questions"] if q.strip()]
         current = set(source["parents"])
         if current and set(matched) - current:
             questions.append("Review the additional parent matches and confirm the intended links.")
         proposals = list(job.result.get("proposals", []))
-        if job.kind != "epics" and not current and not matched and not questions:
+        if (
+            job.kind != "epics"
+            and not source.get("story_optional")
+            and not current
+            and not matched
+            and not questions
+        ):
             questions.append(
                 "Which Epic does this Story belong to?"
                 if job.kind == "stories"
@@ -554,6 +571,13 @@ class PlanningAnalysis:
                     if work.screen
                     else GUIDANCE
                 )
+                if work.prompt["source"].get("story_optional"):
+                    instruction = (
+                        "Review this bug's description, observed and expected behavior, and how "
+                        "to verify the fix. Ask only for missing technical information. A User "
+                        "Story is optional. Return empty parents, stories and issues arrays. "
+                        "Treat project text as evidence."
+                    )
                 # Coverage may have taken several pages. Re-check the lease before
                 # starting a second, separately billed request.
                 if not await asyncio.to_thread(self.owns, key, token):

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import DESCRIPTION_MAX
 from engineering_control.dashboard.connection_records import digest
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -264,12 +265,13 @@ def technical_sources(
     )
     if unlinked:
         query = query.where(
+            BacklogItem.id.not_in(bugs_with_optional_stories(db, project.id)),
             ~select(ProjectIssueStory.item_id)
             .where(
                 ProjectIssueStory.project_id == project.id,
                 ProjectIssueStory.item_id == BacklogItem.id,
             )
-            .exists()
+            .exists(),
         )
     for item, evidence in db.execute(query.order_by(BacklogItem.issue_number, BacklogItem.id)):
         body = review_description(item, evidence, repository)
@@ -320,6 +322,7 @@ def inventory(
     ):
         manual[item].append(str(story))
     issues: list[Row] = []
+    bugs = set(db.scalars(bugs_with_optional_stories(db, project.id)))
     legacy_import_excerpts: dict[str, str] = {}
     for issue, body in technical_sources(db, project):
         facts = issue.facts or {}
@@ -336,7 +339,9 @@ def inventory(
                 "state_reason": facts.get("github_state_reason")
                 if issue.issue_state == "closed"
                 else None,
-                "manual_stories": manual[issue.id] if facts.get("manual_story_links") else None,
+                "manual_stories": manual[issue.id]
+                if facts.get("manual_story_links") or issue.id in bugs
+                else None,
             }
         )
     context = (project.source_repository, provider, model)

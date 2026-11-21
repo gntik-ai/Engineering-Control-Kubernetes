@@ -527,6 +527,7 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
     kind: Mapped[str] = mapped_column(String(16))
     identity: Mapped[str] = mapped_column(String(96))
     review_reason: Mapped[str | None] = mapped_column(Text)
+    execution_type: Mapped[str | None] = mapped_column(String(16))
     origin: Mapped[str] = mapped_column(String(16), default="import", server_default="import")
     number: Mapped[int | None] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(300))
