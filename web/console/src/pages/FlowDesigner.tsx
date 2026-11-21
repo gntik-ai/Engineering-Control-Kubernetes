@@ -59,7 +59,7 @@ function TaskList({
     if (!task.key.startsWith('evidence.')) return false;
     if (reviewTask === 'review.evidence') return true;
     return ['review.coverage','review.issues','review.automatic'].includes(reviewTask)
-      && !['evidence.compare','evidence.wiki','evidence.decisions'].includes(task.key);
+      && !['evidence.compare','evidence.wiki','evidence.decisions','evidence.second_opinion'].includes(task.key);
   });
   const groups = [...new Set(offered.map((task) => task.group))];
   const types = taskTypes(catalogue);
