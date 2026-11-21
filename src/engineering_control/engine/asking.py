@@ -221,6 +221,8 @@ async def _asked(
     prefer = asked_with.get(where[0][0])
     return Question(
         choices=where,
+        upstreams=str(params.get("upstreams") or ""),
+        allow_fallbacks=bool(params.get("allow_fallbacks", True)),
         system=SYSTEM,
         prompt=beginning + ctx.as_agent("\n\n".join(part for part in asking if part)),
         schema=schema,

@@ -29,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.db.models import ProviderAccount
-from engineering_control.models import anthropic_api, openai_style, shape
+from engineering_control.models import anthropic_api, decisions, openai_style, openrouter, shape
 from engineering_control.models.pricelist import PriceLists
 from engineering_control.models.providers import BY_KEY, ApiProvider, cost_of
 from engineering_control.models.sealing import SealError, unseal
@@ -81,6 +81,10 @@ class Question:
     hours: int = 24
     late: str = "stop"
     on_text: TextUpdate | None = None
+    tariff: dict[str, float] | None = None
+    native_score: bool | None = None
+    upstreams: str = ""
+    allow_fallbacks: bool = True
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,7 @@ class _Held:
     url: str
     key: str
     prices: dict[str, Any]
+    catalog: dict[str, Any] | None = None
 
 
 # Below this many characters nothing is marked to be kept: no provider caches so
@@ -156,15 +161,29 @@ def usage_of(
     when the account says what its model costs."""
     write = held.provider.cache_write[1 if question.cache == "hour" else 0]
     cost = cost_of(
-        held.prices,
+        {
+            model: question.tariff
+            or (openrouter.DIRECT_PRICE if held.provider.key == "openai" else {})
+        }
+        if question.native_score is not None
+        else held.prices,
         model,
         used,
         write=write,
         part=held.provider.batch_price if batch else 1.0,
+        precision=12
+        if question.native_score is not None or held.provider.key == "openrouter"
+        else 6,
     )
     counted = {name: count for name, count in used.items() if name != "cache_write" or count}
     return {
-        "tokens": used["input"] + used["output"],
+        "tokens": used["input"]
+        + used["output"]
+        + (
+            used["cached"]
+            if question.native_score is not None or held.provider.key == "openrouter"
+            else 0
+        ),
         **counted,
         **({"cost": cost} if cost is not None else {}),
         **({"batch": True} if batch else {}),
@@ -227,7 +246,13 @@ class Models:
 
     # --- accounts ------------------------------------------------------------------------
 
-    def _held(self, provider: str, besides: set[UUID], prefer: UUID | None = None) -> _Held | None:
+    def _held(
+        self,
+        provider: str,
+        besides: set[UUID],
+        prefer: UUID | None = None,
+        model: str | None = None,
+    ) -> _Held | None:
         """The account of that provider to ask with: the one the run asked with before,
         or else the one unused longest, that has a key, is not paused and is not
         resting."""
@@ -249,6 +274,7 @@ class Models:
                 account
                 for account in accounts
                 if account.id not in besides
+                and (not model or model in (account.models or []))
                 and not (
                     account.state == "limited"
                     and account.limited_until is not None
@@ -274,6 +300,7 @@ class Models:
                     url=kind.endpoint(account.endpoint).url,
                     key=key,
                     prices=dict(account.prices or {}),
+                    catalog=account.model_catalog,
                 )
         return None
 
@@ -303,6 +330,40 @@ class Models:
     async def _call(
         self, held: _Held, model: str, question: Question, prompt: str, *, retry: bool = True
     ) -> Wire:
+        native = question.native_score is not None
+        route = None
+        output_limit = question.max_tokens
+        if held.provider.key == "openrouter":
+            record = (held.catalog or {}).get(model, {})
+            if not openrouter.supports(
+                record,
+                decision=native,
+                score=bool(question.native_score),
+                schema=not question.loose,
+            ):
+                raise WireError(
+                    "configuration", "Refresh Accounts and choose a model that supports this task."
+                )
+            try:
+                route = openrouter.routing(
+                    question.upstreams, question.allow_fallbacks, decisions=native
+                )
+            except ValueError as exc:
+                raise WireError("configuration", str(exc)) from exc
+            if isinstance(record.get("max_output"), int) and record["max_output"] > 0:
+                output_limit = min(output_limit, record["max_output"])
+        if question.native_score is not None:
+            payload = decisions.body(
+                held.provider.key,
+                model,
+                question.system,
+                question.prompt,
+                question.native_score,
+                route or {},
+            )
+            return await decisions.complete(
+                self.http, held.provider.key, held.url, held.key, payload, question.seconds
+            )
         if held.provider.style == "anthropic":
             return await anthropic_api.complete(
                 key=held.key,
@@ -331,8 +392,9 @@ class Models:
             system=question.system,
             prompt=prompt,
             schema=question.schema,
-            max_tokens=question.max_tokens,
+            max_tokens=output_limit,
             seconds=question.seconds,
+            routing=route,
             limit_name=held.provider.limit_name,
             strict=held.provider.shape == "schema" and not question.loose,
             effort=question.effort if held.provider.effort else None,
@@ -370,15 +432,28 @@ class Models:
         base = with_shape(question)
         busy: list[str] = []
         had_account = False
+        if question.native_score is not None:
+            retry = False
         for provider, model in question.choices:
             tried: set[UUID] = set()
             while True:
-                held = await asyncio.to_thread(self._held, provider, tried, question.prefer)
+                held = await asyncio.to_thread(
+                    self._held,
+                    provider,
+                    tried,
+                    question.prefer,
+                    model
+                    if provider == "openrouter" or question.native_score is not None
+                    else None,
+                )
                 if held is None:
                     break
                 tried.add(held.id)
                 had_account = True
                 started = time.monotonic()
+                charges: list[float] = []
+                estimated = 0.0
+                unpriced_tokens = 0
                 used = {"input": 0, "output": 0, "cached": 0, "cache_write": 0}
                 prompt, why = (complaint(base, earlier), earlier) if earlier else (base, "")
                 try:
@@ -395,6 +470,31 @@ class Models:
                         used["output"] += wire.written
                         used["cached"] += wire.cached
                         used["cache_write"] += wire.cache_written
+                        if provider == "openrouter":
+                            used["responses"] = responses
+                            if wire.reported_cost is not None:
+                                charges.append(wire.reported_cost)
+                            else:
+                                rates = (
+                                    {model: question.tariff}
+                                    if question.native_score is not None
+                                    else held.prices
+                                )
+                                cost = cost_of(
+                                    rates,
+                                    model,
+                                    {
+                                        "input": wire.read,
+                                        "output": wire.written,
+                                        "cached": wire.cached,
+                                        "cache_write": wire.cache_written,
+                                    },
+                                    precision=12,
+                                )
+                                if cost is None:
+                                    unpriced_tokens += wire.read + wire.written + wire.cached
+                                else:
+                                    estimated += cost
                         data = shape.read_object(wire.text)
                         why = (
                             "it was not a JSON object"
@@ -410,6 +510,34 @@ class Models:
                             account=held.name,
                             usage={
                                 **usage_of(held, model, wire.model, used, question),
+                                **({"reported_credits_usd": sum(charges)} if charges else {}),
+                                **(
+                                    {
+                                        "cost": sum(charges) + estimated,
+                                        "unpriced_tokens": unpriced_tokens,
+                                    }
+                                    if provider == "openrouter"
+                                    else {}
+                                ),
+                                **({"upstream": wire.upstream} if wire.upstream else {}),
+                                **(
+                                    {
+                                        "requested_model": model,
+                                        "endpoint": (
+                                            openrouter.DECISIONS
+                                            if provider == "openrouter"
+                                            else openrouter.DIRECT_ENDPOINT
+                                        )
+                                        if question.native_score is not None
+                                        else openrouter.CHAT,
+                                        "upstream_policy": {
+                                            "only": question.upstreams,
+                                            "allow_fallbacks": question.allow_fallbacks,
+                                        },
+                                    }
+                                    if provider == "openrouter" or question.native_score is not None
+                                    else {}
+                                ),
                                 **(
                                     {"provider_ref": wire.provider_ref} if wire.provider_ref else {}
                                 ),
@@ -572,6 +700,7 @@ class Models:
                 url=kind.endpoint(account.endpoint).url,
                 key=key,
                 prices=dict(account.prices or {}),
+                catalog=account.model_catalog,
             )
 
     # --- trying an account ----------------------------------------------------------------
@@ -623,12 +752,16 @@ class Models:
             return "unchecked", "This installation has no key to open API keys with."
         if account.archived_at is not None or (catalog_only and account.paused):
             return "unchecked", "The account is inactive."
+        catalog: dict[str, Any] | None = None
         found: list[str] | None = None
         reason: str | None
         try:
             key = unseal(sealing_key, account.id, account.sealed_key)
             url = kind.endpoint(account.endpoint).url
-            if kind.style == "anthropic":
+            if kind.key == "openrouter":
+                catalog = await openrouter.catalog(self.http, url, key)
+                found = sorted(catalog)
+            elif kind.style == "anthropic":
                 found = await anthropic_api.models(key=key, base_url=url, http=self._anthropic_http)
             else:
                 found = await openai_style.models(
@@ -666,8 +799,20 @@ class Models:
                     current.state, current.state_reason = state, reason[:300] if reason else None
                     current.checked_at = datetime.now(UTC)
                     current.limited_until = None
+                current.catalog_error = reason[:300] if reason else None
                 if found is not None:
                     current.models = found
+                    current.catalog_updated_at = datetime.now(UTC)
+                    if catalog is not None:
+                        current.model_catalog = catalog
+                        prices = dict(current.prices or {})
+                        for name, item in catalog.items():
+                            if not prices.get(name, {}).get("own"):
+                                if item["rates"] is None:
+                                    prices.pop(name, None)
+                                else:
+                                    prices[name] = item["rates"]
+                        current.prices = prices
                     current.identity = f"{len(found)} models" if found else None
                 return True
 

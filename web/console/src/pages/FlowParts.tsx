@@ -11,6 +11,7 @@ export const PROVIDER_NAMES: Record<string, string> = { claude: 'Claude', chatgp
 export const API_PROVIDER_NAMES: Record<string, string> = {
   anthropic: 'Anthropic API',
   openai: 'OpenAI API',
+  openrouter: 'OpenRouter',
   google: 'Google Gemini API',
   deepseek: 'DeepSeek',
   qwen: 'Qwen',
@@ -145,6 +146,30 @@ export function Setting({
   // A task that names an agent may leave some settings open: they are then its agent's.
   const itsAgent = param.name !== 'agent' && Boolean(node.with.agent);
   const leftOpen = itsAgent && (node.with[param.name] === undefined || node.with[param.name] === null);
+  if ((param.name === 'upstreams' || param.name === 'allow_fallbacks') && (
+    (node.task === 'evidence.decisions' && node.with.decision_provider !== 'openrouter')
+    || (!node.task.startsWith('review.') && node.task !== 'evidence.decisions' && node.with.provider !== 'openrouter' && node.with.then_provider !== 'openrouter')
+    || (typeof node.with.generation === 'string' && node.with.generation && !node.with.generation.startsWith('openrouter:'))
+  )) return null;
+  const generation = param.name === 'generation';
+  const decision = param.name === 'decision_model';
+  const routed = (param.name === 'model' && node.with.provider === 'openrouter')
+    || (param.name === 'then_model' && node.with.then_provider === 'openrouter');
+  if (generation || decision || routed) {
+    const provider = String(node.with.decision_provider ?? 'openai');
+    const list = decision ? (catalogue.decision_models ?? []).filter(m => m.provider === provider
+      && (!node.with.ordered_score || m.questions.includes('score')))
+      : (catalogue.api_models ?? []).filter(m => generation || m.provider === 'openrouter');
+    const id = (m: {provider: string; model: string}) => generation ? m.provider + ':' + m.model : m.model;
+    const selected = String(value ?? '');
+    return <Field className="max-w-lg"><FieldLabel>{label}</FieldLabel>
+      <select aria-label={label} className="rounded-md border border-border bg-background p-2 text-sm" value={selected}
+        onChange={event => onChange(event.target.value)}>
+        <option value="">{generation ? 'Use the project selection' : 'Choose a model'}</option>
+        {selected && !list.some(m => id(m) === selected) && <option disabled value={selected}>{selected} · unavailable</option>}
+        {list.map(m => <option key={id(m)} value={id(m)}>{generation ? m.provider + ' · ' : ''}{m.model}</option>)}
+      </select><FieldDescription>{param.doc}</FieldDescription></Field>;
+  }
   if (param.kind === 'bool') {
     return (
       <div className="grid gap-1">

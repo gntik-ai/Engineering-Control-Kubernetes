@@ -1867,6 +1867,7 @@ def create_app(
                 b.provider,
                 b.model,
                 b.token_cap,
+                b.candidate,
             ),
             event="project.evidence_run_started",
             subject=name,

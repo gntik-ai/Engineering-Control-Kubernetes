@@ -59,7 +59,22 @@ async def _send(
             method, url, headers={"Authorization": f"Bearer {key}"}, timeout=seconds, **more
         )
     except httpx.HTTPError as error:
-        raise WireError("busy", f"{name} did not answer: {type(error).__name__}") from error
+        kind = (
+            "unconfirmed"
+            if method == "POST" and name.lower() in ("openrouter", "openai")
+            else "busy"
+        )
+        raise WireError(kind, f"{name} did not answer: {type(error).__name__}") from error
+    if (
+        method == "POST"
+        and name.lower() in ("openrouter", "openai")
+        and response.status_code >= 500
+    ):
+        raise WireError(
+            "unconfirmed",
+            f"{name} returned HTTP {response.status_code}.",
+            provider_ref=response.headers.get("x-request-id"),
+        )
     if response.status_code != 200:
         raise _failure(name, response)
     return response
@@ -102,11 +117,16 @@ def read(name: str, answer: Any, model: str, max_tokens: int, model_prefix: str 
         choice = answer["choices"][0]
         message = choice["message"]
     except (LookupError, TypeError) as error:
-        raise WireError("busy", f"{name} answered something that is not an answer.") from error
+        raise WireError(
+            "unconfirmed" if name == "OpenRouter" else "busy",
+            f"{name} returned unreadable answer data."
+            if name == "OpenRouter"
+            else f"{name} answered something that is not an answer.",
+        ) from error
     reason = str(choice.get("finish_reason") or "")
-    if reason == "length":
+    if name != "OpenRouter" and reason == "length":
         raise WireError("cut", f"The answer was longer than the {max_tokens:,} tokens it may have.")
-    if reason == "content_filter" or message.get("refusal"):
+    if name != "OpenRouter" and (reason == "content_filter" or message.get("refusal")):
         raise WireError(
             "declined", f"The model declined to answer: {said(message.get('refusal'))}".rstrip(": ")
         )
@@ -124,14 +144,34 @@ def read(name: str, answer: Any, model: str, max_tokens: int, model_prefix: str 
     kept = _count(details.get("cache_write_tokens")) or _count(
         details.get("cache_creation_input_tokens")
     )
-    return Wire(
+    from engineering_control.models.openrouter import amount
+
+    router = name == "OpenRouter"
+    if router and not all(
+        type(usage.get(field)) is int and usage[field] >= 0
+        for field in ("prompt_tokens", "completion_tokens")
+    ):
+        raise WireError(
+            "unconfirmed", "OpenRouter returned no usable metering.", provider_ref=answer.get("id")
+        )
+    wire = Wire(
         text=str(message.get("content") or ""),
         model=str(answer.get("model") or model).removeprefix(model_prefix),
         read=max(0, read_in_all - cached),
         written=written,
         cached=cached,
         cache_written=min(kept, max(0, read_in_all - cached)),
+        provider_ref=str(answer["id"]) if router and answer.get("id") else None,
+        upstream=str(answer["provider"]) if router and answer.get("provider") else None,
+        reported_cost=amount(usage.get("cost")) if router else None,
     )
+    if reason == "length" or reason == "content_filter" or message.get("refusal"):
+        raise WireError(
+            "cut" if reason == "length" else "declined",
+            "OpenRouter returned an incomplete answer.",
+            metered=wire,
+        )
+    return wire
 
 
 async def _events(response: httpx.Response) -> AsyncIterator[str]:
@@ -158,6 +198,7 @@ async def _stream(
     text, refusal, finish = "", "", ""
     usage: dict[str, Any] = {}
     model = body["model"]
+    metadata: dict[str, Any] = {}
     await on_text("")
     try:
         async with http.stream(
@@ -169,6 +210,10 @@ async def _stream(
         ) as response:
             if response.status_code != 200:
                 await response.aread()
+                if name == "OpenRouter" and response.status_code >= 500:
+                    raise WireError(
+                        "unconfirmed", "OpenRouter interrupted the stream before metering."
+                    )
                 raise _failure(name, response)
             # Some compatible endpoints answer with a complete JSON object in the same request.
             if "application/json" in response.headers.get("content-type", ""):
@@ -179,7 +224,11 @@ async def _stream(
                     break
                 chunk = json.loads(event)
                 if chunk.get("error"):
-                    raise WireError("busy", f"{name} interrupted the answer.")
+                    raise WireError(
+                        "unconfirmed" if name == "OpenRouter" else "busy",
+                        f"{name} interrupted the answer.",
+                    )
+                metadata.update({k: chunk[k] for k in ("id", "provider") if chunk.get(k)})
                 model = chunk.get("model") or model
                 usage = chunk.get("usage") or usage
                 for choice in chunk.get("choices") or []:
@@ -192,14 +241,24 @@ async def _stream(
                         text += delta["content"]
                         await on_text(text)
     except httpx.HTTPError as error:
-        raise WireError("busy", f"{name} did not answer: {type(error).__name__}") from error
+        raise WireError(
+            "unconfirmed" if name == "OpenRouter" else "busy",
+            f"{name} did not answer: {type(error).__name__}",
+        ) from error
     except (ValueError, TypeError, AttributeError) as error:
-        raise WireError("busy", f"{name} returned unreadable answer data.") from error
+        raise WireError(
+            "unconfirmed" if name == "OpenRouter" else "busy",
+            f"{name} returned unreadable answer data.",
+        ) from error
     if not finish:
-        raise WireError("busy", f"{name} stopped sending the answer before it finished.")
+        raise WireError(
+            "unconfirmed" if name == "OpenRouter" else "busy",
+            f"{name} stopped sending the answer before it finished.",
+        )
     return {
         "model": model,
         "usage": usage,
+        **metadata,
         "choices": [{"finish_reason": finish, "message": {"content": text, "refusal": refusal}}],
     }
 
@@ -221,6 +280,7 @@ async def complete(
     effort: str | None = None,
     model_prefix: str = "",
     retry: bool = True,
+    routing: dict[str, Any] | None = None,
     on_text: TextUpdate | None = None,
 ) -> Wire:
     body = body_of(
@@ -233,6 +293,8 @@ async def complete(
         strict=strict,
         effort=effort,
     )
+    if routing is not None:
+        body["provider"] = routing
     url = f"{base_url}/chat/completions"
 
     async def send(payload: dict[str, Any]) -> Any:
@@ -242,12 +304,15 @@ async def complete(
         try:
             return response.json()
         except ValueError as error:
-            raise WireError("busy", f"{name} answered something that is not an answer.") from error
+            raise WireError(
+                "unconfirmed" if routing is not None else "busy",
+                f"{name} answered something that is not an answer.",
+            ) from error
 
     try:
         answer = await send(body)
     except WireError as error:
-        if not (retry and strict and error.kind == "invalid"):
+        if not (retry and strict and routing is None and error.kind == "invalid"):
             raise
         answer = await send({**body, "response_format": {"type": "json_object"}})
     return read(name, answer, model, max_tokens, model_prefix)

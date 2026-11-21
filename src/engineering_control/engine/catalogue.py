@@ -194,7 +194,23 @@ ASK_MINUTES: Final = 5
 ASK_MINUTES_CEILING: Final = 30
 ASK_EFFORTS: Final = ("default", "low", "medium", "high", "xhigh", "max")
 _NAME_OF_A_MODEL: Final = "the name of a model as its provider writes it, without spaces"
+_ROUTING = (
+    Param(
+        "upstreams",
+        "line",
+        "",
+        "Allowed OpenRouter upstream IDs, comma-separated. Leave empty for provider routing.",
+        high=500,
+    ),
+    Param(
+        "allow_fallbacks",
+        "bool",
+        True,
+        "Allow another eligible OpenRouter upstream if the first is unavailable.",
+    ),
+)
 _ASKED: Final = (
+    *_ROUTING,
     Param(
         "instruction",
         "text",
@@ -1196,6 +1212,34 @@ for task_key, title, summary, needs, produces, params in (
         ),
     ),
     (
+        reviews.DECISION,
+        "Review issue links with Decisions",
+        "Judge the link and coverage of an original issue–Story pair for administrator review.",
+        ("candidates",),
+        ("decision_judgment",),
+        (
+            Param(
+                "decision_provider",
+                "choice",
+                "openai",
+                "Native Decisions API account.",
+                choices=("openai", "openrouter"),
+            ),
+            Param(
+                "decision_model",
+                "line",
+                "gpt-6-luna",
+                "Model for link and scope judgments.",
+                high=100,
+                pattern=MODEL_NAME.pattern,
+            ),
+            Param(
+                "ordered_score", "bool", False, "Also score the strength of the source evidence."
+            ),
+            *_ROUTING,
+        ),
+    ),
+    (
         reviews.COMPARE,
         "Compare original and wiki evidence",
         "Compare the same sample twice with an Accounts model under an explicit pilot cap.",
@@ -1234,6 +1278,14 @@ for review_action, (review_name, review_summary) in reviews.ACTIONS.items():
         review_summary,
         "review",
         params=(
+            *_ROUTING,
+            Param(
+                "generation",
+                "line",
+                "",
+                "Generation model from Accounts. Leave empty to use the project selection.",
+                high=120,
+            ),
             Param(
                 "instruction",
                 "line",

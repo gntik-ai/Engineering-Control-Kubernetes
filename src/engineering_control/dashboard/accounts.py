@@ -266,7 +266,12 @@ def _written(now: dict[str, Any], wanted: dict[str, dict[str, float]]) -> dict[s
             before.get(part) == entry.get(part) for part in ("input", "output", "cached")
         )
         own = bool(before.get("own")) if same and isinstance(before, dict) else True
-        kept[model] = {**entry, **({"own": True} if own else {})}
+        extras = {
+            k: before[k]
+            for k in ("request", "cache_write")
+            if isinstance(before, dict) and k in before
+        }
+        kept[model] = {**extras, **entry, **({"own": True} if own else {})}
     return kept
 
 
@@ -281,6 +286,12 @@ def _row(account: ProviderAccount) -> dict[str, Any]:
             "endpoint_name": endpoint.name,
             "host": host_of(endpoint.url),
             "models": list(account.models or []),
+            "catalog_error": account.catalog_error,
+            "catalog_updated_at": _when(account.catalog_updated_at),
+            "decision_models": sum(
+                "decisions" in entry.get("outputs", [])
+                for entry in (account.model_catalog or {}).values()
+            ),
             "prices": dict(account.prices or {}),
         }
     return {
@@ -397,6 +408,8 @@ class Accounts:
                         # A key belongs to the address it was made for.
                         account.state, account.state_reason = "unchecked", None
                         account.models = None
+                        account.model_catalog = account.catalog_error = None
+                        account.catalog_updated_at = None
                     account.endpoint = at
                 if prices is not None:
                     try:
@@ -481,6 +494,8 @@ class Accounts:
             account.state, account.state_reason = "unchecked", None
             account.identity = None
             account.models = None
+            account.model_catalog = account.catalog_error = None
+            account.catalog_updated_at = None
             account.limited_until = None
             account.signed_in_at = datetime.now(UTC)
             account.credential_generation += 1

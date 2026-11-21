@@ -23,6 +23,8 @@ class Wire:
     # some providers charge more for these than for a token only read.
     cache_written: int = 0
     provider_ref: str | None = None
+    reported_cost: float | None = None
+    upstream: str | None = None
 
 
 class WireError(Exception):

@@ -131,6 +131,7 @@ def report(
     }
     accounts: dict[str, Series] = {}
     flows: dict[tuple[str, int | None, bool], Series] = {}
+    routes: dict[tuple[str, ...], Series] = {}
     overall = Series()
     with sessions() as db:
         prices = AccountPrices(db)
@@ -180,6 +181,48 @@ def report(
             projects[project].add(day, counts)
             overall.add(day, counts)
 
+        def route(
+            day: str,
+            pid: UUID | None,
+            flow: tuple[str, str, int | None],
+            task: str,
+            usage: Row,
+            counts: Counts,
+        ) -> None:
+            if not usage.get("endpoint"):
+                return
+            project = projects.get(str(pid))
+            labels = (
+                str(pid or ""),
+                flow[0],
+                str(flow[2]),
+                task,
+                str(usage.get("provider") or ""),
+                str(usage["endpoint"]),
+                str(usage.get("requested_model") or ""),
+                str(usage.get("model") or ""),
+                str(usage.get("upstream") or ""),
+            )
+            if labels not in routes:
+                routes[labels] = Series(
+                    id="|".join(labels),
+                    name=flow[1],
+                    version=flow[2],
+                    project=project.identity["name"] if project else "Unattributed project",
+                    task=task,
+                    provider=labels[4],
+                    endpoint=labels[5],
+                    requested_model=labels[6],
+                    model=labels[7],
+                    upstream=labels[8],
+                    credits_usd=None,
+                )
+            group = routes[labels]
+            group.add(day, counts)
+            credits = usage.get("reported_credits_usd")
+            if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+                group.identity["credits_usd"] = (group.identity["credits_usd"] or 0) + credits
+
         def metered(
             day: str, usage: Row, account: str, provider: str, model: str, calls: int
         ) -> Counts:
@@ -222,6 +265,7 @@ def report(
                 step.account_id,
                 step.input["model"]["model"].as_string(),
                 step.pod_name,
+                step.name,
                 step.started_at,
                 step.finished_at,
             )
@@ -239,6 +283,7 @@ def report(
             account,
             model,
             pod,
+            task_name,
             started,
             finished,
         ) in db.execute(steps.execution_options(yield_per=500)):
@@ -247,16 +292,16 @@ def report(
             direct = bool(started and not pod and usage.get("model"))
             counts = Counts()
             for component in (usage.get("components") or [usage]) if usage else []:
-                counts.merge(
-                    metered(
-                        day,
-                        component,
-                        str(component.get("account_id") or account or ""),
-                        component.get("provider") or provider or "",
-                        model or "",
-                        component.get("responses", 1) if direct else 0,
-                    )
+                component_counts = metered(
+                    day,
+                    component,
+                    str(component.get("account_id") or account or ""),
+                    component.get("provider") or provider or "",
+                    model or "",
+                    component.get("responses", 1) if direct else 0,
                 )
+                counts.merge(component_counts)
+                route(day, pid, sandbox_flow(kind, flow), task_name, component, component_counts)
             if started and not direct and not (pod or "").startswith(BENCH_PREFIX):
                 counts.sandboxes = 1
                 counts.seconds = (
@@ -283,19 +328,23 @@ def report(
             usages.execution_options(yield_per=500)
         ):
             day = utc(at).date().isoformat()
-            add(
+            identity = (key, name, version) if key else legacy_flow(usage)
+            counts = metered(
+                day,
+                usage,
+                usage.get("account_id") or "",
+                usage.get("provider") or "",
+                "",
+                usage.get("responses", 1),
+            )
+            add(day, pid, identity, False, counts)
+            route(
                 day,
                 pid,
-                (key, name, version) if key else legacy_flow(usage),
-                False,
-                metered(
-                    day,
-                    usage,
-                    usage.get("account_id") or "",
-                    usage.get("provider") or "",
-                    "",
-                    usage.get("responses", 1),
-                ),
+                identity,
+                str(usage.get("task") or usage.get("workflow") or ""),
+                usage,
+                counts,
             )
 
         for pid, history, tariff, provider, model in db.execute(
@@ -397,6 +446,7 @@ def report(
         "overall": overall.json(),
         "accounts": rows(accounts.values()),
         "flows": rows(flows.values()),
+        "model_routes": rows(routes.values()),
         "projects": rows(projects.values()),
     }
 

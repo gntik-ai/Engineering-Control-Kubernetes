@@ -10,16 +10,18 @@ type Model = { provider: string; model: string };
 type Step = { id: string; task: string; selected?: number; reusable?: number; pages?: number; records?: number };
 type Source = { title: string; repository: string; number: number | null; revision: string; state: string; body: string; epics: string[]; card?: { text: string; partial: boolean } };
 type Pair = { id: string; issue: Source; story: Source; reason: string; decision: string };
-type Preview = { flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
-type Run = { id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
+type Preview = { decision_model?: DecisionModel | null; generation?: string; flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
+type Native = {scope: string; provider: string; model: string; rubric: string; link_probability: number | null; strength?: number | null; review_reason: string; cached_from?: string; eur: string | null};
+type DecisionModel = Model & {available: boolean; rates: {input:number; output:number; cached?:number; request?:number} | null; endpoint: string; rubric: string};
+type Run = { native?: Native | null; id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
   failed_request?: {arm: string; reason: string; provider_ref?: string | null};
   arms: {arm: string; scope: string | null; evidence: string; tokens: number; input: number; output: number; eur: string | null; provider_ref?: string | null}[] };
-type Status = { paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
+type Status = { decision_model?: DecisionModel | null; generation?: string; paired: boolean; paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
 const keyOf = (m: Model) => JSON.stringify([m.provider, m.model]);
 const active = ['queued','calling','held','stopping','paused'];
 const labels: Record<string,string> = {
   'evidence.relationships':'Read project relationships','evidence.candidates':'Find related records','evidence.reuse':'Reuse review decisions',
-  'evidence.wiki':'Read wiki evidence','evidence.compare':'Compare original and wiki evidence',
+  'evidence.decisions':'Review issue links with Decisions', 'evidence.wiki':'Read wiki evidence','evidence.compare':'Compare original and wiki evidence',
 };
 const optionsClass = 'rounded-md border border-border bg-background px-2 py-1 text-sm';
 
@@ -52,6 +54,8 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
   const [cap,setCap]=useState('12000');
   const [view,setView]=useState<Preview|null>(null);
   const [query,setQuery]=useState<{page:number;search:string;nonce:number}|null>(null);
+  const decisionModel = draft ? view?.decision_model : data?.decision_model;
+  const generation = draft ? view?.generation : data?.generation;
   const [waiting,setWaiting]=useState(false);
   const [busy,setBusy]=useState(false);
   const [problem,setProblem]=useState('');
@@ -67,13 +71,13 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     return ()=>{alive=false;};
   },[path,query,draft,chosen?.provider,chosen?.model]);
   const [attempt,setAttempt]=useState(()=>crypto.randomUUID());
-  async function change(action?:string){
+  async function change(action?:string, candidate?:string){
     if(busy)return;
     setBusy(true);setProblem('');
     try {
       if(action) await postJson(path+'/control',{run_id:run?.id,action});
       else {
-        await postJson(path+'/runs',{request_id:attempt,provider:chosen?.provider,model:chosen?.model,token_cap:Number(cap)});
+        await postJson(path+'/runs',{request_id:attempt,candidate,provider:chosen?.provider,model:chosen?.model,token_cap:Number(cap)});
         setAttempt(crypto.randomUUID());
       }
       status.reload();
@@ -83,13 +87,18 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
   return <section aria-label="Review evidence" className="grid gap-3 rounded-xl border border-border bg-card p-5">
     <h2 className="text-lg font-semibold">{draft ? 'Preview this flow' : 'Review related work'}</h2>
     {data && <div className="flex flex-wrap items-end gap-3">
-      {!!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
+      {!generation && (!decisionModel || data.paired || draft) && !!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
         {data.models.map(m=><option key={keyOf(m)} value={keyOf(m)}>{m.provider} · {m.model}</option>)}</select></label>}
+      {generation && <p className="text-sm">Generation · {generation}</p>}
+      {decisionModel && <div className="grid gap-1 text-sm"><strong>Decision model · {decisionModel.provider} · {decisionModel.model}</strong>
+        <span>{decisionModel.endpoint} · {decisionModel.rubric} · Administrator review</span>
+        <span>{decisionModel.rates ? `USD per million tokens: ${decisionModel.rates.input} input · ${decisionModel.rates.output} output${decisionModel.rates.cached === undefined ? '' : ' · '+decisionModel.rates.cached+' cached input'}${decisionModel.rates.request ? ' · $'+decisionModel.rates.request+' per request' : ''}` : 'Price unavailable'}</span>
+        {!decisionModel.available && <span>Choose an available model in the Flow Designer or check its account.</span>}</div>}
       <Button variant="secondary" size="sm" loading={waiting} disabled={waiting} onClick={()=>setQuery({page:1,search:'',nonce:Date.now()})}>Preview related records</Button>
       {!draft && !(run && active.includes(run.state)) && <>
         {data.paid && <label className="grid gap-1 text-sm">Pilot token cap<Input aria-label="Pilot token cap" type="number" min="1" max="2000000" value={cap} onChange={e=>setCap(e.target.value)} /></label>}
-        <Button size="sm" disabled={busy || (data.paid && (!chosen || Number(cap)<=0 || Number(cap)>2000000))} loading={busy}
-          onClick={()=>void change()}>{data.paid?'Run paired comparison':'Run evidence flow'}</Button>
+        <Button size="sm" disabled={busy || (decisionModel && !decisionModel.available) || (data.paid && ((data.paired && !chosen && !data.generation) || Number(cap)<=0 || Number(cap)>2000000))} loading={busy}
+          onClick={()=>void change()}>{data.decision_model?'Run decision review':data.paid?'Run paired comparison':'Run evidence flow'}</Button>
       </>}
     </div>}
     {status.error && <Alert tone="warning" title={status.error}/>}
@@ -97,7 +106,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     {view && <>
       <p className="text-sm">{view.flow} · {view.selected.toLocaleString()} selected of {view.eligible.toLocaleString()} eligible pairs · {view.reusable} reusable · {view.external} across projects · 0 model calls</p>
       <p className="text-xs text-muted-foreground">{view.steps.map(s=>labels[s.task]).join(' → ')}</p>
-      <DataTable caption="Related records" rows={view.items} columns={columns} getRowId={r=>r.id}
+      <DataTable caption="Related records" rows={view.items} columns={!draft && data?.decision_model ? [...columns, {id:'review',header:'Decision review',sortable:false,cell:r=><Button size="sm" variant="secondary" disabled={busy || !!(run && active.includes(run.state)) || !data.decision_model?.available || r.decision!=='unchecked' || Number(cap)<=0 || Number(cap)>2000000} onClick={()=>void change(undefined,r.id)}>Review this pair</Button>}] : columns} getRowId={r=>r.id}
         selectionMode="none" showQuickFilter showColumnMenu={false} quickFilter={query?.search??''} quickFilterDebounceMs={350}
         paginationMode="server" paginated={view.total>0} page={view.page} pageSize={10} pageSizeOptions={[10]} rowCount={view.total}
         loading={waiting} labels={{quickFilter:()=>'Search issues or Stories'}} emptyState="No related records." noResultsState="No matching records."
@@ -106,6 +115,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     {!draft && run && <div className="grid gap-2 border-t border-border pt-3 text-sm" aria-live="polite">
       <p><strong>{run.flow}</strong> · v{run.version} · {run.state} · {run.spent.toLocaleString()} tokens used / {run.cap.toLocaleString()} cap{run.reserved>0?' · '+run.reserved.toLocaleString()+' reserved':''}</p>
       {run.cached_from && <p>Reused both answers from a completed comparison. The arm totals below are from that run.</p>}
+      {run.native && <NativeResult value={run.native}/>}
       {run.detail && <p>{run.detail}</p>}{run.sample && <p>{run.sample.join(' → ')}</p>}
       {run.steps.length>0 && <p>{run.steps.map(s=>labels[s.task]).join(' → ')}</p>}
       {run.failed_request && <p>{run.failed_request.arm === 'wiki' ? 'Wiki excerpts' : 'Original passages'} · {run.failed_request.reason}{run.failed_request.provider_ref && ' · Provider reference '+run.failed_request.provider_ref}</p>}
@@ -117,9 +127,13 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
   </section>;
 }
 
+function NativeResult({value}: {value: Native}) {
+  return <div className="grid gap-1 text-sm"><strong>{value.provider} · {value.model}</strong><span>Link probability · {value.link_probability == null ? "No answer" : (100 * value.link_probability).toFixed(1)+"%"} · Scope · {scopeText(value.scope)}{value.strength != null && ` · Evidence strength ${value.strength.toFixed(2)}/2`}</span><span>{value.review_reason} · {value.cached_from ? "Reused · no new charge" : value.eur == null ? "EUR estimate unavailable" : "€"+value.eur}</span></div>;
+}
+
 type Judgment = {scope: string; note: string; revision: string};
-type ReviewRow = {id:string; issue:string; story:string; original:string|null; wiki:string|null; decision:string|null};
-type ReviewDetail = {id:string; issue:Source; story:Source; arms:Run['arms']; decision:Judgment|null};
+type ReviewRow = {id:string; issue:string; story:string; original:string|null; wiki:string|null; native:string|null; decision:string|null};
+type ReviewDetail = {id:string; issue:Source; story:Source; arms:Run['arms']; native:Native|null; decision:Judgment|null};
 const scopeText = (value: string | null) => value ? value.charAt(0).toUpperCase()+value.slice(1) : 'No verdict';
 
 function ReviewDecision({path, review, saved}: {path:string; review:ReviewDetail; saved:()=>void}) {
@@ -139,6 +153,7 @@ function ReviewDecision({path, review, saved}: {path:string; review:ReviewDetail
   return <div className="grid gap-3">
     <div><strong>Technical issue</strong><Passage row={review.issue}/></div>
     <div><strong>User Story</strong><Passage row={review.story}/></div>
+    {review.native && <NativeResult value={review.native}/>}
     {review.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'} · {scopeText(a.scope)}</strong><br/>{a.evidence}</p>)}
     <label className="grid gap-1">Your judgment<select className={optionsClass} value={scope} onChange={e=>setScope(e.target.value)}>
       <option value="" disabled>Select a scope</option>
@@ -175,12 +190,13 @@ function VerdictReviews({path,latest}: {path:string; latest:string}) {
     {id:'story',header:'User Story',accessor:r=>r.story,sortable:false},
     {id:'original',header:'Original',accessor:r=>scopeText(r.original),sortable:false},
     {id:'wiki',header:'Wiki',accessor:r=>scopeText(r.wiki),sortable:false},
+    {id:'native',header:'Decisions',accessor:r=>scopeText(r.native),sortable:false},
     ...(state==='reviewed'?[{id:'decision',header:'Your judgment',accessor:(r:ReviewRow)=>scopeText(r.decision),sortable:false}]:[]),
     {id:'review',header:'Action',sortable:false,cell:r=><Button size="sm" variant="secondary" onClick={()=>setOpened(r.id)}>Review</Button>},
   ];
   return <div className="grid gap-2 border-t border-border pt-3">
     <h3 className="font-semibold">Review model verdicts</h3>
-    <p className="text-sm text-muted-foreground">Review comparisons marked Unrelated or Unclear and cases where the two readings disagree.</p>
+    <p className="text-sm text-muted-foreground">Review native Decisions judgments and comparisons with unclear, unrelated or conflicting evidence.</p>
     <Tabs value={state} onValueChange={v=>{setState(String(v));setPage(1);}}>
       <TabsList aria-label="Verdict review status"><TabsTab value="pending">Pending</TabsTab><TabsTab value="reviewed">Reviewed</TabsTab></TabsList>
     </Tabs>

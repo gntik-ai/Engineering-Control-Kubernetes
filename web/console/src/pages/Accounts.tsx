@@ -740,6 +740,8 @@ function AccountRow({
           ) : null}
         </div>
         {shown.detail ? <div className="mt-1 text-[12px] text-muted-foreground">{shown.detail}</div> : null}
+        {account.catalog_error && <div className="text-xs text-muted-foreground">Catalog refresh failed · {account.catalog_error}</div>}
+        {account.catalog_updated_at && <div className="text-xs text-muted-foreground">Catalog refreshed <When value={account.catalog_updated_at} />{account.provider === 'openrouter' && ` · ${account.decision_models ?? 0} decision models`}</div>}
         {account.checked_at ? (
           <div className="mt-1 text-[12px] text-muted-foreground">
             Tried <When value={account.checked_at} />

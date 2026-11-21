@@ -986,6 +986,9 @@ class ProviderAccount(UUIDPrimaryKey, Timestamps, Base):
     # it is used at; the models the provider listed; what each costs per million tokens.
     sealed_key: Mapped[str | None] = mapped_column(Text)
     endpoint: Mapped[str | None] = mapped_column(String(20))
+    catalog_error: Mapped[str | None] = mapped_column(String(300))
+    model_catalog: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    catalog_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     models: Mapped[list[str] | None] = mapped_column(JSON)
     prices: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     __table_args__ = (

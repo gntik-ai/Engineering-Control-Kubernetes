@@ -601,8 +601,11 @@ class DashboardService:
 
     async def flow_catalogue(self, project: str | None = None) -> dict[str, object]:
         """What a flow can be built from: the tasks, the prompts and the budgets."""
+        from engineering_control.dashboard.review_flows import designer_models
+
         owners = await asyncio.to_thread(self.repository.flows.owners)
         return {
+            **await asyncio.to_thread(designer_models, self.repository.sessions),
             "format": FLOW_FORMAT,
             "tasks": task_catalogue(),
             "prompts": [contract.describe({}) for contract in CONTRACTS.values()],

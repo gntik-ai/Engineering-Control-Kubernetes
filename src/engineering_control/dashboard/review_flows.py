@@ -25,6 +25,7 @@ from engineering_control.db.models import (
 from engineering_control.engine.document import Document
 from engineering_control.engine.library import document_in_force
 from engineering_control.engine.reviews import ACTIONS, Policy, action_of, default_key
+from engineering_control.models import openrouter
 from engineering_control.models.service import Question
 
 Owner = WorkspaceImport | PlanningReview | ProjectConnection | EpicExecutionPlan
@@ -144,8 +145,16 @@ def configure(db: Session, pid: UUID, run_id: UUID, stage: str, question: Questi
     if not run or run.project_id != pid:
         raise ProjectInvalid("The review flow run does not belong to this project.")
     extra = wording(run.settings, stage)
+    generation = run.settings.get("generation") if question.native_score is None else None
     return replace(
         question,
+        choices=(tuple(generation.split(":", 1)),) if generation else question.choices,
+        upstreams=run.settings.get("upstreams", question.upstreams)
+        if question.native_score is None
+        else question.upstreams,
+        allow_fallbacks=run.settings.get("allow_fallbacks", question.allow_fallbacks)
+        if question.native_score is None
+        else question.allow_fallbacks,
         system=question.system + ("\n\nAdministrator instructions\n" + extra if extra else ""),
         max_tokens=min(question.max_tokens, run.settings.get("max_output") or question.max_tokens),
     )
@@ -172,17 +181,102 @@ def effective_settings(
 
 
 def matching_revision(db: Session, pid: UUID, action: str, run_id: UUID | None = None) -> str:
-    return wording(effective_settings(db, pid, action, run_id), "matching")
+    settings = effective_settings(db, pid, action, run_id)
+    return matching_key(settings)
+
+
+def matching_key(settings: dict[str, Any]) -> str:
+    from engineering_control.dashboard.connection_records import digest
+
+    text = wording(settings, "matching")
+    if (
+        settings.get("generation")
+        or settings.get("upstreams")
+        or settings.get("allow_fallbacks") is False
+    ):
+        return digest(
+            [
+                text,
+                settings.get("generation"),
+                settings.get("upstreams"),
+                settings.get("allow_fallbacks", True),
+            ]
+        )
+    return text
 
 
 def model_choices(session: Session) -> list[dict[str, str]]:
     fields = session.execute(
-        select(ProviderAccount.provider, ProviderAccount.models).where(
+        select(
+            ProviderAccount.provider, ProviderAccount.models, ProviderAccount.model_catalog
+        ).where(
             ProviderAccount.archived_at.is_(None),
             ProviderAccount.paused.is_(False),
             ProviderAccount.sealed_key.is_not(None),
             ProviderAccount.state.in_(("ready", "unchecked", "limited")),
         )
     )
-    choices = {(p, m) for p, models in fields for m in (models or []) if isinstance(m, str)}
+    choices = {
+        (p, m)
+        for p, models, catalog in fields
+        for m in (models or [])
+        if isinstance(m, str)
+        and (p != "openrouter" or openrouter.supports((catalog or {}).get(m, {})))
+    }
     return [{"provider": p, "model": m} for p, m in sorted(choices)]
+
+
+def decision_models(db: Session) -> list[dict[str, Any]]:
+    accounts = db.execute(
+        select(
+            ProviderAccount.provider,
+            ProviderAccount.models,
+            ProviderAccount.model_catalog,
+            ProviderAccount.prices,
+        )
+        .where(
+            ProviderAccount.provider.in_(("openai", "openrouter")),
+            ProviderAccount.archived_at.is_(None),
+            ProviderAccount.paused.is_(False),
+            ProviderAccount.sealed_key.is_not(None),
+            ProviderAccount.state.in_(("ready", "unchecked", "limited")),
+        )
+        .order_by(ProviderAccount.name)
+    )
+    options: dict[tuple[str, str], dict[str, Any]] = {}
+    rates: dict[str, Any] | None
+    for provider, models, catalog, prices in accounts:
+        for model in models or []:
+            info = (catalog or {}).get(model, {})
+            if provider == "openai":
+                if model != openrouter.DIRECT_MODEL:
+                    continue
+                endpoint, rates, questions = (
+                    openrouter.DIRECT_ENDPOINT,
+                    openrouter.DIRECT_PRICE,
+                    openrouter.TYPES,
+                )
+            else:
+                if not openrouter.supports(info, decision=True):
+                    continue
+                endpoint, rates, questions = (
+                    openrouter.DECISIONS,
+                    (prices or {}).get(model),
+                    info["questions"],
+                )
+            options.setdefault(
+                (provider, model),
+                {
+                    "provider": provider,
+                    "model": model,
+                    "endpoint": endpoint,
+                    "rates": rates,
+                    "questions": list(questions),
+                },
+            )
+    return [options[k] for k in sorted(options)]
+
+
+def designer_models(sessions: sessionmaker[Session]) -> dict[str, Any]:
+    with sessions() as db:
+        return {"api_models": model_choices(db), "decision_models": decision_models(db)}

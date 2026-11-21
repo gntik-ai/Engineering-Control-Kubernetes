@@ -387,6 +387,7 @@ class EvidencePreviewInput(PlainChangeInput):
 
 class EvidenceRunInput(PlainChangeInput):
     request_id: UUID
+    candidate: str = Field(default="", max_length=260)
     provider: str = Field(default="", max_length=32)
     model: str = Field(default="", max_length=200)
     token_cap: int = Field(ge=0, le=2_000_000, strict=True)

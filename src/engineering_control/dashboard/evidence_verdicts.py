@@ -47,13 +47,21 @@ def eligible(db: Session, project: UUID) -> ColumnElement[bool]:
     return and_(
         Job.project_id == project,
         Job.state.not_in(LIVE),
-        Job.result["cached_from"].as_string().is_(None),
         func.substr(sample["story"].as_string(), 1, 36).in_(allowed),
         func.substr(sample["issue"].as_string(), 1, 36).in_(allowed),
         or_(
-            original.in_(("unrelated", "unclear")),
-            wiki.in_(("unrelated", "unclear")),
-            original != wiki,
+            and_(
+                Job.result["native"]["rubric"].as_string().is_not(None),
+                Job.result["native"]["cached_from"].as_string().is_(None),
+            ),
+            and_(
+                Job.result["cached_from"].as_string().is_(None),
+                or_(
+                    original.in_(("unrelated", "unclear")),
+                    wiki.in_(("unrelated", "unclear")),
+                    original != wiki,
+                ),
+            ),
         ),
     )
 
@@ -74,6 +82,7 @@ def listing(
                 Job.result["sample_names"],
                 Job.result["arms"][0]["scope"].as_string(),
                 Job.result["arms"][1]["scope"].as_string(),
+                Job.result["native"]["scope"].as_string(),
                 scope,
             )
             .join(ReviewFlowRun, ReviewFlowRun.id == Job.run_id)
@@ -92,9 +101,10 @@ def listing(
                     "story": names[1],
                     "original": orig,
                     "wiki": wiki,
+                    "native": native,
                     "decision": human,
                 }
-                for run, names, orig, wiki, human in rows
+                for run, names, orig, wiki, native, human in rows
             ],
         }
 
@@ -113,6 +123,7 @@ def detail(sessions: sessionmaker[Session], name: str, run: UUID) -> dict[str, A
         return {
             "id": str(run),
             "arms": result["arms"],
+            "native": result.get("native"),
             "decision": result.get("human_review"),
             **{
                 role: passage(job.source, result, result["sample"][role])

@@ -203,6 +203,7 @@ key" → Enter key):
 | --- | --- |
 | Anthropic API | `api.anthropic.com` |
 | OpenAI API | `api.openai.com` |
+| OpenRouter | `openrouter.ai` |
 | Google Gemini API | `generativelanguage.googleapis.com` |
 | DeepSeek | `api.deepseek.com` |
 | Qwen | `dashscope-intl.aliyuncs.com` (international) or `dashscope.aliyuncs.com` (China) |
@@ -245,7 +246,7 @@ tokens read, written and, if the provider prices it apart, read again from its c
 call on a model with a price shows what it cost; without one it is counted in tokens
 only.
 
-No provider says over its API what its models cost, so the prices are read from two
+OpenRouter supplies token and per-request tariffs through its Models API. Its native Decisions endpoint and its chat endpoint have separate capabilities. OpenAI Decisions has an endpoint-specific tariff. For the other integrations the prices are read from two
 lists that are kept in public: models.dev, which tells a provider's addresses apart (Qwen
 costs something else at its Chinese address than at the international one), and, for a
 model the first does not have, LiteLLM's list on GitHub. **Refresh on the Accounts page
