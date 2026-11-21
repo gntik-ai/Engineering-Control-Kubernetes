@@ -3461,6 +3461,12 @@ def create_app(
         index = CONSOLE_ROOT / "index.html"
         if not _console_view(view) or not index.is_file():
             raise HTTPException(status_code=404, detail="page not found")
+        if (
+            view.startswith("workspace/")
+            and PROJECT_NAME.fullmatch(view.removeprefix("workspace/"))
+            and request.query_params.get("import") == "1"
+        ):
+            return RedirectResponse(f"/console/{view}/reviews/discovery?import=1", status_code=303)
         if view in {"", "workspace"}:
             default = await service(request).default_project()
             if default is not None:
@@ -3553,7 +3559,8 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|automation/(?:flow|flows|operations|assignments|agents|commands))$",
+                    r"/(?:settings/connections|queue|reviews/(?:related-work|planning|discovery)"
+                    r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),
                 )

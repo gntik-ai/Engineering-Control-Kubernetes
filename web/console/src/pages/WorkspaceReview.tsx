@@ -1,7 +1,7 @@
 import { Alert, Button } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
 import { CHANGED, apiUrl, getJson, postJson, useResource } from '../api';
-import { setQuery } from '../router';
+import { RouterLink, workspaceTabUrl } from '../router';
 import { LoadError } from '../parts';
 import { useSubmit } from './ProjectDialogs';
 import { ReviewControl } from './ReviewControls';
@@ -61,8 +61,9 @@ function useReviewProgress(path: string, state: ImportState, watching: boolean, 
 export const nextStageLabel = { epics: 'Continue to User Stories', stories: 'Continue to Issues', issues: 'Finish import' };
 
 export function WorkspaceReview({
-  path, state, model, reload, saved,
+  project, path, state, model, reload, saved,
 }: {
+  project: string;
   path: string;
   state: ImportState;
   model?: { provider: string; model: string };
@@ -166,7 +167,7 @@ export function WorkspaceReview({
               {stage === 'issues' && actionButton('all', 'Generate all remaining Issues', 'Generating Issues')}
               {actionButton('next', 'Generate next ' + label, 'Generating ' + label)}
             </>}
-        <Button variant="ghost" onClick={() => setQuery({ tab: stage, state: null, issue_state: null, search: null, page: null, record: null, epic: null })}>
+        <Button variant="ghost" render={<RouterLink href={workspaceTabUrl(project, stage)} />}>
           {reviewEpics ? `Review ${pending} Epic ${proposalLabel}` : `View ${table}`}
           {!reviewEpics && pending > 0 && ` (${pending} ${proposalLabel})`}
         </Button>

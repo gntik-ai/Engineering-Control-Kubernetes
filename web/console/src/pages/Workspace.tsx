@@ -10,10 +10,10 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus, GitFork, ListChecks, Compass } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
-import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl } from '../router';
+import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
 import { StatsPage } from './Stats';
 import { AccountsPage } from './Accounts';
 import { ConnectionsPage } from './Connections';
@@ -21,8 +21,16 @@ import { NewProjectDialog } from './ProjectDialogs';
 import { ProjectQueue } from './ProjectQueue';
 import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
+import { EvidencePanel } from './ReviewEvidence';
+import { PlanningReviews } from './PlanningReviews';
+import { WorkspaceImport } from './WorkspaceImport';
 
 const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignments', agents: 'Agents', commands: 'Commands' };
+const reviewMenu = {
+  'related-work': { label: 'Related Work', icon: GitFork },
+  planning: { label: 'Planning', icon: ListChecks },
+  discovery: { label: 'Discovery', icon: Compass },
+};
 export function ProjectWorkspace({
   name,
   view,
@@ -31,7 +39,7 @@ export function ProjectWorkspace({
   notice,
 }: {
   name: string;
-  view: 'dashboard' | 'queue' | 'connections' | 'accounts' | 'stats' | AutomationView;
+  view: 'dashboard' | 'queue' | 'connections' | 'accounts' | 'stats' | AutomationView | ReviewView;
   global?: boolean;
   actions: ReactNode;
   notice: ReactNode;
@@ -55,7 +63,7 @@ export function ProjectWorkspace({
     stats: 'Stats · Global settings',
     ...automationTitles,
   };
-  usePageTitle(titles[view]);
+  usePageTitle(isReviewView(view) ? reviewMenu[view].label + ' · ' + projectTitle : titles[view]);
 
   const menu = (owner?: string) => (['flows', 'operations', 'assignments', 'agents', 'commands'] as const)
     .filter((v) => owner || v !== 'assignments')
@@ -64,6 +72,13 @@ export function ProjectWorkspace({
   const groups = [primary];
   if (context) {
     primary.items.push({ label: 'Queue', href: queueUrl(context), icon: ListOrdered });
+    groups.push({
+      id: 'project-reviews',
+      label: 'Reviews',
+      collapsible: true,
+      defaultOpen: true,
+      items: reviewViews.map(page => ({ ...reviewMenu[page], href: reviewUrl(context, page) })),
+    });
     groups.push({
       id: 'project-settings',
       label: 'Project settings',
@@ -79,13 +94,17 @@ export function ProjectWorkspace({
     defaultOpen: true,
     items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }, {label:'Stats',href:statsUrl(context), icon:LayoutDashboard}, ...menu()],
   });
-  const currentHref = isAutomation(view) ? automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : name, context) : {
-    dashboard: dashboardHref,
-    queue: queueUrl(name),
-    connections: connectionsUrl(name),
-    accounts: accountHref,
-    stats: statsUrl(context),
-  }[view];
+  function viewUrl(projectName: string) {
+    if (isReviewView(view)) return reviewUrl(projectName, view);
+    if (isAutomation(view)) return automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : projectName, projectName);
+    switch (view) {
+      case 'stats': return statsUrl(projectName);
+      case 'accounts': return accountsUrl(projectName);
+      case 'queue': return queueUrl(projectName);
+      case 'connections': return connectionsUrl(projectName);
+      case 'dashboard': return projectName ? workspaceUrl(projectName) : BASE;
+    }
+  }
 
   return (
     <SidebarLayout
@@ -101,7 +120,7 @@ export function ProjectWorkspace({
           collapsed={collapsed}
           onNavigate={closeDrawer}
           label="Project navigation"
-          currentHref={currentHref}
+          currentHref={viewUrl(context ?? '')}
           groups={groups}
         />
       )}
@@ -120,8 +139,7 @@ export function ProjectWorkspace({
                   name: item.display_name,
                   meta: item.project === defaultName ? 'Default project' : item.source_repository,
                 }))}
-                onSelect={(item) => navigate(isAutomation(view) ? automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : item.id, item.id) : view === 'stats' ? statsUrl(item.id) : view === 'accounts' ? accountsUrl(item.id)
-                  : view === 'queue' ? queueUrl(item.id) : workspaceUrl(item.id))}
+                onSelect={(item) => navigate(view === 'connections' ? workspaceUrl(item.id) : viewUrl(item.id))}
                 onCreate={() => setCreating(true)}
               />
             </div>
@@ -147,9 +165,14 @@ export function ProjectWorkspace({
           {project ? (
             view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'connections' ? (
               <ConnectionsPage key={project.project} project={project} projects={items} />
-            ) : (
-              <WorkspaceTabs key={project.project} project={project} onApproved={projects.reload} />
-            )
+            ) : isReviewView(view) ? (
+              <div className="grid min-w-0 gap-5" key={project.project}>
+                <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
+                {view === 'related-work' && <EvidencePanel project={project.project} />}
+                {view === 'planning' && <PlanningReviews project={project.project} />}
+                {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
+              </div>
+            ) : <WorkspaceTabs key={project.project} project={project} />
           ) : projects.loading ? (
             <Skeleton className="h-36 w-full" />
           ) : projects.error ? (
@@ -185,7 +208,7 @@ export function ProjectWorkspace({
         onOpenChange={setCreating}
         onSaved={({ project }) => {
           projects.reload();
-          navigate(workspaceUrl(project) + '?import=1');
+          navigate(reviewUrl(project, 'discovery') + '?import=1');
         }}
       />
     </SidebarLayout>

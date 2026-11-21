@@ -26,12 +26,10 @@ import { DataTable } from '../components/blocks/tables/data-table/DataTable';
 import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
-import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl } from '../router';
+import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl, navigate, reviewUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
-import { WorkspaceImport } from './WorkspaceImport';
-import { PlanningReviews, RecordReview, type ReviewResult } from './PlanningReviews';
-import { EvidencePanel } from './ReviewEvidence';
+import { RecordReview, type ReviewResult } from './PlanningReviews';
 import { useSubmit } from './ProjectDialogs';
 
 const sections = {
@@ -51,6 +49,8 @@ export interface PlanRow {
   description: string | null;
   epic_ids?: string[];
   story_ids?: string[];
+  story_count?: number;
+  issue_count?: number;
   review?: string | null;
   proposal?: boolean;
   orphan?: boolean;
@@ -322,7 +322,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   };
   const finish = useSubmit(
     () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
-    () => { reload(); setQuery({ tab: null, page: null, search: null, epic: null, record: null, connected: null }); },
+    () => { reload(); navigate(reviewUrl(project, 'discovery')); },
   );
   const afterDecision = (result: unknown) => {
     reload();
@@ -331,7 +331,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       ((kind === 'epics' && result.advanced_to === 'stories') ||
         (kind === 'stories' && result.advanced_to === 'issues'))
     ) {
-      setQuery({ tab: null, page: null, search: null, epic: null, record: null, connected: null });
+      navigate(reviewUrl(project, 'discovery'));
     }
   };
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
@@ -387,6 +387,14 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         </ul>
       ),
     });
+  }
+  if (kind === 'epics') {
+    columns.push({ id: 'story_count', header: 'User Stories', sortable: false,
+      className: 'align-top tabular-nums', accessor: row => row.story_count });
+  }
+  if (kind !== 'issues') {
+    columns.push({ id: 'issue_count', header: 'Issues', sortable: false,
+      className: 'align-top tabular-nums', accessor: row => row.issue_count });
   }
   if (kind === 'issues' || rows?.some(r => r.connections?.length)) {
     columns.push({ id: 'connections', header: 'Connected projects', sortable: false, className: 'min-w-32 whitespace-normal align-top',
@@ -550,7 +558,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   );
 }
 
-export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary; onApproved: () => void }) {
+export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
   const counts = useResource<Record<Kind, number>>(apiUrl('projects/' + encodeURIComponent(project.project) + '/planning/counts'), 5000);
   useEffect(() => {
     window.addEventListener(CHANGED, counts.reload);
@@ -598,16 +606,7 @@ export function WorkspaceTabs({ project, onApproved }: { project: ProjectSummary
               </dd>
             </div>
           </dl>
-          {tab === 'home' && <EvidencePanel key={'evidence-'+project.project} project={project.project} />}
-          {tab === 'home' && <PlanningReviews key={project.project} project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
-          {tab === 'home' && (
-            <WorkspaceImport
-              project={project.project}
-              repository={project.repository_url}
-              onApproved={onApproved}
-            />
-          )}
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (
           <TabsPanel key={kind} value={kind} className="pt-5">

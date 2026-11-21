@@ -29,7 +29,11 @@ from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
-from engineering_control.dashboard.connection_records import connected_records, finding_links
+from engineering_control.dashboard.connection_records import (
+    connected_records,
+    connected_story_issues,
+    finding_links,
+)
 from engineering_control.dashboard.planning_queue import (
     queue_review,
     record_changed,
@@ -319,6 +323,49 @@ def _state_bucket(rows: Subquery, kind: Kind) -> ColumnElement[str]:
     )
 
 
+def _child_counts(
+    session: Session, project: UUID, kind: Kind, keys: list[UUID]
+) -> dict[UUID, tuple[int, int]]:
+    """Count established relationships for the displayed parents across all child states."""
+    if kind == "issues" or not keys:
+        return {}
+    story = ProjectUserStory
+    member = select(story.id.label("story_id")).where(
+        story.project_id == project, story.archived_at.is_(None)
+    )
+    if kind == "epics":
+        link = ProjectStoryEpic
+        member = (
+            member.add_columns(link.epic_id.label("parent_id"))
+            .join(link, (link.story_id == story.id) & (link.project_id == project))
+            .where(link.epic_id.in_(keys))
+        )
+    else:
+        member = member.add_columns(story.id.label("parent_id")).where(story.id.in_(keys))
+    members = member.cte("member_stories")
+    story_ids = select(members.c.story_id)
+    local_issues = (
+        select(ProjectIssueStory.story_id, ProjectIssueStory.item_id.label("issue_id"))
+        .join(BacklogItem, BacklogItem.id == ProjectIssueStory.item_id)
+        .where(
+            ProjectIssueStory.project_id == project,
+            ProjectIssueStory.story_id.in_(story_ids),
+            BacklogItem.workspace_review.is_distinct_from("planning"),
+        )
+    )
+    issues = union_all(local_issues, connected_story_issues(project, story_ids)).subquery()
+    totals = (
+        select(
+            members.c.parent_id,
+            func.count(members.c.story_id.distinct()),
+            func.count(issues.c.issue_id.distinct()),
+        )
+        .outerjoin(issues, issues.c.story_id == members.c.story_id)
+        .group_by(members.c.parent_id)
+    )
+    return {key: (stories, issues_count) for key, stories, issues_count in session.execute(totals)}
+
+
 def _search_matches(
     session: Session, rows: Subquery, project: UUID, kind: Kind, search: str
 ) -> ColumnElement[bool]:
@@ -532,6 +579,7 @@ class PlanningRecords:
                 else {}
             )
             row_ids = [item["id"] for item in items]
+            child_counts = _child_counts(session, project.id, kind, row_ids)
             reviews = review_results(
                 session,
                 project.id,
@@ -556,6 +604,10 @@ class PlanningRecords:
             )
             for item in items:
                 key = item["id"]
+                if kind != "issues":
+                    stories_count, item["issue_count"] = child_counts.get(key, (0, 0))
+                    if kind == "epics":
+                        item["story_count"] = stories_count
                 item["automatic_review"] = reviews.get(
                     mirror_ids.get(item["number"], key) if item["proposal"] else key
                 )
