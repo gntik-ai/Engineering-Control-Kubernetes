@@ -1208,6 +1208,9 @@ for task_key, title, summary, needs, produces, params in (
                 low=1,
                 high=32,
             ),
+            Param(
+                "prerequisites", "bool", True, "Find issues named as necessary inputs for a Story."
+            ),
         ),
     ),
     (

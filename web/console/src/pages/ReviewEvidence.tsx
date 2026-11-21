@@ -9,9 +9,10 @@ import type { DataTableColumn } from '../components/blocks/tables/data-table/dat
 type Model = { provider: string; model: string };
 type Step = { skipped?: boolean; id: string; task: string; selected?: number; reusable?: number; pages?: number; records?: number };
 type Source = { title: string; repository: string; number: number | null; revision: string; state: string; body: string; epics: string[]; card?: { text: string; partial: boolean } };
-type Pair = { id: string; issue: Source; story: Source; reason: string; decision: string };
+type Dependency = { source: string; title: string; revision: string; passage: string; basis: string };
+type Pair = { prerequisites?: Dependency[]; id: string; issue: Source; story: Source; reason: string; decision: string };
 type Preview = { second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; flow: string; eligible: number; selected: number; reusable: number; external: number; total: number; page: number; steps: Step[]; items: Pair[] };
-type Native = {scope: string; provider: string; model: string; rubric: string; link_probability: number | null; strength?: number | null; review_reason: string; cached_from?: string; eur: string | null};
+type Native = {contribution?: string; scope: string; provider: string; model: string; rubric: string; link_probability: number | null; strength?: number | null; review_reason: string; cached_from?: string; eur: string | null};
 type DecisionModel = Model & {available: boolean; rates: {input:number; output:number; cached?:number; request?:number} | null; endpoint: string; rubric: string};
 type Advisory = { status: 'advisory' | 'needs_review'; scope: string | null; reason: string; existing_link?: boolean };
 type Run = { second_opinion?: Native | null; advisory?: Advisory | null; native?: Native | null; id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
@@ -35,10 +36,22 @@ function Passage({ row }: { row: Source }) {
     <details><summary className="cursor-pointer">Original source</summary><p className="my-2 whitespace-pre-wrap">{row.body}</p></details>
   </details>;
 }
+function DependencySources({items}: {items?: Dependency[]}) {
+  if (!items?.length) return null;
+  return <details className="mt-1 max-w-lg whitespace-normal">
+    <summary className="cursor-pointer text-primary">Dependency evidence</summary>
+    {items.map(item=><div key={item.source} className="my-2">
+      <strong>{item.source} · {item.title}</strong>
+      <p className="text-xs text-muted-foreground">{item.basis} · {item.revision}</p>
+      <p className="whitespace-pre-wrap">{item.passage}</p>
+    </div>)}
+  </details>;
+}
+
 const columns: DataTableColumn<Pair>[] = [
   {id:'issue',header:'Technical issue',accessor:r=>r.issue.title,sortable:false,cell:r=><Passage row={r.issue}/>},
   {id:'story',header:'User Story',accessor:r=>r.story.title,sortable:false,cell:r=><Passage row={r.story}/>},
-  {id:'reason',header:'Why selected',accessor:r=>r.reason,sortable:false},
+  {id:'reason',header:'Why selected',accessor:r=>r.reason,sortable:false,cell:r=><>{r.reason}<DependencySources items={r.prerequisites}/></>},
   {id:'decision',header:'Saved decision',accessor:r=>r.decision,sortable:false},
 ];
 
@@ -132,7 +145,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
 }
 
 function NativeResult({value}: {value: Native}) {
-  return <div className="grid gap-1 text-sm"><strong>{value.provider} · {value.model}</strong><span>Link probability · {value.link_probability == null ? "No answer" : (100 * value.link_probability).toFixed(1)+"%"} · Scope · {scopeText(value.scope)}{value.strength != null && ` · Evidence strength ${value.strength.toFixed(2)}/2`}</span><span>{value.review_reason} · {value.cached_from ? "Reused · no new charge" : value.eur == null ? "EUR estimate unavailable" : "€"+value.eur}</span></div>;
+  return <div className="grid gap-1 text-sm"><strong>{value.provider} · {value.model}</strong><span>Link probability · {value.link_probability == null ? "No answer" : (100 * value.link_probability).toFixed(1)+"%"} · Scope · {scopeText(value.scope)}{value.contribution && ' · Contribution · '+value.contribution}{value.strength != null && ` · Evidence strength ${value.strength.toFixed(2)}/2`}</span><span>{value.review_reason} · {value.cached_from ? "Reused · no new charge" : value.eur == null ? "EUR estimate unavailable" : "€"+value.eur}</span></div>;
 }
 
 function DecisionResults({primary,second,advisory}: {primary?:Native|null; second?:Native|null; advisory?:Advisory|null}) {
@@ -146,8 +159,9 @@ function DecisionResults({primary,second,advisory}: {primary?:Native|null; secon
 
 type Judgment = {scope: string; note: string; revision: string};
 type ReviewRow = {second_opinion:string|null; id:string; issue:string; story:string; original:string|null; wiki:string|null; native:string|null; decision:string|null};
-type ReviewDetail = {second_opinion:Native|null; advisory:Advisory|null; id:string; issue:Source; story:Source; arms:Run['arms']; native:Native|null; decision:Judgment|null};
-const scopeText = (value: string | null) => value ? value.charAt(0).toUpperCase()+value.slice(1) : 'No verdict';
+type ReviewDetail = {prerequisites?:Dependency[]; second_opinion:Native|null; advisory:Advisory|null; id:string; issue:Source; story:Source; arms:Run['arms']; native:Native|null; decision:Judgment|null};
+const scopeLabels: Record<string,string> = {full:'All', partial:'Some', unrelated:'None', unclear:'Unclear'};
+const scopeText = (value: string | null) => value ? scopeLabels[value] ?? value : 'No verdict';
 
 function ReviewDecision({path, review, saved}: {path:string; review:ReviewDetail; saved:()=>void}) {
   const [scope,setScope] = useState(review.decision?.scope ?? '');
@@ -166,6 +180,7 @@ function ReviewDecision({path, review, saved}: {path:string; review:ReviewDetail
   return <div className="grid gap-3">
     <div><strong>Technical issue</strong><Passage row={review.issue}/></div>
     <div><strong>User Story</strong><Passage row={review.story}/></div>
+    <DependencySources items={review.prerequisites}/>
     <DecisionResults primary={review.native} second={review.second_opinion} advisory={review.advisory}/>
     {review.arms.map(a=><p key={a.arm}><strong>{a.arm==='wiki'?'Wiki excerpts':'Original passages'} · {scopeText(a.scope)}</strong><br/>{a.evidence}</p>)}
     <label className="grid gap-1">Your judgment<select className={optionsClass} value={scope} onChange={e=>setScope(e.target.value)}>

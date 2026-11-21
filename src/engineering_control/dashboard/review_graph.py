@@ -13,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from engineering_control.dashboard import review_prerequisites
 from engineering_control.dashboard.connection_records import catalog, counterpart, digest
 from engineering_control.dashboard.issue_coverage import (
     EXCERPT_CHARACTERS,
@@ -227,7 +228,7 @@ def snapshot(
     }
 
 
-def candidates(src: Row, limit: int) -> tuple[list[Row], int]:
+def candidates(src: Row, limit: int, *, prerequisites: bool = False) -> tuple[list[Row], int]:
     records: dict[str, Row] = src["records"]
     stories = {k: r for k, r in records.items() if r["kind"] == "stories"}
     docs = {k: terms(r) for k, r in stories.items()}
@@ -237,6 +238,7 @@ def candidates(src: Row, limit: int) -> tuple[list[Row], int]:
     for k, doc in docs.items():
         for t, f in doc.items():
             postings[t].append((k, f))
+    bridges = review_prerequisites.bridges(src) if prerequisites else {}
     pairs = []
     eligible_count = 0
     for i, issue in sorted(records.items()):
@@ -274,8 +276,34 @@ def candidates(src: Row, limit: int) -> tuple[list[Row], int]:
         if not explicit and max(scores.values(), default=0.0) < 2.0:
             for s in sorted(eligible):
                 reasons.setdefault(s, "wider search")
+        evidence = bridges.get(i, {})
+        # Keep every explicit link and fallback candidate. Within the text shortlist,
+        # reserve up to two places for cited prerequisites without increasing its length.
+        possible = sorted(
+            eligible.intersection(evidence),
+            key=lambda s: (-len(evidence[s]), -scores.get(s, 0.0), s),
+        )
+        new = [s for s in possible if s not in reasons][
+            : min(limit, review_prerequisites.BRIDGE_LIMIT)
+        ]
+        replaceable = sorted(
+            (s for s in reasons if reasons[s] == "text match" and s not in evidence),
+            key=lambda s: (scores[s], s),
+        )
+        free = max(0, limit - len(reasons))
+        for s in new[: free + len(replaceable)]:
+            if not free:
+                del reasons[replaceable.pop(0)]
+            else:
+                free -= 1
+            reasons[s] = "documented prerequisite"
         for s, why in sorted(reasons.items()):
-            pairs.append({"issue": i, "story": s, "why": why, "decision": "unchecked"})
+            pair: Row = {"issue": i, "story": s, "why": why, "decision": "unchecked"}
+            if s in evidence:
+                pair["prerequisites"] = evidence[s]
+                if why in ("text match", "wider search"):
+                    pair["why"] = "documented prerequisite"
+            pairs.append(pair)
     return pairs, eligible_count
 
 
@@ -353,7 +381,9 @@ def node_result(
     if task == reviews.GRAPH:
         return {"records": len(src["records"]), "projects": src["projects"]}
     if task == reviews.RANK:
-        pairs, possible = candidates(src, int(params.get("limit", 8)))
+        pairs, possible = candidates(
+            src, int(params.get("limit", 8)), prerequisites=bool(params.get("prerequisites"))
+        )
         result.update(pairs=pairs, eligible=possible)
         return {"eligible": possible, "selected": len(pairs)}
     if task == reviews.REUSE:
@@ -365,8 +395,10 @@ def node_result(
             # Earlier frozen runs recorded excerpt-based decisions for long documents.
             story = src["records"][pair["story"]]
             if (
-                issue["project"] == src["home"]
+                not pair.get("prerequisites")
+                and issue["project"] == src["home"]
                 and issue["local"] in checked
+                and (not src.get("coverage_rubric") or issue["local"] in positive)
                 and (
                     src.get("matching_evidence") == "full_text"
                     or (

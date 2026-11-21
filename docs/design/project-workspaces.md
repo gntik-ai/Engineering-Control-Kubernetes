@@ -213,3 +213,11 @@ Assign **Review issue links with a second opinion** to a project's **Review rela
 The first task sends the original issue and Story to OpenAI `gpt-6-luna`. A consistent full or partial verdict completes the review. For an unrelated, incomplete or contradictory verdict, the next task sends the same sources independently to OpenRouter `google/gemini-decision-1` with a criterion-by-criterion question. Both models can be configured in the Flow Designer. Each paid task records its own usage and can reuse a receipt for identical inputs.
 
 **Pending** shows disagreements, incomplete judgments and cases where the models contradict a saved link. **Advisory results** shows consistent findings. Open either record to inspect the original sources and record a human judgment. Changes to project links require their existing approval action. To roll back, restore the previous assignment under the project's Flow assignments. Evidence runs retain the Flow version and model selections they started with.
+
+#### Prerequisites in Story coverage
+
+**Some** covers a direct contribution or a necessary prerequisite. A prerequisite supplies an identifiable input that a specific Story outcome needs. **All** requires direct coverage of every material requirement. A shared topic alone earns **None**. Use **Unclear** when the connection is plausible and the evidence is insufficient.
+
+**Find related records** can follow a dependency named by a Story or by an issue with a declared parent, a manual Story link or a current full-coverage review. The task follows one hop. A newer human judgment takes precedence over a model verdict for the same sources. The selector can replace up to two text matches within the configured limit. The preview and saved comparison show the source revision and the passage that named the dependency. Administrators can disable prerequisite retrieval in the Flow Designer.
+
+Both decision models assess the original issue and Story along with any dependency passages. Each returns a scope and a contribution type. A prerequisite-only verdict of All requires review. New runs use the revised rubric. Runs already in progress resume with the rules they started with.

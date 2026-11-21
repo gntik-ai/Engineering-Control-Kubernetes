@@ -82,7 +82,13 @@ def reservation_size(question: Question) -> int:
             else {}
         )
         payload = decisions.body(
-            provider, model, question.system, question.prompt, question.native_score, route
+            provider,
+            model,
+            question.system,
+            question.prompt,
+            question.native_score,
+            route,
+            question.native_rubric,
         )
         return (
             len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + question.max_tokens + 256

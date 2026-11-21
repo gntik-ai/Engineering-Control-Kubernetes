@@ -15,7 +15,12 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows, review_graph
+from engineering_control.dashboard import (
+    review_budget,
+    review_flows,
+    review_graph,
+    review_prerequisites,
+)
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.project_records import (
@@ -87,7 +92,7 @@ def source(
     graph = next((n for n in nodes if n["task"] == reviews.GRAPH), None)
     if not graph:
         raise ProjectInvalid("Add Read project relationships and Find related records to the flow.")
-    return review_graph.snapshot(
+    src = review_graph.snapshot(
         db,
         project,
         bool(graph["params"].get("connected", True)),
@@ -95,6 +100,14 @@ def source(
         model,
         review_flows.matching_key(settings),
     )
+    rank: Row = next((n["params"] for n in nodes if n["task"] == reviews.RANK), {})
+    if "prerequisites" in rank:
+        src["coverage_rubric"] = decisions.RUBRIC
+    if rank.get("prerequisites"):
+        src["reviewed_scopes"] = review_prerequisites.reviewed_scopes(
+            db, project.id, src["records"]
+        )
+    return src
 
 
 def summary(job: ReviewEvidenceJob, run: ReviewFlowRun) -> Row:
@@ -168,6 +181,7 @@ def selection(src: Row, result: Row, page: int, search: str) -> Row:
                 "issue": passage(src, result, p["issue"]),
                 "story": passage(src, result, p["story"]),
                 "reason": p["why"],
+                "prerequisites": p.get("prerequisites", []),
                 "decision": p["decision"],
             }
             for p in shown[(page - 1) * 10 : page * 10]
@@ -459,9 +473,11 @@ def question(j: ReviewEvidenceJob, src: Row, result: Row, pair: Row, arm: str) -
             "source": f"{row['repository']}#{row['number'] or row['local']}",
             "revision": row["revision"][:16],
         }
+    if pair.get("prerequisites"):
+        docs["dependency_sources"] = pair["prerequisites"]
     return Question(
         choices=((j.provider, j.model),),
-        system=SYSTEM,
+        system=SYSTEM + (" " + decisions.PREREQUISITE_RULE if src.get("coverage_rubric") else ""),
         prompt=json.dumps(docs, ensure_ascii=False, separators=(",", ":")),
         schema=SCOPE,
         max_tokens=384,
@@ -551,7 +567,8 @@ def complete_native_step(
 def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Call | None:
     second = node["task"] == reviews.SECOND_OPINION
     config = r.settings["second_model" if second else "decision_model"]
-    if config["rubric"] != (decisions.CRITERIA_RUBRIC if second else decisions.RUBRIC):
+    instructions = decisions.INSTRUCTIONS.get(config["rubric"])
+    if not instructions:
         finish(j, r, "failed", "The pinned decision rubric is unavailable.")
         return None
     result = dict(j.result)
@@ -572,7 +589,8 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
             question(j, j.source, result, pair, "decision"),
             choices=((config["provider"], config["model"]),),
             schema={"type": "object"},
-            system=decisions.CRITERIA_INSTRUCTIONS if second else decisions.ORIGINAL_INSTRUCTIONS,
+            system=instructions,
+            native_rubric=config["rubric"],
             native_score=config["score"],
             upstreams=config["upstreams"],
             allow_fallbacks=config["allow_fallbacks"],
