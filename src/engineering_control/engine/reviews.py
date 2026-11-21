@@ -261,9 +261,11 @@ class Policy:
             if text:
                 steps.append((str(node.params.get("stage") or "all"), text))
             if node.task in EVIDENCE_TASKS:
-                nodes.append(
-                    {"id": node.id, "task": node.task, "version": 1, "params": dict(node.params)}
-                )
+                params = dict(node.params)
+                if node.task == RANK:
+                    # Already queued runs retain their original ranking and comparison rules.
+                    params.setdefault("prerequisites", True)
+                nodes.append({"id": node.id, "task": node.task, "version": 1, "params": params})
             elif node.task != "review.guidance":
                 return cls(
                     tuple(steps),

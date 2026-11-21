@@ -82,6 +82,7 @@ class Question:
     late: str = "stop"
     on_text: TextUpdate | None = None
     tariff: dict[str, float] | None = None
+    native_rubric: str = ""
     native_score: bool | None = None
     upstreams: str = ""
     allow_fallbacks: bool = True
@@ -360,6 +361,7 @@ class Models:
                 question.prompt,
                 question.native_score,
                 route or {},
+                question.native_rubric,
             )
             return await decisions.complete(
                 self.http, held.provider.key, held.url, held.key, payload, question.seconds

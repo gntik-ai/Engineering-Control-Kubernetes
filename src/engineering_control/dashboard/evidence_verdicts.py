@@ -141,6 +141,7 @@ def detail(sessions: sessionmaker[Session], name: str, run: UUID) -> dict[str, A
             "second_opinion": result.get("second_opinion"),
             "advisory": result.get("advisory"),
             "decision": result.get("human_review"),
+            "prerequisites": result["sample"].get("prerequisites", []),
             **{
                 role: passage(job.source, result, result["sample"][role])
                 for role in ("issue", "story")
