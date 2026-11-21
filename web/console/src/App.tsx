@@ -22,7 +22,7 @@ import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { ProjectWorkspace } from './pages/Workspace';
 import { usePageTitle } from './parts';
-import { ACCOUNTS, ADMIN, BASE, WORKSPACE, isAutomation, useLocation } from './router';
+import { ACCOUNTS, ADMIN, BASE, WORKSPACE, isAutomation, isReviewView, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -166,6 +166,10 @@ export default function App() {
   if (current === WORKSPACE || current.startsWith(`${WORKSPACE}/`)) {
     const [name = '', ...rest] = current.slice(WORKSPACE.length + 1).split('/');
     const subpath = rest.join('/');
+    const [group, page = ''] = rest;
+    if (group === 'reviews' && rest.length === 2 && isReviewView(page)) {
+      return <ProjectWorkspace name={name} view={page} actions={actions} notice={notice} />;
+    }
     if (rest[0] === 'automation' && rest.length === 2 && isAutomation(rest[1] ?? '')) {
       return <ProjectWorkspace name={name} view={rest[1] as import('./router').AutomationView} actions={actions} notice={notice} />;
     }

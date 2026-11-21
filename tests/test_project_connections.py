@@ -359,7 +359,10 @@ def test_references_resolve_after_import_and_links_survive_review_and_disconnect
         assert data["status"] == "needs_model" and {
             f["target"]["id"] for f in data["findings"]
         } == {str(epic), str(story)}
-        proposal = data["findings"][0]
+        story_page = ROOT + "falcone-serverless/planning/stories?record=" + str(story)
+        epic_page = ROOT + "falcone-serverless/planning/epics?record=" + str(epic)
+        assert client.get(story_page).json()["items"][0]["issue_count"] == 0
+        proposal = next(f for f in data["findings"] if f["target"]["id"] == str(story))
         decision = path + "/findings/" + proposal["id"]
         assert write(client, decision, accept=True, version=proposal["version"]).status_code == 200
         assert write(client, decision, accept=True, version=proposal["version"]).status_code == 200
@@ -382,10 +385,10 @@ def test_references_resolve_after_import_and_links_survive_review_and_disconnect
             and page["items"][0]["id"] == str(issue)
             and len(page["items"][0]["connections"]) == 3
         )
-        backlink = client.get(
-            ROOT + "falcone-serverless/planning/stories?record=" + str(story)
-        ).json()
+        backlink = client.get(story_page).json()
         assert backlink["items"][0]["connections"][0]["record"] == str(issue)
+        assert backlink["items"][0]["issue_count"] == 1
+        assert client.get(epic_page).json()["items"][0]["issue_count"] == 1
         assert client.get(ROOT + "falcone/planning/issues?connected=llmwiki").json()["total"] == 0
         assert client.get(ROOT + "falcone/planning/counts").json()["issues"] == 1
         remaining = next(f for f in data["findings"] if f["id"] != proposal["id"])
@@ -409,6 +412,7 @@ def test_references_resolve_after_import_and_links_survive_review_and_disconnect
         refreshed = client.get(path).json()["findings"]
         assert len(refreshed) == 3
         assert all(f["status"] == "pending" for f in refreshed if f["origin"] == "reference")
+        assert client.get(story_page).json()["items"][0]["issue_count"] == 0
         repo.planning.remove("falcone-serverless", "stories", story)
         due(repo, id)
         check(repo)

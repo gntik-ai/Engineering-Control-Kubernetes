@@ -167,3 +167,58 @@ def test_empty_invalid_and_authenticated_pages(tmp_path: Path) -> None:
             assert client.get(BASE + suffix).status_code == 401
     finally:
         client.__exit__(None, None, None)
+
+
+def test_relationship_counts_span_states_and_deduplicate_shared_issues(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        plan = repo.planning
+        main, other, empty = (
+            UUID(plan.save("falcone", "epics", title, None, [])["id"])
+            for title in ("Main", "Other", "Empty")
+        )
+        left = UUID(plan.save("falcone", "stories", "Left", None, [main])["id"])
+        right = UUID(plan.save("falcone", "stories", "Right", None, [main, other])["id"])
+        plan.save("falcone", "stories", "No issues", None, [other])
+        plan.save("falcone", "issues", "Local draft", None, [left])
+        shared = UUID(plan.save("falcone", "issues", "Shared", None, [left, right])["id"])
+        planning = UUID(plan.save("falcone", "issues", "Reclassified", None, [left, right])["id"])
+        plan.set_state("falcone", "stories", right, "closed")
+        plan.set_state("falcone", "epics", main, "closed")
+        with repo.sessions.begin() as db:
+            issue = db.get(BacklogItem, shared)
+            assert issue
+            issue.repository = "gntik-ai/falcone"
+            issue.issue_number, issue.issue_state = 41, "closed"
+            issue.workspace_review = "approved"
+            reclassified = db.get(BacklogItem, planning)
+            assert reclassified
+            reclassified.workspace_review = "planning"
+            db.add(
+                WorkspaceCandidate(
+                    project_id=issue.project_id,
+                    kind="issues",
+                    identity="suggested",
+                    origin="review",
+                    title="Unapproved relationship",
+                    parents=[str(right)],
+                )
+            )
+
+        def counts(epic: UUID, state: str) -> tuple[int, int]:
+            page = client.get(BASE + f"epics?record={epic}&page_size=1&state={state}").json()
+            [row] = page["items"]
+            assert row["id"] == str(epic)
+            return row["story_count"], row["issue_count"]
+
+        assert counts(main, "closed") == (2, 2)
+        assert counts(other, "open") == (2, 1)
+        assert counts(empty, "open") == (0, 0)
+        stories = client.get(BASE + "stories?state=open").json()["items"]
+        assert {r["title"]: r["issue_count"] for r in stories} == {"Left": 2, "No issues": 0}
+        [closed] = client.get(BASE + "stories?state=closed").json()["items"]
+        assert closed["issue_count"] == 1
+        plan.remove("falcone", "stories", right)
+        assert counts(other, "open") == (1, 0)
+    finally:
+        client.__exit__(None, None, None)

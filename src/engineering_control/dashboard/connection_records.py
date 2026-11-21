@@ -243,6 +243,43 @@ def connected_records(
     )
 
 
+def connected_story_issues(
+    project: UUID, stories: Select[tuple[UUID]]
+) -> Select[tuple[UUID | None, UUID]]:
+    """Approved issue links to these local Stories on either side of a live connection."""
+    f, c = ConnectionFinding, ProjectConnection
+    outgoing = f.source_project == project
+    peer = case((c.first_id == project, c.second_id), else_=c.first_id)
+    story_id = case((outgoing, f.source_id), else_=f.target_id)
+    issue_id = case((outgoing, f.target_id), else_=f.source_id)
+    return (
+        select(story_id.label("story_id"), BacklogItem.id.label("issue_id"))
+        .join_from(f, c, c.id == f.connection_id)
+        .join(ProjectRecord, ProjectRecord.id == peer)
+        .join(BacklogItem, (BacklogItem.id == issue_id) & (BacklogItem.project_id == peer))
+        .where(
+            (c.first_id == project) | (c.second_id == project),
+            c.archived_at.is_(None),
+            ProjectRecord.archived_at.is_(None),
+            BacklogItem.workspace_review.is_distinct_from("planning"),
+            f.status == "approved",
+            f.action.in_(("link", "create")),
+            (
+                outgoing
+                & (f.source_kind == "stories")
+                & (f.target_kind == "issues")
+                & f.source_id.in_(stories)
+            )
+            | (
+                (f.source_project == peer)
+                & (f.target_kind == "stories")
+                & (f.source_kind == "issues")
+                & f.target_id.in_(stories)
+            ),
+        )
+    )
+
+
 def finding_links(
     session: Session, project: UUID, kind: str, keys: list[UUID]
 ) -> list[tuple[UUID, dict[str, Any]]]:

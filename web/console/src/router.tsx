@@ -8,6 +8,15 @@ export const accountsUrl = (project?: string | null) =>
   project ? ACCOUNTS + '?' + new URLSearchParams({ project }).toString() : ACCOUNTS;
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
+export const reviewViews = ['related-work', 'planning', 'discovery'] as const;
+export type ReviewView = typeof reviewViews[number];
+export const isReviewView = (value: string): value is ReviewView => reviewViews.some(view => view === value);
+export const reviewUrl = (project: string, view: ReviewView) => workspaceUrl(project) + '/reviews/' + view;
+export function workspaceTabUrl(project: string, tab: string, issueState?: 'draft') {
+  const query = new URLSearchParams({ tab });
+  if (issueState) query.set('issue_state', issueState);
+  return workspaceUrl(project) + '?' + query;
+}
 export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');
 export const statsUrl = (project?: string | null) => BASE + '/settings/stats' + (project ? '?' + new URLSearchParams({project}) : '');
 export const connectionsUrl = (name: string, id?: string) => workspaceUrl(name) + '/settings/connections' + (id ? '?connection=' + encodeURIComponent(id) : '');

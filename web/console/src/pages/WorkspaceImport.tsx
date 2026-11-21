@@ -2,7 +2,7 @@ import { Alert, Button, Field, FieldLabel, Link, SimpleSelect, Textarea } from '
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { accountsUrl, setQuery, useLocation } from '../router';
+import { accountsUrl, RouterLink, setQuery, useLocation, workspaceTabUrl } from '../router';
 import { useSubmit } from './ProjectDialogs';
 import { CoveragePreview, ReviewControl } from './ReviewControls';
 import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity } from './WorkspaceReview';
@@ -254,16 +254,11 @@ export function WorkspaceImport({
           : 'Approve the repository description to check Epics, User Stories and technical Issues.'}</p>}
         {(coverage?.state === 'waiting' || coverage?.state === 'completed') && (
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="secondary" onClick={() => setQuery({
-              tab: coverage.state === 'completed' ? 'issues' : state.stage, issue_state: null,
-              state: null, page: null, search: null, record: null, epic: null, connected: null,
-            })}>
+            <Button size="sm" variant="secondary" render={<RouterLink href={workspaceTabUrl(project, coverage.state === 'completed' ? 'issues' : state.stage)} />}>
               {coverage.state === 'completed' ? 'View Issues' : state.stage === 'epics' ? 'Review Epics' : 'Review User Stories'}
             </Button>
             {coverage.state === 'completed' && coverage.issues > 0 && (
-              <Button size="sm" variant="secondary" onClick={() => setQuery({
-                tab: 'issues', issue_state: 'draft', state: null, page: null, search: null, record: null, epic: null, connected: null,
-              })}>Review issue drafts</Button>
+              <Button size="sm" variant="secondary" render={<RouterLink href={workspaceTabUrl(project, 'issues', 'draft')} />}>Review issue drafts</Button>
             )}
           </div>
         )}
@@ -333,6 +328,7 @@ export function WorkspaceImport({
       {state.review && !managed && !pausedCoverage && (
         <WorkspaceReview
           key={state.stage}
+          project={project}
           path={path}
           state={state}
           model={model}

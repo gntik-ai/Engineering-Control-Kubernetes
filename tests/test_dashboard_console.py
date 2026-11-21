@@ -25,6 +25,7 @@ def test_console_requires_a_session(tmp_path: Path) -> None:
             "/console/backlog",
             "/console/admin",
             "/console/workspace/falcone",
+            "/console/workspace/falcone/reviews/planning",
             "/console/settings/accounts?project=llmwiki",
             "/console/accounts",
             "/console/runs?project=falcone&state=running",
@@ -98,7 +99,12 @@ def test_a_browser_asking_for_an_unknown_page_gets_the_console_not_found_page(
     try:
         index = (CONSOLE_ROOT / "index.html").read_text(encoding="utf-8")
         browser = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
-        for path in ("/console/unknown", "/overview", "/settings/password"):
+        for path in (
+            "/console/unknown",
+            "/console/workspace/falcone/reviews/unknown",
+            "/overview",
+            "/settings/password",
+        ):
             page = client.get(path, headers=browser)
             assert page.status_code == 404
             assert page.text == index
@@ -135,6 +141,9 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             "/console",
             "/console/admin",
             "/console/workspace/falcone",
+            "/console/workspace/falcone/reviews/related-work",
+            "/console/workspace/falcone/reviews/planning",
+            "/console/workspace/falcone/reviews/discovery",
             "/console/projects",
             "/console/backlog",
             "/console/settings/accounts",
@@ -149,6 +158,9 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             assert f"style-src 'self' '{CONSOLE_INLINE_STYLE_HASH}';" in policy
             assert "script-src 'self';" in policy
             assert "unsafe" not in policy
+        legacy = client.get("/console/workspace/llmwiki?import=1", follow_redirects=False)
+        assert legacy.status_code == 303
+        assert legacy.headers["location"] == "/console/workspace/llmwiki/reviews/discovery?import=1"
         # Every script and stylesheet is a same-origin console asset; nothing is inline.
         references = re.findall(r'(?:src|href)="([^"]+)"', index)
         assert references

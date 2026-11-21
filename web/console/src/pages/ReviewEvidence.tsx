@@ -101,7 +101,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     finally{setBusy(false);}
   }
   return <section aria-label="Review evidence" className="grid gap-3 rounded-xl border border-border bg-card p-5">
-    <h2 className="text-lg font-semibold">{draft ? 'Preview this flow' : 'Review related work'}</h2>
+    {draft && <h2 className="text-lg font-semibold">Preview this flow</h2>}
     {data && <div className="flex flex-wrap items-end gap-3">
       {!generation && (!decisionModel || data.paired || draft) && !!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
         {data.models.map(m=><option key={keyOf(m)} value={keyOf(m)}>{m.provider} · {m.model}</option>)}</select></label>}

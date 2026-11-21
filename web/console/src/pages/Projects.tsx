@@ -18,7 +18,7 @@ import { FolderKanban, Pencil, Plus, Star, Trash2 } from '@gntik-ai/icons';
 import { useState } from 'react';
 import { postJson, type ProjectSummary } from '../api';
 import { LoadError, RefreshButton, When, useProjects } from '../parts';
-import { BASE, navigate, workspaceUrl } from '../router';
+import { BASE, navigate, reviewUrl } from '../router';
 import { NewProjectDialog, RemoveProjectDialog, RenameProjectDialog, useSubmit } from './ProjectDialogs';
 
 const filtered = (view: string, project: string) => `${BASE}/${view}?project=${encodeURIComponent(project)}`;
@@ -153,7 +153,7 @@ export function ProjectsPage() {
             : !projects.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-44 w-full" />)}
         </div>
       </div>
-      <NewProjectDialog open={creating} onOpenChange={setCreating} onSaved={({ project }) => { projects.reload(); navigate(workspaceUrl(project) + '?import=1'); }} />
+      <NewProjectDialog open={creating} onOpenChange={setCreating} onSaved={({ project }) => { projects.reload(); navigate(reviewUrl(project, 'discovery') + '?import=1'); }} />
     </Page>
   );
 }
