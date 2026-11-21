@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from engineering_control.engine.document import Document, Node
+from engineering_control.models import openrouter
+from engineering_control.models.providers import BY_KEY, MODEL_NAME
 
 # The terminal task selects the worker and the response contract. Additional instruction
 # nodes execute in graph order and can target just one part of a multi-stage review.
@@ -59,7 +61,8 @@ RANK = "evidence.candidates"
 REUSE = "evidence.reuse"
 WIKI = "evidence.wiki"
 COMPARE = "evidence.compare"
-EVIDENCE_TASKS = (GRAPH, RANK, REUSE, WIKI, COMPARE)
+DECISION = "evidence.decisions"
+EVIDENCE_TASKS = (GRAPH, RANK, REUSE, WIKI, COMPARE, DECISION)
 MATCH_ACTIONS = ("evidence", "coverage", "issues", "automatic")
 
 
@@ -108,6 +111,19 @@ def defaults() -> dict[str, Document]:
             for i, (label, task) in enumerate(chain)
         ),
     )
+    shadow = "review-native-decisions"
+    found[shadow] = Document(
+        key=shadow,
+        name="Review issue links with Decisions",
+        summary="Review an issue–Story pair with a native decision model.",
+        start="sources",
+        nodes=(
+            Node("sources", GRAPH, next={"ok": "rank"}),
+            Node("rank", RANK, next={"ok": "verify"}),
+            Node("verify", DECISION, next={"ok": "finish"}),
+            Node("finish", "review.evidence"),
+        ),
+    )
     return found
 
 
@@ -133,6 +149,34 @@ def invalid(document: Document) -> str | None:
     node = document.node(document.start)
     while node and node.id not in seen:
         seen.add(node.id)
+        generation = node.params.get("generation")
+        if generation:
+            provider, _, model = str(generation).partition(":")
+            if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
+                return "Choose a generation provider and model from Accounts."
+        if node.task == DECISION or node.params.get("upstreams"):
+            try:
+                openrouter.routing(
+                    str(node.params.get("upstreams", "")),
+                    bool(node.params.get("allow_fallbacks", True)),
+                    decisions=node.task == DECISION
+                    and node.params.get("decision_provider") == "openrouter",
+                )
+            except ValueError as exc:
+                return str(exc)
+        if (
+            node.task == DECISION
+            and node.params.get("decision_provider") == "openrouter"
+            and "/" not in str(node.params.get("decision_model") or "")
+        ):
+            return "Select a provider-qualified OpenRouter decision model."
+        if (
+            node.task == DECISION
+            and node.params.get("decision_provider", "openai") == "openai"
+            and node.params.get("decision_model", openrouter.DIRECT_MODEL)
+            != openrouter.DIRECT_MODEL
+        ):
+            return "Choose a native OpenAI Decisions model."
         if (
             node.task == "review." + action
             and not any(node.next.values())
@@ -145,14 +189,21 @@ def invalid(document: Document) -> str | None:
             return None
         if node.task in EVIDENCE_TASKS:
             if action not in MATCH_ACTIONS or (
-                node.task in (WIKI, COMPARE) and action != "evidence"
+                node.task in (WIKI, COMPARE, DECISION) and action != "evidence"
             ):
                 return "This evidence task is incompatible with the selected review action."
-            required_input = {RANK: GRAPH, REUSE: RANK, WIKI: RANK, COMPARE: WIKI}.get(node.task)
+            required_input = {
+                RANK: GRAPH,
+                REUSE: RANK,
+                WIKI: RANK,
+                COMPARE: WIKI,
+                DECISION: RANK,
+            }.get(node.task)
             if (
                 node.task in evidence
                 or (required_input and required_input not in evidence)
-                or COMPARE in evidence
+                or DECISION in evidence
+                or (COMPARE in evidence and node.task != DECISION)
             ):
                 return "Use each evidence task once, after its inputs and before comparison."
             evidence.append(node.task)
@@ -169,6 +220,9 @@ class Policy:
     instructions: tuple[tuple[str, str], ...]
     max_output: int | None
     nodes: tuple[dict[str, Any], ...] = ()
+    generation: str = ""
+    upstreams: str = ""
+    allow_fallbacks: bool = True
 
     @classmethod
     def from_document(cls, document: Document) -> Policy:
@@ -186,13 +240,23 @@ class Policy:
                     {"id": node.id, "task": node.task, "version": 1, "params": dict(node.params)}
                 )
             elif node.task != "review.guidance":
-                return cls(tuple(steps), node.params.get("max_output"), tuple(nodes))
+                return cls(
+                    tuple(steps),
+                    node.params.get("max_output"),
+                    tuple(nodes),
+                    str(node.params.get("generation") or ""),
+                    str(node.params.get("upstreams") or ""),
+                    bool(node.params.get("allow_fallbacks", True)),
+                )
             node = document.node(str(node.next["ok"]))
         raise ValueError("The review flow has no terminal task.")
 
     def settings(self) -> dict[str, Any]:
         return {
             "instructions": list(self.instructions),
+            **({"generation": self.generation} if self.generation else {}),
+            **({"upstreams": self.upstreams} if self.upstreams else {}),
+            **({"allow_fallbacks": False} if not self.allow_fallbacks else {}),
             "max_output": self.max_output,
             **({"evidence_nodes": list(self.nodes)} if self.nodes else {}),
         }

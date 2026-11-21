@@ -196,6 +196,8 @@ export interface FlowCatalogue {
   providers: string[];
   /** The models an agent's task can be set to, by subscription, with the levels each has. */
   models: Record<string, ModelChoices>;
+  api_models?: {provider: string; model: string}[];
+  decision_models?: {provider: string; model: string; questions: string[]}[];
   /** What an If can ask about, and the ways each is compared. */
   conditions?: ConditionCatalogue;
   saved: SavedTask[];
@@ -1044,6 +1046,9 @@ export interface Account {
   host?: string;
   /** The models the provider listed for the key when it was last asked. */
   models?: string[];
+  catalog_error?: string | null;
+  catalog_updated_at?: string | null;
+  decision_models?: number;
   /** US dollars per million tokens, by model. */
   prices?: Record<string, ModelPrice>;
 }

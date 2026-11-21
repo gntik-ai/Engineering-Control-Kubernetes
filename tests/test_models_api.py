@@ -49,12 +49,22 @@ GOOD = {"decision": "PASS", "summary": "Fine."}
 # --- the providers ---------------------------------------------------------------------------
 
 
-def test_seven_providers_each_at_addresses_of_its_own() -> None:
-    assert API_KEYS == ("anthropic", "openai", "google", "deepseek", "qwen", "glm", "kimi")
+def test_providers_each_at_addresses_of_its_own() -> None:
+    assert API_KEYS == (
+        "anthropic",
+        "openai",
+        "openrouter",
+        "google",
+        "deepseek",
+        "qwen",
+        "glm",
+        "kimi",
+    )
     hosts = {key: [host_of(e.url) for e in BY_KEY[key].endpoints] for key in API_KEYS}
     assert hosts == {
         "anthropic": ["api.anthropic.com"],
         "openai": ["api.openai.com"],
+        "openrouter": ["openrouter.ai"],
         "google": ["generativelanguage.googleapis.com"],
         "deepseek": ["api.deepseek.com"],
         "qwen": ["dashscope-intl.aliyuncs.com", "dashscope.aliyuncs.com"],
@@ -75,7 +85,11 @@ def test_seven_providers_each_at_addresses_of_its_own() -> None:
     assert FAMILY_OF["google"] not in (FAMILY_OF["claude"], FAMILY_OF["chatgpt"])
     # OpenAI and Google hold a model to the shape of its answer and take a level of
     # reasoning; Google names its models with a word before them.
-    assert [key for key in API_KEYS if BY_KEY[key].shape == "schema"] == ["openai", "google"]
+    assert [key for key in API_KEYS if BY_KEY[key].shape == "schema"] == [
+        "openai",
+        "openrouter",
+        "google",
+    ]
     assert [key for key in API_KEYS if BY_KEY[key].effort] == ["openai", "google"]
     google = BY_KEY["google"]
     assert google.endpoints[0].url == "https://generativelanguage.googleapis.com/v1beta/openai"

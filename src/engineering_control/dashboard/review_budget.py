@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import UUID
 
 from sqlalchemy import Select, select, update
@@ -71,6 +72,21 @@ def authorize(
 def reservation_size(question: Question) -> int:
     # Reserve input conservatively by UTF-8 byte length. Providers can receive the schema
     # both in the text and as a structured-output parameter, plus message framing.
+    if question.native_score is not None:
+        from engineering_control.models import decisions, openrouter
+
+        provider, model = question.choices[0]
+        route = (
+            openrouter.routing(question.upstreams, question.allow_fallbacks, decisions=True)
+            if provider == "openrouter"
+            else {}
+        )
+        payload = decisions.body(
+            provider, model, question.system, question.prompt, question.native_score, route
+        )
+        return (
+            len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + question.max_tokens + 256
+        )
     text = question.system + with_shape(question) + shape.words(question.schema)
     return len(text.encode("utf-8")) + question.max_tokens + 256
 
@@ -119,7 +135,7 @@ async def ask_review(
         return reply
     except ModelError as exc:
         reply = exc.metered
-        if reserved and reply is None and exc.label in ("no_key", "no_account"):
+        if reserved and reply is None and exc.label in ("no_key", "no_account", "configuration"):
             # No inference ran. An ambiguous transport failure keeps its reservation.
             await asyncio.to_thread(release_unused, sessions, project_id, reserved)
         raise

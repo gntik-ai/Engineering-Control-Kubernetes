@@ -238,6 +238,7 @@ def test_which_providers_take_batches_and_at_what_price() -> None:
     assert {key: kind.batch for key, kind in BY_KEY.items()} == {
         "anthropic": "anthropic",
         "openai": "files",
+        "openrouter": "",
         "google": "google",
         "deepseek": "",
         "qwen": "files",

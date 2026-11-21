@@ -1,8 +1,8 @@
 """The providers a model can be asked at over their API.
 
 Beside the two subscriptions (a command-line client signed in to Claude or ChatGPT),
-a model can be reached with an API key, paid by use. Seven providers are known. Anthropic
-is spoken to with its own library; the other six accept the same kind of request
+a model can be reached with an API key, paid by use. Anthropic
+is spoken to with its own library; the other text providers accept the same kind of request
 (OpenAI's chat completions), each at its own address.
 
 An address is chosen from the ones listed here, never typed: a key is sent nowhere else.
@@ -111,12 +111,23 @@ API_PROVIDERS: Final = (
         style="openai",
         endpoints=(Endpoint("default", "OpenAI", "https://api.openai.com/v1"),),
         keys_at="platform.openai.com → API keys",
-        key_pattern=re.compile(r"^sk-[A-Za-z0-9_-]{20,400}$"),
+        key_pattern=re.compile(r"^sk-(?!or-)[A-Za-z0-9_-]{20,400}$"),
         key_shape="it starts with sk-",
         limit_name="max_completion_tokens",
         shape="schema",
         effort=True,
         batch="files",
+    ),
+    ApiProvider(
+        key="openrouter",
+        name="OpenRouter",
+        family="openrouter",
+        style="openai",
+        endpoints=(Endpoint("default", "OpenRouter", "https://openrouter.ai/api/v1"),),
+        keys_at="openrouter.ai/settings/keys",
+        key_pattern=re.compile(r"^sk-or-[A-Za-z0-9_-]{16,380}$"),
+        key_shape="it starts with sk-or-",
+        shape="schema",
     ),
     ApiProvider(
         # The Gemini API of Google AI Studio, through the address at which it accepts
@@ -197,9 +208,9 @@ FAMILY_OF: Final = {
     **{provider.key: provider.family for provider in API_PROVIDERS},
 }
 # How many models an account keeps prices for at most.
-MAX_PRICED: Final = 300
+MAX_PRICED: Final = 2000
 # What a model's name may look like, whoever the provider.
-MODEL_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}$")
+MODEL_NAME: Final = re.compile(r"^(?=.{1,100}$)~?[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 _KEY: Final = re.compile(r"^[\x21-\x7e]{16,400}$")
 
 
@@ -241,7 +252,7 @@ def clean_prices(value: Any) -> dict[str, dict[str, float]]:
         if not isinstance(prices, dict):
             raise ValueError(f"The prices of {name} are not given")
         entry: dict[str, float] = {}
-        for part in ("input", "output", "cached"):
+        for part in ("input", "output", "cached", "cache_write", "request"):
             if prices.get(part) in (None, ""):
                 continue
             try:
@@ -266,6 +277,7 @@ def cost_of(
     *,
     write: float = 1.0,
     part: float = 1.0,
+    precision: int = 6,
 ) -> float | None:
     """What a call cost, when the account says what its model costs. Tokens read again
     from the provider's cache count at their own price, or else as tokens read. Of the
@@ -279,7 +291,10 @@ def cost_of(
         again = float(entry.get("cached", read))
         kept = int(used.get("cache_write", 0) or 0)
         total = int(used.get("input", 0) or 0) * read + int(used.get("output", 0) or 0) * written
-        total += int(used.get("cached", 0) or 0) * again + kept * read * (write - 1.0)
+        total += int(used.get("cached", 0) or 0) * again + kept * (
+            float(entry.get("cache_write", read * write)) - read
+        )
+        total += float(entry.get("request", 0)) * int(used.get("responses", 1)) * 1_000_000
     except (KeyError, TypeError, ValueError):
         return None
-    return round(total * part / 1_000_000, 6)
+    return round(total * part / 1_000_000, precision)

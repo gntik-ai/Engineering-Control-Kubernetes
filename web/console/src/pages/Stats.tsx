@@ -52,7 +52,8 @@ type Series = Values & {
   archived?: boolean;
   daily: Record<string, Values>;
 };
-type Report = { days: string[]; accounts: Series[]; flows: Series[]; projects: Series[]; overall: Series };
+type Route = Series & { project: string; task: string; endpoint: string; requested_model: string; model: string; upstream: string; credits_usd: number | null };
+type Report = { model_routes: Route[]; days: string[]; accounts: Series[]; flows: Series[]; projects: Series[]; overall: Series };
 type LiveRun = {
   id: string;
   title: string;
@@ -373,6 +374,20 @@ export function StatsPage() {
             <Panel title="Usage by flow">
               <Breakdown type="Flows" rows={data.flows} open={(row) => setDetail(row.id)} />
             </Panel>
+            {!!data.model_routes?.length && <Panel title="Usage by model route">
+              <DataTable caption="Usage by model route" rows={data.model_routes} getRowId={r => r.id} selectionMode="none" showQuickFilter paginated pageSizeOptions={[10,25,50]}
+                columns={[
+                  {id:'project',header:'Project',accessor:r=>r.project},
+                  {id:'flow',header:'Flow',accessor:r=>r.name+' · '+version(r)},
+                  {id:'task',header:'Task',accessor:r=>r.task},
+                  {id:'provider',header:'Provider / endpoint',accessor:r=>r.provider+' '+r.endpoint},
+                  {id:'requested',header:'Requested model',accessor:r=>r.requested_model},
+                  {id:'reported',header:'Reported model / upstream',accessor:r=>[r.model,r.upstream].filter(Boolean).join(' · ')},
+                  {id:'calls',header:'Calls',accessor:r=>r.calls},
+                  {id:'tokens',header:'Tokens',accessor:r=>r.tokens},
+                  {id:'credits',header:'Reported credits (USD)',accessor:r=>r.credits_usd ?? undefined,cell:r=>r.credits_usd == null ? '—' : r.credits_usd.toLocaleString(undefined,{maximumFractionDigits:9})},
+                  {id:'eur',header:'Estimated EUR',accessor:r=>r.eur ?? undefined,cell:r=>price(r)},
+                ]}/></Panel>}
             <Panel title="Usage by project">
               <Tabs value={tab} onValueChange={(v) => setTab(String(v))}>
                 <TabsList aria-label="Project usage view">

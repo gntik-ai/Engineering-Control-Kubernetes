@@ -69,6 +69,7 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
         "review-stories",
         "review-issues",
         "review-evidence",
+        "review-native-decisions",
         "review-coverage",
         "review-automatic",
         "review-connections",

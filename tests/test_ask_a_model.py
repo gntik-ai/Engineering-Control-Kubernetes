@@ -101,6 +101,7 @@ def test_an_account_with_an_api_key_is_added_given_its_key_tried_and_removed(
         assert [key for key, kind in kinds.items() if kind == "api"] == [
             "anthropic",
             "openai",
+            "openrouter",
             "google",
             "deepseek",
             "qwen",
@@ -230,6 +231,8 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
         # Passing it does not stand in for the review, the tests or the scan.
         assert not (task.reviewed or task.tested or task.scanned or task.checked)
         assert [param.name for param in task.params] == [
+            "upstreams",
+            "allow_fallbacks",
             "instruction",
             "provider",
             "model",
@@ -270,7 +273,7 @@ def test_two_tasks_ask_a_model_and_say_how() -> None:
         ({"then_provider": "glm"}, "judge does not name the second model it asks"),
         (
             {"provider": "claude"},
-            "provider of judge is one of: anthropic, openai, google, deepseek",
+            "provider of judge is one of: anthropic, openai, openrouter, google, deepseek",
         ),
         ({"instruction": "  "}, "judge has no instruction yet"),
         ({"tokens": 100}, "tokens of judge is between 500 and 32000"),
