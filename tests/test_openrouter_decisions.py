@@ -271,6 +271,15 @@ def test_shadow_task_direct_openai_and_repeated_review(tmp_path: Path) -> None:
         client.close()
 
 
+def test_original_and_wiki_cache_keys_follow_router_policy() -> None:
+    pair = {"issue": "i", "story": "s"}
+    q = question(("openrouter", "test/model"))
+    key = review_evidence.comparison_key(pair, [q, q])
+    for policies in ({"upstreams": "acme"}, {"allow_fallbacks": False}):
+        routed = replace(q, **policies)
+        assert review_evidence.comparison_key(pair, [routed, routed]) != key
+
+
 def test_native_question_contracts_and_uncertain_outcomes() -> None:
     payload = decisions.body("openai", "gpt-6-luna", "rules", "sources", True, {})
     assert payload["questions"][-1]["levels"][2]["label"] == "Explicit source evidence"

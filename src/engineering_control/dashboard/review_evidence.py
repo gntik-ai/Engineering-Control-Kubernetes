@@ -567,7 +567,6 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
             j.cursor += 1
             return None
         if prior.state == "uncertain":
-            j.result = result
             j.state = "held"
             j.result = {
                 **result,
@@ -575,6 +574,19 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
             }
             return None
     return reserve_call(db, j, result, "decision", q)
+
+
+def comparison_key(pair: Row, questions: list[Question]) -> str:
+    inputs: list[Any] = [
+        1,
+        pair["issue"],
+        pair["story"],
+        [(q.choices, q.system, q.prompt, q.schema, q.max_tokens) for q in questions],
+    ]
+    # Preserve existing direct-provider cache keys. Routed requests also depend on the upstreams.
+    if any(provider == "openrouter" for q in questions for provider, _ in q.choices):
+        inputs.append([(q.upstreams, q.allow_fallbacks) for q in questions])
+    return digest(inputs)
 
 
 def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Call | None:
@@ -617,14 +629,7 @@ def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Cal
                 j, r, "failed", "The cap cannot cover both evidence reads for any unchecked pair."
             )
             return None
-        signature = digest(
-            [
-                1,
-                pair["issue"],
-                pair["story"],
-                [(q.choices, q.system, q.prompt, q.schema, q.max_tokens) for q in qs],
-            ]
-        )
+        signature = comparison_key(pair, qs)
         j.comparison_signature = signature
         prior = db.scalar(
             select(ReviewEvidenceJob)
