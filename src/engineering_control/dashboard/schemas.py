@@ -467,6 +467,7 @@ class ProposalDecisions(PlainChangeInput):
 
 
 class ProposalEdit(PlainChangeInput):
+    execution_type: Literal["bug", "enhancement"] | None = None
     version: int | None = Field(default=None, ge=0)
     title: str = Field(min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=40000)
@@ -483,11 +484,13 @@ class StoryInput(EpicInput):
 
 
 class WorkspaceIssueStories(PlainChangeInput):
-    story_ids: list[UUID] = Field(min_length=1)
+    story_ids: list[UUID]
+    execution_type: Literal["bug", "enhancement"] | None = None
 
 
 class WorkspaceIssueInput(EpicInput):
     story_ids: list[UUID] = Field(default_factory=list)
+    execution_type: Literal["bug", "enhancement"] | None = None
 
 
 class FlowDraftInput(DashboardModel):

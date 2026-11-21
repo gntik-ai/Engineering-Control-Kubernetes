@@ -21,6 +21,7 @@ from engineering_control.dashboard.issue_coverage import (
     inventory,
     technical_sources,
 )
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.workspace_issues import STORY_LINE, STORY_REF
 from engineering_control.db.models import (
     ConnectionFinding,
@@ -146,6 +147,7 @@ def snapshot(
             )
         ):
             parents[issue_id].append(source_key(p.id, "stories", story))
+        bugs = set(db.scalars(bugs_with_optional_stories(db, p.id)))
         for issue, body in technical_sources(db, p):
             row = record(
                 p,
@@ -157,6 +159,8 @@ def snapshot(
                 issue.issue_state or "open",
             )
             facts = issue.facts or {}
+            if issue.id in bugs:
+                row["story_optional"] = True
             row.update(
                 parents=sorted(parents[issue.id]),
                 manual=bool(facts.get("manual_story_links")),
@@ -250,6 +254,13 @@ def candidates(src: Row, limit: int, *, prerequisites: bool = False) -> tuple[li
             if (r["project"] == src["home"] or issue["project"] == src["home"])
             and (not issue["manual"] or r["project"] != issue["project"] or s in issue["parents"])
             and src["decisions"].get(i, {}).get(s) != "dismissed"
+            and (
+                not issue.get("story_optional")
+                or s in issue["parents"]
+                or f"{r['repository'].casefold()}#{r['number']}" in issue["refs"]
+                or src["decisions"].get(i, {}).get(s) == "approved"
+                or s in bridges.get(i, {})
+            )
         }
         eligible_count += len(eligible)
         scores: dict[str, float] = defaultdict(float)

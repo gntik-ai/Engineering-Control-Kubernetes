@@ -19,9 +19,11 @@ from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.coverage_preview import proposal_version, remember_proposal
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import (
     Kind,
     coverage_problem,
+    replace_parents,
     save_record,
 )
 from engineering_control.dashboard.planning_queue import queue_review, record_changed
@@ -36,7 +38,11 @@ from engineering_control.dashboard.workspace_issues import (
     import_issues,
     planning_kind,
 )
-from engineering_control.dashboard.workspace_publishing import approve_issue, enqueue
+from engineering_control.dashboard.workspace_publishing import (
+    approve_issue,
+    confirm_classification,
+    enqueue,
+)
 from engineering_control.db.models import (
     BacklogItem,
     ConnectionFinding,
@@ -946,6 +952,8 @@ class WorkspaceReview:
                     BacklogItem.issue_number == candidate.number,
                 )
             ).one()
+            if candidate.execution_type:
+                confirm_classification(session, project, item, candidate.execution_type)
             add_story_links(session, project.id, item.id, set(parents))
             queue_review(session, project.id, kind, item.id, item.title)
             return item.id
@@ -963,6 +971,7 @@ class WorkspaceReview:
             parents,
             review_scope=scope,
             new_id=candidate.id if candidate.origin in ("intake", "review") else None,
+            execution_type=candidate.execution_type,
         )
         if evidence is not None:
             # The original is marked for closure only after its durable local record exists.
@@ -1024,6 +1033,7 @@ class WorkspaceReview:
         title: str,
         description: str | None,
         parents: list[UUID],
+        execution_type: str | None = None,
     ) -> None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
@@ -1035,20 +1045,56 @@ class WorkspaceReview:
                 self._editable(row, kind, version)
             if candidate.decision != "pending":
                 raise ProjectConflict("Only a pending proposal can be edited")
+            if execution_type:
+                if kind != "issues":
+                    raise ProjectInvalid("Only technical Issues have an execution type")
+                candidate.execution_type = execution_type
             candidate.title, candidate.description = (
                 clean_title(title),
                 clean_description(description),
             )
+            previous_parents = set(candidate.parents or [])
             candidate.parents = [
                 str(p)
                 for p in _parents(
                     [str(p) for p in parents],
                     self._active_parents(session, project.id, kind),
                     kind,
-                    orphan=(kind == "issues" and candidate.number is not None)
+                    orphan=(
+                        kind == "issues"
+                        and (candidate.number is not None or candidate.execution_type == "bug")
+                    )
                     or candidate.origin == "intake",
                 )
             ]
+            if kind == "issues" and candidate.number is not None:
+                item = session.scalar(
+                    select(BacklogItem).where(
+                        BacklogItem.project_id == project.id,
+                        BacklogItem.repository == project.source_repository,
+                        BacklogItem.issue_number == candidate.number,
+                        BacklogItem.workspace_review.is_distinct_from("planning"),
+                    )
+                )
+                if item and execution_type:
+                    confirm_classification(session, project, item, execution_type)
+                if item and session.scalar(
+                    bugs_with_optional_stories(session, project.id).where(BacklogItem.id == item.id)
+                ):
+                    previous_parents.update(
+                        str(story)
+                        for story in session.scalars(
+                            select(ProjectIssueStory.story_id).where(
+                                ProjectIssueStory.item_id == item.id
+                            )
+                        )
+                    )
+                    if previous_parents != set(candidate.parents):
+                        replace_parents(
+                            session, "issues", project.id, item.id, parents, allow_empty=True
+                        )
+                        item.facts = {**(item.facts or {}), "manual_story_links": True}
+                        record_changed(session, project.id, "issues", item.id, item.title)
             if candidate.origin == "intake":
                 record_changed(session, project.id, kind, key, candidate.title)
             if row is not None and candidate.origin == "import":
@@ -1105,7 +1151,8 @@ class WorkspaceReview:
                     candidate.parents,
                     valid,
                     kind,
-                    orphan=kind == "issues" and candidate.number is not None,
+                    orphan=kind == "issues"
+                    and (candidate.number is not None or candidate.execution_type == "bug"),
                 )
                 candidate.local_id = self._materialize(
                     session, project, candidate, candidate.title, candidate.description, parents
@@ -1184,7 +1231,8 @@ class WorkspaceReview:
                     [str(p) for p in edit["parents"]],
                     valid,
                     stage,
-                    orphan=stage == "issues" and c.number is not None,
+                    orphan=stage == "issues"
+                    and (c.number is not None or c.execution_type == "bug"),
                 )
                 c.title = clean_title(edit["title"])
                 c.description = clean_description(edit["description"])

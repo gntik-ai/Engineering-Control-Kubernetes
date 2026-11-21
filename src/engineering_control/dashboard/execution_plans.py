@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import review_budget, review_flows
 from engineering_control.dashboard.connection_records import finding_links
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning_analysis import selection
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -22,7 +23,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.workspace_publishing import schedule_classification
+from engineering_control.dashboard.workspace_publishing import confirm_classification
 from engineering_control.dashboard.workspace_review import STRING, shape
 from engineering_control.db.models import (
     BacklogItem,
@@ -174,6 +175,7 @@ class ExecutionPlans:
             ]
             orphans = select(BacklogItem).where(
                 BacklogItem.project_id == p.id,
+                BacklogItem.id.not_in(bugs_with_optional_stories(db, p.id)),
                 BacklogItem.workspace_review.in_(("pending", "publishing", "approved")),
                 BacklogItem.issue_state.is_distinct_from("closed"),
                 ~select(ProjectIssueStory.item_id)
@@ -681,11 +683,7 @@ class ExecutionPlans:
                     item = db.get(BacklogItem, UUID(k))
                     if not item or item.project_id != p.id:
                         raise ProjectNotFound(k)
-                    if value != item.execution_type:
-                        item.classification_reason = "Classification selected by the administrator."
-                    if value != item.execution_type or not item.type_confirmed:
-                        item.execution_type, item.type_confirmed = value, True
-                        schedule_classification(db, p, item)
+                    confirm_classification(db, p, item, value)
             elif operation in ("save", "start"):
                 if plan.status not in ("review", "approved") or q.state == "finished":
                     raise ProjectConflict("The execution plan is not available for editing.")

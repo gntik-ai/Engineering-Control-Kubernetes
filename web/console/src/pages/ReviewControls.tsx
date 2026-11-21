@@ -65,7 +65,7 @@ export function CoveragePreview({ path, model, version, disabled }: {
         : 'The next coverage check will establish a baseline for all three stages.'}</p>
       {preview.baseline && Object.entries(preview.changes).filter(([,c]) => c.added || c.changed || c.removed).map(([kind,c]) =>
         <p key={kind}>{stageLabels[kind]} records and evidence · {c.added} added · {c.changed} changed · {c.removed} removed</p>)}
-      <p>{preview.stories.toLocaleString()} User Stories × {preview.issues.toLocaleString()} imported issues. {preview.reusable.toLocaleString()} comparisons reusable · {preview.remaining.toLocaleString()} to check.{!!preview.excluded_by_manual_links && ` Manual links exclude ${preview.excluded_by_manual_links.toLocaleString()} pairs.`}</p>
+      <p>{preview.stories.toLocaleString()} User Stories × {preview.issues.toLocaleString()} imported issues. {preview.reusable.toLocaleString()} comparisons reusable · {preview.remaining.toLocaleString()} to check.{!!preview.excluded_by_manual_links && ` Bug classifications and manual links exclude ${preview.excluded_by_manual_links.toLocaleString()} pairs.`}</p>
       <p className="text-muted-foreground">Preview uses saved project data and makes no model calls.</p>
     </div>}
   </>;

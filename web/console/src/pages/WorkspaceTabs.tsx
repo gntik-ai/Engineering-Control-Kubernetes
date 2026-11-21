@@ -54,6 +54,8 @@ export interface PlanRow {
   review?: string | null;
   proposal?: boolean;
   orphan?: boolean;
+  standalone_bug?: boolean;
+  story_optional?: boolean;
   execution_type?: 'bug' | 'enhancement' | null;
   type_confirmed?: boolean;
   automatic_review?: ReviewResult | null;
@@ -83,8 +85,9 @@ type PendingSnapshot = { ids: string[]; version: number | null; close_numbers?: 
 const pageSizes = [10, 25, 50, 100];
 const pageParam = (page: number) => page > 1 ? String(page) : null;
 
-function ParentChoices({ path, kind, parents, setParents, optional = false }: {
+function ParentChoices({ path, kind, parents, setParents, optional = false, bug = false }: {
   optional?: boolean;
+  bug?: boolean;
   path: string;
   kind: Kind;
   parents: string[];
@@ -94,7 +97,7 @@ function ParentChoices({ path, kind, parents, setParents, optional = false }: {
   return (
     <fieldset className="grid gap-2">
       <legend className="mb-2 text-sm font-medium">
-        {kind === 'stories' ? 'Epics' : 'User Stories'} {optional ? '(optional · automatic review can identify a parent)' : '(choose at least one)'}
+        {kind === 'stories' ? 'Epics' : 'User Stories'} {bug ? '(optional for bugs)' : optional ? '(optional · automatic review can identify a parent)' : '(choose at least one)'}
       </legend>
       <LoadError resource={choices} />
       {choices.error && <RefreshButton resource={choices} />}
@@ -113,22 +116,41 @@ function ParentChoices({ path, kind, parents, setParents, optional = false }: {
   );
 }
 
+type IssueType = 'bug' | 'enhancement';
+
+function IssueTypeField({ row, selected, onSelect }: {
+  row?: PlanRow; selected?: IssueType; onSelect: (value?: IssueType) => void;
+}) {
+  const current = row?.type_confirmed ? (row.execution_type === 'bug' ? 'Bug' : 'Enhancement')
+    : row?.story_optional ? 'Bug (GitHub)' : 'Unclassified';
+  return <Field><FieldLabel>Issue type</FieldLabel>
+    <SimpleSelect aria-label="Issue type" value={selected ?? 'keep'}
+      items={[{value: 'keep', label: 'Keep current · ' + current}, {value: 'bug', label: 'Bug'}, {value: 'enhancement', label: 'Enhancement'}]}
+      onValueChange={value => onSelect(value === 'bug' || value === 'enhancement' ? value : undefined)} />
+    {selected && <span className="text-xs text-muted-foreground">The confirmed type syncs to the GitHub issue label.</span>}
+  </Field>;
+}
+
 function LinkStories({ path, issue, saved, close }: {
   path: string; issue: PlanRow; saved: () => void; close: () => void;
 }) {
   const [stories, setStories] = useState(issue.story_ids ?? []);
-  const save = useSubmit(() => postJson(path + '/' + issue.id + '/stories', { story_ids: stories }), () => { saved(); close(); });
+  const [classification, setClassification] = useState<IssueType>();
+  const bug = classification ? classification === 'bug' : Boolean(issue.story_optional);
+  const canSave = stories.length > 0 || bug || (classification === 'enhancement' && !issue.story_ids?.length);
+  const save = useSubmit(() => postJson(path + '/' + issue.id + '/stories', { story_ids: stories, execution_type: classification }), () => { saved(); close(); });
   return <Dialog open onOpenChange={open => { if (!open) close(); }}>
     <DialogContent size="md">
-      <DialogHeader><DialogTitle>Link User Stories to #{issue.number}</DialogTitle></DialogHeader>
+      <DialogHeader><DialogTitle>{issue.number ? 'Link User Stories to #' + issue.number : 'Link User Stories'}</DialogTitle></DialogHeader>
       <DialogBody className="grid gap-3">
         <p>{issue.title}</p>
-        <ParentChoices path={path} kind="issues" parents={stories} setParents={setStories} />
+        <IssueTypeField row={issue} selected={classification} onSelect={setClassification} />
+        <ParentChoices path={path} kind="issues" parents={stories} setParents={setStories} bug={bug} />
         {save.problem && <Alert tone="destructive" title={save.problem} />}
       </DialogBody>
       <DialogFooter>
         <Button variant="ghost" onClick={close}>Cancel</Button>
-        <Button disabled={!stories.length || save.pending} loading={save.pending} onClick={() => void save.submit()}>Save links</Button>
+        <Button disabled={!canSave || save.pending} loading={save.pending} onClick={() => void save.submit()}>Save</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>;
@@ -153,12 +175,15 @@ function RecordEditor({
   const [description, setDescription] = useState(row?.description ?? '');
   const [parents, setParents] = useState(row?.epic_ids ?? row?.story_ids ?? []);
   const label = singular[kind];
-  const allowUnassigned = !row || Boolean(row.proposal && row.automatic_review);
+  const [classification, setClassification] = useState<IssueType>();
+  const bug = classification ? classification === 'bug' : Boolean(row?.story_optional);
+  const allowUnassigned = bug || !row || Boolean(row.proposal && row.automatic_review);
   const save = useSubmit(
     () =>
       postJson(row ? path + '/' + row.id + (row.proposal ? '/proposal' : '/update') : path, {
         title,
         description,
+        execution_type: kind === 'issues' ? classification : undefined,
         ...(row?.proposal ? { version, parents } : kind === 'stories' ? { epic_ids: parents } : kind === 'issues' ? { story_ids: parents } : {}),
       }),
     () => {
@@ -195,8 +220,9 @@ function RecordEditor({
               <FieldLabel>Description</FieldLabel>
               <Textarea value={description} onValueChange={setDescription} maxLength={40000} rows={4} />
             </Field>
+            {kind === 'issues' && <IssueTypeField row={row} selected={classification} onSelect={setClassification} />}
             {kind !== 'epics' && (
-              <ParentChoices path={path} kind={kind} parents={parents} setParents={setParents} optional={allowUnassigned} />
+              <ParentChoices path={path} kind={kind} parents={parents} setParents={setParents} optional={allowUnassigned} bug={bug} />
             )}
           </DialogBody>
           <DialogFooter>
@@ -377,6 +403,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             <li key={link.connection + link.record}><Link href={recordUrl(link.project, 'stories', link.record!)}>{link.display_name} · {link.title ?? 'User Story'}</Link></li>
           )}
           {kind === 'issues' && record.orphan && <li><span className="rounded bg-warning/15 px-2 py-1 text-sm font-medium">Orphan · No linked User Story</span></li>}
+          {kind === 'issues' && record.standalone_bug && <li>Standalone bug · User Story optional</li>}
           {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
             <li key={id}>
               {kind === 'stories' && data?.parents[id] ? (
@@ -411,6 +438,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
           {record.review === 'awaiting_stage' && <div className="text-xs text-muted-foreground">Awaiting {sections[kind]} review</div>}
           {record.execution_type && <div className="mt-1 text-xs font-medium">{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'}{record.type_confirmed ? ' · Confirmed' : ' · Suggested'}</div>}
+          {!record.type_confirmed && record.story_optional && <div className="mt-1 text-xs font-medium">Bug · GitHub</div>}
           {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
             id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} /></div>}
           {record.url && (
@@ -427,7 +455,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         <div className="flex flex-wrap justify-end gap-1">
           {kind !== 'issues' && !record.proposal && <PlanningStateAction path={path} row={record}
             closed={view === 'closed'} locked={rowLocked(record)} saved={reload} />}
-          {kind === 'issues' && Boolean(record.number) && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
+          {kind === 'issues' && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
             onClick={() => setLinking(record)}>Link User Stories</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
           {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
@@ -435,7 +463,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>Edit</Button>
           )}
           {(record.proposal || record.review === 'pending') && (
-            <Button size="sm" variant="secondary" disabled={rowLocked(record) || Boolean(record.proposal && kind !== 'epics' && !(kind === 'issues' && record.number) && !(record.epic_ids ?? record.story_ids)?.length)} aria-label={'Approve ' + record.title}
+            <Button size="sm" variant="secondary" disabled={rowLocked(record) || Boolean(record.proposal && kind !== 'epics' && !(kind === 'issues' && (record.number || record.story_optional)) && !(record.epic_ids ?? record.story_ids)?.length)} aria-label={'Approve ' + record.title}
               onClick={() => setApproving({ ids: [record.id], title: record.title, close_numbers: kind !== 'issues' && record.number && record.github_state === 'open' ? [record.number] : [], version: data?.version ?? null })}>Approve</Button>
           )}
           {(record.proposal || kind !== 'issues') && (

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from engineering_control.dashboard.planning_queue import queue_review
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
+    ProjectInvalid,
     ProjectNotFound,
     active_project,
 )
@@ -68,6 +69,33 @@ def enqueue(
         session.add(row)
         session.flush()
     return row
+
+
+def confirm_classification(
+    db: Session, project: ProjectRecord, item: BacklogItem, category: str
+) -> None:
+    if category not in ("bug", "enhancement"):
+        raise ProjectInvalid("Choose Bug or Enhancement for this Issue")
+    if category != item.execution_type:
+        item.classification_reason = "Classification selected by the administrator."
+    if category != item.execution_type or not item.type_confirmed:
+        item.execution_type, item.type_confirmed = category, True
+        schedule_classification(db, project, item)
+        if (
+            item.issue_number
+            and (item.repository or project.source_repository).casefold()
+            == project.source_repository.casefold()
+        ):
+            mirror = db.scalar(
+                select(WorkspaceCandidate).where(
+                    WorkspaceCandidate.project_id == project.id,
+                    WorkspaceCandidate.number == item.issue_number,
+                    WorkspaceCandidate.kind == "issues",
+                    WorkspaceCandidate.decision == "pending",
+                )
+            )
+            if mirror:
+                mirror.execution_type = category
 
 
 def schedule_classification(db: Session, project: ProjectRecord, item: BacklogItem) -> None:

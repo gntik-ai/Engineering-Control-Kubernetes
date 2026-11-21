@@ -25,7 +25,7 @@ import { EvidencePanel } from './ReviewEvidence';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
 
-const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignments', agents: 'Agents', commands: 'Commands' };
+const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignment', agents: 'Agents', commands: 'Commands' };
 const reviewMenu = {
   'related-work': { label: 'Related Work', icon: GitFork },
   planning: { label: 'Planning', icon: ListChecks },
@@ -80,11 +80,18 @@ export function ProjectWorkspace({
       items: reviewViews.map(page => ({ ...reviewMenu[page], href: reviewUrl(context, page) })),
     });
     groups.push({
+      id: 'project-engine',
+      label: 'Engine',
+      collapsible: true,
+      defaultOpen: true,
+      items: menu(context),
+    });
+    groups.push({
       id: 'project-settings',
       label: 'Project settings',
       collapsible: true,
       defaultOpen: true,
-      items: [{ label: 'Connections', href: connectionsUrl(context), icon: Network }, ...menu(context)],
+      items: [{ label: 'Connections', href: connectionsUrl(context), icon: Network }],
     });
   }
   groups.push({

@@ -141,7 +141,7 @@ function QueueList({ project }: { project: string }) {
           {!!data?.orphan_count && (
             <details className="text-sm">
               <summary>
-                {data.orphan_count} open {data.orphan_count === 1 ? 'Issue' : 'Issues'} without a local User Story
+                {data.orphan_count} open {data.orphan_count === 1 ? 'Issue needs' : 'Issues need'} a local User Story
               </summary>
               <ul className="mt-2 grid gap-1">
                 {data.orphans.map((i) => (
