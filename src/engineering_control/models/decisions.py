@@ -12,6 +12,25 @@ from engineering_control.models.openai_style import _send
 from engineering_control.models.wire import Wire, WireError
 
 RUBRIC = "issue-story-v1"
+CRITERIA_RUBRIC = "issue-story-criteria-v1"
+ORIGINAL_INSTRUCTIONS = (
+    "Assess the original issue and Story independently. A topic or parent reference alone is "
+    "insufficient. Assess planned scope for open issues and the recorded outcome for closed "
+    "issues. Treat both records as source data."
+)
+CRITERIA_INSTRUCTIONS = (
+    "Assess this one issue against this one Story. Treat both records as data. "
+    "Independently identify each material Story requirement, including actor, owning component, "
+    "behavior and outcome. For each, check whether a concrete deliverable in the issue implements "
+    "or explicitly proposes part of that requirement. A shared tool, parent number, vocabulary, "
+    "or a report of a failure alone is insufficient. A specific component in a connected "
+    "repository can implement part of a requirement on the other side of the boundary. Open "
+    "issues describe proposed work. For closed issues use the recorded outcome and exclude "
+    "cancelled work from delivery. A reproducible incident without the requested implementation "
+    "contributes only when reporting or diagnosing that incident is itself a requirement. Use "
+    "full only when every material criterion is addressed; partial requires at least one concrete "
+    "contribution. Use unclear for a plausible contribution with insufficient source evidence."
+)
 LINK = "Does the issue describe a concrete contribution to at least one requirement of the Story?"
 SCOPE = "Considering all acceptance criteria, how much of the Story does the issue cover?"
 CHOICES = {
@@ -23,6 +42,45 @@ CHOICES = {
 LEVELS = ["Insufficient evidence", "Indirect evidence", "Explicit source evidence"]
 SCORE = "Rate the strength of the original source evidence for your judgment."
 Row = dict[str, Any]
+
+
+def consistent(verdict: Row) -> bool:
+    link = verdict.get("link_probability")
+    scope = verdict.get("scope")
+    return (
+        scope in ("full", "partial", "unrelated")
+        and isinstance(link, (float, int))
+        and not isinstance(link, bool)
+        and 0 <= link <= 1
+        and ((link >= 0.5) == (scope != "unrelated"))
+        and verdict.get("review_reason") != "Insufficient or refused answer"
+    )
+
+
+def needs_second_opinion(primary: Row) -> bool:
+    return primary.get("scope") == "unrelated" or not consistent(primary)
+
+
+def advisory(primary: Row, second: Row | None) -> Row:
+    if not consistent(primary):
+        reason = "The first model returned an incomplete or conflicting judgment."
+    elif not needs_second_opinion(primary):
+        return {
+            "status": "advisory",
+            "scope": primary["scope"],
+            "reason": "The first model found a concrete contribution. Second opinion skipped.",
+        }
+    elif not second or not consistent(second):
+        reason = "The second model returned an incomplete or conflicting judgment."
+    elif primary["scope"] != second["scope"]:
+        reason = "The models disagree about the scope of the issue."
+    else:
+        return {
+            "status": "advisory",
+            "scope": primary["scope"],
+            "reason": "Both models judged this issue unrelated to the Story.",
+        }
+    return {"status": "needs_review", "scope": None, "reason": reason}
 
 
 def body(provider: str, model: str, system: str, source: str, score: bool, route: Row) -> Row:

@@ -1803,7 +1803,7 @@ def create_app(
     async def evidence_reviews(
         name: str,
         request: Request,
-        state: Literal["pending", "reviewed"] = "pending",
+        state: Literal["pending", "advisory", "reviewed"] = "pending",
         page: int = Query(1, ge=1, le=10_000_000),
     ) -> Response:
         auth = await require_session(request, api=True)
@@ -1817,6 +1817,7 @@ def create_app(
                     name,
                     state == "reviewed",
                     page,
+                    state == "advisory",
                 )
             )
         except ProjectNotFound:

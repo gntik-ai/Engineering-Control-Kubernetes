@@ -1153,6 +1153,30 @@ TASKS: Final = {
 
 # Typed review tasks are executed by the durable project review workers.
 
+
+def _decision_params(task: str) -> tuple[Param, ...]:
+    provider, model = reviews.decision_route(task, {})
+    return (
+        Param(
+            "decision_provider",
+            "choice",
+            provider,
+            "Native Decisions API account.",
+            choices=("openai", "openrouter"),
+        ),
+        Param(
+            "decision_model",
+            "line",
+            model,
+            "Model for link and scope judgments.",
+            high=100,
+            pattern=MODEL_NAME.pattern,
+        ),
+        Param("ordered_score", "bool", False, "Also score the strength of the source evidence."),
+        *_ROUTING,
+    )
+
+
 for task_key, title, summary, needs, produces, params in (
     (
         reviews.GRAPH,
@@ -1217,27 +1241,16 @@ for task_key, title, summary, needs, produces, params in (
         "Judge the link and coverage of an original issue–Story pair for administrator review.",
         ("candidates",),
         ("decision_judgment",),
-        (
-            Param(
-                "decision_provider",
-                "choice",
-                "openai",
-                "Native Decisions API account.",
-                choices=("openai", "openrouter"),
-            ),
-            Param(
-                "decision_model",
-                "line",
-                "gpt-6-luna",
-                "Model for link and scope judgments.",
-                high=100,
-                pattern=MODEL_NAME.pattern,
-            ),
-            Param(
-                "ordered_score", "bool", False, "Also score the strength of the source evidence."
-            ),
-            *_ROUTING,
-        ),
+        _decision_params(reviews.DECISION),
+    ),
+    (
+        reviews.SECOND_OPINION,
+        "Check a negative or uncertain decision",
+        "Ask a second decision model about the same original sources when the first verdict "
+        "is unrelated, incomplete or contradictory.",
+        ("decision_judgment",),
+        ("advisory_judgment",),
+        _decision_params(reviews.SECOND_OPINION),
     ),
     (
         reviews.COMPARE,

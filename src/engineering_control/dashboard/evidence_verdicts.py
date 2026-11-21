@@ -49,7 +49,9 @@ def eligible(db: Session, project: UUID) -> ColumnElement[bool]:
         Job.state.not_in(LIVE),
         func.substr(sample["story"].as_string(), 1, 36).in_(allowed),
         func.substr(sample["issue"].as_string(), 1, 36).in_(allowed),
+        Job.result["repeat_of"].as_string().is_(None),
         or_(
+            Job.result["advisory"]["status"].as_string().in_(("needs_review", "advisory")),
             and_(
                 Job.result["native"]["rubric"].as_string().is_not(None),
                 Job.result["native"]["cached_from"].as_string().is_(None),
@@ -67,13 +69,21 @@ def eligible(db: Session, project: UUID) -> ColumnElement[bool]:
 
 
 def listing(
-    sessions: sessionmaker[Session], name: str, reviewed: bool, page: int
+    sessions: sessionmaker[Session], name: str, reviewed: bool, page: int, advisory: bool = False
 ) -> dict[str, Any]:
     with sessions() as db:
         p = active_project(db, name)
         decision = Job.result["human_review"]
         scope = decision["scope"].as_string()
+        disposition = Job.result["advisory"]["status"].as_string()
         where = and_(eligible(db, p.id), scope.is_not(None) if reviewed else scope.is_(None))
+        if not reviewed:
+            where = and_(
+                where,
+                disposition == "advisory"
+                if advisory
+                else or_(disposition.is_(None), disposition == "needs_review"),
+            )
         count = db.scalar(select(func.count()).select_from(Job).where(where)) or 0
         page = min(page, max(1, (count + 9) // 10))
         rows = db.execute(
@@ -83,6 +93,8 @@ def listing(
                 Job.result["arms"][0]["scope"].as_string(),
                 Job.result["arms"][1]["scope"].as_string(),
                 Job.result["native"]["scope"].as_string(),
+                Job.result["second_opinion"]["scope"].as_string(),
+                disposition,
                 scope,
             )
             .join(ReviewFlowRun, ReviewFlowRun.id == Job.run_id)
@@ -102,9 +114,11 @@ def listing(
                     "original": orig,
                     "wiki": wiki,
                     "native": native,
+                    "second_opinion": second,
+                    "disposition": status,
                     "decision": human,
                 }
-                for run, names, orig, wiki, native, human in rows
+                for run, names, orig, wiki, native, second, status, human in rows
             ],
         }
 
@@ -124,6 +138,8 @@ def detail(sessions: sessionmaker[Session], name: str, run: UUID) -> dict[str, A
             "id": str(run),
             "arms": result["arms"],
             "native": result.get("native"),
+            "second_opinion": result.get("second_opinion"),
+            "advisory": result.get("advisory"),
             "decision": result.get("human_review"),
             **{
                 role: passage(job.source, result, result["sample"][role])

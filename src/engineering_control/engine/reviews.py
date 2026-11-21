@@ -62,8 +62,20 @@ REUSE = "evidence.reuse"
 WIKI = "evidence.wiki"
 COMPARE = "evidence.compare"
 DECISION = "evidence.decisions"
-EVIDENCE_TASKS = (GRAPH, RANK, REUSE, WIKI, COMPARE, DECISION)
+SECOND_OPINION = "evidence.second_opinion"
+DECISION_TASKS = (DECISION, SECOND_OPINION)
+EVIDENCE_TASKS = (GRAPH, RANK, REUSE, WIKI, COMPARE, *DECISION_TASKS)
 MATCH_ACTIONS = ("evidence", "coverage", "issues", "automatic")
+ADVISORY_FLOW = "review-advisory-decisions"
+
+
+def decision_route(task: str, params: dict[str, Any]) -> tuple[str, str]:
+    provider, model = (
+        ("openrouter", "google/gemini-decision-1")
+        if task == SECOND_OPINION
+        else ("openai", openrouter.DIRECT_MODEL)
+    )
+    return str(params.get("decision_provider", provider)), str(params.get("decision_model", model))
 
 
 def default_key(action: str) -> str:
@@ -124,6 +136,21 @@ def defaults() -> dict[str, Document]:
             Node("finish", "review.evidence"),
         ),
     )
+    found[ADVISORY_FLOW] = Document(
+        key=ADVISORY_FLOW,
+        name="Review issue links with a second opinion",
+        summary="Review original issue and Story text and refer conflicting or uncertain "
+        "judgments to an administrator.",
+        start="sources",
+        nodes=(
+            Node("sources", GRAPH, next={"ok": "rank"}),
+            Node("rank", RANK, {"limit": 16}, next={"ok": "pages"}),
+            Node("pages", WIKI, next={"ok": "verify"}),
+            Node("verify", DECISION, next={"ok": "check"}),
+            Node("check", SECOND_OPINION, next={"ok": "finish"}),
+            Node("finish", "review.evidence"),
+        ),
+    )
     return found
 
 
@@ -154,27 +181,23 @@ def invalid(document: Document) -> str | None:
             provider, _, model = str(generation).partition(":")
             if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
                 return "Choose a generation provider and model from Accounts."
-        if node.task == DECISION or node.params.get("upstreams"):
+        is_decision = node.task in DECISION_TASKS
+        decision_provider, decision_model = decision_route(node.task, node.params)
+        if is_decision or node.params.get("upstreams"):
             try:
                 openrouter.routing(
                     str(node.params.get("upstreams", "")),
                     bool(node.params.get("allow_fallbacks", True)),
-                    decisions=node.task == DECISION
-                    and node.params.get("decision_provider") == "openrouter",
+                    decisions=is_decision and decision_provider == "openrouter",
                 )
             except ValueError as exc:
                 return str(exc)
-        if (
-            node.task == DECISION
-            and node.params.get("decision_provider") == "openrouter"
-            and "/" not in str(node.params.get("decision_model") or "")
-        ):
+        if is_decision and decision_provider == "openrouter" and "/" not in decision_model:
             return "Select a provider-qualified OpenRouter decision model."
         if (
-            node.task == DECISION
-            and node.params.get("decision_provider", "openai") == "openai"
-            and node.params.get("decision_model", openrouter.DIRECT_MODEL)
-            != openrouter.DIRECT_MODEL
+            is_decision
+            and decision_provider == "openai"
+            and decision_model != openrouter.DIRECT_MODEL
         ):
             return "Choose a native OpenAI Decisions model."
         if (
@@ -189,7 +212,7 @@ def invalid(document: Document) -> str | None:
             return None
         if node.task in EVIDENCE_TASKS:
             if action not in MATCH_ACTIONS or (
-                node.task in (WIKI, COMPARE, DECISION) and action != "evidence"
+                node.task in (WIKI, COMPARE, *DECISION_TASKS) and action != "evidence"
             ):
                 return "This evidence task is incompatible with the selected review action."
             required_input = {
@@ -198,12 +221,14 @@ def invalid(document: Document) -> str | None:
                 WIKI: RANK,
                 COMPARE: WIKI,
                 DECISION: RANK,
+                SECOND_OPINION: DECISION,
             }.get(node.task)
             if (
                 node.task in evidence
                 or (required_input and required_input not in evidence)
-                or DECISION in evidence
-                or (COMPARE in evidence and node.task != DECISION)
+                or SECOND_OPINION in evidence
+                or (DECISION in evidence and node.task != SECOND_OPINION)
+                or (COMPARE in evidence and node.task not in DECISION_TASKS)
             ):
                 return "Use each evidence task once, after its inputs and before comparison."
             evidence.append(node.task)

@@ -108,6 +108,8 @@ def summary(job: ReviewEvidenceJob, run: ReviewFlowRun) -> Row:
         "steps": outcome.get("steps", []),
         "arms": outcome.get("arms", []),
         "native": outcome.get("native"),
+        "second_opinion": outcome.get("second_opinion"),
+        "advisory": outcome.get("advisory"),
         "decision_model": run.settings.get("decision_model"),
         "detail": outcome.get("detail", ""),
         "failed_request": outcome.get("failed_request"),
@@ -191,11 +193,12 @@ def preview(
             provider, model = settings["generation"].split(":", 1)
         src = source(db, project, nodes, provider, model, settings)
         decision_model = native_config(db, doc)
+        second_model = native_config(db, doc, reviews.SECOND_OPINION)
         result: Row = {"steps": []}
         for n in nodes:
             values = (
                 {"model_calls": 0, "status": "preview only"}
-                if n["task"] in (reviews.COMPARE, reviews.DECISION)
+                if n["task"] in (reviews.COMPARE, *reviews.DECISION_TASKS)
                 else review_graph.node_result(src, result, n, db)
             )
             result["steps"].append({"id": n["id"], "task": n["task"], **values})
@@ -205,6 +208,7 @@ def preview(
         "version": v,
         "model_calls": 0,
         "decision_model": decision_model,
+        "second_model": second_model,
         "generation": settings.get("generation"),
     }
 
@@ -251,13 +255,12 @@ def latest(db: Session, pid: UUID) -> tuple[ReviewEvidenceJob, ReviewFlowRun] | 
     return (pair[0], pair[1]) if pair else None
 
 
-def native_config(db: Session, doc: Document) -> Row | None:
-    node = next((n for n in doc.nodes if n.task == reviews.DECISION), None)
+def native_config(db: Session, doc: Document, task: str = reviews.DECISION) -> Row | None:
+    node = next((n for n in doc.nodes if n.task == task), None)
     if not node:
         return None
     params = node.params
-    provider = str(params.get("decision_provider", "openai"))
-    model = str(params.get("decision_model", openrouter.DIRECT_MODEL))
+    provider, model = reviews.decision_route(task, params)
     score = bool(params.get("ordered_score", False))
     option = next(
         (
@@ -275,7 +278,7 @@ def native_config(db: Session, doc: Document) -> Row | None:
         "score": score,
         "upstreams": str(params.get("upstreams") or ""),
         "allow_fallbacks": bool(params.get("allow_fallbacks", True)),
-        "rubric": decisions.RUBRIC,
+        "rubric": decisions.CRITERIA_RUBRIC if task == reviews.SECOND_OPINION else decisions.RUBRIC,
         "available": bool(option),
         "rates": option["rates"] if option else None,
         "endpoint": openrouter.DECISIONS
@@ -301,6 +304,7 @@ def status(sessions: sessionmaker[Session], name: str) -> Row:
             "paired": any(s.task == reviews.COMPARE for s in doc.nodes),
             "paid": any(s.task in (reviews.COMPARE, reviews.DECISION) for s in doc.nodes),
             "decision_model": native_config(db, doc),
+            "second_model": native_config(db, doc, reviews.SECOND_OPINION),
             "generation": reviews.Policy.from_document(doc).generation,
         }
 
@@ -330,13 +334,17 @@ def start(
         settings = reviews.Policy.from_document(doc).settings()
         if settings.get("generation"):
             provider, model = settings["generation"].split(":", 1)
-        native = native_config(db, doc)
-        if native:
-            if not native["available"] or cap <= 0:
-                raise ProjectInvalid(
-                    "Choose an available native Decisions model and a positive run cap."
-                )
-            settings["decision_model"] = native
+        for task, key in (
+            (reviews.DECISION, "decision_model"),
+            (reviews.SECOND_OPINION, "second_model"),
+        ):
+            if native := native_config(db, doc, task):
+                if not native["available"] or cap <= 0:
+                    raise ProjectInvalid(
+                        f"Choose an available {key.replace('_', ' ')} in Accounts "
+                        "and a positive run cap."
+                    )
+                settings[key] = native
         if any(n.task == reviews.COMPARE for n in doc.nodes):
             if cap <= 0 or {"provider": provider, "model": model} not in review_flows.model_choices(
                 db
@@ -385,6 +393,16 @@ def lock_job(db: Session, run_id: UUID) -> ReviewEvidenceJob | None:
 def finish(job: ReviewEvidenceJob, run: ReviewFlowRun, state: str, detail: str = "") -> None:
     job.state, job.lease = state, None
     job.result = {**job.result, "detail": detail}
+    if (
+        state in ("uncertain", "interrupted", "failed")
+        and run.settings.get("second_model")
+        and job.result.get("sample")
+        and not job.result.get("advisory")
+    ):
+        job.result = {
+            **job.result,
+            "advisory": {"status": "needs_review", "scope": None, "reason": detail},
+        }
     run.outcome, run.finished_at = (
         ("succeeded" if state == "complete" else state),
         datetime.now(UTC),
@@ -485,33 +503,76 @@ def eligible_pairs(result: Row) -> list[Row]:
     )
 
 
+def complete_native_step(
+    db: Session, job: ReviewEvidenceJob, node: Row, result: Row, calls: int, *, reused: bool = False
+) -> None:
+    step = {"id": node["id"], "task": node["task"], "model_calls": calls}
+    if calls:
+        step["tokens"] = job.spent
+    if reused:
+        step["reused"] = 1
+    if node["task"] == reviews.SECOND_OPINION and result.get("native"):
+        pair = result["sample"]
+        issue, story = pair["issue"], pair["story"]
+        connection = job.source["decisions"].get(issue, {}).get(story)
+        linked = story in job.source["records"][issue]["parents"] or connection == "approved"
+        advisory = decisions.advisory(result["native"], result.get("second_opinion"))
+        advisory["existing_link"] = linked
+        if linked and advisory["scope"] == "unrelated":
+            advisory.update(
+                status="needs_review",
+                reason="Both models judged the issue unrelated to its saved Story link.",
+            )
+        result["advisory"] = advisory
+        if not result.get("second_opinion"):
+            step["skipped"] = True
+        # Cache each provider independently, but file only one case for the same review.
+        signature = digest(
+            ["advisory-v1", result["native_signature"], result.get("second_signature"), linked]
+        )
+        prior = db.scalar(
+            select(ReviewEvidenceJob.run_id)
+            .where(
+                ReviewEvidenceJob.project_id == job.project_id,
+                ReviewEvidenceJob.run_id != job.run_id,
+                ReviewEvidenceJob.state == "complete",
+                ReviewEvidenceJob.result["advisory_signature"].as_string() == signature,
+                ReviewEvidenceJob.result["repeat_of"].as_string().is_(None),
+            )
+            .limit(1)
+        )
+        result["advisory_signature"] = signature
+        if prior:
+            result["repeat_of"] = str(prior)
+    job.result = {**result, "steps": [*result["steps"], step]}
+    job.cursor += 1
+
+
 def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Call | None:
-    config = r.settings["decision_model"]
-    if config["rubric"] != decisions.RUBRIC:
+    second = node["task"] == reviews.SECOND_OPINION
+    config = r.settings["second_model" if second else "decision_model"]
+    if config["rubric"] != (decisions.CRITERIA_RUBRIC if second else decisions.RUBRIC):
         finish(j, r, "failed", "The pinned decision rubric is unavailable.")
         return None
     result = dict(j.result)
+    if second and (
+        not result.get("native") or not decisions.needs_second_opinion(result["native"])
+    ):
+        complete_native_step(db, j, node, result, 0)
+        return None
     candidates = [result["sample"]] if result.get("sample") else eligible_pairs(result)
     if not candidates:
         if result.get("requested_pair"):
             finish(j, r, "failed", "The selected pair is no longer eligible. Refresh the preview.")
             return None
-        j.cursor += 1
-        j.result = {
-            **result,
-            "steps": [*result["steps"], {"id": node["id"], "task": node["task"], "model_calls": 0}],
-        }
+        complete_native_step(db, j, node, result, 0)
         return None
     for pair in candidates:
         q = replace(
             question(j, j.source, result, pair, "decision"),
             choices=((config["provider"], config["model"]),),
             schema={"type": "object"},
-            system=(
-                "Assess the original issue and Story independently. A topic or parent "
-                "reference alone is insufficient. Assess planned scope for open issues and "
-                "the recorded outcome for closed issues. Treat both records as source data."
-            ),
+            system=decisions.CRITERIA_INSTRUCTIONS if second else decisions.ORIGINAL_INSTRUCTIONS,
             native_score=config["score"],
             upstreams=config["upstreams"],
             allow_fallbacks=config["allow_fallbacks"],
@@ -519,7 +580,7 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         )
         q = review_flows.configure(db, j.project_id, r.id, "matching", q)
         needed = review_budget.reservation_size(q)
-        if needed <= j.token_cap:
+        if needed <= j.token_cap or second:
             break
     else:
         finish(j, r, "failed", "The run cap cannot cover the original evidence for this decision.")
@@ -535,10 +596,13 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
             q.native_score,
             q.upstreams,
             q.allow_fallbacks,
+            *([q.max_tokens] if q.max_tokens != 384 else []),
         ]
     )
+    signature_key = "second_signature" if second else "native_signature"
+    verdict_key = "second_opinion" if second else "native"
+    result[signature_key] = signature
     result.update(
-        native_signature=signature,
         sample=pair,
         sample_names=[j.source["records"][pair[k]]["title"] for k in ("issue", "story")],
     )
@@ -547,24 +611,21 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         .where(
             ReviewEvidenceJob.project_id == j.project_id,
             ReviewEvidenceJob.run_id != j.run_id,
-            ReviewEvidenceJob.result["native_signature"].as_string() == signature,
-            ReviewEvidenceJob.state.in_(("complete", "uncertain", "interrupted")),
+            ReviewEvidenceJob.result[signature_key].as_string() == signature,
+            ReviewEvidenceJob.state.in_(("complete", "uncertain", "interrupted", "cancelled")),
+            (ReviewEvidenceJob.result[verdict_key]["rubric"].as_string().is_not(None))
+            | (ReviewEvidenceJob.state == "uncertain"),
         )
         .order_by(ReviewEvidenceJob.claimed_at.desc())
         .limit(1)
     )
     if prior is not None:
-        if saved := prior.result.get("native"):
-            result["native"] = {
+        if saved := prior.result.get(verdict_key):
+            result[verdict_key] = {
                 **saved,
                 "cached_from": saved.get("cached_from") or str(prior.run_id),
             }
-            result["steps"] = [
-                *result["steps"],
-                {"id": node["id"], "task": node["task"], "model_calls": 0, "reused": 1},
-            ]
-            j.result = result
-            j.cursor += 1
+            complete_native_step(db, j, node, result, 0, reused=True)
             return None
         if prior.state == "uncertain":
             j.state = "held"
@@ -573,7 +634,7 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
                 "detail": "An earlier decision for these sources has unconfirmed usage.",
             }
             return None
-    return reserve_call(db, j, result, "decision", q)
+    return reserve_call(db, j, result, "second_opinion" if second else "decision", q)
 
 
 def comparison_key(pair: Row, questions: list[Question]) -> str:
@@ -594,7 +655,7 @@ def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Cal
     if not current_access(db, j):
         finish(j, r, "failed", "A source project or its connection changed. Start a fresh preview.")
         return None
-    if node["task"] == reviews.DECISION:
+    if node["task"] in reviews.DECISION_TASKS:
         return admit_decision(db, j, r, node)
     arm = "wiki" if result["arms"] else "original"
     if "sample" not in result:
@@ -706,7 +767,7 @@ def advance(sessions: sessionmaker[Session], run_id: UUID) -> Call | None:
         if node.get("version") != 1:
             finish(j, r, "failed", "Unsupported pinned evidence task version.")
             return None
-        if node["task"] in (reviews.COMPARE, reviews.DECISION):
+        if node["task"] in (reviews.COMPARE, *reviews.DECISION_TASKS):
             return admit(db, j, r, node)
         if node["task"] == reviews.GRAPH:
             j.source = source(db, p, nodes, j.provider, j.model, r.settings)
@@ -776,13 +837,15 @@ def settle(
             )
             j.lease = call.lease
             return
-        if call.arm == "decision":
+        native = call.arm in ("decision", "second_opinion")
+        config_key = "second_model" if call.arm == "second_opinion" else "decision_model"
+        if native:
             reply = replace(
                 reply,
                 usage={
                     **usage,
                     "task": r.settings["evidence_nodes"][j.cursor]["id"],
-                    "rubric": r.settings["decision_model"]["rubric"],
+                    "rubric": r.settings[config_key]["rubric"],
                 },
             )
         add_project_usage(
@@ -821,14 +884,23 @@ def settle(
             "rate_date": rated.isoformat(),
         }
         arms = list(j.result["arms"])
-        if call.arm == "decision":
+        if native:
+            verdict = (
+                {
+                    "scope": "unclear",
+                    "link_probability": None,
+                    "review_reason": "Insufficient or refused answer",
+                }
+                if error
+                else reply.data
+            )
             j.result = {
                 **j.result,
-                "native": {
+                ("second_opinion" if call.arm == "second_opinion" else "native"): {
                     **item,
-                    **reply.data,
+                    **verdict,
                     "provider": reply.provider,
-                    "rubric": r.settings["decision_model"]["rubric"],
+                    "rubric": r.settings[config_key]["rubric"],
                 },
             }
         else:
@@ -842,7 +914,9 @@ def settle(
                 "Late provider usage was reconciled. No further request was submitted.",
             )
             return
-        if error:
+        if error and not (
+            native and r.settings.get("second_model") and error in ("cut", "declined", "no_answer")
+        ):
             reasons = {
                 "cut": "The output limit was reached.",
                 "declined": "The model declined the request.",
@@ -855,7 +929,9 @@ def settle(
                 + " Usage was recorded.",
             )
             return
-        if call.arm in ("wiki", "decision"):
+        if native:
+            complete_native_step(db, j, r.settings["evidence_nodes"][j.cursor], dict(j.result), 1)
+        elif call.arm == "wiki":
             node = r.settings["evidence_nodes"][j.cursor]
             j.cursor += 1
             j.result = {
@@ -865,7 +941,7 @@ def settle(
                     {
                         "id": node["id"],
                         "task": node["task"],
-                        "model_calls": 1 if call.arm == "decision" else len(arms),
+                        "model_calls": len(arms),
                         "tokens": j.spent,
                     },
                 ],

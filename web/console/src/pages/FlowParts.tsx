@@ -146,9 +146,11 @@ export function Setting({
   // A task that names an agent may leave some settings open: they are then its agent's.
   const itsAgent = param.name !== 'agent' && Boolean(node.with.agent);
   const leftOpen = itsAgent && (node.with[param.name] === undefined || node.with[param.name] === null);
+  const nativeTask = ['evidence.decisions', 'evidence.second_opinion'].includes(node.task);
+  const decisionProvider = node.with.decision_provider ?? (node.task === 'evidence.second_opinion' ? 'openrouter' : 'openai');
   if ((param.name === 'upstreams' || param.name === 'allow_fallbacks') && (
-    (node.task === 'evidence.decisions' && node.with.decision_provider !== 'openrouter')
-    || (!node.task.startsWith('review.') && node.task !== 'evidence.decisions' && node.with.provider !== 'openrouter' && node.with.then_provider !== 'openrouter')
+    (nativeTask && decisionProvider !== 'openrouter')
+    || (!node.task.startsWith('review.') && !nativeTask && node.with.provider !== 'openrouter' && node.with.then_provider !== 'openrouter')
     || (typeof node.with.generation === 'string' && node.with.generation && !node.with.generation.startsWith('openrouter:'))
   )) return null;
   const generation = param.name === 'generation';
@@ -156,8 +158,7 @@ export function Setting({
   const routed = (param.name === 'model' && node.with.provider === 'openrouter')
     || (param.name === 'then_model' && node.with.then_provider === 'openrouter');
   if (generation || decision || routed) {
-    const provider = String(node.with.decision_provider ?? 'openai');
-    const list = decision ? (catalogue.decision_models ?? []).filter(m => m.provider === provider
+    const list = decision ? (catalogue.decision_models ?? []).filter(m => m.provider === decisionProvider
       && (!node.with.ordered_score || m.questions.includes('score')))
       : (catalogue.api_models ?? []).filter(m => generation || m.provider === 'openrouter');
     const id = (m: {provider: string; model: string}) => generation ? m.provider + ':' + m.model : m.model;

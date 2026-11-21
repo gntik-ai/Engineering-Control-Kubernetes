@@ -205,3 +205,11 @@ An accepted connection can originate from an earlier controller suggestion. The 
 | 32 | Roll out the selected Flow per project | Agree the acceptable false-link and missed-link rates and review workload before evaluating the held-out set. Compare against the current reviewer with uncertainty intervals. Prefer higher accuracy within the project budget. Use cost to choose between similarly accurate options. Keep advisory findings available for administrator approval and retain the previous Flow assignment for rollback. |
 
 An evaluation run records findings separately from project link decisions. If the original sources support a correction, present the previous link, the proposed change and the passages that justify it. The administrator can confirm the correction from that record.
+
+#### Advisory review of an issue–Story pair
+
+Assign **Review issue links with a second opinion** to a project's **Review related work** action. On Project Home, **Preview related records** ranks up to 16 Stories per issue alongside existing links and the graph's wider search for weak matches. It builds extractive wiki cards locally. **Review this pair** runs the paid tasks for the selected pair under the displayed run cap and project allowance.
+
+The first task sends the original issue and Story to OpenAI `gpt-6-luna`. A consistent full or partial verdict completes the review. For an unrelated, incomplete or contradictory verdict, the next task sends the same sources independently to OpenRouter `google/gemini-decision-1` with a criterion-by-criterion question. Both models can be configured in the Flow Designer. Each paid task records its own usage and can reuse a receipt for identical inputs.
+
+**Pending** shows disagreements, incomplete judgments and cases where the models contradict a saved link. **Advisory results** shows consistent findings. Open either record to inspect the original sources and record a human judgment. Changes to project links require their existing approval action. To roll back, restore the previous assignment under the project's Flow assignments. Evidence runs retain the Flow version and model selections they started with.
