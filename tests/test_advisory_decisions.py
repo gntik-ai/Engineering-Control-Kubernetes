@@ -107,9 +107,10 @@ def test_conditional_review_and_replay(
                     (provider, reviewer if is_second else openrouter.DIRECT_MODEL),
                 )
                 assert call.question.system == (
-                    decisions.CRITERIA_INSTRUCTIONS
-                    if is_second
-                    else decisions.ORIGINAL_INSTRUCTIONS
+                    decisions.CRITERIA_INSTRUCTIONS if is_second else decisions.LEGACY_ORIGINAL
+                )
+                assert call.question.native_rubric == (
+                    decisions.CRITERIA_RUBRIC if is_second else decisions.DIRECT_RUBRIC
                 )
                 source = json.loads(call.question.prompt)
                 assert all(source[k]["text"] == pair[k]["body"] for k in ("issue", "story"))

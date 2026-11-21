@@ -81,7 +81,10 @@ def declarations(record: Row) -> dict[str, str]:
     return found
 
 
-def reviewed_scopes(db: Session, pid: UUID, records: dict[str, Row]) -> dict[str, dict[str, str]]:
+ScopeMap = dict[str, dict[str, str]]
+
+
+def review_history(db: Session, pid: UUID, records: dict[str, Row]) -> tuple[ScopeMap, ScopeMap]:
     """Read current-revision verdicts. A human judgment takes priority over a model receipt."""
     job = ReviewEvidenceJob
     sample = job.result["sample"]
@@ -113,7 +116,8 @@ def reviewed_scopes(db: Session, pid: UUID, records: dict[str, Row]) -> dict[str
             job.run_id.desc(),
         )
     )
-    result: dict[str, dict[str, str]] = defaultdict(dict)
+    anchors: ScopeMap = defaultdict(dict)
+    judgments: ScopeMap = defaultdict(dict)
     for i, s, ir, sr, decided, suggested in rows:
         if (
             i in records
@@ -121,8 +125,14 @@ def reviewed_scopes(db: Session, pid: UUID, records: dict[str, Row]) -> dict[str
             and records[i]["revision"] == ir
             and records[s]["revision"] == sr
         ):
-            result[i].setdefault(s, decided or suggested)
-    return dict(result)
+            if decided:
+                judgments[i].setdefault(s, decided)
+                anchors[i][s] = judgments[i][s]
+            elif suggested == "full":
+                # A conflicting machine estimate does not erase an explicit dependency.
+                # Its original source stays eligible for inspection until a human decides.
+                anchors[i].setdefault(s, "full")
+    return dict(anchors), dict(judgments)
 
 
 def bridges(src: Row) -> dict[str, dict[str, list[Row]]]:

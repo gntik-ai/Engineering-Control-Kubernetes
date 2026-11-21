@@ -103,8 +103,8 @@ def source(
     rank: Row = next((n["params"] for n in nodes if n["task"] == reviews.RANK), {})
     if "prerequisites" in rank:
         src["coverage_rubric"] = decisions.RUBRIC
-    if rank.get("prerequisites"):
-        src["reviewed_scopes"] = review_prerequisites.reviewed_scopes(
+    if rank.get("prerequisites") or settings.get("decision_model", {}).get("direct_rubric"):
+        src["reviewed_scopes"], src["human_scopes"] = review_prerequisites.review_history(
             db, project.id, src["records"]
         )
     return src
@@ -293,6 +293,11 @@ def native_config(db: Session, doc: Document, task: str = reviews.DECISION) -> R
         "upstreams": str(params.get("upstreams") or ""),
         "allow_fallbacks": bool(params.get("allow_fallbacks", True)),
         "rubric": decisions.CRITERIA_RUBRIC if task == reviews.SECOND_OPINION else decisions.RUBRIC,
+        **(
+            {"direct_rubric": decisions.DIRECT_RUBRIC}
+            if task == reviews.DECISION and any(n.task == reviews.SECOND_OPINION for n in doc.nodes)
+            else {}
+        ),
         "available": bool(option),
         "rates": option["rates"] if option else None,
         "endpoint": openrouter.DECISIONS
@@ -532,7 +537,8 @@ def complete_native_step(
         issue, story = pair["issue"], pair["story"]
         connection = job.source["decisions"].get(issue, {}).get(story)
         linked = story in job.source["records"][issue]["parents"] or connection == "approved"
-        advisory = decisions.advisory(result["native"], result.get("second_opinion"))
+        human = result.get("previous_human_scope")
+        advisory = decisions.advisory(result["native"], result.get("second_opinion"), human)
         advisory["existing_link"] = linked
         if linked and advisory["scope"] == "unrelated":
             advisory.update(
@@ -544,7 +550,13 @@ def complete_native_step(
             step["skipped"] = True
         # Cache each provider independently, but file only one case for the same review.
         signature = digest(
-            ["advisory-v1", result["native_signature"], result.get("second_signature"), linked]
+            [
+                "advisory-v1",
+                result["native_signature"],
+                result.get("second_signature"),
+                linked,
+                *([human] if human else []),
+            ]
         )
         prior = db.scalar(
             select(ReviewEvidenceJob.run_id)
@@ -567,13 +579,10 @@ def complete_native_step(
 def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Call | None:
     second = node["task"] == reviews.SECOND_OPINION
     config = r.settings["second_model" if second else "decision_model"]
-    instructions = decisions.INSTRUCTIONS.get(config["rubric"])
-    if not instructions:
-        finish(j, r, "failed", "The pinned decision rubric is unavailable.")
-        return None
     result = dict(j.result)
     if second and (
-        not result.get("native") or not decisions.needs_second_opinion(result["native"])
+        not result.get("native")
+        or not decisions.needs_second_opinion(result["native"], result.get("previous_human_scope"))
     ):
         complete_native_step(db, j, node, result, 0)
         return None
@@ -585,12 +594,21 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         complete_native_step(db, j, node, result, 0)
         return None
     for pair in candidates:
+        rubric = (
+            config["rubric"]
+            if pair.get("prerequisites")
+            else config.get("direct_rubric", config["rubric"])
+        )
+        instructions = decisions.INSTRUCTIONS.get(rubric)
+        if not instructions:
+            finish(j, r, "failed", "The pinned decision rubric is unavailable.")
+            return None
         q = replace(
             question(j, j.source, result, pair, "decision"),
             choices=((config["provider"], config["model"]),),
             schema={"type": "object"},
             system=instructions,
-            native_rubric=config["rubric"],
+            native_rubric=rubric,
             native_score=config["score"],
             upstreams=config["upstreams"],
             allow_fallbacks=config["allow_fallbacks"],
@@ -605,7 +623,7 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         return None
     signature = digest(
         [
-            config["rubric"],
+            q.native_rubric,
             pair["issue"],
             pair["story"],
             q.choices,
@@ -620,6 +638,10 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
     signature_key = "second_signature" if second else "native_signature"
     verdict_key = "second_opinion" if second else "native"
     result[signature_key] = signature
+    if not second and config.get("direct_rubric"):
+        result["previous_human_scope"] = (
+            j.source.get("human_scopes", {}).get(pair["issue"], {}).get(pair["story"])
+        )
     result.update(
         sample=pair,
         sample_names=[j.source["records"][pair[k]]["title"] for k in ("issue", "story")],
@@ -856,14 +878,13 @@ def settle(
             j.lease = call.lease
             return
         native = call.arm in ("decision", "second_opinion")
-        config_key = "second_model" if call.arm == "second_opinion" else "decision_model"
         if native:
             reply = replace(
                 reply,
                 usage={
                     **usage,
                     "task": r.settings["evidence_nodes"][j.cursor]["id"],
-                    "rubric": r.settings[config_key]["rubric"],
+                    "rubric": call.question.native_rubric,
                 },
             )
         add_project_usage(
@@ -918,7 +939,7 @@ def settle(
                     **item,
                     **verdict,
                     "provider": reply.provider,
-                    "rubric": r.settings[config_key]["rubric"],
+                    "rubric": call.question.native_rubric,
                 },
             }
         else:
