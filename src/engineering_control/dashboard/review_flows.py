@@ -103,6 +103,31 @@ def assign(
 def finish(db: Session, owner: Owner, outcome: str) -> None:
     row = db.get(ReviewFlowRun, owner.review_run_id) if owner.review_run_id else None
     if row and row.finished_at is None:
+        if isinstance(owner, PlanningReview):
+            row.findings = {
+                k: v
+                for k, v in (owner.result or {}).items()
+                if k in ("proposals", "questions", "parents", "scanned", "missing")
+            }
+        elif isinstance(owner, WorkspaceImport):
+            row.findings = {
+                "stage": owner.stage,
+                "repository": owner.repository,
+                "revision": owner.commit_sha,
+                "description": owner.draft if row.action == "description" else None,
+            }
+        elif isinstance(owner, ProjectConnection):
+            row.findings = {
+                "connection": str(owner.id),
+                "status": owner.status,
+                "detail": owner.detail,
+            }
+        elif isinstance(owner, EpicExecutionPlan):
+            row.findings = {
+                "queue": str(owner.queue_id),
+                "status": owner.status,
+                "detail": owner.detail,
+            }
         row.outcome, row.finished_at = outcome, datetime.now(UTC)
 
 
@@ -145,7 +170,11 @@ def configure(db: Session, pid: UUID, run_id: UUID, stage: str, question: Questi
     if not run or run.project_id != pid:
         raise ProjectInvalid("The review flow run does not belong to this project.")
     extra = wording(run.settings, stage)
-    generation = run.settings.get("generation") if question.native_score is None else None
+    generation = (
+        run.settings.get("generation")
+        if question.native_score is None and stage != "supervisor_rerank"
+        else None
+    )
     return replace(
         question,
         choices=(tuple(generation.split(":", 1)),) if generation else question.choices,

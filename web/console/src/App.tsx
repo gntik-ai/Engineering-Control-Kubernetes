@@ -157,6 +157,7 @@ export default function App() {
   if (isAutomation(settings) && settings !== 'assignments') {
     return <ProjectWorkspace name={query.get('project') ?? ''} view={settings} global actions={actions} notice={notice} />;
   }
+  if (settings === 'supervisor') return <ProjectWorkspace name={query.get('project') ?? ''} view="supervisor-settings" global actions={actions} notice={notice} />;
   if (settings === 'stats') {
     return <ProjectWorkspace name={query.get('project') ?? ''} view="stats" global actions={actions} notice={notice} />;
   }
@@ -173,7 +174,7 @@ export default function App() {
     if (rest[0] === 'automation' && rest.length === 2 && isAutomation(rest[1] ?? '')) {
       return <ProjectWorkspace name={name} view={rest[1] as import('./router').AutomationView} actions={actions} notice={notice} />;
     }
-    if (subpath !== '' && subpath !== 'queue' && subpath !== 'settings/connections') return <NotFoundPage />;
+    if (subpath !== '' && subpath !== 'queue' && subpath !== 'supervisor' && subpath !== 'settings/connections') return <NotFoundPage />;
     const view = subpath === 'settings/connections' ? 'connections' : subpath || 'dashboard';
     return <ProjectWorkspace name={name} view={view} actions={actions} notice={notice} />;
   }

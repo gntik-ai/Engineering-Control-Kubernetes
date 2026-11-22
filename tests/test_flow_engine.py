@@ -75,6 +75,7 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
         "review-automatic",
         "review-connections",
         "review-execution",
+        "review-supervisor",
     }
     for key, document in BUILTIN.items():
         assert validate.problems(document) == [], key

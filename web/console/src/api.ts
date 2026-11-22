@@ -376,6 +376,8 @@ export interface FlowDetail {
 
 /** A flow the supervisor proposed, before it is decided. */
 export interface ProposedFlow extends FlowChecked {
+  diff: string;
+  impact: { sections: unknown[]; review_assignments: unknown[]; callers: unknown[]; active_runs: string[] } | null;
   action_id: string;
   outcome: string;
   summary: string | null;
@@ -720,6 +722,7 @@ export interface InboxEntry {
   diagnosis?: string | null;
   /** For something the supervisor proposed: what it is, why, and why it waits. */
   action_id?: string;
+  arguments?: Record<string, unknown>;
   /** The tool the supervisor called: a proposed flow can be opened as a graph. */
   tool?: string;
   summary?: string | null;
@@ -827,6 +830,7 @@ export interface SupervisorMessage {
 /** The conversation as the panel shows it. `turn` is set while the supervisor answers. */
 export interface SupervisorConversation {
   items: SupervisorMessage[];
+  incidents?: Incident[];
   turn: { run_id: string; state: 'queued' | 'running'; detail: string | null; provider: string | null } | null;
   /** What the supervisor proposed and that waits for a decision. */
   pending: InboxEntry[];
@@ -863,7 +867,7 @@ export interface SupervisorDefinition {
 /** Trouble with the work that the platform noticed, and what the supervisor made of it. */
 export interface Incident {
   id: string;
-  kind: 'run_failed' | 'run_stalled' | 'queue_paused';
+  kind: 'run_failed' | 'run_stalled' | 'queue_paused' | 'review_attention';
   state: 'open' | 'looking' | 'handled' | 'waiting' | 'dismissed';
   summary: string;
   facts: { needs?: 'decision' | 'administrator'; queue_id?: string; [key: string]: unknown };

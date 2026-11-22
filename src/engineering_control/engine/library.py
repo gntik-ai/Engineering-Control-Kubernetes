@@ -41,6 +41,8 @@ def document_in_force(
     session: Session, key: str, version: int | None = None, *, review: bool = False
 ) -> tuple[Document, int] | None:
     """The flow's document that runs started now follow, with its version."""
+    if is_removed(session, key):
+        return None
     query = select(FlowVersion).where(FlowVersion.flow_key == key, FlowVersion.state == "published")
     if version is not None:
         query = query.where(FlowVersion.version == version)

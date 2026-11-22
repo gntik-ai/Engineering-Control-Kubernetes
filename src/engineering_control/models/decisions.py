@@ -145,6 +145,53 @@ def advisory(primary: Row, second: Row | None, human: str | None = None) -> Row:
 def body(
     provider: str, model: str, system: str, source: str, score: bool, route: Row, rubric: str = ""
 ) -> Row:
+    if rubric == "supervisor-issue-v1":
+        choices = {
+            "bug": "The selected issue documents a defect.",
+            "enhancement": "The selected issue asks for new or improved behavior.",
+            "unclear": "The evidence does not establish an execution type.",
+        }
+        targets = {
+            **{str(i): f"Candidate {i} in the supplied list." for i in range(1, 9)},
+            "unclear": "The request does not identify a unique supplied candidate.",
+        }
+        specialist_questions = [
+            (
+                "target",
+                "Which candidate does the administrator mean? Use unclear if ambiguous.",
+                targets,
+            ),
+            ("category", "What execution type does the selected candidate represent?", choices),
+        ]
+        if provider == "openrouter":
+            return {
+                "model": model,
+                "state": system + "\n\n" + source,
+                "questions": {
+                    key: {"type": "choice", "instructions": prompt, "criteria": opts}
+                    for key, prompt, opts in specialist_questions
+                },
+                **({"provider": route} if route else {}),
+            }
+        if provider != "openai" or model != openrouter.DIRECT_MODEL:
+            raise ValueError("Select a supported native decision model.")
+        return {
+            "model": model,
+            "input": [
+                {"role": role, "content": [{"type": "input_text", "text": t}]}
+                for role, t in (("developer", system), ("user", source))
+            ],
+            "questions": [
+                {
+                    "name": key,
+                    "type": "choice",
+                    "instructions": prompt,
+                    "choices": [{"value": k, "description": v} for k, v in opts.items()],
+                }
+                for key, prompt, opts in specialist_questions
+            ],
+            "prompt_cache_options": {"mode": "explicit"},
+        }
     expanded = rubric in (RUBRIC, "issue-story-criteria-v2", CRITERIA_RUBRIC)
     link = (
         "Does the issue deliver Story work or supply a necessary input to a specific Story outcome?"
@@ -296,9 +343,23 @@ async def complete(
         ) from err
     questions = payload["questions"]
     names = {q["name"] for q in questions} if isinstance(questions, list) else set(questions)
-    normalized = judgment(
-        provider, data.get("answers"), "strength" in names, expanded="contribution" in names
-    )
+    if names == {"target", "category"}:
+        answers = data.get("answers")
+        entries = (
+            {a.get("name"): a for a in answers if isinstance(a, dict)}
+            if isinstance(answers, list)
+            else answers
+        )
+        normalized = {
+            k: str((entries.get(k) or {}).get("choice") or "unclear")
+            if isinstance(entries, dict) and isinstance(entries.get(k), dict)
+            else "unclear"
+            for k in names
+        }
+    else:
+        normalized = judgment(
+            provider, data.get("answers"), "strength" in names, expanded="contribution" in names
+        )
     return Wire(
         json.dumps(normalized),
         str(data.get("model") or payload["model"]),

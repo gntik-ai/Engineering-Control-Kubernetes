@@ -247,6 +247,17 @@ class SupervisorMessageInput(DashboardModel):
     text: str = Field(min_length=1, max_length=8000)
 
 
+class ProjectSupervisorMessage(SupervisorMessageInput):
+    projects: list[str] = Field(default_factory=list, max_length=64)
+    all_reviews: bool = False
+    request_id: UUID
+
+
+class SupervisorStopInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+    run_id: UUID
+
+
 class SupervisorDecisionInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     accept: bool

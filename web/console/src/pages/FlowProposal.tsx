@@ -100,6 +100,10 @@ export function FlowProposalPage({ actionId }: { actionId: string }) {
               .map((entry, index) => (
                 <Alert key={index} tone="destructive" title={entry.text} />
               ))}
+            <details><summary>Changes to the workflow</summary>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap text-xs">{data.diff}</pre>
+            </details>
+            {data.impact && <p className="text-sm">Used by {data.impact.sections.length} sections, {data.impact.review_assignments.length} review assignments and {data.impact.callers.length} workflows. Active runs: {data.impact.active_runs.length}.</p>}
             <div className="overflow-hidden rounded-lg border border-border">
               <ThemedCanvas
                 aria-label={`The proposed flow ${data.document.name}, as a graph`}

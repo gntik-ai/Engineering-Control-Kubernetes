@@ -24,6 +24,7 @@ from engineering_control.db.models import (
     ReviewFlowRun,
     SandboxRun,
     SandboxStep,
+    SupervisorAdvice,
     WorkspaceImport,
     WorkspaceModelUsage,
 )
@@ -484,6 +485,7 @@ def live(sessions: sessionmaker[Session], *, now: datetime | None = None) -> Row
             select(WorkspaceImport.review_run_id)
             .where(WorkspaceImport.lease.is_not(None), WorkspaceImport.lease_until > stamp)
             .union_all(
+                select(SupervisorAdvice.run_id).where(SupervisorAdvice.state == "calling"),
                 select(ReviewEvidenceJob.run_id).where(
                     ReviewEvidenceJob.state.in_(("calling", "stopping"))
                 ),

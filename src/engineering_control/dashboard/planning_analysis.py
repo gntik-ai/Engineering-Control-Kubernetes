@@ -475,6 +475,7 @@ class PlanningAnalysis:
                         if not linked or (work.scope == "children" and source["id"] not in linked):
                             continue
                     candidate = WorkspaceCandidate(
+                        review_run_id=job.review_run_id,
                         project_id=project.id,
                         kind=kind,
                         identity=identity,

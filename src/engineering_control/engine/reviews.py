@@ -12,6 +12,10 @@ from engineering_control.models.providers import BY_KEY, MODEL_NAME
 # The terminal task selects the worker and the response contract. Additional instruction
 # nodes execute in graph order and can target just one part of a multi-stage review.
 ACTIONS = {
+    "supervisor": (
+        "Supervisor advice",
+        "Compare candidate issues and issue classifications for a Supervisor request.",
+    ),
     "evidence": (
         "Review related work",
         "Preview project relationships and compare source evidence.",
@@ -181,7 +185,13 @@ def invalid(document: Document) -> str | None:
             provider, _, model = str(generation).partition(":")
             if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
                 return "Choose a generation provider and model from Accounts."
-        is_decision = node.task in DECISION_TASKS
+        if node.task == "review.supervisor" and node.params.get("rank_model"):
+            provider, _, model = str(node.params["rank_model"]).partition(":")
+            if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
+                return "Select an Accounts provider:model for reranking."
+        is_decision = node.task in DECISION_TASKS or (
+            node.task == "review.supervisor" and node.params.get("method") == "decision"
+        )
         decision_provider, decision_model = decision_route(node.task, node.params)
         if is_decision or node.params.get("upstreams"):
             try:

@@ -19,12 +19,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, or_, select, tuple_, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.project_records import ProjectConflict, ProjectNotFound
 from engineering_control.db.models import (
     ProjectRecord,
+    ReviewFlowRun,
     SandboxRun,
     SandboxStep,
     SupervisorAction,
@@ -35,6 +36,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.flow_library import WORK_KINDS
 from engineering_control.supervisor.conversation import Conversation
+from engineering_control.supervisor.reviews import destination, inventory
 
 # A step that has waited this long for an account or a sandbox is not just busy.
 STALL_MINUTES: Final = 20
@@ -116,6 +118,7 @@ class Operations:
     def __init__(self, sessions: sessionmaker[Session], conversation: Conversation) -> None:
         self.sessions = sessions
         self.conversation = conversation
+        self.next_review_check: datetime | None = None
 
     def settings(self) -> dict[str, Any]:
         return dict(self.conversation.definitions.current()["operations"])
@@ -126,19 +129,33 @@ class Operations:
         """Open an incident for each trouble not yet known. Returns how many were opened."""
         now = now or datetime.now(UTC)
         with self.sessions.begin() as session:
-            known = {
-                (kind, ref)
-                for kind, ref in session.execute(
-                    select(SupervisorIncident.kind, SupervisorIncident.ref).where(
-                        SupervisorIncident.created_at > now - timedelta(days=2)
-                    )
-                )
-            }
+            if session.get_bind().dialect.name == "postgresql" and not session.scalar(
+                select(func.pg_try_advisory_xact_lock(36815, 0))
+            ):
+                return 0
+            review_alerts = []
+            if self.next_review_check is None or now >= self.next_review_check:
+                review_alerts = self._reviews(session, now)
+                self.next_review_check = now + timedelta(minutes=1)
             found = [
                 *self._failed(session, now),
                 *self._stalled(session, now),
                 *self._paused(session),
+                *review_alerts,
             ]
+            keys = [(incident.kind, incident.ref) for incident in found]
+            known = (
+                {
+                    (kind, ref)
+                    for kind, ref in session.execute(
+                        select(SupervisorIncident.kind, SupervisorIncident.ref).where(
+                            tuple_(SupervisorIncident.kind, SupervisorIncident.ref).in_(keys)
+                        )
+                    ).all()
+                }
+                if keys
+                else set()
+            )
             opened = 0
             for incident in found:
                 if (incident.kind, incident.ref) in known:
@@ -147,6 +164,86 @@ class Operations:
                 session.add(incident)
                 opened += 1
             return opened
+
+    @staticmethod
+    def _reviews(session: Session, now: datetime) -> list[SupervisorIncident]:
+        # Review workers own their retries. These notifications never schedule a paid investigation.
+        rows = inventory(now)
+        state = rows.c.state
+        kind = "review_attention"
+        ref = rows.c.source + ":" + func.replace(cast(rows.c.id, String), "-", "") + ":" + state
+        attention = (
+            "failed",
+            "stalled",
+            "needs_input",
+            "awaiting_decision",
+            "proposals",
+            "review",
+            "held",
+            "uncertain",
+        )
+        current = select(ref).where(state.in_(attention), rows.c.source != "sandbox")
+        session.execute(
+            update(SupervisorIncident)
+            .where(
+                SupervisorIncident.kind == kind,
+                SupervisorIncident.state == "waiting",
+                SupervisorIncident.ref.not_in(current),
+            )
+            .values(state="handled", closed_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        recent = now - timedelta(minutes=NEWS_MINUTES)
+        query = (
+            select(
+                rows.c.pid,
+                rows.c.id,
+                rows.c.source,
+                rows.c.action,
+                rows.c.title,
+                state,
+                ref,
+                ProjectRecord.name,
+            )
+            .join(ProjectRecord, ProjectRecord.id == rows.c.pid)
+            .where(
+                rows.c.source != "sandbox",
+                ProjectRecord.archived_at.is_(None),
+                state.in_(attention),
+                or_(
+                    state == "stalled",
+                    rows.c.at > recent,
+                    rows.c.id.in_(
+                        select(ReviewFlowRun.id).where(ReviewFlowRun.finished_at > recent)
+                    ),
+                ),
+                ~select(SupervisorIncident.id)
+                .where(SupervisorIncident.kind == kind, SupervisorIncident.ref == ref)
+                .exists(),
+            )
+            .order_by(rows.c.at.desc(), rows.c.id)
+            .limit(30)
+        )
+        return [
+            SupervisorIncident(
+                kind=kind,
+                ref=reference,
+                state="waiting",
+                project_id=pid,
+                summary=f"{title} in {project}: {status}",
+                facts={
+                    "review": str(key),
+                    "source": source,
+                    "action": action,
+                    "status": status,
+                    "url": destination(project, action),
+                    "needs": "administrator",
+                },
+            )
+            for pid, key, source, action, title, status, reference, project in session.execute(
+                query
+            )
+        ]
 
     @staticmethod
     def _failed(session: Session, now: datetime) -> list[SupervisorIncident]:
@@ -439,7 +536,9 @@ class Operations:
 
     # --- the console ---------------------------------------------------------------------
 
-    def listing(self, *, everything: bool = False, limit: int = 50) -> dict[str, Any]:
+    def listing(
+        self, *, everything: bool = False, limit: int = 50, project: str | None = None
+    ) -> dict[str, Any]:
         """Incidents, newest first: the ones not closed, or all of them."""
         query = (
             select(SupervisorIncident, ProjectRecord)
@@ -447,6 +546,8 @@ class Operations:
             .order_by(SupervisorIncident.created_at.desc())
             .limit(max(1, min(limit, 200)))
         )
+        if project:
+            query = query.where(ProjectRecord.name == project)
         if not everything:
             query = query.where(SupervisorIncident.state.in_(OPEN))
         with self.sessions() as session:

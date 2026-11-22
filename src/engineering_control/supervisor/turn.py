@@ -297,6 +297,21 @@ class SupervisorTurn:
             with_tools=base is not None,
             incidents=incidents,
         )
+        if item.run_data.get("thread"):
+            scope = item.run_data.get("scope") or {}
+            prompt += (
+                "\nCurrent conversation project: "
+                + str(item.run_data["thread"])
+                + ". Selected action targets: "
+                + ", ".join(scope.get("projects", []))
+                + ". All-project review reading: "
+                + str(bool(scope.get("all_reviews")))
+                + ". Check reviews with list_reviews and get_review. Read saved results "
+                "without restarting them. "
+                "For Epic execution use the project execution plan tools. Name each target, "
+                "link to results, "
+                "and distinguish stopping a reply, pausing a queue and cancelling a run."
+            )
         job = turn_job(
             lease.provider,
             lease.generation,

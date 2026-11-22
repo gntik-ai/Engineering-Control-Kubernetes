@@ -521,6 +521,7 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
     """A proposal from a retained issue or a gap found in the project evidence."""
 
     __tablename__ = "workspace_candidates"
+    review_run_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
@@ -718,6 +719,7 @@ class ReviewFlowAssignment(Base):
 
 class ReviewFlowRun(UUIDPrimaryKey, Base):
     __tablename__ = "review_flow_runs"
+    findings: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
@@ -732,6 +734,23 @@ class ReviewFlowRun(UUIDPrimaryKey, Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     outcome: Mapped[str | None] = mapped_column(String(16))
+
+
+class SupervisorAdvice(Base):
+    """One bounded, source-versioned specialist comparison. A lease is never replayed implicitly."""
+
+    __tablename__ = "supervisor_advice"
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("review_flow_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    request: Mapped[dict[str, Any]] = mapped_column(JSON)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ReviewWikiPage(Base):
@@ -1952,6 +1971,9 @@ class SupervisorMessage(UUIDPrimaryKey, Timestamps, Base):
     administrator took on a proposal, a turn that could not be answered."""
 
     __tablename__ = "supervisor_messages"
+    thread: Mapped[str] = mapped_column(String(80), default="", server_default="")
+    scope: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    request_id: Mapped[UUID | None] = mapped_column(Uuid)
     role: Mapped[str] = mapped_column(String(16), index=True)
     channel: Mapped[str] = mapped_column(String(16))
     text: Mapped[str] = mapped_column(Text)
@@ -1960,6 +1982,8 @@ class SupervisorMessage(UUIDPrimaryKey, Timestamps, Base):
         Uuid, ForeignKey("sandbox_runs.id", ondelete="SET NULL"), index=True
     )
     __table_args__ = (
+        Index("ix_supervisor_thread_time", "thread", "created_at"),
+        Index("uq_supervisor_message_request", "thread", "request_id", unique=True),
         CheckConstraint("role IN ('administrator', 'supervisor', 'platform')", name="role"),
         CheckConstraint("channel IN ('console', 'chat', 'platform')", name="channel"),
     )
@@ -1975,6 +1999,7 @@ class SupervisorAction(UUIDPrimaryKey, Timestamps, Base):
     """
 
     __tablename__ = "supervisor_actions"
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     run_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("sandbox_runs.id", ondelete="SET NULL"), index=True
     )

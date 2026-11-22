@@ -10,10 +10,12 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, ListOrdered, Network, Plus, GitFork, ListChecks, Compass } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
+import { ProjectSupervisor } from './ProjectSupervisor';
+import { SupervisorPage } from './Supervisor';
 import { StatsPage } from './Stats';
 import { AccountsPage } from './Accounts';
 import { ConnectionsPage } from './Connections';
@@ -39,7 +41,7 @@ export function ProjectWorkspace({
   notice,
 }: {
   name: string;
-  view: 'dashboard' | 'queue' | 'connections' | 'accounts' | 'stats' | AutomationView | ReviewView;
+  view: 'dashboard' | 'supervisor' | 'supervisor-settings' | 'queue' | 'connections' | 'accounts' | 'stats' | AutomationView | ReviewView;
   global?: boolean;
   actions: ReactNode;
   notice: ReactNode;
@@ -57,6 +59,8 @@ export function ProjectWorkspace({
   const projectTitle = project?.display_name ?? name;
   const titles = {
     dashboard: project?.display_name ?? 'Projects',
+    supervisor: 'Supervisor · ' + projectTitle,
+    'supervisor-settings': 'Supervisor · Global settings',
     queue: 'Queue · ' + projectTitle,
     connections: 'Connections · ' + projectTitle,
     accounts: 'Accounts · Global settings',
@@ -71,6 +75,7 @@ export function ProjectWorkspace({
   const primary: NavGroup = { items: [{ label: 'Dashboard', href: dashboardHref, icon: LayoutDashboard }] };
   const groups = [primary];
   if (context) {
+    primary.items.push({label: 'Supervisor', href: workspaceUrl(context) + '/supervisor', icon: Sparkles});
     primary.items.push({ label: 'Queue', href: queueUrl(context), icon: ListOrdered });
     groups.push({
       id: 'project-reviews',
@@ -99,12 +104,14 @@ export function ProjectWorkspace({
     label: 'Global settings',
     collapsible: true,
     defaultOpen: true,
-    items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }, {label:'Stats',href:statsUrl(context), icon:LayoutDashboard}, ...menu()],
+    items: [{ label: 'Accounts', href: accountHref, icon: KeyRound }, {label:'Stats',href:statsUrl(context), icon:LayoutDashboard}, {label:'Supervisor',href: BASE+'/settings/supervisor'+(context?'?'+new URLSearchParams({project:context}):''),icon:Sparkles}, ...menu()],
   });
   function viewUrl(projectName: string) {
     if (isReviewView(view)) return reviewUrl(projectName, view);
     if (isAutomation(view)) return automationUrl(view === 'flow' ? 'flows' : view, global ? undefined : projectName, projectName);
     switch (view) {
+      case 'supervisor': return workspaceUrl(projectName)+'/supervisor';
+      case 'supervisor-settings': return BASE+'/settings/supervisor'+(projectName?'?'+new URLSearchParams({project:projectName}):'');
       case 'stats': return statsUrl(projectName);
       case 'accounts': return accountsUrl(projectName);
       case 'queue': return queueUrl(projectName);
@@ -166,11 +173,11 @@ export function ProjectWorkspace({
       }
     >
       {notice && <div className="px-6 pt-4">{notice}</div>}
-      {view === 'stats' ? <StatsPage /> : view === 'accounts' ? <AccountsPage /> : isAutomation(view) && (global || project) ? <AutomationPage key={(global ? 'global' : name) + '/' + view} view={view} project={global ? undefined : name} /> : (
+      {view === 'supervisor-settings' ? <SupervisorPage/> : view === 'stats' ? <StatsPage /> : view === 'accounts' ? <AccountsPage /> : isAutomation(view) && (global || project) ? <AutomationPage key={(global ? 'global' : name) + '/' + view} view={view} project={global ? undefined : name} /> : (
         <Page width="wide">
           <LoadError resource={projects} />
           {project ? (
-            view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'connections' ? (
+            view === 'supervisor' ? <ProjectSupervisor key={name} project={project.project} projects={items} /> : view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'connections' ? (
               <ConnectionsPage key={project.project} project={project} projects={items} />
             ) : isReviewView(view) ? (
               <div className="grid min-w-0 gap-5" key={project.project}>
