@@ -896,7 +896,10 @@ class WorkspaceImports:
                     added += 1
                     generated += int(number is None)
                     candidate = WorkspaceCandidate(
-                        project_id=project.id, kind=row.stage, **suggestion
+                        project_id=project.id,
+                        review_run_id=row.review_run_id,
+                        kind=row.stage,
+                        **suggestion,
                     )
                     session.add(candidate)
                     new_proposals.append(candidate)

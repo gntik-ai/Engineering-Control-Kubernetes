@@ -310,7 +310,7 @@ function Subscription({
   return (
     <div className="grid max-w-2xl gap-5">
       <p className="text-[13px] text-muted-foreground">
-        The supervisor works on a subscription, like every agent here; no API key is used. Each of its turns takes an
+        The chat uses a subscription. Specialist comparisons use their configured API accounts. Each of its turns takes an
         account for as long as the turn runs.
       </p>
       <Field>
@@ -822,6 +822,7 @@ export function SupervisorPage({ initialTab = 'instructions' }: { initialTab?: '
                 </TabsTab>
                 <TabsTab value="tools">Tools</TabsTab>
                 <TabsTab value="subscription">Subscription</TabsTab>
+                <TabsTab value="specialists">Specialist models</TabsTab>
                 <TabsTab value="versions" count={data.versions.length || undefined}>
                   Versions
                 </TabsTab>
@@ -836,6 +837,11 @@ export function SupervisorPage({ initialTab = 'instructions' }: { initialTab?: '
               </TabsPanel>
               <TabsPanel value="tools" className="pt-4">
                 <Tools draft={draft} catalogue={data.catalogue} change={change} />
+              </TabsPanel>
+              <TabsPanel value="specialists" className="grid gap-3 pt-4">
+                <p>The Supervisor advice flow selects and classifies ambiguous issues. Configure its generation model, reranker or native Decisions model in the flow designer. Projects can override the global flow under Engine → Flow assignment.</p>
+                <Link href={BASE+'/settings/flow?key=review-supervisor'}>Configure the Supervisor advice flow</Link>
+                <Link href={BASE+'/settings/accounts'}>Model accounts</Link>
               </TabsPanel>
               <TabsPanel value="subscription" className="pt-4">
                 <Subscription draft={draft} settings={data} change={change} />

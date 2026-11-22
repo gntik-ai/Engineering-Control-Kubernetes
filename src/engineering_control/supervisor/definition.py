@@ -80,6 +80,165 @@ class Tool:
 
 CATALOGUE: Final[tuple[Tool, ...]] = (
     Tool(
+        "ask_specialist",
+        "plan",
+        "Request a specialist opinion",
+        "Ask the project’s assigned Supervisor advice flow to select or classify an ambiguous "
+        "technical issue. Reuses unchanged evidence. The result is advisory and can be read "
+        "with get_review. A new comparison uses the project’s review budget.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "request": {"type": "string", "maxLength": 1500},
+                "issues": {"type": "array", "items": _ITEM, "minItems": 1, "maxItems": 8},
+                "reason": _REASON,
+            },
+            ("project", "request", "issues", "reason"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
+        "list_reviews",
+        "read",
+        "Check reviews",
+        "Read paginated review history, including sandbox audits and planning workers. "
+        "Counts cover all pages. Omit project to check the selected projects. No review is "
+        "started.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "state": {
+                    "type": "string",
+                    "description": "Filter by a recorded state, or attention.",
+                },
+                "action": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+            }
+        ),
+    ),
+    Tool(
+        "get_review",
+        "read",
+        "Read a review and its evidence",
+        "Read the saved findings, evidence, workflow and administrator decision for a "
+        "review from list_reviews.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "source": {"type": "string"},
+                "id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+            },
+            ("project", "source", "id"),
+        ),
+    ),
+    Tool(
+        "pending_review_findings",
+        "read",
+        "Find outstanding review proposals",
+        "List a project's saved Epic, Story and Issue proposals awaiting the administrator, "
+        "with the link to each one.",
+        _schema({"project": _PROJECT, "page": {"type": "integer", "minimum": 1}}, ("project",)),
+    ),
+    Tool(
+        "get_execution_plan",
+        "read",
+        "Read a project execution plan",
+        "List open Epics for a project or read a queue plan with its revision, issue "
+        "classifications, assigned workflows and blockers.",
+        _schema({"project": _PROJECT, "queue": _QUEUE}, ("project",)),
+    ),
+    Tool(
+        "prepare_epic",
+        "plan",
+        "Prepare an Epic for execution",
+        "Propose running the project's assigned execution-planning flow for an Epic. The "
+        "analysis uses the project's Accounts model.",
+        _schema(
+            {"project": _PROJECT, "epic": {"type": "string"}, "reason": _REASON},
+            ("project", "epic", "reason"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
+        "change_execution_plan",
+        "operate",
+        "Change a project execution plan",
+        "Propose confirming bug/enhancement labels, saving Story/Issue order and "
+        "prerequisites, or starting the reviewed queue. Read its current revision first. "
+        "Confirmed classifications sync to GitHub.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "queue": _QUEUE,
+                "version": {"type": "integer", "minimum": 1},
+                "operation": {"type": "string", "enum": ["classify", "save", "start"]},
+                "types": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string", "enum": ["bug", "enhancement"]},
+                },
+                "stories": {"type": "array", "items": {"type": "string"}},
+                "order": {"type": "array", "items": {"type": "string"}},
+                "requires": {
+                    "type": "object",
+                    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                },
+                "reason": _REASON,
+            },
+            ("project", "queue", "version", "operation", "reason"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
+        "classify_issue",
+        "plan",
+        "Classify an individual issue",
+        "Propose an execution type for a single technical issue, including a standalone "
+        "bug. Administrator confirmation schedules its GitHub label.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "item": _ITEM,
+                "type": {"type": "string", "enum": ["bug", "enhancement"]},
+                "reason": _REASON,
+            },
+            ("project", "item", "type", "reason"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
+        "flow_impact",
+        "read",
+        "Inspect flow usage",
+        "Read the flow owner, versions, calling flows, assignments and active runs before "
+        "changing or removing a flow.",
+        _schema({"flow": {"type": "string"}}, ("flow",)),
+    ),
+    Tool(
+        "retire_flow",
+        "plan",
+        "Archive or delete a workflow",
+        "Propose archiving or permanently deleting an unused workflow after examining "
+        "flow_impact. Set global_scope explicitly for a global flow. Both actions require "
+        "administrator confirmation.",
+        _schema(
+            {
+                "flow": {"type": "string"},
+                "project": _PROJECT,
+                "global_scope": {"type": "boolean"},
+                "operation": {"type": "string", "enum": ["archive", "delete"]},
+                "reason": _REASON,
+            },
+            ("flow", "operation", "reason"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
         "list_projects",
         "read",
         "List the projects",
@@ -499,6 +658,11 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         _schema(
             {
                 "document": {"type": "object", "description": "The flow's document."},
+                "project": _PROJECT,
+                "global_scope": {
+                    "type": "boolean",
+                    "description": "Explicitly target the shared flow library.",
+                },
                 "reason": _REASON,
             },
             ("document", "reason"),

@@ -17,6 +17,7 @@ supervisor's history of decisions.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import functools
 import json
 from dataclasses import dataclass
@@ -29,15 +30,23 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.backlog_items import OPEN_STATES, BacklogItems, clean_title
+from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
     ProjectNotFound,
     ProjectRecords,
+    active_project,
     serialize,
 )
 from engineering_control.dashboard.project_sections import SectionRecords
-from engineering_control.db.models import ProjectRecord, SupervisorAction
+from engineering_control.dashboard.workspace_publishing import confirm_classification
+from engineering_control.db.models import (
+    BacklogItem,
+    ProjectRecord,
+    SandboxRun,
+    SupervisorAction,
+)
 from engineering_control.engine import validate
 from engineering_control.engine.catalogue import BUDGETS
 from engineering_control.engine.catalogue import catalogue as task_catalogue
@@ -54,9 +63,11 @@ from engineering_control.github_app import GitHubApp, GitHubAppError
 from engineering_control.sandbox.deliver import ROUNDS_CEILING, rounds_of, toolchain_for
 from engineering_control.sandbox.queues import Queues
 from engineering_control.sandbox.runs import Runs
+from engineering_control.supervisor import advice
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS
 from engineering_control.supervisor.operations import Operations
+from engineering_control.supervisor.reviews import ReviewHistory
 
 # How often the same work may run within a day before trying it again needs the
 # administrator, and the outcomes that trying again does not change.
@@ -186,6 +197,8 @@ class Toolbox:
         self.queues = queues
         self.github = github
         self.flows = FlowRecords(sessions)
+        self.reviews = ReviewHistory(sessions)
+        self.plans = ExecutionPlans(sessions)
 
     # --- a call from the supervisor ------------------------------------------------------
 
@@ -207,15 +220,17 @@ class Toolbox:
             )
             return Outcome("Refused: you have no such tool.", error=True)
         try:
+            scope = await asyncio.to_thread(self._scope, run_id)
+            arguments = dict(arguments)
             if tool.kind == "read":
-                answer = await self._read(name, arguments)
+                answer = await self._scoped_read(name, arguments, scope)
                 await asyncio.to_thread(
                     lambda: self._record(run_id, name, "read", arguments, "read")
                 )
                 # This finite, platform-defined catalogue must remain valid JSON as tasks grow.
                 return Outcome(_text(answer, bounded=name != "list_tasks"))
             return await asyncio.to_thread(
-                lambda: self._change(run_id, name, tool.kind, choice, arguments)
+                lambda: self._change(run_id, name, tool.kind, choice, arguments, scope)
             )
         except REFUSALS as error:
             detail = (
@@ -234,10 +249,125 @@ class Toolbox:
             )
             return Outcome(f"Failed: GitHub did not answer ({said}).", error=True)
 
+    def _scope(self, run_id: UUID) -> dict[str, Any]:
+        with self.sessions() as db:
+            run = db.get(SandboxRun, run_id)
+            return (
+                dict((run.data or {}).get("scope") or {}, thread=(run.data or {}).get("thread"))
+                if run
+                else {}
+            )
+
+    @staticmethod
+    def _target(scope: dict[str, Any], project: str | None) -> None:
+        if scope.get("thread") and project not in scope.get("projects", []):
+            raise ProjectInvalid("Select this project in the conversation targets first.")
+
+    async def _scoped_read(
+        self, name: str, arguments: dict[str, Any], scope: dict[str, Any]
+    ) -> Any:
+        thread = scope.get("thread")
+        projects = scope.get("projects") if thread else None
+        project = arguments.get("project")
+        review = name in ("list_reviews", "get_review", "pending_review_findings")
+        if project and not (review and scope.get("all_reviews")):
+            self._target(scope, project)
+        if name == "list_reviews":
+            names = [project] if project else None if scope.get("all_reviews") else projects
+            return await asyncio.to_thread(
+                self.reviews.listing,
+                names,
+                page=arguments.get("page", 1),
+                state=arguments.get("state", ""),
+                action=arguments.get("action", ""),
+            )
+        if name == "get_review":
+            return await asyncio.to_thread(
+                self.reviews.detail,
+                str(project),
+                str(arguments.get("source")),
+                _uuid(arguments.get("id"), "a review"),
+                page=arguments.get("page", 1),
+            )
+        if name == "pending_review_findings":
+            return await asyncio.to_thread(
+                self.reviews.findings, str(project), page=arguments.get("page", 1)
+            )
+        if name == "get_execution_plan":
+            if arguments.get("queue"):
+                return await asyncio.to_thread(
+                    self.plans.detail, str(project), _uuid(arguments["queue"], "a queue")
+                )
+            return await asyncio.to_thread(self.plans.overview, str(project))
+        if thread and name in ("list_items", "list_runs", "list_queues"):
+            arguments.setdefault("project", thread)
+        if thread and name in ("get_flow", "flow_impact"):
+            owner = await asyncio.to_thread(self.flows.owner, str(arguments.get("flow")))
+            if owner:
+                self._target(scope, owner)
+        if name == "flow_impact":
+            return await asyncio.to_thread(self.flows.impact, str(arguments.get("flow")))
+        if thread and name == "get_item":
+            item = await asyncio.to_thread(self._item, arguments)
+            self._target(scope, item.get("project"))
+        if thread and name == "list_incidents":
+            return [
+                i
+                for p in projects or []
+                for i in (await asyncio.to_thread(self._operations().listing, project=p))["items"]
+            ]
+        answer = await self._read(name, arguments)
+        if thread and name in ("get_run", "get_queue"):
+            self._target(scope, answer.get("project"))
+        elif thread and name in ("get_inbox", "list_projects"):
+            return [row for row in answer if row.get("project") in (projects or [])]
+        elif thread and name == "list_flows":
+            owners = await asyncio.to_thread(self.flows.owners)
+            return [
+                row
+                for row in answer
+                if not owners.get(row["flow"]) or owners[row["flow"]] in (projects or [])
+            ]
+        return answer
+
     def _change(
-        self, run_id: UUID, name: str, kind: str, choice: dict[str, Any], arguments: dict[str, Any]
+        self,
+        run_id: UUID,
+        name: str,
+        kind: str,
+        choice: dict[str, Any],
+        arguments: dict[str, Any],
+        scope: dict[str, Any],
     ) -> Outcome:
+        if name in ("propose_flow", "retire_flow"):
+            if arguments.get("global_scope") and arguments.get("project"):
+                raise ProjectInvalid("Choose one project or the global flow library.")
+            if scope.get("thread") and not arguments.get("global_scope"):
+                arguments.setdefault("project", scope["thread"])
+            flow = str((arguments.get("document") or {}).get("key") or arguments.get("flow") or "")
+            target = arguments.get("project")
+            if name == "propose_flow" and target:
+                local = self.flows.import_key(flow, target)
+                if local:
+                    arguments["document"] = {**arguments["document"], "key": local}
+                    flow = local
+            exists = self.flows.exists(flow)
+            if exists and self.flows.owner(flow) != target:
+                raise ProjectInvalid("The selected flow belongs to another library.")
+            arguments["_revision"] = self.flows.version_in_force(flow) if exists else None
+            arguments["_exists"] = exists
+            arguments["_definition"] = self.flows.versions(flow)[0]["sha256"] if exists else None
+        if name == "classify_issue":
+            arguments["_previous"] = self._issue_type(arguments)
+        if len(_text(arguments, bounded=False)) >= 20000:
+            raise ProjectInvalid("Split this proposed change into smaller actions.")
         intent = self._intent(name, arguments)
+        if not (
+            name in ("propose_flow", "retire_flow")
+            and arguments.get("global_scope")
+            and intent.project is None
+        ):
+            self._target(scope, intent.project)
         reason = _words(arguments.get("reason"))
         why = intent.confirm
         if why is None and choice.get("mode") != "automatic":
@@ -247,7 +377,10 @@ class Toolbox:
         if why is not None:
             if name == "propose_flow":
                 # A flow proposed again replaces the proposal that still waits.
-                self._withdraw_flow(str((arguments.get("document") or {}).get("key") or ""))
+                self._withdraw_flow(
+                    str((arguments.get("document") or {}).get("key") or ""),
+                    arguments.get("project"),
+                )
             self._record(
                 run_id,
                 name,
@@ -352,14 +485,16 @@ class Toolbox:
         item["run"] = self.runs.for_items([str(item_id)]).get(str(item_id))
         return item
 
-    def _withdraw_flow(self, key: str) -> None:
+    def _withdraw_flow(self, key: str, project: str | None) -> None:
         with self.sessions.begin() as session:
             for action in session.scalars(
                 select(SupervisorAction).where(
                     SupervisorAction.tool == "propose_flow", SupervisorAction.outcome == "pending"
                 )
             ):
-                if ((action.arguments or {}).get("document") or {}).get("key") == key:
+                if (action.arguments or {}).get("project") == project and (
+                    (action.arguments or {}).get("document") or {}
+                ).get("key") == key:
                     action.outcome = "rejected"
                     action.detail = "Replaced by a later proposal of the same flow."
                     action.decided_at = datetime.now(UTC)
@@ -390,9 +525,23 @@ class Toolbox:
         current = (
             self.flows.version_in_force(document.key) if self.flows.exists(document.key) else None
         )
+        prior = self.flows.document(document.key, current) if current is not None else None
+        baseline = (
+            json.dumps(prior.as_dict(layout=False), sort_keys=True, indent=2).splitlines()
+            if prior
+            else []
+        )
+        revised = json.dumps(document.as_dict(layout=False), sort_keys=True, indent=2).splitlines()
         return {
             **row,
             **described(document),
+            "project": arguments.get("project"),
+            "diff": "\n".join(
+                difflib.unified_diff(
+                    baseline, revised, fromfile="Current", tofile="Proposed", lineterm=""
+                )
+            ),
+            "impact": self.flows.impact(document.key) if prior else None,
             "exists": self.flows.exists(document.key),
             "in_force": current,
             "on_paper": simulate(document),
@@ -733,6 +882,14 @@ class Toolbox:
 
     # --- changing ------------------------------------------------------------------------
 
+    def _issue_type(self, arguments: dict[str, Any]) -> list[Any]:
+        with self.sessions() as db:
+            p = active_project(db, str(arguments.get("project")))
+            item = db.get(BacklogItem, _uuid(arguments.get("item"), "an issue"))
+            if not item or item.project_id != p.id:
+                raise ProjectNotFound("Issue")
+            return [item.execution_type, item.type_confirmed]
+
     def _intent(self, name: str, arguments: dict[str, Any]) -> Intent:
         """Check a change against what exists and put it into words. Raises when it cannot
         be done at all."""
@@ -741,6 +898,101 @@ class Toolbox:
             "conclude_incident",
         ):
             raise ProjectInvalid("Say why: a reason is required")
+        project = arguments.get("project")
+        if name == "ask_specialist":
+            candidates = arguments.get("issues")
+            if (
+                not isinstance(candidates, list)
+                or not (1 <= len(candidates) <= 8)
+                or not isinstance(arguments.get("request"), str)
+            ):
+                raise ProjectInvalid("Supply a request and one to eight technical issue IDs.")
+            for key in candidates:
+                if self.backlog.get(_uuid(key, "an issue"))["project"] != project:
+                    raise ProjectInvalid("Select issues from the named project.")
+            return Intent(
+                f"Request a specialist opinion for {len(candidates)} issues in {project}.",
+                project,
+                "A new comparison may use the project’s API allowance.",
+            )
+        if name == "classify_issue":
+            category = arguments.get("type")
+            if category not in ("bug", "enhancement") or self._issue_type(
+                arguments
+            ) != arguments.get("_previous"):
+                raise ProjectConflict("Refresh the issue classification before applying it.")
+            item = self.backlog.get(_uuid(arguments.get("item"), "an issue"))
+            return Intent(
+                f"Classify {project} issue {item['title']} as {category}.",
+                project,
+                "Confirmation applies its GitHub label once published.",
+            )
+        if name == "prepare_epic":
+            self.plans.preview(str(project), _uuid(arguments.get("epic"), "an Epic"))
+            return Intent(
+                f"Prepare Epic {arguments['epic']} in {project}.",
+                project,
+                "This starts project execution planning.",
+            )
+        if name == "change_execution_plan":
+            execution = self.plans.detail(str(project), _uuid(arguments.get("queue"), "a queue"))
+            if (
+                arguments.get("operation") not in ("classify", "save", "start")
+                or type(arguments.get("version")) is not int
+                or arguments["version"] != execution["version"]
+            ):
+                raise ProjectConflict("Read the current execution plan and its version first.")
+            if not isinstance(arguments.get("types", {}), dict) or any(
+                v not in ("bug", "enhancement") for v in arguments.get("types", {}).values()
+            ):
+                raise ProjectInvalid("Choose bug or enhancement for each issue.")
+            for field in ("stories", "order"):
+                value = arguments.get(field)
+                if value is not None and (
+                    not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+                ):
+                    raise ProjectInvalid("Order contains invalid issue or story identifiers.")
+            req = arguments.get("requires", {})
+            if not isinstance(req, dict) or not all(
+                isinstance(v, list) and all(isinstance(i, str) for i in v) for v in req.values()
+            ):
+                raise ProjectInvalid("Prerequisites must be lists of issue identifiers.")
+            return Intent(
+                f"{arguments['operation'].capitalize()} execution plan {execution['name']} "
+                f"in {project} (revision {execution['version']}).",
+                project,
+                "Review the requested changes to the project queue.",
+            )
+        if name in ("propose_flow", "retire_flow"):
+            key = str((arguments.get("document") or {}).get("key") or arguments.get("flow") or "")
+            exists = self.flows.exists(key)
+            if exists and self.flows.owner(key) != project:
+                raise ProjectInvalid("The flow belongs to another library.")
+            if "_revision" in arguments and (
+                exists != arguments.get("_exists")
+                or (exists and self.flows.version_in_force(key) != arguments["_revision"])
+                or (
+                    exists
+                    and "_definition" in arguments
+                    and self.flows.versions(key)[0]["sha256"] != arguments["_definition"]
+                )
+            ):
+                raise ProjectConflict("The flow has changed since it was proposed.")
+        if name == "retire_flow":
+            impact = self.flows.impact(key)
+            operation = arguments.get("operation")
+            if operation not in ("archive", "delete"):
+                raise ProjectInvalid("Choose archive or delete.")
+            if any(impact[k] for k in ("sections", "review_assignments", "callers", "active_runs")):
+                raise ProjectConflict(
+                    "Resolve the flow's assignments, callers and active runs first."
+                )
+            return Intent(
+                f"{operation.capitalize()} {impact['flow']} in {project or 'Global Settings'} "
+                f"({len(impact['versions'])} versions).",
+                project,
+                "Confirm the workflow retirement.",
+            )
         if name == "propose_flow":
             document = self._flow_document(arguments)
             if len(_text(arguments)) >= 20_000:
@@ -781,8 +1033,11 @@ class Toolbox:
                 if exists
                 else f"A new flow, {document.name} ({document.key})"
             )
+            if project:
+                what += f" in {project}"
             return Intent(
                 f"{what}: {path}. On paper: {went['ends']['text']} {after}",
+                project=project,
                 confirm="A flow takes effect only when you accept it.",
             )
         if name == "propose_items":
@@ -1048,21 +1303,63 @@ class Toolbox:
         if self.flows.exists(document.key):
             saved = self.flows.save_draft(document.key, raw, note=note)
         else:
-            saved = self.flows.create(raw, note=note)
+            saved = self.flows.create(raw, note=note, project=arguments.get("project"))
         kind = traits(document)
         if kind["writes"] or kind["publishes"]:
             return {
-                "flow": document.key,
+                "flow": saved.get("flow", document.key),
                 "version": saved["version"],
                 "state": "draft",
                 "next": "Put it in force on the Flows page.",
             }
         published = self.flows.publish(
-            document.key, note="Drafted by the supervisor, accepted by the administrator"
+            saved.get("flow", document.key),
+            note="Drafted by the supervisor, accepted by the administrator",
         )
-        return {"flow": document.key, "version": published["version"], "state": "in force"}
+        return {
+            "flow": saved.get("flow", document.key),
+            "version": published["version"],
+            "state": "in force",
+        }
 
     def _perform(self, name: str, arguments: dict[str, Any], run_id: UUID | None = None) -> Any:
+        if name == "ask_specialist":
+            return advice.enqueue(
+                self.sessions, arguments["project"], arguments["request"], arguments["issues"]
+            )
+        if name == "classify_issue":
+            with self.sessions.begin() as db:
+                p = active_project(db, str(arguments["project"]), lock=True)
+                item = db.get(
+                    BacklogItem, _uuid(arguments["item"], "an issue"), with_for_update=True
+                )
+                if (
+                    not item
+                    or item.project_id != p.id
+                    or [item.execution_type, item.type_confirmed] != arguments["_previous"]
+                ):
+                    raise ProjectConflict("The issue classification changed.")
+                confirm_classification(db, p, item, arguments["type"])
+                return {"issue": str(item.id), "type": arguments["type"]}
+        if name == "prepare_epic":
+            return self.plans.create(arguments["project"], _uuid(arguments["epic"], "an Epic"))
+        if name == "change_execution_plan":
+            return self.plans.change(
+                arguments["project"],
+                _uuid(arguments["queue"], "a queue"),
+                arguments["version"],
+                arguments["operation"],
+                types=arguments.get("types", {}),
+                stories=arguments.get("stories"),
+                order=arguments.get("order"),
+                requires=arguments.get("requires"),
+            )
+        if name == "retire_flow":
+            return self.flows.remove(
+                str(arguments["flow"]),
+                archive=arguments["operation"] == "archive",
+                require_unassigned=True,
+            )
         if name == "propose_flow":
             return self._accept_flow(arguments)
         if name == "propose_items":
@@ -1229,16 +1526,20 @@ class Toolbox:
 
     # --- the administrator's side --------------------------------------------------------
 
-    def pending(self) -> list[dict[str, Any]]:
+    def pending(self, *, thread: str | None = None) -> list[dict[str, Any]]:
         """Actions that wait for the administrator, as inbox entries, oldest first."""
         with self.sessions() as session:
-            rows = session.execute(
+            query = (
                 select(SupervisorAction, ProjectRecord)
                 .outerjoin(ProjectRecord, SupervisorAction.project_id == ProjectRecord.id)
                 .where(SupervisorAction.outcome == "pending")
-                .order_by(SupervisorAction.created_at)
-                .limit(100)
-            ).all()
+            )
+            if thread is not None:
+                origin = SandboxRun.data["thread"].as_string()
+                query = query.outerjoin(SandboxRun, SupervisorAction.run_id == SandboxRun.id).where(
+                    origin == thread if thread else origin.is_(None)
+                )
+            rows = session.execute(query.order_by(SupervisorAction.created_at).limit(100)).all()
             return [
                 {
                     "kind": "supervisor_action",
@@ -1250,6 +1551,9 @@ class Toolbox:
                     "action_id": str(action.id),
                     "tool": action.tool,
                     "summary": action.summary,
+                    "arguments": {
+                        k: v for k, v in (action.arguments or {}).items() if not k.startswith("_")
+                    },
                     "reason": action.reason,
                     "at": _when(action.created_at),
                 }
@@ -1289,13 +1593,20 @@ class Toolbox:
                 "total": len(rows),
             }
 
-    def decide(self, action_id: UUID, *, accept: bool, via: str) -> dict[str, Any]:
+    def decide(
+        self, action_id: UUID, *, accept: bool, via: str, thread: str | None = None
+    ) -> dict[str, Any]:
         """The administrator's answer to an action that waits: carry it out, or not."""
         with self.sessions.begin() as session:
             action = session.scalar(
                 select(SupervisorAction).where(SupervisorAction.id == action_id).with_for_update()
             )
             if action is None:
+                raise ProjectNotFound(str(action_id))
+            run = session.get(SandboxRun, action.run_id) if action.run_id else None
+            origin = (run.data or {}).get("thread", "") if run else ""
+            original_scope = (run.data or {}).get("scope") if run else None
+            if thread is not None and thread != origin:
                 raise ProjectNotFound(str(action_id))
             if action.outcome != "pending":
                 raise ProjectConflict("That has already been decided")
@@ -1308,7 +1619,9 @@ class Toolbox:
             else:
                 try:
                     self._intent(action.tool, dict(action.arguments or {}))
-                    self._perform(action.tool, dict(action.arguments or {}), action.run_id)
+                    action.result = self._perform(
+                        action.tool, dict(action.arguments or {}), action.run_id
+                    )
                 except REFUSALS as error:
                     detail = (
                         "What it was about is no longer there."
@@ -1330,8 +1643,11 @@ class Toolbox:
                 "summary": summary,
                 "detail": action.detail,
                 "action": summary,
+                "result": action.result,
             }
-        self.conversation.note(said)
+        if origin and row.get("result"):
+            said += " " + _text(row["result"])[:900]
+        self.conversation.note(said, thread=origin, scope=original_scope)
         if row["outcome"] == "failed":
             raise ProjectConflict(str(row["detail"]))
         return row

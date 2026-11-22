@@ -106,6 +106,7 @@ from engineering_control.dashboard.schemas import (
     ProjectDescriptionInput,
     ProjectPauseInput,
     ProjectRenameInput,
+    ProjectSupervisorMessage,
     ProposalDecisions,
     ProposalEdit,
     QueueCreateInput,
@@ -132,6 +133,7 @@ from engineering_control.dashboard.schemas import (
     SupervisorDefinitionInput,
     SupervisorMessageInput,
     SupervisorModelInput,
+    SupervisorStopInput,
     TaskHiddenInput,
     TaskInput,
     TriggerInput,
@@ -152,6 +154,7 @@ from engineering_control.logging import configure_logging
 from engineering_control.models.sealing import read_sealing_key
 from engineering_control.models.service import Models
 from engineering_control.projects import PROJECT_SET
+from engineering_control.supervisor import advice as supervisor_advice
 
 PACKAGE_ROOT = Path(__file__).parent
 # The built gntik-ui console (web/console, `pnpm build`): index.html plus hashed assets.
@@ -180,6 +183,7 @@ CONSOLE_VIEWS = frozenset(
         "backlog",
         "settings/accounts",
         "settings/stats",
+        "settings/supervisor",
         "runs",
         "run",
         "supervisor",
@@ -381,12 +385,13 @@ def create_app(
                             await asyncio.to_thread(records.planning_analysis.active_counts)
                         ),
                     )
-                planned, reviewed, coverage = await asyncio.gather(
+                planned, reviewed, coverage, advice = await asyncio.gather(
                     records.execution_plans.tick(available),
                     records.planning_analysis.tick(available),
                     records.workspace_imports.tick_coverage(available),
+                    supervisor_advice.tick(records.sessions, available),
                 )
-                worked = planned or reviewed or coverage
+                worked = planned or reviewed or coverage or advice
             except Exception as error:  # noqa: BLE001 - an expired lease is resumed on the next pass
                 log_failure("planning-review", "Automatic planning review could not run", error)
                 worked = False
@@ -2242,6 +2247,99 @@ def create_app(
             entity="run",
         )
 
+    @app.get("/api/dashboard/projects/{name}/supervisor")
+    async def project_supervisor(name: str, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await service(request).supervisor(thread=name))
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/supervisor/messages")
+    async def project_supervisor_message(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ProjectSupervisorMessage,
+            lambda body: service(request).say_to_supervisor(
+                body.text,
+                thread=name,
+                projects=body.projects,
+                all_reviews=body.all_reviews,
+                request_id=body.request_id,
+            ),
+            status_code=201,
+            event="dashboard.supervisor_asked",
+            subject=name,
+            entity="message",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/supervisor/stop")
+    async def project_supervisor_stop(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            SupervisorStopInput,
+            lambda body: service(request).stop_supervisor(thread=name, run_id=body.run_id),
+            event="dashboard.supervisor_stopped",
+            subject=name,
+            entity="run",
+        )
+
+    @app.post("/api/dashboard/projects/{name}/supervisor/actions/{action_id}/decide")
+    async def project_supervisor_decide(name: str, action_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            SupervisorDecisionInput,
+            lambda body: service(request).decide_action(action_id, body.accept, thread=name),
+            event="dashboard.supervisor_action_decided",
+            subject=name,
+            entity="action",
+        )
+
+    @app.get("/api/dashboard/projects/{name}/supervisor/reviews")
+    async def project_supervisor_reviews(
+        name: str,
+        request: Request,
+        page: int = 1,
+        state: str = "",
+        action: str = "",
+        all_projects: bool = False,
+        projects: str = Query("", max_length=2400),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            result = await asyncio.to_thread(
+                repo(request).toolbox.reviews.listing,
+                None if all_projects else [name, *filter(None, projects.split(","))],
+                page=page,
+                state=state,
+                action=action,
+            )
+            return JSONResponse(result)
+        except ProjectInvalid as error:
+            raise HTTPException(422, str(error)) from None
+
+    @app.get("/api/dashboard/projects/{name}/supervisor/reviews/{source}/{key}")
+    async def supervisor_review_detail(
+        name: str, source: str, key: UUID, request: Request, page: int = Query(1, ge=1)
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).toolbox.reviews.detail, name, source, key, page=page
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Review not found") from None
+        except ProjectInvalid as error:
+            raise HTTPException(422, str(error)) from None
+
     @app.get("/api/dashboard/supervisor/settings")
     async def supervisor_settings_api(request: Request) -> Response:
         """The supervisor's definition in force, its versions and the tools it can have."""
@@ -3579,7 +3677,7 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|reviews/(?:related-work|planning|discovery)"
+                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

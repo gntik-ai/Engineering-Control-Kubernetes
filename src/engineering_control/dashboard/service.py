@@ -424,29 +424,56 @@ class DashboardService:
 
     # --- the supervisor ------------------------------------------------------------------
 
-    async def supervisor(self, *, after: datetime | None = None) -> dict[str, object]:
+    async def supervisor(
+        self, *, after: datetime | None = None, thread: str = ""
+    ) -> dict[str, object]:
         """The conversation, whether the supervisor is answering, and what it proposed
         that waits for the administrator."""
 
         def read() -> dict[str, Any]:
-            listing = self.repository.conversation.listing(after=after)
-            return {**listing, "pending": self.repository.toolbox.pending()}
+            listing = self.repository.conversation.listing(after=after, thread=thread)
+            return {
+                **listing,
+                "pending": self.repository.toolbox.pending(thread=thread),
+                **(
+                    {"incidents": self.repository.operations.listing(project=thread)["items"]}
+                    if thread
+                    else {}
+                ),
+            }
 
         return await asyncio.to_thread(read)
 
-    async def say_to_supervisor(self, text: str) -> dict[str, object]:
+    async def say_to_supervisor(
+        self,
+        text: str,
+        *,
+        thread: str = "",
+        projects: list[str] | None = None,
+        all_reviews: bool = False,
+        request_id: UUID | None = None,
+    ) -> dict[str, object]:
         return await asyncio.to_thread(
             lambda: {
-                **self.repository.conversation.post(text, channel="console"),
+                **self.repository.conversation.post(
+                    text,
+                    channel="console",
+                    thread=thread,
+                    projects=projects,
+                    all_reviews=all_reviews,
+                    request_id=request_id,
+                ),
                 "message": "console",
             }
         )
 
-    async def stop_supervisor(self) -> dict[str, object]:
+    async def stop_supervisor(
+        self, *, thread: str = "", run_id: UUID | None = None
+    ) -> dict[str, object]:
         def stop() -> dict[str, Any]:
-            turn = self.repository.conversation.listing(limit=1)["turn"]
-            if turn is None:
-                raise ProjectConflict("The supervisor is not answering right now")
+            turn = self.repository.conversation.listing(limit=1, thread=thread)["turn"]
+            if turn is None or (run_id and str(run_id) != turn["run_id"]):
+                raise ProjectConflict("This supervisor reply has already ended")
             return self.repository.runs.request_cancel(UUID(turn["run_id"]))
 
         return await asyncio.to_thread(stop)
@@ -487,9 +514,13 @@ class DashboardService:
 
         return await asyncio.to_thread(choose)
 
-    async def decide_action(self, action_id: UUID, accept: bool) -> dict[str, object]:
+    async def decide_action(
+        self, action_id: UUID, accept: bool, *, thread: str | None = None
+    ) -> dict[str, object]:
         return await asyncio.to_thread(
-            lambda: self.repository.toolbox.decide(action_id, accept=accept, via="console")
+            lambda: self.repository.toolbox.decide(
+                action_id, accept=accept, via="console", thread=thread
+            )
         )
 
     async def proposed_flow(self, action_id: UUID) -> dict[str, object]:

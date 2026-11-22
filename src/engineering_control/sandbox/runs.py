@@ -47,6 +47,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.engine import parts
 from engineering_control.engine.builtin import BUILTIN, COMMANDS_CHECK, FLOW_OF_KIND, kind_of
+from engineering_control.engine.catalogue import REVIEW_TASKS
 from engineering_control.engine.document import Document
 from engineering_control.engine.library import (
     document_in_force,
@@ -1649,6 +1650,9 @@ def _followed(session: Session, document: Document, key: str, version: int) -> d
         found = in_force(session, part)
         if found is not None:
             pinned[part] = found[0]
+    if version or pinned:
+        expanded, _, _ = parts.expand(document, pinned=pinned)
+        said["has_review"] = any(n.task in REVIEW_TASKS for n in expanded.nodes)
     if pinned:
         said["parts"] = pinned
     return said

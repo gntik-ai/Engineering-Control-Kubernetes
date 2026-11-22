@@ -44,6 +44,7 @@ ITEM_KINDS: Final = ("finding", "clean-up", "ui-finding", "ux-finding")
 # The tasks that report candidate findings, and the tasks that verify them.
 AUDITING: Final = ("agent.audit", "agent.audit_application")
 VERIFYING: Final = ("agent.verify", "agent.verify_application")
+REVIEW_TASKS: Final = (*AUDITING, *VERIFYING, "agent.review", "agent.review_proposals")
 
 
 @dataclass(frozen=True)
@@ -1294,6 +1295,27 @@ for review_action, (review_name, review_summary) in reviews.ACTIONS.items():
         review_summary,
         "review",
         params=(
+            *(
+                (
+                    Param(
+                        "method",
+                        "choice",
+                        "standard",
+                        "Method for advisory issue selection and classification.",
+                        choices=("standard", "rerank", "decision"),
+                    ),
+                    Param(
+                        "rank_model",
+                        "line",
+                        "",
+                        "Optional Accounts provider:model used for reranking.",
+                        high=120,
+                    ),
+                    *_decision_params(reviews.DECISION)[:2],
+                )
+                if review_action == "supervisor"
+                else ()
+            ),
             *_ROUTING,
             Param(
                 "generation",

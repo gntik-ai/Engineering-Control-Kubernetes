@@ -450,11 +450,19 @@ open a way into the cluster. Without the key no grant is given or honoured.
 
 ## The supervisor
 
-The supervisor is an agent the administrator talks to: in the panel that opens from the top
-bar of every page, and in chat. It is defined like any agent, and the definition is edited
-on the Supervisor page: its instructions, its skills, which tools it has and whether what
-each does is carried out at once or waits for the administrator, and the subscription it
-works on. Every save is a new version and needs the password.
+Open **Supervisor** directly below **Dashboard** for the current project's conversation.
+The action targets control which projects that conversation can change. **Check reviews**
+reads saved runs, proposals, decisions and evidence, including queued or paused reviews.
+You can include all projects in this view. Reading history and polling for review blockers
+do not start a review or call a model. The top bar and messaging channel retain the
+general conversation.
+
+Under **Global Settings → Supervisor**, the administrator chooses the subscription,
+model, reasoning effort, instructions, skills and tool permissions. Each saved definition
+is versioned. Workflow proposals show their changes before approval. An assigned
+**Supervisor advice** review flow can use a standard model, a reranker, or a native
+decision model for issue selection and classification. Specialist requests require
+confirmation and identical requests reuse the saved result.
 
 Which model answers, and how hard it reasons before it does, is chosen by provider: in
 the supervisor's panel ("Model and reasoning", in force from the next answer and without

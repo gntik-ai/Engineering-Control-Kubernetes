@@ -33,6 +33,7 @@ from engineering_control.db.models import (
     ProjectSection,
     RemovedFlow,
     ReviewFlowAssignment,
+    ReviewFlowRun,
     SandboxRun,
     SavedTask,
 )
@@ -61,6 +62,8 @@ def _when(value: datetime | None) -> str | None:
 def in_force(session: Session, key: str) -> tuple[int, str] | None:
     """The version of a flow that runs started now follow, with its hash; None when the
     platform has no such flow."""
+    if is_removed(session, key):
+        return None
     row = session.scalar(
         select(FlowVersion)
         .where(FlowVersion.flow_key == key, FlowVersion.state == "published")
@@ -79,6 +82,22 @@ def _flow_of(run: SandboxRun) -> str:
     said = (run.data or {}).get("flow")
     key = said.get("key") if isinstance(said, dict) else None
     return str(key or FLOW_OF_KIND.get(run.kind) or "")
+
+
+def _active_flow_runs(db: Session, key: str) -> list[UUID]:
+    delivery = [
+        r.id
+        for r in db.scalars(
+            select(SandboxRun).where(SandboxRun.state.in_(("queued", "running", "waiting")))
+        )
+        if _flow_of(r) == key
+    ]
+    reviews = db.scalars(
+        select(ReviewFlowRun.id).where(
+            ReviewFlowRun.flow_key == key, ReviewFlowRun.finished_at.is_(None)
+        )
+    )
+    return [*delivery, *reviews]
 
 
 def described(document: Document) -> dict[str, Any]:
@@ -279,9 +298,11 @@ class FlowRecords:
 
     def exists(self, key: str) -> bool:
         with self.sessions() as session:
+            if is_removed(session, key):
+                return False
             if key in BUILTIN:
                 # One of the platform's own is there until it is deleted.
-                return not is_removed(session, key)
+                return True
             return (
                 session.scalar(select(FlowVersion.id).where(FlowVersion.flow_key == key))
                 is not None
@@ -317,7 +338,9 @@ class FlowRecords:
                 session.add(ProjectFlow(flow_key=document.key, local_key=local_key, project_id=pid))
             self.check_dependencies(session, document, pid)
             if is_removed(session, document.key):
-                if document.key in BUILTIN:
+                if document.key in BUILTIN or session.scalar(
+                    select(FlowVersion.id).where(FlowVersion.flow_key == document.key).limit(1)
+                ):
                     raise ProjectConflict(
                         f"{document.key} is the key of {BUILTIN[document.key].name}, a flow of "
                         "the platform's own that was deleted: put that one back, or give "
@@ -343,7 +366,7 @@ class FlowRecords:
         with self.sessions() as session:
             made = set(session.scalars(select(FlowVersion.flow_key).distinct()))
             gone = removed_keys(session)
-        return [*(key for key in BUILTIN if key not in gone), *sorted(made - set(BUILTIN))]
+        return [*(key for key in BUILTIN if key not in gone), *sorted(made - set(BUILTIN) - gone)]
 
     def global_documents(self) -> Iterator[tuple[Document, bool]]:
         """The published definition and current draft of each visible global flow."""
@@ -660,9 +683,53 @@ class FlowRecords:
                 listed.append(
                     {"key": key, "name": named.name, "summary": named.summary, "runs": False}
                 )
+            else:
+                with self.sessions() as db:
+                    saved = db.scalar(
+                        select(FlowVersion)
+                        .where(FlowVersion.flow_key == key)
+                        .order_by(FlowVersion.version.desc())
+                        .limit(1)
+                    )
+                    if saved:
+                        listed.append(
+                            {
+                                "key": key,
+                                "name": saved.document.get("name", key),
+                                "summary": saved.document.get("summary", ""),
+                                "runs": True,
+                            }
+                        )
         return listed
 
-    def remove(self, key: str) -> dict[str, Any]:
+    def impact(self, key: str) -> dict[str, Any]:
+        if not self.exists(key):
+            raise ProjectNotFound(key)
+        with self.sessions() as db:
+            sections = db.execute(
+                select(ProjectRecord.name, ProjectSection.key)
+                .join(ProjectSection, ProjectSection.project_id == ProjectRecord.id)
+                .where(ProjectSection.flow_key == key)
+            )
+            assignments = db.execute(
+                select(ProjectRecord.name, ReviewFlowAssignment.action)
+                .join(ReviewFlowAssignment, ReviewFlowAssignment.project_id == ProjectRecord.id)
+                .where(ReviewFlowAssignment.flow_key == key)
+            )
+            active = [str(run_id) for run_id in _active_flow_runs(db, key)]
+            return {
+                "flow": key,
+                "project": self.owner(key),
+                "versions": [v["version"] for v in self.versions(key)],
+                "sections": [{"project": p, "section": s} for p, s in sections],
+                "review_assignments": [{"project": p, "action": a} for p, a in assignments],
+                "callers": self._runs_part_safely(key),
+                "active_runs": active,
+            }
+
+    def remove(
+        self, key: str, *, archive: bool = False, require_unassigned: bool = False
+    ) -> dict[str, Any]:
         """Delete a flow: its versions, its draft and the evaluations made of it. The
         sections that have it are left without a flow. A flow of the platform's own, or
         a name of the library, is kept out from then on and can be put back.
@@ -704,13 +771,7 @@ class FlowRecords:
                     f"run{'s' if len(callers) == 1 else ''} it as a part: take it out of "
                     "there first, or delete that flow first"
                 )
-            under_way = [
-                run
-                for run in session.scalars(
-                    select(SandboxRun).where(SandboxRun.state.in_(("queued", "running", "waiting")))
-                )
-                if _flow_of(run) == key
-            ]
+            under_way = _active_flow_runs(session, key)
             if under_way:
                 count = len(under_way)
                 raise ProjectConflict(
@@ -730,6 +791,17 @@ class FlowRecords:
                 for section, record in sections
                 if record.archived_at is None
             ]
+            if sections and require_unassigned:
+                raise ProjectConflict("Reassign the project sections before retiring this flow.")
+            if archive:
+                session.add(RemovedFlow(flow_key=key))
+                return {
+                    "key": key,
+                    "flow": key,
+                    "name": name,
+                    "archived": True,
+                    "versions": len(rows),
+                }
             session.execute(
                 update(ProjectSection)
                 .where(ProjectSection.flow_key == key)
@@ -768,16 +840,28 @@ class FlowRecords:
         versions made of it here went with it and do not come back."""
         with self.sessions.begin() as session:
             row = session.scalar(select(RemovedFlow).where(RemovedFlow.flow_key == key))
-            if row is None or not (key in BUILTIN or key in FLOWS):
+            saved = session.scalar(
+                select(FlowVersion)
+                .where(FlowVersion.flow_key == key)
+                .order_by(FlowVersion.version.desc())
+                .limit(1)
+            )
+            if row is None or not (key in BUILTIN or key in FLOWS or saved):
                 raise ProjectNotFound(key)
             session.delete(row)
-        name = BUILTIN[key].name if key in BUILTIN else FLOWS[key].name
-        return {"key": key, "flow": key, "name": name, "builtin": True}
+            name = (
+                str(saved.document.get("name") or key)
+                if saved
+                else (BUILTIN[key].name if key in BUILTIN else FLOWS[key].name)
+            )
+        return {"key": key, "flow": key, "name": name, "builtin": key in BUILTIN or key in FLOWS}
 
     def publish(self, key: str, *, note: str | None = None) -> dict[str, Any]:
         """Put the draft in force. A draft with an error cannot be published, and one
         that says nothing new is not worth a version."""
         with self.sessions.begin() as session:
+            if is_removed(session, key):
+                raise ProjectNotFound(key)
             row = session.scalar(
                 select(FlowVersion)
                 .where(FlowVersion.flow_key == key, FlowVersion.state == "draft")
