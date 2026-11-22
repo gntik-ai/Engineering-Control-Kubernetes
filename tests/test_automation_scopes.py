@@ -6,7 +6,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from engineering_control.dashboard.repository import DashboardRepository
-from engineering_control.db.models import ProjectRecord
+from engineering_control.db.models import CommandProfile, FlowVersion, ProjectRecord
+from engineering_control.engine.builtin import BUILTIN
+from engineering_control.sandbox import deliver
 from engineering_control.sandbox.runs import commands_of_project
 from tests.test_dashboard_web import PASSWORD, _authenticated_client
 
@@ -14,6 +16,122 @@ from tests.test_dashboard_web import PASSWORD, _authenticated_client
 def post(client: TestClient, path: str, **body: Any) -> Any:
     token = client.get("/api/dashboard/session").json()["csrf_token"]
     return client.post("/api/dashboard/" + path, json={"csrf_token": token, **body})
+
+
+def test_global_catalog_tracks_published_draft_and_private_sources(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        key = "deliver-issue"
+        draft = BUILTIN[key].as_dict()
+        draft["prompts"] = {"implementer": {"role": "Implement this issue."}}
+        clone = next(node for node in draft["tasks"] if node["task"] == "workspace.install")
+        clone["with"]["commands"] = ["pnpm install"]
+        repo.flows.save_draft(key, draft)
+        private = post(
+            client,
+            "flows?scope_project=falcone",
+            key="local-catalog",
+            name="Private flow",
+            copy_of=key,
+        ).json()["flow"]
+        local = repo.flows.document(private, 1)
+        assert local
+        raw = local.as_dict()
+        next(n for n in raw["tasks"] if n["task"] == "workspace.install")["with"]["commands"] = [
+            "pytest private-check"
+        ]
+        repo.flows.save_draft(private, raw)
+        repo.flows.save_task(
+            name="Shared checks", task="code.run", params={"commands": ["pytest -q"]}, wording={}
+        )
+
+        with repo.sessions.begin() as db:
+            db.add(
+                FlowVersion(
+                    flow_key="code-clean",
+                    version=1,
+                    state="published",
+                    document={"format": "obsolete"},
+                    sha256="0" * 64,
+                )
+            )
+        inventory = client.get("/api/dashboard/agents").json()
+        assert all(use["flow"] != "code-clean" for r in inventory["roles"] for use in r["used_by"])
+        maker = next(x for x in inventory["roles"] if x["prompt"]["name"] == "implementer")
+        assert {
+            (r["draft"], r["custom_wording"]) for r in maker["used_by"] if r["flow"] == key
+        } == {(True, True), (False, False)}
+        assert all(r["flow"] != private for r in maker["used_by"])
+        assert client.get("/api/dashboard/agents?scope_project=falcone").json()["roles"] == []
+        catalog = client.get("/api/dashboard/command-profiles").json()
+        assert catalog["items"] == []
+        assert {
+            (r["name"], r["draft"], tuple(r["commands"])) for r in catalog["task_commands"]
+        } == {("Deliver issue", True, ("pnpm install",)), ("Shared checks", False, ("pytest -q",))}
+        assert (
+            "manifests"
+            not in client.get("/api/dashboard/command-profiles?scope_project=falcone").json()
+        )
+        with repo.sessions() as db:
+            assert db.scalar(select(CommandProfile.id)) is None
+    finally:
+        client.close()
+        repo.engine.dispose()
+
+
+def test_shared_manifest_profile_keeps_execution_metadata_and_selection(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        add_project(client)
+        base = "/api/dashboard/command-profiles"
+
+        def manifest() -> Any:
+            return next(
+                m for m in client.get(base).json()["manifests"] if m["project"] == "falcone"
+            )
+
+        catalog = manifest()
+        chain = deliver.toolchain_for("falcone")
+        assert catalog["using"] == "manifest"
+        fields = dict(
+            name="CI from Falcone",
+            current_password=PASSWORD,
+            manifest="falcone",
+            install=[c["line"] for c in catalog["install"]],
+            tests=[c["line"] for c in catalog["tests"]],
+        )
+        assert fields["install"] == [deliver.line_of(c) for c in chain.prepare]
+        assert fields["tests"] == [deliver.line_of(c) for c in chain.tests]
+        assert post(client, "command-profiles?scope_project=other", **fields).status_code == 422
+        created = post(client, "command-profiles", **fields)
+        assert created.status_code == 201
+        profile = created.json()["id"]
+        path = "projects/falcone/command-profile"
+        assert manifest()["using"] == "manifest"
+        assert post(client, path, profile_id=profile, current_password=PASSWORD).status_code == 200
+        assert manifest()["using"] == "profile"
+
+        def effective() -> dict[str, Any]:
+            with repo.sessions() as db:
+                project = db.scalar(select(ProjectRecord).where(ProjectRecord.name == "falcone"))
+                assert project
+                return commands_of_project(project, chain.as_dict())
+
+        assert effective() == chain.as_dict()
+        changed = {**fields, "tests": ["pytest new-tests", fields["tests"][0]]}
+        del changed["manifest"]
+        assert post(client, "command-profiles/" + profile + "/update", **changed).status_code == 200
+        actual = effective()
+        assert actual["prepare"] == chain.as_dict()["prepare"]
+        assert actual["tests"] == [
+            deliver.command_of("pytest new-tests").as_dict(),
+            chain.tests[0].as_dict(),
+        ]
+        assert post(client, path, profile_id=None, current_password=PASSWORD).status_code == 200
+        assert manifest()["using"] == "manifest" and effective() == chain.as_dict()
+    finally:
+        client.close()
+        repo.engine.dispose()
 
 
 def add_project(client: TestClient) -> None:

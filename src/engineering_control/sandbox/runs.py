@@ -184,16 +184,17 @@ def commands_of_project(project: ProjectRecord, toolchain: dict[str, Any]) -> di
     if not isinstance(own, dict):
         return toolchain
     try:
-        prepare = deliver.commands_of([str(line) for line in own.get("install") or []])
-        tests = deliver.commands_of([str(line) for line in own.get("tests") or []])
+        source = deliver.Toolchain.from_dict(own.get("source_commands"))
+        prepare = deliver.profile_commands(own.get("install") or [], source.prepare)
+        tests = deliver.profile_commands(own.get("tests") or [], source.tests)
     except ValueError:
         # What was written is checked when it is written; a record that cannot be read
         # any more leaves the run with the platform's file.
         return toolchain
     return {
         **toolchain,
-        "prepare": [command.as_dict() for command in prepare],
-        "tests": [command.as_dict() for command in tests],
+        "prepare": prepare,
+        "tests": tests,
         # The file's word on tools the sandbox lacks is about the file's commands.
         "note": None,
     }

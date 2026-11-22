@@ -743,13 +743,13 @@ function SaveDialog({
   );
 }
 
-export function SupervisorPage() {
+export function SupervisorPage({ initialTab = 'instructions' }: { initialTab?: 'instructions' | 'tools' } = {}) {
   const settings = useResource<SupervisorSettings>(apiUrl('supervisor/settings'));
   const [draft, setDraft] = useState<Draft | null>(null);
   const [loadedFrom, setLoadedFrom] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
-  const [tab, setTab] = useState('instructions');
+  const [tab, setTab] = useState<string>(initialTab);
   const definition = settings.data?.definition;
   // The editor starts from the definition in force, and again after every save.
   useEffect(() => {

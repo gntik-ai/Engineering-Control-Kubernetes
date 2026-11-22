@@ -26,6 +26,7 @@ from engineering_control.engine.agents import Agents, clean_settings, told
 from engineering_control.engine.builtin import BUILTIN, STARTERS
 from engineering_control.engine.catalogue import TASKS
 from engineering_control.engine.document import parse
+from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.engine.records import FlowRecords
 from engineering_control.engine.routing import provider_for
 from tests.test_dashboard_accounts import PASSWORD
@@ -517,7 +518,9 @@ def _post(client: TestClient, path: str, **fields: Any) -> httpx.Response:
 def test_agents_skills_and_starters_in_the_console(tmp_path: Path) -> None:
     client = _console(tmp_path)
     try:
-        assert client.get("/api/dashboard/agents").json() == {"agents": [], "skills": []}
+        initial = client.get("/api/dashboard/agents").json()
+        assert initial["agents"] == initial["skills"] == []
+        assert {r["prompt"]["name"] for r in initial["roles"]} == set(CONTRACTS)
         skill = _post(
             client,
             "skills",
@@ -615,7 +618,9 @@ def test_agents_skills_and_starters_in_the_console(tmp_path: Path) -> None:
         gone = _post(client, f"agents/{agent['id']}/remove")
         assert gone.status_code == 200 and gone.json()["still_named_by"] == ["My loop"]
         assert _post(client, f"skills/{skill.json()['id']}/remove").status_code == 200
-        assert client.get("/api/dashboard/agents").json() == {"agents": [], "skills": []}
+        remaining = client.get("/api/dashboard/agents").json()
+        assert remaining["agents"] == remaining["skills"] == []
+        assert {r["prompt"]["name"] for r in remaining["roles"]} == set(CONTRACTS)
         assert _post(client, f"agents/{uuid4()}/remove").status_code == 404
         activity = (
             json.dumps(client.get("/api/dashboard/activity").json())

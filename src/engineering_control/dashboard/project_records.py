@@ -337,7 +337,14 @@ class ProjectRecords:
 
             profile = selection(session, record) if own is None else None
             if profile:
-                return {**profile.commands, "own": False, "note": None, "profile": shown(profile)}
+                view = shown(profile)
+                return {
+                    "install": view["install"],
+                    "tests": view["tests"],
+                    "own": False,
+                    "note": None,
+                    "profile": view,
+                }
         if own is not None:
             return {
                 "install": [str(line) for line in own.get("install") or []],

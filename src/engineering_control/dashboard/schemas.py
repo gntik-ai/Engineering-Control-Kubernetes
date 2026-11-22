@@ -138,6 +138,7 @@ class ProjectCommandsInput(DashboardModel):
 
 class CommandProfileInput(ProjectCommandsInput):
     name: str = Field(min_length=1, max_length=80)
+    manifest: str | None = Field(default=None, max_length=80)
 
 
 class CommandSelectionInput(DashboardModel):
