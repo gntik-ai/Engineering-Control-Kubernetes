@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import functools
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -66,6 +67,7 @@ from engineering_control.sandbox.runs import Runs
 from engineering_control.supervisor import advice
 from engineering_control.supervisor.conversation import Conversation
 from engineering_control.supervisor.definition import TOOLS
+from engineering_control.supervisor.learning import ProcessLearning, delivery_brief, draft_issue
 from engineering_control.supervisor.operations import Operations
 from engineering_control.supervisor.reviews import ReviewHistory
 
@@ -198,6 +200,7 @@ class Toolbox:
         self.github = github
         self.flows = FlowRecords(sessions)
         self.reviews = ReviewHistory(sessions)
+        self.learning = ProcessLearning(sessions)
         self.plans = ExecutionPlans(sessions)
 
     # --- a call from the supervisor ------------------------------------------------------
@@ -272,6 +275,10 @@ class Toolbox:
         review = name in ("list_reviews", "get_review", "pending_review_findings")
         if project and not (review and scope.get("all_reviews")):
             self._target(scope, project)
+        if name == "get_process_learning":
+            return await asyncio.to_thread(
+                self.learning.summary, str(project), page=arguments.get("page", 1)
+            )
         if name == "list_reviews":
             names = [project] if project else None if scope.get("all_reviews") else projects
             return await asyncio.to_thread(
@@ -357,6 +364,18 @@ class Toolbox:
             arguments["_revision"] = self.flows.version_in_force(flow) if exists else None
             arguments["_exists"] = exists
             arguments["_definition"] = self.flows.versions(flow)[0]["sha256"] if exists else None
+        if name in ("remember_approach", "propose_process_issue"):
+            self._target(scope, arguments.get("project"))
+        if name == "propose_process_issue":
+            issue = self.learning.issue(arguments)
+            if not issue["register"]:
+                self._target(scope, issue["project"])
+            arguments["_destination"] = [
+                issue["project"],
+                issue["repository"],
+                issue["branch"],
+                issue["project_id"],
+            ]
         if name == "classify_issue":
             arguments["_previous"] = self._issue_type(arguments)
         if len(_text(arguments, bounded=False)) >= 20000:
@@ -899,6 +918,25 @@ class Toolbox:
         ):
             raise ProjectInvalid("Say why: a reason is required")
         project = arguments.get("project")
+        if name == "remember_approach":
+            lesson = self.learning.approach(arguments)
+            return Intent(
+                f"Remember an approach for {project} / {lesson['flow']}: {lesson['approach']}",
+                project=project,
+                confirm="Accept to use this guidance in future Supervisor turns.",
+            )
+        if name == "propose_process_issue":
+            issue = self.learning.issue(arguments)
+            registration = (
+                f"Register Engineering Control on {issue['branch']} with its Issues flow and "
+                if issue["register"]
+                else "Accept to "
+            )
+            return Intent(
+                f"Draft “{issue['title']}” in {issue['repository']} from {project} evidence.",
+                project=project,
+                confirm=f"{registration}save a draft. Publication requires issue approval.",
+            )
         if name == "ask_specialist":
             candidates = arguments.get("issues")
             if (
@@ -1053,6 +1091,9 @@ class Toolbox:
                 if not _words(item.get("reason")):
                     raise ProjectInvalid("Each item needs a reason")
                 section = item.get("section")
+                if section == "issues":
+                    brief = item.get("delivery")
+                    delivery_brief(brief if isinstance(brief, dict) else {})
                 if section and section not in keys:
                     raise ProjectInvalid(f"The project {project} has no section {section}")
             titles = "; ".join(_words(item.get("title"), 80) for item in items[:5])
@@ -1323,6 +1364,10 @@ class Toolbox:
         }
 
     def _perform(self, name: str, arguments: dict[str, Any], run_id: UUID | None = None) -> Any:
+        if name == "remember_approach":
+            return self.learning.approach(arguments)
+        if name == "propose_process_issue":
+            return self.learning.issue(arguments, create=True)
         if name == "ask_specialist":
             return advice.enqueue(
                 self.sessions, arguments["project"], arguments["request"], arguments["issues"]
@@ -1366,6 +1411,24 @@ class Toolbox:
             project = str(arguments["project"])
             proposed, repeated = [], []
             for item in arguments["items"]:
+                if item.get("section") == "issues":
+                    title = clean_title(str(item["title"]))
+                    with self.sessions.begin() as db:
+                        result = draft_issue(
+                            db,
+                            active_project(db, project),
+                            title=title,
+                            body=delivery_brief(item["delivery"]),
+                            origin="supervisor-issue:"
+                            + hashlib.sha256(title.casefold().encode()).hexdigest(),
+                            category=None,
+                            facts={},
+                        )
+                    if result["existing"]:
+                        repeated.append(result["title"])
+                    else:
+                        proposed.append(result)
+                    continue
                 made = self.backlog.propose(
                     project,
                     title=str(item["title"]),

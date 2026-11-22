@@ -51,6 +51,8 @@ interface History {
   total: number;
 }
 interface ReviewDetail {
+  title?: string;
+  version?: number;
   outcome?: string;
   evidence?: unknown;
   findings?: unknown;
@@ -68,6 +70,7 @@ function SavedReview({ review, close }: { review: ReviewRow; close: () => void }
     apiUrl(`projects/${review.project}/supervisor/reviews/${review.source}/${review.id}`, { page }),
   );
   const data = saved.data;
+  const version = data?.version ?? review.version;
   return (
     <Dialog
       open
@@ -77,10 +80,10 @@ function SavedReview({ review, close }: { review: ReviewRow; close: () => void }
     >
       <DialogContent size="lg">
         <DialogHeader>
-          <DialogTitle>{review.title}</DialogTitle>
+          <DialogTitle>{data?.title ?? review.title}</DialogTitle>
           <DialogDescription>
-            {review.project} · {review.state.replaceAll('_', ' ')}
-            {review.version != null && ' · Flow v' + review.version}
+            {review.project} · {(data?.outcome ?? review.state).replaceAll('_', ' ')}
+            {version != null && ' · Flow v' + version}
           </DialogDescription>
         </DialogHeader>
         <DialogBody className="grid gap-3">
@@ -126,7 +129,9 @@ function SavedReview({ review, close }: { review: ReviewRow; close: () => void }
               </Button>
             </div>
           )}
-          <Link href={review.url}>Open {review.source === 'sandbox' ? 'run' : 'project review page'}</Link>
+          {review.action !== 'supervisor' && (
+            <Link href={review.url}>Open {review.source === 'sandbox' ? 'run' : 'project review page'}</Link>
+          )}
         </DialogBody>
       </DialogContent>
     </Dialog>
@@ -237,6 +242,206 @@ function ReviewHistory({ project, all, targets }: { project: string; all: boolea
   );
 }
 
+interface ProcessEvidence {
+  id: string;
+  flow: string;
+  source: string;
+  signal: string;
+  step: string;
+  outcome: string;
+  seconds: number;
+}
+interface LearningSummary {
+  page: number;
+  pages: number;
+  sampled: number;
+  window_days: number;
+  limit_per_source: number;
+  slow_minutes: number;
+  patterns: (ProcessEvidence & {
+    occurrences: number;
+    samples: number;
+    examples: string[];
+    latest_success: ProcessEvidence | null;
+  })[];
+  approaches: (ProcessEvidence & { approach: string })[];
+  improvements: {
+    id: string;
+    title: string;
+    project: string;
+    url: string;
+    github_url: string | null;
+    issue_state: string | null;
+    flow: string | null;
+    run_id: string | null;
+    run_state: string | null;
+    outcome: string | null;
+  }[];
+}
+
+function LearningPanel({ project, discuss }: { project: string; discuss: (message: string) => void }) {
+  const [page, setPage] = useState(1);
+  const saved = useResource<LearningSummary>(apiUrl(`projects/${project}/supervisor/learning`, { page }));
+  const data = saved.data;
+  return (
+    <section className="grid gap-3" aria-label="Process learning">
+      <h2 className="text-lg font-semibold">Process learning</h2>
+      <LoadError resource={saved} />
+      {saved.loading && !data && <Spinner size={16} />}
+      {data && (
+        <>
+          <p className="text-sm text-muted-foreground">
+            {data.sampled} completed executions and reviews in the last {data.window_days} days. Includes up
+            to {data.limit_per_source} of each. Runs taking {data.slow_minutes} minutes or longer are flagged
+            for review.
+          </p>
+          {data.patterns.length ? (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Workflow</TableHead>
+                    <TableHead>Observation</TableHead>
+                    <TableHead>Occurrences</TableHead>
+                    <TableHead>Evidence</TableHead>
+                    <TableHead>Action</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {data.patterns.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell>
+                        {row.flow}
+                        {row.step && <div className="text-sm">{row.step}</div>}
+                      </TableCell>
+                      <TableCell>
+                        {row.signal === 'failure' ? row.outcome : 'Possible bottleneck'}
+                        <div className="text-xs text-muted-foreground">
+                          Latest run · {Math.ceil(row.seconds / 60)} min
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        {row.occurrences} of {row.samples}
+                      </TableCell>
+                      <TableCell>
+                        {row.examples.map((id, i) => (
+                          <div key={id}>
+                            <Link
+                              href={
+                                row.source === 'run'
+                                  ? BASE + '/run?id=' + id
+                                  : workspaceUrl(project) + '/supervisor?review=' + id
+                              }
+                            >
+                              {row.source === 'run' ? 'Run' : 'Review'} {i + 1}
+                            </Link>
+                          </div>
+                        ))}
+                        {row.latest_success && !row.examples.includes(row.latest_success.id) && (
+                          <Link
+                            href={
+                              row.source === 'run'
+                                ? BASE + '/run?id=' + row.latest_success.id
+                                : workspaceUrl(project) + '/supervisor?review=' + row.latest_success.id
+                            }
+                          >
+                            Latest success
+                          </Link>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() =>
+                            discuss(
+                              `Investigate the ${row.signal} in ${row.flow} for ${project}. Use saved ${row.source} ${row.id}, compare later outcomes, and propose a specific improvement if warranted.`,
+                            )
+                          }
+                        >
+                          Discuss
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <p>No failures or slow processes in this sample.</p>
+          )}
+          {data.pages > 1 && (
+            <div className="flex items-center gap-3">
+              <Button size="sm" variant="secondary" disabled={page === 1} onClick={() => setPage(page - 1)}>
+                Previous
+              </Button>
+              <span>
+                Page {data.page} of {data.pages}
+              </span>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={page >= data.pages}
+                onClick={() => setPage(page + 1)}
+              >
+                Next
+              </Button>
+            </div>
+          )}
+          {data.improvements.length > 0 && (
+            <>
+              <h3 className="font-semibold">Improvement issues</h3>
+              <ul className="grid gap-2">
+                {data.improvements.map((issue) => (
+                  <li key={issue.id}>
+                    <Link href={issue.url}>{issue.title}</Link> · {issue.project} · {issue.issue_state}
+                    {issue.github_url && (
+                      <>
+                        {' '}
+                        · <Link href={issue.github_url}>GitHub issue</Link>
+                      </>
+                    )}
+                    {issue.run_id ? (
+                      <>
+                        {' '}
+                        ·{' '}
+                        <Link href={BASE + '/run?id=' + issue.run_id}>
+                          Delivery {issue.run_state}
+                          {issue.outcome && ' · ' + issue.outcome}
+                        </Link>
+                      </>
+                    ) : (
+                      <>
+                        {' '}
+                        ·{' '}
+                        {issue.flow
+                          ? 'Workflow: ' + issue.flow
+                          : 'Assign an Issues flow in Engine before execution'}
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <h3 className="font-semibold">Approved approaches</h3>
+          {data.approaches.length ? (
+            <ul className="list-disc ps-5">
+              {data.approaches.map((r) => (
+                <li key={r.id}>
+                  <strong>{r.flow}</strong> · {r.approach}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-muted-foreground">No saved approaches for this project.</p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 export function ProjectSupervisor({ project, projects }: { project: string; projects: ProjectSummary[] }) {
   const root = `projects/${project}/supervisor`;
   const [busy, setBusy] = useState(false);
@@ -244,7 +449,25 @@ export function ProjectSupervisor({ project, projects }: { project: string; proj
   const [problem, setProblem] = useState('');
   const [targets, setTargets] = useState<string[]>([project]);
   const [allReviews, setAllReviews] = useState(false);
-  const [history, setHistory] = useState(false);
+  const [panel, setPanel] = useState<'chat' | 'history' | 'learning'>('chat');
+  const [alertReview, setAlertReview] = useState<ReviewRow | null>(null);
+  const reviewId = new URLSearchParams(window.location.search).get('review');
+  useEffect(() => {
+    setAlertReview(
+      reviewId
+        ? {
+            id: reviewId,
+            project,
+            source: 'review',
+            title: 'Saved review',
+            state: 'saved',
+            action: 'supervisor',
+            version: null,
+            url: workspaceUrl(project) + '/supervisor',
+          }
+        : null,
+    );
+  }, [reviewId, project]);
   const [pending, setPending] = useState(false);
   const request = useRef<{ signature: string; id: string } | null>(null);
   const channel = useResource<SupervisorConversation>(apiUrl(root), busy ? 2000 : 8000);
@@ -285,8 +508,21 @@ export function ProjectSupervisor({ project, projects }: { project: string; proj
     <div className="grid min-w-0 gap-4">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="me-auto text-2xl font-semibold">Supervisor</h1>
-        <Button size="sm" variant="secondary" onClick={() => setHistory(!history)}>
-          {history ? 'Open chat' : 'Check reviews'}
+        <Button
+          size="sm"
+          variant="secondary"
+          aria-pressed={panel === 'history'}
+          onClick={() => setPanel(panel === 'history' ? 'chat' : 'history')}
+        >
+          {panel === 'history' ? 'Open chat' : 'Check reviews'}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          aria-pressed={panel === 'learning'}
+          onClick={() => setPanel(panel === 'learning' ? 'chat' : 'learning')}
+        >
+          {panel === 'learning' ? 'Open chat' : 'Process learning'}
         </Button>
         <Link href={BASE + '/settings/supervisor?project=' + encodeURIComponent(project)}>
           Supervisor settings
@@ -323,7 +559,29 @@ export function ProjectSupervisor({ project, projects }: { project: string; proj
           <summary>Needs attention ({data.incidents.length})</summary>
           {data.incidents.map((i) => (
             <p key={i.id} className="mt-1 text-sm">
-              {typeof i.facts.url === 'string' ? (
+              {i.facts.action === 'supervisor' &&
+              i.facts.source === 'review' &&
+              typeof i.facts.review === 'string' ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-primary underline"
+                  onClick={() =>
+                    setAlertReview({
+                      id: String(i.facts.review),
+                      source: 'review',
+                      project,
+                      title: i.summary,
+                      action: 'supervisor',
+                      state: String(i.facts.status),
+                      version: null,
+                      url: workspaceUrl(project) + '/supervisor',
+                    })
+                  }
+                >
+                  {i.summary}
+                </Button>
+              ) : typeof i.facts.url === 'string' ? (
                 <Link href={i.facts.url}>{i.summary}</Link>
               ) : i.run_id ? (
                 <Link href={BASE + '/run?id=' + i.run_id}>{i.summary}</Link>
@@ -334,7 +592,17 @@ export function ProjectSupervisor({ project, projects }: { project: string; proj
           ))}
         </details>
       ) : null}
-      {history ? (
+      {alertReview && <SavedReview review={alertReview} close={() => setAlertReview(null)} />}
+      {panel === 'learning' ? (
+        <LearningPanel
+          key={project}
+          project={project}
+          discuss={(message) => {
+            setDraft(message);
+            setPanel('chat');
+          }}
+        />
+      ) : panel === 'history' ? (
         <ReviewHistory
           key={allReviews ? 'all' : targets.join(',')}
           project={project}
