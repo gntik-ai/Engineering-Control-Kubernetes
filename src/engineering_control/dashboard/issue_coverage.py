@@ -223,16 +223,18 @@ class Inventory:
             if issue["manual_stories"] is None or story in issue["manual_stories"]
         }
 
-    def checkpoints(self, db: Session, pid: UUID) -> dict[str, StoryIssueCoverage]:
-        return {
-            str(c.story_id): c
-            for c in db.scalars(
-                select(StoryIssueCoverage).where(
-                    StoryIssueCoverage.project_id == pid,
-                    StoryIssueCoverage.story_id.in_([UUID(s) for s in self.stories]),
-                )
+    def iter_checkpoints(self, db: Session, pid: UUID) -> Iterator[StoryIssueCoverage]:
+        yield from db.scalars(
+            select(StoryIssueCoverage)
+            .where(
+                StoryIssueCoverage.project_id == pid,
+                StoryIssueCoverage.story_id.in_([UUID(s) for s in self.stories]),
             )
-        }
+            .execution_options(yield_per=16)
+        )
+
+    def checkpoints(self, db: Session, pid: UUID) -> dict[str, StoryIssueCoverage]:
+        return {str(c.story_id): c for c in self.iter_checkpoints(db, pid)}
 
 
 def technical_sources(
@@ -273,7 +275,9 @@ def technical_sources(
             )
             .exists(),
         )
-    for item, evidence in db.execute(query.order_by(BacklogItem.issue_number, BacklogItem.id)):
+    for item, evidence in db.execute(
+        query.order_by(BacklogItem.issue_number, BacklogItem.id).execution_options(yield_per=64)
+    ):
         body = review_description(item, evidence, repository)
         if not planning_kind({"title": item.title, "body": body, "labels": item.issue_labels}):
             yield item, body

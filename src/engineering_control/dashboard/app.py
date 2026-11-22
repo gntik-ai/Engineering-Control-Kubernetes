@@ -1786,21 +1786,29 @@ def create_app(
             raise HTTPException(404, "Project not found") from None
         return JSONResponse(value)
 
+    # Previews rank a full inventory. Queue concurrent previews in the console
+    # while status, stop requests and the background worker remain independent.
+    evidence_preview_lock = asyncio.Lock()
+
     @app.post("/api/dashboard/projects/{name}/evidence/preview")
     async def evidence_preview(name: str, request: Request) -> Response:
+        async def build(body: EvidencePreviewInput) -> dict[str, Any]:
+            async with evidence_preview_lock:
+                return await asyncio.to_thread(
+                    review_evidence.preview,
+                    repo(request).sessions,
+                    name,
+                    body.document,
+                    body.provider,
+                    body.model,
+                    body.page,
+                    body.search,
+                )
+
         return await project_change(
             request,
             EvidencePreviewInput,
-            lambda b: asyncio.to_thread(
-                review_evidence.preview,
-                repo(request).sessions,
-                name,
-                b.document,
-                b.provider,
-                b.model,
-                b.page,
-                b.search,
-            ),
+            build,
             event="project.evidence_preview",
             subject=name,
             max_bytes=300_000,

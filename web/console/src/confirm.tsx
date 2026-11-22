@@ -24,6 +24,7 @@ export function Confirm({
   title,
   about,
   action,
+  cancelLabel = 'Not now',
   destructive = false,
   password = false,
   children,
@@ -34,6 +35,7 @@ export function Confirm({
   title: string;
   about: ReactNode;
   action: string;
+  cancelLabel?: string;
   destructive?: boolean;
   password?: boolean;
   /** What is chosen before it is confirmed, shown under the question. */
@@ -54,7 +56,7 @@ export function Confirm({
     onClose();
   }, [result]);
   return (
-    <AlertDialog open onOpenChange={(open) => (open ? undefined : onClose())}>
+    <AlertDialog open onOpenChange={(open) => { if (!open && !go.pending) onClose(); }}>
       <AlertDialogContent>
         <AlertDialogHeader tone={destructive ? 'destructive' : undefined}>
           <AlertDialogTitle>{title}</AlertDialogTitle>
@@ -79,11 +81,11 @@ export function Confirm({
         ) : null}
         {go.problem ? <Alert tone="destructive" title={go.problem} /> : null}
         <AlertDialogFooter>
-          <AlertDialogCancel>Not now</AlertDialogCancel>
+          <AlertDialogCancel disabled={go.pending}>{cancelLabel}</AlertDialogCancel>
           <Button
             variant={destructive ? 'destructive' : 'primary'}
             loading={go.pending}
-            disabled={password && typed === ''}
+            disabled={go.pending || (password && typed === '')}
             onClick={() => void go.submit()}
           >
             {action}

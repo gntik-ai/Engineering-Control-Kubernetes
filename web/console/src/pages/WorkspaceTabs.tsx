@@ -1,3 +1,4 @@
+import { CircleCheck, Pencil, RotateCcw, Trash2 } from '@gntik-ai/icons';
 import {
   Alert,
   Button,
@@ -279,11 +280,13 @@ function PlanningStateAction({ path, row, closed, locked, saved }: {
   path: string; row: PlanRow; closed: boolean; locked: boolean; saved: () => void;
 }) {
   const change = useSubmit(() => postJson(path + '/' + row.id + '/state', { state: closed ? 'open' : 'closed' }), saved);
-  const label = closed ? 'Reopen' : 'Close';
+  const label = (closed ? 'Reopen ' : 'Close ') + row.title;
   return (
     <div>
-      <Button size="sm" variant="ghost" aria-label={label + ' ' + row.title}
-        loading={change.pending} disabled={locked || change.pending} onClick={() => void change.submit()}>{label}</Button>
+      <Button size="sm" variant="ghost" iconOnly aria-label={label} title={label}
+        loading={change.pending} disabled={locked || change.pending} onClick={() => void change.submit()}>
+        {closed ? <RotateCcw size={16} aria-hidden /> : <CircleCheck size={16} aria-hidden className="text-orange-700 dark:text-orange-400" />}
+      </Button>
       {change.problem && <Alert tone="destructive" title={change.problem} />}
     </div>
   );
@@ -459,17 +462,21 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             onClick={() => setLinking(record)}>Link User Stories</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
           {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
-            <Button size="sm" variant="ghost" disabled={rowLocked(record)} aria-label={'Edit ' + record.title}
-              onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>Edit</Button>
+            <Button size="sm" variant="ghost" iconOnly={kind !== 'issues'} disabled={rowLocked(record)}
+              aria-label={'Edit ' + record.title} title={kind !== 'issues' ? 'Edit ' + record.title : undefined}
+              onClick={() => setEditor({ row: record, version: data?.version ?? undefined })}>
+              {kind === 'issues' ? 'Edit' : <Pencil size={16} aria-hidden className="text-sky-600 dark:text-sky-300" />}
+            </Button>
           )}
           {(record.proposal || record.review === 'pending') && (
             <Button size="sm" variant="secondary" disabled={rowLocked(record) || Boolean(record.proposal && kind !== 'epics' && !(kind === 'issues' && (record.number || record.story_optional)) && !(record.epic_ids ?? record.story_ids)?.length)} aria-label={'Approve ' + record.title}
               onClick={() => setApproving({ ids: [record.id], title: record.title, close_numbers: kind !== 'issues' && record.number && record.github_state === 'open' ? [record.number] : [], version: data?.version ?? null })}>Approve</Button>
           )}
           {(record.proposal || kind !== 'issues') && (
-            <Button size="sm" variant="ghost" disabled={rowLocked(record)}
+            <Button size="sm" variant="ghost" iconOnly={!record.proposal} disabled={rowLocked(record)}
+              aria-haspopup="dialog" title={record.proposal ? undefined : 'Delete ' + record.title}
               aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title} onClick={() => setRemoving(record)}>
-              {record.proposal ? 'Dismiss' : 'Delete'}
+              {record.proposal ? 'Dismiss' : <Trash2 size={16} aria-hidden className="text-destructive" />}
             </Button>
           )}
         </div>
@@ -574,6 +581,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           title={(removing.proposal ? 'Dismiss ' : 'Delete ') + singular[kind] + '?'}
           about={removing.title}
           action={removing.proposal ? 'Dismiss' : 'Delete'}
+          cancelLabel="Cancel"
           destructive
           run={() => removing.proposal
             ? postJson(path + '/decisions', { ids: [removing.id], version: data?.version, dismiss: true })

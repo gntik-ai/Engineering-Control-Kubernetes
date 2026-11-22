@@ -12,8 +12,9 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import JSON, func, select, update
+from sqlalchemy.orm import Session, defer, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard import (
     review_budget,
@@ -99,6 +100,7 @@ def source(
         provider,
         model,
         review_flows.matching_key(settings),
+        reuse=any(n["task"] == reviews.REUSE for n in nodes),
     )
     rank: Row = next((n["params"] for n in nodes if n["task"] == reviews.RANK), {})
     if "prerequisites" in rank:
@@ -110,29 +112,76 @@ def source(
     return src
 
 
-def summary(job: ReviewEvidenceJob, run: ReviewFlowRun) -> Row:
-    outcome = job.result
+def result_fields(db: Session, *keys: str) -> ColumnElement[Any]:
+    """Read selected receipt fields without transferring the candidates or wiki cards."""
+    result = ReviewEvidenceJob.result
+    if db.get_bind().dialect.name == "postgresql":
+        fields = func.json_each(result).table_valued("key", "value")
+        return (
+            select(func.json_object_agg(fields.c.key, fields.c.value, type_=JSON))
+            .select_from(fields)
+            .where(fields.c.key.in_(keys))
+            .correlate(ReviewEvidenceJob)
+            .scalar_subquery()
+        )
+    # SQLite preserves nested arrays and objects when json_extract feeds json_object.
+    args = [arg for key in keys for arg in (key, func.json_extract(result, "$." + key))]
+    return func.json_object(*args, type_=JSON)
+
+
+def summary(db: Session, run_id: UUID) -> Row:
+    job, run = ReviewEvidenceJob, ReviewFlowRun
+    row = db.execute(
+        select(
+            job.run_id,
+            job.state,
+            job.cursor,
+            job.model,
+            job.provider,
+            job.spent,
+            job.reserved,
+            job.token_cap,
+            run.flow_name,
+            run.version,
+            run.settings["decision_model"].label("decision_model"),
+            result_fields(
+                db,
+                "steps",
+                "arms",
+                "native",
+                "second_opinion",
+                "advisory",
+                "detail",
+                "failed_request",
+                "sample_names",
+                "cached_from",
+            ).label("receipt"),
+        )
+        .join(run, run.id == job.run_id)
+        .where(job.run_id == run_id)
+    ).one()
+    outcome = row.receipt or {}
     return {
-        "id": str(job.run_id),
-        "flow": run.flow_name,
-        "version": run.version,
-        "state": job.state,
-        "cursor": job.cursor,
-        "steps": outcome.get("steps", []),
-        "arms": outcome.get("arms", []),
+        "id": str(row.run_id),
+        "flow": row.flow_name,
+        "version": row.version,
+        "state": row.state,
+        "cursor": row.cursor,
+        "steps": outcome.get("steps") or [],
+        "arms": outcome.get("arms") or [],
         "native": outcome.get("native"),
         "second_opinion": outcome.get("second_opinion"),
         "advisory": outcome.get("advisory"),
-        "decision_model": run.settings.get("decision_model"),
-        "detail": outcome.get("detail", ""),
+        "decision_model": row.decision_model,
+        "detail": outcome.get("detail") or "",
         "failed_request": outcome.get("failed_request"),
         "sample": outcome.get("sample_names"),
         "cached_from": outcome.get("cached_from"),
-        "model": job.model,
-        "provider": job.provider,
-        "spent": job.spent,
-        "reserved": job.reserved,
-        "cap": job.token_cap,
+        "model": row.model,
+        "provider": row.provider,
+        "spent": row.spent,
+        "reserved": row.reserved,
+        "cap": row.token_cap,
     }
 
 
@@ -258,9 +307,9 @@ def matching_priority(
         return priority
 
 
-def latest(db: Session, pid: UUID) -> tuple[ReviewEvidenceJob, ReviewFlowRun] | None:
+def latest(db: Session, pid: UUID) -> tuple[UUID, str] | None:
     pair = db.execute(
-        select(ReviewEvidenceJob, ReviewFlowRun)
+        select(ReviewEvidenceJob.run_id, ReviewEvidenceJob.state)
         .join(ReviewFlowRun, ReviewFlowRun.id == ReviewEvidenceJob.run_id)
         .where(ReviewEvidenceJob.project_id == pid)
         .order_by(ReviewFlowRun.started_at.desc(), ReviewFlowRun.id.desc())
@@ -311,11 +360,15 @@ def status(sessions: sessionmaker[Session], name: str) -> Row:
         project = active_project(db, name)
         found = latest(db, project.id)
         models = review_flows.model_choices(db)
-        wizard = db.get(WorkspaceImport, project.id)
+        wizard = db.execute(
+            select(WorkspaceImport.provider, WorkspaceImport.model).where(
+                WorkspaceImport.project_id == project.id
+            )
+        ).one_or_none()
         configured = {"provider": wizard.provider, "model": wizard.model} if wizard else None
         doc, v = definition(db, project, None)
         return {
-            "run": summary(*found) if found else None,
+            "run": summary(db, found[0]) if found else None,
             "models": models,
             "configured": configured,
             "flow": doc.name,
@@ -339,13 +392,15 @@ def start(
 ) -> Row:
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
-        old = db.get(ReviewEvidenceJob, request_id)
+        old = db.scalar(
+            select(ReviewEvidenceJob.project_id).where(ReviewEvidenceJob.run_id == request_id)
+        )
         if old:
-            if old.project_id != project.id:
+            if old != project.id:
                 raise ProjectConflict("This request ID is already in use.")
-            return summary(old, db.get_one(ReviewFlowRun, old.run_id))
+            return summary(db, request_id)
         found = latest(db, project.id)
-        if found and found[0].state in LIVE:
+        if found and found[1] in LIVE:
             raise ProjectConflict(
                 "There is an active evidence run. Resume or end it before starting another."
             )
@@ -397,15 +452,26 @@ def start(
         )
         db.add(job)
         db.flush()
-        return summary(job, run)
+        return summary(db, run.id)
 
 
 def lock_job(db: Session, run_id: UUID) -> ReviewEvidenceJob | None:
-    return db.scalar(
+    # The no-op update also serializes writers on SQLite. A status change or stale
+    # lease can be settled without decoding the immutable graph and candidate list.
+    key = db.scalar(
         update(ReviewEvidenceJob)
         .where(ReviewEvidenceJob.run_id == run_id)
         .values(cursor=ReviewEvidenceJob.cursor)
-        .returning(ReviewEvidenceJob)
+        .returning(ReviewEvidenceJob.run_id)
+    )
+    return (
+        db.get(
+            ReviewEvidenceJob,
+            key,
+            options=(defer(ReviewEvidenceJob.source), defer(ReviewEvidenceJob.result)),
+        )
+        if key is not None
+        else None
     )
 
 
@@ -444,7 +510,7 @@ def control(sessions: sessionmaker[Session], name: str, run_id: UUID, action: st
             finish(j, r, "cancelled")
         else:
             raise ProjectConflict("The run changed. Refresh to see its current controls.")
-        return summary(j, r)
+        return summary(db, j.run_id)
 
 
 @dataclass(frozen=True)
@@ -646,8 +712,12 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         sample=pair,
         sample_names=[j.source["records"][pair[k]]["title"] for k in ("issue", "story")],
     )
-    prior = db.scalar(
-        select(ReviewEvidenceJob)
+    prior = db.execute(
+        select(
+            ReviewEvidenceJob.run_id,
+            ReviewEvidenceJob.state,
+            ReviewEvidenceJob.result[verdict_key].label("verdict"),
+        )
         .where(
             ReviewEvidenceJob.project_id == j.project_id,
             ReviewEvidenceJob.run_id != j.run_id,
@@ -658,9 +728,9 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
         )
         .order_by(ReviewEvidenceJob.claimed_at.desc())
         .limit(1)
-    )
+    ).one_or_none()
     if prior is not None:
-        if saved := prior.result.get(verdict_key):
+        if saved := prior.verdict:
             result[verdict_key] = {
                 **saved,
                 "cached_from": saved.get("cached_from") or str(prior.run_id),
@@ -732,8 +802,11 @@ def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Cal
             return None
         signature = comparison_key(pair, qs)
         j.comparison_signature = signature
-        prior = db.scalar(
-            select(ReviewEvidenceJob)
+        prior = db.execute(
+            select(
+                ReviewEvidenceJob.run_id,
+                result_fields(db, "arms", "cached_from", "sample_names").label("receipt"),
+            )
             .where(
                 ReviewEvidenceJob.project_id == j.project_id,
                 ReviewEvidenceJob.comparison_signature == signature,
@@ -742,14 +815,14 @@ def admit(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Row) -> Cal
             )
             .order_by(ReviewEvidenceJob.run_id)
             .limit(1)
-        )
-        if prior is not None and len(prior.result.get("arms", [])) == 2:
+        ).one_or_none()
+        if prior is not None and len((prior.receipt or {}).get("arms") or []) == 2:
             j.result = {
                 **result,
                 "sample": pair,
-                "sample_names": prior.result["sample_names"],
-                "cached_from": prior.result.get("cached_from", str(prior.run_id)),
-                "arms": prior.result["arms"],
+                "sample_names": prior.receipt["sample_names"],
+                "cached_from": prior.receipt.get("cached_from") or str(prior.run_id),
+                "arms": prior.receipt["arms"],
                 "steps": [
                     *result["steps"],
                     {"id": node["id"], "task": node["task"], "model_calls": 0, "reused_arms": 2},

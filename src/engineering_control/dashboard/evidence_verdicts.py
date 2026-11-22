@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import batched
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import JSON, and_, cast, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -15,7 +17,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.review_evidence import LIVE, passage
+from engineering_control.dashboard.review_evidence import LIVE, passage, result_fields
 from engineering_control.db.models import (
     ProjectConnection,
     ProjectRecord,
@@ -123,28 +125,73 @@ def listing(
         }
 
 
-def find(db: Session, project: UUID, run: UUID) -> ReviewEvidenceJob:
-    job = db.scalar(select(Job).where(Job.run_id == run, eligible(db, project)))
-    if not job:
+def receipt(db: Session, project: UUID, run: UUID, *keys: str) -> dict[str, Any]:
+    row = db.execute(
+        select(result_fields(db, *keys))
+        .select_from(Job)
+        .where(Job.run_id == run, eligible(db, project))
+    ).one_or_none()
+    if row is None:
         raise ProjectNotFound("Evidence comparison")
-    return job
+    return row[0] or {}
 
 
 def detail(sessions: sessionmaker[Session], name: str, run: UUID) -> dict[str, Any]:
     with sessions() as db:
-        job = find(db, active_project(db, name).id, run)
-        result = job.result
+        project = active_project(db, name).id
+        result = receipt(
+            db,
+            project,
+            run,
+            "arms",
+            "native",
+            "second_opinion",
+            "advisory",
+            "human_review",
+            "sample",
+        )
+        sample = result["sample"]
+        roles = ("issue", "story")
+        # Each saved graph can contain thousands of unrelated records. Read only
+        # the two passages, their wiki cards and the Epic titles needed by the dialog.
+        columns = [
+            field
+            for role in roles
+            for field in (
+                Job.source[("records", sample[role])],
+                Job.result[("cards", sample[role])],
+            )
+        ]
+        values = db.execute(select(*columns).where(Job.run_id == run)).one()
+        records = {sample[role]: values[2 * i] for i, role in enumerate(roles)}
+        cards = {sample[role]: values[2 * i + 1] for i, role in enumerate(roles)}
+        epics = sorted(
+            {key for row in records.values() for key in row["parents"] if "/epics/" in key}
+        )
+        for group in batched(epics, 64):
+            titles = db.execute(
+                select(*(Job.source[("records", key, "title")].as_string() for key in group)).where(
+                    Job.run_id == run
+                )
+            ).one()
+            records.update(
+                {
+                    key: {"kind": "epics", "title": title}
+                    for key, title in zip(group, titles, strict=True)
+                    if title is not None
+                }
+            )
         return {
             "id": str(run),
-            "arms": result["arms"],
+            "arms": result.get("arms") or [],
             "native": result.get("native"),
             "second_opinion": result.get("second_opinion"),
             "advisory": result.get("advisory"),
             "decision": result.get("human_review"),
-            "prerequisites": result["sample"].get("prerequisites", []),
+            "prerequisites": sample.get("prerequisites", []),
             **{
-                role: passage(job.source, result, result["sample"][role])
-                for role in ("issue", "story")
+                role: passage({"records": records}, {"cards": cards}, sample[role])
+                for role in roles
             },
         }
 
@@ -159,8 +206,7 @@ def decide(
 ) -> dict[str, Any]:
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
-        job = find(db, project.id, run)
-        old = job.result.get("human_review") or {}
+        old = receipt(db, project.id, run, "human_review").get("human_review") or {}
         note = note.strip()
         if old.get("scope") == scope and old.get("note") == note:
             return old
@@ -172,5 +218,20 @@ def decide(
             "at": datetime.now(UTC).isoformat(),
             "revision": str(uuid4()),
         }
-        job.result = {**job.result, "human_review": reviewed}
+        value = literal(reviewed, type_=JSON)
+        changed: ColumnElement[Any]
+        if db.get_bind().dialect.name == "postgresql":
+            changed = cast(
+                func.jsonb_set(
+                    cast(Job.result, JSONB), array(["human_review"]), cast(value, JSONB)
+                ),
+                JSON,
+            )
+        else:
+            changed = func.json_set(Job.result, "$.human_review", func.json(value))
+        db.execute(
+            update(Job)
+            .where(Job.run_id == run, Job.project_id == project.id)
+            .values(result=changed)
+        )
         return reviewed

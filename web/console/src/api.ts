@@ -1310,12 +1310,12 @@ export function useResource<T>(
   }, [url, tick, keepPreviousData]);
 
   useEffect(() => {
-    if (!intervalMs) return;
+    if (!intervalMs || state.loading) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') reload();
     }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [intervalMs, reload]);
+  }, [intervalMs, reload, state.loading]);
 
   return { ...state, reload };
 }
