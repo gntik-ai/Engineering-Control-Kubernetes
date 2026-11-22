@@ -82,7 +82,9 @@ CASES = (
 )
 
 
-async def evaluate(project: str, run_id: UUID) -> dict[str, Any]:
+async def evaluate(
+    project: str, run_id: UUID, methods: frozenset[str] | None = None
+) -> dict[str, Any]:
     settings = get_settings()
     engine = create_engine(settings.database_url.get_secret_value(), hide_parameters=True)
     sessions = sessionmaker(engine, expire_on_commit=False)
@@ -149,6 +151,8 @@ async def evaluate(project: str, run_id: UUID) -> dict[str, Any]:
                     routes.append(("decision", provider, choice["model"]))
         result: dict[str, Any] = {"project": project, "cases": len(CASES), "routes": []}
         for method, provider, model in routes:
+            if methods and method not in methods:
+                continue
             route: dict[str, Any] = {
                 "method": method,
                 "provider": provider,
@@ -230,5 +234,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True)
     parser.add_argument("--run-id", required=True, type=UUID)
+    parser.add_argument("--method", action="append", choices=("standard", "rerank", "decision"))
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(evaluate(args.project, args.run_id)), sort_keys=True))
+    print(
+        json.dumps(
+            asyncio.run(evaluate(args.project, args.run_id, frozenset(args.method or []))),
+            sort_keys=True,
+        )
+    )

@@ -921,3 +921,19 @@ async def test_anthropic_is_asked_like_the_others_and_an_account_is_tried_for_fr
     empty = UUID(asked.accounts.create(name="Empty", provider="glm")["id"])
     assert (await asked.models.check(empty))[0] == "signed_out"
     await asked.http.aclose()
+
+
+def test_metered_partial_openai_answer_keeps_its_token_usage() -> None:
+    body = {
+        "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+        "usage": {"prompt_tokens": 180, "completion_tokens": 160, "total_tokens": 340},
+    }
+    with pytest.raises(WireError) as exc:
+        openai_style.read("OpenAI API", body, "gpt-5-nano", 160)
+    assert exc.value.kind == "cut"
+    assert exc.value.metered is not None
+    assert (exc.value.metered.read, exc.value.metered.written) == (180, 160)
+    del body["usage"]
+    with pytest.raises(WireError) as exc:
+        openai_style.read("OpenAI API", body, "gpt-5-nano", 160)
+    assert exc.value.metered is None

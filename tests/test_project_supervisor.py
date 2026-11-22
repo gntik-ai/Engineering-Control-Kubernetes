@@ -255,3 +255,36 @@ def test_specialist_cache_is_bound_to_source_and_flow(world: Any) -> None:
             "target",
             "category",
         }
+
+
+def test_reasoning_models_have_room_to_finish_ranking_and_classification(
+    world: Any, monkeypatch: Any
+) -> None:
+    from types import SimpleNamespace
+
+    captured = []
+
+    async def ask(
+        _sessions: Any, _pid: Any, _models: Any, question: Any, _workflow: str, **options: Any
+    ) -> Any:
+        captured.append((question.effort, question.max_tokens, options["stage"]))
+        data = (
+            {"order": [2, 1]}
+            if options["stage"] == "supervisor_rerank"
+            else {"target": "2", "category": "bug"}
+        )
+        return SimpleNamespace(
+            data=data, usage={}, seconds=0, provider="openai", model="gpt-5-nano"
+        )
+
+    monkeypatch.setattr(advice.review_budget, "ask_review", ask)
+    work = {
+        "method": "rerank",
+        "provider": "openai",
+        "model": "gpt-5-nano",
+        "request": "Find the broken login.",
+        "candidates": [{"id": "a", "title": "New filter"}, {"id": "b", "title": "Broken login"}],
+    }
+    output = asyncio.run(advice.compare(world.sessions, None, uuid4(), uuid4(), work))
+    assert (output["item"], output["category"]) == ("b", "bug")
+    assert captured == [("low", 1536, "supervisor_rerank"), ("low", 1536, "supervisor")]
