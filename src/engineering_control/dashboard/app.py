@@ -2297,6 +2297,20 @@ def create_app(
             entity="action",
         )
 
+    @app.get("/api/dashboard/projects/{name}/supervisor/learning")
+    async def project_process_learning(
+        name: str, request: Request, page: int = Query(1, ge=1)
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).toolbox.learning.summary, name, page=page)
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Project not found") from None
+
     @app.get("/api/dashboard/projects/{name}/supervisor/reviews")
     async def project_supervisor_reviews(
         name: str,

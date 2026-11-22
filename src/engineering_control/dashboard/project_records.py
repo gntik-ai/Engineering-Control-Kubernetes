@@ -224,65 +224,83 @@ class ProjectRecords:
         default_branch: str = "main",
         description: str | None = None,
     ) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            record = self.register(
+                session,
+                name=name,
+                display_name=display_name,
+                repository=repository,
+                default_branch=default_branch,
+                description=description,
+            )
+            return serialize(record)
+
+    @classmethod
+    def register(
+        cls,
+        session: Session,
+        *,
+        name: str,
+        display_name: str | None,
+        repository: str,
+        default_branch: str,
+        description: str | None = None,
+    ) -> ProjectRecord:
+        """Register a workspace within its caller's transaction."""
         from engineering_control.dashboard.backlog_items import clean_description
 
         name = clean_name(name)
         repository = clean_repository(repository)
         display = clean_display_name(display_name, fallback=name)
-        with self.sessions() as session:
-            settings = self._lock_settings(session)
-            taken = session.scalar(select(ProjectRecord).where(ProjectRecord.name == name))
-            if taken is not None:
-                raise ProjectConflict(
-                    f"The identifier {name} belonged to a removed project and stays reserved"
-                    if taken.archived_at is not None
-                    else f"A project with the identifier {name} already exists"
-                )
-            connected = session.scalar(
-                select(ProjectRecord).where(
-                    ProjectRecord.archived_at.is_(None),
-                    (func.lower(ProjectRecord.source_repository) == repository.lower())
-                    | (func.lower(ProjectRecord.deployment_repository) == repository.lower()),
-                )
+        settings = cls._lock_settings(session)
+        taken = session.scalar(select(ProjectRecord).where(ProjectRecord.name == name))
+        if taken is not None:
+            raise ProjectConflict(
+                f"The identifier {name} belonged to a removed project and stays reserved"
+                if taken.archived_at is not None
+                else f"A project with the identifier {name} already exists"
             )
-            if connected is not None:
-                raise ProjectConflict(
-                    f"The repository {repository} is already connected to the project "
-                    f"{connected.name}"
-                )
-            record = ProjectRecord(
-                name=name,
-                display_name=display,
-                description=clean_description(description),
-                source_repository=repository,
-                deployment_repository=repository,
-                default_branch=default_branch[:100] or "main",
-                origin="console",
+        connected = session.scalar(
+            select(ProjectRecord).where(
+                ProjectRecord.archived_at.is_(None),
+                (func.lower(ProjectRecord.source_repository) == repository.lower())
+                | (func.lower(ProjectRecord.deployment_repository) == repository.lower()),
             )
-            session.add(record)
-            try:
-                session.flush()
-                # A project is born with its six core sections.
-                from engineering_control.dashboard.project_sections import ensure_core_sections
+        )
+        if connected is not None:
+            raise ProjectConflict(
+                f"The repository {repository} is already connected to the project {connected.name}"
+            )
+        record = ProjectRecord(
+            name=name,
+            display_name=display,
+            description=clean_description(description),
+            source_repository=repository,
+            deployment_repository=repository,
+            default_branch=default_branch[:100] or "main",
+            origin="console",
+        )
+        session.add(record)
+        try:
+            session.flush()
+            # A project is born with its six core sections.
+            from engineering_control.dashboard.project_sections import ensure_core_sections
 
-                ensure_core_sections(session, record)
-                session.add(
-                    WorkspaceImport(
-                        project_id=record.id,
-                        repository=record.source_repository,
-                        branch=record.default_branch,
-                        progress={"counts": {}, "page": 1},
-                    )
+            ensure_core_sections(session, record)
+            session.add(
+                WorkspaceImport(
+                    project_id=record.id,
+                    repository=record.source_repository,
+                    branch=record.default_branch,
+                    progress={"counts": {}, "page": 1},
                 )
-                if settings.default_project_id is None:
-                    settings.default_project_id = record.id
-                session.commit()
-            except IntegrityError as error:
-                session.rollback()
-                raise ProjectConflict(
-                    f"A project with the identifier {name} already exists"
-                ) from error
-            return serialize(record)
+            )
+            if settings.default_project_id is None:
+                settings.default_project_id = record.id
+            session.flush()
+        except IntegrityError as error:
+            raise ProjectConflict(f"A project with the identifier {name} already exists") from error
+        return record
 
     def rename(self, name: str, display_name: str) -> dict[str, Any]:
         with self.sessions() as session:

@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from engineering_control.agent_models import problem as model_problem
 from engineering_control.dashboard.project_records import ProjectInvalid, ProjectNotFound
 from engineering_control.db.models import ProviderAccount, SupervisorDefinition
+from engineering_control.supervisor.learning import BRIEF
 
 PROVIDERS: Final = ("claude", "chatgpt")
 MODES: Final = ("automatic", "confirm")
@@ -55,6 +56,18 @@ _REASON: Final = {
 }
 
 
+_RECEIPT = {
+    "project": _PROJECT,
+    "source": {"type": "string", "enum": ["run", "review"]},
+    "evidence_id": {"type": "string", "description": "A saved execution ID in this project."},
+    "reason": _REASON,
+}
+_DELIVERY_BRIEF = {
+    key: {"type": "string", "description": description, "minLength": 8, "maxLength": 1200}
+    for key, description in BRIEF.items()
+}
+
+
 @dataclass(frozen=True)
 class Tool:
     """One operation the supervisor may call. ``kind`` groups the tools by what they can
@@ -79,6 +92,47 @@ class Tool:
 
 
 CATALOGUE: Final[tuple[Tool, ...]] = (
+    Tool(
+        "get_process_learning",
+        "read",
+        "Learn from completed processes",
+        "Compare project execution and review outcomes with saved evidence. Returns recurring "
+        "failures, slow runs, occurrence counts and accepted approaches. No model is called.",
+        _schema({"project": _PROJECT, "page": {"type": "integer", "minimum": 1}}, ("project",)),
+    ),
+    Tool(
+        "remember_approach",
+        "plan",
+        "Remember a project approach",
+        "Propose an evidence-backed adjustment to your own approach for this project. "
+        "Acceptance replaces the previous guidance for the same execution pattern.",
+        _schema(
+            {**_RECEIPT, "approach": {"type": "string", "minLength": 8, "maxLength": 600}},
+            (*_RECEIPT, "approach"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
+    Tool(
+        "propose_process_issue",
+        "plan",
+        "Draft a deployable process improvement",
+        "Use a saved execution to propose one technical issue in its project or in "
+        "Engineering Control itself. Include the implementation, tests and release checks. "
+        "Select an existing destination as an action target. Approval creates a local draft.",
+        _schema(
+            {
+                **_RECEIPT,
+                **_DELIVERY_BRIEF,
+                "title": {"type": "string"},
+                "category": {"type": "string", "enum": ["bug", "enhancement"]},
+                "target": {"type": "string", "enum": ["project", "engineering_control"]},
+            },
+            (*_RECEIPT, *_DELIVERY_BRIEF, "title", "category", "target"),
+        ),
+        "confirm",
+        ("confirm",),
+    ),
     Tool(
         "ask_specialist",
         "plan",
@@ -347,7 +401,8 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         "Propose backlog items",
         "Propose new backlog items for a project. Each appears in the backlog as proposed "
         "by you, for the administrator to accept, edit or reject. Give each a section when "
-        "one fits (read the project first) and always a reason.",
+        "one fits (read the project first) and always a reason."
+        " For technical issues use section issues and include the full delivery brief.",
         _schema(
             {
                 "project": _PROJECT,
@@ -364,6 +419,7 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
                                 "when no section's guide fits.",
                             },
                             "reason": _REASON,
+                            "delivery": _schema(_DELIVERY_BRIEF, tuple(_DELIVERY_BRIEF)),
                         },
                         ("title", "reason"),
                     ),

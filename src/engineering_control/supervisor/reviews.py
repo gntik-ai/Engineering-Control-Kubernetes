@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import String, case, cast, func, literal, or_, select, union_all
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from engineering_control.dashboard import evidence_verdicts
 from engineering_control.dashboard.planning_queue import review_results
@@ -59,6 +60,14 @@ def destination(project: str, action: str) -> str:
         "supervisor": "supervisor",
     }.get(action, "reviews/discovery")
     return f"/console/workspace/{project}/{path}"
+
+
+def operational_review() -> ColumnElement[bool]:
+    """Model evaluations share review accounting but have no project work to recover."""
+    return or_(
+        ReviewFlowRun.action != "supervisor",
+        ReviewFlowRun.findings["benchmark"].as_string().is_(None),
+    )
 
 
 def inventory(now: datetime) -> Any:
@@ -115,6 +124,7 @@ def inventory(now: datetime) -> Any:
             state.label("state"),
             r.version.label("version"),
             r.started_at.label("at"),
+            operational_review().label("operational"),
         )
         .outerjoin(SupervisorAdvice, SupervisorAdvice.run_id == r.id)
         .outerjoin(e, e.run_id == r.id)
@@ -161,6 +171,7 @@ def inventory(now: datetime) -> Any:
         SandboxRun.state,
         SandboxRun.data["flow"]["version"].as_integer(),
         SandboxRun.created_at,
+        literal(True),
     ).where(
         or_(
             SandboxRun.kind.in_((AUDIT, DISCOVER)),
@@ -182,6 +193,7 @@ def inventory(now: datetime) -> Any:
         job.status,
         empty_version,
         job.created_at,
+        literal(True),
     ).where(job.review_run_id.is_(None))
     pending_conn = select(
         literal("connection"),
@@ -192,6 +204,7 @@ def inventory(now: datetime) -> Any:
         conn.status,
         empty_version,
         conn.created_at,
+        literal(True),
     ).where(conn.review_run_id.is_(None), conn.archived_at.is_(None))
     pending_plan = (
         select(
@@ -203,6 +216,7 @@ def inventory(now: datetime) -> Any:
             plan.status,
             empty_version,
             plan.created_at,
+            literal(True),
         )
         .join(WorkQueue, WorkQueue.id == plan.queue_id)
         .where(plan.review_run_id.is_(None))
@@ -216,6 +230,7 @@ def inventory(now: datetime) -> Any:
         func.coalesce(imp.progress["scan_state"].as_string(), imp.stage),
         empty_version,
         imp.created_at,
+        literal(True),
     ).where(
         imp.review_run_id.is_(None),
         or_(
@@ -260,7 +275,7 @@ class ReviewHistory:
             }
             seen = set(db.execute(select(summary.c.pid, summary.c.action).distinct()).all())
             if state == "attention":
-                query = query.where(rows.c.state.in_(ATTENTION))
+                query = query.where(rows.c.operational, rows.c.state.in_(ATTENTION))
             elif state:
                 query = query.where(rows.c.state == state)
             if action:

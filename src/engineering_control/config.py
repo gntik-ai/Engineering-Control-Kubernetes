@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     database_url: SecretStr = SecretStr(
         "postgresql+psycopg://engineering_control@127.0.0.1/engineering_control"
     )
+    controller_repository: str = "gntik-ai/Engineering-Control-Kubernetes"
+    controller_branch: str = "main"
     # The GitHub App the platform acts through. These three identify it and are not
     # secret; its private key and client secret are mounted secrets, never settings.
     github_app_id: int | None = Field(default=None, ge=1)

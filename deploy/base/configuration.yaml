@@ -7,6 +7,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
 data:
   ENGINEERING_ENVIRONMENT: cluster
+  ENGINEERING_CONTROLLER_BRANCH: claude/determined-cray-5v3lhn
   # Listeners are on the pod interface; network policy decides who may reach them.
   ENGINEERING_NETWORK_BOUNDARY: cluster
   ENGINEERING_DASHBOARD_HOST: 0.0.0.0

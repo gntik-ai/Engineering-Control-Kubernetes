@@ -55,7 +55,10 @@ The platform noticed the incidents below by itself. Nobody asked you about them:
 each one and deal with it. For each incident:
 1. Read what happened: get_run for a run (its failed step, its detail and the end of its \
 output), get_queue for a queue, get_item for the item.
-2. Decide what the cause is, and how sure you are (high, medium or low).
+2. Compare the incident with saved process evidence using get_process_learning. Check whether \
+an earlier remedy worked before repeating it. Record the cause and confidence. For a recurring \
+problem, use remember_approach for future decisions, propose_flow for a workflow revision, or \
+propose_process_issue when a deployable change is needed. Cite the run and check for a prior fix.
 3. Act only when acting helps:
    - A cause that passes by itself (an account that was limited, a sandbox that did not \
 start, a provider that was overloaded, a client that gave no answer): try again with \
@@ -182,7 +185,8 @@ class Operations:
             "held",
             "uncertain",
         )
-        current = select(ref).where(state.in_(attention), rows.c.source != "sandbox")
+        eligible = (rows.c.source != "sandbox") & rows.c.operational & state.in_(attention)
+        current = select(ref).where(eligible)
         session.execute(
             update(SupervisorIncident)
             .where(
@@ -207,9 +211,8 @@ class Operations:
             )
             .join(ProjectRecord, ProjectRecord.id == rows.c.pid)
             .where(
-                rows.c.source != "sandbox",
+                eligible,
                 ProjectRecord.archived_at.is_(None),
-                state.in_(attention),
                 or_(
                     state == "stalled",
                     rows.c.at > recent,
