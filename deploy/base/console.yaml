@@ -104,9 +104,10 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 256Mi
-            limits:
               memory: 512Mi
+            limits:
+              # The API serves requests alongside the project review workers.
+              memory: 1Gi
           volumeMounts:
             - name: secrets
               mountPath: /var/run/secrets/engineering-control

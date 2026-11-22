@@ -89,7 +89,14 @@ def record(
 
 
 def snapshot(
-    db: Session, project: ProjectRecord, peers: bool, provider: str, model: str, policy: str
+    db: Session,
+    project: ProjectRecord,
+    peers: bool,
+    provider: str,
+    model: str,
+    policy: str,
+    *,
+    reuse: bool = True,
 ) -> Row:
     links = (
         list(
@@ -119,7 +126,7 @@ def snapshot(
     by_num: dict[tuple[str, int], str] = {}
     by_id: dict[tuple[UUID, UUID], str] = {}
     for p in projects:
-        cat = catalog(db, p)
+        cat = catalog(db, p, planning_only=True)
         for kind, table in (("stories", ProjectUserStory), ("epics", ProjectEpic)):
             for local, closed in db.execute(
                 select(table.id, table.closed_at).where(
@@ -209,9 +216,10 @@ def snapshot(
         for r in records.values()
         if r["project"] == str(project.id) and r["kind"] == "stories"
     }
-    if provider and model and local_stories:
+    if reuse and provider and model and local_stories:
         data = inventory(db, project, local_stories, provider, model, policy)
-        for s, c in data.checkpoints(db, project.id).items():
+        for c in data.iter_checkpoints(db, project.id):
+            s = str(c.story_id)
             key = source_key(project.id, "stories", UUID(s))
             # The graph can display a GitHub fallback body for a Story with no local
             # description. Only carry a matching decision for the evidence it reviewed.

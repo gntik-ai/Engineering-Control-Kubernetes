@@ -1,12 +1,14 @@
 """Project preview and isolated metered flow runs go through the normal console entry points."""
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
 
 from engineering_control.dashboard import review_evidence
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage, inventory
@@ -425,5 +427,102 @@ def test_admin_can_correct_a_saved_unrelated_comparison_without_another_call(
         )
         with repo.sessions() as db:
             assert db.scalar(select(func.count()).select_from(WorkspaceModelUsage)) == 2
+    finally:
+        client.close()
+
+
+def test_poll_and_verdict_actions_do_not_decode_the_entire_evidence_graph(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        pid = repo.projects.identity_of("falcone")
+        run = uuid4()
+        issue, story, epic, other = (
+            f"{pid}/{kind}/{uuid4()}" for kind in ("issues", "stories", "epics", "issues")
+        )
+
+        def source(title: str, kind: str, parents: list[str]) -> dict[str, Any]:
+            return dict(
+                title=title,
+                repository="gntik-ai/falcone",
+                kind=kind,
+                number=3,
+                state="open",
+                parents=parents,
+                revision="1",
+                body="Evidence",
+            )
+
+        with repo.sessions.begin() as db:
+            db.add(
+                ReviewFlowRun(
+                    id=run,
+                    project_id=pid,
+                    flow_key="review-evidence",
+                    flow_name="Related work",
+                    action="evidence",
+                    version=0,
+                    settings={},
+                )
+            )
+            db.flush()
+            db.add(
+                ReviewEvidenceJob(
+                    run_id=run,
+                    project_id=pid,
+                    state="complete",
+                    provider="fixture",
+                    model="analysis",
+                    token_cap=12000,
+                    source={
+                        "records": {
+                            issue: source("Repair", "issues", [story]),
+                            story: source("Receipts", "stories", [epic]),
+                            epic: source("Billing", "epics", []),
+                            other: source("full-snapshot-sentinel", "issues", []),
+                        }
+                    },
+                    result={
+                        "steps": [{"id": "rank"}],
+                        "arms": [{"scope": "partial"}, {"scope": "unclear"}],
+                        "sample": {"issue": issue, "story": story},
+                        "sample_names": ["Repair", "Receipts"],
+                        "cards": {issue: {"text": "Relevant excerpt"}},
+                        "pairs": [{"debug": "full-candidates-sentinel"}],
+                    },
+                )
+            )
+
+        def narrow(value: str) -> Any:
+            assert "full-snapshot-sentinel" not in value and "full-candidates-sentinel" not in value
+            return json.loads(value)
+
+        engine = create_engine(repo.engine.url, json_deserializer=narrow)
+        try:
+            repo.sessions = sessionmaker(engine, expire_on_commit=False)
+            base = "/api/dashboard/projects/falcone/evidence"
+            reply = client.get(base)
+            assert reply.status_code == 200 and reply.json()["run"]["steps"] == [{"id": "rank"}]
+            assert client.get(base + "/reviews").json()["items"][0]["id"] == str(run)
+            detail = client.get(base + "/reviews/" + str(run)).json()
+            assert (
+                detail["story"]["epics"] == ["Billing"]
+                and detail["issue"]["card"]["text"] == "Relevant excerpt"
+            )
+            assert (
+                post(
+                    client, "evidence/reviews/" + str(run), scope="partial", note="Reviewed"
+                ).status_code
+                == 200
+            )
+            assert (
+                client.get(base + "/reviews/" + str(run)).json()["decision"]["scope"] == "partial"
+            )
+            with repo.engine.connect() as conn:
+                result = conn.execute(
+                    select(ReviewEvidenceJob.result).where(ReviewEvidenceJob.run_id == run)
+                ).scalar_one()
+                assert result["pairs"] == [{"debug": "full-candidates-sentinel"}]
+        finally:
+            engine.dispose()
     finally:
         client.close()

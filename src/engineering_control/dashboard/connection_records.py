@@ -91,7 +91,7 @@ class Catalog:
         return [*self.local.values(), *(item for item in self.numbers.values() if not item.id)]
 
 
-def catalog(session: Session, project: ProjectRecord) -> Catalog:
+def catalog(session: Session, project: ProjectRecord, *, planning_only: bool = False) -> Catalog:
     result = Catalog(project)
     for kind, model in (("epics", ProjectEpic), ("stories", ProjectUserStory)):
         for key, title, body in session.execute(
@@ -100,36 +100,51 @@ def catalog(session: Session, project: ProjectRecord) -> Catalog:
             )
         ):
             result.local[key] = Item(project.id, kind, key, None, title, body or "", True)
-    for key, title, body, number, repo, review in session.execute(
-        select(
-            BacklogItem.id,
-            BacklogItem.title,
-            BacklogItem.description,
-            BacklogItem.issue_number,
-            BacklogItem.repository,
-            BacklogItem.workspace_review,
-        ).where(BacklogItem.project_id == project.id)
-    ):
-        if review == "planning" or (
-            not number and review not in ("approved", "publishing", "pending")
-        ):
-            continue
-        if number and (repo or "").lower() != project.source_repository.lower():
-            continue
-        visible = review in ("pending", "publishing", "approved")
-        item = Item(
-            project.id,
-            "issues",
-            key if visible else None,
-            number,
-            title,
-            body or "",
-            review in ("approved", "publishing"),
+    # The evidence graph reads technical issues separately with their complete bodies.
+    # Only their numbers are needed here to resolve reclassified planning records.
+    claimed_numbers: set[int | None] = set()
+    if planning_only:
+        claimed_numbers.update(
+            session.scalars(
+                select(BacklogItem.issue_number).where(
+                    BacklogItem.project_id == project.id,
+                    func.lower(BacklogItem.repository) == project.source_repository.lower(),
+                    BacklogItem.issue_number.is_not(None),
+                    BacklogItem.workspace_review.is_distinct_from("planning"),
+                )
+            )
         )
-        if visible:
-            result.local[key] = item
-        if number:
-            result.numbers[number] = item
+    else:
+        for key, title, body, number, repo, review in session.execute(
+            select(
+                BacklogItem.id,
+                BacklogItem.title,
+                BacklogItem.description,
+                BacklogItem.issue_number,
+                BacklogItem.repository,
+                BacklogItem.workspace_review,
+            ).where(BacklogItem.project_id == project.id)
+        ):
+            if review == "planning" or (
+                not number and review not in ("approved", "publishing", "pending")
+            ):
+                continue
+            if number and (repo or "").lower() != project.source_repository.lower():
+                continue
+            visible = review in ("pending", "publishing", "approved")
+            item = Item(
+                project.id,
+                "issues",
+                key if visible else None,
+                number,
+                title,
+                body or "",
+                review in ("approved", "publishing"),
+            )
+            if visible:
+                result.local[key] = item
+            if number:
+                result.numbers[number] = item
     for key, number, kind in session.execute(
         select(
             WorkspaceCandidate.local_id, WorkspaceCandidate.number, WorkspaceCandidate.kind
@@ -141,7 +156,7 @@ def catalog(session: Session, project: ProjectRecord) -> Catalog:
     ):
         # A reclassified technical issue owns its GitHub number. Keep the historic
         # local planning record and its existing relationships independently.
-        if kind in ("epics", "stories") and number in result.numbers:
+        if kind in ("epics", "stories") and (number in claimed_numbers or number in result.numbers):
             continue
         if key in result.local and number:
             result.local[key].number = number
@@ -150,16 +165,22 @@ def catalog(session: Session, project: ProjectRecord) -> Catalog:
         (ProjectStoryEpic, ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id),
         (ProjectIssueStory, ProjectIssueStory.item_id, ProjectIssueStory.story_id),
     ):
+        if planning_only and link is ProjectIssueStory:
+            continue
         for key, parent_key in session.execute(
             select(child, parent).where(link.project_id == project.id)
         ):
             if key in result.local:
                 result.local[key].parents.append(str(parent_key))
-    for (evidence,) in session.execute(
-        select(WorkspaceSource.evidence).where(
-            WorkspaceSource.project_id == project.id, WorkspaceSource.kind == "issue"
-        )
-    ):
+    original = select(WorkspaceSource.evidence).where(
+        WorkspaceSource.project_id == project.id, WorkspaceSource.kind == "issue"
+    )
+    if planning_only:
+        missing = [f"issue:{number}" for number, item in result.numbers.items() if not item.body]
+        if not missing:
+            return result
+        original = original.where(WorkspaceSource.key.in_(missing))
+    for evidence in session.scalars(original.execution_options(yield_per=64)):
         number = evidence.get("number")
         if type(number) is not int or number <= 0:
             continue
