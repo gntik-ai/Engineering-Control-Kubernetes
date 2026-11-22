@@ -18,7 +18,9 @@ import {
   apiUrl,
   postJson,
   useResource,
+  type CommandCatalog,
   type CommandProfile,
+  type ManifestCommands,
   type FlowDetail,
   type FlowLibrary,
   type FlowListed,
@@ -28,9 +30,11 @@ import {
   type Section,
 } from '../api';
 import { LoadError } from '../parts';
-import { type AutomationView } from '../router';
+import { setQuery, useLocation, type AutomationView } from '../router';
 import { AgentsTab } from './Agents';
 import { CommandsCard, linesOf } from './Commands';
+import { PlatformCommands } from './EngineCatalog';
+import { SupervisorPage } from './Supervisor';
 import { FlowPage } from './Flow';
 import { FlowsPage } from './Flows';
 import { RemoveSectionDialog, SectionDialog, SectionRunDialog, SupervisorBrief } from './Project';
@@ -280,10 +284,10 @@ function Assignments({ project }: { project: string }) {
   );
 }
 
-function ProfileEditor({ profile, done }: { profile?: CommandProfile; done: () => void }) {
-  const [name, setName] = useState(profile?.name ?? '');
-  const [install, setInstall] = useState(profile?.install.join('\n') ?? '');
-  const [tests, setTests] = useState(profile?.tests.join('\n') ?? '');
+function ProfileEditor({ profile, source, done }: { profile?: CommandProfile; source?: ManifestCommands; done: () => void }) {
+  const [name, setName] = useState(profile?.name ?? (source ? source.name + ' commands' : ''));
+  const [install, setInstall] = useState((profile?.install ?? source?.install.map(c => c.line) ?? []).join('\n'));
+  const [tests, setTests] = useState((profile?.tests ?? source?.tests.map(c => c.line) ?? []).join('\n'));
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -296,7 +300,7 @@ function ProfileEditor({ profile, done }: { profile?: CommandProfile; done: () =
         'command-profiles' + (profile ? '/' + profile.id + (remove ? '/remove' : '/update') : ''),
         remove
           ? { current_password: password }
-          : { name, install: linesOf(install), tests: linesOf(tests), current_password: password },
+          : { name, install: linesOf(install), tests: linesOf(tests), current_password: password, manifest: source?.project },
       );
       done();
     } catch (e) {
@@ -419,8 +423,8 @@ function CommandSelection({
 }
 
 function Commands({ project }: { project?: string }) {
-  const profiles = useResource<Listing<CommandProfile>>(apiUrl('command-profiles'));
-  const [editing, setEditing] = useState<CommandProfile | 'new' | null>(null);
+  const profiles = useResource<CommandCatalog>(apiUrl('command-profiles'));
+  const [editing, setEditing] = useState<CommandProfile | ManifestCommands | 'new' | null>(null);
   const [revision, setRevision] = useState(0);
   const items = profiles.data?.items ?? [];
   return (
@@ -429,7 +433,7 @@ function Commands({ project }: { project?: string }) {
       description={
         project
           ? 'Select how this project installs dependencies and runs tests.'
-          : 'Maintain install and test command profiles shared across projects.'
+          : 'Inspect the commands the engine runs and manage shared profiles.'
       }
       actions={
         <Button size="sm" onClick={() => setEditing('new')}>
@@ -449,8 +453,9 @@ function Commands({ project }: { project?: string }) {
         )}
         {editing && (
           <ProfileEditor
-            key={editing === 'new' ? 'new' : editing.id}
-            profile={editing === 'new' ? undefined : editing}
+            key={editing === 'new' ? 'new' : 'id' in editing ? editing.id : editing.project}
+            profile={editing !== 'new' && 'id' in editing ? editing : undefined}
+            source={editing !== 'new' && 'project' in editing ? editing : undefined}
             done={() => {
               setEditing(null);
               profiles.reload();
@@ -458,6 +463,8 @@ function Commands({ project }: { project?: string }) {
             }}
           />
         )}
+        {!project && profiles.data && <PlatformCommands catalog={profiles.data} copy={setEditing} />}
+        {items.some(p => p.global === !project) && <h2 className="text-lg font-semibold">{project ? 'Project profiles' : 'Shared profiles'}</h2>}
         {items
           .filter((p) => p.global === !project)
           .map((p) => (
@@ -479,6 +486,15 @@ function Commands({ project }: { project?: string }) {
 }
 
 export function AutomationPage({ view, project }: { view: AutomationView; project?: string }) {
+  const supervisor = useLocation().query.get('supervisor');
+  if (!project && ((view === 'agents' && supervisor === 'instructions') || (view === 'commands' && supervisor === 'tools'))) {
+    return <div className="grid gap-3">
+      <Button className="justify-self-start" size="sm" variant="secondary" onClick={() => setQuery({ supervisor: null })}>
+        Back to {view === 'agents' ? 'Agents' : 'Commands'}
+      </Button>
+      <SupervisorPage initialTab={supervisor} />
+    </div>;
+  }
   if (view === 'flows') return <FlowsPage />;
   if (view === 'flow') return <FlowPage />;
   if (view === 'operations') return <Operations project={project} />;

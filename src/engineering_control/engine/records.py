@@ -9,6 +9,7 @@ with, so nothing changes under a run that is under way.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -343,6 +344,42 @@ class FlowRecords:
             made = set(session.scalars(select(FlowVersion.flow_key).distinct()))
             gone = removed_keys(session)
         return [*(key for key in BUILTIN if key not in gone), *sorted(made - set(BUILTIN))]
+
+    def global_documents(self) -> Iterator[tuple[Document, bool]]:
+        """The published definition and current draft of each visible global flow."""
+        with self.sessions() as db:
+            versions = (
+                select(
+                    FlowVersion.flow_key,
+                    func.max(FlowVersion.version).label("latest"),
+                )
+                .where(
+                    FlowVersion.flow_key.not_in(select(ProjectFlow.flow_key)),
+                    FlowVersion.state.in_(("published", "draft")),
+                    FlowVersion.flow_key.not_in(select(RemovedFlow.flow_key)),
+                )
+                .group_by(FlowVersion.flow_key, FlowVersion.state)
+                .subquery()
+            )
+            query = select(FlowVersion.document, FlowVersion.state).join(
+                versions,
+                (versions.c.flow_key == FlowVersion.flow_key)
+                & (versions.c.latest == FlowVersion.version),
+            )
+            published = set()
+            for raw, state in db.execute(
+                query.order_by(FlowVersion.flow_key, FlowVersion.version).execution_options(
+                    yield_per=20
+                )
+            ):
+                document = parse(raw)
+                if state == "published":
+                    published.add(document.key)
+                yield document, state == "draft"
+            hidden = removed_keys(db) | published
+            for key, document in BUILTIN.items():
+                if key not in hidden:
+                    yield document, False
 
     def document(self, key: str, version: int) -> Document | None:
         """That version of the flow, or None when it is not there."""

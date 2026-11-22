@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -230,6 +231,18 @@ def line_of(command: Command) -> str:
     """A command as the line that says it."""
     line = shlex.join(command.argv)
     return line if command.cwd in (".", "") else f"[{command.cwd}] {line}"
+
+
+def profile_commands(lines: list[str], original: tuple[Command, ...]) -> list[dict[str, Any]]:
+    """Keep a copied manifest command's timeout and description while its line is unchanged."""
+    by_line: dict[str, deque[Command]] = defaultdict(deque)
+    for command in original:
+        by_line[line_of(command)].append(command)
+    commands = []
+    for command in commands_of(lines):
+        matches = by_line.get(line_of(command))
+        commands.append((matches.popleft() if matches else command).as_dict())
+    return commands
 
 
 @dataclass(frozen=True)

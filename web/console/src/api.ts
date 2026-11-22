@@ -158,6 +158,20 @@ export interface SavedTask {
 
 /** How a project is installed and how its tests are run, as command lines. */
 export interface CommandProfile { id: string; name: string; global: boolean; install: string[]; tests: string[]; }
+export interface ManifestCommand { line: string; description: string; timeout: number; }
+export interface ManifestCommands {
+  project: string;
+  name: string;
+  using: 'manifest' | 'override' | 'profile' | 'unregistered';
+  install: ManifestCommand[];
+  tests: ManifestCommand[];
+  note: string | null;
+}
+export interface CommandCatalog {
+  items: CommandProfile[];
+  manifests?: ManifestCommands[];
+  task_commands?: {name: string; flow: string | null; task: string; draft: boolean; commands: string[]}[];
+}
 export interface ProjectCommands {
   profile?: CommandProfile;
   install: string[];
@@ -243,6 +257,13 @@ export interface SkillShown {
 export interface AgentsListing {
   agents: AgentShown[];
   skills: SkillShown[];
+  roles: EngineRole[];
+}
+
+export interface EngineRole {
+  prompt: PromptShown;
+  tasks: {key: string; name: string; description: string}[];
+  used_by: (AgentShown['used_by'][number] & {custom_wording: boolean})[];
 }
 
 /** Something the platform knows about a run, that an If of a flow can ask about. */

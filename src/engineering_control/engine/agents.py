@@ -39,7 +39,9 @@ from engineering_control.engine.catalogue import (
     AGENT_MINUTES_CEILING,
     ASK_EFFORTS,
     INSTRUCTION_CHARACTERS,
+    TASKS,
 )
+from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.engine.records import FlowRecords
 from engineering_control.models.providers import API_KEYS, MODEL_NAME
 from engineering_control.sandbox import deliver
@@ -199,8 +201,40 @@ class Agents:
                 )
         return found
 
+    def platform_roles(self) -> list[dict[str, Any]]:
+        """The real sandbox roles and the global flow versions that invoke their contracts."""
+        roles: dict[str, dict[str, Any]] = {
+            contract.name: {
+                "prompt": contract.describe({}),
+                "tasks": [
+                    {"key": t.key, "name": t.title, "description": t.summary}
+                    for t in TASKS.values()
+                    if t.account and t.prompt == contract.name
+                ],
+                "used_by": [],
+            }
+            for contract in CONTRACTS.values()
+        }
+        if self.flows:
+            for doc, draft in self.flows.global_documents():
+                nodes: dict[str, list[str]] = {}
+                for node in doc.nodes:
+                    task = TASKS.get(node.task)
+                    if task and task.prompt in roles:
+                        nodes.setdefault(str(task.prompt), []).append(node.id)
+                for role, ids in nodes.items():
+                    roles[role]["used_by"].append(
+                        {
+                            "flow": doc.key,
+                            "name": doc.name,
+                            "tasks": ids,
+                            "draft": draft,
+                            "custom_wording": bool(doc.prompts.get(role)),
+                        }
+                    )
+        return [role for role in roles.values() if role["tasks"]]
+
     def listing(self, project: str | None = None) -> dict[str, Any]:
-        uses = self._uses()
         with self.sessions() as session:
             pid = active_project(session, project).id if project else None
             skills = session.scalars(select(Skill).order_by(func.lower(Skill.name))).all()
@@ -210,11 +244,13 @@ class Agents:
                 .where(AgentRecord.project_id == pid)
                 .order_by(func.lower(AgentRecord.name))
             ).all()
+            uses = self._uses() if agents else {}
             held: dict[str, list[str]] = {}
             for agent in agents:
                 for skill in agent.skills or []:
                     held.setdefault(str(skill), []).append(agent.name)
             return {
+                "roles": self.platform_roles() if project is None else [],
                 "agents": [
                     {**self._agent(agent, names), "used_by": uses.get(str(agent.id), [])}
                     for agent in agents

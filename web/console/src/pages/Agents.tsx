@@ -49,6 +49,7 @@ import {
 } from '../api';
 import { LoadError, TableFrame } from '../parts';
 import { BASE } from '../router';
+import { EngineRoles } from './EngineCatalog';
 import { API_PROVIDER_NAMES, PROVIDER_NAMES } from './FlowParts';
 import { useSubmit, type DialogProps } from './ProjectDialogs';
 
@@ -452,24 +453,22 @@ export function AgentsTab({ project }: { project?: string } = {}) {
   return (
     <div className="grid gap-4">
       <LoadError resource={listing} />
+      {!project && listing.data && <EngineRoles roles={listing.data.roles} />}
       {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between gap-3">
-          <CardTitle>Agents</CardTitle>
+          <CardTitle>{project ? 'Project agents' : 'Custom agents'}</CardTitle>
           <Button icon={Plus} size="sm" disabled={!listing.data} onClick={() => setAgent('new')}>
             Add agent
           </Button>
         </CardHeader>
         <CardBody className="grid gap-3">
           <p className="text-[13px] text-muted-foreground">
-            An agent is who does a task: its standing instructions, its skills, and how it works. A task of a flow names
-            an agent in its setting “Agent”; what the task leaves open (the subscriptions, the model, the time) then
-            comes from the agent. Changing an agent changes every task that names it, in every flow, from the next step
-            that starts.
+            Assign a custom agent to a flow task to share its instructions, skills, and model preferences.
           </p>
           {listing.data && agents.length === 0 ? (
             <div className="flex flex-wrap items-center gap-3 rounded-md border border-dashed border-border p-4">
-              <span className="text-[13px]">No agents yet.</span>
+              <span className="text-[13px]">{project ? 'No project agents yet.' : 'No custom agents yet.'}</span>
               <Button size="sm" variant="secondary" loading={adding} onClick={usual}>
                 Add Maker and Reviewer to start with
               </Button>

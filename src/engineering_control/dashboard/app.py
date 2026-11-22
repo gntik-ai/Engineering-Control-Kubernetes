@@ -1641,10 +1641,12 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         try:
-            items = await asyncio.to_thread(repo(request).command_profiles.listing, scope(request))
+            result = await asyncio.to_thread(
+                repo(request).command_profiles.catalog, scope(request), repo(request).flows
+            )
         except ProjectNotFound:
             raise HTTPException(404, "Project not found") from None
-        return JSONResponse({"items": items})
+        return JSONResponse(result)
 
     @app.post("/api/dashboard/operations")
     async def create_operation(request: Request) -> Response:
@@ -1693,6 +1695,7 @@ def create_app(
                 b.name,
                 b.install,
                 b.tests,
+                b.manifest,
             ),
             event="dashboard.command_profile_created",
             entity="id",
@@ -1712,6 +1715,7 @@ def create_app(
                 b.name,
                 b.install,
                 b.tests,
+                b.manifest,
             ),
             event="dashboard.command_profile_changed",
             subject=str(profile_id),
