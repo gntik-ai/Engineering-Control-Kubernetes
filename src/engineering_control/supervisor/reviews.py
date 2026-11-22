@@ -35,7 +35,7 @@ from engineering_control.db.models import (
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import REVIEW_TASKS
 from engineering_control.engine.reviews import ACTIONS
-from engineering_control.flow_library import AUDIT, DISCOVER
+from engineering_control.flow_library import AUDIT, DELIVER, DISCOVER
 
 ATTENTION = (
     "awaiting_decision",
@@ -159,6 +159,7 @@ def inventory(now: datetime) -> Any:
     ).where(
         or_(
             SandboxRun.kind.in_((AUDIT, DISCOVER)),
+            (SandboxRun.kind == DELIVER) & key.is_(None),
             checked.is_(True),
             checked.is_(None) & (((version == 0) & key.in_(builtin_reviews)) | historical),
             key.in_(("ui-audit", "ux-audit", "audit-code")),

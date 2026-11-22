@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import func, select
 
-from engineering_control.dashboard.project_records import ProjectRecords
+from engineering_control.dashboard.project_records import ProjectConflict, ProjectRecords
 from engineering_control.db.models import (
     BacklogItem,
     PlanningReview,
@@ -195,6 +196,25 @@ def test_project_flow_creation_archive_and_restore(world: Any) -> None:
     key = saved["flow"]
     assert world.toolbox.flows.owner(key) == p
     assert world.toolbox.flows.impact(key)["versions"]
+    with world.sessions.begin() as db:
+        project = db.scalar(select(ProjectRecord).where(ProjectRecord.name == p))
+        running = ReviewFlowRun(
+            project_id=project.id,
+            action="issues",
+            flow_key=key,
+            flow_name="Active review",
+            version=0,
+            settings={},
+        )
+        db.add(running)
+        db.flush()
+        review_id = running.id
+    assert str(review_id) in world.toolbox.flows.impact(key)["active_runs"]
+    with pytest.raises(ProjectConflict, match="has not ended"):
+        world.toolbox.flows.remove(key, archive=True)
+    with world.sessions.begin() as db:
+        db.get(ReviewFlowRun, review_id).finished_at = datetime.now(UTC)
+
     change(
         "retire_flow",
         {"flow": key, "operation": "archive", "reason": "Hide it and keep its versions."},

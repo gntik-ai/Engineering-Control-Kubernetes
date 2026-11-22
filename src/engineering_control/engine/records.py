@@ -33,6 +33,7 @@ from engineering_control.db.models import (
     ProjectSection,
     RemovedFlow,
     ReviewFlowAssignment,
+    ReviewFlowRun,
     SandboxRun,
     SavedTask,
 )
@@ -81,6 +82,22 @@ def _flow_of(run: SandboxRun) -> str:
     said = (run.data or {}).get("flow")
     key = said.get("key") if isinstance(said, dict) else None
     return str(key or FLOW_OF_KIND.get(run.kind) or "")
+
+
+def _active_flow_runs(db: Session, key: str) -> list[UUID]:
+    delivery = [
+        r.id
+        for r in db.scalars(
+            select(SandboxRun).where(SandboxRun.state.in_(("queued", "running", "waiting")))
+        )
+        if _flow_of(r) == key
+    ]
+    reviews = db.scalars(
+        select(ReviewFlowRun.id).where(
+            ReviewFlowRun.flow_key == key, ReviewFlowRun.finished_at.is_(None)
+        )
+    )
+    return [*delivery, *reviews]
 
 
 def described(document: Document) -> dict[str, Any]:
@@ -699,13 +716,7 @@ class FlowRecords:
                 .join(ReviewFlowAssignment, ReviewFlowAssignment.project_id == ProjectRecord.id)
                 .where(ReviewFlowAssignment.flow_key == key)
             )
-            active = [
-                str(r.id)
-                for r in db.scalars(
-                    select(SandboxRun).where(SandboxRun.state.in_(("queued", "running", "waiting")))
-                )
-                if _flow_of(r) == key
-            ]
+            active = [str(run_id) for run_id in _active_flow_runs(db, key)]
             return {
                 "flow": key,
                 "project": self.owner(key),
@@ -760,13 +771,7 @@ class FlowRecords:
                     f"run{'s' if len(callers) == 1 else ''} it as a part: take it out of "
                     "there first, or delete that flow first"
                 )
-            under_way = [
-                run
-                for run in session.scalars(
-                    select(SandboxRun).where(SandboxRun.state.in_(("queued", "running", "waiting")))
-                )
-                if _flow_of(run) == key
-            ]
+            under_way = _active_flow_runs(session, key)
             if under_way:
                 count = len(under_way)
                 raise ProjectConflict(
