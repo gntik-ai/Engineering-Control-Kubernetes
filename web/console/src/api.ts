@@ -257,7 +257,7 @@ export interface SkillShown {
 export interface AgentsListing {
   agents: AgentShown[];
   skills: SkillShown[];
-  roles: EngineRole[];
+  roles?: EngineRole[];
 }
 
 export interface EngineRole {

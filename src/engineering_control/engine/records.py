@@ -361,20 +361,23 @@ class FlowRecords:
                 .group_by(FlowVersion.flow_key, FlowVersion.state)
                 .subquery()
             )
-            query = select(FlowVersion.document, FlowVersion.state).join(
+            query = select(FlowVersion.flow_key, FlowVersion.document, FlowVersion.state).join(
                 versions,
                 (versions.c.flow_key == FlowVersion.flow_key)
                 & (versions.c.latest == FlowVersion.version),
             )
             published = set()
-            for raw, state in db.execute(
+            for key, raw, state in db.execute(
                 query.order_by(FlowVersion.flow_key, FlowVersion.version).execution_options(
                     yield_per=20
                 )
             ):
-                document = parse(raw)
                 if state == "published":
-                    published.add(document.key)
+                    published.add(key)
+                try:
+                    document = parse(raw)
+                except FlowInvalid:
+                    continue
                 yield document, state == "draft"
             hidden = removed_keys(db) | published
             for key, document in BUILTIN.items():

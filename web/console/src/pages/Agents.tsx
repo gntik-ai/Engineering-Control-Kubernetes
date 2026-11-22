@@ -453,7 +453,7 @@ export function AgentsTab({ project }: { project?: string } = {}) {
   return (
     <div className="grid gap-4">
       <LoadError resource={listing} />
-      {!project && listing.data && <EngineRoles roles={listing.data.roles} />}
+      {!project && listing.data && <EngineRoles roles={listing.data.roles ?? []} />}
       {problem ? <Alert tone="destructive" title={problem} onDismiss={() => setProblem(null)} /> : null}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between gap-3">

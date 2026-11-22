@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from engineering_control.dashboard.repository import DashboardRepository
-from engineering_control.db.models import CommandProfile, ProjectRecord
+from engineering_control.db.models import CommandProfile, FlowVersion, ProjectRecord
 from engineering_control.engine.builtin import BUILTIN
 from engineering_control.sandbox import deliver
 from engineering_control.sandbox.runs import commands_of_project
@@ -45,7 +45,18 @@ def test_global_catalog_tracks_published_draft_and_private_sources(tmp_path: Pat
             name="Shared checks", task="code.run", params={"commands": ["pytest -q"]}, wording={}
         )
 
+        with repo.sessions.begin() as db:
+            db.add(
+                FlowVersion(
+                    flow_key="code-clean",
+                    version=1,
+                    state="published",
+                    document={"format": "obsolete"},
+                    sha256="0" * 64,
+                )
+            )
         inventory = client.get("/api/dashboard/agents").json()
+        assert all(use["flow"] != "code-clean" for r in inventory["roles"] for use in r["used_by"])
         maker = next(x for x in inventory["roles"] if x["prompt"]["name"] == "implementer")
         assert {
             (r["draft"], r["custom_wording"]) for r in maker["used_by"] if r["flow"] == key
