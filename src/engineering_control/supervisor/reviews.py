@@ -70,7 +70,14 @@ def inventory(now: datetime) -> Any:
         PlanningReview,
         WorkspaceImport,
     )
-    scan = imp.progress["coverage_run"]["state"].as_string()
+    coverage = imp.progress["coverage_run"]["state"].as_string()
+    scanning = imp.progress["scan_state"].as_string()
+    operation = imp.progress["operation"]["state"].as_string()
+    import_state = case(
+        (r.action.in_(("epics", "stories", "issues")), operation),
+        (r.action == "coverage", func.coalesce(coverage, scanning)),
+        else_=scanning,
+    )
     # An elapsed worker lease is evidence of a stall. A queued or paused job can be old by design.
     stalled = or_(
         (job.lease.is_not(None)) & (job.due_at < now),
@@ -94,9 +101,7 @@ def inventory(now: datetime) -> Any:
             job.status,
             conn.status,
             plan.status,
-            scan,
-            imp.progress["scan_state"].as_string(),
-            imp.progress["operation"]["state"].as_string(),
+            import_state,
             "running",
         ),
     )
@@ -211,7 +216,16 @@ def inventory(now: datetime) -> Any:
         func.coalesce(imp.progress["scan_state"].as_string(), imp.stage),
         empty_version,
         imp.created_at,
-    ).where(imp.review_run_id.is_(None))
+    ).where(
+        imp.review_run_id.is_(None),
+        or_(
+            imp.stage != "inventory",
+            imp.lease.is_not(None),
+            imp.commit_sha.is_not(None),
+            scanning.is_not(None),
+            operation.is_not(None),
+        ),
+    )
     return union_all(
         flow, sandbox, pending_job, pending_conn, pending_plan, pending_import
     ).subquery()
@@ -319,7 +333,10 @@ class ReviewHistory:
         from engineering_control.sandbox.runs import Runs
 
         with self.sessions() as db:
-            pid = active_project(db, project).id
+            # Archived projects retain their historical receipts in the all-project review view.
+            pid = db.scalar(select(ProjectRecord.id).where(ProjectRecord.name == project))
+            if pid is None:
+                raise ProjectNotFound(project)
             if source == "sandbox":
                 run = db.get(SandboxRun, key)
                 rows = inventory(datetime.now(UTC))

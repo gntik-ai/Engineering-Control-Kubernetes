@@ -109,6 +109,7 @@ def test_scope_enforced_at_tool_and_approval(world: Any) -> None:
 
 def test_review_history_pages_attention_and_idle_monitor(world: Any) -> None:
     baseline = world.toolbox.reviews.listing(["falcone-workflow"])["total"]
+    assert baseline == 0  # Connecting a repository has not started its first review.
     with world.sessions.begin() as db:
         project = db.scalar(select(ProjectRecord))
         runs = [
@@ -174,6 +175,12 @@ def test_review_history_pages_attention_and_idle_monitor(world: Any) -> None:
     assert watcher.listing(project="falcone-workflow")["items"] == []
     with world.sessions() as db:
         assert db.scalar(select(func.count()).select_from(ReviewFlowRun)) == 56
+    with world.sessions.begin() as db:
+        db.scalar(select(ProjectRecord)).archived_at = now
+    assert (
+        history.detail("falcone-workflow", "review", run_id)["proposals"][0]["decision"]
+        == "accepted"
+    )
 
 
 def test_project_flow_creation_archive_and_restore(world: Any) -> None:
