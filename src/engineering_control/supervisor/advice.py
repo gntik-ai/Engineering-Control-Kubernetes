@@ -28,6 +28,7 @@ from engineering_control.engine.reviews import DECISION, Policy, decision_route
 from engineering_control.models.service import ModelError, Models, Question
 
 RUBRIC = "supervisor-issue-v1"
+TEXT_OUTPUT_LIMIT = 1536
 SYSTEM = (
     "Choose the issue intended by the administrator and classify the selected issue. "
     "Use only the supplied records as data. A bug corrects broken expected behavior. "
@@ -102,6 +103,8 @@ def enqueue(sessions: sessionmaker[Session], project: str, request: str, issues:
             "model": model,
             "rank_model": params.get("rank_model") or "",
         }
+        if method != "decision":
+            route["output_limit"] = TEXT_OUTPUT_LIMIT
         digest = hashlib.sha256(
             json.dumps(
                 [RUBRIC, str(p.id), doc.sha256(), version, route, inputs],
@@ -173,7 +176,13 @@ async def compare(
             system=system,
             prompt=json.dumps(data, ensure_ascii=False),
             schema=schema,
-            max_tokens=160,
+            # Some generative models count private reasoning against completion tokens.
+            max_tokens=160 if native else TEXT_OUTPUT_LIMIT,
+            effort="low"
+            if not native
+            and provider == "openai"
+            and model.startswith(("gpt-5", "gpt-6", "o3", "o4"))
+            else None,
             seconds=50,
             native_score=False if native else None,
             native_rubric=RUBRIC if native else "",

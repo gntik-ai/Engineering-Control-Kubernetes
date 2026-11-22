@@ -124,12 +124,6 @@ def read(name: str, answer: Any, model: str, max_tokens: int, model_prefix: str 
             else f"{name} answered something that is not an answer.",
         ) from error
     reason = str(choice.get("finish_reason") or "")
-    if name != "OpenRouter" and reason == "length":
-        raise WireError("cut", f"The answer was longer than the {max_tokens:,} tokens it may have.")
-    if name != "OpenRouter" and (reason == "content_filter" or message.get("refusal")):
-        raise WireError(
-            "declined", f"The model declined to answer: {said(message.get('refusal'))}".rstrip(": ")
-        )
     usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
     read_in_all = _count(usage.get("prompt_tokens"))
     # What a model thought before it answered is paid as written. A provider that
@@ -165,12 +159,19 @@ def read(name: str, answer: Any, model: str, max_tokens: int, model_prefix: str 
         upstream=str(answer["provider"]) if router and answer.get("provider") else None,
         reported_cost=amount(usage.get("cost")) if router else None,
     )
-    if reason == "length" or reason == "content_filter" or message.get("refusal"):
-        raise WireError(
-            "cut" if reason == "length" else "declined",
-            "OpenRouter returned an incomplete answer.",
-            metered=wire,
+    if reason in ("length", "content_filter") or message.get("refusal"):
+        label = "cut" if reason == "length" else "declined"
+        if router:
+            detail = "OpenRouter returned an incomplete answer."
+        elif label == "cut":
+            detail = f"The answer was longer than the {max_tokens:,} tokens it may have."
+        else:
+            detail = f"The model declined to answer: {said(message.get('refusal'))}".rstrip(": ")
+        measured = all(
+            type(usage.get(k)) is int and usage[k] >= 0
+            for k in ("prompt_tokens", "completion_tokens")
         )
+        raise WireError(label, detail, metered=wire if measured else None)
     return wire
 
 
