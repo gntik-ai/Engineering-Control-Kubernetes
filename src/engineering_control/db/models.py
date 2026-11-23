@@ -801,6 +801,51 @@ class ReviewEvidenceJob(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PlanningLink(UUIDPrimaryKey, Timestamps, Base):
+    """What is known of one link between two planning records (migration 0071): a User
+    Story under an Epic, or a technical Issue under a User Story.
+
+    Whether the two are linked is said by the link tables; this says who made the link
+    and why, and whether it is the child's primary parent. It is kept in step with them:
+    a link that is made gets a record, and the record of one that is taken away is kept,
+    with the day it went, as the link's history."""
+
+    __tablename__ = "planning_links"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    parent_id: Mapped[UUID] = mapped_column(Uuid)
+    # Who made it: ``declared`` in the child's own text, the ``administrator``, a
+    # ``model``, or ``unknown`` for a link nothing explains.
+    origin: Mapped[str] = mapped_column(String(16))
+    # Whether the administrator made it or approved it.
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    # The passages that justify it: each with the side it is from and its words.
+    evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    strength: Mapped[str | None] = mapped_column(String(16))
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    # How the primary parent was chosen: it is the ``only`` one, it was ``suggested``
+    # by how alike the texts are, or the ``administrator`` chose it.
+    primary_by: Mapped[str | None] = mapped_column(String(16))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        Index("ix_planning_links_child", "project_id", "kind", "child_id"),
+        Index(
+            "uq_planning_links_active",
+            "project_id",
+            "kind",
+            "child_id",
+            "parent_id",
+            unique=True,
+            sqlite_where=text("removed_at IS NULL"),
+            postgresql_where=text("removed_at IS NULL"),
+        ),
+    )
+
+
 class PlanningHealth(Base):
     """How a project's Epics, User Stories and Issues hang together on one UTC day
     (migration 0070): the last measurement of that day. Kept so that the numbers can be

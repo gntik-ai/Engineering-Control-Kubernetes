@@ -43,8 +43,8 @@ def test_the_numbers_are_the_ones_the_planning_tables_show(tmp_path: Path) -> No
         assert now["orphans_open"] == _orphans(client, "open") == 2
         assert now["orphans_closed"] == _orphans(client, "closed") == 2
         assert (now["issue_story_links"], now["story_epic_links"]) == (1, 3)
-        # No link says who made it or why yet.
-        assert (now["links_with_reason"], now["links_without_reason"]) == (0, 4)
+        # One link was made by the administrator; nothing explains the Stories' Epics.
+        assert (now["links_with_reason"], now["links_without_reason"]) == (1, 3)
         assert now["stories_without_issue"] == 2 and now["stories_under_several_epics"] == 0
         assert (now["largest_epic_title"], now["largest_epic_stories"]) == ("Operations", 3)
         # With three Stories in all, one Epic that has them all is no catch-all.

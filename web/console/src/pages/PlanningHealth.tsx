@@ -28,6 +28,12 @@ interface Numbers {
   issue_story_links: number;
   story_epic_links: number;
   links_without_reason: number;
+  links_with_reason?: number;
+  links_declared?: number;
+  links_by_administrator?: number;
+  links_by_model?: number;
+  links_unknown?: number;
+  primaries_suggested?: number;
   reviews_queued: number;
   reviews_needing_input: number;
   reviews_failed: number;
@@ -227,9 +233,23 @@ export function PlanningHealth({ project }: { project: string }) {
                 value={now.links_without_reason}
                 label="Links with no recorded reason"
                 of={`of ${whole(links)} links: ${whole(now.issue_story_links)} issue to Story, ${whole(now.story_epic_links)} Story to Epic`}
+                note={
+                  now.links_by_model === undefined
+                    ? undefined
+                    : `${whole(now.links_declared ?? 0)} stated in the text, ${whole(now.links_by_administrator ?? 0)} chosen by you, ${whole(now.links_by_model)} made by a review, ${whole(now.links_unknown ?? 0)} that nothing explains`
+                }
                 was={was?.links_without_reason}
                 since={since}
               />
+              {now.primaries_suggested === undefined ? null : (
+                <Tile
+                  value={now.primaries_suggested}
+                  label="Primary parents nobody chose"
+                  of="Records under several parents whose primary one is only suggested"
+                  was={was?.primaries_suggested}
+                  since={since}
+                />
+              )}
               <Tile
                 value={now.reviews_waiting}
                 label="Reviews waiting"

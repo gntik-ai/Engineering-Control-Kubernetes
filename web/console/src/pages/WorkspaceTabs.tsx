@@ -33,6 +33,7 @@ import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { querySort, sortParams } from '../components/table-order';
 import { LayoutSwitch, PlanningGrid, type Layout } from './PlanningGrid';
 import { NewEpicDialog } from './NewEpicDialog';
+import { PlanningLinkNote, type ParentLink } from './PlanningLinkNote';
 import { PlanningHealth } from './PlanningHealth';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { RecordReview, type ReviewResult } from './PlanningReviews';
@@ -55,6 +56,8 @@ export interface PlanRow {
   description: string | null;
   epic_ids?: string[];
   story_ids?: string[];
+  /** Of each parent: who linked it and why, and whether it is the primary one. */
+  parent_links?: ParentLink[];
   story_count?: number;
   issue_count?: number;
   review?: string | null;
@@ -480,13 +483,23 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           )}
           {kind === 'issues' && record.orphan && <li><span className="rounded bg-warning/15 px-2 py-1 text-sm font-medium">Orphan · No linked User Story</span></li>}
           {kind === 'issues' && record.standalone_bug && <li>Standalone bug · User Story optional</li>}
-          {(record.epic_ids ?? record.story_ids ?? []).map((id) => (
-            <li key={id}>
-              {kind === 'stories' && data?.parents[id] ? (
-                <Link href={epicUrl(id)} underline="always">{data.parents[id]}</Link>
-              ) : data?.parents[id] ?? (kind === 'stories' ? 'Unavailable Epic' : 'Unavailable User Story')}
-            </li>
-          ))}
+          {/* The primary parent first; under each, who linked it and why. */}
+          {[...(record.epic_ids ?? record.story_ids ?? [])]
+            .sort((a, b) => Number(Boolean(record.parent_links?.find(l => l.parent === b)?.primary)) - Number(Boolean(record.parent_links?.find(l => l.parent === a)?.primary)))
+            .map((id, _index, all) => {
+              const note = record.parent_links?.find(l => l.parent === id);
+              return (
+                <li key={id}>
+                  {kind === 'stories' && data?.parents[id] ? (
+                    <Link href={epicUrl(id)} underline="always">{data.parents[id]}</Link>
+                  ) : data?.parents[id] ?? (kind === 'stories' ? 'Unavailable Epic' : 'Unavailable User Story')}
+                  {note && !record.proposal && (
+                    <PlanningLinkNote path={path} child={record.id} link={note} several={all.length > 1}
+                      parentKind={kind === 'stories' ? 'Epic' : 'User Story'} onChanged={reload} />
+                  )}
+                </li>
+              );
+            })}
         </ul>
       ),
     });

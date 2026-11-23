@@ -20,6 +20,7 @@ from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_analysis import PlanningAnalysis
 from engineering_control.dashboard.planning_health import PlanningHealthRecords
+from engineering_control.dashboard.planning_links import PlanningLinks
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.schemas import ActivityEventInput
@@ -114,6 +115,7 @@ class DashboardRepository:
         self.publishing = WorkspacePublishing(self.sessions)
         self.workspace_metrics = WorkspaceMetrics(self.sessions)
         self.planning_health = PlanningHealthRecords(self.sessions)
+        self.planning_links = PlanningLinks(self.sessions)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

@@ -265,6 +265,26 @@ The administrator agreed these rules and phases. Every change to existing record
 
 The project is measured once a day, and again when the page is opened after ten minutes or **Measure now** is pressed. The last measurement of each UTC day is kept (`planning_health`, migration 0070). The first one is the baseline: each tile says how its number moved since. `GET /api/dashboard/projects/{name}/planning/health?days=30` returns the current numbers, the baseline and the days between. No model is asked.
 
+### Links as records, and the primary parent
+
+Whether a User Story is under an Epic, or a technical Issue under a User Story, is still said by the link tables, and everything that reads or writes them works as before. What they cannot say is kept in `planning_links` (migration 0071), one record a link: who made it, the reason and the passages that justify it, and whether it is the child's primary parent. The records follow the link tables: a link without a record gets one when its row is next listed or the project is measured, and the record of a link that is taken away is kept with the day it went. A link made by any part of the platform is therefore recorded, and a link's history outlives the link.
+
+Who made a link is established from what is stored, never guessed.
+
+| Shown as | When |
+| --- | --- |
+| Stated in its text | The child's own text names the parent's GitHub number on a `Story:`, `Epic:` or `Parent:` line. The line is kept as evidence. |
+| Chosen by you | The administrator set the record's parents in the console. |
+| Matched by a review | A coverage review matched the issue with the Story. Its evidence is kept as the reason, with whether it covers the whole Story or part of it. |
+| Proposed by a review, approved by you | The record was a proposal that named this parent, and the administrator approved it. |
+| No reason recorded | Nothing stored explains the link. |
+
+A record with parents has exactly one primary parent. An only parent is the primary one. Among several, one is suggested: first by how much is known of the link, then by how alike the two texts are, counting less the words that all the parents share. A suggestion is marked as one until the administrator chooses, with **Make this the primary Epic** or **User Story** under the parent's name. Every other parent is a related link.
+
+In the User Stories and Issues tables each parent shows whether it is primary and who linked it; opening the line shows the reason, the passages and the date. `GET /api/dashboard/projects/{name}/planning/{kind}/{id}/links` returns a record's current and past links. `POST …/{id}/primary` with `parent_id` records the administrator's choice.
+
+Planning health counts the links that say why, by who made them, and the records whose primary parent nobody chose.
+
 ### A review run that was cut off
 
 A paid call whose provider never reported its usage leaves its run **uncertain**: its tokens stay reserved against the run and the project, and a later review of the same issue and Story is held with "An earlier decision for these sources has unconfirmed usage".

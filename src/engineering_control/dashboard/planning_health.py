@@ -6,7 +6,8 @@ when its row says so. One measurement is kept per project and UTC day, the last 
 the day, so that the numbers can be followed over time and a change to how records are
 connected can be judged by what it did to them.
 
-Nothing is asked of a model, and nothing is changed but the measurement itself.
+Nothing is asked of a model. A measurement first brings the records of the project's links
+in step with the links (``planning_links``), so that it counts what each link says of itself.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any, Final
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import planning_links
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
 from engineering_control.db.models import (
@@ -46,6 +48,7 @@ FOLLOWED: Final = (
     "stories_under_several_epics",
     "largest_epic_stories",
     "links_without_reason",
+    "primaries_suggested",
     "reviews_waiting",
 )
 
@@ -66,6 +69,7 @@ def _rows(planning: PlanningRecords, name: str, kind: str, **view: Any) -> list[
 def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
     """The project's numbers as they are now."""
     planning = PlanningRecords(sessions)
+    planning_links.PlanningLinks(sessions).reconcile_project(name)
     epics = [
         row for state in ("open", "closed") for row in _rows(planning, name, "epics", state=state)
     ]
@@ -105,6 +109,7 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
                 ReviewEvidenceJob.project_id == project.id, ReviewEvidenceJob.state == "uncertain"
             )
         )
+        said = planning_links.numbers(db, project.id)
     links = int(issue_links or 0) + int(story_links or 0)
     return {
         "epics": len(epics),
@@ -141,9 +146,16 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         ),
         "issue_story_links": int(issue_links or 0),
         "story_epic_links": int(story_links or 0),
-        # No link records who made it or why yet: until one does, none can be explained.
-        "links_with_reason": 0,
-        "links_without_reason": links,
+        # A link says why when its child's text names the parent, the administrator
+        # chose it, or the review that made it gave a reason.
+        "links_with_reason": said["links_with_reason"],
+        "links_without_reason": max(0, links - said["links_with_reason"]),
+        "links_declared": said["links_declared"],
+        "links_by_administrator": said["links_by_administrator"],
+        "links_by_model": said["links_by_model"],
+        "links_unknown": said["links_unknown"],
+        # Children of several parents whose primary one nobody chose: it is suggested.
+        "primaries_suggested": said["primaries_suggested"],
         "reviews_queued": waiting.get("queued", 0),
         "reviews_needing_input": waiting.get("needs_input", 0),
         "reviews_failed": waiting.get("failed", 0),

@@ -512,6 +512,12 @@ class StoryInput(EpicInput):
     epic_ids: list[UUID] = Field(default_factory=list)
 
 
+class PrimaryParentInput(PlainChangeInput):
+    """The administrator's choice of a record's primary parent, among its parents."""
+
+    parent_id: UUID
+
+
 class WorkspaceIssueStories(PlainChangeInput):
     story_ids: list[UUID]
     execution_type: Literal["bug", "enhancement"] | None = None

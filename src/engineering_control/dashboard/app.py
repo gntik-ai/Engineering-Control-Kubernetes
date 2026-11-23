@@ -10,7 +10,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -102,6 +102,7 @@ from engineering_control.dashboard.schemas import (
     PlainChangeInput,
     PlanningConfirmation,
     PlanningStateInput,
+    PrimaryParentInput,
     ProjectApplicationInput,
     ProjectArchiveInput,
     ProjectCommandsInput,
@@ -1476,23 +1477,26 @@ def create_app(
         direction: Direction = "asc",
     ) -> Response:
         try:
-            return JSONResponse(
-                await asyncio.to_thread(
-                    repo(request).planning.page,
-                    name,
-                    kind,
-                    page,
-                    page_size,
-                    search,
-                    epic,
-                    record,
-                    connected,
-                    issue_state,
-                    state,
-                    sort,
-                    direction,
-                )
+            listed = await asyncio.to_thread(
+                repo(request).planning.page,
+                name,
+                kind,
+                page,
+                page_size,
+                search,
+                epic,
+                record,
+                connected,
+                issue_state,
+                state,
+                sort,
+                direction,
             )
+            # Who linked each record to its parents and why, and which is the primary one.
+            await asyncio.to_thread(
+                repo(request).planning_links.annotate, name, kind, listed["items"]
+            )
+            return JSONResponse(listed)
         except ProjectInvalid as error:
             raise HTTPException(422, str(error)) from None
         except ProjectNotFound:
@@ -1522,13 +1526,64 @@ def create_app(
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
+    def by_the_administrator(
+        records: DashboardRepository,
+        name: str,
+        kind: str,
+        key: UUID | None,
+        change: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Make a change to a record's parents that the administrator asked for. What is
+        linked before is recorded first, so that what the change adds is known to be the
+        administrator's own."""
+        links = records.planning_links
+        if key is not None:
+            links.before_change(name, kind, key)
+        saved = change()
+        changed = key or (UUID(saved["id"]) if saved.get("id") else None)
+        if changed is not None:
+            links.after_change(name, kind, changed)
+        return saved
+
+    @app.get("/api/dashboard/projects/{name}/planning/{kind}/{key}/links")
+    async def planning_links_api(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        """Every link the record has and had to a parent: who made each and why."""
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).planning_links.history, name, kind, key)
+            )
+        except ProjectInvalid as error:
+            raise HTTPException(422, str(error)) from None
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/primary")
+    async def planning_primary_api(name: str, kind: Kind, key: UUID, request: Request) -> Response:
+        """The administrator's choice of the record's primary parent."""
+        return await project_change(
+            request,
+            PrimaryParentInput,
+            lambda body: asyncio.to_thread(
+                repo(request).planning_links.set_primary, name, kind, key, body.parent_id
+            ),
+            event="workspace.primary_parent_chosen",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/planning/issues/{key}/stories")
     async def link_issue_stories(name: str, key: UUID, request: Request) -> Response:
         return await project_change(
             request,
             WorkspaceIssueStories,
             lambda body: asyncio.to_thread(
-                repo(request).planning.link_stories, name, key, body.story_ids, body.execution_type
+                by_the_administrator,
+                repo(request),
+                name,
+                "issues",
+                key,
+                lambda: repo(request).planning.link_stories(
+                    name, key, body.story_ids, body.execution_type
+                ),
             ),
             event="workspace.issue_stories_linked",
             subject=name,
@@ -1576,14 +1631,20 @@ def create_app(
                 else (body.story_ids if isinstance(body, WorkspaceIssueInput) else [])
             )
             return await asyncio.to_thread(
-                repo(request).planning.save,
+                by_the_administrator,
+                repo(request),
                 name,
                 kind,
-                body.title,
-                body.description,
-                parents,
                 key,
-                body.execution_type if isinstance(body, WorkspaceIssueInput) else None,
+                lambda: repo(request).planning.save(
+                    name,
+                    kind,
+                    body.title,
+                    body.description,
+                    parents,
+                    key,
+                    body.execution_type if isinstance(body, WorkspaceIssueInput) else None,
+                ),
             )
 
         return await project_change(

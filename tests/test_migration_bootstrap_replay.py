@@ -49,7 +49,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0047 (the day a backlog item was done) follows it, and 0048 (deleted flows of the
     # platform's own) follows that. 0049 adds the workspace records and default.
     # 0070 keeps a daily measurement of how each project's planning hangs together.
-    assert (head, parent) == ("0070", "0069")
+    # 0071 records who made each planning link and why, and the primary parent.
+    assert (head, parent) == ("0071", "0070")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -148,7 +149,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert "confirmation_token" in {
         c["name"] for c in inspect(engine).get_columns("workspace_actions")
     }
+    links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
+    assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     command.downgrade(config, parent)
+    assert "planning_links" not in inspect(engine).get_table_names()
+    assert "planning_health" in inspect(engine).get_table_names()
+    command.downgrade(config, "0069")
     assert "planning_health" not in inspect(engine).get_table_names()
     assert "planning_lifecycle_receipts" in inspect(engine).get_table_names()
     command.downgrade(config, "0068")
