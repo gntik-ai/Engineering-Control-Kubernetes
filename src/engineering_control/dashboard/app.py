@@ -38,6 +38,7 @@ from engineering_control.dashboard import (
     review_budget,
     review_evidence,
     review_flows,
+    signals,
     stats,
 )
 from engineering_control.dashboard.auth import (
@@ -63,6 +64,7 @@ from engineering_control.dashboard.project_records import (
     clean_repository,
 )
 from engineering_control.dashboard.project_sections import SECTION_KEY, Guide
+from engineering_control.dashboard.ranking import Ranker
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
     AccountCreateInput,
@@ -525,6 +527,13 @@ def create_app(
                     parent_choice.worker(resolved_repository.sessions, app.state.models)
                 )
             )
+            if resolved.ranker_url:
+                # Vectors and scores of the planning records, from the ranking service.
+                keepers.append(
+                    asyncio.create_task(
+                        signals.worker(resolved_repository.signals, Ranker(resolved.ranker_url))
+                    )
+                )
             if resolved_github is not None:
                 # The documentation of each project is read when its branch moved.
                 keepers.append(

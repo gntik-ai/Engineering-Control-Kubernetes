@@ -1,0 +1,117 @@
+# The ranking service: two small open models that run on the cluster's own processors
+# (src/engineering_control/ranker/service.py). The console's workers send it texts and get
+# numbers back: a vector for a text, so that records that mean alike can be found, and a
+# score for how well two texts fit. It decides nothing and stores nothing.
+#
+# The models are part of the image. The service has no database, no key and no identity
+# towards the cluster, and may open no connection at all (network-policy.yaml), so no text
+# it is sent can leave the cluster through it. Only pods of the control plane reach it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineering-control-ranker
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: ranker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engineering-control
+      app.kubernetes.io/component: ranker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: engineering-control
+        app.kubernetes.io/component: ranker
+    spec:
+      serviceAccountName: engineering-control
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Never on the node reserved for sandboxes (see deploy/README.md).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: engineering-control/sandbox
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["aibot"]
+      containers:
+        - name: ranker
+          image: engineering-control
+          command: ["engineering-ranker"]
+          ports:
+            - name: ranker
+              containerPort: 8796
+          envFrom:
+            - configMapRef:
+                name: engineering-control-settings
+          # Loading the models takes seconds; until then the service answers 503.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: ranker
+            periodSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ranker
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ranker
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # The models hold about 1 GiB once both have been asked. The processors are
+          # shared: it works through what it is sent one request at a time.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 3Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: engineering-control-ranker
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: ranker
+spec:
+  selector:
+    app.kubernetes.io/name: engineering-control
+    app.kubernetes.io/component: ranker
+  ports:
+    - name: ranker
+      port: 8796
+      targetPort: ranker

@@ -113,6 +113,18 @@ class Settings(BaseSettings):
     gateway_url: str | None = Field(
         default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
     )
+    # The ranking service (deploy/base/ranker.yaml): where it listens, where the console's
+    # workers find it, and the two open models it runs. The models are part of the image
+    # and are found in ``ranker_models_dir``; nothing is fetched at run time.
+    ranker_host: str = "127.0.0.1"
+    ranker_port: int = Field(default=8796, ge=1024, le=65535)
+    ranker_url: str | None = Field(
+        default=None, pattern=r"^http://[a-z0-9]([a-z0-9.-]{0,200}[a-z0-9])?:\d{2,5}$"
+    )
+    ranker_embedding_model: str = Field(default="BAAI/bge-base-en-v1.5", max_length=120)
+    ranker_rerank_model: str = Field(default="Xenova/ms-marco-MiniLM-L-12-v2", max_length=120)
+    ranker_models_dir: str = Field(default="/opt/models", max_length=200)
+    ranker_threads: int = Field(default=4, ge=1, le=32)
     # How many steps may run in sandboxes at the same time, over all runs.
     sandbox_parallel_steps: int = Field(default=4, ge=1, le=32)
     sandbox_pull_secret: str = Field(
@@ -176,6 +188,8 @@ class Settings(BaseSettings):
             raise ValueError("the supervisor's tool service cannot bind to every interface")
         if self.gateway_host in every_interface:
             raise ValueError("the gateway cannot bind to every interface")
+        if self.ranker_host in every_interface:
+            raise ValueError("the ranking service cannot bind to every interface")
         if self.health_host in every_interface:
             raise ValueError("the health listener cannot bind to every interface")
         return self

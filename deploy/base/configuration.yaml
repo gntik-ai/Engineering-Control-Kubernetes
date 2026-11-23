@@ -60,3 +60,7 @@ data:
   # the client of a step that is paid by an API key to find it, again by address.
   ENGINEERING_GATEWAY_HOST: 0.0.0.0
   ENGINEERING_GATEWAY_URL: http://engineering-control-gateway:8794
+  # The ranking service (deploy/base/ranker.yaml): where it listens, and where the
+  # console's workers find it.
+  ENGINEERING_RANKER_HOST: 0.0.0.0
+  ENGINEERING_RANKER_URL: http://engineering-control-ranker:8796

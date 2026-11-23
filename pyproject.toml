@@ -16,6 +16,7 @@ dependencies = [
   "cryptography>=50,<51",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "numpy>=2.3,<3",
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
@@ -36,6 +37,12 @@ dev = [
   "types-PyYAML>=6.0.12,<7",
 ]
 
+# The open models of the ranking service and their runtime. Only that service needs them;
+# the image installs them, a development environment need not.
+ranker = [
+  "fastembed>=0.9,<1",
+]
+
 [project.scripts]
 engineering-dashboard = "engineering_control.dashboard.app:run"
 engineering-launcher = "engineering_control.sandbox.launcher:run"
@@ -43,6 +50,7 @@ engineering-egress = "engineering_control.sandbox.egress:run"
 engineering-tools = "engineering_control.supervisor.service:run"
 engineering-chat = "engineering_control.chat.service:run"
 engineering-gateway = "engineering_control.gateway.service:run"
+engineering-ranker = "engineering_control.ranker.service:run"
 engineering-ctl = "engineering_control.cli:main"
 
 [tool.hatch.build.targets.wheel]

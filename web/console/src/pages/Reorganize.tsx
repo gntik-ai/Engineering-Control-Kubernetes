@@ -28,9 +28,21 @@ interface Progress {
   by_label: Record<string, number>;
   buckets: { bucket: string; why: string; drawn: number; judged: number }[];
 }
+/** The ranking service: whether it answers, its models, and how much it was asked about. */
+interface RankerState {
+  ready: boolean;
+  absent?: boolean;
+  detail?: string;
+  embedding: string | null;
+  rerank: string | null;
+  records: number;
+  vectors: number;
+  pairs: number;
+}
 interface Report {
   kinds: Kind[];
   labels: Progress;
+  ranker: RankerState;
 }
 interface Side {
   kind: 'issue' | 'story' | 'epic';
@@ -235,6 +247,16 @@ export function Reorganize({ project }: { project: string }) {
                 Before a way of choosing a parent is trusted it is measured on the records whose right parent is known:
                 from a link their own text states, from a choice you made, or from a pair you judged below. Each row is
                 one way of ranking the candidates; a line of the text that names the parent is hidden from it.
+              </p>
+              <p className="text-sm text-muted-foreground">
+                {data.ranker.absent
+                  ? 'The ranking service is not part of this installation: only word matching is measured.'
+                  : data.ranker.ready
+                    ? `The ranking service runs in the cluster with two open models, ${data.ranker.embedding} for meaning and ${data.ranker.rerank} as reranker.`
+                    : `The ranking service does not answer${data.ranker.detail ? ': ' + data.ranker.detail : '.'} What it said before is still used.`}{' '}
+                {data.ranker.embedding
+                  ? `It has given a vector for ${whole(data.ranker.vectors)} of ${whole(data.ranker.records)} records and a score for ${whole(data.ranker.pairs)} pairs.`
+                  : ''}
               </p>
               {data.kinds.map((kind) => (
                 <section key={kind.kind} className="grid gap-2">

@@ -104,3 +104,91 @@ def test_pairs_are_drawn_judged_and_become_known_truth(tmp_path: Path) -> None:
         assert kinds(client)["issue_story"]["sources"]["judged"] == 0
     finally:
         client.close()
+
+
+class Ranking:
+    """Stands in for the ranking service: a vector from a text's words, a score from how
+    many words two texts share."""
+
+    def __init__(self) -> None:
+        self.ready = True
+        self.embedded: list[str] = []
+        self.scored: list[tuple[str, list[str]]] = []
+
+    async def health(self) -> dict[str, Any]:
+        return {"ready": self.ready, "embedding": "words-64", "rerank": "overlap"}
+
+    async def embed(self, texts: list[str]) -> tuple[str, list[bytes]]:
+        import numpy
+
+        self.embedded.extend(texts)
+        found = []
+        for text in texts:
+            vector = numpy.zeros(64, dtype=numpy.float32)
+            for word in text.lower().split():
+                vector[sum(word.encode()) % 64] += 1
+            found.append((vector / (numpy.linalg.norm(vector) or 1)).tobytes())
+        return "words-64", found
+
+    async def rerank(self, query: str, documents: list[str]) -> tuple[str, list[float]]:
+        self.scored.append((query, documents))
+        mine = set(query.lower().split())
+        return "overlap", [float(len(mine & set(d.lower().split()))) for d in documents]
+
+
+def test_the_ranking_service_is_asked_once_for_each_text(tmp_path: Path) -> None:
+    import asyncio
+
+    from engineering_control.db.models import BacklogItem, PairScore, RecordVector
+
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        more_epics(repo, data)
+        service = Ranking()
+        # No service, no answers: only words are measured.
+        absent = client.get(BASE + "signals").json()
+        assert absent["ranker"]["absent"] and absent["ranker"]["vectors"] == 0
+        assert [m["key"] for m in kinds(client)["issue_story"]["methods"]] == ["words"]
+
+        asked = asyncio.run(repo.signals.ask_ranker(service))  # type: ignore[arg-type]
+        with repo.sessions() as db:
+            vectors = db.scalars(
+                select(RecordVector).where(RecordVector.project_id == data["project"])
+            ).all()
+            scores = db.scalars(
+                select(PairScore).where(PairScore.project_id == data["project"])
+            ).all()
+            locked = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 44)).first()
+            assert locked is not None
+        # Every Epic, Story and issue of the project has a vector; the issue whose Story is
+        # known has a score for each candidate.
+        assert {vector.kind for vector in vectors} == {"epic", "story", "issue"}
+        assert len(vectors) == 3 + 3 + 5 and all(len(v.vector) == 64 * 4 for v in vectors)
+        assert scores and {score.child_id for score in scores} == {locked.id}
+        assert asked >= len(vectors) + len(scores)
+        assert not any("Story:" in text for text in service.embedded)
+
+        report = client.get(BASE + "signals").json()
+        assert report["ranker"]["ready"] and report["ranker"]["embedding"] == "words-64"
+        assert (report["ranker"]["vectors"], report["ranker"]["records"]) == (11, 11)
+        methods = {m["key"]: m for m in report["kinds"][0]["methods"]}
+        assert list(methods) == ["words", "meaning", "joined", "reranked"]
+        assert all(method["children"] == 1 for method in methods.values())
+
+        # Nothing changed: nothing is asked again.
+        before = (len(service.embedded), len(service.scored))
+        assert asyncio.run(repo.signals.ask_ranker(service)) == 0  # type: ignore[arg-type]
+        assert (len(service.embedded), len(service.scored)) == before
+        # A text that changed gets a new vector, and its pairs new scores.
+        with repo.sessions.begin() as db:
+            db.get_one(BacklogItem, locked.id).description = "Notify the operator of failed runs."
+        assert asyncio.run(repo.signals.ask_ranker(service)) > 0  # type: ignore[arg-type]
+        assert len(service.embedded) == before[0] + 1 and len(service.scored) == before[1] + 1
+
+        # A service that is not ready is not asked.
+        service.ready = False
+        assert asyncio.run(repo.signals.ask_ranker(service)) == 0  # type: ignore[arg-type]
+        assert not client.get(BASE + "signals").json()["ranker"]["ready"]
+    finally:
+        client.close()

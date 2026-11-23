@@ -54,7 +54,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0073 keeps one kind of run and answer for every choice of a parent.
     # 0074 keeps an inventory of each project's documentation and its changes.
     # 0075 keeps the pairs of planning records the administrator judges once.
-    assert (head, parent) == ("0075", "0074")
+    # 0076 keeps the ranking service's vectors and scores.
+    assert (head, parent) == ("0076", "0075")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -156,8 +157,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert "gold_pairs" in inspect(engine).get_table_names()
+    assert {"record_vectors", "pair_scores"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, parent)
+    assert not {"record_vectors", "pair_scores"} & set(inspect(engine).get_table_names())
+    assert "gold_pairs" in inspect(engine).get_table_names()
+    command.downgrade(config, "0074")
     assert "gold_pairs" not in inspect(engine).get_table_names()
     assert documents <= set(inspect(engine).get_table_names())
     command.downgrade(config, "0073")

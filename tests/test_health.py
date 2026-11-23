@@ -262,7 +262,15 @@ def test_every_process_with_a_loop_is_restarted_when_it_stands_and_all_say_their
         for d in documents
         if d["kind"] == "Deployment"
     }
-    assert set(deployments) == {"console", "launcher", "egress", "tools", "gateway", "chat"}
+    assert set(deployments) == {
+        "console",
+        "launcher",
+        "egress",
+        "tools",
+        "gateway",
+        "ranker",
+        "chat",
+    }
     settings = next(
         d["data"]
         for d in documents
@@ -275,7 +283,7 @@ def test_every_process_with_a_loop_is_restarted_when_it_stands_and_all_say_their
         (container,) = template["spec"]["containers"]
         ports = {p["name"]: p["containerPort"] for p in container.get("ports", [])}
         assert container.get("livenessProbe"), name
-        if name in {"tools", "gateway"}:
+        if name in {"tools", "gateway", "ranker"}:
             # Probed on the port they serve on: they have no loop that could stand.
             assert "health" not in ports
             continue

@@ -376,7 +376,11 @@ The page lists the OpenSpec changes with their state (open, every task done, arc
 
 The pairs of one Epic in five are held out: they are only tested on, never learned from.
 
-`GET /api/dashboard/projects/{name}/signals` returns the measurement; `POST …/labels/draw` draws the pairs; `GET …/labels/next` returns the next pair with both texts; `POST …/labels/{id}` records a judgment. The pairs are kept in `gold_pairs` (migration 0075).
+**The ranking service.** Two small open models run in the cluster as their own workload (`deploy/base/ranker.yaml`, `engineering-ranker`): `BAAI/bge-base-en-v1.5` gives each record's text a vector, so that records that mean alike lie close, and `Xenova/ms-marco-MiniLM-L-12-v2` scores how well two texts fit. The models are part of the image, fetched once when it is built. The service has no database and no key and may open no connection at all, so no text leaves the cluster through it, and a fixed model gives the same answer for the same text.
+
+The console keeps what the service said: a vector for every Epic, User Story and issue (`record_vectors`), and a score for each candidate parent of the records that are measured or judged (`pair_scores`, migration 0076). A text is sent once; it is sent again only when it or the model changed. A line that names a record's parent, and identifiers, are taken out of the text first. The measurement then has four rows: shared words; meaning; the two joined by rank; and the reranker on the first fifteen candidates of each. Neither a vector nor a score decides anything: they are signals that the next phase combines.
+
+`GET /api/dashboard/projects/{name}/signals` returns the measurement and the state of the ranking service; `POST …/labels/draw` draws the pairs; `GET …/labels/next` returns the next pair with both texts; `POST …/labels/{id}` records a judgment. The pairs are kept in `gold_pairs` (migration 0075).
 
 ### A review run that was cut off
 

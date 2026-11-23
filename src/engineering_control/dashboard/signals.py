@@ -14,7 +14,9 @@ Nothing here changes a link.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -22,9 +24,11 @@ from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import UUID
 
+import numpy
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import ranking
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import _visible_issues
@@ -34,16 +38,20 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
+from engineering_control.dashboard.ranking import Ranker, RankerError, digest_of, text_of
 from engineering_control.dashboard.review_graph import terms
 from engineering_control.db.models import (
     BacklogItem,
     GoldPair,
+    PairScore,
     PlanningLink,
     ProjectEpic,
     ProjectRecord,
     ProjectUserStory,
+    RecordVector,
 )
 
+log = logging.getLogger(__name__)
 ISSUE_STORY: Final = "issue_story"
 STORY_EPIC: Final = "story_epic"
 LABELS: Final = {
@@ -77,6 +85,8 @@ QUESTION: Final = {
     STORY_EPIC: "What is this Epic to this User Story?",
 }
 CLEAR: Final = 1.5
+# How many candidates of each way of ranking the reranker is asked about, for one record.
+CANDIDATES: Final = 15
 HELD_OUT_ONE_IN: Final = 5
 
 
@@ -125,6 +135,20 @@ class _Plan:
                     / (count + 1.2 * (0.25 + 0.75 * self.lengths[key] / self.average))
                 )
         return sorted(scores.items(), key=lambda entry: (-entry[1], str(entry[0])))
+
+    def texts(self) -> dict[tuple[str, UUID], str]:
+        """Every record's text as the ranking service is given it."""
+        found = {("epic", key): text_of(title, body) for key, (title, body) in self.epics.items()}
+        found.update(
+            {("story", key): text_of(title, body) for key, (title, body) in self.stories.items()}
+        )
+        found.update(
+            {("issue", key): text_of(title, body) for key, (title, body, _n) in self.issues.items()}
+        )
+        return found
+
+    def own_epics(self, story: UUID) -> list[UUID]:
+        return [p for p, *_rest in self.story_links.get(story, []) if p in self.epics]
 
     def epics_by_words(self, story: UUID) -> list[tuple[UUID, float]]:
         """The Story's own Epics, the one its text is most like first."""
@@ -235,6 +259,47 @@ def _truth(
     return known, sources
 
 
+class _Meaning:
+    """The project's records ranked by how close their vectors lie."""
+
+    def __init__(self, plan: _Plan, kept: dict[tuple[str, UUID], Any]) -> None:
+        self.plan, self.kept = plan, kept
+        self.stories = [key for key in sorted(plan.stories, key=str) if ("story", key) in kept]
+        self.matrix = (
+            numpy.stack([kept["story", key] for key in self.stories]) if self.stories else None
+        )
+
+    def of_issue(self, issue: UUID) -> list[UUID] | None:
+        """The Stories whose meaning is closest to the issue's, closest first."""
+        mine = self.kept.get(("issue", issue))
+        if mine is None or self.matrix is None or mine.shape[0] != self.matrix.shape[1]:
+            return None
+        return [self.stories[place] for place in numpy.argsort(-(self.matrix @ mine))]
+
+    def of_story(self, story: UUID) -> list[UUID] | None:
+        """The Story's own Epics, the one closest in meaning first."""
+        mine = self.kept.get(("story", story))
+        own = [epic for epic in self.plan.own_epics(story) if ("epic", epic) in self.kept]
+        if mine is None or len(own) != len(self.plan.own_epics(story)):
+            return None
+        return sorted(own, key=lambda epic: (-float(self.kept["epic", epic] @ mine), str(epic)))
+
+
+def joined(*rankings: list[UUID]) -> list[UUID]:
+    """Several rankings as one, by reciprocal rank: a candidate that stands high in any
+    of them stands high in the result."""
+    points: dict[UUID, float] = defaultdict(float)
+    for ranks in rankings:
+        for place, key in enumerate(ranks):
+            points[key] += 1.0 / (60 + place)
+    return sorted(points, key=lambda key: (-points[key], str(key)))
+
+
+def _candidates(words: list[UUID], meaning: list[UUID] | None) -> list[UUID]:
+    """The parents the reranker is asked about: the first of each way of ranking."""
+    return list(dict.fromkeys([*words[:CANDIDATES], *(meaning or [])[:CANDIDATES]]))
+
+
 def measure(ranks: dict[UUID, list[UUID]], right: dict[UUID, set[UUID]]) -> dict[str, Any]:
     """How well a ranking finds the known parents: how often the first is right, how high
     the first right one stands on average, and how many are among the first 5 and 20."""
@@ -268,6 +333,61 @@ class Signals:
     def __init__(self, sessions: sessionmaker[Session], links: PlanningLinks) -> None:
         self.sessions = sessions
         self.links = links
+        # What the ranking service last said of itself; None where there is no service.
+        self.ranker: dict[str, Any] | None = None
+
+    def _ranked(
+        self, db: Session, project: UUID, plan: _Plan, known: dict[str, dict[UUID, set[UUID]]]
+    ) -> tuple[dict[str, dict[str, dict[UUID, list[UUID]]]], dict[str, Any]]:
+        """The known children ranked by each way that has what it needs, and how much of
+        the project the ranking service has been asked about."""
+        ways: dict[str, dict[str, dict[UUID, list[UUID]]]] = {
+            kind: {"words": {}, "meaning": {}, "joined": {}, "reranked": {}}
+            for kind in (ISSUE_STORY, STORY_EPIC)
+        }
+        embedding = ranking.stored_model(db, RecordVector, project)
+        reranker = ranking.stored_model(db, PairScore, project)
+        kept = ranking.vectors(db, project, embedding) if embedding else {}
+        said = ranking.scores(db, project, reranker) if reranker else {}
+        texts = plan.texts()
+        meaning = _Meaning(plan, kept)
+        for kind, child_kind, parent_kind in (
+            (ISSUE_STORY, "issue", "story"),
+            (STORY_EPIC, "story", "epic"),
+        ):
+            for child in known[kind]:
+                if kind == ISSUE_STORY:
+                    words = [parent for parent, _score in plan.by_words(child)]
+                    close = meaning.of_issue(child)
+                else:
+                    words = [parent for parent, _score in plan.epics_by_words(child)]
+                    close = meaning.of_story(child)
+                ways[kind]["words"][child] = words
+                if close is None:
+                    continue
+                ways[kind]["meaning"][child] = close
+                ways[kind]["joined"][child] = joined(words, close)
+                candidates = _candidates(words, close)
+                fits = []
+                for parent in candidates:
+                    kept_score = said.get((kind, child, parent))
+                    wanted = digest_of(texts[child_kind, child], texts[parent_kind, parent])
+                    if kept_score is None or kept_score[0] != wanted:
+                        break
+                    fits.append((kept_score[1], parent))
+                else:
+                    ways[kind]["reranked"][child] = [
+                        parent
+                        for _score, parent in sorted(fits, key=lambda fit: (-fit[0], str(fit[1])))
+                    ]
+        coverage = {
+            "embedding": embedding,
+            "rerank": reranker,
+            "records": len(texts),
+            "vectors": sum(1 for key in texts if key in kept),
+            "pairs": len(said),
+        }
+        return ways, coverage
 
     def report(self, name: str) -> dict[str, Any]:
         """What is known to be true in the project, how well each way of finding a parent
@@ -277,17 +397,14 @@ class Signals:
             project = active_project(db, name)
             plan = _plan(db, project)
             known, sources = _truth(db, project.id, plan)
-            words = {
-                ISSUE_STORY: {
-                    issue: [parent for parent, _score in plan.by_words(issue)]
-                    for issue in known[ISSUE_STORY]
-                },
-                STORY_EPIC: {
-                    story: [parent for parent, _score in plan.epics_by_words(story)]
-                    for story in known[STORY_EPIC]
-                },
-            }
+            ways, coverage = self._ranked(db, project.id, plan, known)
             progress = self._progress(db, project.id)
+        labels = {
+            "words": "Shared words, as the worklists use now",
+            "meaning": "Meaning: how close the vectors of the two texts lie",
+            "joined": "Words and meaning joined by rank",
+            "reranked": "The reranker, on the first candidates of words and of meaning",
+        }
         return {
             "kinds": [
                 {
@@ -297,17 +414,153 @@ class Signals:
                         key: sources[kind][key] for key in ("declared", "administrator", "judged")
                     },
                     "methods": [
-                        {
-                            "key": "words",
-                            "label": "Shared words, as the worklists use now",
-                            **measure(words[kind], known[kind]),
-                        }
+                        {"key": key, "label": labels[key], **measure(ranks, known[kind])}
+                        for key, ranks in ways[kind].items()
+                        if key == "words" or ranks
                     ],
                 }
                 for kind in (ISSUE_STORY, STORY_EPIC)
             ],
             "labels": progress,
+            # The ranking service: whether it answers, which models it runs, and how much
+            # of the project it has been asked about.
+            "ranker": {**(self.ranker or {"ready": False, "absent": True}), **coverage},
         }
+
+    # ------------------------------------------------------- the ranking service
+
+    def _project_names(self) -> list[str]:
+        with self.sessions() as db:
+            return list(
+                db.scalars(
+                    select(ProjectRecord.name)
+                    .where(ProjectRecord.archived_at.is_(None))
+                    .order_by(ProjectRecord.name)
+                )
+            )
+
+    def _vectors_due(self, name: str, model: str) -> list[tuple[UUID, str, UUID, str, str]]:
+        """The records whose text has no vector of that model yet, or has changed since."""
+        with self.sessions() as db:
+            project = active_project(db, name)
+            have = ranking.vector_digests(db, project.id, model)
+            due = []
+            for (kind, record), text in _plan(db, project).texts().items():
+                wanted = digest_of(text)
+                if have.get((kind, record)) != wanted:
+                    due.append((project.id, kind, record, text, wanted))
+            return due
+
+    def _keep_vectors(
+        self, rows: list[tuple[UUID, str, UUID, str, str]], model: str, found: list[bytes]
+    ) -> None:
+        with self.sessions.begin() as db:
+            for (project, kind, record, _text, wanted), vector in zip(rows, found, strict=True):
+                ranking.keep_vector(db, project, kind, record, model, wanted, vector)
+
+    def _pairs_due(
+        self, name: str, embedding: str, reranker: str
+    ) -> list[tuple[UUID, str, UUID, str, list[tuple[UUID, str, str]]]]:
+        """For each record that is measured or judged, the candidate parents the reranker
+        has not scored yet: the record's text, and each parent with its text."""
+        self.links.reconcile_project(name)
+        with self.sessions() as db:
+            project = active_project(db, name)
+            plan = _plan(db, project)
+            known, _sources = _truth(db, project.id, plan)
+            texts = plan.texts()
+            meaning = _Meaning(plan, ranking.vectors(db, project.id, embedding))
+            said = ranking.scores(db, project.id, reranker)
+            drawn: dict[str, dict[UUID, set[UUID]]] = {
+                ISSUE_STORY: defaultdict(set),
+                STORY_EPIC: defaultdict(set),
+            }
+            for pair in db.scalars(select(GoldPair).where(GoldPair.project_id == project.id)):
+                drawn[pair.kind][pair.child_id].add(pair.parent_id)
+            due = []
+            for kind, child_kind, parent_kind in (
+                (ISSUE_STORY, "issue", "story"),
+                (STORY_EPIC, "story", "epic"),
+            ):
+                children = plan.issues if kind == ISSUE_STORY else plan.stories
+                for child in sorted({*known[kind], *drawn[kind]}, key=str):
+                    if child not in children:
+                        continue
+                    if kind == ISSUE_STORY:
+                        words = [parent for parent, _score in plan.by_words(child)]
+                        close = meaning.of_issue(child)
+                    else:
+                        words = [parent for parent, _score in plan.epics_by_words(child)]
+                        close = meaning.of_story(child)
+                    if close is None:
+                        # Its vector is not there yet: it is scored on a later pass.
+                        continue
+                    wanted = [
+                        parent
+                        for parent in dict.fromkeys(
+                            [*_candidates(words, close), *drawn[kind][child]]
+                        )
+                        if (parent_kind, parent) in texts
+                    ]
+                    missing = []
+                    for parent in wanted:
+                        both = digest_of(texts[child_kind, child], texts[parent_kind, parent])
+                        kept_score = said.get((kind, child, parent))
+                        if kept_score is None or kept_score[0] != both:
+                            missing.append((parent, texts[parent_kind, parent], both))
+                    if missing:
+                        due.append((project.id, kind, child, texts[child_kind, child], missing))
+            return due
+
+    def _keep_scores(
+        self,
+        project: UUID,
+        kind: str,
+        child: UUID,
+        parents: list[tuple[UUID, str, str]],
+        model: str,
+        found: list[float],
+    ) -> None:
+        with self.sessions.begin() as db:
+            for (parent, _text, both), score in zip(parents, found, strict=True):
+                ranking.keep_score(db, project, kind, child, parent, model, both, score)
+
+    async def ask_ranker(self, ranker: Ranker, *, limit: int = 400) -> int:
+        """Bring what is kept of the ranking service's answers up to date: a vector for
+        every record whose text is new or changed, and a score for every candidate parent
+        of the records that are measured or judged. How many answers were asked for; at
+        most ``limit`` in one pass, so that a large project does not hold the others up."""
+        health = await ranker.health()
+        self.ranker = health
+        if not health.get("ready"):
+            return 0
+        embedding, reranker = str(health.get("embedding")), str(health.get("rerank"))
+        asked = 0
+        for name in await asyncio.to_thread(self._project_names):
+            try:
+                due = await asyncio.to_thread(self._vectors_due, name, embedding)
+                for start in range(0, len(due), ranking.BATCH):
+                    if asked >= limit:
+                        return asked
+                    rows = due[start : start + ranking.BATCH]
+                    model, found = await ranker.embed([row[3] for row in rows])
+                    await asyncio.to_thread(self._keep_vectors, rows, model, found)
+                    asked += len(rows)
+                pairs = await asyncio.to_thread(self._pairs_due, name, embedding, reranker)
+                for project, kind, child, text, parents in pairs:
+                    if asked >= limit:
+                        return asked
+                    model, scores = await ranker.rerank(text, [parent[1] for parent in parents])
+                    await asyncio.to_thread(
+                        self._keep_scores, project, kind, child, parents, model, scores
+                    )
+                    asked += len(parents)
+            except RankerError as error:
+                self.ranker = {**health, "ready": False, "detail": str(error)}
+                return asked
+            except ProjectNotFound:
+                continue
+        return asked
 
     # ----------------------------------------------------------- pairs to judge
 
@@ -521,3 +774,16 @@ class Signals:
             pair.judged_at = datetime.now(UTC) if label is not None else None
             db.flush()
             return {"id": str(pair.id), "label": pair.label, **self._progress(db, project.id)}
+
+
+async def worker(signals: Signals, ranker: Ranker) -> None:
+    """Keep the ranking service's answers up to date: at once while there is something to
+    ask, every few minutes when there is not."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            asked = await signals.ask_ranker(ranker)
+        except Exception:
+            log.exception("Asking the ranking service failed")
+            asked = 0
+        await asyncio.sleep(5 if asked else 300)

@@ -633,8 +633,10 @@ def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
         d
         for d in documents
         if d["kind"] == "NetworkPolicy"
-        # The two a sandbox may reach have tests of their own.
-        and d["metadata"]["name"] not in {"egress-proxy", "supervisor-tools", "gateway"}
+        # The two a sandbox may reach have tests of their own, as has the one that
+        # shuts the ranking service in.
+        and d["metadata"]["name"]
+        not in {"egress-proxy", "supervisor-tools", "gateway", "ranker-no-egress"}
     ]
     assert policies and all(p["spec"]["policyTypes"] == ["Ingress"] for p in policies)
     same_namespace = [{"from": [{"podSelector": {}}]}]
@@ -658,6 +660,37 @@ def test_only_the_nodes_reach_the_console_from_outside_the_namespace() -> None:
     )
     trusted = json.loads(settings["ENGINEERING_DASHBOARD_TRUSTED_PROXY_NETWORKS"])
     assert sorted(trusted) == sorted(addresses)
+
+
+def test_the_ranking_service_reaches_nothing_and_holds_nothing() -> None:
+    """It is sent the texts of the planning records. It may open no connection, has no
+    secret and no database, and its models come with the image."""
+    documents = _documents()
+    [policy] = [
+        d
+        for d in documents
+        if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "ranker-no-egress"
+    ]
+    assert policy["spec"]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "engineering-control",
+        "app.kubernetes.io/component": "ranker",
+    }
+    assert policy["spec"]["policyTypes"] == ["Egress"] and policy["spec"]["egress"] == []
+    [ranker] = [
+        d
+        for d in documents
+        if d["kind"] == "Deployment" and d["metadata"]["name"] == "engineering-control-ranker"
+    ]
+    pod = ranker["spec"]["template"]["spec"]
+    (container,) = pod["containers"]
+    assert container["command"] == ["engineering-ranker"]
+    assert pod["automountServiceAccountToken"] is False
+    assert container["securityContext"]["readOnlyRootFilesystem"] is True
+    # Settings only: no secret, no database, nothing mounted but a place for temporary files.
+    assert container["envFrom"] == [{"configMapRef": {"name": "engineering-control-settings"}}]
+    assert "env" not in container
+    assert [volume["name"] for volume in pod["volumes"]] == ["tmp"]
+    assert "emptyDir" in pod["volumes"][0]
 
 
 def test_nothing_is_left_of_what_the_original_ran_and_nothing_mounts_a_claim() -> None:

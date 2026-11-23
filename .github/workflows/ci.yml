@@ -145,6 +145,20 @@ jobs:
           print("ok", engineering_control.__name__, len(BUILTIN), "flows")
           PY
           docker run --rm engineering-control:ci alembic --help >/dev/null
+          # The ranking service's models are in the image and work with no network and
+          # a read-only filesystem, as the service runs in the cluster.
+          docker run --rm --network none --read-only --tmpfs /tmp engineering-control:ci python - <<'PY'
+          from engineering_control.config import Settings
+          from engineering_control.ranker.service import Models
+
+          models = Models(Settings())
+          models.load()
+          assert models.ready, models.problem
+          assert len(models.embed(["a text"])[0]) == 768 * 4
+          near, far = models.rerank("retry failed deliveries", ["deliveries are retried", "a dark theme"])
+          assert near > far, (near, far)
+          print("ok ranking models")
+          PY
           # The export script for the original system's records is handed out by the
           # console and by the command line: it has to be in the image.
           docker run --rm engineering-control:ci engineering-ctl records script | grep -q "SET TRANSACTION READ ONLY"

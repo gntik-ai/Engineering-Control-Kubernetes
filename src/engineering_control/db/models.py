@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -1066,6 +1067,54 @@ class GoldPair(UUIDPrimaryKey, Timestamps, Base):
     judged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("project_id", "kind", "child_id", "parent_id", name="uq_gold_pairs_pair"),
+    )
+
+
+class RecordVector(UUIDPrimaryKey, Timestamps, Base):
+    """The vector the ranking service gave for one planning record's text (migration
+    0076): records that mean alike have vectors that lie close. Kept until the text or
+    the model changes."""
+
+    __tablename__ = "record_vectors"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # epic, story or issue.
+    kind: Mapped[str] = mapped_column(String(8))
+    record_id: Mapped[UUID] = mapped_column(Uuid)
+    model: Mapped[str] = mapped_column(String(120))
+    # Of the text the vector was made from.
+    digest: Mapped[str] = mapped_column(String(64))
+    # 32-bit floating point numbers, of length one.
+    vector: Mapped[bytes] = mapped_column(LargeBinary)
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "kind", "record_id", "model", name="uq_record_vectors_record"
+        ),
+    )
+
+
+class PairScore(UUIDPrimaryKey, Timestamps, Base):
+    """How well the ranking service found two planning records to fit (migration 0076):
+    an issue and a User Story, or a User Story and an Epic. Kept until either text or
+    the model changes."""
+
+    __tablename__ = "pair_scores"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # issue_story or story_epic.
+    kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    parent_id: Mapped[UUID] = mapped_column(Uuid)
+    model: Mapped[str] = mapped_column(String(120))
+    # Of the two texts the score was made from.
+    digest: Mapped[str] = mapped_column(String(64))
+    score: Mapped[float] = mapped_column(Float)
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "kind", "child_id", "parent_id", "model", name="uq_pair_scores_pair"
+        ),
     )
 
 
