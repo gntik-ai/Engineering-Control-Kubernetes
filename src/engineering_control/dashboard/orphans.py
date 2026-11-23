@@ -54,6 +54,7 @@ from engineering_control.db.models import (
     ProjectReviewBudget,
     ProjectStoryEpic,
     ProjectUserStory,
+    WorkspaceCandidate,
 )
 from engineering_control.models.service import ModelError, Models, Question, Reply
 
@@ -139,7 +140,51 @@ class _Stories:
     average: float
 
 
+# The index of each project's Stories, kept for as long as nothing it is made of changed.
+_INDEX: dict[UUID, tuple[tuple[Any, ...], _Stories]] = {}
+
+
+def _stamp(db: Session, project: UUID) -> tuple[Any, ...]:
+    """What the index is made of, in brief: it is rebuilt when any of this differs."""
+
+    def of(model: Any, *where: Any) -> tuple[Any, ...]:
+        return tuple(
+            db.execute(
+                select(func.count(), func.max(model.updated_at)).where(
+                    model.project_id == project, *where
+                )
+            ).one()
+        )
+
+    pairs = db.execute(
+        select(ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id).where(
+            ProjectStoryEpic.project_id == project
+        )
+    ).all()
+    return (
+        of(ProjectUserStory),
+        of(ProjectEpic),
+        hash(frozenset((story, epic) for story, epic in pairs)),
+        of(PlanningLink, PlanningLink.kind == "story_epic"),
+        of(
+            WorkspaceCandidate,
+            WorkspaceCandidate.kind == "stories",
+            WorkspaceCandidate.decision == "approved",
+        ),
+    )
+
+
 def _stories(db: Session, project: UUID) -> _Stories:
+    stamp = _stamp(db, project)
+    kept = _INDEX.get(project)
+    if kept is not None and kept[0] == stamp:
+        return kept[1]
+    index = _index(db, project)
+    _INDEX[project] = (stamp, index)
+    return index
+
+
+def _index(db: Session, project: UUID) -> _Stories:
     rows = {
         key: (title, body or "")
         for key, title, body in db.execute(
@@ -733,7 +778,10 @@ class Orphans:
             }
             rows = []
             counts: Counter[str] = Counter()
-            estimate = 0
+            # What a run holds while it asks, counted by the size of the texts; what it
+            # is likely to use, at four characters a token and a short answer; and the
+            # most one question holds.
+            estimate = likely = likely_all = largest = 0
             placeholder = OrphanRun(provider="", model="")
             for issue in issues:
                 listed = shortlist(issue, project.source_repository, stories)
@@ -752,11 +800,13 @@ class Orphans:
                     counts[shown["answer"]] += 1
                 if _approvable(shown):
                     counts["approvable"] += 1
+                asked = question(placeholder, issue, project.source_repository, listed, stories)
+                held = review_budget.reservation_size(asked)
+                use = (len(asked.system) + len(asked.prompt)) // 4 + 350
+                largest, likely_all = max(largest, held), likely_all + use
                 if _to_ask(review, current, False):
                     counts["to_ask"] += 1
-                    estimate += review_budget.reservation_size(
-                        question(placeholder, issue, project.source_repository, listed, stories)
-                    )
+                    estimate, likely = estimate + held, likely + use
                 if show == "waiting" and not waiting:
                     continue
                 if show == "unanswered" and waiting:
@@ -800,6 +850,9 @@ class Orphans:
                 },
                 "stories": len(stories.rows),
                 "estimate": estimate,
+                "likely": likely,
+                "likely_all": likely_all,
+                "largest": largest,
                 "run": _shown(run) if run is not None else None,
                 "models": review_flows.model_choices(db),
                 "budget": review_budget.status(db, project.id),

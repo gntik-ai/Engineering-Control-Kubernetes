@@ -304,7 +304,7 @@ The answer quotes one passage of the issue and one of the chosen Story. The plat
 
 Nothing is linked by an answer. The administrator approves it, alone or with every other checked answer at once, links the issue to another Story of the shortlist, says it is a bug, or sets the answer aside. An issue stays on the list until it has a Story, is a bug or is closed.
 
-A run is started by the administrator with a model and a token limit, and shows beforehand how many issues it asks about and how many tokens that holds at most. It asks only about issues that have no answer to the current question, unless told to ask again about all. It counts against the project's review tokens like every review, stops at its own limit, and can be stopped, resumed and ended.
+A run is started by the administrator with a model and a token limit, and shows beforehand how many issues it asks about and how many tokens that is likely to use, counting the texts at four characters a token. While a question is asked it holds its whole size against the project's review tokens, and gives back what it did not use when the provider reports. It asks only about issues that have no answer to the current question, unless told to ask again about all. It counts against the project's review tokens like every review, stops at its own limit, and can be stopped, resumed and ended.
 
 - A call the provider refused, or that no account could make, used nothing: what it held returns to the project at once.
 - A call that ended without saying what it used gives its tokens back as well, and is counted on the run as a call whose use is unknown. A run is never left waiting for a call that will not report.

@@ -96,6 +96,11 @@ interface Worklist {
   };
   stories: number;
   estimate: number;
+  /** What a run is likely to use: for the issues without an answer, and for all of them. */
+  likely: number;
+  likely_all: number;
+  /** The most one question holds of the project's review tokens while it is asked. */
+  largest: number;
   run: Run | null;
   models: Model[];
 }
@@ -203,8 +208,10 @@ export function OrphanWorklist({ project }: { project: string }) {
   const [told, setTold] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<'run' | 'approve' | null>(null);
   const model = data?.models.find((entry) => keyOf(entry) === chosen) ?? data?.models[0];
-  // Room above the estimate: a question's answer is counted by what it may be at most.
-  const suggested = data ? Math.max(10_000, Math.ceil((data.estimate * 1.2) / 10_000) * 10_000) : 0;
+  // Half as much again as the run is likely to use, and room for the last question: a
+  // question holds its whole size until the provider says what it used.
+  const likely = data ? (again ? data.likely_all : data.likely) : 0;
+  const suggested = data ? Math.max(10_000, Math.ceil((likely * 1.5 + data.largest) / 10_000) * 10_000) : 0;
   const limit = Number(cap || suggested);
   const asked = data ? (again ? data.counts.total : data.counts.to_ask) : 0;
 
@@ -296,8 +303,9 @@ export function OrphanWorklist({ project }: { project: string }) {
                   <p className="text-sm text-muted-foreground">
                     One question per issue: the issue, its shortlist, and four possible answers — this User Story, none
                     fits, it is a bug, or the texts do not say. {some(data.counts.to_ask, 'issue has', 'issues have')}{' '}
-                    no answer yet; asking about {data.counts.to_ask === 1 ? 'it' : 'them'} holds about{' '}
-                    {whole(data.estimate)} tokens at most, counted against the project’s review tokens.
+                    no answer yet; asking about {data.counts.to_ask === 1 ? 'it' : 'them'} is likely to use about{' '}
+                    {whole(data.likely)} tokens, counted against the project’s review tokens. While a question is asked
+                    it holds up to {whole(data.largest)} of them, and gives back what it did not use.
                   </p>
                   <div className="flex flex-wrap items-end gap-3">
                     <label className="grid gap-1 text-sm">
