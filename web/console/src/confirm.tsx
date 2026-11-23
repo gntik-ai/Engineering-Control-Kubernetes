@@ -26,6 +26,7 @@ export function Confirm({
   action,
   cancelLabel = 'Not now',
   destructive = false,
+  disabled = false,
   password = false,
   children,
   run,
@@ -37,6 +38,7 @@ export function Confirm({
   action: string;
   cancelLabel?: string;
   destructive?: boolean;
+  disabled?: boolean;
   password?: boolean;
   /** What is chosen before it is confirmed, shown under the question. */
   children?: ReactNode;
@@ -85,7 +87,7 @@ export function Confirm({
           <Button
             variant={destructive ? 'destructive' : 'primary'}
             loading={go.pending}
-            disabled={go.pending || (password && typed === '')}
+            disabled={disabled || go.pending || (password && typed === '')}
             onClick={() => void go.submit()}
           >
             {action}

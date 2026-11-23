@@ -122,6 +122,7 @@ def serialize(
         if section
         else None,
         "title": item.title,
+        "workspace_managed": item.workspace_review is not None,
         "source": item.source,
         "state": item.state,
         "routed_by": item.routed_by,
@@ -219,7 +220,10 @@ class BacklogItems:
             select(BacklogItem, ProjectRecord, ProjectSection)
             .join(ProjectRecord, BacklogItem.project_id == ProjectRecord.id)
             .outerjoin(ProjectSection, BacklogItem.section_id == ProjectSection.id)
-            .where(ProjectRecord.archived_at.is_(None))
+            .where(
+                ProjectRecord.archived_at.is_(None),
+                BacklogItem.workspace_review.is_distinct_from("deleted_draft"),
+            )
         )
         if project is not None:
             query = query.where(ProjectRecord.name == project)
@@ -284,7 +288,11 @@ class BacklogItems:
             if remove:
                 # An item a run is working on stays, with its run.
                 busy = _at_work(session, [item.id for item, _record, _section in rows])
-                busy.update(item.id for item, _, _ in rows if item.workspace_review is not None)
+                busy.update(
+                    item.id
+                    for item, _, _ in rows
+                    if item.workspace_review is not None or item.issue_number
+                )
                 gone = [item.id for item, _record, _section in rows if item.id not in busy]
                 _delete(session, gone)
                 session.commit()
@@ -314,13 +322,11 @@ class BacklogItems:
             return {"project": record.name, "changed": changed, "unchanged": unchanged}
 
     def remove(self, item_id: UUID) -> dict[str, Any]:
-        """Delete an item: it leaves the backlog and every queue it is in. The runs that
-        worked on it stay in the list of runs. An item that is an issue still open on
-        GitHub comes back the next time the backlog is brought in step."""
+        """Delete a local backlog item while preserving the runs that worked on it."""
         with self.sessions.begin() as session:
             item, record = self._item(session, item_id)
-            if item.workspace_review is not None:
-                raise ProjectConflict("This item is managed in the project workspace")
+            if item.workspace_review is not None or item.issue_number:
+                raise ProjectConflict("Manage this Issue in the project workspace.")
             if _at_work(session, [item.id]):
                 raise ProjectConflict(
                     "A run of the item has not ended: stop it or wait, then delete the item"
@@ -330,7 +336,7 @@ class BacklogItems:
                 "item": item.title,
                 "title": item.title,
                 "project": record.name,
-                "returns": item.source == "github" and item.issue_state == "open",
+                "returns": False,
             }
             _delete(session, [item.id])
             return gone

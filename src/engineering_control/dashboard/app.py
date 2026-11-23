@@ -98,6 +98,7 @@ from engineering_control.dashboard.schemas import (
     ItemStateInput,
     ManagedCoverageInput,
     PlainChangeInput,
+    PlanningConfirmation,
     PlanningStateInput,
     ProjectApplicationInput,
     ProjectArchiveInput,
@@ -1560,27 +1561,40 @@ def create_app(
     async def update_planning(name: str, kind: Kind, key: UUID, request: Request) -> Response:
         return await save_planning(name, kind, key, request)
 
-    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/remove")
-    async def remove_planning(
-        name: str, kind: Literal["epics", "stories"], key: UUID, request: Request
+    @app.get("/api/dashboard/projects/{name}/planning/{kind}/{key}/impact")
+    async def planning_impact(
+        name: str, kind: Kind, key: UUID, operation: Literal["close", "delete"], request: Request
     ) -> Response:
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).planning.lifecycle.preview, name, kind, key, operation
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(404, "Planning record not found") from None
+        except ProjectInvalid as error:
+            raise HTTPException(422, str(error)) from None
+
+    @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/remove")
+    async def remove_planning(name: str, kind: Kind, key: UUID, request: Request) -> Response:
         return await project_change(
             request,
-            PlainChangeInput,
-            lambda _: asyncio.to_thread(repo(request).planning.remove, name, kind, key),
+            PlanningConfirmation,
+            lambda body: asyncio.to_thread(
+                repo(request).planning.remove, name, kind, key, body.confirmation
+            ),
             event="workspace.planning_removed",
             subject=name,
         )
 
     @app.post("/api/dashboard/projects/{name}/planning/{kind}/{key}/state")
-    async def change_planning_state(
-        name: str, kind: Literal["epics", "stories"], key: UUID, request: Request
-    ) -> Response:
+    async def change_planning_state(name: str, kind: Kind, key: UUID, request: Request) -> Response:
         return await project_change(
             request,
             PlanningStateInput,
             lambda body: asyncio.to_thread(
-                repo(request).planning.set_state, name, kind, key, body.state
+                repo(request).planning.set_state, name, kind, key, body.state, body.confirmation
             ),
             event="workspace.planning_state_changed",
             subject=name,

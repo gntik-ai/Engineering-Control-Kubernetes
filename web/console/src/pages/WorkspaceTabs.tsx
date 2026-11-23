@@ -15,6 +15,7 @@ import {
   linkVariants,
   SimpleSelect,
   Skeleton,
+  Spinner,
   Tabs,
   TabsList,
   TabsPanel,
@@ -22,7 +23,7 @@ import {
   Textarea,
 } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
-import { CHANGED, apiUrl, getJson, postJson, useResource, type Paged, type ProjectSummary } from '../api';
+import { ApiError, CHANGED, apiUrl, getJson, postJson, useResource, type Paged, type ProjectSummary } from '../api';
 import { DataTable } from '../components/blocks/tables/data-table/DataTable';
 import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
@@ -55,6 +56,8 @@ export interface PlanRow {
   issue_count?: number;
   review?: string | null;
   proposal?: boolean;
+  lifecycle_id?: string | null;
+  closing?: boolean;
   orphan?: boolean;
   standalone_bug?: boolean;
   story_optional?: boolean;
@@ -277,20 +280,72 @@ function ConnectionFilter({project,value}:{project:string;value:string}) {
     onValueChange={v=>setQuery({connected:v==='all'?null:v,page:null,record:null,epic:null})}/>;
 }
 
-function PlanningStateAction({ path, row, closed, locked, saved }: {
-  path: string; row: PlanRow; closed: boolean; locked: boolean; saved: () => void;
+type LifecycleAction = 'close' | 'delete';
+interface ImpactRow {
+  project: string;
+  id: string;
+  kind: Kind;
+  title: string;
+  state: string;
+  action: 'close' | 'delete' | 'keep' | 'already_closed' | 'sync_pending';
+  reason: string;
+  repository?: string;
+  number?: number | null;
+  github?: 'close' | 'after_publication' | null;
+}
+interface ImpactPreview {
+  token: string;
+  items: ImpactRow[];
+}
+
+function ImpactDialog({ path, kind, row, operation, done, close }: {
+  path: string; kind: Kind; row: PlanRow; operation: LifecycleAction; done: () => void; close: () => void;
 }) {
-  const change = useSubmit(() => postJson(path + '/' + row.id + '/state', { state: closed ? 'open' : 'closed' }), saved);
-  const label = (closed ? 'Reopen ' : 'Close ') + row.title;
-  return (
-    <div>
-      <Button size="sm" variant="ghost" iconOnly aria-label={label} title={label}
-        loading={change.pending} disabled={locked || change.pending} onClick={() => void change.submit()}>
-        {closed ? <RotateCcw size={16} aria-hidden /> : <CircleCheck size={16} aria-hidden className="text-orange-700 dark:text-orange-400" />}
-      </Button>
-      {change.problem && <Alert tone="destructive" title={change.problem} />}
-    </div>
-  );
+  const id = row.lifecycle_id ?? row.id;
+  const preview = useResource<ImpactPreview>(apiUrl(path + '/' + id + '/impact', { operation }));
+  const data = preview.data;
+  const verb = operation === 'delete' ? 'Delete' : 'Close';
+  const submit = async () => {
+    if (!data || preview.loading || preview.error) throw new Error('Load the current impact before confirming.');
+    try {
+      await postJson(path + '/' + id + (operation === 'delete' ? '/remove' : '/state'), {
+        confirmation: data.token, ...(operation === 'close' ? { state: 'closed' } : {}),
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) preview.reload();
+      throw error;
+    }
+  };
+  return <Confirm title={verb + ' ' + singular[kind] + '?'} about={row.title}
+    action={'Confirm ' + (operation === 'delete' ? 'deletion' : 'closure')} destructive cancelLabel="Cancel"
+    disabled={!data || preview.loading || Boolean(preview.error)} run={submit} onClose={close} onDone={done}>
+    <LoadError resource={preview} />
+    {preview.loading && <Spinner size={16} aria-label="Loading affected records" />}
+    {data && <>
+      <p className="text-sm">{data.items.filter(r => r.action === 'close').length} to close · {data.items.filter(r => r.action === 'delete').length} to delete</p>
+      {operation === 'delete' && <p className="text-sm">The selected record will be archived and its links removed.</p>}
+      <ul aria-label="Affected records" tabIndex={0} className="max-h-[min(50vh,28rem)] divide-y overflow-y-auto">
+        {data.items.map(r => <li key={r.kind + r.id} className="py-2 text-sm">
+          <strong>{r.action === 'keep' ? 'Keep ' + r.state : r.action === 'sync_pending' ? 'GitHub closure pending' : r.action === 'already_closed' ? 'Already closed' : r.action === 'close' ? 'Close' : 'Delete'}</strong>
+          {' · ' + r.project + ' · ' + singular[r.kind] + ' · ' + r.title}
+          {r.number && <span>{' · ' + r.repository + '#' + r.number}</span>}
+          <div className="text-xs text-muted-foreground">{r.reason}
+            {r.github === 'close' && ' · Close on GitHub'}
+            {r.github === 'after_publication' && ' · Close on GitHub after the approved publication finishes'}
+            {r.kind === 'issues' && !r.number && !r.github && r.action === 'close' && ' · Local draft only'}
+          </div>
+        </li>)}
+      </ul>
+    </>}
+  </Confirm>;
+}
+
+function ReopenAction({ path, row, locked, saved }: { path: string; row: PlanRow; locked: boolean; saved: () => void }) {
+  const change = useSubmit(() => postJson(path + '/' + row.id + '/state', { state: 'open' }), saved);
+  return <div><Button size="sm" variant="ghost" iconOnly aria-label={'Reopen ' + row.title} title={'Reopen ' + row.title}
+    loading={change.pending} disabled={locked || change.pending} onClick={() => void change.submit()}>
+    <RotateCcw size={16} aria-hidden />
+  </Button>{change.problem && <Alert tone="destructive" title={change.problem} />}</div>;
 }
 
 function Records({ kind, project, onRead }: { kind: Kind; project: string; onRead: ReadDescription }) {
@@ -366,6 +421,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   };
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
   const [approving, setApproving] = useState<(PendingSnapshot & { title?: string }) | null>(null);
+  const [impact, setImpact] = useState<{ row: PlanRow; operation: LifecycleAction } | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
   const selectAll = useSubmit(
     () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { [stateKey]: view }), new AbortController().signal),
@@ -439,8 +495,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       id: 'status', header: 'Status', sortable: false, className: 'align-top',
       cell: (record) => (
         <>
-          {record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
+          {record.review === 'closed_draft' ? 'Closed locally' : record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
           {record.review === 'awaiting_stage' && <div className="text-xs text-muted-foreground">Awaiting {sections[kind]} review</div>}
+          {record.closing && <div className="text-xs text-muted-foreground">GitHub closure pending</div>}
           {record.execution_type && <div className="mt-1 text-xs font-medium">{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'}{record.type_confirmed ? ' · Confirmed' : ' · Suggested'}</div>}
           {!record.type_confirmed && record.story_optional && <div className="mt-1 text-xs font-medium">Bug · GitHub</div>}
           {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
@@ -457,8 +514,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
       cell: (record) => (
         <div className="flex flex-wrap justify-end gap-1">
-          {kind !== 'issues' && !record.proposal && <PlanningStateAction path={path} row={record}
-            closed={view === 'closed'} locked={rowLocked(record)} saved={reload} />}
+          {kind !== 'issues' && !record.proposal && view === 'closed' && <ReopenAction path={path} row={record} locked={rowLocked(record)} saved={reload} />}
+          {record.lifecycle_id && view !== 'closed' && record.review !== 'closed_draft' && !record.closing && (
+            <Button size="sm" variant="ghost" iconOnly aria-haspopup="dialog" disabled={rowLocked(record)} aria-label={'Close ' + record.title} title={'Close ' + record.title}
+              onClick={() => setImpact({ row: record, operation: 'close' })}>
+              <CircleCheck size={16} aria-hidden className="text-orange-700 dark:text-orange-400" />
+            </Button>
+          )}
           {kind === 'issues' && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
             onClick={() => setLinking(record)}>Link User Stories</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
@@ -473,10 +535,10 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             <Button size="sm" variant="secondary" disabled={rowLocked(record) || Boolean(record.proposal && kind !== 'epics' && !(kind === 'issues' && (record.number || record.story_optional)) && !(record.epic_ids ?? record.story_ids)?.length)} aria-label={'Approve ' + record.title}
               onClick={() => setApproving({ ids: [record.id], title: record.title, close_numbers: kind !== 'issues' && record.number && record.github_state === 'open' ? [record.number] : [], version: data?.version ?? null })}>Approve</Button>
           )}
-          {(record.proposal || kind !== 'issues') && (
+          {(record.proposal || kind !== 'issues' || (!record.number && record.review !== 'publishing')) && (
             <Button size="sm" variant="ghost" iconOnly={!record.proposal} disabled={rowLocked(record)}
               aria-haspopup="dialog" title={record.proposal ? undefined : 'Delete ' + record.title}
-              aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title} onClick={() => setRemoving(record)}>
+              aria-label={(record.proposal ? 'Dismiss ' : 'Delete ') + record.title} onClick={() => record.proposal ? setRemoving(record) : setImpact({ row: record, operation: 'delete' })}>
               {record.proposal ? 'Dismiss' : <Trash2 size={16} aria-hidden className="text-destructive" />}
             </Button>
           )}
@@ -577,19 +639,12 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           }}
         />
       )}
+      {impact && <ImpactDialog key={kind + impact.row.id + impact.operation} path={path} kind={kind} row={impact.row}
+        operation={impact.operation} done={() => afterDecision({})} close={() => setImpact(null)} />}
       {removing && (
-        <Confirm
-          title={(removing.proposal ? 'Dismiss ' : 'Delete ') + singular[kind] + '?'}
-          about={removing.title}
-          action={removing.proposal ? 'Dismiss' : 'Delete'}
-          cancelLabel="Cancel"
-          destructive
-          run={() => removing.proposal
-            ? postJson(path + '/decisions', { ids: [removing.id], version: data?.version, dismiss: true })
-            : postJson(path + '/' + removing.id + '/remove')}
-          onDone={afterDecision}
-          onClose={() => setRemoving(null)}
-        />
+        <Confirm title={'Dismiss ' + singular[kind] + '?'} about={removing.title} action="Dismiss" cancelLabel="Cancel" destructive
+          run={() => postJson(path + '/decisions', { ids: [removing.id], version: data?.version, dismiss: true })}
+          onDone={afterDecision} onClose={() => setRemoving(null)} />
       )}
     </section>
   );

@@ -21,6 +21,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.workspace_issues import planning_kind
 from engineering_control.db.models import (
     BacklogItem,
+    PlanningLifecycleReceipt,
     ProjectEpic,
     ProjectRecord,
     ProjectUserStory,
@@ -31,6 +32,7 @@ from engineering_control.db.models import (
 from engineering_control.github_app import GitHubApp, GitHubAppError
 
 LOGGER = logging.getLogger(__name__)
+CLOSE_ISSUE = "close_issue"
 
 
 def action_row(action: WorkspaceAction) -> dict[str, Any]:
@@ -127,6 +129,43 @@ def approve_issue(session: Session, project: ProjectRecord, key: UUID) -> UUID |
     return enqueue(session, project.id, "create", key, project.source_repository).id
 
 
+def _confirmed_issue(db: Session, action: WorkspaceAction, project: ProjectRecord) -> bool:
+    receipt = (
+        db.get(PlanningLifecycleReceipt, action.confirmation_token)
+        if action.confirmation_token
+        else None
+    )
+    if not receipt:
+        return False
+    for entry in receipt.impact["items"]:
+        if (
+            entry["kind"] != "issues"
+            or entry["action"] != "close"
+            or entry["project"] != project.name
+            or entry["id"] != str(action.local_id)
+            or entry["repository"].casefold() != action.repository.casefold()
+        ):
+            continue
+        if entry["github"] == "close":
+            return bool(entry["number"] == action.number)
+        if entry["github"] == "after_publication":
+            # A draft had no GitHub number at confirmation. Its own completed publication
+            # is the authority for the number now attached to it.
+            return bool(
+                db.scalar(
+                    select(WorkspaceAction.id).where(
+                        WorkspaceAction.project_id == action.project_id,
+                        WorkspaceAction.operation == "create",
+                        WorkspaceAction.local_id == action.local_id,
+                        WorkspaceAction.repository == action.repository,
+                        WorkspaceAction.number == action.number,
+                        WorkspaceAction.status == "done",
+                    )
+                )
+            )
+    return False
+
+
 class WorkspacePublishing:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -148,6 +187,28 @@ class WorkspacePublishing:
             now = datetime.now(UTC)
             if action.lease_until and action.lease_until.replace(tzinfo=UTC) > now:
                 raise ProjectConflict("Synchronization is already running")
+            if action.operation == CLOSE_ISSUE:
+                item = session.get(BacklogItem, action.local_id)
+                if action.status == "waiting":
+                    raise ProjectConflict("Waiting for the approved issue publication to finish.")
+                if (
+                    not item
+                    or item.project_id != project.id
+                    or item.workspace_review == "planning"
+                    or not action.number
+                    or item.issue_number != action.number
+                    or (item.repository or project.source_repository).casefold()
+                    != action.repository.casefold()
+                    or not _confirmed_issue(session, action, project)
+                ):
+                    action.status, action.detail = (
+                        "blocked",
+                        "The Issue no longer matches its confirmed closure.",
+                    )
+                    session.flush()
+                    session.expunge(action)
+                    return action, "", ""
+                action.status, action.detail = "pending", None
             title = body = ""
             if action.operation == "create":
                 item = session.get(BacklogItem, action.local_id)
@@ -210,9 +271,10 @@ class WorkspacePublishing:
         number: int | None = None,
         snapshot: dict[str, Any] | None = None,
         error: str | None = None,
+        blocked: str | None = None,
         category: str | None = None,
         labels: list[str] | None = None,
-    ) -> None:
+    ) -> str | None:
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             action = session.get(WorkspaceAction, claimed.id)
@@ -220,22 +282,57 @@ class WorkspacePublishing:
                 raise ProjectConflict("Synchronization was resumed in another session")
             if sent:
                 action.status = "uncertain"
-                return
+                return None
             action.lease = action.lease_until = None
+            if blocked:
+                action.status, action.detail = "blocked", blocked
+                return None
             if retained:
                 action.status = "retained"
                 action.detail = (
                     "GitHub source retained because its planning type could not be verified."
                 )
-                return
+                return None
             action.detail = error[:350] if error else None
             if error:
-                return
+                return None
+            if action.operation == CLOSE_ISSUE:
+                item = session.get(BacklogItem, action.local_id)
+                if (
+                    not item
+                    or (item.project_id, item.issue_number) != (project.id, number)
+                    or (item.repository or project.source_repository).casefold()
+                    != action.repository.casefold()
+                ):
+                    action.status, action.detail = (
+                        "blocked",
+                        "The local Issue changed during synchronization.",
+                    )
+                    return action.detail
+                closed = (snapshot or {}).get("closed_at")
+                updated = (snapshot or {}).get("updated_at")
+                item.issue_state = "closed"
+                item.github_closed_at = (
+                    datetime.fromisoformat(closed.replace("Z", "+00:00"))
+                    if closed
+                    else datetime.now(UTC)
+                )
+                item.state, item.done_at = "done", item.github_closed_at
+                if updated:
+                    item.issue_updated_at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                source = session.get(WorkspaceSource, (project.id, f"issue:{number}"))
+                if source and action.repository.casefold() == project.source_repository.casefold():
+                    source.evidence = {
+                        **source.evidence,
+                        "state": "closed",
+                        "closed_at": closed,
+                        "updated_at": updated,
+                    }
             if action.operation == "label":
                 item = session.get(BacklogItem, action.local_id)
                 if item and item.execution_type != category:
                     action.status, action.detail = "pending", None
-                    return
+                    return None
                 if item and labels is not None:
                     item.issue_labels = labels
             if action.operation in ("create", "link"):
@@ -266,13 +363,27 @@ class WorkspacePublishing:
                         "github_state_reason": snapshot.get("state_reason"),
                     }
                 item.workspace_review = "approved"
+                waiting = session.scalar(
+                    select(WorkspaceAction).where(
+                        WorkspaceAction.project_id == project.id,
+                        WorkspaceAction.operation == CLOSE_ISSUE,
+                        WorkspaceAction.local_id == item.id,
+                        WorkspaceAction.status == "waiting",
+                    )
+                )
+                if waiting:
+                    waiting.number, waiting.status = number, "pending"
+                    item.state = "done"
                 schedule_classification(session, project, item)
             action.status = "done"
+        return None
 
     async def sync(self, name: str, key: UUID, github: GitHubApp | None) -> dict[str, Any]:
         action, title, body = await asyncio.to_thread(self._claim, name, key)
         if action.status in ("done", "retained"):
             return {"project": name, "status": action.status}
+        if action.status == "blocked":
+            return {"project": name, "status": "needs_attention", "detail": action.detail}
         number = action.number
         snapshot = None
         labels = None
@@ -289,6 +400,25 @@ class WorkspacePublishing:
                         "The creation outcome is uncertain. Recheck GitHub before publishing again."
                     )
                 snapshot = await github.workspace_issue(action.repository, number)
+            elif action.operation == CLOSE_ISSUE and number:
+                snapshot = await github.workspace_issue(action.repository, number)
+                if planning_kind(snapshot):
+                    reason = (
+                        "GitHub now identifies this record as an Epic or Story. Review its type."
+                    )
+                    await asyncio.to_thread(self._update, name, action, blocked=reason)
+                    return {"project": name, "status": "needs_attention", "detail": reason}
+                if snapshot["state"] != "closed":
+                    token = await github.repository_token(action.repository, {"issues": "write"})
+                    try:
+                        await github.close_workspace_issue(action.repository, number, token=token)
+                    finally:
+                        await github.revoke(token)
+                    snapshot = await github.workspace_issue(action.repository, number)
+                    if snapshot["state"] != "closed":
+                        raise GitHubAppError(
+                            "GitHub has not confirmed the technical Issue closure."
+                        )
             elif action.operation == "close" and number:
                 expected = await asyncio.to_thread(self._approved_planning_kind, action)
                 current = (
@@ -329,7 +459,7 @@ class WorkspacePublishing:
         except GitHubAppError as error:
             await asyncio.to_thread(self._update, name, action, error=str(error))
             return {"project": name, "status": "needs_attention", "detail": str(error)}
-        await asyncio.to_thread(
+        problem = await asyncio.to_thread(
             self._update,
             name,
             action,
@@ -338,6 +468,8 @@ class WorkspacePublishing:
             category=title,
             labels=labels,
         )
+        if problem:
+            return {"project": name, "status": "needs_attention", "detail": problem}
         return {"project": name, "status": "done", "number": number}
 
     def due(self) -> list[tuple[str, UUID]]:

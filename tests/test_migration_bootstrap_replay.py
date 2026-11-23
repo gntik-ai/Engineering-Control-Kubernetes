@@ -48,8 +48,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0046 (batches of questions to a model) follows 0045 (summaries of a project's code).
     # 0047 (the day a backlog item was done) follows it, and 0048 (deleted flows of the
     # platform's own) follows that. 0049 adds the workspace records and default.
-    # 0069 keeps a daily measurement of how each project's planning hangs together.
-    assert (head, parent) == ("0069", "0068")
+    # 0070 keeps a daily measurement of how each project's planning hangs together.
+    assert (head, parent) == ("0070", "0069")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -143,9 +143,19 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert "execution_type" in {
         c["name"] for c in inspect(engine).get_columns("workspace_candidates")
     }
+    assert "supervisor_advice" in inspect(engine).get_table_names()
+    assert "planning_lifecycle_receipts" in inspect(engine).get_table_names()
+    assert "confirmation_token" in {
+        c["name"] for c in inspect(engine).get_columns("workspace_actions")
+    }
     command.downgrade(config, parent)
     assert "planning_health" not in inspect(engine).get_table_names()
-    assert "supervisor_advice" in inspect(engine).get_table_names()
+    assert "planning_lifecycle_receipts" in inspect(engine).get_table_names()
+    command.downgrade(config, "0068")
+    assert "planning_lifecycle_receipts" not in inspect(engine).get_table_names()
+    assert "confirmation_token" not in {
+        c["name"] for c in inspect(engine).get_columns("workspace_actions")
+    }
     command.downgrade(config, "0067")
     assert "supervisor_advice" not in inspect(engine).get_table_names()
     command.downgrade(config, "0066")

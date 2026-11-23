@@ -656,6 +656,7 @@ export interface WorkItem {
    */
   section: { key: string; name: string; flow?: string | null; starts?: 'item' | 'scope' | null } | null;
   title: string;
+  workspace_managed?: boolean;
   source: 'github' | 'manual';
   state: 'proposed' | 'accepted' | 'skipped' | 'done';
   /** Who chose the section: a label of the issue, the supervisor, or the administrator. */

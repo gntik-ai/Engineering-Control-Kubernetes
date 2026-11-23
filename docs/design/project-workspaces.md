@@ -263,7 +263,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | Links with no recorded reason | Every link, until links record who made them and why (phase R1). |
 | Reviews waiting | Automatic reviews that are queued, need input or failed, and evidence runs that were cut off. |
 
-The project is measured once a day, and again when the page is opened after ten minutes or **Measure now** is pressed. The last measurement of each UTC day is kept (`planning_health`, migration 0069). The first one is the baseline: each tile says how its number moved since. `GET /api/dashboard/projects/{name}/planning/health?days=30` returns the current numbers, the baseline and the days between. No model is asked.
+The project is measured once a day, and again when the page is opened after ten minutes or **Measure now** is pressed. The last measurement of each UTC day is kept (`planning_health`, migration 0070). The first one is the baseline: each tile says how its number moved since. `GET /api/dashboard/projects/{name}/planning/health?days=30` returns the current numbers, the baseline and the days between. No model is asked.
 
 ### A review run that was cut off
 

@@ -451,7 +451,11 @@ class WorkspaceImportStep(WorkspaceCoverageInput):
     background: bool = False
 
 
-class PlanningStateInput(PlainChangeInput):
+class PlanningConfirmation(PlainChangeInput):
+    confirmation: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class PlanningStateInput(PlanningConfirmation):
     state: Literal["open", "closed"]
 
 
