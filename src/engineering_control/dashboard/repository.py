@@ -15,6 +15,7 @@ from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
+from engineering_control.dashboard.doc_inventory import DocInventory
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
 from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.orphans import Orphans
@@ -120,6 +121,7 @@ class DashboardRepository:
         self.planning_links = PlanningLinks(self.sessions)
         self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
         self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
+        self.documents = DocInventory(self.sessions)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

@@ -940,6 +940,104 @@ class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class DocFolders(Base):
+    """Which folders of a project's repository hold its documentation (migration 0074).
+    A project without a row uses the platform's own list."""
+
+    __tablename__ = "doc_folders"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    # A name without a slash is a folder of that name at any depth; one with a slash is
+    # a path from the root of the repository.
+    include: Mapped[list[str]] = mapped_column(JSON, default=list)
+    exclude: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class DocScan(UUIDPrimaryKey, Timestamps, Base):
+    """One reading of a project's documentation at one commit (migration 0074): which
+    documents there are, and what changed since the reading before. No model is asked."""
+
+    __tablename__ = "doc_scans"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    repository: Mapped[str] = mapped_column(String(200))
+    branch: Mapped[str] = mapped_column(String(120))
+    # The commit that is read: given when the scan is asked for, else the branch's head
+    # when it runs.
+    commit_sha: Mapped[str | None] = mapped_column(String(40))
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The commit of the reading before, which this one is compared with.
+    previous_sha: Mapped[str | None] = mapped_column(String(40))
+    # queued, running, complete or failed.
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    # Why it was made: ``baseline`` for the commit Discovery read, ``manual`` at the
+    # administrator's word, ``schedule`` when the branch moved.
+    reason: Mapped[str] = mapped_column(String(16))
+    files: Mapped[int] = mapped_column(Integer, default=0)
+    added: Mapped[int] = mapped_column(Integer, default=0)
+    modified: Mapped[int] = mapped_column(Integer, default=0)
+    removed: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DocFile(UUIDPrimaryKey, Timestamps, Base):
+    """One document of a project's repository as the last reading found it (migration
+    0074): its text, its headings with their lines, and the readings that first saw it,
+    last saw it change, and saw it gone."""
+
+    __tablename__ = "doc_files"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    path: Mapped[str] = mapped_column(String(700))
+    blob_sha: Mapped[str] = mapped_column(String(40))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    lines: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str | None] = mapped_column(String(300))
+    # Its headings in order: level, title and the line each is on.
+    sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # None for a file too large to keep.
+    text: Mapped[str | None] = mapped_column(Text)
+    first_scan_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("doc_scans.id", ondelete="SET NULL")
+    )
+    changed_scan_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("doc_scans.id", ondelete="SET NULL")
+    )
+    removed_scan_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("doc_scans.id", ondelete="SET NULL")
+    )
+    __table_args__ = (UniqueConstraint("project_id", "path", name="uq_doc_files_path"),)
+
+
+class DocChange(UUIDPrimaryKey, Timestamps, Base):
+    """What one reading found changed in one document (migration 0074): whether it was
+    added, modified or removed, how many lines, under which headings, and the lines."""
+
+    __tablename__ = "doc_changes"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    scan_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("doc_scans.id", ondelete="CASCADE"), index=True
+    )
+    path: Mapped[str] = mapped_column(String(700))
+    # added, modified or removed.
+    kind: Mapped[str] = mapped_column(String(16))
+    old_blob: Mapped[str | None] = mapped_column(String(40))
+    new_blob: Mapped[str | None] = mapped_column(String(40))
+    added_lines: Mapped[int] = mapped_column(Integer, default=0)
+    removed_lines: Mapped[int] = mapped_column(Integer, default=0)
+    # The headings under which lines changed, each with how many were added and removed.
+    sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # The changed lines with a little of what surrounds them, shortened when long.
+    diff: Mapped[str | None] = mapped_column(Text)
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

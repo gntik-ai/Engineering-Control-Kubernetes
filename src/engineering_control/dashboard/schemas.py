@@ -522,6 +522,14 @@ class OrphanRunInput(PlainChangeInput):
     again: bool = False
 
 
+class DocFoldersInput(PlainChangeInput):
+    """The folders that hold a project's documentation, and those among them that do not.
+    With no folders given the platform's own list is used again."""
+
+    include: list[str] | None = Field(default=None, max_length=40)
+    exclude: list[str] = Field(default_factory=list, max_length=40)
+
+
 class PrimaryEpicRunInput(OrphanRunInput):
     """A run that asks which Epic is the primary one of each User Story under several."""
 

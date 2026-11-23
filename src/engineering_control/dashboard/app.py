@@ -32,6 +32,7 @@ from fastapi.responses import (
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard import (
+    doc_inventory,
     evidence_verdicts,
     parent_choice,
     review_budget,
@@ -80,6 +81,7 @@ from engineering_control.dashboard.schemas import (
     ConnectionDecisionInput,
     ConnectionInput,
     ConnectionLinkInput,
+    DocFoldersInput,
     EpicDescriptionCheck,
     EpicInput,
     EpicQueueInput,
@@ -522,6 +524,13 @@ def create_app(
                     parent_choice.worker(resolved_repository.sessions, app.state.models)
                 )
             )
+            if resolved_github is not None:
+                # The documentation of each project is read when its branch moved.
+                keepers.append(
+                    asyncio.create_task(
+                        doc_inventory.worker(resolved_repository.documents, resolved_github)
+                    )
+                )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
             keepers.append(asyncio.create_task(keep_planning_health_measured(resolved_repository)))
@@ -1692,6 +1701,79 @@ def create_app(
             PlainChangeInput,
             lambda _body: asyncio.to_thread(repo(request).orphans.dismiss, name, key),
             event="workspace.orphan_answer_dismissed",
+            subject=name,
+        )
+
+    async def documents_read(request: Request, read: Callable[[], Any]) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(await asyncio.to_thread(read))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/documents")
+    async def documents_api(name: str, request: Request) -> Response:
+        """The project's documentation in brief: the last reading and what changed."""
+        return await documents_read(request, lambda: repo(request).documents.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/documents/changes")
+    async def document_changes_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+        folder: str = Query("", max_length=200),
+        kind: Literal["", "added", "modified", "removed"] = "",
+    ) -> Response:
+        """The documents that changed since the first reading."""
+        return await documents_read(
+            request, lambda: repo(request).documents.changes(name, page, page_size, folder, kind)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/documents/files")
+    async def document_files_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+        folder: str = Query("", max_length=200),
+        search: str = Query("", max_length=200, pattern=r"^[^\x00]*$"),
+    ) -> Response:
+        """The documents the last reading found."""
+        return await documents_read(
+            request, lambda: repo(request).documents.files(name, page, page_size, folder, search)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/documents/file")
+    async def document_file_api(
+        name: str, request: Request, path: str = Query(min_length=1, max_length=700)
+    ) -> Response:
+        """One document: its text, its headings and every change the readings found."""
+        return await documents_read(request, lambda: repo(request).documents.file(name, path))
+
+    @app.post("/api/dashboard/projects/{name}/documents/scan")
+    async def documents_scan_api(name: str, request: Request) -> Response:
+        """Read the project's documentation again now, at the head of its branch."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).documents.request, name, "manual"),
+            event="workspace.documents_read",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/documents/folders")
+    async def documents_folders_api(name: str, request: Request) -> Response:
+        """Say which folders hold the project's documentation."""
+        return await project_change(
+            request,
+            DocFoldersInput,
+            lambda body: asyncio.to_thread(
+                repo(request).documents.save_folders, name, body.include, body.exclude
+            ),
+            event="workspace.document_folders_changed",
             subject=name,
         )
 

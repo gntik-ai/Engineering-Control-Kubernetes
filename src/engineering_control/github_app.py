@@ -388,6 +388,24 @@ class GitHubApp:
             raise GitHubAppError("GitHub returned no root tree for the repository")
         return commit, tree
 
+    async def commit_tree(
+        self, repository: str, commit: str, *, token: str
+    ) -> tuple[str, str | None]:
+        """The root tree of that commit, and when it was committed."""
+        if not COMMIT.fullmatch(commit):
+            raise GitHubAppError("Invalid commit")
+        data = await self._request(
+            "GET",
+            f"/repos/{repository}/git/commits/{commit}",
+            token=token,
+            not_found=f"{repository} has no commit {commit[:12]}",
+        )
+        tree = (data.get("tree") or {}).get("sha") if isinstance(data, dict) else None
+        if not isinstance(tree, str) or not COMMIT.fullmatch(tree):
+            raise GitHubAppError("GitHub returned no root tree for the commit")
+        when = (data.get("committer") or {}).get("date")
+        return tree, when if isinstance(when, str) else None
+
     async def workspace_tree(
         self, repository: str, tree: str, *, token: str, recursive: bool
     ) -> tuple[list[dict[str, Any]], bool]:
