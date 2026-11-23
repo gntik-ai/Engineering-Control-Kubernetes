@@ -1002,6 +1002,9 @@ class DocFile(UUIDPrimaryKey, Timestamps, Base):
     sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     # None for a file too large to keep.
     text: Mapped[str | None] = mapped_column(Text)
+    # What its path and text say about what it is: the OpenSpec change or capability it
+    # belongs to, how many of a change's tasks are done, and the identifiers it names.
+    facts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     first_scan_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("doc_scans.id", ondelete="SET NULL")
     )

@@ -245,8 +245,8 @@ The administrator agreed these rules and phases. Every change to existing record
 | R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
 | R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
 | R6 | Scorer in shadow mode: a calibrated classifier that abstains, with escalation to decision models. | A report of every change it would make, with precision per kind of change measured on held-out cases. Nothing is changed. |
-| R7 | Reorganize links automatically: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | Batches with undo and an audit sample; audited precision within the allowed error rate. |
-| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are closed; every Story shows its state with its evidence. |
+| R7 | Reorganize links: batches to approve for reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | A sample before each batch and undo of a batch; sampled precision within the allowed error rate. Nothing is applied without approval. |
+| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are offered as a batch to close; every Story shows its state with its evidence. |
 | R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
 | R10 | Reorganize structure: split Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
 | R11 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; the clean-up plan follows the repository; each project follows the same numbers. |
@@ -346,6 +346,27 @@ The Epics table shows under each Epic's count of linked Stories how many it is t
 `GET /api/dashboard/projects/{name}/primary-epics` returns the list, the counts, what a run would use and the last run. `POST …/primary-epics/runs` starts a run (`unclear_only` limits it), `…/primary-epics/runs/{id}/control` stops, resumes or ends it, `…/primary-epics/{story}/choose` with `epic_id` and `…/dismiss` record a decision on one Story, and `…/primary-epics/approve` approves many answers at once. `GET …/finished-stories` lists the Stories whose issues are all closed.
 
 Both kinds of run, for issues and for Stories, are one mechanism (`parent_choice`): a kind says which records wait, what each is shown with and what is asked; the run, the token accounting, the checks of an answer and the controls are shared.
+
+### Documentation inventory
+
+**Reviews → Discovery** opens with the project's documentation as its repository holds it. A reading takes the tree of the repository at one commit, keeps the documents, and compares them with the reading before by the identity git gives each file's content, so only what is new or changed is fetched. No model is asked, and the same commit always reads the same.
+
+A document is a README anywhere, a `.md`, `.mdx`, `.rst` or `.adoc` file at the root of the repository, or a file of those kinds or `.txt` in a folder that holds documentation. The platform's list of such folders is `docs`, `doc`, `documentation`, `adr`, `design`, `openspec` and `docs-site`; a project can have its own list, and folders or files that are left out. A name without a slash is a folder of that name at any depth, a name with a slash a path from the root. Changing the list reads the repository again.
+
+The first reading of a project is made at the commit Discovery read, where there is one, so the next reading says what changed since. Afterwards the branch is looked at every quarter of an hour and read again when it moved; **Read now** asks for a reading at once. A reading that fails says why, and the branch is left alone for six hours unless a reading is asked for.
+
+For each document that changed, the page shows whether it was added, modified or removed, how many lines, under which headings, and on opening it the changed lines themselves. A document in a folder Discovery does not read is marked: Discovery's own reading covers `docs`, `doc`, `documentation`, `adr`, `design`, READMEs and the root, and condenses what it reads into the project's description.
+
+What a document's path and text say about what it is is read by rule and kept with it, as the keys that later join documents, issues and Stories:
+
+- the OpenSpec change it belongs to (`openspec/changes/<name>/…`, archived when under `archive/`), or the capability (`openspec/specs/<name>/…`);
+- the issue number in a change's name (`add-1069-…`, `fix-976-…`);
+- how many tasks of a change's `tasks.md` are done;
+- the identifiers it names, such as `GAP-FAL-008`, and the issues it refers to.
+
+The page lists the OpenSpec changes with their state (open, every task done, archived), their progress, and the issues that name the change in their title or that the change is named after. It counts the changes no issue names and those whose issues are all closed.
+
+`GET /api/dashboard/projects/{name}/documents` returns the overview; `…/documents/changes` the documents that changed since the first reading; `…/documents/files` the documents; `…/documents/file?path=` one document with its text, headings, facts and every change the readings found; `…/documents/openspec` the changes. `POST …/documents/scan` asks for a reading and `…/documents/folders` sets the folders. Readings, documents and changes are kept in `doc_scans`, `doc_files` and `doc_changes`, the folders in `doc_folders` (migration 0074).
 
 ### A review run that was cut off
 

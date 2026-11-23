@@ -34,6 +34,7 @@ from engineering_control.dashboard.project_records import (
     active_project,
 )
 from engineering_control.db.models import (
+    BacklogItem,
     DocChange,
     DocFile,
     DocFolders,
@@ -143,6 +144,49 @@ def outline(path: str, text: str) -> list[dict[str, Any]]:
         if match:
             found.append({"level": len(match[1]), "title": match[2].strip()[:200], "line": number})
     return found
+
+
+CHANGE: Final = re.compile(r"^openspec/changes/(archive/)?([^/]+)/", re.I)
+CAPABILITY: Final = re.compile(r"^openspec/specs/([^/]+)/", re.I)
+NUMBER_IN_NAME: Final = re.compile(r"(?:^|-)(\d{2,6})(?=-|$)")
+TASK: Final = re.compile(r"^\s*[-*]\s*\[([ xX])\]", re.M)
+CODE: Final = re.compile(r"\b[A-Z][A-Z0-9]{1,7}(?:-[A-Z0-9]{1,8}){0,2}-\d{1,5}\b")
+ISSUE_REF: Final = re.compile(r"(?:^|[\s(\[])#(\d{1,6})\b|/issues/(\d{1,6})\b")
+
+
+def facts_of(path: str, text: str | None) -> dict[str, Any]:
+    """What a document's path and text say about what it is, read by rule: the OpenSpec
+    change or capability it belongs to, how many tasks of a change are done, and the
+    identifiers and issue numbers it names. These join documents, issues and Stories."""
+    facts: dict[str, Any] = {}
+    change = CHANGE.match(path)
+    if change:
+        name = change[2]
+        entry: dict[str, Any] = {"change": name, "archived": bool(change[1])}
+        number = NUMBER_IN_NAME.search(name)
+        if number:
+            # A change is named after the issue it answers: add-1069-…, fix-976-….
+            entry["issue"] = int(number[1])
+        facts["openspec"] = entry
+    capability = CAPABILITY.match(path)
+    if capability:
+        facts["openspec"] = {"capability": capability[1]}
+    if text:
+        if PurePosixPath(path).name.lower() == "tasks.md":
+            boxes = TASK.findall(text)
+            facts["tasks"] = {
+                "done": sum(1 for box in boxes if box.strip()),
+                "total": len(boxes),
+            }
+        codes = list(dict.fromkeys(CODE.findall(text)))[:60]
+        if codes:
+            facts["codes"] = codes
+        issues = list(
+            dict.fromkeys(int(a or b) for a, b in ISSUE_REF.findall(text) if int(a or b) > 0)
+        )[:60]
+        if issues:
+            facts["issues"] = issues
+    return facts
 
 
 def title_of(sections: list[dict[str, Any]]) -> str | None:
@@ -493,6 +537,7 @@ class DocInventory:
                     change(path, "modified", **more)
                 row.blob_sha, row.size, row.lines = sha, size, lines
                 row.text, row.sections, row.title = text, sections, title_of(sections)
+                row.facts = facts_of(path, text)
                 row.changed_scan_id = scan.id
             for path, row in rows.items():
                 if path not in wanted and row.removed_scan_id is None:
@@ -822,6 +867,89 @@ class DocInventory:
                 )
             return {"items": items, "total": total, "page": page, "pages": pages}
 
+    def openspec(self, name: str, page: int, page_size: int, state: str = "") -> dict[str, Any]:
+        """The OpenSpec changes the last reading found: each with whether it is archived,
+        how many of its tasks are done, and the issues that name it or that it is named
+        after. A change is proposed work until it is archived; then it is done."""
+        with self.sessions() as db:
+            project = active_project(db, name)
+            changes: dict[str, dict[str, Any]] = {}
+            capabilities: set[str] = set()
+            for path, title, facts in db.execute(
+                select(DocFile.path, DocFile.title, DocFile.facts).where(
+                    DocFile.project_id == project.id, DocFile.removed_scan_id.is_(None)
+                )
+            ):
+                spec = (facts or {}).get("openspec") or {}
+                if spec.get("capability"):
+                    capabilities.add(spec["capability"])
+                if not spec.get("change"):
+                    continue
+                entry = changes.setdefault(
+                    spec["change"],
+                    {
+                        "change": spec["change"],
+                        "archived": bool(spec.get("archived")),
+                        "issue": spec.get("issue"),
+                        "title": None,
+                        "files": 0,
+                        "tasks_done": 0,
+                        "tasks": 0,
+                        "path": path.rsplit("/", 1)[0],
+                    },
+                )
+                entry["files"] += 1
+                if PurePosixPath(path).name.lower() == "proposal.md" and title:
+                    entry["title"] = title
+                tasks = (facts or {}).get("tasks")
+                if tasks:
+                    entry["tasks_done"] += int(tasks.get("done") or 0)
+                    entry["tasks"] += int(tasks.get("total") or 0)
+            issues = db.execute(
+                select(
+                    BacklogItem.id,
+                    BacklogItem.issue_number,
+                    BacklogItem.title,
+                    BacklogItem.issue_state,
+                ).where(BacklogItem.project_id == project.id, BacklogItem.issue_number.is_not(None))
+            ).all()
+        by_number = {number: (key, number, title, state) for key, number, title, state in issues}
+        for entry in changes.values():
+            named = [row for row in issues if entry["change"].lower() in (row[2] or "").lower()]
+            after = by_number.get(entry["issue"]) if entry["issue"] else None
+            found = {row[1]: row for row in ([after] if after else []) + named}
+            entry["issues"] = [
+                {"id": str(key), "number": number, "title": title, "state": state or "open"}
+                for key, number, title, state in sorted(found.values(), key=lambda row: row[1])
+            ]
+            done = entry["tasks"] > 0 and entry["tasks_done"] == entry["tasks"]
+            entry["state"] = "archived" if entry["archived"] else "tasks done" if done else "open"
+        rows = [row for row in changes.values() if not state or row["state"] == state]
+        rows.sort(key=lambda row: (row["state"] != "open", row["change"]))
+        pages = max(1, (len(rows) + page_size - 1) // page_size)
+        page = min(max(1, page), pages)
+        counts = Counter(row["state"] for row in changes.values())
+        return {
+            "items": rows[(page - 1) * page_size : page * page_size],
+            "total": len(rows),
+            "page": page,
+            "pages": pages,
+            "counts": {
+                "changes": len(changes),
+                "open": counts["open"],
+                "tasks_done": counts["tasks done"],
+                "archived": counts["archived"],
+                "capabilities": len(capabilities),
+                # Changes no issue names, and changes whose issues are all closed.
+                "without_issue": sum(1 for row in changes.values() if not row["issues"]),
+                "issues_closed": sum(
+                    1
+                    for row in changes.values()
+                    if row["issues"] and all(i["state"] == "closed" for i in row["issues"])
+                ),
+            },
+        }
+
     def file(self, name: str, path: str) -> dict[str, Any]:
         """One document: its text and headings, and every change the readings found."""
         with self.sessions() as db:
@@ -860,6 +988,7 @@ class DocInventory:
                 "text": row.text,
                 "removed": row.removed_scan_id is not None,
                 "read_by_discovery": read_by_discovery(row.path),
+                "facts": row.facts or {},
                 "url": f"https://github.com/{project.source_repository}/blob/"
                 f"{project.default_branch}/{row.path}",
                 "history": history,

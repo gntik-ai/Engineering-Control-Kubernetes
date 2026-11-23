@@ -1753,6 +1753,19 @@ def create_app(
             request, lambda: repo(request).documents.files(name, page, page_size, folder, search)
         )
 
+    @app.get("/api/dashboard/projects/{name}/documents/openspec")
+    async def document_openspec_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+        state: Literal["", "open", "tasks done", "archived"] = "",
+    ) -> Response:
+        """The OpenSpec changes of the repository, with their progress and their issues."""
+        return await documents_read(
+            request, lambda: repo(request).documents.openspec(name, page, page_size, state)
+        )
+
     @app.get("/api/dashboard/projects/{name}/documents/file")
     async def document_file_api(
         name: str, request: Request, path: str = Query(min_length=1, max_length=700)

@@ -35,6 +35,8 @@ SECOND = {
     **{path: text for path, text in FIRST.items() if path != "docs/old.md"},
     "docs/guide.md": GUIDE_2,
     "openspec/changes/add-queue/proposal.md": "# Add a queue\n\n## Why\n\nFairness.\n",
+    "openspec/changes/fix-42-error-events/proposal.md": "# Record errors\n\n#42, GAP-FAL-008.\n",
+    "openspec/changes/fix-42-error-events/tasks.md": "- [x] Store\n- [ ] Show\n",
 }
 
 
@@ -160,17 +162,22 @@ def test_readings_and_what_changed_between_them(tmp_path: Path) -> None:
         seen = client.get(BASE + "documents").json()
         assert seen["scan"]["commit"] == C2 and seen["scan"]["previous"] == C1
         assert (seen["scan"]["added"], seen["scan"]["modified"], seen["scan"]["removed"]) == (
-            1,
+            3,
             1,
             1,
         )
-        assert seen["since"] == {"added": 1, "modified": 1, "removed": 1, "unread_by_discovery": 1}
+        assert seen["since"] == {"added": 3, "modified": 1, "removed": 1, "unread_by_discovery": 3}
         # Only what is new or changed is fetched.
-        assert sorted(github.fetched) == ["docs/guide.md", "openspec/changes/add-queue/proposal.md"]
+        assert sorted(github.fetched) == [
+            "docs/guide.md",
+            "openspec/changes/add-queue/proposal.md",
+            "openspec/changes/fix-42-error-events/proposal.md",
+            "openspec/changes/fix-42-error-events/tasks.md",
+        ]
         folders = {row["folder"]: (row["files"], row["changed"]) for row in seen["by_folder"]}
         assert folders == {
             "docs": (1, 2),
-            "openspec": (2, 1),
+            "openspec": (4, 3),
             "docs-site": (1, 0),
             "(root)": (1, 0),
         }
@@ -181,12 +188,32 @@ def test_readings_and_what_changed_between_them(tmp_path: Path) -> None:
             "docs/guide.md": "modified",
             "docs/old.md": "removed",
             "openspec/changes/add-queue/proposal.md": "added",
+            "openspec/changes/fix-42-error-events/proposal.md": "added",
+            "openspec/changes/fix-42-error-events/tasks.md": "added",
         }
         guide = next(row for row in changes["items"] if row["path"] == "docs/guide.md")
         assert (guide["added_lines"], guide["removed_lines"]) == (2, 1)
         assert guide["sections"] == [{"title": "Install", "added": 2, "removed": 1}]
         only = client.get(BASE + "documents/changes", params={"folder": "openspec"}).json()
-        assert [row["path"] for row in only["items"]] == ["openspec/changes/add-queue/proposal.md"]
+        assert only["total"] == 3
+
+        # A change is named after the issue it answers, and says how far its tasks are.
+        spec = client.get(BASE + "documents/openspec").json()
+        assert spec["counts"]["changes"] == 2 and spec["counts"]["without_issue"] == 1
+        fix = next(row for row in spec["items"] if row["change"] == "fix-42-error-events")
+        assert (fix["state"], fix["tasks_done"], fix["tasks"]) == ("open", 1, 2)
+        assert fix["title"] == "Record errors"
+        assert [(i["number"], i["state"]) for i in fix["issues"]] == [(42, "open")]
+        named = client.get(
+            BASE + "documents/file",
+            params={"path": "openspec/changes/fix-42-error-events/proposal.md"},
+        ).json()
+        assert named["facts"]["codes"] == ["GAP-FAL-008"] and named["facts"]["issues"] == [42]
+        assert named["facts"]["openspec"] == {
+            "change": "fix-42-error-events",
+            "archived": False,
+            "issue": 42,
+        }
 
         detail = client.get(BASE + "documents/file", params={"path": "docs/guide.md"}).json()
         assert "Run the Helm chart." in detail["text"]

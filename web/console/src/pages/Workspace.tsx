@@ -27,6 +27,7 @@ import { EvidencePanel } from './ReviewEvidence';
 import { PlanningHealth } from './PlanningHealth';
 import { OrphanWorklist } from './OrphanWorklist';
 import { PrimaryEpics } from './PrimaryEpics';
+import { Documents } from './Documents';
 import { FinishedStories } from './FinishedStories';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
@@ -192,6 +193,7 @@ export function ProjectWorkspace({
                 {view === 'planning' && <PrimaryEpics project={project.project} />}
                 {view === 'planning' && <FinishedStories project={project.project} />}
                 {view === 'planning' && <PlanningReviews project={project.project} />}
+                {view === 'discovery' && <Documents project={project.project} />}
                 {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
               </div>
             ) : <WorkspaceTabs key={project.project} project={project} />

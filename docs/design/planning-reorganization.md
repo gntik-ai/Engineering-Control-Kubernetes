@@ -56,7 +56,7 @@ The target is that at most one case in five goes beyond stage 3, and at most one
 
 Two options for stages 1 and 2:
 
-- **In the cluster, with open models** (recommended). A small service with an ONNX runtime on CPU and an open embedding model and reranker (candidates to benchmark in the first phase: `multilingual-e5-small` or `bge-small` for vectors, `bge-reranker-base` or a MiniLM cross-encoder for reranking). No price per call, no text leaves the cluster, and a fixed model gives the same score for the same input every time. Cost: one more workload of 1 to 2 GB of memory, and a reading of Falcone takes minutes instead of seconds.
+- **In the cluster, with open models** (chosen). A small service with an ONNX runtime on CPU and an open embedding model and reranker (candidates to benchmark in the first phase: `multilingual-e5-small` or `bge-small` for vectors, `bge-reranker-base` or a MiniLM cross-encoder for reranking). No price per call, no text leaves the cluster, and a fixed model gives the same score for the same input every time. Cost: one more workload of 1 to 2 GB of memory, and a reading of Falcone takes minutes instead of seconds.
 - **At a provider.** Embedding and rerank endpoints of an account the platform already has, where the provider offers them. Faster to build, costs cents per project, and the scores can change when the provider changes the model.
 
 The service is written so that either can be used, per project.
@@ -67,21 +67,24 @@ The service is written so that either can be used, per project.
 2. **Error rates chosen beforehand.** Per kind of change (see the table below), with thresholds derived from the held-out set.
 3. **Shadow mode first.** The cascade runs over the whole project and reports what it would do, with its measured precision, before it changes anything.
 4. **Every change explains itself.** A link made or kept by the cascade records the signals, the score and the two passages that match best. That is also how the 887 links without a reason get one.
-5. **Everything automatic can be undone.** Changes are applied in batches; a batch can be reverted for 30 days. Link history is already kept.
-6. **Audit by sample.** One automatic change in twenty is shown to you to confirm or reject. If the rejected share exceeds the chosen error rate, that kind of change stops being automatic until the scorer is recalibrated.
+5. **Everything approved in bulk can be undone.** Changes are applied in batches; a batch can be reverted for 30 days. Link history is already kept.
+6. **A sample before the batch.** A batch opens with a random sample of its lines to confirm or reject. If the rejected share exceeds the chosen error rate, the batch is withdrawn and the scorer recalibrated before it is offered again.
 7. **The few questions you get are the useful ones.** Cases are sent to a person in order of how many similar cases the answer settles, and each answer recalibrates the scorer.
 
-### What is automatic and what is not
+### Nothing is applied without approval
 
-This changes the rule agreed in R2, "approval always", for changes that add or correct. Removing an Epic, a User Story or an issue always needs your authorization, whatever the evidence. Proposed policy, settable per project:
+Decided on 23 November 2026: approval always. The cascade proposes and never applies. What it changes is how much there is to read, and in what order:
 
-| Change | Error rate allowed | Default |
-| --- | --- | --- |
-| Record the reason and passages of an existing link | — | Automatic |
-| Choose a Story's primary Epic; put an issue under a Story; mark an issue as a bug | 3 in 100 | Automatic above the threshold, with undo and audit |
-| Remove a link the evidence contradicts; close a Story whose work is done | 1 in 100, and two independent signals | Automatic above the threshold, with undo and audit |
-| Remove an Epic, a User Story or an issue that is no longer relevant; merge two Stories or two Epics | — | Never automatic. Proposed with its reasons, as a clean-up plan for you to authorize |
-| Create an Epic or a Story; split an Epic | — | One plan for you to approve, already worded |
+| What the scorer finds | How it reaches you |
+| --- | --- |
+| Changes that add or correct, above the measured threshold: a reason for an existing link, a primary Epic, an issue under a Story, a bug | One batch per kind, to approve with one word. The batch states its measured precision, and a sample of it is shown first. |
+| The same, where the scorer abstained and a decision model answered | A second batch, marked as decided by a model, with each answer's reason and passages. |
+| Where the models disagree or cannot tell | A short list, one decision each, in the order in which an answer settles the most similar cases. |
+| Removing a link the evidence contradicts; closing a Story whose work is done | Their own batch, with stricter thresholds and two independent signals for each line. |
+| Removing an Epic, a User Story or an issue; merging two Stories or two Epics | The clean-up plan, grouped by reason. |
+| Creating an Epic or a Story; splitting an Epic | The structure plan, already worded. |
+
+An approved batch can be undone as a whole for 30 days. A line you strike from a batch is a label for the scorer.
 
 ## What happens to each misalignment
 
@@ -105,7 +108,7 @@ This changes the rule agreed in R2, "approval always", for changes that add or c
 
 Planning health then follows "Stories that nothing supports" and "delivered Stories still open", which are numbers that should be zero.
 
-**Open Stories whose issues are all closed (89).** Closed automatically when a review found full coverage; otherwise checked by the decision model.
+**Open Stories whose issues are all closed (89).** Offered as a batch to close when a review found full coverage; otherwise checked by the decision model first.
 
 **Missing Stories and Epics.** Orphans that fit no Story are clustered; each cluster and each document section that no Story covers yields one proposed Story, worded by a language model and placed under an Epic by the same cascade. This is the earlier phase "Epics and Stories grounded in documents and issues".
 
@@ -168,15 +171,15 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived), extracts identifiers from documents, issues and Stories, and keeps which sections were deleted or rewritten, as evidence for removals. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
 | R5 | Signals. Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes; joined recall. The labelled set and the evaluation harness. | On held-out links, the true parent is among the top 20 candidates for at least 95% and is ranked first by the reranker for at least 85%. Measured against R2's word matching. |
 | R6 | Scorer in shadow mode. Calibrated classifier, abstention thresholds, escalation to the decision models. A report per project of every change it would make, with measured precision per kind of change, and a first count of the records it would propose for removal, by reason. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
-| R7 | Reorganize links. Applies the policy: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. Batches with undo, audit sample, automatic stop. Planning health redefined. | Falcone: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; audited precision within the allowed error rate. |
-| R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories closed. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
+| R7 | Reorganize links. Batches to approve: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. A sample before each batch, undo of a batch, Planning health redefined. | Falcone, once its batches are approved: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; the sampled precision within the allowed error rate. |
+| R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories offered as a batch to close. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
 | R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |
 | R10 | Reorganize structure. Epic cohesion; proposals to split a broad Epic; missing Stories from orphan clusters and from document sections; all as one plan to approve. Replaces the earlier R5. | The plan can be approved or edited as a whole; after it, no Epic is the primary Epic of more than 10% of Stories. |
 | R11 | Continuous and everywhere. A new issue or a changed document goes through the cascade when it arrives; a nightly check for drift, which also refreshes the clean-up plan as the repository changes; rollout to the other projects, including those never through Discovery. Replaces the earlier R7. | A new issue is placed, or queued with its shortlist, within minutes; each project has its own thresholds and its health follows the same numbers. |
 | R12 | Epic pages written by the platform from the organized plan. The earlier R6, now last because it reads better from a plan that is in order. | Each Epic has a page that cites its Stories, issues and documents. |
 
-## Decisions needed before R5
+## Decisions (23 November 2026)
 
-1. **Automation.** Whether changes that add or correct may be applied above the measured threshold without approval of each one, as in the policy table. Removals are never automatic.
-2. **Where the ranking models run.** In the cluster with open models, or at a provider.
-3. **The labelled set.** Whether you will judge about 150 pairs once. Without it the thresholds rest on stated links and on agreement between models, which is weaker.
+1. **Approval always.** Nothing is applied without the administrator's word; the cascade prepares batches and plans.
+2. **The ranking models run in the cluster, with open models.** The node has 32 GB of memory and a graphics card with 6 GB, which is enough for an embedding model and a reranker of the base size on the card, and for larger ones on the CPU.
+3. **A labelled set of about 150 pairs** will be judged once by the administrator.

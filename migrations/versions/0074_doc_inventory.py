@@ -71,6 +71,7 @@ def upgrade():
             sa.Column("title", sa.String(300)),
             sa.Column("sections", sa.JSON(), nullable=False),
             sa.Column("text", sa.Text()),
+            sa.Column("facts", sa.JSON(), nullable=False),
             _scan("first_scan_id"),
             _scan("changed_scan_id"),
             _scan("removed_scan_id"),
