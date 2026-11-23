@@ -1,6 +1,5 @@
 import {
   Alert,
-  Badge,
   Button,
   Card,
   CardBody,
@@ -11,12 +10,14 @@ import {
   Pagination,
   SimpleSelect,
   Skeleton,
+  Textarea,
 } from '@gntik-ai/ui';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
+import { isAsking, ReviewAnswer, RunPanel, some, whole, type Model, type Review, type Run } from './ChoiceRun';
 
 /** One open User Story an issue is shown with, and how alike the two are. */
 interface Candidate {
@@ -30,27 +31,6 @@ interface Candidate {
   /** The two share few words, or only words many Stories have. */
   weak: boolean;
 }
-interface Passage {
-  side: 'issue' | 'story';
-  text: string;
-  /** Whether the quoted words are in the text they are said to be from. */
-  found: boolean;
-}
-interface Review {
-  state: 'queued' | 'answered' | 'failed';
-  answer: 'story' | 'none' | 'bug' | 'unclear' | null;
-  story_id: string | null;
-  story: string | null;
-  confidence: 'high' | 'medium' | 'low' | null;
-  reason: string | null;
-  evidence: Passage[];
-  checked: boolean;
-  missing: { title: string; description: string } | null;
-  model: string | null;
-  detail: string;
-  decision: 'pending' | 'approved' | 'dismissed';
-  stale: boolean;
-}
 interface Orphan {
   id: string;
   number: number;
@@ -59,24 +39,8 @@ interface Orphan {
   shortlist: Candidate[];
   review: Review | null;
   approvable: boolean;
-}
-interface Run {
-  id: string;
-  state: 'queued' | 'running' | 'paused' | 'held' | 'complete' | 'cancelled' | 'failed';
-  model: string;
-  token_cap: number;
-  spent: number;
-  total: number;
-  done: number;
-  failed: number;
-  uncounted: number;
-  detail: string;
-  started_at: string;
-  ended_at: string | null;
-}
-interface Model {
-  provider: string;
-  model: string;
+  /** The Epics a User Story drafted from the answer may go under, the most alike first. */
+  epics: { id: string; title: string }[] | null;
 }
 interface Worklist {
   items: Orphan[];
@@ -95,7 +59,6 @@ interface Worklist {
     unclear: number;
   };
   stories: number;
-  estimate: number;
   /** What a run is likely to use: for the issues without an answer, and for all of them. */
   likely: number;
   likely_all: number;
@@ -105,81 +68,84 @@ interface Worklist {
   models: Model[];
 }
 
-const whole = (value: number) => value.toLocaleString('en');
-const some = (value: number, one: string, many: string) => `${whole(value)} ${value === 1 ? one : many}`;
-const keyOf = (model: Model) => JSON.stringify([model.provider, model.model]);
-const LIVE = ['queued', 'running', 'paused', 'held'];
-const ASKING = ['queued', 'running'];
-const RUN_STATE: Record<Run['state'], string> = {
-  queued: 'About to ask',
-  running: 'Asking',
-  paused: 'Stopped',
-  held: 'On hold',
-  complete: 'Finished',
-  cancelled: 'Ended by you',
-  failed: 'Failed',
+const SAID: Record<string, string> = {
+  bug: 'Is a bug: it may stand alone',
+  none: 'Is planned work that no listed User Story covers',
+  unclear: 'The texts do not say',
 };
 
-/** What the review answered about one issue, with its reason and the passages it quoted. */
-function Answer({ review }: { review: Review }) {
-  if (review.state === 'queued') return <p className="text-sm text-muted-foreground">Waiting to be asked about.</p>;
-  if (review.state === 'failed')
-    return (
-      <p className="text-sm text-muted-foreground">
-        The review gave no answer that can be used: {review.detail || 'no reason was given.'}
-      </p>
-    );
-  const said =
-    review.answer === 'story'
-      ? `Belongs under “${review.story ?? 'a User Story that is no longer listed'}”`
-      : review.answer === 'bug'
-        ? 'Is a bug: it may stand alone'
-        : review.answer === 'none'
-          ? 'Is planned work that no listed User Story covers'
-          : 'The texts do not say';
+/**
+ * The User Story a review said was missing, for the administrator to word, place under an
+ * Epic and make. The issue is put under it.
+ */
+function DraftStory({
+  issue,
+  path,
+  onDone,
+  onProblem,
+}: {
+  issue: Orphan;
+  path: string;
+  onDone: () => void;
+  onProblem: (problem: string | null) => void;
+}) {
+  const missing = issue.review?.missing;
+  const [title, setTitle] = useState(missing?.title ?? '');
+  const [description, setDescription] = useState(missing?.description ?? '');
+  const [epic, setEpic] = useState(issue.epics?.[0]?.id ?? '');
+  const [pending, setPending] = useState(false);
+  if (!missing || !issue.epics?.length) return null;
+  const make = () => {
+    setPending(true);
+    onProblem(null);
+    postJson(`${path}/${issue.id}/draft`, { title: title.trim(), description: description.trim(), epic_id: epic })
+      .then(onDone)
+      .catch((error: unknown) => onProblem(error instanceof Error ? error.message : 'The request failed.'))
+      .finally(() => setPending(false));
+  };
   return (
-    <div className="grid gap-1 rounded-md border border-border bg-muted/30 p-3 text-sm">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-foreground">The review’s answer: {said}</span>
-        {review.confidence ? (
-          <Badge tone={review.confidence === 'high' ? 'success' : 'neutral'} size="sm">
-            {review.confidence === 'high' ? 'Sure' : review.confidence === 'medium' ? 'Fairly sure' : 'Not sure'}
-          </Badge>
-        ) : null}
-        {review.decision === 'dismissed' ? (
-          <Badge tone="neutral" size="sm">
-            Set aside by you
-          </Badge>
-        ) : null}
-        {review.stale ? (
-          <Badge tone="warning" size="sm">
-            The issue or its shortlist changed since
-          </Badge>
-        ) : null}
+    <details className="rounded-md border border-border p-3 text-sm">
+      <summary className="cursor-pointer font-medium text-foreground">
+        The User Story it says is missing: {missing.title}
+      </summary>
+      <div className="mt-3 grid gap-3">
+        <p className="text-muted-foreground">
+          Word it as you want it, choose its Epic, and make it: the issue is put under the new User Story. The Epics are
+          listed with those most like it first.
+        </p>
+        <label className="grid gap-1">
+          Title
+          <Input
+            aria-label="Title of the new User Story"
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+          />
+        </label>
+        <label className="grid gap-1">
+          What its user gains
+          <Textarea
+            aria-label="Description of the new User Story"
+            rows={3}
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+          />
+        </label>
+        <label className="grid gap-1">
+          Epic
+          <SimpleSelect
+            aria-label="Epic of the new User Story"
+            value={epic}
+            items={issue.epics.map((entry) => ({ value: entry.id, label: entry.title }))}
+            onValueChange={(value) => setEpic(String(value))}
+          />
+        </label>
+        <div>
+          <Button size="sm" disabled={title.trim().length < 3 || !epic} loading={pending} onClick={make}>
+            Make this User Story and put the issue under it
+          </Button>
+        </div>
       </div>
-      {review.reason ? <p className="text-foreground">{review.reason}</p> : null}
-      {review.evidence.map((passage, index) => (
-        <p key={index} className="text-muted-foreground">
-          From the {passage.side === 'story' ? 'User Story' : 'issue'}:{' '}
-          <q className="text-foreground">{passage.text}</q>
-          {passage.found ? null : (
-            <span className="font-medium text-warning-foreground"> · These words are not in that text.</span>
-          )}
-        </p>
-      ))}
-      {!review.checked && (review.answer === 'story' || review.answer === 'bug') ? (
-        <p className="text-muted-foreground">
-          The answer is not backed by words found in the texts, so it is left out when answers are approved together.
-        </p>
-      ) : null}
-      {review.missing ? (
-        <p className="text-muted-foreground">
-          The User Story it says is missing: <span className="font-medium text-foreground">{review.missing.title}</span>
-          {review.missing.description ? ` — ${review.missing.description}` : ''}
-        </p>
-      ) : null}
-      {review.model ? <p className="text-xs text-muted-foreground">Answered by {review.model}.</p> : null}
-    </div>
+    </details>
   );
 }
 
@@ -195,40 +161,22 @@ export function OrphanWorklist({ project }: { project: string }) {
   const [fast, setFast] = useState(false);
   const list = useResource<Worklist>(apiUrl(path, { page, show }), fast ? 4000 : 30000, { keepPreviousData: true });
   const data = list.data;
-  const run = data?.run ?? null;
-  const live = run ? LIVE.includes(run.state) : false;
-  const asking = run ? ASKING.includes(run.state) : false;
+  const asking = isAsking(data?.run ?? null);
   useEffect(() => setFast(asking), [asking]);
 
-  const [chosen, setChosen] = useState('');
-  const [cap, setCap] = useState('');
-  const [again, setAgain] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [told, setTold] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState<'run' | 'approve' | null>(null);
-  const model = data?.models.find((entry) => keyOf(entry) === chosen) ?? data?.models[0];
-  // Half as much again as the run is likely to use, and room for the last question: a
-  // question holds its whole size until the provider says what it used.
-  const likely = data ? (again ? data.likely_all : data.likely) : 0;
-  const suggested = data ? Math.max(10_000, Math.ceil((likely * 1.5 + data.largest) / 10_000) * 10_000) : 0;
-  const limit = Number(cap || suggested);
-  const asked = data ? (again ? data.counts.total : data.counts.to_ask) : 0;
-
-  const change = (name: string, send: () => Promise<unknown>, done?: (result: unknown) => string | null) => {
+  const [confirming, setConfirming] = useState(false);
+  const change = (name: string, send: () => Promise<unknown>) => {
     setBusy(name);
     setProblem(null);
     setTold(null);
     send()
-      .then((result) => {
-        setTold(done ? done(result) : null);
-        list.reload();
-      })
+      .then(() => list.reload())
       .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The request failed.'))
       .finally(() => setBusy(null));
   };
-  const control = (action: 'stop' | 'resume' | 'end') =>
-    run && change(action, () => postJson(`${path}/runs/${run.id}/control`, { action }));
 
   return (
     <Card>
@@ -253,100 +201,26 @@ export function OrphanWorklist({ project }: { project: string }) {
               approve an answer, choose a User Story yourself, or say the issue is a bug.
             </p>
 
-            <section className="grid gap-3 rounded-lg border border-border p-4">
-              <h3 className="text-sm font-semibold text-foreground">Ask a model which User Story each belongs to</h3>
-              {run ? (
-                <div className="grid gap-1 text-sm">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge
-                      tone={asking ? 'info' : run.state === 'held' || run.state === 'paused' ? 'warning' : 'neutral'}
-                    >
-                      {RUN_STATE[run.state]}
-                    </Badge>
-                    <span className="text-foreground">
-                      {whole(run.done)} of {whole(run.total)} answered
-                      {run.failed ? `, ${whole(run.failed)} without a usable answer` : ''} · {whole(run.spent)} of{' '}
-                      {whole(run.token_cap)} tokens · {run.model}
-                    </span>
-                  </div>
-                  {run.detail ? <p className="text-muted-foreground">{run.detail}</p> : null}
-                  {run.uncounted ? (
-                    <p className="text-muted-foreground">
-                      {some(run.uncounted, 'call ended', 'calls ended')} without saying what was used: those tokens are
-                      not counted.
-                    </p>
-                  ) : null}
-                  {live ? (
-                    <div className="flex flex-wrap gap-2 pt-1">
-                      {asking ? (
-                        <Button size="sm" variant="secondary" loading={busy === 'stop'} onClick={() => control('stop')}>
-                          Stop
-                        </Button>
-                      ) : (
-                        <Button size="sm" loading={busy === 'resume'} onClick={() => control('resume')}>
-                          Resume
-                        </Button>
-                      )}
-                      <Button size="sm" variant="secondary" loading={busy === 'end'} onClick={() => control('end')}>
-                        End the run
-                      </Button>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-              {live ? null : data.models.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No API account can be asked. Add one under Global settings, Accounts.
-                </p>
-              ) : (
-                <div className="grid gap-3">
-                  <p className="text-sm text-muted-foreground">
-                    One question per issue: the issue, its shortlist, and four possible answers — this User Story, none
-                    fits, it is a bug, or the texts do not say. {some(data.counts.to_ask, 'issue has', 'issues have')}{' '}
-                    no answer yet; asking about {data.counts.to_ask === 1 ? 'it' : 'them'} is likely to use about{' '}
-                    {whole(data.likely)} tokens, counted against the project’s review tokens. While a question is asked
-                    it holds up to {whole(data.largest)} of them, and gives back what it did not use.
-                  </p>
-                  <div className="flex flex-wrap items-end gap-3">
-                    <label className="grid gap-1 text-sm">
-                      Model
-                      <SimpleSelect
-                        aria-label="Model that is asked"
-                        value={model ? keyOf(model) : ''}
-                        items={data.models.map((entry) => ({
-                          value: keyOf(entry),
-                          label: `${entry.model} · ${entry.provider}`,
-                        }))}
-                        onValueChange={(value) => setChosen(String(value))}
-                      />
-                    </label>
-                    <label className="grid gap-1 text-sm">
-                      Stop at this many tokens
-                      <Input
-                        aria-label="Token limit of the run"
-                        type="number"
-                        min="1000"
-                        max="5000000"
-                        step="1000"
-                        value={cap || String(suggested)}
-                        onChange={(event) => setCap(event.target.value)}
-                      />
-                    </label>
-                    <label className="flex items-center gap-2 pb-2 text-sm">
-                      <input type="checkbox" checked={again} onChange={(event) => setAgain(event.target.checked)} />
-                      Ask again about those that have an answer
-                    </label>
-                    <Button
-                      disabled={!model || asked === 0 || !(limit >= 1000)}
-                      loading={busy === 'run'}
-                      onClick={() => setConfirming('run')}
-                    >
-                      Ask about {some(asked, 'issue', 'issues')}
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </section>
+            <RunPanel
+              title="Ask a model which User Story each belongs to"
+              about={
+                <>
+                  One question per issue: the issue, its shortlist, and four possible answers — this User Story, none
+                  fits, it is a bug, or the texts do not say. {some(data.counts.to_ask, 'issue has', 'issues have')} no
+                  answer yet.
+                </>
+              }
+              path={path}
+              run={data.run}
+              models={data.models}
+              options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
+              asked={(chosen) => (chosen.again ? data.counts.total : data.counts.to_ask)}
+              likely={(chosen) => (chosen.again ? data.likely_all : data.likely)}
+              largest={data.largest}
+              noun={['issue', 'issues']}
+              onChanged={list.reload}
+              onProblem={setProblem}
+            />
 
             <section className="grid gap-3">
               <div className="flex flex-wrap items-center gap-3">
@@ -376,7 +250,7 @@ export function OrphanWorklist({ project }: { project: string }) {
                     }}
                   />
                   {data.counts.approvable ? (
-                    <Button size="sm" loading={busy === 'approve'} onClick={() => setConfirming('approve')}>
+                    <Button size="sm" onClick={() => setConfirming(true)}>
                       Approve {some(data.counts.approvable, 'checked answer', 'checked answers')}
                     </Button>
                   ) : null}
@@ -391,8 +265,9 @@ export function OrphanWorklist({ project }: { project: string }) {
                 </p>
               ) : null}
               {data.items.map((issue) => {
-                const answered = issue.review?.state === 'answered' && issue.review.decision === 'pending';
-                const proposed = issue.review?.answer === 'story' ? issue.review.story_id : null;
+                const review = issue.review;
+                const answered = review?.state === 'answered' && review.decision === 'pending';
+                const proposed = review?.answer === 'story' ? review.parent_id : null;
                 return (
                   <article key={issue.id} className="grid gap-3 rounded-lg border border-border p-4">
                     <div className="flex flex-wrap items-baseline gap-2">
@@ -403,7 +278,31 @@ export function OrphanWorklist({ project }: { project: string }) {
                         On GitHub
                       </Link>
                     </div>
-                    {issue.review ? <Answer review={issue.review} /> : null}
+                    {review ? (
+                      <ReviewAnswer
+                        review={review}
+                        said={
+                          review.answer === 'story'
+                            ? `Belongs under “${review.parent ?? 'a User Story that is no longer listed'}”`
+                            : (SAID[review.answer ?? 'unclear'] ?? 'The texts do not say')
+                        }
+                        sides={{ issue: 'issue', story: 'User Story' }}
+                        actionable={['story', 'bug']}
+                        changed="The issue or its shortlist changed since"
+                      />
+                    ) : null}
+                    {answered && review?.answer === 'none' ? (
+                      <DraftStory
+                        key={issue.id + (review.missing?.title ?? '')}
+                        issue={issue}
+                        path={path}
+                        onProblem={setProblem}
+                        onDone={() => {
+                          setTold(`The User Story was made and issue #${issue.number} put under it.`);
+                          list.reload();
+                        }}
+                      />
+                    ) : null}
                     <details open={!answered}>
                       <summary className="cursor-pointer text-sm text-muted-foreground">
                         {issue.shortlist.length
@@ -453,16 +352,16 @@ export function OrphanWorklist({ project }: { project: string }) {
                             )
                           }
                         >
-                          Approve: put it under “{issue.review?.story ?? 'that User Story'}”
+                          Approve: put it under “{review?.parent ?? 'that User Story'}”
                         </Button>
                       ) : null}
                       <Button
                         size="sm"
-                        variant={issue.review?.answer === 'bug' && answered ? 'primary' : 'secondary'}
+                        variant={review?.answer === 'bug' && answered ? 'primary' : 'secondary'}
                         loading={busy === issue.id + 'bug'}
                         onClick={() => change(issue.id + 'bug', () => postJson(`${path}/${issue.id}/bug`, {}))}
                       >
-                        {issue.review?.answer === 'bug' && answered ? 'Approve: it is a bug' : 'It is a bug'}
+                        {review?.answer === 'bug' && answered ? 'Approve: it is a bug' : 'It is a bug'}
                       </Button>
                       {answered ? (
                         <Button
@@ -485,27 +384,7 @@ export function OrphanWorklist({ project }: { project: string }) {
           </>
         )}
       </CardBody>
-      {confirming === 'run' && data && model ? (
-        <Confirm
-          title={`Ask about ${some(asked, 'issue', 'issues')}?`}
-          about={
-            <>
-              {model.model} is asked one question per issue. The run stops at {whole(limit)} tokens and counts against
-              the project’s review tokens. It links nothing: every answer waits for you.
-            </>
-          }
-          action="Start asking"
-          run={() =>
-            postJson(`${path}/runs`, { provider: model.provider, model: model.model, token_cap: limit, again })
-          }
-          onClose={() => setConfirming(null)}
-          onDone={() => {
-            setConfirming(null);
-            list.reload();
-          }}
-        />
-      ) : null}
-      {confirming === 'approve' && data ? (
+      {confirming && data ? (
         <Confirm
           title={`Approve ${some(data.counts.approvable, 'answer', 'answers')}?`}
           about={
@@ -518,10 +397,10 @@ export function OrphanWorklist({ project }: { project: string }) {
           }
           action="Approve them"
           run={() => postJson(`${path}/approve`, {})}
-          onClose={() => setConfirming(null)}
+          onClose={() => setConfirming(false)}
           onDone={(result) => {
             const done = result as { linked: number; bugs: number; skipped: number };
-            setConfirming(null);
+            setConfirming(false);
             setTold(
               `${some(done.linked, 'issue', 'issues')} linked, ${whole(done.bugs)} marked as bugs` +
                 (done.skipped ? `, ${whole(done.skipped)} left as they were.` : '.'),

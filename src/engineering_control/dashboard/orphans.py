@@ -14,24 +14,21 @@ A link made by approval is recorded with the review's reason and passages.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
 import math
-import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard import parent_choice, review_budget, review_flows
 from engineering_control.dashboard.connection_records import digest, finding_links
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.parent_choice import Unusable, passage, position
 from engineering_control.dashboard.planning import PlanningRecords, _visible_issues
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, _numbers
 from engineering_control.dashboard.project_records import (
@@ -41,24 +38,19 @@ from engineering_control.dashboard.project_records import (
     active_project,
 )
 from engineering_control.dashboard.review_graph import terms
-from engineering_control.dashboard.workspace_costs import add_project_usage
 from engineering_control.dashboard.workspace_issues import STORY_LINE, STORY_REF
 from engineering_control.db.models import (
     BacklogItem,
-    OrphanReview,
-    OrphanRun,
+    ChoiceRun,
     PlanningLink,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
-    ProjectReviewBudget,
     ProjectStoryEpic,
     ProjectUserStory,
     WorkspaceCandidate,
 )
-from engineering_control.models.service import ModelError, Models, Question, Reply
-
-log = logging.getLogger(__name__)
+from engineering_control.models.service import Question
 
 # How many User Stories an issue is shown with, and below which score a match is weak:
 # the two then share few words, or only words that many Stories have.
@@ -67,18 +59,6 @@ WEAK: Final = 2.0
 # How much of a Story's text the question carries.
 STORY_TEXT: Final = 1000
 ANSWERS: Final = ("story", "none", "bug", "unclear")
-LIVE: Final = ("queued", "running", "paused", "held")
-ASKING: Final = ("queued", "running")
-# After how long a call that never reported back is taken to be lost, how many calls in
-# a row may fail before the run waits for the administrator, and how long a run waits
-# when every provider was busy.
-LOST: Final = timedelta(minutes=8)
-TRIES: Final = 3
-BUSY_SECONDS: Final = 60.0
-# No inference ran, or the provider turned the question down before answering: nothing
-# was used. Any other failure leaves unknown what the call used.
-UNBILLED: Final = frozenset({"no_key", "no_account", "configuration", "refused", "invalid", "busy"})
-NO_ACCOUNT: Final = frozenset({"no_key", "no_account", "configuration"})
 SYSTEM: Final = (
     "You place one open technical issue of a software project under the User Story it helps "
     "to deliver. You are given the issue and a shortlist of the project's open User Stories, "
@@ -340,17 +320,17 @@ def orphans(db: Session, project: ProjectRecord) -> list[BacklogItem]:
 
 
 def question(
-    run: OrphanRun,
+    run: ChoiceRun,
     issue: BacklogItem,
     repository: str,
     listed: list[dict[str, Any]],
     stories: _Stories,
 ) -> Question:
     offered = []
-    for position, entry in enumerate(listed, start=1):
+    for place, entry in enumerate(listed, start=1):
         title, body = stories.rows[UUID(entry["id"])]
         offered.append(
-            {"id": f"S{position}", "title": title, "epic": entry["epic"], "text": body[:STORY_TEXT]}
+            {"id": f"S{place}", "title": title, "epic": entry["epic"], "text": body[:STORY_TEXT]}
         )
     asked = {
         "issue": {
@@ -374,20 +354,6 @@ def question(
     )
 
 
-def _plain(text: str) -> str:
-    return " ".join(text.split()).casefold()
-
-
-def _within(quote: str, text: str) -> bool:
-    """Whether the quoted words are in the text, as written but for case and spacing."""
-    said = _plain(quote).strip("\"'“”‘’ ")
-    return len(said) >= 12 and said in _plain(text)
-
-
-class Unusable(ValueError):
-    """The model answered, but not with something that can be shown as an answer."""
-
-
 def read_answer(
     data: dict[str, Any], issue: BacklogItem, listed: list[dict[str, Any]], stories: _Stories
 ) -> dict[str, Any]:
@@ -398,32 +364,25 @@ def read_answer(
         raise Unusable("The answer was none of story, none, bug or unclear.")
     story: UUID | None = None
     if answer == "story":
-        named = str(data.get("story") or "").strip().upper()
-        position = int(named[1:]) if named[:1] == "S" and named[1:].isdigit() else 0
-        if not 1 <= position <= len(listed):
+        story = position(data.get("story"), "S", listed)
+        if story is None or story not in stories.rows:
             raise Unusable("The answer named a User Story that was not on the shortlist.")
-        story = UUID(listed[position - 1]["id"])
-    passages = []
-    said = " ".join(str(data.get("issue_quote") or "").split())[:600]
-    if said:
-        found = _within(said, issue.title + "\n" + (issue.description or ""))
-        passages.append({"side": "issue", "text": said, "found": found})
-    said = " ".join(str(data.get("story_quote") or "").split())[:600]
-    if story is not None and said:
-        title, body = stories.rows[story]
-        passages.append(
-            {"side": "story", "text": said, "found": _within(said, title + "\n" + body)}
-        )
+    passages = [
+        passage("issue", data.get("issue_quote"), issue.title + "\n" + (issue.description or ""))
+    ]
+    if story is not None:
+        passages.append(passage("story", data.get("story_quote"), "\n".join(stories.rows[story])))
+    quoted = [entry for entry in passages if entry is not None]
     wanted = {"issue", "story"} if story is not None else {"issue"}
     confidence = str(data.get("confidence") or "")
     title = " ".join(str(data.get("missing_title") or "").split())[:300]
     return {
         "answer": answer,
-        "story_id": story,
+        "parent_id": story,
         "confidence": confidence if confidence in ("high", "medium", "low") else "low",
         "reason": " ".join(str(data.get("reason") or "").split())[:1000] or None,
-        "evidence": passages,
-        "checked": wanted == {p["side"] for p in passages if p["found"]},
+        "evidence": quoted,
+        "checked": wanted == {entry["side"] for entry in quoted if entry["found"]},
         "missing": (
             {
                 "title": title,
@@ -435,330 +394,84 @@ def read_answer(
     }
 
 
-# ---------------------------------------------------------------------------------- run
-
-
-def _tokens(reply: Reply) -> int | None:
-    tokens = reply.usage.get("tokens")
-    if tokens is None and all(
-        type(reply.usage.get(k)) is int and reply.usage[k] >= 0 for k in ("input", "output")
-    ):
-        tokens = reply.usage["input"] + reply.usage["output"]
-    return tokens if type(tokens) is int and tokens >= 0 else None
-
-
-def _give_back(db: Session, project: UUID, held: int) -> None:
-    if held:
-        db.execute(
-            update(ProjectReviewBudget)
-            .where(ProjectReviewBudget.project_id == project)
-            .values(reserved=ProjectReviewBudget.reserved - held)
-        )
-
-
-def _finish(db: Session, run: OrphanRun, state: str, detail: str = "") -> None:
-    """End the run. What it had not asked yet is no longer waiting to be asked."""
-    run.state, run.detail, run.ended_at = state, detail, datetime.now(UTC)
-    db.execute(
-        delete(OrphanReview).where(OrphanReview.run_id == run.id, OrphanReview.state == "queued")
-    )
-
-
-def _locked(db: Session, run_id: UUID) -> OrphanRun | None:
-    # SQLite ignores SELECT FOR UPDATE. Acquire the same write lock on both databases.
-    return db.scalar(
-        update(OrphanRun)
-        .where(OrphanRun.id == run_id)
-        .values(updated_at=OrphanRun.updated_at)
-        .returning(OrphanRun)
-    )
-
-
-def _shown(run: OrphanRun) -> dict[str, Any]:
-    return {
-        "id": str(run.id),
-        "state": run.state,
-        "provider": run.provider,
-        "model": run.model,
-        "token_cap": run.token_cap,
-        "spent": run.spent,
-        "total": run.total,
-        "done": run.done,
-        "failed": run.failed,
-        "uncounted": run.uncounted,
-        "detail": run.detail,
-        "asking": run.claimed_at is not None,
-        "started_at": run.created_at.isoformat(),
-        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
-    }
-
-
-@dataclass
-class _Call:
-    run: UUID
-    review: UUID
-    project: UUID
-    asked: Question
-    needed: int
-
-
-# What a tick did when it asked nothing: there was nothing to do, or it moved a run on.
-_IDLE: Final = "idle"
-_MOVED: Final = "moved"
-# Kept in memory, so a restart starts again: how many calls of a run failed in a row,
-# and until when a run waits because every provider was busy.
-_TROUBLE: dict[UUID, int] = {}
-_WAIT: dict[UUID, float] = {}
-
-
-def _lost(db: Session, run: OrphanRun) -> None:
-    """A call that never reported back: what it held is given back, and the issue it
-    asked about is marked. What the call used is unknown and is not counted."""
-    _give_back(db, run.project_id, run.reserved)
-    review = db.scalar(
-        select(OrphanReview).where(
-            OrphanReview.run_id == run.id,
-            OrphanReview.item_id == run.current_item,
-            OrphanReview.state == "queued",
-        )
-    )
-    if review is not None:
-        review.state = "failed"
-        review.detail = "The call was interrupted before it answered. Run again to ask."
-        run.failed += 1
-    run.uncounted += 1
-    run.claimed_at, run.current_item, run.reserved = None, None, 0
-
-
-def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
-    """The next question of the oldest run that is asking, or what was done instead."""
-    with sessions.begin() as db:
-        now = datetime.now(UTC)
-        for stale in db.scalars(
-            select(OrphanRun.id).where(
-                OrphanRun.claimed_at.is_not(None), OrphanRun.claimed_at < now - LOST
-            )
-        ).all():
-            run = _locked(db, stale)
-            if (
-                run is not None
-                and run.claimed_at
-                and run.claimed_at.replace(tzinfo=UTC) < now - LOST
-            ):
-                _lost(db, run)
-        waiting = [key for key, until in _WAIT.items() if until > time.monotonic()]
-        found = db.scalar(
-            select(OrphanRun.id)
-            .where(
-                OrphanRun.state.in_(ASKING),
-                OrphanRun.claimed_at.is_(None),
-                OrphanRun.id.not_in(waiting),
-            )
-            .order_by(OrphanRun.created_at, OrphanRun.id)
-            .limit(1)
-        )
-        run = _locked(db, found) if found else None
-        if run is None or run.state not in ASKING or run.claimed_at is not None:
-            return _IDLE
-        project = db.get(ProjectRecord, run.project_id)
-        if project is None or project.archived_at is not None:
-            _finish(db, run, "cancelled", "The project was archived.")
-            return _MOVED
-        review = db.scalar(
-            select(OrphanReview)
-            .where(OrphanReview.run_id == run.id, OrphanReview.state == "queued")
-            .order_by(OrphanReview.created_at, OrphanReview.id)
-            .limit(1)
-        )
-        if review is None:
-            _finish(db, run, "complete")
-            return _MOVED
-        issue = next((row for row in orphans(db, project) if row.id == review.item_id), None)
-        if issue is None:
-            # Linked, closed or marked a bug since the run began: nothing is left to ask.
-            db.delete(review)
-            run.total = max(run.done + run.failed, run.total - 1)
-            return _MOVED
-        stories = _stories(db, project.id)
-        listed = shortlist(issue, project.source_repository, stories)
-        review.shortlist, review.revision = listed, revision(issue, listed)
-        asked = question(run, issue, project.source_repository, listed, stories)
-        needed = review_budget.reservation_size(asked)
-        if run.spent + needed > run.token_cap:
-            left = run.total - run.done - run.failed
-            _finish(
-                db,
-                run,
-                "complete",
-                f"Stopped at its limit of {run.token_cap:,} tokens with {left:,} "
-                f"{'issue' if left == 1 else 'issues'} not asked. Run again to ask the rest.",
-            )
-            return _MOVED
-        return _Call(run.id, review.id, project.id, asked, needed)
-
-
-def _admit(sessions: sessionmaker[Session], call: _Call) -> bool:
-    """Hold the project's review tokens for the call and mark the run as asking."""
-    try:
-        held = review_budget.reserve(sessions, call.project, call.needed)
-    except review_budget.ReviewBudgetHeld as held_back:
-        with sessions.begin() as db:
-            run = _locked(db, call.run)
-            if run is not None and run.state in ASKING:
-                run.state, run.detail = "held", str(held_back)
-        return False
-    with sessions.begin() as db:
-        run = _locked(db, call.run)
-        if run is None or run.state not in ASKING or run.claimed_at is not None:
-            _give_back(db, call.project, held)
-            return False
-        review = db.get(OrphanReview, call.review)
-        if review is None or review.state != "queued":
-            _give_back(db, call.project, held)
-            return False
-        run.state, run.detail = "running", ""
-        run.claimed_at, run.current_item, run.reserved = datetime.now(UTC), review.item_id, held
-        return True
-
-
-def _settle(
-    sessions: sessionmaker[Session], call: _Call, reply: Reply | None, label: str, detail: str
-) -> None:
-    """Record what the call used and answered, and decide whether the run goes on."""
-    with sessions.begin() as db:
-        run = _locked(db, call.run)
-        if run is None:
-            return
-        held = run.reserved
-        run.claimed_at, run.current_item, run.reserved = None, None, 0
-        review = db.get(OrphanReview, call.review)
-        tokens = _tokens(reply) if reply is not None else None
-        if reply is not None:
-            add_project_usage(
-                db, run.project_id, run.model, reply, "orphan_parent", held if tokens else 0, None
-            )
-        if tokens:
-            run.spent += tokens
-        else:
-            _give_back(db, run.project_id, held)
-            if label not in UNBILLED:
-                run.uncounted += 1
-        problem = detail
-        if reply is not None and not label and review is not None:
-            project = db.get_one(ProjectRecord, run.project_id)
-            issue = db.get(BacklogItem, review.item_id)
-            try:
-                if issue is None:
-                    raise Unusable("The issue is gone.")
-                read = read_answer(reply.data, issue, review.shortlist, _stories(db, project.id))
-            except (Unusable, KeyError, ValueError) as unusable:
-                problem = str(unusable) or "The answer could not be read."
-            else:
-                review.state, review.detail = "answered", ""
-                review.answer, review.story_id = read["answer"], read["story_id"]
-                review.confidence, review.reason = read["confidence"], read["reason"]
-                review.evidence, review.checked = read["evidence"], read["checked"]
-                review.missing = read["missing"]
-                review.provider, review.model, review.tokens = reply.provider, reply.model, tokens
-                review.decision, review.decided_at = "pending", None
-                run.done += 1
-                _TROUBLE.pop(run.id, None)
-                return
-        if label in NO_ACCOUNT:
-            if run.state in ASKING:
-                run.state = "paused"
-                run.detail = f"{detail} Resume when the account can be asked."
-            return
-        if label == "busy":
-            _WAIT[run.id] = time.monotonic() + BUSY_SECONDS
-        elif review is not None and review.state == "queued":
-            review.state, review.detail = "failed", problem or "The model gave no answer."
-            run.failed += 1
-        _TROUBLE[run.id] = _TROUBLE.get(run.id, 0) + 1
-        if _TROUBLE[run.id] >= TRIES and run.state in ASKING:
-            _TROUBLE.pop(run.id, None)
-            run.state = "paused"
-            run.detail = (
-                f"{TRIES} calls in a row failed, the last with: "
-                f"{problem or 'no answer'} Resume to ask the rest."
-            )
-
-
-async def tick(sessions: sessionmaker[Session], models: Models) -> bool:
-    """Ask one question of one run. Whether something was done."""
-    call = await asyncio.to_thread(_prepare, sessions)
-    if isinstance(call, str):
-        return call == _MOVED
-    if not await asyncio.to_thread(_admit, sessions, call):
-        return True
-    try:
-        reply = await models.ask(call.asked, retry=False)
-    except ModelError as error:
-        await asyncio.to_thread(_settle, sessions, call, error.metered, error.label, error.detail)
-    except Exception:
-        await asyncio.to_thread(
-            _settle, sessions, call, None, "transport", "The call could not be made."
-        )
-        raise
-    else:
-        await asyncio.to_thread(_settle, sessions, call, reply, "", "")
-    return True
-
-
-async def worker(sessions: sessionmaker[Session], models: Models) -> None:
-    while True:
-        try:
-            if await tick(sessions, models):
-                continue
-        except Exception:
-            log.exception("The run over issues without a User Story failed")
-        await asyncio.sleep(3)
-
-
 # ------------------------------------------------------------------------- the worklist
 
 
-def _answer(review: OrphanReview, current: str, titles: dict[str, str]) -> dict[str, Any]:
-    story = str(review.story_id) if review.story_id else None
-    return {
-        "state": review.state,
-        "answer": review.answer,
-        "story_id": story,
-        "story": titles.get(story) if story else None,
-        "confidence": review.confidence,
-        "reason": review.reason,
-        "evidence": review.evidence or [],
-        "checked": review.checked,
-        "missing": review.missing,
-        "provider": review.provider,
-        "model": review.model,
-        "tokens": review.tokens,
-        "detail": review.detail,
-        "decision": review.decision,
-        # The issue or its shortlist changed since it was asked about.
-        "stale": review.state == "answered" and review.revision != current,
-        "answered_at": review.updated_at.isoformat(),
-    }
+class _Scope:
+    """The open issues of one project that have no User Story, as one transaction sees them."""
+
+    def __init__(self, db: Session, project: ProjectRecord) -> None:
+        self.db, self.project = db, project
+        self.stories = _stories(db, project.id)
+        self._waiting: list[BacklogItem] | None = None
+
+    def children(self) -> list[BacklogItem]:
+        if self._waiting is None:
+            self._waiting = orphans(self.db, self.project)
+        return self._waiting
+
+    def record(self, key: UUID) -> BacklogItem | None:
+        return next((row for row in self.children() if row.id == key), None)
+
+    def refusal(self) -> str | None:
+        return None if self.stories.rows else "The project has no open User Story to choose from."
+
+    def shortlist(self, child: BacklogItem) -> list[dict[str, Any]]:
+        return shortlist(child, self.project.source_repository, self.stories)
+
+    def revision(self, child: BacklogItem, listed: list[dict[str, Any]]) -> str:
+        return revision(child, listed)
+
+    def question(
+        self, run: ChoiceRun, child: BacklogItem, listed: list[dict[str, Any]]
+    ) -> Question:
+        return question(run, child, self.project.source_repository, listed, self.stories)
+
+    def read(
+        self, data: dict[str, Any], child: BacklogItem, listed: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return read_answer(data, child, listed, self.stories)
 
 
-def _approvable(shown: dict[str, Any] | None) -> bool:
-    """An answer the administrator can approve with others: it says what to do, its
-    passages are in the texts, and the texts are still the ones it was asked about."""
-    return bool(
-        shown
-        and shown["state"] == "answered"
-        and shown["decision"] == "pending"
-        and shown["answer"] in ("story", "bug")
-        and shown["checked"]
-        and not shown["stale"]
+class _Kind:
+    name = "issue_story"
+    workflow = "orphan_parent"
+    actionable: tuple[str, ...] = ("story", "bug")
+    nothing_to_ask = (
+        "Every open issue without a User Story already has an answer. "
+        "Approve or dismiss them, or ask again about all."
     )
+    nothing_waits = "Every open issue that is no bug has a User Story."
+
+    def scope(self, db: Session, project: ProjectRecord) -> _Scope:
+        return _Scope(db, project)
 
 
-def _to_ask(review: OrphanReview | None, current: str, again: bool) -> bool:
-    """Whether a run asks about the issue: it has no answer to this question yet."""
-    if again or review is None or review.state != "answered":
-        return True
-    return review.revision != current
+KIND: Final = _Kind()
+parent_choice.register(KIND)
+
+
+def _epics_for(db: Session, project: UUID, text: str) -> list[dict[str, str]]:
+    """The project's open Epics, those most like the text first: for a User Story that is
+    drafted from an answer, the Epics it may go under."""
+    rows = db.execute(
+        select(ProjectEpic.id, ProjectEpic.title, ProjectEpic.description)
+        .where(
+            ProjectEpic.project_id == project,
+            ProjectEpic.archived_at.is_(None),
+            ProjectEpic.closed_at.is_(None),
+        )
+        .order_by(ProjectEpic.title, ProjectEpic.id)
+    ).all()
+    wanted = terms({"title": text, "body": ""})
+    have = {key: terms({"title": title, "body": body or ""}) for key, title, body in rows}
+    spread = Counter(word for words in have.values() for word in words)
+    score = {
+        key: sum(math.log1p(len(rows) / spread[word]) for word in wanted if word in words)
+        for key, words in have.items()
+    }
+    ordered = sorted(rows, key=lambda row: (-score[row[0]], row[1], str(row[0])))
+    return [{"id": str(key), "title": title} for key, title, _body in ordered]
 
 
 class Orphans:
@@ -774,43 +487,36 @@ class Orphans:
         answered; what a run would ask and cost; and the last run."""
         with self.sessions() as db:
             project = active_project(db, name)
-            issues = orphans(db, project)
-            stories = _stories(db, project.id)
-            reviews = {
-                review.item_id: review
-                for review in db.scalars(
-                    select(OrphanReview).where(OrphanReview.project_id == project.id)
-                )
-            }
+            scope = _Scope(db, project)
+            known = parent_choice.reviews(db, project.id, KIND.name)
             rows = []
             counts: Counter[str] = Counter()
             # What a run holds while it asks, counted by the size of the texts; what it
-            # is likely to use, at four characters a token and a short answer; and the
-            # most one question holds.
+            # is likely to use; and the most one question holds.
             estimate = likely = likely_all = largest = 0
-            placeholder = OrphanRun(provider="", model="")
-            for issue in issues:
-                listed = shortlist(issue, project.source_repository, stories)
-                current = revision(issue, listed)
-                review = reviews.get(issue.id)
+            placeholder = ChoiceRun(provider="", model="")
+            for issue in scope.children():
+                listed = scope.shortlist(issue)
+                current = scope.revision(issue, listed)
+                review = known.get(issue.id)
                 titles = {entry["id"]: entry["title"] for entry in listed}
                 if review is not None:
                     titles.update({entry["id"]: entry["title"] for entry in review.shortlist or []})
-                shown = _answer(review, current, titles) if review is not None else None
-                waiting = bool(
-                    shown and shown["state"] == "answered" and shown["decision"] == "pending"
+                shown = (
+                    parent_choice.shown_answer(review, current, titles)
+                    if review is not None
+                    else None
                 )
+                waiting = parent_choice.waiting(shown)
                 counts["total"] += 1
                 counts["waiting" if waiting else "unanswered"] += 1
                 if waiting and shown:
                     counts[shown["answer"]] += 1
-                if _approvable(shown):
+                if parent_choice.approvable(shown, KIND.actionable):
                     counts["approvable"] += 1
-                asked = question(placeholder, issue, project.source_repository, listed, stories)
-                held = review_budget.reservation_size(asked)
-                use = (len(asked.system) + len(asked.prompt)) // 4 + 350
+                held, use = parent_choice.sizes(scope.question(placeholder, issue, listed))
                 largest, likely_all = max(largest, held), likely_all + use
-                if _to_ask(review, current, False):
+                if parent_choice.to_ask(review, current, False):
                     counts["to_ask"] += 1
                     estimate, likely = estimate + held, likely + use
                 if show == "waiting" and not waiting:
@@ -821,14 +527,10 @@ class Orphans:
             rows.sort(key=lambda row: (row[0], row[1].issue_number or 0))
             pages = max(1, (len(rows) + page_size - 1) // page_size)
             page = min(max(1, page), pages)
-            run = db.scalar(
-                select(OrphanRun)
-                .where(OrphanRun.project_id == project.id)
-                .order_by(OrphanRun.created_at.desc(), OrphanRun.id)
-                .limit(1)
-            )
-            return {
-                "items": [
+            items = []
+            for _order, issue, listed, shown in rows[(page - 1) * page_size : page * page_size]:
+                missing = shown.get("missing") if shown and shown["answer"] == "none" else None
+                items.append(
                     {
                         "id": str(issue.id),
                         "number": issue.issue_number,
@@ -839,12 +541,22 @@ class Orphans:
                         ),
                         "shortlist": listed,
                         "review": shown,
-                        "approvable": _approvable(shown),
+                        "approvable": parent_choice.approvable(shown, KIND.actionable),
+                        # The Epics a User Story drafted from the answer may go under.
+                        "epics": (
+                            _epics_for(
+                                db,
+                                project.id,
+                                f"{missing['title']} {missing.get('description') or ''} "
+                                f"{issue.title}",
+                            )
+                            if missing
+                            else None
+                        ),
                     }
-                    for _order, issue, listed, shown in rows[
-                        (page - 1) * page_size : page * page_size
-                    ]
-                ],
+                )
+            return {
+                "items": items,
                 "page": page,
                 "pages": pages,
                 "page_size": page_size,
@@ -854,12 +566,12 @@ class Orphans:
                     key: counts[key]
                     for key in ("total", "waiting", "unanswered", "approvable", "to_ask", *ANSWERS)
                 },
-                "stories": len(stories.rows),
+                "stories": len(scope.stories.rows),
                 "estimate": estimate,
                 "likely": likely,
                 "likely_all": likely_all,
                 "largest": largest,
-                "run": _shown(run) if run is not None else None,
+                "run": parent_choice.latest_run(db, project.id, KIND.name),
                 "models": review_flows.model_choices(db),
                 "budget": review_budget.status(db, project.id),
             }
@@ -869,97 +581,46 @@ class Orphans:
     ) -> dict[str, Any]:
         """Begin a run over the open issues without a User Story that have no answer yet,
         or over all of them when asked to ask ``again``."""
-        with self.sessions.begin() as db:
-            project = active_project(db, name, lock=True)
-            if {"provider": provider, "model": model} not in review_flows.model_choices(db):
-                raise ProjectInvalid("Choose a model of an account that can be asked.")
-            if db.scalar(
-                select(OrphanRun.id).where(
-                    OrphanRun.project_id == project.id, OrphanRun.state.in_(LIVE)
-                )
-            ):
-                raise ProjectConflict("A run is under way for this project. End it first.")
-            review_budget.require_available(db, project.id)
-            stories = _stories(db, project.id)
-            if not stories.rows:
-                raise ProjectInvalid("The project has no open User Story to choose from.")
-            run = OrphanRun(
-                project_id=project.id,
-                state="queued",
-                provider=provider,
-                model=model,
-                token_cap=token_cap,
-            )
-            db.add(run)
-            db.flush()
-            reviews = {
-                review.item_id: review
-                for review in db.scalars(
-                    select(OrphanReview).where(OrphanReview.project_id == project.id)
-                )
-            }
-            for issue in orphans(db, project):
-                listed = shortlist(issue, project.source_repository, stories)
-                current = revision(issue, listed)
-                review = reviews.get(issue.id)
-                if not _to_ask(review, current, again):
-                    continue
-                if review is None:
-                    review = OrphanReview(project_id=project.id, item_id=issue.id)
-                    db.add(review)
-                review.run_id, review.state = run.id, "queued"
-                review.revision, review.shortlist = current, listed
-                review.answer = review.story_id = review.confidence = review.reason = None
-                review.evidence = review.missing = review.tokens = None
-                review.provider = review.model = None
-                review.checked, review.detail = False, ""
-                review.decision, review.decided_at = "pending", None
-                run.total += 1
-            if not run.total:
-                raise ProjectInvalid(
-                    "Every open issue without a User Story already has an answer. "
-                    "Approve or dismiss them, or ask again about all."
-                )
-            db.flush()
-            return _shown(run)
+        return parent_choice.start(
+            self.sessions, name, KIND.name, provider, model, token_cap, again
+        )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:
-        with self.sessions.begin() as db:
-            project = active_project(db, name, lock=True)
-            run = _locked(db, run_id)
-            if run is None or run.project_id != project.id:
-                raise ProjectNotFound(str(run_id))
-            if run.state not in LIVE:
-                raise ProjectConflict("The run is over.")
-            if action == "stop":
-                if run.state not in ASKING:
-                    raise ProjectConflict("The run is not asking.")
-                run.state, run.detail = "paused", "You stopped it. Resume to ask the rest."
-            elif action == "resume":
-                if run.state in ASKING:
-                    raise ProjectConflict("The run is asking already.")
-                review_budget.require_available(db, project.id)
-                run.state, run.detail = "queued", ""
-                _TROUBLE.pop(run.id, None)
-                _WAIT.pop(run.id, None)
-            else:
-                # A call under way still reports what it used when it comes back.
-                _finish(db, run, "cancelled", "You ended it.")
-            db.flush()
-            return _shown(run)
-
-    def _review(self, db: Session, project: UUID, item: UUID) -> OrphanReview | None:
-        return db.scalar(
-            select(OrphanReview).where(
-                OrphanReview.project_id == project, OrphanReview.item_id == item
-            )
-        )
+        return parent_choice.control(self.sessions, name, KIND.name, run_id, action)
 
     def _orphan(self, db: Session, project: ProjectRecord, item: UUID) -> BacklogItem:
         issue = next((row for row in orphans(db, project) if row.id == item), None)
         if issue is None:
             raise ProjectConflict("The issue is no longer an open issue without a User Story.")
         return issue
+
+    def _put_under(self, name: str, item: UUID, story: UUID, proposed: bool) -> Note:
+        """Link the issue to the Story and record who chose it: the review, approved by
+        the administrator, when it is the Story the review answered with or the one it
+        said was missing (``proposed``); otherwise the administrator alone."""
+        self.links.before_change(name, "issues", item)
+        self.planning.link_stories(name, item, [story])
+        note = Note("administrator", confirmed=True)
+        with self.sessions.begin() as db:
+            project = active_project(db, name)
+            review = parent_choice.review_of(db, project.id, KIND.name, item)
+            if review is not None and review.state == "answered":
+                agreed = proposed or (review.answer == "story" and review.parent_id == story)
+                if agreed:
+                    note = Note(
+                        "model",
+                        confirmed=True,
+                        reason=review.reason,
+                        evidence=[
+                            {"side": quoted["side"], "text": quoted["text"]}
+                            for quoted in review.evidence or []
+                            if quoted.get("found")
+                        ]
+                        or None,
+                    )
+                parent_choice.decide(review, agreed)
+        self.links.noted(name, "issues", item, story, note)
+        return note
 
     def link(self, name: str, item: UUID, story: UUID) -> dict[str, Any]:
         """Put the issue under that User Story, at the administrator's word. When it is
@@ -976,29 +637,29 @@ class Orphans:
                 )
             ):
                 raise ProjectInvalid("Choose a User Story of this project.")
-        self.links.before_change(name, "issues", item)
-        self.planning.link_stories(name, item, [story])
-        note = Note("administrator", confirmed=True)
-        with self.sessions.begin() as db:
+        note = self._put_under(name, item, story, False)
+        return {"id": str(item), "story_id": str(story), "origin": note.origin}
+
+    def draft(
+        self, name: str, item: UUID, title: str, description: str | None, epic: UUID
+    ) -> dict[str, Any]:
+        """Make the User Story a review said was missing, under the Epic the administrator
+        chose, and put the issue under it. The Story is the administrator's: they saw its
+        words and may have changed them."""
+        with self.sessions() as db:
             project = active_project(db, name)
-            review = self._review(db, project.id, item)
-            if review is not None and review.state == "answered":
-                agreed = review.answer == "story" and review.story_id == story
-                if agreed:
-                    note = Note(
-                        "model",
-                        confirmed=True,
-                        reason=review.reason,
-                        evidence=[
-                            {"side": passage["side"], "text": passage["text"]}
-                            for passage in review.evidence or []
-                            if passage.get("found")
-                        ]
-                        or None,
-                    )
-                review.decision = "approved" if agreed else "dismissed"
-                review.decided_at = datetime.now(UTC)
-        self.links.noted(name, "issues", item, story, note)
+            self._orphan(db, project, item)
+            review = parent_choice.review_of(db, project.id, KIND.name, item)
+            proposed = bool(
+                review is not None
+                and review.state == "answered"
+                and review.answer == "none"
+                and review.missing
+            )
+        made = self.planning.save(name, "stories", title, description, [epic])
+        story = UUID(made["id"])
+        self.links.after_change(name, "stories", story)
+        note = self._put_under(name, item, story, proposed)
         return {"id": str(item), "story_id": str(story), "origin": note.origin}
 
     def bug(self, name: str, item: UUID) -> dict[str, Any]:
@@ -1010,21 +671,13 @@ class Orphans:
         self.links.after_change(name, "issues", item)
         with self.sessions.begin() as db:
             project = active_project(db, name)
-            review = self._review(db, project.id, item)
-            if review is not None and review.state == "answered":
-                review.decision = "approved" if review.answer == "bug" else "dismissed"
-                review.decided_at = datetime.now(UTC)
+            review = parent_choice.review_of(db, project.id, KIND.name, item)
+            parent_choice.decide(review, bool(review and review.answer == "bug"))
         return {"id": str(item), "bug": True}
 
     def dismiss(self, name: str, item: UUID) -> dict[str, Any]:
         """Set the review's answer aside. The issue stays without a User Story."""
-        with self.sessions.begin() as db:
-            project = active_project(db, name, lock=True)
-            review = self._review(db, project.id, item)
-            if review is None or review.state != "answered" or review.decision != "pending":
-                raise ProjectConflict("There is no answer waiting for this issue.")
-            review.decision, review.decided_at = "dismissed", datetime.now(UTC)
-        return {"id": str(item), "dismissed": True}
+        return parent_choice.dismiss(self.sessions, name, KIND.name, item)
 
     def approve(self, name: str, items: list[UUID] | None = None) -> dict[str, int]:
         """Approve many answers at once: those given, or every one that can be approved
@@ -1032,27 +685,25 @@ class Orphans:
         since, is left for the administrator to look at."""
         with self.sessions() as db:
             project = active_project(db, name)
-            stories = _stories(db, project.id)
-            reviews = {
-                review.item_id: review
-                for review in db.scalars(
-                    select(OrphanReview).where(OrphanReview.project_id == project.id)
-                )
-            }
+            scope = _Scope(db, project)
+            known = parent_choice.reviews(db, project.id, KIND.name)
             wanted = set(items) if items is not None else None
             chosen: list[tuple[UUID, str, UUID | None]] = []
-            skipped = 0
-            for issue in orphans(db, project):
+            for issue in scope.children():
                 if wanted is not None and issue.id not in wanted:
                     continue
-                review = reviews.get(issue.id)
-                listed = shortlist(issue, project.source_repository, stories)
-                shown = _answer(review, revision(issue, listed), {}) if review is not None else None
-                if review is not None and _approvable(shown) and review.answer:
-                    chosen.append((issue.id, review.answer, review.story_id))
-            if wanted is not None:
-                skipped = len(wanted) - len(chosen)
-        done = {"linked": 0, "bugs": 0, "skipped": skipped}
+                review = known.get(issue.id)
+                if review is None:
+                    continue
+                current = scope.revision(issue, scope.shortlist(issue))
+                shown = parent_choice.shown_answer(review, current, {})
+                if parent_choice.approvable(shown, KIND.actionable) and review.answer:
+                    chosen.append((issue.id, review.answer, review.parent_id))
+        done = {
+            "linked": 0,
+            "bugs": 0,
+            "skipped": len(wanted) - len(chosen) if wanted is not None else 0,
+        }
         for item, answer, story in chosen:
             try:
                 if answer == "story" and story is not None:

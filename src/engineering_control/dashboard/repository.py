@@ -22,6 +22,7 @@ from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_analysis import PlanningAnalysis
 from engineering_control.dashboard.planning_health import PlanningHealthRecords
 from engineering_control.dashboard.planning_links import PlanningLinks
+from engineering_control.dashboard.primary_epics import PrimaryEpics
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.schemas import ActivityEventInput
@@ -118,6 +119,7 @@ class DashboardRepository:
         self.planning_health = PlanningHealthRecords(self.sessions)
         self.planning_links = PlanningLinks(self.sessions)
         self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
+        self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

@@ -9,11 +9,11 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
-from engineering_control.dashboard import orphans
+from engineering_control.dashboard import parent_choice
 from engineering_control.db.models import (
     BacklogItem,
-    OrphanReview,
-    OrphanRun,
+    ChoiceReview,
+    ChoiceRun,
     PlanningLink,
     ProjectIssueStory,
     ProjectReviewBudget,
@@ -86,7 +86,7 @@ def by_number(listed: dict[str, Any]) -> dict[int, dict[str, Any]]:
 
 def run(repo: Any, model: Any) -> None:
     for _ in range(25):
-        if not asyncio.run(orphans.tick(repo.sessions, model)):
+        if not asyncio.run(parent_choice.tick(repo.sessions, model)):
             return
     raise AssertionError("The run did not finish")
 
@@ -149,7 +149,7 @@ def test_worklist_run_and_approval(tmp_path: Path) -> None:
         assert (listed["counts"]["story"], listed["counts"]["none"]) == (1, 1)
         assert listed["counts"]["approvable"] == 1
         review = rows[42]["review"]
-        assert review["answer"] == "story" and review["story"] == "Respond to failures"
+        assert review["answer"] == "story" and review["parent"] == "Respond to failures"
         assert review["checked"] and rows[42]["approvable"]
         assert [p["found"] for p in review["evidence"]] == [True, True]
         assert rows[45]["review"]["missing"]["title"] == "Keep dependencies current"
@@ -272,8 +272,8 @@ def test_run_limits_and_failures(tmp_path: Path) -> None:
         ended = post(client, f"orphans/runs/{current['id']}/control", action="end")
         assert ended.json()["state"] == "cancelled"
         with repo.sessions() as db:
-            assert not db.scalars(select(OrphanReview).where(OrphanReview.state == "queued")).all()
+            assert not db.scalars(select(ChoiceReview).where(ChoiceReview.state == "queued")).all()
             assert db.get_one(ProjectReviewBudget, pid).reserved == 0
-            assert len(db.scalars(select(OrphanRun)).all()) == 3
+            assert len(db.scalars(select(ChoiceRun)).all()) == 3
     finally:
         client.close()

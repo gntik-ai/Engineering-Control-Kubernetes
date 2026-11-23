@@ -241,7 +241,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R0 | Unblock stuck review runs and measure planning health. | A run that was cut off can be released, a refused call holds nothing, and each project has a dated baseline of its numbers. |
 | R1 | Links as records with reasons, and the primary parent. | Every link shows who made it and why. Each Story has one primary Epic and each issue at most one primary Story. |
 | R2 | Orphan worklist and bulk choice of the parent. Bug label and filter. | The open orphans of a project get an answer in one run within a stated budget, and are linked on approval. |
-| R3 | Consolidate the existing plan. | Proposals to assign primary Epics, merge overlapping Stories, split a catch-all Epic and review Stories without issues, approved in bulk. |
+| R3 | Consolidate the existing plan. | A primary Epic for each User Story under several, chosen by approval in bulk; Epics counted by their primary Stories; a missing Story drafted from an answer; finished Stories listed. Merging Stories and splitting an Epic were measured and found unnecessary. |
 | R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
 | R5 | Epics and Stories grounded in documents and issues. | A changed document yields proposals to add, update or remove, each traced to its lines. |
 | R6 | Epic wiki pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
@@ -297,7 +297,7 @@ A run asks a model one question per issue: the issue, its shortlist, and four po
 | --- | --- | --- |
 | This User Story | Delivering the issue is part of delivering one Story of the shortlist. | Puts the issue under that Story. The link is recorded as proposed by a review and approved by you, with the review's reason and passages. |
 | It is a bug | The issue reports that existing behaviour is wrong. | Confirms the issue as a bug, as the Issues table does: it may stand alone, and the bug label is applied on GitHub. |
-| None fits | It is planned work that no listed Story covers. The answer names the Story that is missing. | Nothing yet: drafting the missing Story is part of consolidating the plan. |
+| None fits | It is planned work that no listed Story covers. The answer names the Story that is missing. | Nothing by itself. The answer opens a form with the missing Story's title and description, to word as wanted, and the project's Epics with those most like it first. **Make this User Story** creates it under the chosen Epic and puts the issue under it (`POST …/orphans/{issue}/draft`). |
 | The texts do not say | No decision is possible from the two texts. | Nothing. |
 
 The answer quotes one passage of the issue and one of the chosen Story. The platform checks that the quoted words are in those texts; an answer that fails the check is shown with a note and is left out when answers are approved together. An answer about a text that changed since, or a shortlist that changed since, is marked and left out as well.
@@ -310,9 +310,33 @@ A run is started by the administrator with a model and a token limit, and shows 
 - A call that ended without saying what it used gives its tokens back as well, and is counted on the run as a call whose use is unknown. A run is never left waiting for a call that will not report.
 - When no account can be asked the run stops and waits to be resumed. After three failures in a row it stops as well.
 
-`GET /api/dashboard/projects/{name}/orphans` returns the list, the counts, what a run would hold and the last run. `POST …/orphans/runs` starts a run, `…/orphans/runs/{id}/control` stops, resumes or ends it, `…/orphans/{issue}/link`, `…/bug` and `…/dismiss` record the administrator's decision on one issue, and `…/orphans/approve` approves many answers at once. The runs and answers are kept in `orphan_runs` and `orphan_reviews` (migration 0072).
+`GET /api/dashboard/projects/{name}/orphans` returns the list, the counts, what a run would hold and the last run. `POST …/orphans/runs` starts a run, `…/orphans/runs/{id}/control` stops, resumes or ends it, `…/orphans/{issue}/link`, `…/bug` and `…/dismiss` record the administrator's decision on one issue, and `…/orphans/approve` approves many answers at once. The runs and answers are kept in `choice_runs` and `choice_reviews` (migration 0073), which also hold the runs that choose primary Epics.
 
 The Issues table marks every bug with a **Bug** badge beside its title and can list bugs only, or everything but bugs (`bugs=only` or `bugs=without` on the planning listing).
+
+### Consolidating the plan: one primary Epic for each User Story
+
+Measured on Falcone before anything was built: 704 of 737 User Stories are under several Epics, 3.6 on average, because Stories were generated with the instruction to link each to all relevant Epics. The Epic that looked like a catch-all, with 273 Stories linked to it, is the primary Epic of 53. Counting each Story once, under its primary Epic, the largest Epic holds 57 Stories and the median Epic 9. Almost no two Stories say the same thing: one pair of 737 has texts more alike than 0.7, on a scale where 1 is identical. So nothing is merged and no Epic is split; what the plan lacks is a primary Epic for each Story that somebody chose, and counts that use it.
+
+**Reviews → Planning** lists the User Stories under several Epics whose primary Epic nobody chose. Each is shown with its own Epics, the one the texts suggest first, with a likeness score and the words only that Epic shares with the Story. Where the best Epic scores at least one and a half times the next, the texts are said to point to one Epic; otherwise they leave it open. The suggestion is not accepted in bulk: the texts are compared by their words, and a Story about installing the Helm chart is not matched to an Epic about installation.
+
+A run asks a model one question per Story: the Story, the Epics it is linked to, and three answers.
+
+| Answer | Meaning | What approval does |
+| --- | --- | --- |
+| This Epic | The Epic whose goal the Story delivers most directly. An Epic about the capability the Story adds is preferred over one about a quality many Stories share. | Makes it the Story's primary Epic, as the administrator's choice, and keeps the review's reason and passages on the link. |
+| None of them | The Story belongs under none of its Epics. | Nothing. |
+| The texts do not say | No decision is possible from the texts. | Nothing. |
+
+The answer quotes the Story and the chosen Epic, and the quotes are checked as for issues. The page says for each answer whether it names the Epic the texts suggest, and can list only those that differ. A run can be limited to the Stories whose texts leave it open. The administrator approves an answer alone or with every other checked answer, or makes any of the Story's Epics the primary one. No link is added or removed: the other Epics stay linked as related.
+
+The Epics table shows under each Epic's count of linked Stories how many it is the primary Epic of. Planning health follows the largest Epic counted that way, and how many primary parents were chosen.
+
+**Reviews → Planning** also lists the open User Stories every issue of which is closed, with those issues and whether a review found one that covers the whole Story. Such a Story is delivered, or what is left of it has no issue yet. Closing it is done in the User Stories table, where its effect is shown first.
+
+`GET /api/dashboard/projects/{name}/primary-epics` returns the list, the counts, what a run would use and the last run. `POST …/primary-epics/runs` starts a run (`unclear_only` limits it), `…/primary-epics/runs/{id}/control` stops, resumes or ends it, `…/primary-epics/{story}/choose` with `epic_id` and `…/dismiss` record a decision on one Story, and `…/primary-epics/approve` approves many answers at once. `GET …/finished-stories` lists the Stories whose issues are all closed.
+
+Both kinds of run, for issues and for Stories, are one mechanism (`parent_choice`): a kind says which records wait, what each is shown with and what is asked; the run, the token accounting, the checks of an answer and the controls are shared.
 
 ### A review run that was cut off
 

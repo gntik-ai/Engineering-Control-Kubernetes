@@ -60,6 +60,7 @@ export interface PlanRow {
   /** Of each parent: who linked it and why, and whether it is the primary one. */
   parent_links?: ParentLink[];
   story_count?: number;
+  primary_story_count?: number;
   issue_count?: number;
   review?: string | null;
   proposal?: boolean;
@@ -511,7 +512,8 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   }
   if (kind === 'epics') {
     columns.push({ id: 'story_count', header: 'User Stories', sortable: true,
-      className: 'align-top tabular-nums', accessor: row => row.story_count });
+      className: 'align-top tabular-nums', accessor: row => row.story_count,
+      cell: row => <>{row.story_count}{row.primary_story_count != null && !row.proposal && <div className="text-xs font-normal text-muted-foreground">{row.primary_story_count} as primary Epic</div>}</> });
   }
   if (kind !== 'issues') {
     columns.push({ id: 'issue_count', header: 'Issues', sortable: true,

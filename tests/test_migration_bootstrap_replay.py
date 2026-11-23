@@ -51,7 +51,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0070 keeps a daily measurement of how each project's planning hangs together.
     # 0071 records who made each planning link and why, and the primary parent.
     # 0072 keeps the runs that ask about issues without a User Story, and the answers.
-    assert (head, parent) == ("0072", "0071")
+    # 0073 keeps one kind of run and answer for every choice of a parent.
+    assert (head, parent) == ("0073", "0072")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -152,8 +153,12 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     }
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
-    assert {"orphan_runs", "orphan_reviews"} <= set(inspect(engine).get_table_names())
+    assert {"choice_runs", "choice_reviews"} <= set(inspect(engine).get_table_names())
+    assert not {"orphan_runs", "orphan_reviews"} & set(inspect(engine).get_table_names())
     command.downgrade(config, parent)
+    assert {"orphan_runs", "orphan_reviews"} <= set(inspect(engine).get_table_names())
+    assert not {"choice_runs", "choice_reviews"} & set(inspect(engine).get_table_names())
+    command.downgrade(config, "0071")
     assert not {"orphan_runs", "orphan_reviews"} & set(inspect(engine).get_table_names())
     assert "planning_links" in inspect(engine).get_table_names()
     command.downgrade(config, "0070")

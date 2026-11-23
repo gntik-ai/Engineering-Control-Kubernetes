@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final
+from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -22,10 +23,13 @@ from engineering_control.dashboard import planning_links
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
 from engineering_control.db.models import (
+    BacklogItem,
     PlanningHealth,
+    PlanningLink,
     ProjectIssueStory,
     ProjectRecord,
     ProjectStoryEpic,
+    ProjectUserStory,
     ReviewEvidenceJob,
 )
 
@@ -47,6 +51,8 @@ FOLLOWED: Final = (
     "stories_without_issue",
     "stories_under_several_epics",
     "largest_epic_stories",
+    "largest_epic_primary_stories",
+    "stories_with_closed_issues_only",
     "links_without_reason",
     "primaries_suggested",
     "reviews_waiting",
@@ -110,6 +116,18 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
             )
         )
         said = planning_links.numbers(db, project.id)
+        as_primary = planning_links.primary_stories(db, project.id)
+    # Each Story counted once, under its primary Epic.
+    titles = {str(row["id"]): str(row["title"]) for row in epics}
+    primary_largest = max(
+        (key for key in as_primary if str(key) in titles),
+        key=lambda key: (as_primary[key], str(key)),
+        default=None,
+    )
+    primary_count = as_primary[primary_largest] if primary_largest else 0
+    # Open Stories every issue of which is closed: the work under them is done.
+    open_issues = {story for row in issues["open"] for story in row.get("story_ids") or []}
+    closed_issues = {story for row in issues["closed"] for story in row.get("story_ids") or []}
     links = int(issue_links or 0) + int(story_links or 0)
     return {
         "epics": len(epics),
@@ -138,6 +156,18 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         "largest_epic_stories": largest_count,
         "largest_epic_title": str(largest["title"])[:200] if largest and largest_count else None,
         "largest_epic_share": round(share, 3),
+        "largest_epic_primary_stories": primary_count,
+        "largest_epic_primary_title": (
+            titles[str(primary_largest)][:200] if primary_largest and primary_count else None
+        ),
+        "largest_epic_primary_share": round(primary_count / len(stories), 3) if stories else 0.0,
+        "stories_with_closed_issues_only": sum(
+            1
+            for row in stories
+            if row.get("local_state") == "open"
+            and str(row["id"]) in closed_issues
+            and str(row["id"]) not in open_issues
+        ),
         "catch_all_epics": sum(
             1
             for row in epics
@@ -156,11 +186,92 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         "links_unknown": said["links_unknown"],
         # Children of several parents whose primary one nobody chose: it is suggested.
         "primaries_suggested": said["primaries_suggested"],
+        "primaries_chosen": said["primaries_chosen"],
         "reviews_queued": waiting.get("queued", 0),
         "reviews_needing_input": waiting.get("needs_input", 0),
         "reviews_failed": waiting.get("failed", 0),
         "runs_cut_off": int(cut_off or 0),
         "reviews_waiting": sum(waiting.values()) + int(cut_off or 0),
+    }
+
+
+def finished_stories(
+    sessions: sessionmaker[Session], name: str, page: int, page_size: int
+) -> dict[str, Any]:
+    """The open User Stories every issue of which is closed, with those issues and
+    whether a review found that one of them covers the whole Story. Closing a Story is
+    the administrator's, in the User Stories table: this only says which may be done."""
+    with sessions() as db:
+        project = active_project(db, name)
+        strengths = {
+            (child, parent): strength
+            for child, parent, strength in db.execute(
+                select(PlanningLink.child_id, PlanningLink.parent_id, PlanningLink.strength).where(
+                    PlanningLink.project_id == project.id,
+                    PlanningLink.kind == "issue_story",
+                    PlanningLink.removed_at.is_(None),
+                )
+            )
+        }
+        under: dict[UUID, list[dict[str, Any]]] = {}
+        unfinished: set[UUID] = set()
+        for story, item, number, title, state in db.execute(
+            select(
+                ProjectIssueStory.story_id,
+                BacklogItem.id,
+                BacklogItem.issue_number,
+                BacklogItem.title,
+                BacklogItem.issue_state,
+            )
+            .join(BacklogItem, BacklogItem.id == ProjectIssueStory.item_id)
+            .where(ProjectIssueStory.project_id == project.id)
+            .order_by(BacklogItem.issue_number, BacklogItem.id)
+        ):
+            if number is None or state != "closed":
+                unfinished.add(story)
+            under.setdefault(story, []).append(
+                {
+                    "id": str(item),
+                    "number": number,
+                    "title": title,
+                    "strength": strengths.get((item, story)),
+                }
+            )
+        found = [
+            {
+                "id": str(key),
+                "title": title,
+                "issues": under[key],
+                # Whether a review found an issue that covers the whole Story.
+                "covered": (
+                    "full"
+                    if any(issue["strength"] == "full" for issue in under[key])
+                    else "partial"
+                    if any(issue["strength"] == "partial" for issue in under[key])
+                    else None
+                ),
+            }
+            for key, title in db.execute(
+                select(ProjectUserStory.id, ProjectUserStory.title)
+                .where(
+                    ProjectUserStory.project_id == project.id,
+                    ProjectUserStory.archived_at.is_(None),
+                    ProjectUserStory.closed_at.is_(None),
+                )
+                .order_by(ProjectUserStory.title, ProjectUserStory.id)
+            )
+            if key in under and key not in unfinished
+        ]
+    order = {"full": 0, "partial": 1, None: 2}
+    found.sort(key=lambda row: (order[row["covered"]], row["title"]))
+    pages = max(1, (len(found) + page_size - 1) // page_size)
+    page = min(max(1, page), pages)
+    return {
+        "items": found[(page - 1) * page_size : page * page_size],
+        "total": len(found),
+        "covered": sum(1 for row in found if row["covered"] == "full"),
+        "page": page,
+        "pages": pages,
     }
 
 

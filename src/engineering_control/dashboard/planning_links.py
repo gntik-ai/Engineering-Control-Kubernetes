@@ -35,7 +35,7 @@ from functools import partial
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -255,6 +255,23 @@ def _texts(db: Session, project: UUID, model: Any, ids: set[UUID]) -> dict[UUID,
     return found
 
 
+def likeness(title: str, body: str, parents: dict[UUID, str]) -> dict[UUID, float]:
+    """How alike a record's text is to the text of each of its parents. A word of its
+    title counts three times a word of its body, and a word every parent has tells them
+    apart less than one that a single parent has."""
+    in_title, in_body = _words(title), _words(body)
+    words = {parent: _words(text) for parent, text in parents.items()}
+    shared: dict[str, int] = defaultdict(int)
+    for found in words.values():
+        for word in found:
+            shared[word] += 1
+    return {
+        parent: sum(3.0 / shared[word] for word in in_title & found)
+        + sum(1.0 / shared[word] for word in (in_body - in_title) & found)
+        for parent, found in words.items()
+    }
+
+
 def _order(link: PlanningLink, *, scores: dict[UUID, float]) -> tuple[int, int, float, str]:
     """Which of a child's links comes first as its primary parent."""
     return (
@@ -278,22 +295,11 @@ def _suggest(
     )
     for child, links in groups.items():
         title, body = of_children.get(child, ("", ""))
-        in_title, in_body = _words(title), _words(body)
-        words = {
-            link.parent_id: _words(" ".join(of_parents.get(link.parent_id, ("", ""))))
-            for link in links
-        }
-        # A word every parent has tells them apart less than one that a single parent has.
-        shared: dict[str, int] = defaultdict(int)
-        for found in words.values():
-            for word in found:
-                shared[word] += 1
-
-        scores = {
-            parent: sum(3.0 / shared[word] for word in in_title & found)
-            + sum(1.0 / shared[word] for word in (in_body - in_title) & found)
-            for parent, found in words.items()
-        }
+        scores = likeness(
+            title,
+            body,
+            {link.parent_id: " ".join(of_parents.get(link.parent_id, ("", ""))) for link in links},
+        )
         best = min(links, key=partial(_order, scores=scores))
         best.is_primary, best.primary_by = True, "suggested"
 
@@ -457,6 +463,29 @@ def numbers(db: Session, project: UUID) -> dict[str, int]:
         "primaries_suggested": sum(
             1 for _o, _r, primary, by, _c in rows if primary and by == "suggested"
         ),
+        "primaries_chosen": sum(
+            1 for _o, _r, primary, by, _c in rows if primary and by == "administrator"
+        ),
+    }
+
+
+def primary_stories(db: Session, project: UUID) -> dict[UUID, int]:
+    """How many User Stories each Epic is the primary Epic of. A Story is counted once,
+    under its primary Epic, however many Epics it is linked to."""
+    return {
+        epic: count
+        for epic, count in db.execute(
+            select(PlanningLink.parent_id, func.count())
+            .join(ProjectUserStory, ProjectUserStory.id == PlanningLink.child_id)
+            .where(
+                PlanningLink.project_id == project,
+                PlanningLink.kind == "story_epic",
+                PlanningLink.removed_at.is_(None),
+                PlanningLink.is_primary,
+                ProjectUserStory.archived_at.is_(None),
+            )
+            .group_by(PlanningLink.parent_id)
+        )
     }
 
 
@@ -516,7 +545,16 @@ class PlanningLinks:
 
     def annotate(self, name: str, kind: str, items: list[dict[str, Any]]) -> None:
         """Say of each listed record's parents who linked them and why, and which is the
-        primary one. A proposal is no record yet and has none."""
+        primary one. A proposal is no record yet and has none. Of each listed Epic, say
+        how many User Stories it is the primary Epic of."""
+        if kind == "epics":
+            self._in_step(name, "stories", None)
+            with self.sessions() as db:
+                counts = primary_stories(db, active_project(db, name).id)
+            for item in items:
+                if not item.get("proposal"):
+                    item["primary_story_count"] = counts.get(UUID(str(item["id"])), 0)
+            return
         if kind not in _SPECS:
             return
         spec = _SPECS[kind]
@@ -576,8 +614,12 @@ class PlanningLinks:
             }
             return {"items": [{**_shown(row), "title": titles.get(row.parent_id)} for row in rows]}
 
-    def set_primary(self, name: str, kind: str, child: UUID, parent: UUID) -> dict[str, Any]:
-        """The administrator's choice of the record's primary parent, among its parents."""
+    def set_primary(
+        self, name: str, kind: str, child: UUID, parent: UUID, why: Note | None = None
+    ) -> dict[str, Any]:
+        """The administrator's choice of the record's primary parent, among its parents.
+        ``why`` is what a review said for it, when the choice approves a review's answer:
+        its reason and passages are kept on the link."""
         if kind not in _SPECS:
             raise ProjectInvalid("An Epic has no parent")
         spec = _SPECS[kind]
@@ -603,6 +645,8 @@ class PlanningLinks:
                     "administrator" if row is chosen else None,
                 )
             chosen.confirmed = True
+            if why is not None and (why.reason or why.evidence):
+                chosen.reason, chosen.evidence = why.reason, why.evidence
             db.flush()
             return {
                 "id": str(child),

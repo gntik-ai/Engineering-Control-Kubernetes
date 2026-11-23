@@ -34,6 +34,11 @@ interface Numbers {
   links_by_model?: number;
   links_unknown?: number;
   primaries_suggested?: number;
+  primaries_chosen?: number;
+  largest_epic_primary_stories?: number;
+  largest_epic_primary_title?: string | null;
+  largest_epic_primary_share?: number;
+  stories_with_closed_issues_only?: number;
   reviews_queued: number;
   reviews_needing_input: number;
   reviews_failed: number;
@@ -210,13 +215,34 @@ export function PlanningHealth({ project }: { project: string }) {
               />
               <Tile
                 value={now.largest_epic_stories}
-                label="User Stories in the largest Epic"
-                of={`${Math.round(now.largest_epic_share * 100)}% of all User Stories`}
+                label="User Stories linked to the largest Epic"
+                of={`${Math.round(now.largest_epic_share * 100)}% of all User Stories, counting every link`}
                 note={now.largest_epic_title ?? undefined}
                 was={was?.largest_epic_stories}
                 since={since}
                 href={`${home}?tab=epics`}
               />
+              {now.largest_epic_primary_stories === undefined ? null : (
+                <Tile
+                  value={now.largest_epic_primary_stories}
+                  label="User Stories in the largest Epic, each counted once"
+                  of={`${Math.round((now.largest_epic_primary_share ?? 0) * 100)}% of all User Stories, under their primary Epic`}
+                  note={now.largest_epic_primary_title ?? undefined}
+                  was={was?.largest_epic_primary_stories}
+                  since={since}
+                  href={`${home}?tab=epics`}
+                />
+              )}
+              {now.stories_with_closed_issues_only === undefined ? null : (
+                <Tile
+                  value={now.stories_with_closed_issues_only}
+                  label="Open User Stories whose issues are all closed"
+                  of="Delivered, or waiting for an issue nobody wrote"
+                  was={was?.stories_with_closed_issues_only}
+                  since={since}
+                  href={reviewUrl(project, 'planning')}
+                />
+              )}
               <Tile
                 value={now.epics_without_story}
                 label="Epics with no User Story"
@@ -246,6 +272,8 @@ export function PlanningHealth({ project }: { project: string }) {
                   value={now.primaries_suggested}
                   label="Primary parents nobody chose"
                   of="Records under several parents whose primary one is only suggested"
+                  note={now.primaries_chosen === undefined ? undefined : `${whole(now.primaries_chosen)} chosen by you`}
+                  href={reviewUrl(project, 'planning')}
                   was={was?.primaries_suggested}
                   since={since}
                 />

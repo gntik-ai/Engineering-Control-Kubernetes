@@ -522,6 +522,27 @@ class OrphanRunInput(PlainChangeInput):
     again: bool = False
 
 
+class PrimaryEpicRunInput(OrphanRunInput):
+    """A run that asks which Epic is the primary one of each User Story under several."""
+
+    # Ask only about the Stories whose texts do not point to one Epic.
+    unclear_only: bool = False
+
+
+class PrimaryEpicInput(PlainChangeInput):
+    """The Epic the administrator makes the User Story's primary one."""
+
+    epic_id: UUID
+
+
+class OrphanDraftInput(PlainChangeInput):
+    """The User Story a review said was missing, as the administrator wants it made."""
+
+    title: str = Field(min_length=3, max_length=300)
+    description: str | None = Field(default=None, max_length=20_000)
+    epic_id: UUID
+
+
 class OrphanRunControlInput(PlainChangeInput):
     action: Literal["stop", "resume", "end"]
 

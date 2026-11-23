@@ -33,7 +33,7 @@ from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard import (
     evidence_verdicts,
-    orphans,
+    parent_choice,
     review_budget,
     review_evidence,
     review_flows,
@@ -51,6 +51,7 @@ from engineering_control.dashboard.bring_over import SCRIPT as EXPORT_SCRIPT
 from engineering_control.dashboard.bring_over import export_script
 from engineering_control.dashboard.dependencies import AuthenticatedSession
 from engineering_control.dashboard.planning import IssueView, Kind, PlanningState
+from engineering_control.dashboard.planning_health import finished_stories
 from engineering_control.dashboard.project_records import (
     NAME as PROJECT_NAME,
 )
@@ -101,12 +102,15 @@ from engineering_control.dashboard.schemas import (
     ManagedCoverageInput,
     NewEpicInput,
     OrphanApproveInput,
+    OrphanDraftInput,
     OrphanLinkInput,
     OrphanRunControlInput,
     OrphanRunInput,
     PlainChangeInput,
     PlanningConfirmation,
     PlanningStateInput,
+    PrimaryEpicInput,
+    PrimaryEpicRunInput,
     PrimaryParentInput,
     ProjectApplicationInput,
     ProjectArchiveInput,
@@ -514,7 +518,9 @@ def create_app(
                 )
             )
             keepers.append(
-                asyncio.create_task(orphans.worker(resolved_repository.sessions, app.state.models))
+                asyncio.create_task(
+                    parent_choice.worker(resolved_repository.sessions, app.state.models)
+                )
             )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
@@ -1650,6 +1656,25 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/orphans/{key}/draft")
+    async def orphans_draft_api(name: str, key: UUID, request: Request) -> Response:
+        """Make the User Story a review said was missing and put the issue under it."""
+        return await project_change(
+            request,
+            OrphanDraftInput,
+            lambda body: asyncio.to_thread(
+                repo(request).orphans.draft,
+                name,
+                key,
+                body.title,
+                body.description,
+                body.epic_id,
+            ),
+            event="workspace.orphan_story_drafted",
+            subject=name,
+            max_bytes=64_000,
+        )
+
     @app.post("/api/dashboard/projects/{name}/orphans/{key}/bug")
     async def orphans_bug_api(name: str, key: UUID, request: Request) -> Response:
         return await project_change(
@@ -1667,6 +1692,113 @@ def create_app(
             PlainChangeInput,
             lambda _body: asyncio.to_thread(repo(request).orphans.dismiss, name, key),
             event="workspace.orphan_answer_dismissed",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/finished-stories")
+    async def finished_stories_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """The open User Stories every issue of which is closed."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    finished_stories, repo(request).sessions, name, page, page_size
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/primary-epics")
+    async def primary_epics_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+        show: Literal["", "waiting", "unanswered", "differs", "unclear"] = "",
+    ) -> Response:
+        """The User Stories under several Epics whose primary Epic nobody chose: each
+        with its Epics and what a review answered, and the run that asks."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).primary_epics.listing, name, page, page_size, show
+                )
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/primary-epics/runs")
+    async def primary_epics_run_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PrimaryEpicRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).primary_epics.start,
+                name,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.again,
+                body.unclear_only,
+            ),
+            event="workspace.primary_epic_run_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/primary-epics/runs/{run_id}/control")
+    async def primary_epics_run_control_api(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).primary_epics.control, name, run_id, body.action
+            ),
+            event="workspace.primary_epic_run_controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/primary-epics/approve")
+    async def primary_epics_approve_api(name: str, request: Request) -> Response:
+        """Approve many answers at once: each makes its Epic the Story's primary one."""
+        return await project_change(
+            request,
+            OrphanApproveInput,
+            lambda body: asyncio.to_thread(
+                repo(request).primary_epics.approve, name, body.item_ids
+            ),
+            event="workspace.primary_epics_approved",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/primary-epics/{key}/choose")
+    async def primary_epics_choose_api(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PrimaryEpicInput,
+            lambda body: asyncio.to_thread(
+                repo(request).primary_epics.choose, name, key, body.epic_id
+            ),
+            event="workspace.primary_epic_chosen",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/primary-epics/{key}/dismiss")
+    async def primary_epics_dismiss_api(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).primary_epics.dismiss, name, key),
+            event="workspace.primary_epic_answer_dismissed",
             subject=name,
         )
 
