@@ -243,9 +243,15 @@ The administrator agreed these rules and phases. Every change to existing record
 | R2 | Orphan worklist and bulk choice of the parent. Bug label and filter. | The open orphans of a project get an answer in one run within a stated budget, and are linked on approval. |
 | R3 | Consolidate the existing plan. | A primary Epic for each User Story under several, chosen by approval in bulk; Epics counted by their primary Stories; a missing Story drafted from an answer; finished Stories listed. Merging Stories and splitting an Epic were measured and found unnecessary. |
 | R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
-| R5 | Epics and Stories grounded in documents and issues. | A changed document yields proposals to add, update or remove, each traced to its lines. |
-| R6 | Epic wiki pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
-| R7 | Automation and rollout. | Discovery runs on push or on a schedule, and the remaining projects are onboarded. |
+| R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
+| R6 | Scorer in shadow mode: a calibrated classifier that abstains, with escalation to decision models. | A report of every change it would make, with precision per kind of change measured on held-out cases. Nothing is changed. |
+| R7 | Reorganize links automatically: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | Batches with undo and an audit sample; audited precision within the allowed error rate. |
+| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are closed; unsupported and duplicate Stories are offered as batches. |
+| R9 | Reorganize structure: split and merge Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
+| R10 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; each project follows the same numbers. |
+| R11 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
+
+R5 to R11 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
 
 ### Planning health
 
