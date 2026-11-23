@@ -14,6 +14,7 @@ from engineering_control.db.models import (
     WorkspaceSource,
 )
 from tests.test_dashboard_web import _authenticated_client
+from tests.test_workspace_planning import confirmed
 
 BASE = "/api/dashboard/projects/falcone/planning/"
 
@@ -29,9 +30,14 @@ def test_local_lifecycle_preserves_links_and_resolves_closed_deep_links(tmp_path
         csrf = client.get("/api/dashboard/session").json()["csrf_token"]
 
         def change(kind: str, key: str, state: str):
-            return client.post(
-                BASE + kind + "/" + key + "/state", json={"csrf_token": csrf, "state": state}
-            )
+            path = BASE + kind + "/" + key
+            body = {"csrf_token": csrf, "state": state}
+            if state == "closed":
+                preview = client.get(path + "/impact?operation=close")
+                if preview.status_code != 200:
+                    return preview
+                body["confirmation"] = preview.json()["token"]
+            return client.post(path + "/state", json=body)
 
         with repo.sessions.begin() as db:
             project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
@@ -64,7 +70,12 @@ def test_local_lifecycle_preserves_links_and_resolves_closed_deep_links(tmp_path
             db.flush()
             proposal_id = str(proposal.id)
         assert change("epics", proposal_id, "closed").status_code == 404
-        assert change("issues", task, "closed").status_code == 422
+        assert (
+            client.post(
+                BASE + f"issues/{task}/state", json={"csrf_token": csrf, "state": "closed"}
+            ).status_code
+            == 409
+        )
         other = repo.planning.save("llmwiki", "epics", "Elsewhere", None, [])["id"]
         assert change("epics", other, "closed").status_code == 404
         for kind, key in (("epics", epic), ("stories", story)):
@@ -233,10 +244,10 @@ def test_epic_link_locates_exact_active_row_in_project(tmp_path: Path) -> None:
         assert locate(target, 5)["page"] == 2
         # The same link resolves again as earlier rows are removed. Global title matches
         # and lookalikes in another project cannot determine which record opens.
-        repo.planning.remove("falcone", "epics", UUID(int=1))
-        repo.planning.remove("falcone", "epics", UUID(int=2))
+        confirmed(repo.planning, "falcone", "epics", UUID(int=1), "delete")
+        confirmed(repo.planning, "falcone", "epics", UUID(int=2), "delete")
         assert locate(target)["page"] == 2
-        repo.planning.remove("falcone", "epics", UUID(target))
+        confirmed(repo.planning, "falcone", "epics", UUID(target), "delete")
         for missing in (target, elsewhere):
             result = locate(missing)
             assert result["page"] == 1 and all(r["id"] != missing for r in result["items"])

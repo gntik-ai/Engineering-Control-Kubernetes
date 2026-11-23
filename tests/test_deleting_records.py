@@ -60,13 +60,20 @@ def _count(world: Any, table: Any) -> int:  # noqa: F811
         return len(session.scalars(select(table)).all())
 
 
+def local_items(data: Any, *keys: UUID) -> None:
+    with data.sessions.begin() as db:
+        for key in keys:
+            item = db.get(BacklogItem, key)
+            item.source, item.issue_number, item.repository = "manual", None, None
+
+
 def test_an_item_is_deleted_with_its_places_in_queues_and_its_runs_stay(world: Any) -> None:  # noqa: F811
     first, second = world.items[0], world.items[1]
+    local_items(world, first, second)
     world.queue(0, 1)
     ended = _run(world, "succeeded", item=first)
     gone = world.backlog.remove(first)
     assert (gone["title"], gone["project"]) == ("Expired cookie", "falcone-workflow")
-    # Whether it comes back with the next import: only an issue that is open on GitHub.
     assert gone["returns"] is False
     with world.sessions() as session:
         assert session.get(BacklogItem, first) is None
@@ -87,6 +94,7 @@ def test_an_item_is_deleted_with_its_places_in_queues_and_its_runs_stay(world: A
 
 
 def test_the_items_a_filter_matches_are_deleted_together(world: Any) -> None:  # noqa: F811
+    local_items(world, world.items[0], world.items[1], world.items[3])
     _run(world, "waiting", item=world.items[3])
     with pytest.raises(Exception, match="exactly one change"):
         world.backlog.bulk(
@@ -105,12 +113,12 @@ def test_the_items_a_filter_matches_are_deleted_together(world: Any) -> None:  #
     done = world.backlog.bulk(
         "falcone-workflow", section=None, state=None, search=None, expected=4, remove=True
     )
-    # The one a run still waits on stays.
-    assert done == {"project": "falcone-workflow", "changed": 3, "unchanged": 1}
+    # The active run and the published Issue each retain their item.
+    assert done == {"project": "falcone-workflow", "changed": 2, "unchanged": 2}
     with world.sessions() as session:
         left = session.scalars(select(BacklogItem).order_by(BacklogItem.title)).all()
     # The other project's item was never matched.
-    assert [item.title for item in left] == ["Of another project", "Wrong total"]
+    assert [item.title for item in left] == ["Of another project", "Slow search", "Wrong total"]
 
 
 def test_a_run_that_has_ended_is_deleted_with_what_is_its_own(world: Any) -> None:  # noqa: F811

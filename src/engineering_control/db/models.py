@@ -572,6 +572,7 @@ class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
+    confirmation_token: Mapped[str | None] = mapped_column(String(64))
     operation: Mapped[str] = mapped_column(String(16))
     local_id: Mapped[UUID] = mapped_column(Uuid)
     repository: Mapped[str] = mapped_column(String(140))
@@ -583,6 +584,19 @@ class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (
         UniqueConstraint("project_id", "operation", "local_id", name="uq_workspace_action_record"),
     )
+
+
+class PlanningLifecycleReceipt(Base):
+    """The exact planning impact confirmed by an administrator, also used for replay."""
+
+    __tablename__ = "planning_lifecycle_receipts"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(16))
+    record_id: Mapped[UUID] = mapped_column(Uuid)
+    operation: Mapped[str] = mapped_column(String(12))
+    impact: Mapped[dict[str, Any]] = mapped_column(JSON)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class WorkspaceModelUsage(UUIDPrimaryKey, Base):

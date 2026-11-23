@@ -35,6 +35,12 @@ from engineering_control.dashboard.connection_records import (
     finding_links,
 )
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.planning_lifecycle import (
+    ARCHIVED_DRAFT,
+    CLOSED_DRAFT,
+    PlanningLifecycle,
+    story_has_epic,
+)
 from engineering_control.dashboard.planning_queue import (
     queue_review,
     record_changed,
@@ -46,7 +52,7 @@ from engineering_control.dashboard.project_records import (
     ProjectNotFound,
     active_project,
 )
-from engineering_control.dashboard.workspace_publishing import confirm_classification
+from engineering_control.dashboard.workspace_publishing import CLOSE_ISSUE, confirm_classification
 from engineering_control.db.models import (
     BacklogItem,
     PlanningReview,
@@ -55,6 +61,7 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectStoryEpic,
     ProjectUserStory,
+    WorkspaceAction,
     WorkspaceCandidate,
     WorkspaceImport,
     WorkspaceSource,
@@ -179,10 +186,18 @@ def save_record(
 
 
 def _visible_issues(project: UUID) -> ColumnElement[bool]:
-    return BacklogItem.workspace_review.in_(
-        ("pending", "publishing", "approved")
-    ) | BacklogItem.id.in_(
-        select(ProjectIssueStory.item_id).where(ProjectIssueStory.project_id == project)
+    return BacklogItem.workspace_review.is_distinct_from(ARCHIVED_DRAFT) & (
+        BacklogItem.workspace_review.in_(("pending", "publishing", "approved", CLOSED_DRAFT))
+        | BacklogItem.id.in_(
+            select(ProjectIssueStory.item_id).where(ProjectIssueStory.project_id == project)
+        )
+        | BacklogItem.id.in_(
+            select(WorkspaceAction.local_id).where(
+                WorkspaceAction.project_id == project,
+                WorkspaceAction.operation == CLOSE_ISSUE,
+                WorkspaceAction.confirmation_token.is_not(None),
+            )
+        )
     )
 
 
@@ -426,6 +441,7 @@ def _search_matches(
 class PlanningRecords:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
+        self.lifecycle = PlanningLifecycle(sessions)
 
     @contextmanager
     def _snapshot(self) -> Iterator[Session]:
@@ -544,7 +560,8 @@ class PlanningRecords:
                     for number, key in session.execute(
                         select(BacklogItem.issue_number, BacklogItem.id).where(
                             BacklogItem.project_id == project.id,
-                            BacklogItem.repository == project.source_repository,
+                            func.lower(BacklogItem.repository) == project.source_repository.lower(),
+                            BacklogItem.workspace_review.is_distinct_from("planning"),
                             BacklogItem.issue_number.in_(
                                 [i["number"] for i in items if i["proposal"] and i["number"]]
                             ),
@@ -556,6 +573,20 @@ class PlanningRecords:
             )
             connection_keys = [i["id"] for i in items if not i["proposal"]] + list(
                 mirror_ids.values()
+            )
+            closing = (
+                set(
+                    session.scalars(
+                        select(WorkspaceAction.local_id).where(
+                            WorkspaceAction.project_id == project.id,
+                            WorkspaceAction.local_id.in_(connection_keys),
+                            WorkspaceAction.operation == CLOSE_ISSUE,
+                            WorkspaceAction.status != "done",
+                        )
+                    )
+                )
+                if kind == "issues"
+                else set()
             )
             linked: dict[UUID, list[str]] = defaultdict(list)
             parents: dict[str, str] = {}
@@ -637,6 +668,12 @@ class PlanningRecords:
                     if kind == "epics":
                         item["story_count"] = stories_count
                 mirror = mirror_ids.get(item["number"], key) if item["proposal"] else key
+                item["lifecycle_id"] = (
+                    str(mirror)
+                    if not item["proposal"] or (kind == "issues" and item["number"] in mirror_ids)
+                    else None
+                )
+                item["closing"] = mirror in closing
                 item["automatic_review"] = reviews.get(mirror)
                 item["review_reason"] = reasons.get(key)
                 item["connections"] = external[mirror]
@@ -942,8 +979,17 @@ class PlanningRecords:
             return {"project": name, "id": str(identifier)}
 
     def set_state(
-        self, name: str, kind: Literal["epics", "stories"], key: UUID, state: PlanningState
-    ) -> dict[str, str]:
+        self,
+        name: str,
+        kind: Kind,
+        key: UUID,
+        state: PlanningState,
+        confirmation: str | None = None,
+    ) -> dict[str, Any]:
+        if state == "closed":
+            return self.lifecycle.confirm(name, kind, key, "close", confirmation)
+        if kind == "issues":
+            raise ProjectInvalid("Reopen published Issues in GitHub.")
         with self.sessions.begin() as session:
             project = active_project(session, name, lock=True)
             model = ProjectEpic if kind == "epics" else ProjectUserStory
@@ -955,58 +1001,14 @@ class PlanningRecords:
             if row is None:
                 raise ProjectNotFound(str(key))
             record = cast(ProjectEpic | ProjectUserStory, row)
-            if (record.closed_at is None) != (state == "open"):
-                now = datetime.now(UTC)
-                record.closed_at = now if state == "closed" else None
-                record.updated_at = now
+            if record.closed_at is not None:
+                if kind == "stories" and not story_has_epic(session, key):
+                    raise ProjectConflict("Link the User Story to an Epic before reopening it.")
+                record.closed_at = None
+                record.updated_at = datetime.now(UTC)
             return {"id": str(key), "state": state}
 
-    def remove(self, name: str, kind: Literal["epics", "stories"], key: UUID) -> dict[str, str]:
-        with self.sessions.begin() as session:
-            project = active_project(session, name, lock=True)
-            model = ProjectEpic if kind == "epics" else ProjectUserStory
-            row = session.scalar(
-                select(model).where(
-                    model.project_id == project.id, model.id == key, model.archived_at.is_(None)
-                )
-            )
-            if row is None:
-                raise ProjectNotFound(str(key))
-            links: type[ProjectStoryEpic] | type[ProjectIssueStory]
-            if kind == "epics":
-                links, parent, child = (
-                    ProjectStoryEpic,
-                    ProjectStoryEpic.epic_id,
-                    ProjectStoryEpic.story_id,
-                )
-            else:
-                links, parent, child = (
-                    ProjectIssueStory,
-                    ProjectIssueStory.story_id,
-                    ProjectIssueStory.item_id,
-                )
-            other_parents = select(child).where(links.project_id == project.id, parent != key)
-            last_parent = select(child).where(
-                links.project_id == project.id, parent == key, child.not_in(other_parents)
-            )
-            if kind == "stories":
-                last_parent = last_parent.where(
-                    child.not_in(bugs_with_optional_stories(session, project.id))
-                )
-            orphan = session.scalar(last_parent.limit(1))
-            if orphan:
-                raise ProjectConflict(
-                    "Reassign the linked story or issue before removing its last parent"
-                )
-            session.execute(delete(links).where(links.project_id == project.id, parent == key))
-            if kind == "stories":
-                session.execute(
-                    delete(ProjectStoryEpic).where(
-                        ProjectStoryEpic.project_id == project.id, ProjectStoryEpic.story_id == key
-                    )
-                )
-            cast(ProjectEpic | ProjectUserStory, row).archived_at = datetime.now(UTC)
-            job = session.get(PlanningReview, (project.id, kind, key))
-            if job:
-                job.status, job.lease = "dismissed", None
-            return {"project": name, "id": str(key)}
+    def remove(
+        self, name: str, kind: Kind, key: UUID, confirmation: str | None = None
+    ) -> dict[str, Any]:
+        return self.lifecycle.confirm(name, kind, key, "delete", confirmation)

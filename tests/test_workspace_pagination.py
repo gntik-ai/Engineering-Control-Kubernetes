@@ -14,6 +14,7 @@ from engineering_control.db.models import (
     WorkspaceImport,
 )
 from tests.test_dashboard_web import _authenticated_client
+from tests.test_workspace_planning import confirmed
 
 BASE = "/api/dashboard/projects/falcone/planning/"
 
@@ -71,7 +72,7 @@ def test_mixed_pages_and_approval_snapshot(tmp_path: Path) -> None:
         pending = client.get(BASE + "epics/pending").json()
         assert pending == {"ids": [str(UUID(int=n)) for n in (1, 2)], "version": 7}
         # Removing the last row takes a stale bookmark back to the last real page.
-        repo.planning.remove("falcone", "epics", UUID(int=5))
+        confirmed(repo.planning, "falcone", "epics", UUID(int=5), "delete")
         clamped = client.get(BASE + "epics?page=3&page_size=2").json()
         assert (clamped["requested_page"], clamped["page"], clamped["pages"]) == (3, 2, 2)
         csrf = client.get("/api/dashboard/session").json()["csrf_token"]
@@ -183,8 +184,8 @@ def test_relationship_counts_span_states_and_deduplicate_shared_issues(tmp_path:
         plan.save("falcone", "issues", "Local draft", None, [left])
         shared = UUID(plan.save("falcone", "issues", "Shared", None, [left, right])["id"])
         planning = UUID(plan.save("falcone", "issues", "Reclassified", None, [left, right])["id"])
-        plan.set_state("falcone", "stories", right, "closed")
-        plan.set_state("falcone", "epics", main, "closed")
+        confirmed(plan, "falcone", "stories", right, "close")
+        confirmed(plan, "falcone", "epics", main, "close")
         with repo.sessions.begin() as db:
             issue = db.get(BacklogItem, shared)
             assert issue
@@ -215,10 +216,10 @@ def test_relationship_counts_span_states_and_deduplicate_shared_issues(tmp_path:
         assert counts(other, "open") == (2, 1)
         assert counts(empty, "open") == (0, 0)
         stories = client.get(BASE + "stories?state=open").json()["items"]
-        assert {r["title"]: r["issue_count"] for r in stories} == {"Left": 2, "No issues": 0}
-        [closed] = client.get(BASE + "stories?state=closed").json()["items"]
-        assert closed["issue_count"] == 1
-        plan.remove("falcone", "stories", right)
+        assert {r["title"]: r["issue_count"] for r in stories} == {"No issues": 0}
+        closed = client.get(BASE + "stories?state=closed").json()["items"]
+        assert {r["title"]: r["issue_count"] for r in closed} == {"Left": 2, "Right": 1}
+        confirmed(plan, "falcone", "stories", right, "delete")
         assert counts(other, "open") == (1, 0)
     finally:
         client.__exit__(None, None, None)
