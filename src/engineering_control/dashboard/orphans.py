@@ -20,7 +20,7 @@ import logging
 import math
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
@@ -138,6 +138,8 @@ class _Stories:
     postings: dict[str, list[tuple[UUID, int]]]
     lengths: dict[UUID, int]
     average: float
+    # The shortlists already ranked against this index, by issue and its text.
+    ranked: dict[tuple[UUID, str], list[dict[str, Any]]] = field(default_factory=dict)
 
 
 # The index of each project's Stories, kept for as long as nothing it is made of changed.
@@ -253,6 +255,9 @@ def _named(issue: BacklogItem, repository: str, stories: _Stories) -> list[UUID]
 def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[dict[str, Any]]:
     """The Stories most like the issue, best first: those its text names, then by the
     words the two share, where a word counts for more the fewer Stories have it."""
+    known = (issue.id, digest([repository, issue.title, issue.description or ""]))
+    if known in stories.ranked:
+        return [dict(entry) for entry in stories.ranked[known]]
     scores: dict[UUID, float] = defaultdict(float)
     shared: dict[UUID, list[tuple[float, str]]] = defaultdict(list)
     total = len(stories.rows)
@@ -286,7 +291,8 @@ def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[di
                 "weak": key not in named and scores.get(key, 0.0) < WEAK,
             }
         )
-    return listed
+    stories.ranked[known] = listed
+    return [dict(entry) for entry in listed]
 
 
 def revision(issue: BacklogItem, listed: list[dict[str, Any]]) -> str:
