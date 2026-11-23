@@ -10,7 +10,7 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
@@ -28,6 +28,7 @@ import { PlanningHealth } from './PlanningHealth';
 import { OrphanWorklist } from './OrphanWorklist';
 import { PrimaryEpics } from './PrimaryEpics';
 import { Documents } from './Documents';
+import { Reorganize } from './Reorganize';
 import { FinishedStories } from './FinishedStories';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
@@ -37,6 +38,7 @@ const reviewMenu = {
   'related-work': { label: 'Related Work', icon: GitFork },
   planning: { label: 'Planning', icon: ListChecks },
   discovery: { label: 'Discovery', icon: Compass },
+  reorganize: { label: 'Reorganize', icon: Shuffle },
 };
 export function ProjectWorkspace({
   name,
@@ -193,6 +195,7 @@ export function ProjectWorkspace({
                 {view === 'planning' && <PrimaryEpics project={project.project} />}
                 {view === 'planning' && <FinishedStories project={project.project} />}
                 {view === 'planning' && <PlanningReviews project={project.project} />}
+                {view === 'reorganize' && <Reorganize project={project.project} />}
                 {view === 'discovery' && <Documents project={project.project} />}
                 {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
               </div>

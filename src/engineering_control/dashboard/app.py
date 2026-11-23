@@ -96,6 +96,7 @@ from engineering_control.dashboard.schemas import (
     FlowDraftInput,
     FlowPublishInput,
     FlowSimulationInput,
+    GoldLabelInput,
     ItemBulkInput,
     ItemCreateInput,
     ItemEditInput,
@@ -1795,6 +1796,40 @@ def create_app(
             ),
             event="workspace.document_folders_changed",
             subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/signals")
+    async def signals_api(name: str, request: Request) -> Response:
+        """What is known to be true in the project and how well each way of finding a
+        parent does against it."""
+        return await documents_read(request, lambda: repo(request).signals.report(name))
+
+    @app.get("/api/dashboard/projects/{name}/labels/next")
+    async def labels_next_api(name: str, request: Request, after: UUID | None = None) -> Response:
+        """The next pair of planning records to judge."""
+        return await documents_read(request, lambda: repo(request).signals.next(name, after))
+
+    @app.post("/api/dashboard/projects/{name}/labels/draw")
+    async def labels_draw_api(name: str, request: Request) -> Response:
+        """Draw the pairs to judge, or the ones still missing from the set."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).signals.draw, name),
+            event="workspace.pairs_drawn",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/labels/{pair_id}")
+    async def labels_judge_api(name: str, pair_id: UUID, request: Request) -> Response:
+        """The administrator's judgment of one pair."""
+        return await project_change(
+            request,
+            GoldLabelInput,
+            lambda body: asyncio.to_thread(repo(request).signals.judge, name, pair_id, body.label),
+            event="workspace.pair_judged",
+            subject=name,
+            record=False,
         )
 
     @app.get("/api/dashboard/projects/{name}/finished-stories")
@@ -4221,7 +4256,7 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery)"
+                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery|reorganize)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

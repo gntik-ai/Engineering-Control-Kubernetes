@@ -1041,6 +1041,34 @@ class DocChange(UUIDPrimaryKey, Timestamps, Base):
     diff: Mapped[str | None] = mapped_column(Text)
 
 
+class GoldPair(UUIDPrimaryKey, Timestamps, Base):
+    """One pair of planning records that the administrator judges once (migration 0075):
+    an issue and a User Story, or a User Story and an Epic. The judged pairs are the
+    known truth that every way of finding a parent is measured against.
+
+    A pair is drawn for a reason, its ``bucket``: easy, doubtful and missing links are
+    all in the set. Pairs of whole Epics are ``held_out``: they are only ever tested on,
+    never learned from."""
+
+    __tablename__ = "gold_pairs"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # issue_story or story_epic.
+    kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    parent_id: Mapped[UUID] = mapped_column(Uuid)
+    bucket: Mapped[str] = mapped_column(String(24))
+    held_out: Mapped[bool] = mapped_column(Boolean, default=False)
+    # For an issue and a Story: yes, no or unsure. For a Story and an Epic: primary,
+    # related, no or unsure. Not set until it is judged.
+    label: Mapped[str | None] = mapped_column(String(16))
+    judged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("project_id", "kind", "child_id", "parent_id", name="uq_gold_pairs_pair"),
+    )
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

@@ -8,7 +8,7 @@ export const accountsUrl = (project?: string | null) =>
   project ? ACCOUNTS + '?' + new URLSearchParams({ project }).toString() : ACCOUNTS;
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
-export const reviewViews = ['related-work', 'planning', 'discovery'] as const;
+export const reviewViews = ['related-work', 'planning', 'discovery', 'reorganize'] as const;
 export type ReviewView = typeof reviewViews[number];
 export const isReviewView = (value: string): value is ReviewView => reviewViews.some(view => view === value);
 export const reviewUrl = (project: string, view: ReviewView) => workspaceUrl(project) + '/reviews/' + view;

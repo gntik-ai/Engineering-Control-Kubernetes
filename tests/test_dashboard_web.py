@@ -273,6 +273,8 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/orphans/{key}/link",
         "/api/dashboard/projects/{name}/orphans/{key}/draft",
         "/api/dashboard/projects/{name}/orphans/{key}/bug",
+        "/api/dashboard/projects/{name}/labels/draw",
+        "/api/dashboard/projects/{name}/labels/{pair_id}",
         "/api/dashboard/projects/{name}/documents/scan",
         "/api/dashboard/projects/{name}/documents/folders",
         "/api/dashboard/projects/{name}/primary-epics/runs",

@@ -32,6 +32,7 @@ from engineering_control.dashboard.session_store import (
     lock_authentication,
     retire_session,
 )
+from engineering_control.dashboard.signals import Signals
 from engineering_control.dashboard.workspace_import import WorkspaceImports
 from engineering_control.dashboard.workspace_issues import WorkspaceIssueInventory
 from engineering_control.dashboard.workspace_metrics import WorkspaceMetrics
@@ -122,6 +123,7 @@ class DashboardRepository:
         self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
         self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
         self.documents = DocInventory(self.sessions)
+        self.signals = Signals(self.sessions, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

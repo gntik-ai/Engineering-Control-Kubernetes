@@ -522,6 +522,13 @@ class OrphanRunInput(PlainChangeInput):
     again: bool = False
 
 
+class GoldLabelInput(PlainChangeInput):
+    """The administrator's judgment of one pair of planning records, or none to take it
+    back. Which answers a pair allows depends on what it pairs."""
+
+    label: Literal["yes", "no", "unsure", "primary", "related"] | None = None
+
+
 class DocFoldersInput(PlainChangeInput):
     """The folders that hold a project's documentation, and those among them that do not.
     With no folders given the platform's own list is used again."""

@@ -34,7 +34,7 @@ So the process is a cascade. Each stage costs more than the one before and sees 
 | 5. Write | Only where text has to be written: the name of a new Epic, the wording of a missing Story. | Large language model, in batch | Tens of calls per project |
 | 6. Person | What is left, and anything that creates or destroys structure, presented as one plan. | You | Minutes |
 
-The target is that at most one case in five goes beyond stage 3, and at most one in twenty reaches a person.
+The first target was that at most one case in five goes beyond stage 3, and at most one in twenty reaches a person. The first measurements, below, put the share that goes beyond stage 3 nearer two or three in five.
 
 ## The models, and why each
 
@@ -162,6 +162,32 @@ The figures on the right are targets to be confirmed in shadow mode, not measure
 
 Other projects cost less than Falcone: vectors and thresholds are computed per project, but the scorer starts from what was learned on the others.
 
+## First measurements (23 November 2026)
+
+Measured before the ranking service was built, on Falcone-serverless, where 134 issues state their User Story in their own text. The line that names the Story was hidden; each way had to find it among 66 Stories.
+
+| Way of ranking the candidates | Right Story first | Among the first 5 | Among the first 20 |
+| --- | --- | --- | --- |
+| Shared words, as the worklists use now | 74% | 94% | 99% |
+| Meaning alone (`bge-small-en-v1.5`) | 49% | 77% | 90% |
+| Meaning alone (`bge-base-en-v1.5`) | 58% | 85% | 96% |
+| Words and meaning joined by rank | 70% | 93% | 100% |
+| A small reranker on the joined list (`ms-marco-MiniLM-L-12`) | 49 to 57% | 92% | 99% |
+| A larger reranker (`bge-reranker-v2-m3`, 8-bit), on 50 of the issues | 56% | — | — |
+| **A learned combination of words, meaning and the small reranker**, cross-validated | **82%** | — | — |
+
+What this says, and what it changes in the plan:
+
+- **Word matching is already good at recall.** The right Story is among the first 20 for 99% and among the first 5 for 94%. The first target of R5, 95% among the first 20, is met without a model.
+- **No open ranking model beats words by itself.** A generic reranker judges whether two texts are about the same thing, not whether an issue implements a Story, and is worse than words when used alone.
+- **Combined, the signals help.** A logistic regression over all of them puts the right Story first for 82% instead of 74%. The combination is what R6 builds; a single model replacing words is not the way.
+- **Confidence is what makes approval cheap.** Of the cases the combination is most sure of, the top half is right 96 times in 100 and the top 70% is right 91 times in 100. Those are the batches to approve; the rest goes to a decision model.
+- **The target of one case in five reaching a paid model was too optimistic.** On this evidence it is nearer two or three in five at the precision asked for. That still halves the paid calls and, more to the point, orders what is left by how sure each answer is.
+- **These projects differ.** Falcone-serverless's issues were written from its Stories and share their wording. Falcone's Stories were generated from a description. The pairs judged on **Reviews → Reorganize** will say how much of this carries over.
+- **Speed.** On four slow processors: 3 to 8 texts a second for vectors, 10 pairs a second for the small reranker, 1.3 for the larger one. A reading of Falcone is minutes for vectors and an hour for 30,000 pairs with the small reranker. The larger reranker needs the graphics card to be practical.
+
+An instruction-following reranker or a small language model on the graphics card, asked the real question (does this issue implement part of this Story?), is the candidate that could replace the paid decision model for most cases. It is to be measured on the labelled set once that exists, not assumed.
+
 ## Revised plan
 
 R0 to R3 are done and deployed. Their worklists stay: they become the place where the cases the cascade abstains on are decided, and where its batches are approved.
@@ -169,8 +195,8 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | Phase | What | Done when |
 | --- | --- | --- |
 | R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived), extracts identifiers from documents, issues and Stories, and keeps which sections were deleted or rewritten, as evidence for removals. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
-| R5 | Signals. Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes; joined recall. The labelled set and the evaluation harness. | On held-out links, the true parent is among the top 20 candidates for at least 95% and is ranked first by the reranker for at least 85%. Measured against R2's word matching. |
-| R6 | Scorer in shadow mode. Calibrated classifier, abstention thresholds, escalation to the decision models. A report per project of every change it would make, with measured precision per kind of change, and a first count of the records it would propose for removal, by reason. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
+| R5 | Signals. The measurement of each way of ranking against known truth, and the pairs to judge (built). Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes. | The true parent is among the top 20 candidates for at least 95% (met by words alone: 99%). Every way of ranking is shown beside word matching on the same known links. The earlier target of 85% first by a reranker alone is dropped: see the first measurements. |
+| R6 | Scorer in shadow mode. Calibrated classifier over all signals (82% first in the first measurement), abstention thresholds, escalation to the decision models, and a trial of a local model on the graphics card as the decision model. A report per project of every change it would make, with measured precision per kind of change, and a first count of the records it would propose for removal, by reason. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
 | R7 | Reorganize links. Batches to approve: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. A sample before each batch, undo of a batch, Planning health redefined. | Falcone, once its batches are approved: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; the sampled precision within the allowed error rate. |
 | R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories offered as a batch to close. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
 | R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |

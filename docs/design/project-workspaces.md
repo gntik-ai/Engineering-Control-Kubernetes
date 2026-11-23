@@ -368,6 +368,16 @@ The page lists the OpenSpec changes with their state (open, every task done, arc
 
 `GET /api/dashboard/projects/{name}/documents` returns the overview; `…/documents/changes` the documents that changed since the first reading; `…/documents/files` the documents; `…/documents/file?path=` one document with its text, headings, facts and every change the readings found; `…/documents/openspec` the changes. `POST …/documents/scan` asks for a reading and `…/documents/folders` sets the folders. Readings, documents and changes are kept in `doc_scans`, `doc_files` and `doc_changes`, the folders in `doc_folders` (migration 0074).
 
+### Measuring how a parent is found
+
+**Reviews → Reorganize** shows, for each project, how well each way of ranking the candidate parents does against the parents that are known to be right. A right parent is known from a link the record's own text states, from a choice the administrator made, or from a pair the administrator judged. For an issue the parent is its User Story; for a User Story under several Epics it is its primary Epic. The table gives, for each way, how often the right parent is ranked first and how often it is among the first 5 and the first 20. A line of the text that names the parent is hidden from the ranking.
+
+**Pairs to judge** draws about 150 pairs per project, once, from six situations: an issue and the Story it is linked to where the words agree, where the words point elsewhere, the most likely Story of an issue that has none; the suggested primary Epic of a Story where the texts point to it and where they do not, and the Epic of a Story that its text is least like. No record is asked about twice and a pair whose answer is already known is not drawn. The page shows the two texts side by side and the question; it does not show why the pair was drawn, so that a judgment does not lean on the platform's guess. An issue and a Story are judged as part of it, not part of it, or cannot tell; a Story and an Epic as primary, related, not related, or cannot tell. A judgment can be changed or taken back, and changes no link.
+
+The pairs of one Epic in five are held out: they are only tested on, never learned from.
+
+`GET /api/dashboard/projects/{name}/signals` returns the measurement; `POST …/labels/draw` draws the pairs; `GET …/labels/next` returns the next pair with both texts; `POST …/labels/{id}` records a judgment. The pairs are kept in `gold_pairs` (migration 0075).
+
 ### A review run that was cut off
 
 A paid call whose provider never reported its usage leaves its run **uncertain**: its tokens stay reserved against the run and the project, and a later review of the same issue and Story is held with "An earlier decision for these sources has unconfirmed usage".

@@ -53,7 +53,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0072 keeps the runs that ask about issues without a User Story, and the answers.
     # 0073 keeps one kind of run and answer for every choice of a parent.
     # 0074 keeps an inventory of each project's documentation and its changes.
-    assert (head, parent) == ("0074", "0073")
+    # 0075 keeps the pairs of planning records the administrator judges once.
+    assert (head, parent) == ("0075", "0074")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -155,8 +156,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert documents <= set(inspect(engine).get_table_names())
+    assert "gold_pairs" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
+    assert "gold_pairs" not in inspect(engine).get_table_names()
+    assert documents <= set(inspect(engine).get_table_names())
+    command.downgrade(config, "0073")
     assert not documents & set(inspect(engine).get_table_names())
     assert {"choice_runs", "choice_reviews"} <= set(inspect(engine).get_table_names())
     assert not {"orphan_runs", "orphan_reviews"} & set(inspect(engine).get_table_names())
