@@ -20,7 +20,12 @@ from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import replace_parents
-from engineering_control.dashboard.planning_queue import reset_review, review_id, review_results
+from engineering_control.dashboard.planning_queue import (
+    REVIEW_STATUS_LABELS,
+    reset_review,
+    review_id,
+    review_results,
+)
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -698,6 +703,7 @@ class PlanningAnalysis:
                 "model": model,
                 "paused": bool(p.planning_reviews_paused_at),
                 "counts": counts,
+                "status_labels": {s: REVIEW_STATUS_LABELS.get(s, s) for s in counts},
                 "usage_24h": usage,
                 "review_budget": review_budget.status(db, p.id),
                 "page": page,

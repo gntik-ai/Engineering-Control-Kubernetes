@@ -78,6 +78,21 @@ export interface PlanRow {
   url?: string | null;
   connections?: {connection: string; project: string; display_name: string; kind: string | null; record: string | null; status: string; title: string | null}[];
 }
+const statusTones = {
+  Approved: 'success',
+  Proposal: 'warning',
+  Syncing: 'info',
+  Linked: 'info',
+  'Closed locally': 'neutral',
+} as const;
+
+function planStatus(kind: Kind, record: PlanRow): keyof typeof statusTones {
+  if (record.review === 'closed_draft') return 'Closed locally';
+  if (record.proposal || record.review === 'pending') return 'Proposal';
+  if (kind !== 'issues' || record.review === 'approved') return 'Approved';
+  return record.review === 'publishing' ? 'Syncing' : 'Linked';
+}
+
 interface PlanningPage extends Paged<PlanRow> {
   sort: string;
   direction: string;
@@ -380,7 +395,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const stateKey = kind === 'issues' ? 'issue_state' : 'state';
   const requestedState = query.get(stateKey);
   const view: IssueView = requestedState === 'closed' || (kind === 'issues' && requestedState === 'draft') ? requestedState : 'open';
-  const allowedSort = ['title', 'status', 'connections', ...(kind === 'epics' ? ['story_count','issue_count'] : kind === 'stories' ? ['parents','issue_count'] : ['parents'])];
+  const allowedSort = ['title', 'status', 'planning', 'connections', ...(kind === 'epics' ? ['story_count','issue_count'] : kind === 'stories' ? ['parents','issue_count'] : ['parents'])];
   const sort = querySort(query, allowedSort);
   const [preferred, setPreferred] = useState<Layout>(() => {
     try { return localStorage.getItem('planning-layout') === 'grid' ? 'grid' : 'table'; } catch { return 'table'; }
@@ -467,6 +482,16 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               {record.title}
             </span>
             {kind === 'issues' && record.story_optional && <Badge tone="destructive" size="sm" className="ms-2 align-middle">Bug</Badge>}
+            {(record.url || record.closing || record.execution_type || record.story_optional) && (
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                {record.url && <Link href={record.url} target="_blank" rel="noreferrer">
+                  #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
+                </Link>}
+                {record.closing && <span>GitHub closure pending</span>}
+                {record.execution_type && <span>{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'} · {record.type_confirmed ? 'Confirmed' : 'Suggested'}</span>}
+                {!record.type_confirmed && record.story_optional && <span>Bug · GitHub</span>}
+              </div>
+            )}
             {record.review_reason && <p className="mt-1 text-sm">Reason for proposal · {record.review_reason}</p>}
             {record.description && (
               <p className="mt-1 break-words text-sm text-muted-foreground">
@@ -529,27 +554,31 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   columns.push(
     {
       id: 'status', header: 'Status', sortable: true, className: 'align-top',
+      cell: (record) => {
+        const status = planStatus(kind, record);
+        return <Badge shape="pill" tone={statusTones[status]} size="sm" dot>{status}</Badge>;
+      },
+    },
+    {
+      id: 'planning', header: 'Planning', sortable: true,
+      className: 'min-w-32 max-w-xs whitespace-normal break-words align-top',
       cell: (record) => (
-        <>
-          {record.review === 'closed_draft' ? 'Closed locally' : record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
-          {record.review === 'awaiting_stage' && <div className="text-xs text-muted-foreground">Awaiting {sections[kind]} review</div>}
-          {record.closing && <div className="text-xs text-muted-foreground">GitHub closure pending</div>}
-          {record.execution_type && <div className="mt-1 text-xs font-medium">{record.execution_type === 'bug' ? 'Bug' : 'Enhancement'}{record.type_confirmed ? ' · Confirmed' : ' · Suggested'}</div>}
-          {!record.type_confirmed && record.story_optional && <div className="mt-1 text-xs font-medium">Bug · GitHub</div>}
-          {record.automatic_review && <div className="mt-1"><RecordReview project={project} kind={kind}
-            id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} /></div>}
-          {record.url && (
-            <div><Link href={record.url} target="_blank" rel="noreferrer">
-              #{record.number}{record.github_state ? ' · ' + record.github_state : ''}
-            </Link></div>
+        <div className="grid gap-1">
+          {record.review === 'awaiting_stage' && <span className="text-xs text-muted-foreground">Awaiting {sections[kind]} review</span>}
+          {record.automatic_review && <RecordReview project={project} kind={kind}
+            id={record.automatic_review.id ?? record.id} result={record.automatic_review} reload={reload} showPrefix={false} />}
+          {record.review !== 'awaiting_stage' && !record.automatic_review && (
+            <span className="text-muted-foreground"><span aria-hidden="true">—</span><span className="sr-only">No planning review</span></span>
           )}
-        </>
+        </div>
       ),
     },
     {
       id: 'actions', header: 'Actions', sortable: false, align: 'right', className: 'align-top',
       cell: (record) => (
-        <div className="flex flex-wrap justify-end gap-1">
+        <div className={kind === 'stories'
+          ? 'inline-flex min-w-max flex-nowrap items-start justify-end gap-1 whitespace-nowrap'
+          : 'flex flex-wrap justify-end gap-1'}>
           {kind !== 'issues' && !record.proposal && view === 'closed' && <ReopenAction path={path} row={record} locked={rowLocked(record)} saved={reload} />}
           {record.lifecycle_id && view !== 'closed' && record.review !== 'closed_draft' && !record.closing && (
             <Button size="sm" variant="ghost" iconOnly aria-haspopup="dialog" disabled={rowLocked(record)} aria-label={'Close ' + record.title} title={'Close ' + record.title}

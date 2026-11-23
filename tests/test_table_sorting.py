@@ -11,13 +11,16 @@ from engineering_control.dashboard.planning import Kind, PlanningRecords
 from engineering_control.dashboard.review_evidence import selection
 from engineering_control.db.models import (
     BacklogItem,
+    PlanningReview,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
     ProjectStoryEpic,
     ProjectUserStory,
     WorkspaceCandidate,
+    WorkspaceImport,
 )
+from engineering_control.table_sort import Direction
 from tests.test_dashboard_web import _authenticated_client
 
 
@@ -107,6 +110,111 @@ def test_all_result_pages_sort_and_keep_their_filters(tmp_path: Path) -> None:
             "/api/dashboard/items?project=falcone&sort=title&direction=desc&page_size=10"
         ).json()
         assert items["total"] == 40 and items["items"][0]["title"] == "Issue 15.3"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def exercise_planning_column(sessions: sessionmaker[Session]) -> None:
+    with sessions.begin() as db:
+        project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+        issues = db.scalars(
+            select(BacklogItem)
+            .where(BacklogItem.project_id == project.id)
+            .order_by(BacklogItem.issue_number)
+            .limit(3)
+        ).all()
+        for issue, status in zip(issues, ("paused", "covered", "needs_input"), strict=True):
+            db.add(
+                PlanningReview(
+                    project_id=project.id,
+                    kind="issues",
+                    record_id=issue.id,
+                    scope="full",
+                    title=issue.title,
+                    status=status,
+                )
+            )
+        db.add(
+            WorkspaceImport(
+                project_id=project.id,
+                repository=project.source_repository,
+                branch="main",
+                stage="epics",
+                progress={"coverage_run": {"state": "running"}},
+            )
+        )
+        db.add_all(
+            [
+                WorkspaceCandidate(
+                    project_id=project.id,
+                    kind="issues",
+                    identity="source:mirror",
+                    origin="review",
+                    title="Mirrored issue",
+                    number=issues[1].issue_number,
+                ),
+                WorkspaceCandidate(
+                    project_id=project.id,
+                    kind="issues",
+                    identity="source:waiting",
+                    origin="import",
+                    title="Waiting for the Issues stage",
+                    number=900,
+                ),
+            ]
+        )
+        proposal = db.scalars(
+            select(WorkspaceCandidate).where(WorkspaceCandidate.kind == "stories")
+        ).one()
+        db.add(
+            PlanningReview(
+                project_id=project.id,
+                kind="stories",
+                record_id=proposal.id,
+                scope="intake",
+                title=proposal.title,
+                status="matched",
+            )
+        )
+    planning = PlanningRecords(sessions)
+    directions: tuple[Direction, ...] = ("asc", "desc")
+    for direction in directions:
+        rows = [
+            row
+            for page in (1, 2, 3)
+            for row in planning.page(
+                "falcone", "issues", page, 2, sort="planning", direction=direction
+            )["items"]
+        ]
+        labels = [
+            "Awaiting Issues review"
+            if row["review"] == "awaiting_stage"
+            else (row["automatic_review"] or {}).get("status_label")
+            for row in rows
+        ]
+        names = ["Already covered", "Awaiting Issues review", "Needs input", "Stopped"]
+        assert labels == (names if direction == "asc" else names[::-1]) + [None, None]
+        assert (
+            next(r for r in rows if r["title"] == "Mirrored issue")["automatic_review"]["status"]
+            == "covered"
+        )
+    first_story = planning.page("falcone", "stories", 1, 1, sort="planning")["items"][0]
+    assert (
+        first_story["proposal"]
+        and first_story["automatic_review"]["status_label"] == "Ready for approval"
+    )
+
+
+def test_planning_column_sorts_visible_review_labels_before_pagination(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        sample(repo.sessions)
+        exercise_planning_column(repo.sessions)
+        response = client.get(
+            "/api/dashboard/projects/falcone/planning/issues?sort=planning&page_size=1"
+        )
+        assert response.status_code == 200
+        assert response.json()["items"][0]["title"] == "Mirrored issue"
     finally:
         client.__exit__(None, None, None)
 

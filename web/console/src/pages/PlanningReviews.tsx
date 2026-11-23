@@ -9,6 +9,7 @@ type RecordLink = { kind: string; id: string; title: string; decision?: string }
 export type ReviewResult = {
   id?: string;
   status: string;
+  status_label?: string;
   control_id?: string;
   questions?: string[];
   detail?: string;
@@ -16,21 +17,18 @@ export type ReviewResult = {
   parents?: RecordLink[];
   proposals?: RecordLink[];
 };
-const labels: Record<string, string> = {
-  paused: 'Stopped', queued: 'Queued', running: 'Reviewing', needs_input: 'Needs input', failed: 'Review interrupted',
-  covered: 'Already covered', proposals: 'Proposals created', matched: 'Ready for approval',
-};
 type ReviewBudget = { limit: number | null; used: number; reserved: number; required: number | null };
 type ReviewPage = {
   review_budget?: ReviewBudget;
+  status_labels?: Record<string, string>;
   usage_24h?: { requests: number; tokens: number };
   paused: boolean; counts: Record<string, number>; page: number; pages: number;
   provider: string | null; model: string | null; models: { provider: string; model: string }[];
   items: (RecordLink & ReviewResult)[];
 };
 
-export function RecordReview({ project, kind, id, result, reload }: {
-  project: string; kind: string; id: string; result: ReviewResult; reload: () => void;
+export function RecordReview({ project, kind, id, result, reload, showPrefix = true }: {
+  project: string; kind: string; id: string; result: ReviewResult; reload: () => void; showPrefix?: boolean;
 }) {
   const retry = useSubmit(() => postJson('projects/' + encodeURIComponent(project) +
     '/planning-reviews/' + kind + '/' + id + '/retry', {}), reload);
@@ -38,13 +36,14 @@ export function RecordReview({ project, kind, id, result, reload }: {
   const control = useSubmit(() => postJson('projects/' + encodeURIComponent(project) + '/planning-reviews/' + kind + '/' + id + '/pause',
     { control_id: result.control_id, paused: result.status !== 'paused' }), reload);
   const proposals = result.proposals ?? [];
-  const label = (labels[result.status] ?? result.status) + (proposals.length ? ' (' + proposals.length + ')' : '');
+  const label = (showPrefix ? 'Planning review · ' : '') + (result.status_label ?? result.status)
+    + (proposals.length ? ' (' + proposals.length + ')' : '');
   const canRetry = result.status === 'failed' || result.status === 'needs_input';
   if (!canControl && !canRetry && !proposals.length && !result.parents?.length && !result.scanned && !result.detail) {
-    return <span className="text-xs text-muted-foreground">Planning review · {label}</span>;
+    return <span className="text-xs text-muted-foreground">{label}</span>;
   }
   return <details className="text-sm">
-    <summary className="cursor-pointer">Planning review · {label}</summary>
+    <summary className="cursor-pointer">{label}</summary>
     <div className="mt-1 grid gap-1">
       {!!result.scanned && <p>{result.scanned} records checked</p>}
       {result.questions?.map((q, index) => <p key={index}>{q}</p>)}
@@ -137,7 +136,7 @@ export function PlanningReviews({ project }: { project: string }) {
       {!data.model && !!data.counts.queued && <Alert tone="warning" title="Choose a model to start the queued reviews." />}
       {!!data.items.length && <details>
         <summary className="cursor-pointer text-sm">Review history · {Object.entries(data.counts)
-          .map(([state, n]) => n + ' ' + (labels[state] ?? state).toLowerCase()).join(' · ')}</summary>
+          .map(([state, n]) => n + ' ' + (data.status_labels?.[state] ?? state).toLowerCase()).join(' · ')}</summary>
         <ul className="divide-y divide-border">{data.items.map(j => <li key={j.kind + j.id} className="grid gap-1 py-2 text-sm">
           <Link href={recordUrl(project, j.kind, j.id)} underline="always">{j.title}</Link>
           <RecordReview project={project} kind={j.kind} id={j.id} result={j} reload={resource.reload} />
