@@ -78,6 +78,7 @@ from engineering_control.dashboard.schemas import (
     ConnectionDecisionInput,
     ConnectionInput,
     ConnectionLinkInput,
+    EpicDescriptionCheck,
     EpicInput,
     EpicQueueInput,
     EvaluationInput,
@@ -97,6 +98,7 @@ from engineering_control.dashboard.schemas import (
     ItemRouteInput,
     ItemStateInput,
     ManagedCoverageInput,
+    NewEpicInput,
     PlainChangeInput,
     PlanningConfirmation,
     PlanningStateInput,
@@ -156,6 +158,7 @@ from engineering_control.models.sealing import read_sealing_key
 from engineering_control.models.service import Models
 from engineering_control.projects import PROJECT_SET
 from engineering_control.supervisor import advice as supervisor_advice
+from engineering_control.table_sort import Direction
 
 PACKAGE_ROOT = Path(__file__).parent
 # The built gntik-ui console (web/console, `pnpm build`): index.html plus hashed assets.
@@ -1467,6 +1470,10 @@ def create_app(
         connected: str = Query("", max_length=32),
         issue_state: IssueView | None = None,
         state: PlanningState | None = None,
+        sort: Literal[
+            "", "title", "parents", "status", "connections", "story_count", "issue_count"
+        ] = "",
+        direction: Direction = "asc",
     ) -> Response:
         try:
             return JSONResponse(
@@ -1482,8 +1489,12 @@ def create_app(
                     connected,
                     issue_state,
                     state,
+                    sort,
+                    direction,
                 )
             )
+        except ProjectInvalid as error:
+            raise HTTPException(422, str(error)) from None
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
@@ -1523,10 +1534,42 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/planning/epics/validate")
+    async def check_epic_description(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            EpicDescriptionCheck,
+            lambda body: repo(request).epic_descriptions.check(
+                name,
+                body.request_id,
+                body.title,
+                body.description,
+                body.previous,
+                body.answer,
+                models_of(request),
+            ),
+            event="workspace.epic_description_checked",
+            max_bytes=220_000,
+            subject=name,
+            record=False,
+        )
+
     async def save_planning(name: str, kind: Kind, key: UUID | None, request: Request) -> Response:
-        schema = {"epics": EpicInput, "stories": StoryInput, "issues": WorkspaceIssueInput}[kind]
+        schema = {
+            "epics": NewEpicInput if key is None else EpicInput,
+            "stories": StoryInput,
+            "issues": WorkspaceIssueInput,
+        }[kind]
 
         async def change(body: EpicInput) -> dict[str, str]:
+            if isinstance(body, NewEpicInput):
+                return await asyncio.to_thread(
+                    repo(request).epic_descriptions.create,
+                    name,
+                    body.review_id,
+                    body.title,
+                    body.description,
+                )
             parents = (
                 body.epic_ids
                 if isinstance(body, StoryInput)
@@ -1624,7 +1667,12 @@ def create_app(
 
     @app.get("/api/dashboard/flows", dependencies=[Depends(verify_scope)])
     async def flows_api(
-        request: Request, page: int | None = None, page_size: int = 10, search: str = ""
+        request: Request,
+        page: int | None = None,
+        page_size: int = 10,
+        search: str = "",
+        sort: Literal["", "name", "version", "tasks", "rounds", "changes"] = "",
+        direction: Direction = "asc",
     ) -> Response:
         """The flows a section can be assigned, and for those that run here, the version
         in force and whether a draft is being worked on."""
@@ -1636,7 +1684,13 @@ def create_app(
                 raise HTTPException(422, "Invalid page size or search")
             return JSONResponse(
                 await asyncio.to_thread(
-                    repo(request).flows.page, scope(request), page, page_size, search.strip()
+                    repo(request).flows.page,
+                    scope(request),
+                    page,
+                    page_size,
+                    search.strip(),
+                    sort,
+                    direction,
                 )
             )
         return JSONResponse(
@@ -1856,6 +1910,8 @@ def create_app(
                     body.model,
                     body.page,
                     body.search,
+                    body.sort,
+                    body.direction,
                 )
 
         return await project_change(
@@ -1874,6 +1930,10 @@ def create_app(
         request: Request,
         state: Literal["pending", "advisory", "reviewed"] = "pending",
         page: int = Query(1, ge=1, le=10_000_000),
+        sort: Literal[
+            "", "issue", "story", "original", "wiki", "native", "second", "decision"
+        ] = "",
+        direction: Direction = "asc",
     ) -> Response:
         auth = await require_session(request, api=True)
         if isinstance(auth, Response):
@@ -1887,6 +1947,8 @@ def create_app(
                     state == "reviewed",
                     page,
                     state == "advisory",
+                    sort,
+                    direction,
                 )
             )
         except ProjectNotFound:
@@ -2015,6 +2077,8 @@ def create_app(
         search: str | None = Query(default=None, max_length=200),
         page: int = Query(default=1, ge=1, le=10_000),
         page_size: int = Query(default=50, ge=1, le=200),
+        sort: Literal["", "title", "project", "section", "state", "updated"] = "",
+        direction: Direction = "asc",
     ) -> Response:
         """The backlog: the work wanted, with the section each item is routed to."""
         authenticated = await require_session(request, api=True)
@@ -2033,6 +2097,8 @@ def create_app(
                 search=search,
                 page=page,
                 page_size=page_size,
+                sort=sort,
+                direction=direction,
             )
         )
 
@@ -2343,14 +2409,24 @@ def create_app(
 
     @app.get("/api/dashboard/projects/{name}/supervisor/learning")
     async def project_process_learning(
-        name: str, request: Request, page: int = Query(1, ge=1)
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        sort: Literal["", "flow", "observation", "occurrences", "evidence"] = "",
+        direction: Direction = "asc",
     ) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
         try:
             return JSONResponse(
-                await asyncio.to_thread(repo(request).toolbox.learning.summary, name, page=page)
+                await asyncio.to_thread(
+                    repo(request).toolbox.learning.summary,
+                    name,
+                    page=page,
+                    sort=sort,
+                    direction=direction,
+                )
             )
         except ProjectNotFound:
             raise HTTPException(404, "Project not found") from None
@@ -2363,6 +2439,8 @@ def create_app(
         state: str = "",
         action: str = "",
         all_projects: bool = False,
+        sort: Literal["", "title", "project", "state", "version"] = "",
+        direction: Direction = "asc",
         projects: str = Query("", max_length=2400),
     ) -> Response:
         authenticated = await require_session(request, api=True)
@@ -2375,6 +2453,8 @@ def create_app(
                 page=page,
                 state=state,
                 action=action,
+                sort=sort,
+                direction=direction,
             )
             return JSONResponse(result)
         except ProjectInvalid as error:

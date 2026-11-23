@@ -50,6 +50,16 @@ def test_published_project_review_is_executed_and_libraries_page_independently(
         second = client.get(library, params={"page": 2}).json()
         assert first["total"] > 10 and len(first["items"]) == 10
         assert not {r["key"] for r in first["items"]} & {r["key"] for r in second["items"]}
+        by_tasks = [
+            item
+            for page in (1, 2)
+            for item in client.get(
+                library, params={"page": page, "sort": "tasks", "direction": "desc"}
+            ).json()["items"]
+        ]
+        task_counts = [r["engine"]["tasks"] for r in by_tasks if r["engine"]]
+        assert task_counts == sorted(task_counts, reverse=True) and task_counts[0] > 1
+        assert len({r["key"] for r in by_tasks}) == len(by_tasks)
         filtered = client.get(
             library, params={"page": 100, "search": "evidence review", "scope_project": "falcone"}
         ).json()
@@ -72,12 +82,7 @@ def test_published_project_review_is_executed_and_libraries_page_independently(
                 and review_flows.resolve(db, other.id, "automatic")[0].key == "review-automatic"
             )
         configure(repo, client)
-        post(
-            client,
-            "planning/epics",
-            title="Reporting",
-            description="Make delivery progress visible.",
-        )
+        repo.planning.save("falcone", "epics", "Reporting", "Make delivery progress visible.", [])
         questions = []
 
         class Recorder:

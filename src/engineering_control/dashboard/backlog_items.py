@@ -38,6 +38,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.engine.library import plan_for_item
 from engineering_control.github_app import Issue
+from engineering_control.table_sort import Direction, sql_order
 
 # proposed: seen, not decided. accepted: the administrator wants it done. skipped: the
 # administrator does not. done: finished, or its issue was closed on GitHub.
@@ -179,6 +180,8 @@ class BacklogItems:
         search: str | None = None,
         page: int = 1,
         page_size: int = 50,
+        sort: str = "",
+        direction: Direction = "asc",
     ) -> dict[str, Any]:
         """Items of the active projects, newest activity first. ``section`` is a section
         key, or ``none`` for the items not routed yet."""
@@ -187,9 +190,18 @@ class BacklogItems:
         query = self._filtered(project=project, section=section, state=state, search=search)
         with self.sessions() as session:
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
+            updated = func.coalesce(BacklogItem.issue_updated_at, BacklogItem.updated_at)
+            values = {
+                "title": func.lower(BacklogItem.title),
+                "project": func.lower(ProjectRecord.name),
+                "section": func.lower(ProjectSection.name),
+                "state": BacklogItem.state,
+                "updated": updated,
+            }
+            order = sql_order(values[sort], direction) if sort else updated.desc()
             rows = session.execute(
                 query.order_by(
-                    func.coalesce(BacklogItem.issue_updated_at, BacklogItem.updated_at).desc(),
+                    order,
                     BacklogItem.created_at.desc(),
                     BacklogItem.id,
                 )

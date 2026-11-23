@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   AlertDialog,
@@ -434,6 +435,8 @@ function RemoveDialog({
 }
 
 export function AgentsTab({ project }: { project?: string } = {}) {
+  const skillOrder = useTableOrder();
+  const agentOrder = useTableOrder();
   const listing = useResource<AgentsListing>(apiUrl('agents'));
   const [agent, setAgent] = useState<AgentShown | 'new' | null>(null);
   const [skill, setSkill] = useState<SkillShown | 'new' | null>(null);
@@ -479,17 +482,22 @@ export function AgentsTab({ project }: { project?: string } = {}) {
                 <TableCaption className="sr-only">Agents</TableCaption>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Agent</TableHead>
-                    <TableHead>How it works</TableHead>
-                    <TableHead>Skills</TableHead>
-                    <TableHead>Named by</TableHead>
+                    <TableHead {...agentOrder.header('agent')}>Agent</TableHead>
+                    <TableHead {...agentOrder.header('works')}>How it works</TableHead>
+                    <TableHead {...agentOrder.header('skills')}>Skills</TableHead>
+                    <TableHead {...agentOrder.header('flows')}>Named by</TableHead>
                     <TableHead>
                       <span className="sr-only">Actions</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {agents.map((entry) => (
+                  {agentOrder.rows(agents, {
+                  agent: r => r.name,
+                  works: r => works(r.settings),
+                  skills: r => r.skill_names.join(', '),
+                  flows: r => r.used_by.map(u => u.name).join(', '),
+                }).map((entry) => (
                     <TableRow key={entry.id}>
                       <TableCell>
                         <div className="font-medium">{entry.name}</div>
@@ -571,15 +579,18 @@ export function AgentsTab({ project }: { project?: string } = {}) {
                 <TableCaption className="sr-only">Skills</TableCaption>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Skill</TableHead>
-                    <TableHead>Agents that have it</TableHead>
+                    <TableHead {...skillOrder.header('skill')}>Skill</TableHead>
+                    <TableHead {...skillOrder.header('agents')}>Agents that have it</TableHead>
                     <TableHead>
                       <span className="sr-only">Actions</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {skills.map((entry) => (
+                  {skillOrder.rows(skills, {
+                  skill: r => r.name,
+                  agents: r => r.agents.join(', '),
+                }).map((entry) => (
                     <TableRow key={entry.id}>
                       <TableCell>
                         <div className="font-medium">{entry.name}</div>

@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   AlertDialog,
@@ -84,6 +85,10 @@ export function QueueState({ queue }: { queue: Pick<Queue, 'state' | 'proposed_b
 }
 
 /** One scope's limits: two numbers, each empty for no limit, saved together. */
+function budgetLabel(row: BudgetRow) {
+  return row.scope === 'platform' ? 'The whole platform' : row.scope === 'account' ? 'Account ' + row.name : 'Project ' + (row.display_name ?? row.name);
+}
+
 function BudgetLine({ row, label, onSaved }: { row: BudgetRow; label: string; onSaved: () => void }) {
   const [atOnce, setAtOnce] = useState(row.at_once?.toString() ?? '');
   const [perDay, setPerDay] = useState(row.per_day?.toString() ?? '');
@@ -156,6 +161,7 @@ function BudgetLine({ row, label, onSaved }: { row: BudgetRow; label: string; on
 }
 
 function BudgetsSection() {
+  const budgetOrder = useTableOrder();
   const budgets = useResource<Budgets>(apiUrl('budgets'), 30_000);
   const data = budgets.data;
   return (
@@ -173,29 +179,18 @@ function BudgetsSection() {
           <TableCaption className="sr-only">Budgets</TableCaption>
           <TableHeader>
             <TableRow>
-              <TableHead>For</TableHead>
-              <TableHead className="w-40">At the same time</TableHead>
-              <TableHead className="w-40">In a day</TableHead>
-              <TableHead>Used</TableHead>
+              <TableHead {...budgetOrder.header('scope')}>For</TableHead>
+              <TableHead {...budgetOrder.header('atOnce')} className="w-40">At the same time</TableHead>
+              <TableHead {...budgetOrder.header('day')} className="w-40">In a day</TableHead>
+              <TableHead {...budgetOrder.header('used')}>Used</TableHead>
               <TableHead className="w-24" />
             </TableRow>
           </TableHeader>
           <TableBody>
             {data ? (
-              <>
-                <BudgetLine row={data.platform} label="The whole platform" onSaved={budgets.reload} />
-                {data.projects.map((row) => (
-                  <BudgetLine
-                    key={row.scope_id}
-                    row={row}
-                    label={`Project ${row.display_name ?? row.name}`}
-                    onSaved={budgets.reload}
-                  />
-                ))}
-                {data.accounts.map((row) => (
-                  <BudgetLine key={row.scope_id} row={row} label={`Account ${row.name}`} onSaved={budgets.reload} />
-                ))}
-              </>
+              budgetOrder.rows([data.platform, ...data.projects, ...data.accounts], {
+                scope: budgetLabel, atOnce: row => row.at_once, day: row => row.per_day, used: row => row.started_today,
+              }).map(row => <BudgetLine key={row.scope + (row.scope_id ?? '')} row={row} label={budgetLabel(row)} onSaved={budgets.reload} />)
             ) : (
               <TableRow>
                 <TableCell colSpan={5}>
@@ -279,6 +274,7 @@ function DiscardDialog({
 }
 
 export function QueuePage({project,id}: {project: string; id: string}) {
+  const entryOrder = useTableOrder();
   const path = `projects/${project}/queues/${id}`;
   const queue = useResource<QueueDetail>(apiUrl(path), 5_000);
   const [pending, setPending] = useState<string | null>(null);
@@ -403,14 +399,18 @@ export function QueuePage({project,id}: {project: string; id: string}) {
                 <TableCaption className="sr-only">Items of the queue, in order</TableCaption>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-24">Order</TableHead>
-                    <TableHead>Item</TableHead>
-                    <TableHead>State</TableHead>
+                    <TableHead {...entryOrder.header('order')} className="w-24">Order</TableHead>
+                    <TableHead {...entryOrder.header('item')}>Item</TableHead>
+                    <TableHead {...entryOrder.header('state')}>State</TableHead>
                     <TableHead className="w-12" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {data.entries.map((entry, index) => {
+                  {entryOrder.rows(data.entries, {
+                  order: r => r.position,
+                  item: r => r.title,
+                  state: r => ENTRY_STATES[r.state].label,
+                }).map((entry) => {
                     const place = waiting.findIndex((other) => other.item_id === entry.item_id);
                     const movable = editable && entry.state === 'waiting' && pending === null;
                     return (
@@ -444,7 +444,7 @@ export function QueuePage({project,id}: {project: string; id: string}) {
                             ) : (
                               <span className="inline-block w-4" />
                             )}
-                            <span className={mono}>{index + 1}</span>
+                            <span className={mono}>{entry.position}</span>
                             {movable ? (
                               <>
                                 <IconButton

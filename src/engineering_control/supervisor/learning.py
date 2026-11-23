@@ -32,6 +32,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.flow_library import WORK_KINDS
 from engineering_control.supervisor.reviews import operational_review
+from engineering_control.table_sort import Direction, ordered
 
 SAMPLE_SIZE = 50
 PATTERNS_PER_PAGE = 8
@@ -358,7 +359,9 @@ class ProcessLearning:
     def __init__(self, sessions: sessionmaker[Session]):
         self.sessions = sessions
 
-    def summary(self, name: str, *, page: int = 1) -> dict[str, Any]:
+    def summary(
+        self, name: str, *, page: int = 1, sort: str = "", direction: Direction = "asc"
+    ) -> dict[str, Any]:
         if type(page) is not int or page < 1:
             raise ProjectInvalid("Choose a positive page of process observations.")
         with self.sessions() as db:
@@ -383,6 +386,18 @@ class ProcessLearning:
                 for group in groups.values()
             ]
             signals.sort(key=lambda s: (s["occurrences"], s["at"]), reverse=True)
+            if sort:
+
+                def value(row: dict[str, Any]) -> Any:
+                    if sort == "observation":
+                        return (
+                            row["outcome"] if row["signal"] == "failure" else "Possible bottleneck"
+                        )
+                    if sort == "evidence":
+                        return len(row["examples"])
+                    return row[sort]
+
+                signals = ordered(signals, value, direction)
             controller = controller_project(db)
             return {
                 "project": name,

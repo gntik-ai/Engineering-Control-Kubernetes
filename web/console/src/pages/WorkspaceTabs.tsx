@@ -30,6 +30,9 @@ import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
 import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl, navigate, reviewUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
+import { querySort, sortParams } from '../components/table-order';
+import { LayoutSwitch, PlanningGrid, type Layout } from './PlanningGrid';
+import { NewEpicDialog } from './NewEpicDialog';
 import { PlanningHealth } from './PlanningHealth';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { RecordReview, type ReviewResult } from './PlanningReviews';
@@ -71,6 +74,8 @@ export interface PlanRow {
   connections?: {connection: string; project: string; display_name: string; kind: string | null; record: string | null; status: string; title: string | null}[];
 }
 interface PlanningPage extends Paged<PlanRow> {
+  sort: string;
+  direction: string;
   page_size: number;
   requested_page: number;
   search: string;
@@ -367,9 +372,20 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const stateKey = kind === 'issues' ? 'issue_state' : 'state';
   const requestedState = query.get(stateKey);
   const view: IssueView = requestedState === 'closed' || (kind === 'issues' && requestedState === 'draft') ? requestedState : 'open';
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, [stateKey]: view }), 4000, { keepPreviousData: true });
+  const allowedSort = ['title', 'status', 'connections', ...(kind === 'epics' ? ['story_count','issue_count'] : kind === 'stories' ? ['parents','issue_count'] : ['parents'])];
+  const sort = querySort(query, allowedSort);
+  const [preferred, setPreferred] = useState<Layout>(() => {
+    try { return localStorage.getItem('planning-layout') === 'grid' ? 'grid' : 'table'; } catch { return 'table'; }
+  });
+  const layout = query.get('layout') === 'grid' ? 'grid' : query.get('layout') === 'table' ? 'table' : preferred;
+  function setLayout(mode: Layout) {
+    setPreferred(mode);
+    try { localStorage.setItem('planning-layout',mode); } catch { /* The URL retains the choice. */ }
+    setQuery({ layout: mode });
+  }
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, [stateKey]: view, ...sortParams(sort) }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && data.state === view;
+  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && data.state === view && data.sort === (sort?.columnId ?? '') && data.direction === (sort?.direction === 'descending' ? 'desc' : 'asc');
   const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
   const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
@@ -431,7 +447,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const rowLocked = (row: PlanRow) => Boolean(changingPage || row.review === 'awaiting_stage' || (row.proposal && data?.busy));
   const columns: DataTableColumn<PlanRow>[] = [
     {
-      id: 'title', header: 'Title', sortable: false, accessor: (record) => record.title,
+      id: 'title', header: 'Title', sortable: true, accessor: (record) => record.title,
       className: 'min-w-40 max-w-lg whitespace-normal align-top',
       cell: (record) => {
         const targeted = foundRecord && (record.id === focus || record.automatic_review?.id === focus);
@@ -455,7 +471,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   ];
   if (kind !== 'epics') {
     columns.push({
-      id: 'parents', header: kind === 'stories' ? 'Epics' : 'User Stories', sortable: false,
+      id: 'parents', header: kind === 'stories' ? 'Epics' : 'User Stories', sortable: true,
       className: 'max-w-xs whitespace-normal align-top',
       cell: (record) => (
         <ul>
@@ -476,15 +492,15 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     });
   }
   if (kind === 'epics') {
-    columns.push({ id: 'story_count', header: 'User Stories', sortable: false,
+    columns.push({ id: 'story_count', header: 'User Stories', sortable: true,
       className: 'align-top tabular-nums', accessor: row => row.story_count });
   }
   if (kind !== 'issues') {
-    columns.push({ id: 'issue_count', header: 'Issues', sortable: false,
+    columns.push({ id: 'issue_count', header: 'Issues', sortable: true,
       className: 'align-top tabular-nums', accessor: row => row.issue_count });
   }
-  if (kind === 'issues' || rows?.some(r => r.connections?.length)) {
-    columns.push({ id: 'connections', header: 'Connected projects', sortable: false, className: 'min-w-32 whitespace-normal align-top',
+  if (kind === 'issues' || sort?.columnId === 'connections' || rows?.some(r => r.connections?.length)) {
+    columns.push({ id: 'connections', header: 'Connected projects', sortable: true, className: 'min-w-32 whitespace-normal align-top',
       cell: row => <ul className="grid gap-1">{(row.connections??[]).map((l,i) =>
         <li key={l.connection + i}><Link className="rounded bg-accent px-2 py-0.5 text-xs" href={connectionsUrl(project,l.connection)}>{l.display_name}</Link>
           {l.kind && l.record && <div><Link underline="always" href={recordUrl(l.project,l.kind,l.record)}>{l.title || 'View linked record'}</Link></div>}
@@ -492,7 +508,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   }
   columns.push(
     {
-      id: 'status', header: 'Status', sortable: false, className: 'align-top',
+      id: 'status', header: 'Status', sortable: true, className: 'align-top',
       cell: (record) => (
         <>
           {record.review === 'closed_draft' ? 'Closed locally' : record.proposal || record.review === 'pending' ? 'Proposal' : kind !== 'issues' || record.review === 'approved' ? 'Approved' : record.review === 'publishing' ? 'Syncing' : 'Linked'}
@@ -551,12 +567,23 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       <DataTable
         className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
         caption={sections[kind]}
-        rows={rows ?? []} columns={columns}
+        rows={rows ?? []} columns={columns} sort={sort}
+        renderGrid={layout === 'grid' ? records => <PlanningGrid rows={records} columns={columns} label={sections[kind]} /> : undefined}
         selectionMode="none" showColumnMenu={false} showDensityToggle={false}
         showQuickFilter quickFilter={search} quickFilterDebounceMs={350}
         labels={{ quickFilter: (caption) => 'Search ' + caption }}
         toolbar={
-          <div className="ms-auto flex flex-wrap gap-2">
+          <div className="ms-auto flex flex-wrap items-center gap-2">
+            <LayoutSwitch value={layout} change={setLayout} />
+            {layout === 'grid' && <>
+              <SimpleSelect aria-label="Sort grid by" size="sm" value={sort?.columnId ?? 'default'}
+                items={[{ value: 'default', label: 'Default order' }, ...columns.filter(c => c.sortable).map(c => ({ value: c.id, label: c.header }))]}
+                onValueChange={id => setQuery({ sort: id === 'default' ? null : id, direction: null, page: null, record: null, epic: null })} />
+              {sort && <Button size="sm" variant="ghost" aria-label="Reverse sort direction"
+                onClick={() => setQuery({ direction: sort.direction === 'ascending' ? 'desc' : 'asc', page: null, record: null, epic: null })}>
+                {sort.direction === 'ascending' ? 'Ascending' : 'Descending'}
+              </Button>}
+            </>}
             {kind === 'issues' && <>
               <ConnectionFilter project={project} value={connected}/>
               <Button size="sm" variant="secondary" disabled={refreshIssues.pending} loading={refreshIssues.pending} onClick={() => void refreshIssues.submit()}>Refresh from GitHub</Button>
@@ -578,6 +605,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         rowCount={currentFilter ? data.total : 0}
         page={data?.page ?? page} pageSize={data?.page_size ?? pageSize} pageSizeOptions={pageSizes}
         onQueryChange={(next) => setQuery({
+          ...sortParams(next.sort),
           search: (next.quickFilter ?? '').trim().slice(0, 200),
           page: pageParam(next.page), page_size: next.pageSize === 10 ? null : String(next.pageSize), epic: null, record: null,
         })}
@@ -626,7 +654,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
           )}
         </Confirm>
       )}
-      {editor && (
+      {editor && kind === 'epics' && !editor.row && <NewEpicDialog path={path} close={() => setEditor(null)}
+        saved={() => { if (view === 'closed') setQuery({ state: null, page: null, epic: null, record: null, search: null }); reload(); }} />}
+      {editor && (kind !== 'epics' || editor.row) && (
         <RecordEditor
           kind={kind}
           path={path}

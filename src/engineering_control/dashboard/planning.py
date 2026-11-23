@@ -27,6 +27,7 @@ from sqlalchemy import (
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import FromClause
 
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import (
@@ -55,7 +56,9 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.workspace_publishing import CLOSE_ISSUE, confirm_classification
 from engineering_control.db.models import (
     BacklogItem,
+    ConnectionFinding,
     PlanningReview,
+    ProjectConnection,
     ProjectEpic,
     ProjectIssueStory,
     ProjectRecord,
@@ -66,6 +69,7 @@ from engineering_control.db.models import (
     WorkspaceImport,
     WorkspaceSource,
 )
+from engineering_control.table_sort import Direction, sql_order
 
 Kind = Literal["epics", "stories", "issues"]
 PlanningState = Literal["open", "closed"]
@@ -360,25 +364,22 @@ def _state_bucket(rows: Subquery, kind: Kind) -> ColumnElement[str]:
     )
 
 
-def _child_counts(
-    session: Session, project: UUID, kind: Kind, keys: list[UUID]
-) -> dict[UUID, tuple[int, int]]:
-    """Count established relationships for the displayed parents across all child states."""
-    if kind == "issues" or not keys:
-        return {}
+def _child_totals(project: UUID, kind: Kind, keys: list[UUID] | None = None) -> Select[Any]:
     story = ProjectUserStory
     member = select(story.id.label("story_id")).where(
         story.project_id == project, story.archived_at.is_(None)
     )
     if kind == "epics":
         link = ProjectStoryEpic
-        member = (
-            member.add_columns(link.epic_id.label("parent_id"))
-            .join(link, (link.story_id == story.id) & (link.project_id == project))
-            .where(link.epic_id.in_(keys))
+        member = member.add_columns(link.epic_id.label("parent_id")).join(
+            link, (link.story_id == story.id) & (link.project_id == project)
         )
+        if keys is not None:
+            member = member.where(link.epic_id.in_(keys))
     else:
-        member = member.add_columns(story.id.label("parent_id")).where(story.id.in_(keys))
+        member = member.add_columns(story.id.label("parent_id"))
+        if keys is not None:
+            member = member.where(story.id.in_(keys))
     members = member.cte("member_stories")
     story_ids = select(members.c.story_id)
     local_issues = (
@@ -394,13 +395,121 @@ def _child_counts(
     totals = (
         select(
             members.c.parent_id,
-            func.count(members.c.story_id.distinct()),
-            func.count(issues.c.issue_id.distinct()),
+            func.count(members.c.story_id.distinct()).label("story_count"),
+            func.count(issues.c.issue_id.distinct()).label("issue_count"),
         )
         .outerjoin(issues, issues.c.story_id == members.c.story_id)
         .group_by(members.c.parent_id)
     )
-    return {key: (stories, issues_count) for key, stories, issues_count in session.execute(totals)}
+    return totals
+
+
+def _child_counts(
+    session: Session, project: UUID, kind: Kind, keys: list[UUID]
+) -> dict[UUID, tuple[int, int]]:
+    if kind == "issues" or not keys:
+        return {}
+    return {
+        key: (stories, issues)
+        for key, stories, issues in session.execute(_child_totals(project, kind, keys))
+    }
+
+
+def _json_parents(session: Session, rows: Subquery) -> tuple[Any, ColumnElement[Any]]:
+    if session.get_bind().dialect.name == "postgresql":
+        entries = func.json_array_elements_text(rows.c.parents).table_valued("value")
+        # Earlier proposals may carry repository identifiers alongside UUIDs.
+        uuid_text = r"^(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$"
+        return entries, case((entries.c.value.op("~*")(uuid_text), sql_cast(entries.c.value, Uuid)))
+    entries = func.json_each(rows.c.parents).table_valued("value")
+    return entries, func.replace(entries.c.value, "-", "")
+
+
+def _order_value(db: Session, rows: Subquery, pid: UUID, kind: Kind, sort: str) -> Any:
+    if sort == "title":
+        return func.lower(rows.c.title)
+    if sort == "status":
+        return case(
+            (rows.c.review == "closed_draft", "closed locally"),
+            (rows.c.proposal | (rows.c.review == "pending"), "proposal"),
+            (rows.c.review == "approved", "approved"),
+            (rows.c.review == "publishing", "syncing"),
+            else_="linked",
+        )
+    if sort not in ("parents", "connections") or (sort == "parents" and kind == "epics"):
+        raise ProjectInvalid("This column cannot be sorted in this table.")
+    record: ColumnElement[Any] = rows.c.id
+    if kind == "issues":
+        mirror = (
+            select(BacklogItem.id)
+            .join(ProjectRecord, ProjectRecord.id == BacklogItem.project_id)
+            .where(
+                BacklogItem.project_id == pid,
+                BacklogItem.issue_number == rows.c.number,
+                func.lower(BacklogItem.repository) == func.lower(ProjectRecord.source_repository),
+                BacklogItem.workspace_review.is_distinct_from("planning"),
+            )
+            .correlate(rows)
+            .limit(1)
+            .scalar_subquery()
+        )
+        record = case((rows.c.proposal, mirror), else_=rows.c.id)
+    f, c = ConnectionFinding, ProjectConnection
+    outgoing = f.source_project == pid
+    peer = case((c.first_id == pid, c.second_id), else_=c.first_id)
+    relation = (
+        select(func.min(func.lower(ProjectRecord.display_name)))
+        .select_from(f)
+        .join(c, c.id == f.connection_id)
+        .join(ProjectRecord, ProjectRecord.id == peer)
+        .where(
+            (c.first_id == pid) | (c.second_id == pid),
+            c.archived_at.is_(None),
+            ProjectRecord.archived_at.is_(None),
+            f.status.in_(("approved", "pending")),
+            (f.action == "link") | ((f.action == "create") & f.target_id.is_not(None)),
+            case((outgoing, f.source_kind), else_=f.target_kind) == kind,
+            case((outgoing, f.source_id), else_=f.target_id) == record,
+        )
+        .correlate(rows)
+    )
+    if sort == "connections":
+        return relation.scalar_subquery()
+    parent = ProjectEpic if kind == "stories" else ProjectUserStory
+    child, parent_id, link = _parent_links(kind)
+    local: ColumnElement[Any] = (
+        select(func.min(func.lower(parent.title)))
+        .select_from(link)
+        .join(parent, parent.id == parent_id)
+        .where(link.project_id == pid, child == record, parent.archived_at.is_(None))
+        .correlate(rows)
+        .scalar_subquery()
+    )
+    entries, value = _json_parents(db, rows)
+    proposed = (
+        select(func.min(func.lower(parent.title)))
+        .select_from(entries)
+        .join(parent, parent.id == value)
+        .where(parent.project_id == pid, parent.archived_at.is_(None))
+        .correlate(rows)
+        .scalar_subquery()
+    )
+    if kind == "issues":
+        external = (
+            relation.join(
+                ProjectUserStory,
+                ProjectUserStory.id == case((outgoing, f.target_id), else_=f.source_id),
+            )
+            .where(
+                f.status == "approved",
+                (case((outgoing, f.target_kind), else_=f.source_kind) == "stories"),
+                ProjectUserStory.archived_at.is_(None),
+            )
+            .with_only_columns(func.min(func.lower(ProjectUserStory.title)))
+            .scalar_subquery()
+        )
+        local = case((local.is_(None), external), (external < local, external), else_=local)
+    return case((rows.c.proposal, func.coalesce(proposed, local)), else_=local)
 
 
 def _search_matches(
@@ -427,13 +536,7 @@ def _search_matches(
 
     # Saved records have link rows. Pending import proposals still carry a JSON array
     # of UUID strings. Match both against active parents before paging the results.
-    if session.get_bind().dialect.name == "postgresql":
-        entries = func.json_array_elements_text(rows.c.parents).table_valued("value")
-        value: ColumnElement[Any] = sql_cast(entries.c.value, Uuid)
-    else:
-        entries = func.json_each(rows.c.parents).table_valued("value")
-        # SQLAlchemy stores SQLite UUID columns as 32 hex digits without hyphens.
-        value = func.replace(entries.c.value, "-", "")
+    entries, value = _json_parents(session, rows)
     proposed = select(1).select_from(entries).where(value.in_(parents)).correlate(rows).exists()
     return match | (~rows.c.proposal & rows.c.id.in_(saved)) | (rows.c.proposal & proposed)
 
@@ -467,6 +570,8 @@ class PlanningRecords:
         connected: str = "",
         issue_state: IssueView | None = None,
         state: PlanningState | None = None,
+        sort: str = "",
+        direction: Direction = "asc",
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -518,7 +623,21 @@ class PlanningRecords:
             if view:
                 scope = bucket == view
                 matches = matches & scope
-            ordering = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+            ordering: tuple[Any, ...] = (rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
+            source: FromClause = rows
+            if sort in ("story_count", "issue_count"):
+                if kind == "issues" or (sort == "story_count" and kind != "epics"):
+                    raise ProjectInvalid("This column cannot be sorted in this table.")
+                totals = _child_totals(project.id, kind).subquery()
+                source = rows.outerjoin(
+                    totals, (totals.c.parent_id == rows.c.id) & ~rows.c.proposal
+                )
+                ordering = (sql_order(func.coalesce(totals.c[sort], 0), direction), rows.c.id)
+            elif sort:
+                ordering = (
+                    sql_order(_order_value(session, rows, project.id, kind, sort), direction),
+                    rows.c.id,
+                )
             # Stage progression covers every view. Bulk approval covers the selected state.
             total, pending, proposed = session.execute(
                 select(
@@ -537,6 +656,7 @@ class PlanningRecords:
                         rows.c.proposal,
                         func.row_number().over(order_by=ordering).label("position"),
                     )
+                    .select_from(source)
                     .where(scope)
                     .subquery()
                 )
@@ -548,6 +668,7 @@ class PlanningRecords:
                 dict(record)
                 for record in session.execute(
                     select(rows)
+                    .select_from(source)
                     .where(matches)
                     .order_by(*ordering)
                     .offset((page - 1) * page_size)
@@ -609,7 +730,13 @@ class PlanningRecords:
                         else item["id"]
                     )
                     item["parents"] = list(dict.fromkeys([*(item["parents"] or []), *linked[key]]))
-                ids = {UUID(uid) for item in items for uid in item["parents"]}
+                ids: set[UUID] = set()
+                for item in items:
+                    for uid in item["parents"]:
+                        try:
+                            ids.add(UUID(uid))
+                        except (ValueError, AttributeError, TypeError):
+                            continue
                 if ids:
                     parent_model = ProjectEpic if kind == "stories" else ProjectUserStory
                     parents = {
@@ -730,6 +857,8 @@ class PlanningRecords:
                 "page": page,
                 "page_size": page_size,
                 "requested_page": requested_page,
+                "sort": sort,
+                "direction": direction,
                 "search": search,
                 "epic": str(epic) if epic else None,
                 "record": str(record) if record else None,

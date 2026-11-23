@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   AlertDialog,
@@ -403,6 +404,7 @@ function BatchTrialDialog({
 /** Ask a model of the account the same long question again, and show what the provider
  * read from its cache: whether caching works for the way the platform asks. */
 function CacheTrialDialog({ account, open, onOpenChange, onSaved }: DialogProps & { account: Account }) {
+  const trialOrder = useTableOrder();
   const models = account.models ?? [];
   const [model, setModel] = useState(models[0] ?? '');
   const [shown, setShown] = useState<CacheTrial | null>(null);
@@ -471,15 +473,21 @@ function CacheTrialDialog({ account, open, onOpenChange, onSaved }: DialogProps 
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Asked</TableHead>
-                      <TableHead>Read new</TableHead>
-                      <TableHead>Of that, kept</TableHead>
-                      <TableHead>Read from cache</TableHead>
-                      <TableHead>Written</TableHead>
+                      <TableHead {...trialOrder.header('what')}>Asked</TableHead>
+                      <TableHead {...trialOrder.header('input')}>Read new</TableHead>
+                      <TableHead {...trialOrder.header('write')}>Of that, kept</TableHead>
+                      <TableHead {...trialOrder.header('cache')}>Read from cache</TableHead>
+                      <TableHead {...trialOrder.header('output')}>Written</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {shown.asked.map((entry, index) => (
+                    {trialOrder.rows(shown.asked, {
+                  what: r => r.what,
+                  input: r => r.input,
+                  write: r => r.cache_write,
+                  cache: r => r.cached,
+                  output: r => r.output,
+                }).map((entry, index) => (
                       <TableRow key={index}>
                         <TableCell>{entry.what}</TableCell>
                         <TableCell className={mono}>{number(entry.input)}</TableCell>
@@ -833,6 +841,7 @@ function AccountRow({
 }
 
 export function AccountsPage() {
+  const accountOrder = useTableOrder();
   // While an account is being tried the page looks again every few seconds.
   const [busy, setBusy] = useState(false);
   const accounts = useResource<Accounts>(apiUrl('accounts'), busy ? 4_000 : 30_000);
@@ -938,11 +947,11 @@ export function AccountsPage() {
               <TableCaption className="sr-only">Accounts</TableCaption>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Account</TableHead>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>At once</TableHead>
-                  <TableHead>Last used</TableHead>
+                  <TableHead {...accountOrder.header('account')}>Account</TableHead>
+                  <TableHead {...accountOrder.header('provider')}>Provider</TableHead>
+                  <TableHead {...accountOrder.header('state')}>State</TableHead>
+                  <TableHead {...accountOrder.header('atOnce')}>At once</TableHead>
+                  <TableHead {...accountOrder.header('used')}>Last used</TableHead>
                   <TableHead>
                     <span className="sr-only">Actions</span>
                   </TableHead>
@@ -951,7 +960,13 @@ export function AccountsPage() {
               <TableBody>
                 <Rows resource={accounts} columns={6} empty="No accounts yet">
                   {(items) =>
-                    items.map((account) => (
+                    accountOrder.rows(items, {
+                  account: r => r.name,
+                  provider: r => r.provider_name,
+                  state: r => r.paused ? 'Paused' : r.state,
+                  atOnce: r => r.kind === 'api' ? null : r.max_concurrent,
+                  used: r => r.last_used_at,
+                }).map((account) => (
                       <AccountRow
                         key={account.id}
                         account={account}

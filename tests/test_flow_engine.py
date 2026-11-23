@@ -65,6 +65,7 @@ def test_the_platforms_own_flows_are_documents_that_pass_every_rule() -> None:
         "ui-audit",
         "ux-audit",
         "review-description",
+        "review-epic-intake",
         "review-epics",
         "review-stories",
         "review-issues",

@@ -48,6 +48,7 @@ from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.validate import errors
 from engineering_control.models import decisions, openrouter
 from engineering_control.models.service import ModelError, Models, Question, Reply
+from engineering_control.table_sort import Direction, ordered
 
 Row = dict[str, Any]
 LIVE = ("queued", "calling", "paused", "stopping", "held")
@@ -201,7 +202,9 @@ def passage(src: Row, result: Row, key: str) -> Row:
     }
 
 
-def selection(src: Row, result: Row, page: int, search: str) -> Row:
+def selection(
+    src: Row, result: Row, page: int, search: str, sort: str = "", direction: Direction = "asc"
+) -> Row:
     pairs = result.get("pairs", [])
     records = src["records"]
     q = search.strip().casefold()
@@ -214,6 +217,16 @@ def selection(src: Row, result: Row, page: int, search: str) -> Row:
         return False
 
     shown = [p for p in pairs if fits(p)] if q else pairs
+    if sort:
+        shown = ordered(
+            shown,
+            lambda p: (
+                records[p[sort]]["title"]
+                if sort in ("issue", "story")
+                else p["why" if sort == "reason" else sort]
+            ),
+            direction,
+        )
     return {
         "selected": len(pairs),
         "eligible": result.get("eligible", 0),
@@ -246,6 +259,8 @@ def preview(
     model: str,
     page: int,
     search: str,
+    sort: str = "",
+    direction: Direction = "asc",
 ) -> Row:
     with sessions() as db:
         project = active_project(db, name)
@@ -266,7 +281,7 @@ def preview(
             )
             result["steps"].append({"id": n["id"], "task": n["task"], **values})
     return {
-        **selection(src, result, page, search),
+        **selection(src, result, page, search, sort, direction),
         "flow": doc.name,
         "version": v,
         "model_calls": 0,

@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   Badge,
@@ -254,6 +255,9 @@ function TaskDialog({
 const flowsOf = (uses: TaskUse[]) => uses.map((use) => use.name).join(', ');
 
 export function TasksTab() {
+  const deletedOrder = useTableOrder();
+  const platformOrder = useTableOrder();
+  const mineOrder = useTableOrder();
   const library = useResource<TaskLibrary>(apiUrl('tasks'));
   const catalogue = useResource<FlowCatalogue>(apiUrl('flows/catalogue'));
   const [editing, setEditing] = useState<Editing | null>(null);
@@ -392,9 +396,9 @@ export function TasksTab() {
               <TableCaption className="sr-only">Your tasks</TableCaption>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Task</TableHead>
-                  <TableHead>Kind</TableHead>
-                  <TableHead>Used by</TableHead>
+                  <TableHead {...mineOrder.header('task')}>Task</TableHead>
+                  <TableHead {...mineOrder.header('kind')}>Kind</TableHead>
+                  <TableHead {...mineOrder.header('uses')}>Used by</TableHead>
                   <TableHead>
                     <span className="sr-only">What can be done</span>
                   </TableHead>
@@ -410,7 +414,11 @@ export function TasksTab() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  mine.map((task) => (
+                  mineOrder.rows(mine, {
+                  task: r => r.name,
+                  kind: r => titleOf(r.task),
+                  uses: r => r.used_by.map(u => u.name).join(', '),
+                }).map((task) => (
                     <TableRow key={task.id}>
                       <TableCell className="max-w-md">
                         <span className="font-medium">{task.name}</span>
@@ -474,25 +482,25 @@ export function TasksTab() {
               <TableCaption className="sr-only">The platform’s tasks</TableCaption>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Task</TableHead>
-                  <TableHead>Runs</TableHead>
-                  <TableHead>Ends with</TableHead>
-                  <TableHead>Used by</TableHead>
+                  <TableHead {...platformOrder.header('task')}>Task</TableHead>
+                  <TableHead {...platformOrder.header('runs')}>Runs</TableHead>
+                  <TableHead {...platformOrder.header('outcomes')}>Ends with</TableHead>
+                  <TableHead {...platformOrder.header('uses')}>Used by</TableHead>
                   <TableHead>
                     <span className="sr-only">Actions</span>
                   </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {groups.flatMap((group) =>
-                  kept
-                    .filter((kind) => kind.group === group)
-                    .map((kind) => (
+                {platformOrder.rows(groups.flatMap(group => kept.filter(kind => kind.group === group)), {
+                  task: r => r.title, runs: r => WHERE[r.where], outcomes: r => r.outcomes.join(', '),
+                  uses: r => r.used_by.map(use => use.name).join(', '),
+                }).map((kind) => (
                       <TableRow key={kind.key}>
                         <TableCell className="max-w-md">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-medium">{kind.title}</span>
-                            <span className="text-[11px] tracking-wide text-muted-foreground uppercase">{group}</span>
+                            <span className="text-[11px] tracking-wide text-muted-foreground uppercase">{kind.group}</span>
                           </div>
                           <div className="text-[12px] text-muted-foreground">{kind.summary}</div>
                           {canBeOwn(kind) ? (
@@ -541,8 +549,7 @@ export function TasksTab() {
                           )}
                         </TableCell>
                       </TableRow>
-                    )),
-                )}
+                  ))}
               </TableBody>
             </Table>
           </TableFrame>
@@ -564,15 +571,18 @@ export function TasksTab() {
                 <TableCaption className="sr-only">Deleted tasks of the platform</TableCaption>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Task</TableHead>
-                    <TableHead>Used by</TableHead>
+                    <TableHead {...deletedOrder.header('task')}>Task</TableHead>
+                    <TableHead {...deletedOrder.header('uses')}>Used by</TableHead>
                     <TableHead>
                       <span className="sr-only">Actions</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {deleted.map((kind) => (
+                  {deletedOrder.rows(deleted, {
+                  task: r => r.title,
+                  uses: r => r.used_by.map(u => u.name).join(', '),
+                }).map((kind) => (
                     <TableRow key={kind.key}>
                       <TableCell className="max-w-md">
                         <div className="flex flex-wrap items-center gap-2">

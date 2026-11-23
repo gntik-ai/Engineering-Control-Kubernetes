@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Badge,
   Button,
@@ -46,6 +47,7 @@ function shown(batch: Batch): { label: string; tone: Tone } {
 /** The batches that are out at a provider, and the ones that ended last. Nothing is
  * shown while no question was ever asked in a batch. */
 export function BatchesCard() {
+  const order = useTableOrder();
   const batches = useResource<Batches>(apiUrl('batches'), 30_000);
   const [removing, setRemoving] = useState<Batch | null>(null);
   const items = batches.data?.items ?? [];
@@ -66,19 +68,26 @@ export function BatchesCard() {
           <TableCaption className="sr-only">Batches</TableCaption>
           <TableHeader>
             <TableRow>
-              <TableHead>For</TableHead>
-              <TableHead>Asked at</TableHead>
-              <TableHead>State</TableHead>
-              <TableHead>Answered</TableHead>
-              <TableHead>Handed in</TableHead>
-              <TableHead>Ended, or waited for until</TableHead>
+              <TableHead {...order.header('work')}>For</TableHead>
+              <TableHead {...order.header('provider')}>Asked at</TableHead>
+              <TableHead {...order.header('state')}>State</TableHead>
+              <TableHead {...order.header('answered')}>Answered</TableHead>
+              <TableHead {...order.header('submitted')}>Handed in</TableHead>
+              <TableHead {...order.header('ended')}>Ended, or waited for until</TableHead>
               <TableHead>
                 <span className="sr-only">Actions</span>
               </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {items.map((batch) => {
+            {order.rows(items, {
+                  work: r => r.run ?? (r.run_id ? 'A run' : 'A trial, for no run'),
+                  provider: r => r.provider_name,
+                  state: r => shown(r).label,
+                  answered: r => r.answered,
+                  submitted: r => r.submitted_at ?? r.created_at,
+                  ended: r => r.ended_at ?? r.deadline_at,
+                }).map((batch) => {
               const state = shown(batch);
               return (
                 <TableRow key={batch.id}>

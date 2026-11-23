@@ -1,3 +1,4 @@
+import { sortParams, useTableOrder } from '../components/table-order';
 import { Alert, Button, Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Tabs, TabsList, TabsTab, Textarea } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource, type FlowDocument } from '../api';
@@ -50,10 +51,10 @@ function DependencySources({items}: {items?: Dependency[]}) {
 }
 
 const columns: DataTableColumn<Pair>[] = [
-  {id:'issue',header:'Technical issue',accessor:r=>r.issue.title,sortable:false,cell:r=><Passage row={r.issue}/>},
-  {id:'story',header:'User Story',accessor:r=>r.story.title,sortable:false,cell:r=><Passage row={r.story}/>},
-  {id:'reason',header:'Why selected',accessor:r=>r.reason,sortable:false,cell:r=><>{r.reason}<DependencySources items={r.prerequisites}/></>},
-  {id:'decision',header:'Saved decision',accessor:r=>r.decision,sortable:false},
+  {id:'issue',header:'Technical issue',accessor:r=>r.issue.title,sortable:true,cell:r=><Passage row={r.issue}/>},
+  {id:'story',header:'User Story',accessor:r=>r.story.title,sortable:true,cell:r=><Passage row={r.story}/>},
+  {id:'reason',header:'Why selected',accessor:r=>r.reason,sortable:true,cell:r=><>{r.reason}<DependencySources items={r.prerequisites}/></>},
+  {id:'decision',header:'Saved decision',accessor:r=>r.decision,sortable:true},
 ];
 
 export function EvidencePanel({project, draft}: {project:string; draft?: FlowDocument}) {
@@ -63,6 +64,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
   const data=status.data;
   const run=data?.run;
   useEffect(()=>setPoll(!!run && ['queued','calling','stopping'].includes(run.state)),[run?.state]);
+  const ordering = useTableOrder();
   const [pick,setPick]=useState('');
   const fallback=data?.models.find(m=>data.configured && keyOf(m)===keyOf(data.configured)) ?? data?.models.find(m=>m.provider==='anthropic') ?? data?.models[0];
   const chosen=data?.models.find(m=>keyOf(m)===pick) ?? fallback;
@@ -81,12 +83,12 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     if(!query)return;
     let alive=true;
     setWaiting(true);
-    postJson<Preview>(path+'/preview',{document:draft,provider:chosen?.provider,model:chosen?.model,page:query.page,search:query.search},{quiet:true})
+    postJson<Preview>(path+'/preview',{document:draft,provider:chosen?.provider,model:chosen?.model,page:query.page,search:query.search,...sortParams(ordering.sort)},{quiet:true})
       .then(value=>{if(alive){setView(value);setProblem('');}})
       .catch(e=>{if(alive)setProblem(e instanceof Error?e.message:'Preview failed.');})
       .finally(()=>{if(alive)setWaiting(false);});
     return ()=>{alive=false;};
-  },[path,query,draft,chosen?.provider,chosen?.model]);
+  },[path,query,draft,chosen?.provider,chosen?.model,ordering.sort]);
   const [attempt,setAttempt]=useState(()=>crypto.randomUUID());
   async function change(action?:string, candidate?:string){
     if(busy)return;
@@ -141,7 +143,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     {view && <>
       <p className="text-sm">{view.flow} · {view.selected.toLocaleString()} selected of {view.eligible.toLocaleString()} eligible pairs · {view.reusable} reusable · {view.external} across projects · 0 model calls</p>
       <p className="text-xs text-muted-foreground">{view.steps.map(s=>labels[s.task]).join(' → ')}</p>
-      <DataTable caption="Related records" rows={view.items} columns={!draft && data?.decision_model ? [...columns, {id:'review',header:'Decision review',sortable:false,cell:r=><Button size="sm" variant="secondary" disabled={busy || !!(run && active.includes(run.state)) || unavailable || r.decision!=='unchecked' || Number(cap)<=0 || Number(cap)>2000000} onClick={()=>void change(undefined,r.id)}>Review this pair</Button>}] : columns} getRowId={r=>r.id}
+      <DataTable sort={ordering.sort} onSortChange={ordering.change} caption="Related records" rows={view.items} columns={!draft && data?.decision_model ? [...columns, {id:'review',header:'Decision review',sortable:false,cell:r=><Button size="sm" variant="secondary" disabled={busy || !!(run && active.includes(run.state)) || unavailable || r.decision!=='unchecked' || Number(cap)<=0 || Number(cap)>2000000} onClick={()=>void change(undefined,r.id)}>Review this pair</Button>}] : columns} getRowId={r=>r.id}
         selectionMode="none" showQuickFilter showColumnMenu={false} quickFilter={query?.search??''} quickFilterDebounceMs={350}
         paginationMode="server" paginated={view.total>0} page={view.page} pageSize={10} pageSizeOptions={[10]} rowCount={view.total}
         loading={waiting} labels={{quickFilter:()=>'Search issues or Stories'}} emptyState="No related records." noResultsState="No matching records."
@@ -226,19 +228,20 @@ function ReviewDialog({path, close, saved}: {path:string; close:()=>void; saved:
 function VerdictReviews({path,latest}: {path:string; latest:string}) {
   const [state,setState]=useState('pending');
   const [page,setPage]=useState(1);
+  const ordering=useTableOrder();
   const [opened,setOpened]=useState('');
-  const list=useResource<{total:number;page:number;items:ReviewRow[]}>(apiUrl(path,{state,page}));
+  const list=useResource<{total:number;page:number;items:ReviewRow[]}>(apiUrl(path,{state,page,...sortParams(ordering.sort)}));
   const reload=list.reload;
   const previous=useRef(latest);
   useEffect(()=>{if(previous.current!==latest){previous.current=latest;reload();}},[latest,reload]);
   const columns:DataTableColumn<ReviewRow>[]=[
-    {id:'issue',header:'Technical issue',accessor:r=>r.issue,sortable:false},
-    {id:'story',header:'User Story',accessor:r=>r.story,sortable:false},
-    {id:'original',header:'Original',accessor:r=>scopeText(r.original),sortable:false},
-    {id:'wiki',header:'Wiki',accessor:r=>scopeText(r.wiki),sortable:false},
-    {id:'native',header:'Decisions',accessor:r=>scopeText(r.native),sortable:false},
-    {id:'second',header:'Second opinion',accessor:r=>r.second_opinion ? scopeText(r.second_opinion) : '—',sortable:false},
-    ...(state==='reviewed'?[{id:'decision',header:'Your judgment',accessor:(r:ReviewRow)=>scopeText(r.decision),sortable:false}]:[]),
+    {id:'issue',header:'Technical issue',accessor:r=>r.issue,sortable:true},
+    {id:'story',header:'User Story',accessor:r=>r.story,sortable:true},
+    {id:'original',header:'Original',accessor:r=>scopeText(r.original),sortable:true},
+    {id:'wiki',header:'Wiki',accessor:r=>scopeText(r.wiki),sortable:true},
+    {id:'native',header:'Decisions',accessor:r=>scopeText(r.native),sortable:true},
+    {id:'second',header:'Second opinion',accessor:r=>r.second_opinion ? scopeText(r.second_opinion) : '—',sortable:true},
+    ...(state==='reviewed'?[{id:'decision',header:'Your judgment',accessor:(r:ReviewRow)=>scopeText(r.decision),sortable:true}]:[]),
     {id:'review',header:'Action',sortable:false,cell:r=><Button size="sm" variant="secondary" onClick={()=>setOpened(r.id)}>Review</Button>},
   ];
   return <div className="grid gap-2 border-t border-border pt-3">
@@ -248,7 +251,7 @@ function VerdictReviews({path,latest}: {path:string; latest:string}) {
       <TabsList aria-label="Verdict review status"><TabsTab value="pending">Pending</TabsTab><TabsTab value="advisory">Advisory results</TabsTab><TabsTab value="reviewed">Reviewed</TabsTab></TabsList>
     </Tabs>
     {list.error && <Alert tone="warning" title={list.error}/>}
-    {list.data && <DataTable caption="Model verdicts" rows={list.data.items} columns={columns} getRowId={r=>r.id}
+    {list.data && <DataTable sort={ordering.sort} onSortChange={ordering.change} caption="Model verdicts" rows={list.data.items} columns={columns} getRowId={r=>r.id}
       selectionMode="none" showColumnMenu={false} paginationMode="server" paginated={list.data.total>10}
       page={list.data.page} pageSize={10} pageSizeOptions={[10]} rowCount={list.data.total} loading={list.loading}
       emptyState={state==='pending'?'No comparisons awaiting review.':state==='advisory'?'No advisory results.':'No reviewed comparisons.'} onQueryChange={q=>setPage(q.page)}/>}
