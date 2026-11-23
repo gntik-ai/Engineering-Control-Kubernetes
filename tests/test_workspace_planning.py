@@ -7,9 +7,18 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
+from engineering_control.dashboard.planning import Kind, PlanningRecords
+from engineering_control.dashboard.planning_lifecycle import Operation
 from engineering_control.dashboard.project_records import ProjectConflict
 from engineering_control.db.models import BacklogItem
 from tests.test_dashboard_web import _authenticated_client
+
+
+def confirmed(
+    planning: PlanningRecords, name: str, kind: Kind, key: UUID, operation: Operation
+) -> dict[str, Any]:
+    preview = planning.lifecycle.preview(name, kind, key, operation)
+    return planning.lifecycle.confirm(name, kind, key, operation, preview["token"])
 
 
 def test_project_planning_crud_and_pending_issues(tmp_path: Path) -> None:
@@ -46,8 +55,15 @@ def test_project_planning_crud_and_pending_issues(tmp_path: Path) -> None:
             == 404
         )
         assert post(base + f"/epics/{first}/update", title="Catalog v2").status_code == 200
-        assert post(base + f"/epics/{second}/remove").status_code == 200
-        assert post(base + f"/epics/{first}/remove").status_code == 409
+        before = client.get(base + f"/epics/{first}/impact?operation=delete").json()["token"]
+
+        def remove(kind: str, key: str) -> Any:
+            url = base + f"/{kind}/{key}"
+            token = client.get(url + "/impact?operation=delete").json()["token"]
+            return post(url + "/remove", confirmation=token)
+
+        assert remove("epics", second).status_code == 200
+        assert post(base + f"/epics/{first}/remove", confirmation=before).status_code == 409
         assert client.get(base).json()["stories"][0]["epic_ids"] == [first]
         assert (
             post(
@@ -59,7 +75,7 @@ def test_project_planning_crud_and_pending_issues(tmp_path: Path) -> None:
         draft = post(base + "/issues", title="Add receipt route", story_ids=[story, more])
         assert draft.status_code == 201
         identifier = UUID(draft.json()["id"])
-        assert post(base + f"/stories/{more}/remove").status_code == 200
+        assert remove("stories", more).status_code == 200
         assert post(base + f"/stories/{story}/remove").status_code == 409
         issue = client.get(base).json()["issues"][0]
         assert issue["story_ids"] == [story]
@@ -77,7 +93,7 @@ def test_project_planning_crud_and_pending_issues(tmp_path: Path) -> None:
         client.__exit__(None, None, None)
 
 
-def test_concurrent_removals_keep_one_epic(tmp_path: Path) -> None:
+def test_concurrent_removals_require_a_new_preview_for_changed_children(tmp_path: Path) -> None:
     client, repository = _authenticated_client(tmp_path)
     try:
         planning = repository.planning
@@ -85,12 +101,16 @@ def test_concurrent_removals_keep_one_epic(tmp_path: Path) -> None:
             UUID(planning.save("falcone", "epics", name, None, [])["id"]) for name in ("A", "B")
         ]
         planning.save("falcone", "stories", "One story", None, epics)
+        previews = {
+            key: planning.lifecycle.preview("falcone", "epics", key, "delete")["token"]
+            for key in epics
+        }
         together = Barrier(2)
 
         def remove(epic: UUID) -> bool:
             together.wait(timeout=10)
             try:
-                planning.remove("falcone", "epics", epic)
+                planning.remove("falcone", "epics", epic, previews[epic])
             except ProjectConflict:
                 return False
             return True

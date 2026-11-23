@@ -28,6 +28,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.models.service import Question, Reply
 from tests.test_dashboard_web import _authenticated_client
+from tests.test_workspace_planning import confirmed
 
 ROOT = "/api/dashboard/projects/"
 F = ROOT + "falcone/connections"
@@ -413,7 +414,7 @@ def test_references_resolve_after_import_and_links_survive_review_and_disconnect
         assert len(refreshed) == 3
         assert all(f["status"] == "pending" for f in refreshed if f["origin"] == "reference")
         assert client.get(story_page).json()["items"][0]["issue_count"] == 0
-        repo.planning.remove("falcone-serverless", "stories", story)
+        confirmed(repo.planning, "falcone-serverless", "stories", story, "delete")
         due(repo, id)
         check(repo)
         retained = next(

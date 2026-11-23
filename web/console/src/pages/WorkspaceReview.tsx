@@ -185,7 +185,7 @@ export function WorkspaceReview({
 }
 interface Action {
   id: string;
-  operation: 'create' | 'close' | 'link';
+  operation: 'create' | 'close' | 'link' | 'label' | 'close_issue';
   number: number | null;
   status: string;
   detail: string | null;
@@ -224,8 +224,11 @@ export function WorkspaceSync({ project, onSynced }: { project: string; onSynced
           key={a.id}
         >
           <div className="text-sm">
-            <span>{a.operation === 'close'
+            <span>{a.operation === 'close_issue'
+              ? (a.number ? 'Close technical Issue #' + a.number : 'Close technical Issue after publication')
+              : a.operation === 'close'
               ? 'Close planning issue #' + a.number
+              : a.operation === 'label' ? 'Apply classification to Issue #' + a.number
               : a.operation === 'link'
                 ? 'Verify linked issue #' + a.number
                 : 'Publish approved issue'}</span>
@@ -235,7 +238,7 @@ export function WorkspaceSync({ project, onSynced }: { project: string; onSynced
             size="sm"
             variant="secondary"
             loading={running === a.id}
-            disabled={!!running}
+            disabled={!!running || a.status === 'waiting'}
             onClick={() => void retry(a.id)}
           >
             Recheck

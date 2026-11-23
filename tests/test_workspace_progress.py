@@ -27,6 +27,7 @@ from engineering_control.models import openai_style
 from engineering_control.models.service import ModelError, Question, Reply
 from engineering_control.models.wire import WireError
 from tests.test_dashboard_web import PASSWORD, _authenticated_client, _csrf
+from tests.test_workspace_planning import confirmed
 from tests.test_workspace_review import ReviewModel
 
 BASE = "/api/dashboard/projects/falcone/"
@@ -661,7 +662,7 @@ def test_bulk_epics_handoff_requires_an_approved_open_epic(
     seed(repo, 0)
     epic = UUID(repo.planning.save("falcone", "epics", "Runtime", None, [])["id"])
     if not has_open_epic:
-        repo.planning.set_state("falcone", "epics", epic, "closed")
+        confirmed(repo.planning, "falcone", "epics", epic, "close")
     calls = []
 
     class Covered(ReviewModel):
@@ -775,7 +776,7 @@ def test_generate_all_issues_checks_each_story_and_leaves_local_drafts(tmp_path:
     )
     repo.planning.save("falcone", "issues", "Existing work", None, [UUID(stories[0])])
     finished = repo.planning.save("falcone", "stories", "Finished work", None, [epic])["id"]
-    repo.planning.set_state("falcone", "stories", UUID(finished), "closed")
+    confirmed(repo.planning, "falcone", "stories", UUID(finished), "close")
     with repo.sessions.begin() as db:
         row = db.scalars(select(WorkspaceImport)).one()
         row.stage = "issues"

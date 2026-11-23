@@ -248,7 +248,7 @@ function BulkDialog({
       });
       onDone(
         change.kind === 'remove'
-          ? `${result.changed.toLocaleString('en')} deleted${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} kept: a run is working on them` : ''}.`
+          ? `${result.changed.toLocaleString('en')} deleted${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} kept` : ''}.`
           : `${result.changed.toLocaleString('en')} changed${result.unchanged ? `, ${result.unchanged.toLocaleString('en')} left as they were` : ''}.`,
       );
       onOpenChange(false);
@@ -266,7 +266,7 @@ function BulkDialog({
             <DialogTitle>{what}</DialogTitle>
             <DialogDescription>
               {change?.kind === 'remove'
-                ? `This deletes every item of ${project} that the filters on the page match now: ${items}. They leave the backlog and the queues they are in; the runs that worked on them stay. An item a run is working on is kept. An issue that is still open on GitHub comes back the next time the backlog is brought in step: skip those instead to keep them out.`
+                ? `Of the ${items} matching these filters in ${project}, eligible local items will leave the backlog and their queues. Published Issues, workspace records, and items with active runs will be kept.`
                 : `This changes every item of ${project} that the filters on the page match now: ${items}. Items outside the filters are not touched.`}
             </DialogDescription>
           </DialogHeader>
@@ -431,7 +431,7 @@ function ItemRow({
       ? { label: 'Back to proposed', icon: RotateCcw, onSelect: () => void change('state', { state: 'proposed' }) }
       : null,
     item.state !== 'done' ? { label: 'Mark done', icon: Check, onSelect: () => void change('state', { state: 'done' }) } : null,
-    runActive ? null : { label: 'Delete', icon: Trash2, destructive: true, onSelect: onRemove },
+    runActive || item.issue_number || item.workspace_managed ? null : { label: 'Delete', icon: Trash2, destructive: true, onSelect: onRemove },
   ].filter((action) => action !== null);
   return (
     <TableRow>
@@ -733,12 +733,7 @@ export function BacklogPage() {
       {removing ? (
         <Confirm
           title={`Delete ${removing.title}?`}
-          about={
-            'It leaves the backlog and every queue it is in. The runs that worked on it stay in the list of runs.' +
-            (removing.issue_number && removing.issue_state !== 'closed'
-              ? ' Its issue is still open on GitHub, so it comes back the next time the backlog is brought in step: skip it instead to keep it out.'
-              : '')
-          }
+          about="It leaves the backlog and its queues. Its previous runs stay in the run history."
           action="Delete the item"
           destructive
           run={() => postJson(`items/${removing.id}/remove`)}
