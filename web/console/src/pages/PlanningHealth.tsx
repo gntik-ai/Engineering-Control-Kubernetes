@@ -3,7 +3,7 @@ import { RefreshCw } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { apiUrl, getJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { workspaceUrl } from '../router';
+import { reviewUrl, workspaceUrl } from '../router';
 
 /** What is counted of a project's planning. Every number is one the planning tables show. */
 interface Numbers {
@@ -162,7 +162,7 @@ export function PlanningHealth({ project }: { project: string }) {
                 of={`of ${whole(now.issues_open)} open issues`}
                 was={was?.orphans_open}
                 since={since}
-                href={`${home}?tab=issues`}
+                href={reviewUrl(project, 'related-work')}
               />
               <Tile
                 value={now.orphans_closed}

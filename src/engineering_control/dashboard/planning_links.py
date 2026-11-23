@@ -491,6 +491,29 @@ class PlanningLinks:
         if kind in _SPECS:
             self._in_step(name, kind, {child}, made_by="administrator")
 
+    def noted(self, name: str, kind: str, child: UUID, parent: UUID, note: Note) -> None:
+        """The link the administrator just approved is recorded with what is known of
+        it: who proposed it, why, and the passages that show it."""
+        if kind not in _SPECS:
+            return
+        self._in_step(name, kind, {child}, made_by="administrator")
+        if note.origin == "administrator":
+            return
+        with self.sessions.begin() as db:
+            project = active_project(db, name)
+            row = db.scalar(
+                select(PlanningLink).where(
+                    PlanningLink.project_id == project.id,
+                    PlanningLink.kind == _SPECS[kind].name,
+                    PlanningLink.child_id == child,
+                    PlanningLink.parent_id == parent,
+                    PlanningLink.removed_at.is_(None),
+                )
+            )
+            if row is not None:
+                row.origin, row.confirmed = note.origin, note.confirmed
+                row.reason, row.evidence, row.strength = note.reason, note.evidence, note.strength
+
     def annotate(self, name: str, kind: str, items: list[dict[str, Any]]) -> None:
         """Say of each listed record's parents who linked them and why, and which is the
         primary one. A proposal is no record yet and has none."""

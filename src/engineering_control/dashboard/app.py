@@ -33,6 +33,7 @@ from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard import (
     evidence_verdicts,
+    orphans,
     review_budget,
     review_evidence,
     review_flows,
@@ -99,6 +100,10 @@ from engineering_control.dashboard.schemas import (
     ItemStateInput,
     ManagedCoverageInput,
     NewEpicInput,
+    OrphanApproveInput,
+    OrphanLinkInput,
+    OrphanRunControlInput,
+    OrphanRunInput,
     PlainChangeInput,
     PlanningConfirmation,
     PlanningStateInput,
@@ -507,6 +512,9 @@ def create_app(
                         lambda: resolved_repository.workspace_metrics.exchange_rates,
                     )
                 )
+            )
+            keepers.append(
+                asyncio.create_task(orphans.worker(resolved_repository.sessions, app.state.models))
             )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
@@ -1475,6 +1483,7 @@ def create_app(
             "", "title", "parents", "status", "connections", "story_count", "issue_count"
         ] = "",
         direction: Direction = "asc",
+        bugs: Literal["", "only", "without"] = "",
     ) -> Response:
         try:
             listed = await asyncio.to_thread(
@@ -1491,6 +1500,7 @@ def create_app(
                 state,
                 sort,
                 direction,
+                bugs,
             )
             # Who linked each record to its parents and why, and which is the primary one.
             await asyncio.to_thread(
@@ -1567,6 +1577,96 @@ def create_app(
                 repo(request).planning_links.set_primary, name, kind, key, body.parent_id
             ),
             event="workspace.primary_parent_chosen",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/orphans")
+    async def orphans_api(
+        name: str,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+        show: Literal["", "waiting", "unanswered"] = "",
+    ) -> Response:
+        """The open issues without a User Story: each with the Stories most like it and
+        what a review answered, and the run that asks."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).orphans.listing, name, page, page_size, show)
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/orphans/runs")
+    async def orphans_run_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).orphans.start,
+                name,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.again,
+            ),
+            event="workspace.orphan_run_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/orphans/runs/{run_id}/control")
+    async def orphans_run_control_api(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).orphans.control, name, run_id, body.action
+            ),
+            event="workspace.orphan_run_controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/orphans/approve")
+    async def orphans_approve_api(name: str, request: Request) -> Response:
+        """Approve many answers at once: each links its issue or marks it a bug."""
+        return await project_change(
+            request,
+            OrphanApproveInput,
+            lambda body: asyncio.to_thread(repo(request).orphans.approve, name, body.item_ids),
+            event="workspace.orphan_answers_approved",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/orphans/{key}/link")
+    async def orphans_link_api(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanLinkInput,
+            lambda body: asyncio.to_thread(repo(request).orphans.link, name, key, body.story_id),
+            event="workspace.orphan_linked",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/orphans/{key}/bug")
+    async def orphans_bug_api(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).orphans.bug, name, key),
+            event="workspace.orphan_marked_bug",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/orphans/{key}/dismiss")
+    async def orphans_dismiss_api(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).orphans.dismiss, name, key),
+            event="workspace.orphan_answer_dismissed",
             subject=name,
         )
 

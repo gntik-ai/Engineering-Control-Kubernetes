@@ -17,6 +17,7 @@ from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
 from engineering_control.dashboard.execution_plans import ExecutionPlans
+from engineering_control.dashboard.orphans import Orphans
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_analysis import PlanningAnalysis
 from engineering_control.dashboard.planning_health import PlanningHealthRecords
@@ -116,6 +117,7 @@ class DashboardRepository:
         self.workspace_metrics = WorkspaceMetrics(self.sessions)
         self.planning_health = PlanningHealthRecords(self.sessions)
         self.planning_links = PlanningLinks(self.sessions)
+        self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

@@ -512,6 +512,32 @@ class StoryInput(EpicInput):
     epic_ids: list[UUID] = Field(default_factory=list)
 
 
+class OrphanRunInput(PlainChangeInput):
+    """A run that asks about the open issues without a User Story, within these tokens."""
+
+    provider: str = Field(min_length=1, max_length=32)
+    model: str = Field(min_length=1, max_length=200)
+    token_cap: int = Field(ge=1_000, le=5_000_000, strict=True)
+    # Ask about every one of them, also those that have an answer already.
+    again: bool = False
+
+
+class OrphanRunControlInput(PlainChangeInput):
+    action: Literal["stop", "resume", "end"]
+
+
+class OrphanLinkInput(PlainChangeInput):
+    """The User Story the administrator puts the issue under."""
+
+    story_id: UUID
+
+
+class OrphanApproveInput(PlainChangeInput):
+    """The answers to approve at once: those of these issues, or every one that can be."""
+
+    item_ids: list[UUID] | None = Field(default=None, max_length=500)
+
+
 class PrimaryParentInput(PlainChangeInput):
     """The administrator's choice of a record's primary parent, among its parents."""
 

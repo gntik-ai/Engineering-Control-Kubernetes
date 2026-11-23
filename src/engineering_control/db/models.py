@@ -860,6 +860,77 @@ class PlanningHealth(Base):
     numbers: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class OrphanRun(UUIDPrimaryKey, Timestamps, Base):
+    """One pass over a project's open issues that have no User Story (migration 0072):
+    each is asked about once, with its shortlist of Stories, at the administrator's word
+    and within the tokens they allowed."""
+
+    __tablename__ = "orphan_runs"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # queued and running while it asks; paused by the administrator; held when the
+    # project's review tokens ran out; complete, cancelled or failed when it is over.
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(200))
+    token_cap: Mapped[int] = mapped_column(BigInteger)
+    spent: Mapped[int] = mapped_column(BigInteger, default=0)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    done: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    # Calls that ended without saying what they used: their tokens are not counted.
+    uncounted: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    # The call under way: when it began, for which issue, and what it holds of the
+    # project's review tokens until it reports what it used.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_item: Mapped[UUID | None] = mapped_column(Uuid)
+    reserved: Mapped[int] = mapped_column(BigInteger, default=0)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OrphanReview(UUIDPrimaryKey, Timestamps, Base):
+    """What a review answered about one issue without a User Story (migration 0072):
+    which of the Stories it was shown is its parent, or that none fits, or that it is a
+    bug. Nothing is linked by it: the administrator approves or dismisses the answer."""
+
+    __tablename__ = "orphan_reviews"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("backlog_items.id", ondelete="CASCADE"))
+    run_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("orphan_runs.id", ondelete="SET NULL")
+    )
+    # queued until it is asked; answered; failed with the reason in ``detail``.
+    state: Mapped[str] = mapped_column(String(16))
+    # The text of the issue and the Stories it was shown, as a digest: an answer about
+    # another text is an answer about another question.
+    revision: Mapped[str] = mapped_column(String(64))
+    # The Stories that were offered: id, title, Epic, score, the words they share.
+    shortlist: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # story, none, bug or unclear.
+    answer: Mapped[str | None] = mapped_column(String(16))
+    story_id: Mapped[UUID | None] = mapped_column(Uuid)
+    confidence: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+    # The passages it quoted, each with its side and whether the words are in the text.
+    evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    # Whether every passage it quoted is in the text it says it is from.
+    checked: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The User Story it says is missing, when none of those offered fits.
+    missing: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    provider: Mapped[str | None] = mapped_column(String(32))
+    model: Mapped[str | None] = mapped_column(String(200))
+    tokens: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    # pending until the administrator approves or dismisses the answer.
+    decision: Mapped[str] = mapped_column(String(16), default="pending")
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (UniqueConstraint("project_id", "item_id", name="uq_orphan_reviews_item"),)
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

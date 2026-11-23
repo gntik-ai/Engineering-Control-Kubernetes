@@ -1,6 +1,7 @@
 import { CircleCheck, Pencil, RotateCcw, Trash2 } from '@gntik-ai/icons';
 import {
   Alert,
+  Badge,
   Button,
   Dialog,
   DialogBody,
@@ -85,6 +86,8 @@ interface PlanningPage extends Paged<PlanRow> {
   epic: string | null;
   record: string | null;
   connected: string;
+  bugs?: string;
+  bug_count?: number | null;
   state: IssueView | null;
   state_counts: Partial<Record<IssueView, number>>;
   pending: number;
@@ -366,6 +369,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const recordId = query.get('record')?.toLowerCase() || null;
   const focus = recordId || epic;
   const connected = query.get('connected') ?? '';
+  const bugs = kind === 'issues' && !focus && ['only', 'without'].includes(query.get('bugs') ?? '') ? query.get('bugs')! : '';
   const searchValue = query.get('search') ?? '';
   const search = focus ? '' : searchValue.trim().slice(0, 200);
   const requested = Number(pageValue);
@@ -386,9 +390,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
     try { localStorage.setItem('planning-layout',mode); } catch { /* The URL retains the choice. */ }
     setQuery({ layout: mode });
   }
-  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, [stateKey]: view, ...sortParams(sort) }), 4000, { keepPreviousData: true });
+  const plan = useResource<PlanningPage>(apiUrl(path, { page, page_size: pageSize, search, epic, record: recordId, connected, bugs, [stateKey]: view, ...sortParams(sort) }), 4000, { keepPreviousData: true });
   const data = plan.data;
-  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && data.state === view && data.sort === (sort?.columnId ?? '') && data.direction === (sort?.direction === 'descending' ? 'desc' : 'asc');
+  const currentFilter = data?.search === search && data.epic === epic && (data.record ?? null) === recordId && (data.connected ?? '') === connected && (data.bugs ?? '') === bugs && data.state === view && data.sort === (sort?.columnId ?? '') && data.direction === (sort?.direction === 'descending' ? 'desc' : 'asc');
   const changingPage = data && (!currentFilter || data.requested_page !== page || data.page_size !== pageSize);
   const rows = currentFilter ? data.items : undefined;
   const reload = plan.reload;
@@ -461,6 +465,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               className="rounded-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">
               {record.title}
             </span>
+            {kind === 'issues' && record.story_optional && <Badge tone="destructive" size="sm" className="ms-2 align-middle">Bug</Badge>}
             {record.review_reason && <p className="mt-1 text-sm">Reason for proposal · {record.review_reason}</p>}
             {record.description && (
               <p className="mt-1 break-words text-sm text-muted-foreground">
@@ -598,6 +603,9 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               </Button>}
             </>}
             {kind === 'issues' && <>
+              <SimpleSelect className="w-56" aria-label="Filter by bugs" size="sm" value={bugs || 'all'}
+                items={[{ value: 'all', label: 'Bugs and other issues' }, { value: 'only', label: 'Bugs only' + (data?.bug_count != null ? ' (' + data.bug_count + ')' : '') }, { value: 'without', label: 'Without bugs' }]}
+                onValueChange={v => setQuery({ bugs: v === 'all' ? null : String(v), page: null, record: null, epic: null })} />
               <ConnectionFilter project={project} value={connected}/>
               <Button size="sm" variant="secondary" disabled={refreshIssues.pending} loading={refreshIssues.pending} onClick={() => void refreshIssues.submit()}>Refresh from GitHub</Button>
             </>}
@@ -708,7 +716,7 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, issue_state: null, state: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, bugs: null, issue_state: null, state: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {

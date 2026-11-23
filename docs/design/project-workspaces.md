@@ -285,6 +285,35 @@ In the User Stories and Issues tables each parent shows whether it is primary an
 
 Planning health counts the links that say why, by who made them, and the records whose primary parent nobody chose.
 
+### Open issues with no User Story
+
+**Reviews → Related Work** lists the project's open issues that have no User Story and are no bug: the issues the Issues table marks as orphans. A closed issue is not listed, and a bug may stand alone.
+
+Each issue is shown with a shortlist of at most eight open User Stories, best first. A Story the issue's own text names on a `Story:` line comes first. The others are ranked by the words the two texts share, where a word counts for more the fewer Stories have it; each entry shows its score, the words it shares and its primary Epic, and one below 2.0 is marked a weak match. No model is asked for the shortlist, so it costs nothing and is the same every time it is computed. A closed or archived Story is never offered.
+
+A run asks a model one question per issue: the issue, its shortlist, and four possible answers.
+
+| Answer | Meaning | What approval does |
+| --- | --- | --- |
+| This User Story | Delivering the issue is part of delivering one Story of the shortlist. | Puts the issue under that Story. The link is recorded as proposed by a review and approved by you, with the review's reason and passages. |
+| It is a bug | The issue reports that existing behaviour is wrong. | Confirms the issue as a bug, as the Issues table does: it may stand alone, and the bug label is applied on GitHub. |
+| None fits | It is planned work that no listed Story covers. The answer names the Story that is missing. | Nothing yet: drafting the missing Story is part of consolidating the plan. |
+| The texts do not say | No decision is possible from the two texts. | Nothing. |
+
+The answer quotes one passage of the issue and one of the chosen Story. The platform checks that the quoted words are in those texts; an answer that fails the check is shown with a note and is left out when answers are approved together. An answer about a text that changed since, or a shortlist that changed since, is marked and left out as well.
+
+Nothing is linked by an answer. The administrator approves it, alone or with every other checked answer at once, links the issue to another Story of the shortlist, says it is a bug, or sets the answer aside. An issue stays on the list until it has a Story, is a bug or is closed.
+
+A run is started by the administrator with a model and a token limit, and shows beforehand how many issues it asks about and how many tokens that holds at most. It asks only about issues that have no answer to the current question, unless told to ask again about all. It counts against the project's review tokens like every review, stops at its own limit, and can be stopped, resumed and ended.
+
+- A call the provider refused, or that no account could make, used nothing: what it held returns to the project at once.
+- A call that ended without saying what it used gives its tokens back as well, and is counted on the run as a call whose use is unknown. A run is never left waiting for a call that will not report.
+- When no account can be asked the run stops and waits to be resumed. After three failures in a row it stops as well.
+
+`GET /api/dashboard/projects/{name}/orphans` returns the list, the counts, what a run would hold and the last run. `POST …/orphans/runs` starts a run, `…/orphans/runs/{id}/control` stops, resumes or ends it, `…/orphans/{issue}/link`, `…/bug` and `…/dismiss` record the administrator's decision on one issue, and `…/orphans/approve` approves many answers at once. The runs and answers are kept in `orphan_runs` and `orphan_reviews` (migration 0072).
+
+The Issues table marks every bug with a **Bug** badge beside its title and can list bugs only, or everything but bugs (`bugs=only` or `bugs=without` on the planning listing).
+
 ### A review run that was cut off
 
 A paid call whose provider never reported its usage leaves its run **uncertain**: its tokens stay reserved against the run and the project, and a later review of the same issue and Story is held with "An earlier decision for these sources has unconfirmed usage".

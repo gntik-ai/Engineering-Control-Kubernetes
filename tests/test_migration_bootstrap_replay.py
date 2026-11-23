@@ -50,7 +50,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # platform's own) follows that. 0049 adds the workspace records and default.
     # 0070 keeps a daily measurement of how each project's planning hangs together.
     # 0071 records who made each planning link and why, and the primary parent.
-    assert (head, parent) == ("0071", "0070")
+    # 0072 keeps the runs that ask about issues without a User Story, and the answers.
+    assert (head, parent) == ("0072", "0071")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -151,7 +152,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     }
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
+    assert {"orphan_runs", "orphan_reviews"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, parent)
+    assert not {"orphan_runs", "orphan_reviews"} & set(inspect(engine).get_table_names())
+    assert "planning_links" in inspect(engine).get_table_names()
+    command.downgrade(config, "0070")
     assert "planning_links" not in inspect(engine).get_table_names()
     assert "planning_health" in inspect(engine).get_table_names()
     command.downgrade(config, "0069")

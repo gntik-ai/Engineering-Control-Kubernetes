@@ -572,6 +572,7 @@ class PlanningRecords:
         state: PlanningState | None = None,
         sort: str = "",
         direction: Direction = "asc",
+        bugs: str = "",
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -591,6 +592,31 @@ class PlanningRecords:
                     & ~rows.c.proposal
                     & rows.c.id.in_(connected_records(project.id, kind, connected, exact=True))
                 )
+            # An issue is a bug by the administrator's word, else by its GitHub type or
+            # label; one that is still a proposal by its own type, else by the issue it
+            # stands for.
+            is_bug: ColumnElement[bool] = false()
+            if kind == "issues":
+                known = bugs_with_optional_stories(session, project.id).subquery()
+                is_bug = (~rows.c.proposal & rows.c.id.in_(select(known.c.id))) | (
+                    rows.c.proposal
+                    & (
+                        (func.coalesce(rows.c.proposal_type, "") == "bug")
+                        | (
+                            rows.c.proposal_type.is_(None)
+                            & rows.c.number.is_not(None)
+                            & rows.c.number.in_(
+                                select(BacklogItem.issue_number).where(
+                                    BacklogItem.project_id == project.id,
+                                    BacklogItem.issue_number.is_not(None),
+                                    BacklogItem.id.in_(select(known.c.id)),
+                                )
+                            )
+                        )
+                    )
+                )
+                if bugs and not focus:
+                    matches = matches & (is_bug if bugs == "only" else ~is_bug)
             scope: ColumnElement[bool] = true()
             view = issue_state if kind == "issues" else state
             bucket = _state_bucket(rows, kind)
@@ -639,11 +665,12 @@ class PlanningRecords:
                     rows.c.id,
                 )
             # Stage progression covers every view. Bulk approval covers the selected state.
-            total, pending, proposed = session.execute(
+            total, pending, proposed, bug_count = session.execute(
                 select(
                     func.count().filter(matches),
                     func.count().filter(scope & _approvable(rows, kind)),
                     func.count().filter(rows.c.proposal),
+                    func.count().filter(scope & is_bug),
                 ).select_from(rows)
             ).one()
             pages = max(1, (total + page_size - 1) // page_size)
@@ -863,6 +890,8 @@ class PlanningRecords:
                 "epic": str(epic) if epic else None,
                 "record": str(record) if record else None,
                 "connected": connected,
+                "bugs": bugs if kind == "issues" and not focus else "",
+                "bug_count": bug_count if kind == "issues" else None,
                 "pages": pages,
                 "pending": pending,
                 "parents": parents,
