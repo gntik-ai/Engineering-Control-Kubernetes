@@ -223,3 +223,54 @@ The first task sends the original issue and Story to OpenAI `gpt-6-luna`. A cons
 In the second-opinion Flow, the first model uses the direct-coverage rubric when the graph has no dependency passage. With a passage, it also judges whether the issue supplies a prerequisite. Both routes can reuse a receipt for identical sources and instructions. A negative or inconsistent verdict, or a conflict with a human judgment on the same source revisions, triggers an independent second opinion. This second model also checks for prerequisites established by the original issue and Story. A shared input alone does not establish dependency.
 
 The review inbox flags disagreement with a previous administrator judgment and shows that judgment alongside the new verdicts. Human labels stay out of model requests. A prerequisite-only verdict of All requires review. Runs already in progress retain their pinned routing and instructions.
+
+## Connecting Epics, User Stories and Issues: redesign
+
+A profile of the live projects on 23 November 2026 showed why the connections disappoint. In Falcone the 64 Epics and 737 User Stories were written from a 2,000-character description of the repository, a Story sat under 3.6 Epics on average and up to ten, one Epic held 273 Stories, 543 Stories had no issue and 279 issues that are no bugs had no Story. A link is two identifiers: nothing says who made it or why. Falcone-serverless, whose Stories were written by people with acceptance criteria, had six orphans in 258 issues.
+
+The administrator agreed these rules and phases. Every change to existing records is a proposal that the administrator approves.
+
+- A User Story has one primary Epic and a technical Issue one primary User Story. Any other connection is a related link, kept apart.
+- A link is a record: who made it (stated in the text, the administrator, or a model), the passages on both sides that justify it, its strength, its status and its history.
+- A User Story cites the document lines or the issues it groups. One with neither is unsupported.
+- An issue's parent is chosen from a ranked shortlist in one question, which may answer that none fits or that the issue is a bug. Only open orphans are resolved; a bug may stand alone and is labelled as one.
+- Documentation is read incrementally, from `openspec/` and `docs-site/` as well as the usual folders.
+
+| Phase | Deliverable | Acceptance criterion |
+| --- | --- | --- |
+| R0 | Unblock stuck review runs and measure planning health. | A run that was cut off can be released, a refused call holds nothing, and each project has a dated baseline of its numbers. |
+| R1 | Links as records with reasons, and the primary parent. | Every link shows who made it and why. Each Story has one primary Epic and each issue at most one primary Story. |
+| R2 | Orphan worklist and bulk choice of the parent. Bug label and filter. | The open orphans of a project get an answer in one run within a stated budget, and are linked on approval. |
+| R3 | Consolidate the existing plan. | Proposals to assign primary Epics, merge overlapping Stories, split a catch-all Epic and review Stories without issues, approved in bulk. |
+| R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
+| R5 | Epics and Stories grounded in documents and issues. | A changed document yields proposals to add, update or remove, each traced to its lines. |
+| R6 | Epic wiki pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
+| R7 | Automation and rollout. | Discovery runs on push or on a schedule, and the remaining projects are onboarded. |
+
+### Planning health
+
+**Project Home → Planning health**, also shown at the top of **Reviews → Related Work**, counts how the project's records hang together. Every number is the one the planning tables show: an issue is an orphan here exactly when its row says so. Lower is better for all of them.
+
+| Number | What it counts |
+| --- | --- |
+| Open and closed issues with no User Story | Issues that are no bugs and have neither a saved parent nor an approved connection to a Story. |
+| Bugs standing alone | Issues classified as bugs, by the administrator or by their GitHub type or label, that have no Story. A Story is optional for them. |
+| Issues under several User Stories | Issues with more than one parent. |
+| User Stories with no issue | Stories no issue is linked to. |
+| User Stories under several Epics | Stories with more than one Epic, with the average and the maximum. |
+| User Stories in the largest Epic | The size of the largest Epic and its share of all Stories. |
+| Epics with no User Story | Epics nothing is planned under. |
+| Links with no recorded reason | Every link, until links record who made them and why (phase R1). |
+| Reviews waiting | Automatic reviews that are queued, need input or failed, and evidence runs that were cut off. |
+
+The project is measured once a day, and again when the page is opened after ten minutes or **Measure now** is pressed. The last measurement of each UTC day is kept (`planning_health`, migration 0069). The first one is the baseline: each tile says how its number moved since. `GET /api/dashboard/projects/{name}/planning/health?days=30` returns the current numbers, the baseline and the days between. No model is asked.
+
+### A review run that was cut off
+
+A paid call whose provider never reported its usage leaves its run **uncertain**: its tokens stay reserved against the run and the project, and a later review of the same issue and Story is held with "An earlier decision for these sources has unconfirmed usage".
+
+- When the provider refuses the request before doing any work, because it does not accept the key or rejects the request itself, nothing was used. The run ends as failed with the reason and holds nothing.
+- When the provider was busy or did not answer, it may have done the work. **Reviews → Related Work** lists these runs with what each holds. **Release** ends the wait: the reserved tokens return to the project's allowance, the run ends as interrupted, and what the call used stays unknown and is not counted. A reply that still arrives afterwards is ignored.
+- A run that cannot be continued three times in a row, for a reason that is not its own input, is ended as failed so that the runs of other projects are not kept waiting behind it.
+
+The Discovery page asks for its status with `brief=true`, which leaves the texts of the proposals out; they are read in the planning tables.

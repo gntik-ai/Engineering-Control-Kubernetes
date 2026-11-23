@@ -1,0 +1,246 @@
+import { Button, Card, CardAction, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
+import { RefreshCw } from '@gntik-ai/icons';
+import { useState, type ReactNode } from 'react';
+import { apiUrl, getJson, useResource } from '../api';
+import { LoadError } from '../parts';
+import { workspaceUrl } from '../router';
+
+/** What is counted of a project's planning. Every number is one the planning tables show. */
+interface Numbers {
+  epics: number;
+  stories: number;
+  issues: number;
+  issues_open: number;
+  issues_closed: number;
+  orphans_open: number;
+  orphans_closed: number;
+  bugs_without_story: number;
+  bugs_confirmed: number;
+  issues_under_several_stories: number;
+  stories_without_issue: number;
+  stories_under_several_epics: number;
+  epics_per_story: number;
+  most_epics_of_a_story: number;
+  epics_without_story: number;
+  largest_epic_stories: number;
+  largest_epic_title: string | null;
+  largest_epic_share: number;
+  issue_story_links: number;
+  story_epic_links: number;
+  links_without_reason: number;
+  reviews_queued: number;
+  reviews_needing_input: number;
+  reviews_failed: number;
+  runs_cut_off: number;
+  reviews_waiting: number;
+}
+interface Health {
+  measured_at: string;
+  now: Numbers;
+  baseline: { day: string; numbers: Partial<Numbers> } | null;
+}
+
+const whole = (value: number) => value.toLocaleString('en');
+/** A number with what it counts, in the singular for one. */
+const some = (value: number, one: string, many: string) => `${whole(value)} ${value === 1 ? one : many}`;
+const shortDay = (day: string) =>
+  new Date(day + 'T12:00:00Z').toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+
+/** One number with what it counts, what it is a part of, and how it moved since first measured. */
+function Tile({
+  value,
+  label,
+  of,
+  note,
+  was,
+  since,
+  href,
+}: {
+  value: number;
+  label: string;
+  /** What the number is a part of, as words: "of 826 issues". */
+  of?: string;
+  note?: ReactNode;
+  /** The same number when the project was first measured. */
+  was?: number;
+  since?: string;
+  href?: string;
+}) {
+  const moved = was === undefined ? 0 : value - was;
+  return (
+    <div className="grid content-start gap-1 rounded-lg border border-border p-4">
+      <div className="text-2xl font-semibold leading-tight text-foreground">{whole(value)}</div>
+      <div className="text-sm font-medium text-foreground">{href ? <Link href={href}>{label}</Link> : label}</div>
+      {of ? <div className="text-xs text-muted-foreground">{of}</div> : null}
+      {note ? <div className="text-xs text-muted-foreground">{note}</div> : null}
+      {was !== undefined && since ? (
+        <div className="text-xs text-muted-foreground">
+          {moved === 0
+            ? `Unchanged since ${since}`
+            : `${moved > 0 ? 'Up' : 'Down'} ${whole(Math.abs(moved))} since ${since} (was ${whole(was)})`}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function Group({ title, about, children }: { title: string; about: string; children: ReactNode }) {
+  return (
+    <section className="grid gap-2">
+      <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+      <p className="text-xs text-muted-foreground">{about}</p>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{children}</div>
+    </section>
+  );
+}
+
+/**
+ * How the project's Epics, User Stories and Issues hang together: what has no parent, what
+ * has too many, what nothing explains. Measured once a day and whenever it is asked for,
+ * so that a change to how records are connected can be judged by what it did to the numbers.
+ */
+export function PlanningHealth({ project }: { project: string }) {
+  const path = 'projects/' + encodeURIComponent(project) + '/planning/health';
+  const health = useResource<Health>(apiUrl(path), 300_000);
+  const [measuring, setMeasuring] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const measure = () => {
+    setMeasuring(true);
+    setProblem(null);
+    getJson<Health>(apiUrl(path, { refresh: 'true' }), new AbortController().signal)
+      .then(() => health.reload())
+      .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The measurement failed.'))
+      .finally(() => setMeasuring(false));
+  };
+  const data = health.data;
+  const now = data?.now;
+  const was = data?.baseline?.numbers;
+  const since = data?.baseline ? shortDay(data.baseline.day) : undefined;
+  const home = workspaceUrl(project);
+  const links = now ? now.issue_story_links + now.story_epic_links : 0;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Planning health</CardTitle>
+        <CardAction>
+          <Button variant="secondary" size="sm" icon={RefreshCw} loading={measuring} onClick={measure}>
+            Measure now
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardBody className="grid gap-5">
+        <LoadError resource={health} />
+        {problem ? <p className="text-sm text-destructive">{problem}</p> : null}
+        {!now ? (
+          health.loading ? (
+            <Skeleton className="h-48 w-full" />
+          ) : null
+        ) : (
+          <>
+            <p className="text-sm text-muted-foreground">
+              {some(now.epics, 'Epic', 'Epics')}, {some(now.stories, 'User Story', 'User Stories')} and{' '}
+              {some(now.issues, 'technical Issue', 'technical Issues')}, as the planning tables show them. Measured{' '}
+              {new Date(data.measured_at).toLocaleString('en')}
+              {since
+                ? `; compared with the first measurement, of ${since}.`
+                : '. This is the first measurement: later ones are compared with it.'}{' '}
+              Every number here is better when it is lower.
+            </p>
+            <Group
+              title="Issues and their User Stories"
+              about="An issue that is no bug should belong to a User Story. A bug may stand alone."
+            >
+              <Tile
+                value={now.orphans_open}
+                label="Open issues with no User Story"
+                of={`of ${whole(now.issues_open)} open issues`}
+                was={was?.orphans_open}
+                since={since}
+                href={`${home}?tab=issues`}
+              />
+              <Tile
+                value={now.orphans_closed}
+                label="Closed issues with no User Story"
+                of={`of ${whole(now.issues_closed)} closed issues`}
+                was={was?.orphans_closed}
+                since={since}
+                href={`${home}?tab=issues&issue_state=closed`}
+              />
+              <Tile
+                value={now.bugs_without_story}
+                label="Bugs standing alone"
+                of="A User Story is optional for a bug"
+                note={`${whole(now.bugs_confirmed)} confirmed as bugs by you; the others by their GitHub label`}
+                was={was?.bugs_without_story}
+                since={since}
+              />
+              <Tile
+                value={now.issues_under_several_stories}
+                label="Issues under several User Stories"
+                of={`of ${whole(now.issues)} issues`}
+                was={was?.issues_under_several_stories}
+                since={since}
+              />
+            </Group>
+            <Group
+              title="User Stories and their Epics"
+              about="A User Story should lead to work and belong to one Epic. An Epic that holds a large share of all Stories is where Stories go that fit nowhere."
+            >
+              <Tile
+                value={now.stories_without_issue}
+                label="User Stories with no issue"
+                of={`of ${whole(now.stories)} User Stories`}
+                was={was?.stories_without_issue}
+                since={since}
+                href={`${home}?tab=stories`}
+              />
+              <Tile
+                value={now.stories_under_several_epics}
+                label="User Stories under several Epics"
+                of={`of ${whole(now.stories)} User Stories`}
+                note={`Epics per Story: ${now.epics_per_story.toLocaleString('en')} on average, ${whole(now.most_epics_of_a_story)} at most`}
+                was={was?.stories_under_several_epics}
+                since={since}
+              />
+              <Tile
+                value={now.largest_epic_stories}
+                label="User Stories in the largest Epic"
+                of={`${Math.round(now.largest_epic_share * 100)}% of all User Stories`}
+                note={now.largest_epic_title ?? undefined}
+                was={was?.largest_epic_stories}
+                since={since}
+                href={`${home}?tab=epics`}
+              />
+              <Tile
+                value={now.epics_without_story}
+                label="Epics with no User Story"
+                of={`of ${whole(now.epics)} Epics`}
+                was={was?.epics_without_story}
+                since={since}
+              />
+            </Group>
+            <Group
+              title="Links and reviews"
+              about="A link should say who made it and why. A review that waits or was cut off decides nothing."
+            >
+              <Tile
+                value={now.links_without_reason}
+                label="Links with no recorded reason"
+                of={`of ${whole(links)} links: ${whole(now.issue_story_links)} issue to Story, ${whole(now.story_epic_links)} Story to Epic`}
+                was={was?.links_without_reason}
+                since={since}
+              />
+              <Tile
+                value={now.reviews_waiting}
+                label="Reviews waiting"
+                note={`${whole(now.reviews_queued)} queued, ${whole(now.reviews_needing_input)} need your input, ${whole(now.reviews_failed)} failed, ${whole(now.runs_cut_off)} cut off`}
+                was={was?.reviews_waiting}
+                since={since}
+              />
+            </Group>
+          </>
+        )}
+      </CardBody>
+    </Card>
+  );
+}

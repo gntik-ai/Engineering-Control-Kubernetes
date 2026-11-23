@@ -18,7 +18,8 @@ type Advisory = { human_scope?: string; status: 'advisory' | 'needs_review'; sco
 type Run = { second_opinion?: Native | null; advisory?: Advisory | null; native?: Native | null; id: string; state: string; flow: string; version: number; model: string; cached_from?: string; spent: number; reserved: number; cap: number; detail: string; steps: Step[]; sample?: string[];
   failed_request?: {arm: string; reason: string; provider_ref?: string | null};
   arms: {arm: string; scope: string | null; evidence: string; tokens: number; input: number; output: number; eur: string | null; provider_ref?: string | null}[] };
-type Status = { second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; paired: boolean; paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
+type Unsettled = { id: string; flow: string; reserved: number; at: string | null; detail: string; sample?: string[] | null };
+type Status = { unsettled?: Unsettled[]; second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; paired: boolean; paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
 const keyOf = (m: Model) => JSON.stringify([m.provider, m.model]);
 const active = ['queued','calling','held','stopping','paused'];
 const labels: Record<string,string> = {
@@ -100,8 +101,25 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
     } catch(e){setProblem(e instanceof Error?e.message:'Evidence review failed.');}
     finally{setBusy(false);}
   }
+  async function release(id: string) {
+    if(busy)return;
+    setBusy(true);setProblem('');
+    try { await postJson(path+'/control',{run_id:id,action:'release'}); status.reload(); }
+    catch(e){setProblem(e instanceof Error?e.message:'The reservation could not be released.');}
+    finally{setBusy(false);}
+  }
+  const unsettled = draft ? [] : data?.unsettled ?? [];
   return <section aria-label="Review evidence" className="grid gap-3 rounded-xl border border-border bg-card p-5">
     {draft && <h2 className="text-lg font-semibold">Preview this flow</h2>}
+    {unsettled.length > 0 && <Alert tone="warning"
+      title={unsettled.length === 1 ? 'One run was cut off and never reported what it used' : unsettled.length+' runs were cut off and never reported what they used'}
+      description={<div className="grid gap-2">
+        <p>Each keeps its tokens reserved and holds back every later review of the same issue and Story. Releasing ends the wait: the reserved tokens return to the project’s allowance, and what the interrupted call used stays unknown and is not counted.</p>
+        <ul className="grid gap-2">{unsettled.map(item=><li key={item.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span><strong>{item.flow}</strong>{item.sample?.length ? ' · '+item.sample.join(' → ') : ''} · {item.reserved.toLocaleString()} tokens reserved{item.at ? ' · since '+new Date(item.at).toLocaleString() : ''}</span>
+          <Button size="sm" variant="secondary" disabled={busy} onClick={()=>void release(item.id)}>Release</Button>
+        </li>)}</ul>
+      </div>}/>}
     {data && <div className="flex flex-wrap items-end gap-3">
       {!generation && (!decisionModel || data.paired || draft) && !!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
         {data.models.map(m=><option key={keyOf(m)} value={keyOf(m)}>{m.provider} · {m.model}</option>)}</select></label>}

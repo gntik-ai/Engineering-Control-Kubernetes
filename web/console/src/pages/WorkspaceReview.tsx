@@ -10,7 +10,7 @@ import type { ImportState } from './WorkspaceImport';
 export interface Candidate {
   id: string;
   title: string;
-  description: string | null;
+  description?: string | null;
   parents: string[];
   number: number | null;
   decision: string;

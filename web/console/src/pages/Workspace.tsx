@@ -24,6 +24,7 @@ import { ProjectQueue } from './ProjectQueue';
 import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
 import { EvidencePanel } from './ReviewEvidence';
+import { PlanningHealth } from './PlanningHealth';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
 
@@ -182,6 +183,7 @@ export function ProjectWorkspace({
             ) : isReviewView(view) ? (
               <div className="grid min-w-0 gap-5" key={project.project}>
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
+                {view === 'related-work' && <PlanningHealth project={project.project} />}
                 {view === 'related-work' && <EvidencePanel project={project.project} />}
                 {view === 'planning' && <PlanningReviews project={project.project} />}
                 {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}

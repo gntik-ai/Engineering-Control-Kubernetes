@@ -787,6 +787,20 @@ class ReviewEvidenceJob(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PlanningHealth(Base):
+    """How a project's Epics, User Stories and Issues hang together on one UTC day
+    (migration 0069): the last measurement of that day. Kept so that the numbers can be
+    followed over time."""
+
+    __tablename__ = "planning_health"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    measured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    numbers: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

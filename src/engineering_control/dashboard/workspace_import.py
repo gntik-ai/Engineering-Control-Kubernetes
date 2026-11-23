@@ -117,6 +117,19 @@ def _file_key(path: str) -> str:
     return "file:" + hashlib.sha256(path.encode()).hexdigest()
 
 
+def _brief(review: dict[str, Any]) -> dict[str, Any]:
+    """The stage's review as the page needs it. The page counts the proposals and what
+    is decided; their texts, up to 40,000 characters each, are read in the tables and
+    are left out of a status that the page asks for every few seconds."""
+    return {
+        **review,
+        "candidates": [
+            {key: value for key, value in candidate.items() if key != "description"}
+            for candidate in review["candidates"]
+        ],
+    }
+
+
 def _file_kind(path: str) -> str | None:
     p = PurePosixPath(path.lower())
     parts = set(p.parts)
@@ -193,7 +206,9 @@ class WorkspaceImports:
         self.tasks: set[asyncio.Task[None]] = set()
         self.scan_requests: dict[UUID, asyncio.Task[Any]] = {}
 
-    def status(self, name: str, *, progress_only: bool = False) -> dict[str, Any]:
+    def status(
+        self, name: str, *, progress_only: bool = False, brief: bool = False
+    ) -> dict[str, Any]:
         with self.sessions() as session:
             project = active_project(session, name)
             # Read the lease and candidate count in one database snapshot. A batch
@@ -267,7 +282,9 @@ class WorkspaceImports:
                 "models": self.model_choices()
                 if row and row.stage in ("analysis", *KINDS, "complete")
                 else [],
-                "review": review_state(session, row) if row and row.stage in KINDS else None,
+                "review": (_brief(found) if brief else found)
+                if row and row.stage in KINDS and (found := review_state(session, row))
+                else None,
                 "project": name,
                 "commit": row.commit_sha if row else None,
                 "description": row.draft if row else None,

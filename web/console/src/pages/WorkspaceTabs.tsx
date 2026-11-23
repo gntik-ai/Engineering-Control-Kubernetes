@@ -29,6 +29,7 @@ import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
 import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl, navigate, reviewUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
+import { PlanningHealth } from './PlanningHealth';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { RecordReview, type ReviewResult } from './PlanningReviews';
 import { useSubmit } from './ProjectDialogs';
@@ -642,6 +643,7 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
               </dd>
             </div>
           </dl>
+          {tab === 'home' && <PlanningHealth project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (

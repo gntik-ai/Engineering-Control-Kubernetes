@@ -355,6 +355,36 @@ def native_config(db: Session, doc: Document, task: str = reviews.DECISION) -> R
     }
 
 
+def unsettled(db: Session, pid: UUID) -> list[Row]:
+    """The runs whose interrupted call never said what it used. Each keeps its tokens
+    reserved, and holds back every later review of the same sources, until released."""
+    job, run = ReviewEvidenceJob, ReviewFlowRun
+    rows = db.execute(
+        select(
+            job.run_id,
+            job.reserved,
+            job.claimed_at,
+            run.flow_name,
+            result_fields(db, "detail", "sample_names").label("receipt"),
+        )
+        .join(run, run.id == job.run_id)
+        .where(job.project_id == pid, job.state == "uncertain")
+        .order_by(job.claimed_at.desc())
+        .limit(50)
+    ).all()
+    return [
+        {
+            "id": str(row.run_id),
+            "flow": row.flow_name,
+            "reserved": row.reserved,
+            "at": row.claimed_at.replace(tzinfo=UTC).isoformat() if row.claimed_at else None,
+            "detail": (row.receipt or {}).get("detail") or "",
+            "sample": (row.receipt or {}).get("sample_names"),
+        }
+        for row in rows
+    ]
+
+
 def status(sessions: sessionmaker[Session], name: str) -> Row:
     with sessions() as db:
         project = active_project(db, name)
@@ -369,6 +399,7 @@ def status(sessions: sessionmaker[Session], name: str) -> Row:
         doc, v = definition(db, project, None)
         return {
             "run": summary(db, found[0]) if found else None,
+            "unsettled": unsettled(db, project.id),
             "models": models,
             "configured": configured,
             "flow": doc.name,
@@ -475,6 +506,27 @@ def lock_job(db: Session, run_id: UUID) -> ReviewEvidenceJob | None:
     )
 
 
+# What a provider says when it will not take a request at all. No work was done for it.
+REFUSED_UNBILLED = {
+    "refused": "The provider did not accept the account's key. Nothing was used. "
+    "Check the account, then run the review again.",
+    "invalid": "The provider rejected the request itself. Nothing was used. "
+    "Check the model chosen for this review, then run it again.",
+}
+
+
+def give_back(db: Session, job: ReviewEvidenceJob, held: int | None) -> None:
+    """Give back what a call that will never be settled holds: of the run's own cap, and
+    of the project's allowance. ``held`` is what was reserved against the project; a run
+    from before that was recorded held what the run itself reserved, when the project
+    has an allowance."""
+    budget = review_budget.locked_budget(db, job.project_id)
+    if budget:
+        amount = job.reserved if held is None else held
+        budget.reserved = max(0, budget.reserved - max(0, amount))
+    job.reserved = 0
+
+
 def finish(job: ReviewEvidenceJob, run: ReviewFlowRun, state: str, detail: str = "") -> None:
     job.state, job.lease = state, None
     job.result = {**job.result, "detail": detail}
@@ -508,6 +560,19 @@ def control(sessions: sessionmaker[Session], name: str, run_id: UUID, action: st
             j.result = {**j.result, "detail": ""}
         elif action == "end" and j.state in ("paused", "held") and not j.lease:
             finish(j, r, "cancelled")
+        elif action == "release" and j.state == "uncertain":
+            # The call was cut off and its provider never said what it used. Waiting
+            # longer brings nothing: the administrator ends the wait. A reply that
+            # still arrives finds no lease and is not counted.
+            freed = j.reserved
+            give_back(db, j, j.result.get("project_reserved"))
+            finish(
+                j,
+                r,
+                "interrupted",
+                f"You released {freed:,} reserved tokens. What the interrupted call used "
+                "is unknown and is not counted.",
+            )
         else:
             raise ProjectConflict("The run changed. Refresh to see its current controls.")
         return summary(db, j.run_id)
@@ -857,7 +922,9 @@ def reserve_call(
         budget.reserved += needed
     result.pop("failed_request", None)
     j.lease, j.claimed_at, j.state, j.reserved = uuid4(), datetime.now(UTC), "calling", needed
-    j.result = {**result, "detail": ""}
+    # What this call holds of the project's allowance, so that a release gives back
+    # exactly that and nothing of another review's.
+    j.result = {**result, "detail": "", "project_reserved": needed if budget else 0}
     return Call(j.run_id, j.lease, arm, q, needed if budget else 0)
 
 
@@ -926,6 +993,12 @@ def settle(
                 j.reserved = 0
                 j.state, j.lease = "held", None
                 j.result = {**j.result, "detail": "The selected Accounts model is unavailable."}
+            elif error in REFUSED_UNBILLED:
+                # The provider answered that it would not take the request: its key, or
+                # the request itself. It did no work, so nothing is owed and nothing is
+                # left reserved. The run ends with the reason; a new run can ask again.
+                give_back(db, j, call.project_reserved)
+                finish(j, r, "failed", REFUSED_UNBILLED[error])
             else:
                 finish(
                     j,
@@ -1097,16 +1170,21 @@ def next_job(sessions: sessionmaker[Session]) -> UUID | None:
         )
 
 
-def fail_input(sessions: sessionmaker[Session], key: UUID) -> None:
+# How often a run may fail to advance for a reason that is not its own input, and how
+# often each has so far. Kept in memory: a restart starts counting again.
+TRIES = 3
+_TROUBLE: dict[UUID, int] = {}
+
+
+def fail_input(
+    sessions: sessionmaker[Session],
+    key: UUID,
+    detail: str = "Invalid saved evidence input. Preview the current flow before retrying.",
+) -> None:
     with sessions.begin() as db:
         j = lock_job(db, key)
         if j and j.state == "queued":
-            finish(
-                j,
-                db.get_one(ReviewFlowRun, key),
-                "failed",
-                "Invalid saved evidence input. Preview the current flow before retrying.",
-            )
+            finish(j, db.get_one(ReviewFlowRun, key), "failed", detail)
 
 
 async def tick(
@@ -1121,6 +1199,22 @@ async def tick(
         log.exception("Invalid evidence input for run %s", key)
         await asyncio.to_thread(fail_input, sessions, key)
         return True
+    except Exception:
+        # The oldest queued run is always tried first. One that fails every time would
+        # keep every other project's run waiting behind it: after a few tries it is ended.
+        _TROUBLE[key] = _TROUBLE.get(key, 0) + 1
+        if _TROUBLE[key] < TRIES:
+            raise
+        log.exception("Evidence run %s could not be advanced %s times", key, TRIES)
+        _TROUBLE.pop(key, None)
+        await asyncio.to_thread(
+            fail_input,
+            sessions,
+            key,
+            "The run could not be continued after several tries. Start a new run.",
+        )
+        return True
+    _TROUBLE.pop(key, None)
     if call:
         try:
             reply = await models.ask(call.question, retry=False)

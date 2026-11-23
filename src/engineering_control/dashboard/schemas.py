@@ -407,7 +407,8 @@ class EvidenceRunInput(PlainChangeInput):
 
 class EvidenceControlInput(PlainChangeInput):
     run_id: UUID
-    action: Literal["stop", "resume", "end"]
+    # ``release`` ends the wait for a run whose interrupted call never reported its usage.
+    action: Literal["stop", "resume", "end", "release"]
 
 
 class EvidenceDecisionInput(PlainChangeInput):

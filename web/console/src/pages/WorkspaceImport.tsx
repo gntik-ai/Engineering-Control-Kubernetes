@@ -64,7 +64,8 @@ export function WorkspaceImport({
   onApproved: () => void;
 }) {
   const path = 'projects/' + encodeURIComponent(project) + '/import';
-  const persisted = useResource<ImportState>(apiUrl(path), 12000);
+  // The page counts the proposals; their texts are read in the tables, not on every poll.
+  const persisted = useResource<ImportState>(apiUrl(path, { brief: 'true' }), 12000);
   const [latest, setLatest] = useState<ImportState | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState('');

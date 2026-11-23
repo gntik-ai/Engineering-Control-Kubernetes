@@ -424,6 +424,18 @@ def create_app(
                     )
                 await asyncio.sleep(6 * 3600)
 
+    async def keep_planning_health_measured(records: DashboardRepository) -> None:
+        """Once a day every project with planning is measured, also when nobody opens its
+        page: the numbers are followed over time, and a day without one is a gap."""
+        while True:
+            try:
+                for name in await asyncio.to_thread(records.planning_health.missing_today):
+                    await asyncio.to_thread(records.planning_health.record, name)
+                log_recovery("planning-health", "Planning health measured")
+            except Exception as error:  # noqa: BLE001 - the next pass measures again
+                log_failure("planning-health", "Planning health could not be measured", error)
+            await asyncio.sleep(3600)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -493,6 +505,7 @@ def create_app(
             )
             keepers.append(asyncio.create_task(keep_the_record_short(resolved_repository)))
             keepers.append(asyncio.create_task(keep_exchange_rates_current(resolved_repository)))
+            keepers.append(asyncio.create_task(keep_planning_health_measured(resolved_repository)))
             if app.state.models.sealing_key is not None:
                 keepers.append(asyncio.create_task(keep_model_catalogs_current(app.state.models)))
             told = await listen(
@@ -972,11 +985,13 @@ def create_app(
 
     @app.get("/api/dashboard/projects/{name}/import")
     async def workspace_import_status(
-        name: str, request: Request, progress_only: bool = False
+        name: str, request: Request, progress_only: bool = False, brief: bool = False
     ) -> Response:
         try:
             imports = repo(request).workspace_imports
-            result = await asyncio.to_thread(imports.status, name, progress_only=progress_only)
+            result = await asyncio.to_thread(
+                imports.status, name, progress_only=progress_only, brief=brief
+            )
             return JSONResponse(result)
         except ProjectNotFound:
             return JSONResponse({"detail": "Project not found"}, status_code=404)
@@ -1413,6 +1428,21 @@ def create_app(
     async def project_planning(name: str, request: Request) -> Response:
         try:
             return JSONResponse(await asyncio.to_thread(repo(request).planning.listing, name))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.get("/api/dashboard/projects/{name}/planning/health")
+    async def planning_health(
+        name: str, request: Request, days: int = Query(30, ge=1, le=120), refresh: bool = False
+    ) -> Response:
+        """How the project's Epics, User Stories and Issues hang together: now, when first
+        measured, and day by day between. Nothing is asked of a model."""
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repo(request).planning_health.report, name, days=days, refresh=refresh
+                )
+            )
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
 
