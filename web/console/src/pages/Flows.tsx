@@ -1,3 +1,4 @@
+import { useTableOrder, querySort, sortParams } from '../components/table-order';
 import {
   Alert,
   Badge,
@@ -246,14 +247,16 @@ export function minutes(value: number): string {
 }
 
 export function FlowsPage() {
+  const removedOrder = useTableOrder();
   const owner = projectScope();
   const { query } = useLocation();
   const search = (query.get('search') ?? '').slice(0, 200);
   const page = Math.max(1, Number(query.get('page')) || 1);
   const sizes = [10, 25, 50, 100];
   const size = sizes.includes(Number(query.get('page_size'))) ? Number(query.get('page_size')) : 10;
+  const sort = querySort(query, ['name','version','tasks','rounds','changes']);
   const flows = useResource<FlowLibrary & {page: number; page_size: number; total: number}>(
-    apiUrl('flows', { search, page, page_size: size }));
+    apiUrl('flows', { search, page, page_size: size, ...sortParams(sort) }));
   const [making, setMaking] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<FlowListed | null>(null);
@@ -269,17 +272,17 @@ export function FlowsPage() {
   const wanted = query.get('tab');
   const tab = !owner && wanted === 'tasks' ? wanted : 'flows';
   const columns: DataTableColumn<FlowListed>[] = [
-    {id: 'name', header: 'Flow', accessor: f=>f.name, sortable: false,
+    {id: 'name', header: 'Flow', accessor: f=>f.name, sortable: true,
       className: 'max-w-xl whitespace-normal', cell: f=><><div className="flex items-center gap-2">
       {f.engine ? <Link href={currentAutomationUrl('flow', f.key)}>{f.name}</Link> : f.name}
       {f.engine?.review_action && <Badge size="sm">Review</Badge>}{f.engine?.part && <Badge size="sm">Part</Badge>}
       </div><p className="text-xs text-muted-foreground">{f.summary}</p></>},
-    {id: 'version', header: 'In force', accessor: f=>f.engine?.version ?? '', sortable: false,
+    {id: 'version', header: 'In force', accessor: f=>f.engine?.version ?? '', sortable: true,
       cell: f=>f.engine ? <>{versionName(f.engine.version)} {f.engine.draft && <Badge size="sm">Draft v{f.engine.draft}</Badge>}</> : 'Library entry'},
-    {id: 'tasks', header: 'Tasks', accessor: f=>f.engine?.tasks ?? '', sortable: false,
+    {id: 'tasks', header: 'Tasks', accessor: f=>f.engine?.tasks ?? '', sortable: true,
       cell: f=>f.engine ? f.engine.tasks+' · '+f.engine.agents+' with an agent' : '—'},
-    {id: 'rounds', header: 'Rounds', accessor: f=>f.engine?.review_action ? '—' : f.engine?.budgets.rounds ?? '—', sortable: false},
-    {id: 'changes', header: 'Changed here', accessor: f=>f.engine?.version ?? '', sortable: false,
+    {id: 'rounds', header: 'Rounds', accessor: f=>f.engine?.review_action ? '—' : f.engine?.budgets.rounds ?? '—', sortable: true},
+    {id: 'changes', header: 'Changed here', accessor: f=>f.engine?.version ?? '', sortable: true,
       cell: f=>!f.engine ? '—' : f.engine.version === null ? 'Made here' : !f.engine.version ? 'None' : f.engine.prompts_changed.join(', ') || 'Settings'},
     {id: 'actions', header: 'Actions', sortable: false, accessor: f=>f.key,
       cell: f=>f.engine?.review_action && f.engine.builtin ? null :
@@ -357,7 +360,7 @@ export function FlowsPage() {
                 onDismiss={() => setGone(null)}
               />
             ) : null}
-            <DataTable caption="Flows" rows={flows.data?.items ?? []} columns={columns} getRowId={f=>f.key}
+            <DataTable sort={sort} caption="Flows" rows={flows.data?.items ?? []} columns={columns} getRowId={f=>f.key}
               selectionMode="none" showColumnMenu={false} showDensityToggle={false} showQuickFilter
               quickFilter={search} quickFilterDebounceMs={350} labels={{quickFilter: ()=>'Search flows'}}
               paginationMode="server" paginated={Boolean(flows.data?.total)} rowCount={flows.data?.total ?? 0}
@@ -365,7 +368,7 @@ export function FlowsPage() {
               loading={flows.loading} filtered={Boolean(search)} emptyState="No flows in this library."
               noResultsState="No flows match your search."
               onQueryChange={next=>setQuery({search: (next.quickFilter ?? '').trim().slice(0,200) || null,
-                page: next.page>1 ? String(next.page) : null, page_size: next.pageSize===10 ? null : String(next.pageSize)})} />
+                ...sortParams(next.sort), page: next.page>1 ? String(next.page) : null, page_size: next.pageSize===10 ? null : String(next.pageSize)})} />
             {removed.length ? (
               <Card>
                 <CardHeader>
@@ -381,14 +384,16 @@ export function FlowsPage() {
                       <TableCaption className="sr-only">Deleted flows of the platform</TableCaption>
                       <TableHeader>
                         <TableRow>
-                          <TableHead>Flow</TableHead>
+                          <TableHead {...removedOrder.header('flow')}>Flow</TableHead>
                           <TableHead>
                             <span className="sr-only">Actions</span>
                           </TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {removed.map((flow) => (
+                        {removedOrder.rows(removed, {
+                  flow: r => r.name,
+                }).map((flow) => (
                           <TableRow key={flow.key}>
                             <TableCell className="max-w-xl">
                               <span className="font-medium">{flow.name}</span>

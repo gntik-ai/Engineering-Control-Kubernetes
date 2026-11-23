@@ -45,6 +45,8 @@ interface DataTableCommonProps<T> {
   /** Per-key overrides; omitted keys keep existing defaults and provider translations. */
   labels?: Partial<DataTableLabels>;
   rows?: readonly T[];
+  /** Alternative layout for the current page, sharing the toolbar and pagination. */
+  renderGrid?: (rows: readonly T[]) => ReactNode;
   columns?: ReadonlyArray<DataTableColumn<T>>;
   /** Stable row id (defaults to `row.id`). */
   getRowId?: (row: T) => string;

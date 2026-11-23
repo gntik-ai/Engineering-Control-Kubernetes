@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   AlertDialog,
@@ -203,6 +204,7 @@ function Tools({
   catalogue: SupervisorTool[];
   change: (next: Partial<Draft>) => void;
 }) {
+  const toolOrder = useTableOrder();
   const set = (name: string, next: Partial<{ enabled: boolean; mode: ToolMode }>) =>
     change({
       tools: { ...draft.tools, [name]: { ...draft.tools[name]!, ...next } },
@@ -229,14 +231,18 @@ function Tools({
               <TableCaption className="sr-only">{KINDS[kind].title} tools</TableCaption>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Tool</TableHead>
-                  <TableHead className="w-40">Available</TableHead>
-                  <TableHead className="w-56">When it is called</TableHead>
+                  <TableHead {...toolOrder.header('tool')}>Tool</TableHead>
+                  <TableHead {...toolOrder.header('available')} className="w-40">Available</TableHead>
+                  <TableHead {...toolOrder.header('mode')} className="w-56">When it is called</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {catalogue
-                  .filter((tool) => tool.kind === kind)
+                {toolOrder.rows(catalogue
+                  .filter((tool) => tool.kind === kind), {
+                  tool: r => r.title,
+                  available: r => draft.tools[r.name]?.enabled ?? true,
+                  mode: r => draft.tools[r.name]?.mode ?? r.default_mode,
+                })
                   .map((tool) => {
                     const choice = draft.tools[tool.name] ?? {
                       enabled: true,
@@ -401,6 +407,7 @@ function Subscription({
 }
 
 function Versions({ settings, onLoad }: { settings: SupervisorSettings; onLoad: (version: number) => void }) {
+  const versionOrder = useTableOrder();
   if (settings.versions.length === 0) {
     return (
       <EmptyState
@@ -416,14 +423,18 @@ function Versions({ settings, onLoad }: { settings: SupervisorSettings; onLoad: 
         <TableCaption className="sr-only">Versions of the definition</TableCaption>
         <TableHeader>
           <TableRow>
-            <TableHead className="w-28">Version</TableHead>
-            <TableHead>What changed</TableHead>
-            <TableHead className="w-44">Saved</TableHead>
+            <TableHead {...versionOrder.header('version')} className="w-28">Version</TableHead>
+            <TableHead {...versionOrder.header('note')}>What changed</TableHead>
+            <TableHead {...versionOrder.header('saved')} className="w-44">Saved</TableHead>
             <TableHead className="w-48" />
           </TableRow>
         </TableHeader>
         <TableBody>
-          {settings.versions.map((item) => (
+          {versionOrder.rows(settings.versions, {
+                  version: r => r.version,
+                  note: r => r.note,
+                  saved: r => r.saved_at,
+                }).map((item) => (
             <TableRow key={item.version}>
               <TableCell>
                 <span className="font-medium">{item.version}</span>{' '}
@@ -469,6 +480,7 @@ const OUTCOMES: Record<
 };
 
 function RecordTable() {
+  const recordOrder = useTableOrder();
   const record = useResource<Listing<SupervisorRecordEntry>>(apiUrl('supervisor/record'), 30_000);
   return (
     <div className="grid gap-3">
@@ -484,16 +496,21 @@ function RecordTable() {
           <TableCaption className="sr-only">What the supervisor did</TableCaption>
           <TableHeader>
             <TableRow>
-              <TableHead>Action</TableHead>
-              <TableHead className="w-44">What became of it</TableHead>
-              <TableHead>Why</TableHead>
-              <TableHead className="w-40">When</TableHead>
+              <TableHead {...recordOrder.header('action')}>Action</TableHead>
+              <TableHead {...recordOrder.header('outcome')} className="w-44">What became of it</TableHead>
+              <TableHead {...recordOrder.header('why')}>Why</TableHead>
+              <TableHead {...recordOrder.header('when')} className="w-40">When</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             <Rows resource={record} columns={4} empty="The supervisor has not acted yet">
               {(items) =>
-                items.map((entry) => (
+                recordOrder.rows(items, {
+                  action: r => r.summary ?? r.title,
+                  outcome: r => OUTCOMES[r.outcome].label,
+                  why: r => r.reason ?? r.detail,
+                  when: r => r.at,
+                }).map((entry) => (
                   <TableRow key={entry.id}>
                     <TableCell className="max-w-md">
                       <div className="font-medium">{entry.summary ?? entry.title}</div>
@@ -541,6 +558,7 @@ const INCIDENT_STATES: Record<Incident['state'], { label: string; tone: 'neutral
  * the trouble the platform noticed.
  */
 function Trouble({ draft, change }: { draft: Draft; change: (next: Partial<Draft>) => void }) {
+  const incidentOrder = useTableOrder();
   const incidents = useResource<Incidents>(apiUrl('supervisor/incidents', { everything: 'true' }), 30_000);
   const [problem, setProblem] = useState<string | null>(null);
   const dismiss = (id: string) => {
@@ -602,10 +620,10 @@ function Trouble({ draft, change }: { draft: Draft; change: (next: Partial<Draft
           <TableCaption className="sr-only">Trouble with the work</TableCaption>
           <TableHeader>
             <TableRow>
-              <TableHead>What happened</TableHead>
-              <TableHead className="w-48">State</TableHead>
-              <TableHead>What the supervisor made of it</TableHead>
-              <TableHead className="w-40">When</TableHead>
+              <TableHead {...incidentOrder.header('what')}>What happened</TableHead>
+              <TableHead {...incidentOrder.header('state')} className="w-48">State</TableHead>
+              <TableHead {...incidentOrder.header('diagnosis')}>What the supervisor made of it</TableHead>
+              <TableHead {...incidentOrder.header('when')} className="w-40">When</TableHead>
               <TableHead className="w-24">
                 <span className="sr-only">Actions</span>
               </TableHead>
@@ -614,7 +632,12 @@ function Trouble({ draft, change }: { draft: Draft; change: (next: Partial<Draft
           <TableBody>
             <Rows resource={incidents} columns={5} empty="Nothing went wrong yet">
               {(items) =>
-                items.map((incident) => (
+                incidentOrder.rows(items, {
+                  what: r => r.summary,
+                  state: r => INCIDENT_STATES[r.state].label,
+                  diagnosis: r => r.diagnosis,
+                  when: r => r.at,
+                }).map((incident) => (
                   <TableRow key={incident.id}>
                     <TableCell className="max-w-md">
                       <div className="text-[13px]">{incident.summary}</div>

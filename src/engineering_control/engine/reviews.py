@@ -24,6 +24,10 @@ ACTIONS = {
         "Repository description",
         "Extract the project description from repository evidence.",
     ),
+    "epic-intake": (
+        "Validate an Epic description",
+        "Clarify the author’s intent and review wording before creating a project Epic.",
+    ),
     "epics": ("Review Epics", "Review existing Epics and propose missing project outcomes."),
     "stories": ("Review User Stories", "Review Stories and propose coverage for approved Epics."),
     "issues": (

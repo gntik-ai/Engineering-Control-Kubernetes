@@ -7,7 +7,7 @@ from itertools import batched
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, and_, cast, func, literal, or_, select, update
+from sqlalchemy import JSON, and_, case, cast, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -24,6 +24,7 @@ from engineering_control.db.models import (
     ReviewEvidenceJob,
     ReviewFlowRun,
 )
+from engineering_control.table_sort import Direction, sql_order
 
 Job = ReviewEvidenceJob
 
@@ -71,7 +72,13 @@ def eligible(db: Session, project: UUID) -> ColumnElement[bool]:
 
 
 def listing(
-    sessions: sessionmaker[Session], name: str, reviewed: bool, page: int, advisory: bool = False
+    sessions: sessionmaker[Session],
+    name: str,
+    reviewed: bool,
+    page: int,
+    advisory: bool = False,
+    sort: str = "",
+    direction: Direction = "asc",
 ) -> dict[str, Any]:
     with sessions() as db:
         p = active_project(db, name)
@@ -88,6 +95,25 @@ def listing(
             )
         count = db.scalar(select(func.count()).select_from(Job).where(where)) or 0
         page = min(page, max(1, (count + 9) // 10))
+        values = {
+            "issue": Job.result["sample_names"][0].as_string(),
+            "story": Job.result["sample_names"][1].as_string(),
+            "original": Job.result["arms"][0]["scope"].as_string(),
+            "wiki": Job.result["arms"][1]["scope"].as_string(),
+            "native": Job.result["native"]["scope"].as_string(),
+            "second": Job.result["second_opinion"]["scope"].as_string(),
+            "decision": scope,
+        }
+        order = ReviewFlowRun.started_at.desc()
+        if sort:
+            value = values[sort]
+            if sort not in ("issue", "story"):
+                value = case(
+                    {"full": "All", "partial": "Some", "unrelated": "None", "unclear": "Unclear"},
+                    value=value,
+                    else_=value,
+                )
+            order = sql_order(func.lower(value), direction)
         rows = db.execute(
             select(
                 Job.run_id,
@@ -101,7 +127,7 @@ def listing(
             )
             .join(ReviewFlowRun, ReviewFlowRun.id == Job.run_id)
             .where(where)
-            .order_by(ReviewFlowRun.started_at.desc(), Job.run_id.desc())
+            .order_by(order, Job.run_id.desc())
             .offset(10 * (page - 1))
             .limit(10)
         )

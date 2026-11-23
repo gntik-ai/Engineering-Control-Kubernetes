@@ -1,3 +1,4 @@
+import { useTableOrder, sortParams } from '../components/table-order';
 import {
   ChatComposer,
   ChatLayout,
@@ -139,6 +140,7 @@ function SavedReview({ review, close }: { review: ReviewRow; close: () => void }
 }
 
 function ReviewHistory({ project, all, targets }: { project: string; all: boolean; targets: string[] }) {
+  const order = useTableOrder(() => setPage(1));
   const [selected, setSelected] = useState<ReviewRow | null>(null);
   const [page, setPage] = useState(1);
   const [state, setState] = useState('');
@@ -146,7 +148,7 @@ function ReviewHistory({ project, all, targets }: { project: string; all: boolea
     apiUrl(`projects/${project}/supervisor/reviews`, {
       page,
       state,
-      projects: targets.join(','),
+      projects: targets.join(','), ...sortParams(order.sort),
       all_projects: all ? 'true' : 'false',
     }),
     30000,
@@ -177,10 +179,10 @@ function ReviewHistory({ project, all, targets }: { project: string; all: boolea
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Review</TableHead>
-                  <TableHead>Project</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>Flow version</TableHead>
+                  <TableHead {...order.header('title')}>Review</TableHead>
+                  <TableHead {...order.header('project')}>Project</TableHead>
+                  <TableHead {...order.header('state')}>State</TableHead>
+                  <TableHead {...order.header('version')}>Flow version</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -280,8 +282,9 @@ interface LearningSummary {
 }
 
 function LearningPanel({ project, discuss }: { project: string; discuss: (message: string) => void }) {
+  const order = useTableOrder(() => setPage(1));
   const [page, setPage] = useState(1);
-  const saved = useResource<LearningSummary>(apiUrl(`projects/${project}/supervisor/learning`, { page }));
+  const saved = useResource<LearningSummary>(apiUrl(`projects/${project}/supervisor/learning`, { page, ...sortParams(order.sort) }));
   const data = saved.data;
   return (
     <section className="grid gap-3" aria-label="Process learning">
@@ -300,10 +303,10 @@ function LearningPanel({ project, discuss }: { project: string; discuss: (messag
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Workflow</TableHead>
-                    <TableHead>Observation</TableHead>
-                    <TableHead>Occurrences</TableHead>
-                    <TableHead>Evidence</TableHead>
+                    <TableHead {...order.header('flow')}>Workflow</TableHead>
+                    <TableHead {...order.header('observation')}>Observation</TableHead>
+                    <TableHead {...order.header('occurrences')}>Occurrences</TableHead>
+                    <TableHead {...order.header('evidence')}>Evidence</TableHead>
                     <TableHead>Action</TableHead>
                   </TableRow>
                 </TableHeader>

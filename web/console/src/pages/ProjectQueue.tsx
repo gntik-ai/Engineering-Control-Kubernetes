@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   Badge,
@@ -81,6 +82,7 @@ export function ProjectQueue({ project }: { project: string }) {
 }
 
 function QueueList({ project }: { project: string }) {
+  const queueOrder = useTableOrder();
   const root = `projects/${project}`;
   const overview = useResource<Overview>(apiUrl(root + '/execution'), 30_000);
   const queues = useResource<Listing<Queue>>(apiUrl(root + '/queues'), 8_000);
@@ -161,14 +163,18 @@ function QueueList({ project }: { project: string }) {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Queue</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>Progress</TableHead>
+                  <TableHead {...queueOrder.header('queue')}>Queue</TableHead>
+                  <TableHead {...queueOrder.header('state')}>State</TableHead>
+                  <TableHead {...queueOrder.header('progress')}>Progress</TableHead>
                   {hasDraft && <TableHead>Action</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {queues.data?.items.map((q) => (
+                {queueOrder.rows(queues.data?.items ?? [], {
+                  queue: r => r.name,
+                  state: r => r.state,
+                  progress: r => r.counts.total ? r.counts.done / r.counts.total : null,
+                }).map((q) => (
                   <TableRow key={q.id}>
                     <TableCell>
                       <Link href={queueUrl(project, q.id)}>{q.name}</Link>
@@ -343,6 +349,7 @@ function ReviewOrder({
   change: (op: string, fields?: Record<string, unknown>) => void;
   pending: string;
 }) {
+  const issueOrder = useTableOrder(() => setPage(0));
   const [edit, setEdit] = useState<Edits>({
     stories: plan.stories.map((s) => s.id),
     order: plan.issues.map((i) => i.id),
@@ -373,6 +380,7 @@ function ReviewOrder({
       order: [...edit.order.filter((i) => entries.get(i)?.state !== 'waiting'), ...waiting],
     });
   };
+  const positions = new Map(edit.order.map((id, index) => [id, index]));
   const matches = edit.order.filter((id) => {
     const i = issues.get(id);
     return i && (i.title + ' ' + (i.number ?? '')).toLowerCase().includes(search.toLowerCase());
@@ -464,13 +472,17 @@ function ReviewOrder({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Order</TableHead>
-              <TableHead>Issue and prerequisites</TableHead>
-              <TableHead>Classification</TableHead>
+              <TableHead {...issueOrder.header('order')}>Order</TableHead>
+              <TableHead {...issueOrder.header('issue')}>Issue and prerequisites</TableHead>
+              <TableHead {...issueOrder.header('type')}>Classification</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {matches.slice(page * pageSize, (page + 1) * pageSize).map((id) => {
+            {issueOrder.rows(matches, {
+                  order: id => positions.get(id),
+                  issue: id => issues.get(id)?.title,
+                  type: id => { const issue = issues.get(id); return issue ? typeName(types[id] ?? issue.type) : null; },
+                }).slice(page * pageSize, (page + 1) * pageSize).map((id) => {
               const i = issues.get(id)!;
               const pos = edit.order.indexOf(id);
               const deps = edit.requires[id] ?? [];

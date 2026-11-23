@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   AlertDialog,
@@ -147,6 +148,7 @@ const active = (run: Pick<Run, 'state'> | null | undefined) =>
   run?.state === 'queued' || run?.state === 'running';
 
 export function RunsPage() {
+  const order = useTableOrder();
   const [busy, setBusy] = useState(false);
   const project = useLocation().query.get('project');
   const runs = useResource<Listing<Run>>(apiUrl('runs', { project }), busy ? 5_000 : 30_000);
@@ -240,11 +242,11 @@ export function RunsPage() {
               <TableCaption className="sr-only">Runs</TableCaption>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Run</TableHead>
-                  <TableHead>Project</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>What happened</TableHead>
-                  <TableHead>Started</TableHead>
+                  <TableHead {...order.header('run')}>Run</TableHead>
+                  <TableHead {...order.header('project')}>Project</TableHead>
+                  <TableHead {...order.header('state')}>State</TableHead>
+                  <TableHead {...order.header('outcome')}>What happened</TableHead>
+                  <TableHead {...order.header('started')}>Started</TableHead>
                   <TableHead>
                     <span className="sr-only">Actions</span>
                   </TableHead>
@@ -253,7 +255,13 @@ export function RunsPage() {
               <TableBody>
                 <Rows resource={runs} columns={6} empty="Nothing has run yet">
                   {(items) =>
-                    items.map((run) => (
+                    order.rows(items, {
+                  run: r => r.title,
+                  project: r => r.project,
+                  state: r => r.state,
+                  outcome: r => r.detail,
+                  started: r => r.started_at ?? r.created_at,
+                }).map((run) => (
                       <TableRow key={run.id}>
                         <TableCell className="max-w-md">
                           <Link href={`${BASE}/run?id=${run.id}`} className="font-medium">

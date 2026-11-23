@@ -142,6 +142,20 @@ def start(
     document, version = resolve(db, pid, action)
     if old and old.finished_at is None:
         finish(db, owner, "cancelled")
+    row = new_run(db, pid, action, document, version)
+    owner.review_run_id = row.id
+    return row.id
+
+
+def new_run(
+    db: Session,
+    pid: UUID,
+    action: str,
+    document: Document,
+    version: int,
+    *,
+    key: UUID | None = None,
+) -> ReviewFlowRun:
     policy = Policy.from_document(document).settings()
     if policy.get("evidence_nodes"):
         policy["document"] = document.as_dict()
@@ -153,10 +167,11 @@ def start(
         version=version,
         settings=policy,
     )
+    if key is not None:
+        row.id = key
     db.add(row)
     db.flush()
-    owner.review_run_id = row.id
-    return row.id
+    return row
 
 
 def wording(settings: dict[str, Any], stage: str) -> str:

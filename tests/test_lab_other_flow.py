@@ -48,7 +48,8 @@ def test_flows_are_of_two_sorts_and_only_one_sort_is_put_next_to_each_other() ->
     assert sorts["review-native-decisions"] == "review"
     assert sorts["review-advisory-decisions"] == "review"
     assert sorts["review-supervisor"] == "review"
-    assert sum(sort == "review" for sort in sorts.values()) == 12
+    assert sorts["review-epic-intake"] == "review"
+    assert sum(sort == "review" for sort in sorts.values()) == 13
     assert sum(sort == "section" for sort in sorts.values()) == 5
     assert set(sorts.values()) == {"review", "section"}
     # A flow in which a model writes the change works on an item like Deliver issue.

@@ -51,6 +51,7 @@ from engineering_control.sandbox.deliver import toolchain_for
 from engineering_control.sandbox.pods import identity_secret
 from engineering_control.supervisor.definition import PROVIDERS as SUPERVISOR_PROVIDERS
 from engineering_control.supervisor.definition import catalogue as tool_catalogue
+from engineering_control.table_sort import Direction
 
 # How many runs and queues the start page lists; the rest is on their own pages.
 OVERVIEW_ROWS = 8
@@ -292,6 +293,8 @@ class DashboardService:
         search: str | None,
         page: int,
         page_size: int,
+        sort: str = "",
+        direction: Direction = "asc",
     ) -> dict[str, object]:
         def read() -> dict[str, Any]:
             listing = self.repository.backlog.listing(
@@ -301,6 +304,8 @@ class DashboardService:
                 search=search,
                 page=page,
                 page_size=page_size,
+                sort=sort,
+                direction=direction,
             )
             # Each item with its latest run, so the backlog shows what is being worked on.
             ids = [item["id"] for item in listing["items"]]

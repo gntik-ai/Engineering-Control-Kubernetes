@@ -51,6 +51,7 @@ from engineering_control.engine.library import (
 )
 from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.flow_library import FLOWS, BuiltInFlow
+from engineering_control.table_sort import Direction, ordered, sql_order
 
 
 def _when(value: datetime | None) -> str | None:
@@ -424,8 +425,16 @@ class FlowRecords:
             except FlowInvalid:
                 return None
 
-    def page(self, project: str | None, page: int, size: int, search: str) -> dict[str, Any]:
-        """Page the visible library before opening any documents or calculating traits."""
+    def page(
+        self,
+        project: str | None,
+        page: int,
+        size: int,
+        search: str,
+        sort: str = "",
+        direction: Direction = "asc",
+    ) -> dict[str, Any]:
+        """Page the visible library, resolving every match for a sort on a derived trait."""
         base: dict[str, BuiltInFlow | Document] = {**FLOWS, **BUILTIN}
         static = union_all(
             *(
@@ -494,25 +503,46 @@ class FlowRecords:
         with self.sessions() as db:
             total = db.scalar(select(func.count()).select_from(result.subquery())) or 0
             page = max(1, min(page, (total + size - 1) // size))
-            rows = db.execute(
-                result.order_by(func.lower(visible.c.name), visible.c.key)
-                .offset((page - 1) * size)
-                .limit(size)
-            ).all()
+            by_traits = sort in ("version", "tasks", "rounds", "changes")
+            query = result.order_by(
+                sql_order(func.lower(visible.c.name), direction if sort == "name" else "asc"),
+                visible.c.key,
+            )
+            if not by_traits:
+                query = query.offset((page - 1) * size).limit(size)
+            rows = db.execute(query).all()
         engine = {
-            row["key"]: row for row in self.summary([row.key for row in rows if row.runnable])
+            entry["key"]: entry for entry in self.summary([r.key for r in rows if r.runnable])
         }
+        items = [
+            {
+                "key": r.key,
+                "name": r.name,
+                "summary": r.summary,
+                "engine": engine.get(r.key),
+                "owner": project,
+            }
+            for r in rows
+        ]
+        if by_traits:
+
+            def value(row: dict[str, Any]) -> Any:
+                e = row["engine"]
+                if not e:
+                    return None
+                if sort == "rounds":
+                    return None if e.get("review_action") else e["budgets"]["rounds"]
+                if sort == "changes":
+                    if e["version"] is None:
+                        return "Made here"
+                    return (
+                        (", ".join(e["prompts_changed"]) or "Settings") if e["version"] else "None"
+                    )
+                return e[sort]
+
+            items = ordered(items, value, direction)[(page - 1) * size : page * size]
         return {
-            "items": [
-                {
-                    "key": row.key,
-                    "name": row.name,
-                    "summary": row.summary,
-                    "engine": engine.get(row.key),
-                    "owner": project,
-                }
-                for row in rows
-            ],
+            "items": items,
             "removed": [] if project else self.removed(),
             "page": page,
             "page_size": size,

@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import { currentAutomationUrl } from '../router';
 import {
   Alert,
@@ -363,23 +364,29 @@ function DocumentText({ document, change }: { document: FlowDocument; change: (n
 }
 
 function Versions({ detail, onOpen }: { detail: FlowDetail; onOpen: (version: number) => void }) {
+  const order = useTableOrder();
   return (
     <TableFrame>
       <Table>
         <TableCaption className="sr-only">Versions of the flow</TableCaption>
         <TableHeader>
           <TableRow>
-            <TableHead>Version</TableHead>
-            <TableHead>State</TableHead>
-            <TableHead>What changed</TableHead>
-            <TableHead>Published</TableHead>
+            <TableHead {...order.header('version')}>Version</TableHead>
+            <TableHead {...order.header('state')}>State</TableHead>
+            <TableHead {...order.header('note')}>What changed</TableHead>
+            <TableHead {...order.header('published')}>Published</TableHead>
             <TableHead>
               <span className="sr-only">Actions</span>
             </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {detail.versions.map((version) => (
+          {order.rows(detail.versions, {
+                  version: r => r.version,
+                  state: r => r.state === 'draft' ? 'Draft' : r.version === detail.in_force?.version ? 'In force' : 'Published',
+                  note: r => r.note,
+                  published: r => r.published_at,
+                }).map((version) => (
             <TableRow key={version.version}>
               <TableCell className="text-[13px]">{versionName(version.version)}</TableCell>
               <TableCell>

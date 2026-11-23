@@ -1,3 +1,5 @@
+import { useTableOrder } from '../components/table-order';
+import { Table, TableHeader, TableHead, TableBody, TableRow, TableCell } from '@gntik-ai/ui';
 import { Button, Card, CardBody, CardHeader, CardTitle, Skeleton } from '@gntik-ai/ui';
 import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
@@ -166,6 +168,7 @@ function CostUsage({ series }: { series: Day[] }) {
 }
 
 export function WorkspaceMetrics({ project }: { project: string }) {
+  const daily = useTableOrder();
   const [days, setDays] = useState<7 | 30>(7);
   const resource = useResource<{ series: Day[]; days: number }>(
     apiUrl('projects/' + encodeURIComponent(project) + '/statistics', { days }),
@@ -224,31 +227,28 @@ export function WorkspaceMetrics({ project }: { project: string }) {
           <details className="text-sm">
             <summary className="cursor-pointer font-medium">Daily figures (UTC)</summary>
             <div className="mt-2 overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr>
-                    {['Date', 'Resolved Issues', 'Measured tokens', 'Estimated EUR', 'Unpriced tokens', 'ECB rate (USD per EUR)'].map(
-                      (h) => (
-                        <th key={h} className="p-2">
-                          {h}
-                        </th>
-                      ),
-                    )}
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...series].reverse().map((d) => (
-                    <tr key={d.day} className="border-t border-border">
-                      <td className="p-2">{d.day}</td>
-                      <td>{d.resolved}</td>
-                      <td>{d.tokens.toLocaleString()}</td>
-                      <td>{estimate(d)}</td>
-                      <td>{d.unpriced_tokens?.toLocaleString() ?? '—'}</td>
-                      <td>{d.usd_per_eur ? d.usd_per_eur + ' · ' + d.exchange_rate_date : '—'}</td>
-                    </tr>
+              <Table containerLabel="Daily project usage">
+                <TableHeader><TableRow>
+                    {['Date', 'Resolved Issues', 'Measured tokens', 'Estimated EUR', 'Unpriced tokens', 'ECB rate (USD per EUR)'].map(label =>
+                      <TableHead key={label} {...daily.header(label)}>{label}</TableHead>)}
+                  </TableRow></TableHeader>
+                <TableBody>
+                  {daily.rows([...series].reverse(), {
+                    Date: r => r.day, 'Resolved Issues': r => r.resolved, 'Measured tokens': r => r.tokens,
+                    'Estimated EUR': r => r.estimated_eur == null ? null : Number(r.estimated_eur),
+                    'Unpriced tokens': r => r.unpriced_tokens, 'ECB rate (USD per EUR)': r => r.usd_per_eur ? Number(r.usd_per_eur) : null,
+                  }).map((d) => (
+                    <TableRow key={d.day} className="border-t border-border">
+                      <TableCell className="p-2">{d.day}</TableCell>
+                      <TableCell>{d.resolved}</TableCell>
+                      <TableCell>{d.tokens.toLocaleString()}</TableCell>
+                      <TableCell>{estimate(d)}</TableCell>
+                      <TableCell>{d.unpriced_tokens?.toLocaleString() ?? '—'}</TableCell>
+                      <TableCell>{d.usd_per_eur ? d.usd_per_eur + ' · ' + d.exchange_rate_date : '—'}</TableCell>
+                    </TableRow>
                   ))}
-                </tbody>
-              </table>
+                </TableBody>
+              </Table>
             </div>
           </details>
         </>

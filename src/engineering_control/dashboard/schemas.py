@@ -390,6 +390,8 @@ class ConnectionBulkLinksInput(PlainChangeInput):
 
 
 class EvidencePreviewInput(PlainChangeInput):
+    sort: Literal["", "issue", "story", "reason", "decision"] = ""
+    direction: Literal["asc", "desc"] = "asc"
     document: dict[str, Any] | None = None
     provider: str = Field(default="", max_length=32)
     model: str = Field(default="", max_length=200)
@@ -494,6 +496,16 @@ class ProposalEdit(PlainChangeInput):
 class EpicInput(PlainChangeInput):
     title: str = Field(min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=40000)
+
+
+class NewEpicInput(EpicInput):
+    review_id: UUID | None = None
+
+
+class EpicDescriptionCheck(EpicInput):
+    request_id: UUID
+    previous: UUID | None = None
+    answer: str | None = Field(default=None, max_length=8000)
 
 
 class StoryInput(EpicInput):

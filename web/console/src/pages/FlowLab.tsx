@@ -1,3 +1,4 @@
+import { useTableOrder } from '../components/table-order';
 import {
   Alert,
   Badge,
@@ -67,6 +68,7 @@ export function TryOnPaper({
   document: FlowDocument;
   catalogue: FlowCatalogue;
 }) {
+  const stepOrder = useTableOrder();
   const lab = useResource<Lab>(apiUrl(`flows/${flowKey}/evaluations`));
   const types = useMemo(() => new Map(catalogue.tasks.map((task) => [task.key, task])), [catalogue]);
   const [ways, setWays] = useState<Record<string, string>>({});
@@ -225,16 +227,23 @@ export function TryOnPaper({
                 <TableCaption className="sr-only">The run, task by task</TableCaption>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Task</TableHead>
-                    <TableHead>Where</TableHead>
-                    <TableHead>Given to</TableHead>
-                    <TableHead>Round</TableHead>
-                    <TableHead>Ends with</TableHead>
-                    <TableHead>Prompt</TableHead>
+                    <TableHead {...stepOrder.header('task')}>Task</TableHead>
+                    <TableHead {...stepOrder.header('where')}>Where</TableHead>
+                    <TableHead {...stepOrder.header('provider')}>Given to</TableHead>
+                    <TableHead {...stepOrder.header('round')}>Round</TableHead>
+                    <TableHead {...stepOrder.header('outcome')}>Ends with</TableHead>
+                    <TableHead {...stepOrder.header('prompt')}>Prompt</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {result.steps.map((step, index) => (
+                  {stepOrder.rows(result.steps, {
+                  task: r => r.title,
+                  where: r => WHERE[r.where],
+                  provider: r => r.provider ? PROVIDER_NAMES[r.provider] ?? r.provider : null,
+                  round: r => r.round,
+                  outcome: r => r.outcome,
+                  prompt: r => r.prompt?.name,
+                }).map((step, index) => (
                     <TableRow key={index}>
                       <TableCell>
                         <span className={step.where === 'control' ? 'text-muted-foreground' : 'font-medium'}>
@@ -351,6 +360,7 @@ function Arm({ measured, waiting }: { measured: Measured | null; waiting?: strin
 }
 
 function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => void }) {
+  const evaluationOrder = useTableOrder();
   const [open, setOpen] = useState(row.state === 'running');
   const detail = useResource<Evaluation>(
     apiUrl(`evaluations/${row.id}`),
@@ -448,14 +458,19 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
                   <TableCaption className="sr-only">Cases of the evaluation</TableCaption>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Past work</TableHead>
-                      <TableHead>{other ? `As the run went, by ${shown.of_name}` : 'As the run went'}</TableHead>
-                      <TableHead>{other ? 'By this flow' : 'On the version tried'}</TableHead>
-                      <TableHead>Verdict</TableHead>
+                      <TableHead {...evaluationOrder.header('work')}>Past work</TableHead>
+                      <TableHead {...evaluationOrder.header('baseline')}>{other ? `As the run went, by ${shown.of_name}` : 'As the run went'}</TableHead>
+                      <TableHead {...evaluationOrder.header('candidate')}>{other ? 'By this flow' : 'On the version tried'}</TableHead>
+                      <TableHead {...evaluationOrder.header('verdict')}>Verdict</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {detail.data.items.map((entry) => (
+                    {evaluationOrder.rows(detail.data.items, {
+                  work: r => r.subject.title,
+                  baseline: r => r.baseline?.state,
+                  candidate: r => r.candidate?.state,
+                  verdict: r => r.verdict ? VERDICTS[r.verdict]?.label : null,
+                }).map((entry) => (
                       <TableRow key={entry.subject.n}>
                         <TableCell className="max-w-xs align-top">
                           <span className="text-[13px] font-medium">{entry.subject.title}</span>
@@ -505,6 +520,7 @@ function EvaluationCard({ row, onChanged }: { row: Evaluation; onChanged: () => 
 
 /** Try a version of the flow on the work of runs that happened. */
 export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; detail: FlowDetail; dirty: boolean }) {
+  const candidateOrder = useTableOrder();
   const [busy, setBusy] = useState(false);
   // Whose past runs are gone through: this flow's, or another flow's of the same sort.
   const [wanted, setWanted] = useState<string | null>(null);
@@ -645,14 +661,19 @@ export function EvaluationLab({ flowKey, detail, dirty }: { flowKey: string; det
                       <TableHead>
                         <span className="sr-only">Choose</span>
                       </TableHead>
-                      <TableHead>Past run</TableHead>
-                      <TableHead>How it ended</TableHead>
-                      <TableHead>Used</TableHead>
-                      <TableHead>When</TableHead>
+                      <TableHead {...candidateOrder.header('run')}>Past run</TableHead>
+                      <TableHead {...candidateOrder.header('outcome')}>How it ended</TableHead>
+                      <TableHead {...candidateOrder.header('usage')}>Used</TableHead>
+                      <TableHead {...candidateOrder.header('date')}>When</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {candidates.map((run) => (
+                    {candidateOrder.rows(candidates, {
+                  run: r => r.title,
+                  outcome: r => r.outcome ?? r.state,
+                  usage: r => r.minutes,
+                  date: r => r.created_at,
+                }).map((run) => (
                       <TableRow key={run.run_id}>
                         <TableCell className="w-8">
                           <Checkbox

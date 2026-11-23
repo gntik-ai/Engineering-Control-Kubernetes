@@ -137,12 +137,9 @@ def test_creation_coverage_across_epics_follow_up_and_explicit_publication(works
                 project_id=pid, stage="complete", repository="gntik-ai/falcone", branch="main"
             )
         )
-    epic = post(
-        client,
-        "planning/epics",
-        title="Migrate runtime",
-        description="Move jobs to FaaS with traceable failures.",
-    ).json()["id"]
+    epic = repo.planning.save(
+        "falcone", "epics", "Migrate runtime", "Move jobs to FaaS with traceable failures.", []
+    )["id"]
     assert repo.planning_analysis.claim() is None
     assert (
         post(client, "planning-reviews/model", provider="fixture", model="unknown").status_code
@@ -329,12 +326,9 @@ def test_checkpoint_recovers_expired_lease_and_rejects_old_results(workspace: An
             ProjectEpic(project_id=pid, id=UUID(int=n + 1), title=f"Existing epic {n}")
             for n in range(80)
         )
-    uid = post(
-        client,
-        "planning/epics",
-        title="Cross-cutting change",
-        description="Move the service registry.",
-    ).json()["id"]
+    uid = repo.planning.save(
+        "falcone", "epics", "Cross-cutting change", "Move the service registry.", []
+    )["id"]
     worker = repo.planning_analysis
     claim = worker.claim()
     work = worker.prepare(*claim)
@@ -447,7 +441,7 @@ def test_story_and_issue_check_other_epics_and_reject_foreign_parents(workspace:
         assert db.get(PlanningReview, (pid, "issues", UUID(issue))).status == "proposals"
         assert not db.scalar(select(WorkspaceAction.id))
     # Missing text asks for a correction before spending tokens or generating related work.
-    blank = post(client, "planning/epics", title="Audit report").json()["id"]
+    blank = repo.planning.save("falcone", "epics", "Audit report", None, [])["id"]
     drain(repo.planning_analysis, Model(lambda _: pytest.fail("Unexpected model call")))
     with repo.sessions() as db:
         assert db.get(PlanningReview, (pid, "epics", UUID(blank))).status == "needs_input"

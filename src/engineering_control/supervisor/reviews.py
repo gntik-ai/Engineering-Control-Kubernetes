@@ -37,6 +37,7 @@ from engineering_control.engine.builtin import BUILTIN
 from engineering_control.engine.catalogue import REVIEW_TASKS
 from engineering_control.engine.reviews import ACTIONS
 from engineering_control.flow_library import AUDIT, DELIVER, DISCOVER
+from engineering_control.table_sort import Direction, sql_order
 
 ATTENTION = (
     "awaiting_decision",
@@ -251,7 +252,14 @@ class ReviewHistory:
         self.sessions = sessions
 
     def listing(
-        self, projects: list[str] | None, *, page: int = 1, state: str = "", action: str = ""
+        self,
+        projects: list[str] | None,
+        *,
+        page: int = 1,
+        state: str = "",
+        action: str = "",
+        sort: str = "",
+        direction: Direction = "asc",
     ) -> dict[str, Any]:
         if page < 1:
             raise ProjectInvalid("Choose a positive review page.")
@@ -281,8 +289,18 @@ class ReviewHistory:
             if action:
                 query = query.where(rows.c.action == action)
             total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+            values = {
+                "title": func.lower(rows.c.title),
+                "project": select(ProjectRecord.name)
+                .where(ProjectRecord.id == rows.c.pid)
+                .correlate(rows)
+                .scalar_subquery(),
+                "state": rows.c.state,
+                "version": rows.c.version,
+            }
+            order = sql_order(values[sort], direction) if sort else rows.c.at.desc()
             result = db.execute(
-                query.order_by(rows.c.at.desc(), rows.c.source, rows.c.id.desc())
+                query.order_by(order, rows.c.source, rows.c.id.desc())
                 .limit(PAGE_SIZE)
                 .offset((page - 1) * PAGE_SIZE)
             ).mappings()

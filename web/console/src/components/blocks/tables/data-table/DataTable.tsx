@@ -90,6 +90,7 @@ const ROW_HEIGHT: Record<TableDensity, number> = { comfortable: 44, compact: 36 
 export function DataTable<T = (typeof DEPLOYMENT_ROWS)[number]>({
   rows = DEPLOYMENT_ROWS as unknown as readonly T[],
   columns = DEPLOYMENT_COLUMNS as unknown as ReadonlyArray<DataTableColumn<T>>,
+  renderGrid,
   getRowId = defaultRowId,
   getRowLabel,
   caption: captionProp,
@@ -649,7 +650,12 @@ export function DataTable<T = (typeof DEPLOYMENT_ROWS)[number]>({
     : (labels?.pageSelected?.(pageIds.length) ?? t('table.pageSelected', { count: formatNumber(pageIds.length) }));
   const selectionCount = labels?.selectionCount ? labels.selectionCount(selectedCount) : <>{selectedCount} selected</>;
 
-  const tableContent = (
+  const tableContent = renderGrid ? (
+    <div aria-busy={Boolean(loading)} className="min-w-0">
+      {refresh.skeleton ? <div role="status">{t('loading.table')}</div> : pageRows.length
+        ? renderGrid(pageRows) : filtered ? noResultsState ?? emptyState : emptyState}
+    </div>
+  ) : (
     <SelectionGroup single={singleMode} legend={legend} aria-label={ariaLabel} aria-labelledby={ariaLabelledBy}>
       <DensityProvider density={density}>
         <Table
@@ -718,7 +724,7 @@ export function DataTable<T = (typeof DEPLOYMENT_ROWS)[number]>({
                   <DataTableHeadCell
                     labels={labels}
                     key={c.id}
-                    column={sortingEnabled ? c : { ...c, sortable: false }}
+                    column={{ ...c, sortable: sortingEnabled && (c.sortable ?? Boolean(c.accessor)) }}
                     layout={layout.columns.get(c.id)}
                     sortDirection={sortingEnabled && sort?.columnId === c.id ? sort.direction : 'none'}
                     onSortChange={(dir) => changeSort(c.id, dir)}

@@ -36,9 +36,10 @@ def test_project_planning_crud_and_pending_issues(tmp_path: Path) -> None:
             == 403
         )
         first, second = (
-            post(base + "/epics", title=name).json()["id"] for name in ("Catalog", "Billing")
+            repository.planning.save("falcone", "epics", name, None, [])["id"]
+            for name in ("Catalog", "Billing")
         )
-        other = post(foreign + "/epics", title="Independent").json()["id"]
+        other = repository.planning.save("llmwiki", "epics", "Independent", None, [])["id"]
         story = post(base + "/stories", title="Issue receipt", epic_ids=[first, second]).json()[
             "id"
         ]

@@ -1,3 +1,4 @@
+import { useTableOrder, sortParams } from '../components/table-order';
 import {
   Alert,
   Badge,
@@ -529,6 +530,7 @@ function ItemRow({
 }
 
 export function BacklogPage() {
+  const order = useTableOrder(() => setQuery({ page: null }));
   const { query } = useLocation();
   const project = query.get('project');
   const section = query.get('section');
@@ -554,7 +556,7 @@ export function BacklogPage() {
   };
 
   const backlog = useResource<Paged<WorkItem>>(
-    apiUrl('items', { project, section, state, search, page, page_size: PAGE_SIZE }),
+    apiUrl('items', { project, section, state, search, page, page_size: PAGE_SIZE, ...sortParams(order.sort) }),
     30_000,
   );
   // The sections of the chosen project: what an item can be routed to.
@@ -678,11 +680,11 @@ export function BacklogPage() {
                     <span className="sr-only">Select</span>
                   </TableHead>
                 ) : null}
-                <TableHead>Item</TableHead>
-                {project ? null : <TableHead>Project</TableHead>}
-                <TableHead>Section</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Last change</TableHead>
+                <TableHead {...order.header('title')}>Item</TableHead>
+                {project ? null : <TableHead {...order.header('project')}>Project</TableHead>}
+                <TableHead {...order.header('section')}>Section</TableHead>
+                <TableHead {...order.header('state')}>State</TableHead>
+                <TableHead {...order.header('updated')}>Last change</TableHead>
                 <TableHead>
                   <span className="sr-only">Actions</span>
                 </TableHead>

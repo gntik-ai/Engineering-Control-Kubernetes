@@ -15,6 +15,7 @@ from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
+from engineering_control.dashboard.epic_descriptions import EpicDescriptions
 from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_analysis import PlanningAnalysis
@@ -105,6 +106,7 @@ class DashboardRepository:
         self.connections = Connections(self.sessions)
         self.connection_analysis = ConnectionAnalysis(self.sessions)
         self.planning = PlanningRecords(self.sessions)
+        self.epic_descriptions = EpicDescriptions(self.sessions)
         self.planning_analysis = PlanningAnalysis(self.sessions)
         self.execution_plans = ExecutionPlans(self.sessions)
         self.workspace_imports = WorkspaceImports(self.sessions)
