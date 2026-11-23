@@ -246,12 +246,13 @@ The administrator agreed these rules and phases. Every change to existing record
 | R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
 | R6 | Scorer in shadow mode: a calibrated classifier that abstains, with escalation to decision models. | A report of every change it would make, with precision per kind of change measured on held-out cases. Nothing is changed. |
 | R7 | Reorganize links automatically: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | Batches with undo and an audit sample; audited precision within the allowed error rate. |
-| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are closed; unsupported and duplicate Stories are offered as batches. |
-| R9 | Reorganize structure: split and merge Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
-| R10 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; each project follows the same numbers. |
-| R11 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
+| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are closed; every Story shows its state with its evidence. |
+| R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
+| R10 | Reorganize structure: split Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
+| R11 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; the clean-up plan follows the repository; each project follows the same numbers. |
+| R12 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
 
-R5 to R11 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
+R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
 
 ### Planning health
 

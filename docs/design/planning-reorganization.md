@@ -73,14 +73,14 @@ The service is written so that either can be used, per project.
 
 ### What is automatic and what is not
 
-This changes the rule agreed in R2, "approval always". Proposed policy, settable per project:
+This changes the rule agreed in R2, "approval always", for changes that add or correct. Removing an Epic, a User Story or an issue always needs your authorization, whatever the evidence. Proposed policy, settable per project:
 
 | Change | Error rate allowed | Default |
 | --- | --- | --- |
 | Record the reason and passages of an existing link | — | Automatic |
 | Choose a Story's primary Epic; put an issue under a Story; mark an issue as a bug | 3 in 100 | Automatic above the threshold, with undo and audit |
 | Remove a link the evidence contradicts; close a Story whose work is done | 1 in 100, and two independent signals | Automatic above the threshold, with undo and audit |
-| Archive a Story that nothing supports; merge two Stories | 1 in 100 | One batch for you to approve |
+| Remove an Epic, a User Story or an issue that is no longer relevant; merge two Stories or two Epics | — | Never automatic. Proposed with its reasons, as a clean-up plan for you to authorize |
 | Create an Epic or a Story; split an Epic | — | One plan for you to approve, already worded |
 
 ## What happens to each misalignment
@@ -91,6 +91,8 @@ This changes the rule agreed in R2, "approval always". Proposed policy, settable
 
 **Issues without a Story (70 open, 209 closed).** The same cascade. Closed issues are included now, because they are the evidence of delivery that the Stories without issues are missing.
 
+**Records that are no longer relevant.** Not in Planning health today, because nothing looks for them. See "Proposing what to remove" below; Planning health gains "records proposed for removal" and "removed with your authorization".
+
 **Stories without an issue (543).** Each gets a delivery state from evidence, which replaces the single alarming number:
 
 | State | Evidence | Action |
@@ -98,14 +100,49 @@ This changes the rule agreed in R2, "approval always". Proposed policy, settable
 | Delivered | Closed issues or merged pull requests that match; a section of `openspec/specs/` or of the published documentation that describes it; an archived OpenSpec change | Link the evidence; close the Story |
 | In progress | Open issues, or an open OpenSpec change | Link them |
 | Planned | A document section that asks for it, and no work yet | Keep; it is what the next issues are written from |
-| Unsupported | Nothing in issues, documents or code | Batch to archive, for approval |
-| Duplicate | Clusters with another Story | Batch to merge, for approval |
+| Unsupported | Nothing in issues, documents or code | Proposed for removal in the clean-up plan |
+| Duplicate | Clusters with another Story | Proposed for a merge in the clean-up plan |
 
 Planning health then follows "Stories that nothing supports" and "delivered Stories still open", which are numbers that should be zero.
 
 **Open Stories whose issues are all closed (89).** Closed automatically when a review found full coverage; otherwise checked by the decision model.
 
 **Missing Stories and Epics.** Orphans that fit no Story are clustered; each cluster and each document section that no Story covers yields one proposed Story, worded by a language model and placed under an Epic by the same cascade. This is the earlier phase "Epics and Stories grounded in documents and issues".
+
+## Proposing what to remove
+
+A backlog fills with records that no longer matter: an issue for a dependency that was replaced, a Story drawn from a document section that was deleted, an Epic whose Stories all moved elsewhere. The process proposes their removal, for Epics, User Stories and individual issues alike. It never removes anything by itself.
+
+The platform can already close and delete all three kinds, with a preview of what the change affects and a confirmation; deleting archives the record and, for a published issue, closes it on GitHub. What is missing is finding the candidates and saying why. That is what this adds.
+
+**Reasons a record is proposed for removal.** Each is checked by rule or by the ranking models; none needs a language model to be found.
+
+| Kind | Reason | Evidence that is shown |
+| --- | --- | --- |
+| Issue | Duplicate of another issue | The other issue, their likeness score, the passages that match |
+| Issue | Superseded: a closed issue or merged pull request delivered the same thing; a newer issue replaces it (a later version bump, a rewritten request) | The record that replaced it |
+| Issue | Its subject is gone: it names files, components, an OpenSpec change or a document section that no longer exist | What it names, and the reading of the repository where it disappeared |
+| Issue | Stale: open, no activity and no linked work for longer than the project's limit, and no Story that still needs it | Dates, and what was looked for |
+| Issue | Its User Story was closed as delivered or removed, and nothing else needs the issue | The Story and its state |
+| User Story | Nothing supports it: no issue, no document section, no code that matches | What was searched and the best matches that were not good enough |
+| User Story | Its source is gone: the document section it was drawn from was deleted or rewritten (from the documentation inventory's changes) | The section before and after |
+| User Story | Duplicate of, or contained in, another Story | The other Story and the matching passages; proposed as a merge that keeps the links of both |
+| User Story | Every issue under it was closed as not planned | Those issues |
+| Epic | No Story has it as primary Epic after the reorganization | Where its Stories went |
+| Epic | Overlaps another Epic: their Stories cluster together | The other Epic; proposed as a merge |
+| Epic | Every Story is closed or removed, and no document asks for more | Its Stories and the documents searched |
+
+**Why this needs more care than adding.** Showing that a record is irrelevant means showing an absence, and an absence is easy to get wrong. So:
+
+- A removal is proposed only on two independent reasons, or on one reason that is exact (a stated duplicate, a subject that no longer exists).
+- Before it is proposed, a decision model is asked the opposite question, with the current documents as context: is there any reason this is still needed? An answer of yes or cannot tell withdraws the proposal, or shows it as doubtful.
+- A record that is doubtful is proposed for closing, not for deletion.
+
+**How it reaches you.** One clean-up plan per project, grouped by reason, each line with its evidence and with what the removal would affect: the Stories of an Epic, the issues of a Story, the links that would be re-pointed. You authorize the whole plan, a group, or single lines, and can strike any line. Nothing in it is applied before that.
+
+**How it is applied.** Through the existing close and delete actions, so that the impact preview and the confirmation record are the same as for a removal you make by hand. Epics and Stories are archived, not erased, and can be restored. A published issue is closed on GitHub as not planned, with a comment that gives the reason and the record that replaced it; reopening it restores it here. Children are never lost: a Story of a removed Epic is first given its new primary Epic by the cascade, and an issue of a removed Story is placed again or listed in the same plan.
+
+**What it learns.** A line you strike is a label: that reason, for that kind of record, was wrong here. The thresholds for proposing follow, so the next plan is shorter and better.
 
 ## Cost
 
@@ -116,7 +153,7 @@ For Falcone, with the ranking models in the cluster:
 | Records decided | 774 | About 2,400, and 3,000 links explained |
 | Paid model calls | 774 chat calls | About 400 to 500 decision calls, and tens of chat calls |
 | Tokens | About 1.08 million | About 0.6 million, on the cheapest model that passes the labelled set, in batch |
-| Decisions that wait for you | 774 | About 100, and three batches |
+| Decisions that wait for you | 774 | About 100, and two plans to authorize: clean-up and structure |
 
 The figures on the right are targets to be confirmed in shadow mode, not measurements. The platform reads current prices and shows an estimate before any paid run, as it does now.
 
@@ -128,17 +165,18 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 
 | Phase | What | Done when |
 | --- | --- | --- |
-| R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived) and extracts identifiers from documents, issues and Stories. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
+| R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived), extracts identifiers from documents, issues and Stories, and keeps which sections were deleted or rewritten, as evidence for removals. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
 | R5 | Signals. Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes; joined recall. The labelled set and the evaluation harness. | On held-out links, the true parent is among the top 20 candidates for at least 95% and is ranked first by the reranker for at least 85%. Measured against R2's word matching. |
-| R6 | Scorer in shadow mode. Calibrated classifier, abstention thresholds, escalation to the decision models. A report per project of every change it would make, with measured precision per kind of change. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
+| R6 | Scorer in shadow mode. Calibrated classifier, abstention thresholds, escalation to the decision models. A report per project of every change it would make, with measured precision per kind of change, and a first count of the records it would propose for removal, by reason. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
 | R7 | Reorganize links. Applies the policy: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. Batches with undo, audit sample, automatic stop. Planning health redefined. | Falcone: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; audited precision within the allowed error rate. |
-| R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories closed; unsupported and duplicate Stories offered as batches. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
-| R9 | Reorganize structure. Epic cohesion; proposals to split a broad Epic and to merge overlapping ones; missing Stories from orphan clusters and from document sections; all as one plan to approve. Replaces the earlier R5. | The plan can be approved or edited as a whole; after it, no Epic is the primary Epic of more than 10% of Stories. |
-| R10 | Continuous and everywhere. A new issue or a changed document goes through the cascade when it arrives; a nightly check for drift; rollout to the other projects, including those never through Discovery. Replaces the earlier R7. | A new issue is placed, or queued with its shortlist, within minutes; each project has its own thresholds and its health follows the same numbers. |
-| R11 | Epic pages written by the platform from the organized plan. The earlier R6, now last because it reads better from a plan that is in order. | Each Epic has a page that cites its Stories, issues and documents. |
+| R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories closed. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
+| R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |
+| R10 | Reorganize structure. Epic cohesion; proposals to split a broad Epic; missing Stories from orphan clusters and from document sections; all as one plan to approve. Replaces the earlier R5. | The plan can be approved or edited as a whole; after it, no Epic is the primary Epic of more than 10% of Stories. |
+| R11 | Continuous and everywhere. A new issue or a changed document goes through the cascade when it arrives; a nightly check for drift, which also refreshes the clean-up plan as the repository changes; rollout to the other projects, including those never through Discovery. Replaces the earlier R7. | A new issue is placed, or queued with its shortlist, within minutes; each project has its own thresholds and its health follows the same numbers. |
+| R12 | Epic pages written by the platform from the organized plan. The earlier R6, now last because it reads better from a plan that is in order. | Each Epic has a page that cites its Stories, issues and documents. |
 
 ## Decisions needed before R5
 
-1. **Automation.** Whether changes above the measured threshold may be applied without approval of each one, as in the policy table.
+1. **Automation.** Whether changes that add or correct may be applied above the measured threshold without approval of each one, as in the policy table. Removals are never automatic.
 2. **Where the ranking models run.** In the cluster with open models, or at a provider.
 3. **The labelled set.** Whether you will judge about 150 pairs once. Without it the thresholds rest on stated links and on agreement between models, which is weaker.
