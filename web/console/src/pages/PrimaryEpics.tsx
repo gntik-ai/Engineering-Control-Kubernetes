@@ -27,6 +27,8 @@ interface Epic {
   words: string[];
   /** The primary Epic as it stands: suggested by the texts, chosen by nobody. */
   suggested: boolean;
+  /** The Story's own text names this Epic, and no other of its Epics. */
+  stated: boolean;
 }
 interface Story {
   id: string;
@@ -35,6 +37,8 @@ interface Story {
   epics: Epic[];
   /** Whether the texts alone point to one Epic. */
   clear: boolean;
+  /** Whether the Story's own text names one of its Epics. */
+  stated: boolean;
   review: Review | null;
   /** Whether the review's answer is the Epic the texts suggest. */
   agrees: boolean;
@@ -49,6 +53,7 @@ interface Worklist {
     total: number;
     clear: number;
     unclear: number;
+    stated: number;
     waiting: number;
     unanswered: number;
     approvable: number;
@@ -87,7 +92,7 @@ export function PrimaryEpics({ project }: { project: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [told, setTold] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState(false);
+  const [confirming, setConfirming] = useState<'approve' | 'stated' | null>(null);
   const change = (name: string, send: () => Promise<unknown>) => {
     setBusy(name);
     setProblem(null);
@@ -117,9 +122,12 @@ export function PrimaryEpics({ project }: { project: string }) {
               A User Story has one primary Epic; the other Epics it is linked to are related.{' '}
               {some(data.counts.total, 'User Story is', 'User Stories are')} under several Epics with a primary one that
               is only suggested, by how alike the texts are. For {whole(data.counts.clear)} of them the texts point to
-              one Epic; for {whole(data.counts.unclear)} they do not. Nothing is chosen until you approve an answer or
-              choose an Epic yourself, and no link is added or removed here: an Epic then counts the Stories it is the
-              primary Epic of.
+              one Epic; for {whole(data.counts.unclear)} they do not.
+              {data.counts.stated
+                ? ` ${some(data.counts.stated, 'Story names', 'Stories name')} one of their Epics in their own text: those need no model.`
+                : ''}{' '}
+              Nothing is chosen until you approve an answer or choose an Epic yourself, and no link is added or removed
+              here: an Epic then counts the Stories it is the primary Epic of.
             </p>
 
             <RunPanel
@@ -142,7 +150,7 @@ export function PrimaryEpics({ project }: { project: string }) {
                 chosen.again
                   ? chosen.unclear_only
                     ? data.counts.unclear
-                    : data.counts.total
+                    : data.counts.total - data.counts.stated
                   : chosen.unclear_only
                     ? data.counts.to_ask_unclear
                     : data.counts.to_ask
@@ -150,7 +158,9 @@ export function PrimaryEpics({ project }: { project: string }) {
               likely={(chosen) =>
                 chosen.again
                   ? chosen.unclear_only
-                    ? Math.round((data.likely_all * data.counts.unclear) / Math.max(1, data.counts.total))
+                    ? Math.round(
+                        (data.likely_all * data.counts.unclear) / Math.max(1, data.counts.total - data.counts.stated),
+                      )
                     : data.likely_all
                   : chosen.unclear_only
                     ? data.likely_unclear
@@ -192,8 +202,13 @@ export function PrimaryEpics({ project }: { project: string }) {
                       setPage(1);
                     }}
                   />
+                  {data.counts.stated ? (
+                    <Button size="sm" variant="secondary" onClick={() => setConfirming('stated')}>
+                      Confirm {some(data.counts.stated, 'Epic a Story names', 'Epics the Stories name')}
+                    </Button>
+                  ) : null}
                   {data.counts.approvable ? (
-                    <Button size="sm" onClick={() => setConfirming(true)}>
+                    <Button size="sm" onClick={() => setConfirming('approve')}>
                       Approve {some(data.counts.approvable, 'checked answer', 'checked answers')}
                     </Button>
                   ) : null}
@@ -219,7 +234,11 @@ export function PrimaryEpics({ project }: { project: string }) {
                           {story.title}
                         </Link>
                         <Badge tone={story.clear ? 'neutral' : 'warning'} size="sm">
-                          {story.clear ? 'The texts point to one Epic' : 'The texts leave it open'}
+                          {story.stated
+                            ? 'Its own text names its Epic'
+                            : story.clear
+                              ? 'The texts point to one Epic'
+                              : 'The texts leave it open'}
                         </Badge>
                         {answered && review?.answer === 'epic' ? (
                           <Badge tone={story.agrees ? 'success' : 'info'} size="sm">
@@ -262,7 +281,9 @@ export function PrimaryEpics({ project }: { project: string }) {
                           </Button>
                           <span className="min-w-0 flex-1">
                             <Link href={recordUrl(project, 'epics', epic.id)}>{epic.title}</Link>
-                            {epic.suggested ? (
+                            {epic.stated ? (
+                              <span className="text-muted-foreground"> · Named in the Story’s own text</span>
+                            ) : epic.suggested ? (
                               <span className="text-muted-foreground"> · Suggested by the texts</span>
                             ) : null}
                             <span className="block text-xs text-muted-foreground">
@@ -295,7 +316,7 @@ export function PrimaryEpics({ project }: { project: string }) {
           </>
         )}
       </CardBody>
-      {confirming && data ? (
+      {confirming === 'approve' && data ? (
         <Confirm
           title={`Approve ${some(data.counts.approvable, 'answer', 'answers')}?`}
           about={
@@ -307,12 +328,35 @@ export function PrimaryEpics({ project }: { project: string }) {
           }
           action="Approve them"
           run={() => postJson(`${path}/approve`, {})}
-          onClose={() => setConfirming(false)}
+          onClose={() => setConfirming(null)}
           onDone={(result) => {
             const done = result as { chosen: number; skipped: number };
-            setConfirming(false);
+            setConfirming(null);
             setTold(
               `${some(done.chosen, 'User Story has', 'User Stories have')} a primary Epic of your choice` +
+                (done.skipped ? `; ${whole(done.skipped)} left as they were.` : '.'),
+            );
+            list.reload();
+          }}
+        />
+      ) : null}
+      {confirming === 'stated' && data ? (
+        <Confirm
+          title={`Confirm ${some(data.counts.stated, 'Epic', 'Epics')}?`}
+          about={
+            <>
+              Each of these User Stories names one of its Epics in its own text. That Epic becomes its primary Epic, as
+              your choice; its other Epics stay linked as related. No model is asked.
+            </>
+          }
+          action="Confirm them"
+          run={() => postJson(`${path}/confirm-stated`, {})}
+          onClose={() => setConfirming(null)}
+          onDone={(result) => {
+            const done = result as { chosen: number; skipped: number };
+            setConfirming(null);
+            setTold(
+              `${some(done.chosen, 'User Story has', 'User Stories have')} the Epic its text names as primary Epic` +
                 (done.skipped ? `; ${whole(done.skipped)} left as they were.` : '.'),
             );
             list.reload();

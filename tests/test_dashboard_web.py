@@ -276,6 +276,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/primary-epics/runs",
         "/api/dashboard/projects/{name}/primary-epics/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/primary-epics/approve",
+        "/api/dashboard/projects/{name}/primary-epics/confirm-stated",
         "/api/dashboard/projects/{name}/primary-epics/{key}/choose",
         "/api/dashboard/projects/{name}/primary-epics/{key}/dismiss",
         "/api/dashboard/projects/{name}/orphans/{key}/dismiss",

@@ -252,3 +252,50 @@ def test_missing_story_is_drafted_and_finished_stories_are_listed(tmp_path: Path
         assert health["stories_with_closed_issues_only"] == 1
     finally:
         client.close()
+
+
+def test_an_epic_the_story_names_is_confirmed_without_a_model(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        epics = more_epics(repo, data)
+        listing(client)
+        with repo.sessions.begin() as db:
+            # The Story's own text names Billing, which its wording is least like.
+            link = db.scalars(
+                select(PlanningLink).where(
+                    PlanningLink.kind == "story_epic",
+                    PlanningLink.child_id == data["Audit executions"],
+                    PlanningLink.parent_id == epics["Billing"],
+                )
+            ).one()
+            link.origin = "declared"
+        listed = listing(client)
+        rows = {row["title"]: row for row in listed["items"]}
+        audit = rows["Audit executions"]
+        assert audit["stated"] and audit["clear"]
+        assert audit["epics"][0]["title"] == "Billing" and audit["epics"][0]["stated"]
+        assert (listed["counts"]["stated"], listed["counts"]["to_ask"]) == (1, 1)
+        # A run does not ask what the text already says.
+        started = start(client)
+        assert started.status_code == 200 and started.json()["total"] == 1
+        ended = post(client, f"primary-epics/runs/{started.json()['id']}/control", action="end")
+        assert ended.status_code == 200, ended.text
+
+        confirmed = post(client, "primary-epics/confirm-stated")
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json() == {"chosen": 1, "skipped": 0}
+        with repo.sessions() as db:
+            primary = db.scalars(
+                select(PlanningLink).where(
+                    PlanningLink.kind == "story_epic",
+                    PlanningLink.child_id == data["Audit executions"],
+                    PlanningLink.is_primary,
+                    PlanningLink.removed_at.is_(None),
+                )
+            ).one()
+            assert (primary.parent_id, primary.primary_by) == (epics["Billing"], "administrator")
+        assert [row["title"] for row in listing(client)["items"]] == ["Respond to failures"]
+        assert post(client, "primary-epics/confirm-stated").json() == {"chosen": 0, "skipped": 0}
+    finally:
+        client.close()

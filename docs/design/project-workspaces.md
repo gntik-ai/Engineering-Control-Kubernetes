@@ -320,7 +320,9 @@ Measured on Falcone before anything was built: 704 of 737 User Stories are under
 
 **Reviews → Planning** lists the User Stories under several Epics whose primary Epic nobody chose. Each is shown with its own Epics, the one the texts suggest first, with a likeness score and the words only that Epic shares with the Story. Where the best Epic scores at least one and a half times the next, the texts are said to point to one Epic; otherwise they leave it open. The suggestion is not accepted in bulk: the texts are compared by their words, and a Story about installing the Helm chart is not matched to an Epic about installation.
 
-A run asks a model one question per Story: the Story, the Epics it is linked to, and three answers.
+Where a Story's own text names exactly one of its Epics, on an `Epic:` or `Parent:` line, that Epic is listed first and no model is asked about the Story: **Confirm the Epics the Stories name** makes each of them the primary Epic at one word of the administrator (`POST …/primary-epics/confirm-stated`).
+
+For every other Story a run asks a model one question: the Story, the Epics it is linked to, and three answers.
 
 | Answer | Meaning | What approval does |
 | --- | --- | --- |

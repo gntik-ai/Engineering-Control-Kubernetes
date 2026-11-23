@@ -88,11 +88,14 @@ class _Story:
     # Its Epics, and which of them is the primary one now.
     epics: list[UUID]
     primary: UUID | None
+    # The one Epic its own text names, when it names exactly one of them.
+    stated: UUID | None = None
 
 
 def clear(listed: list[dict[str, Any]]) -> bool:
-    """Whether the texts alone point to one Epic: the best is well ahead of the next."""
-    if len(listed) < 2:
+    """Whether the texts alone point to one Epic: the Story's own text names it, or the
+    best is well ahead of the next."""
+    if len(listed) < 2 or listed[0].get("stated"):
         return True
     best, second = float(listed[0]["score"]), float(listed[1]["score"])
     return best > 0 and best >= CLEAR * second
@@ -118,12 +121,14 @@ class _Scope:
         if self._waiting is not None:
             return self._waiting
         linked: dict[UUID, list[tuple[UUID, bool, str | None]]] = defaultdict(list)
-        for child, parent, primary, by in self.db.execute(
+        named: dict[UUID, list[UUID]] = defaultdict(list)
+        for child, parent, primary, by, origin in self.db.execute(
             select(
                 PlanningLink.child_id,
                 PlanningLink.parent_id,
                 PlanningLink.is_primary,
                 PlanningLink.primary_by,
+                PlanningLink.origin,
             ).where(
                 PlanningLink.project_id == self.project.id,
                 PlanningLink.kind == "story_epic",
@@ -132,6 +137,8 @@ class _Scope:
         ):
             if parent in self.epics:
                 linked[child].append((parent, primary, by))
+                if origin == "declared":
+                    named[child].append(parent)
         found = []
         for key, title, body in self.db.execute(
             select(ProjectUserStory.id, ProjectUserStory.title, ProjectUserStory.description)
@@ -152,6 +159,7 @@ class _Scope:
                     body or "",
                     [parent for parent, _primary, _by in links],
                     next((parent for parent, primary, _by in links if primary), None),
+                    named[key][0] if len(named.get(key, [])) == 1 else None,
                 )
             )
         self._waiting = found
@@ -172,7 +180,10 @@ class _Scope:
         theirs = {epic: _words(text) for epic, text in texts.items()}
         spread = Counter(word for words in theirs.values() for word in words)
         listed = []
-        for epic in sorted(child.epics, key=lambda e: (-scores[e], self.epics[e][0], str(e))):
+        for epic in sorted(
+            child.epics,
+            key=lambda e: (e != child.stated, -scores[e], self.epics[e][0], str(e)),
+        ):
             apart = sorted(mine & theirs[epic], key=lambda word: (spread[word], word))
             listed.append(
                 {
@@ -181,6 +192,7 @@ class _Scope:
                     "score": round(scores[epic], 1),
                     "words": [word for word in apart if spread[word] == 1][:5],
                     "suggested": epic == child.primary,
+                    "stated": epic == child.stated,
                 }
             )
         return listed
@@ -302,6 +314,8 @@ class PrimaryEpics:
                 )
                 counts["total"] += 1
                 counts["clear" if plain else "unclear"] += 1
+                if story.stated:
+                    counts["stated"] += 1
                 counts["waiting" if waiting else "unanswered"] += 1
                 if waiting and shown:
                     counts["answer_" + shown["answer"]] += 1
@@ -311,7 +325,10 @@ class PrimaryEpics:
                     counts["approvable"] += 1
                 held, use = parent_choice.sizes(scope.question(placeholder, story, listed))
                 largest, likely_all = max(largest, held), likely_all + use
-                if parent_choice.to_ask(review, current, False):
+                if story.stated:
+                    # Its own text says which Epic: no model is asked about it.
+                    likely_all -= use
+                elif parent_choice.to_ask(review, current, False):
                     counts["to_ask"] += 1
                     likely += use
                     if not plain:
@@ -337,6 +354,7 @@ class PrimaryEpics:
                         "text": story.text[:600],
                         "epics": listed,
                         "clear": plain,
+                        "stated": story.stated is not None,
                         "review": shown,
                         "agrees": agrees,
                         "approvable": parent_choice.approvable(shown, KIND.actionable),
@@ -356,6 +374,7 @@ class PrimaryEpics:
                         "total",
                         "clear",
                         "unclear",
+                        "stated",
                         "waiting",
                         "unanswered",
                         "approvable",
@@ -397,7 +416,7 @@ class PrimaryEpics:
             model,
             token_cap,
             again,
-            (lambda _child, listed: not clear(listed)) if unclear_only else None,
+            lambda child, listed: not child.stated and not (unclear_only and clear(listed)),
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:
@@ -443,6 +462,24 @@ class PrimaryEpics:
             project = active_project(db, name)
             parent_choice.decide(parent_choice.review_of(db, project.id, KIND.name, story), agreed)
         return {"id": str(story), "epic_id": str(epic), "approved": agreed}
+
+    def confirm_stated(self, name: str) -> dict[str, int]:
+        """Make the Epic that a Story's own text names its primary Epic, for every Story
+        that names exactly one of its Epics. No model is asked: the text says it."""
+        with self.sessions() as db:
+            stated = [
+                (story.id, story.stated)
+                for story in _Scope(db, active_project(db, name)).children()
+                if story.stated is not None
+            ]
+        done = {"chosen": 0, "skipped": 0}
+        for story_id, epic in stated:
+            try:
+                self.choose(name, story_id, epic)
+                done["chosen"] += 1
+            except (ProjectConflict, ProjectInvalid, ProjectNotFound):
+                done["skipped"] += 1
+        return done
 
     def approve(self, name: str, items: list[UUID] | None = None) -> dict[str, int]:
         """Approve many answers at once: those given, or every one that can be approved

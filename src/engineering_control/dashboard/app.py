@@ -1780,6 +1780,17 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/primary-epics/confirm-stated")
+    async def primary_epics_stated_api(name: str, request: Request) -> Response:
+        """Make the Epic each Story's own text names its primary Epic."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).primary_epics.confirm_stated, name),
+            event="workspace.primary_epics_stated_confirmed",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/primary-epics/{key}/choose")
     async def primary_epics_choose_api(name: str, key: UUID, request: Request) -> Response:
         return await project_change(
