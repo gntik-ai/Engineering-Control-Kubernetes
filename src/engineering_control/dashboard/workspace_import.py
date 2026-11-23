@@ -119,14 +119,17 @@ def _file_key(path: str) -> str:
 
 def _brief(review: dict[str, Any]) -> dict[str, Any]:
     """The stage's review as the page needs it. The page counts the proposals and what
-    is decided; their texts, up to 40,000 characters each, are read in the tables and
-    are left out of a status that the page asks for every few seconds."""
+    is decided. The texts of the proposals and of their possible parents, every Story
+    of the project at the Issues stage, are read in the tables and are left out of a
+    status that the page asks for every few seconds."""
+
+    def short(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{key: value for key, value in row.items() if key != "description"} for row in rows]
+
     return {
         **review,
-        "candidates": [
-            {key: value for key, value in candidate.items() if key != "description"}
-            for candidate in review["candidates"]
-        ],
+        "parents": short(review["parents"]),
+        "candidates": short(review["candidates"]),
     }
 
 

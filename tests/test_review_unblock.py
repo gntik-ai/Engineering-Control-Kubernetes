@@ -157,11 +157,11 @@ def test_the_polled_discovery_status_leaves_the_long_texts_out(tmp_path: Path) -
         with repo.sessions.begin() as db:
             row = db.get(WorkspaceImport, data["project"])
             assert row is not None
-            row.stage = "epics"
+            row.stage = "stories"
             db.add(
                 WorkspaceCandidate(
                     project_id=data["project"],
-                    kind="epics",
+                    kind="stories",
                     identity="gap:long",
                     title="A long proposal",
                     description="x" * 40000,
@@ -179,6 +179,10 @@ def test_the_polled_discovery_status_leaves_the_long_texts_out(tmp_path: Path) -
         assert len(full["description"]) == 40000 and "description" not in brief
         # Everything the page counts by is still there.
         assert {k: v for k, v in full.items() if k != "description"} == brief
+        # The possible parents are named, without their texts.
+        parents = (whole.json()["review"]["parents"], short.json()["review"]["parents"])
+        assert parents[0] and [p["id"] for p in parents[0]] == [p["id"] for p in parents[1]]
+        assert all("title" in p and "description" not in p for p in parents[1])
         assert len(short.content) < len(whole.content) - 39000
     finally:
         client.close()
