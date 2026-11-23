@@ -1486,7 +1486,14 @@ def create_app(
         issue_state: IssueView | None = None,
         state: PlanningState | None = None,
         sort: Literal[
-            "", "title", "parents", "status", "connections", "story_count", "issue_count"
+            "",
+            "title",
+            "parents",
+            "status",
+            "planning",
+            "connections",
+            "story_count",
+            "issue_count",
         ] = "",
         direction: Direction = "asc",
         bugs: Literal["", "only", "without"] = "",

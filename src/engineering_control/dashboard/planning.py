@@ -43,6 +43,7 @@ from engineering_control.dashboard.planning_lifecycle import (
     story_has_epic,
 )
 from engineering_control.dashboard.planning_queue import (
+    REVIEW_STATUS_LABELS,
     queue_review,
     record_changed,
     review_results,
@@ -436,7 +437,9 @@ def _order_value(db: Session, rows: Subquery, pid: UUID, kind: Kind, sort: str) 
             (rows.c.review == "publishing", "syncing"),
             else_="linked",
         )
-    if sort not in ("parents", "connections") or (sort == "parents" and kind == "epics"):
+    if sort not in ("planning", "parents", "connections") or (
+        sort == "parents" and kind == "epics"
+    ):
         raise ProjectInvalid("This column cannot be sorted in this table.")
     record: ColumnElement[Any] = rows.c.id
     if kind == "issues":
@@ -454,6 +457,21 @@ def _order_value(db: Session, rows: Subquery, pid: UUID, kind: Kind, sort: str) 
             .scalar_subquery()
         )
         record = case((rows.c.proposal, mirror), else_=rows.c.id)
+    if sort == "planning":
+        # A numbered import proposal can display the review belonging to its saved GitHub
+        # issue. Other proposals can have an intake review on their own ID.
+        review = PlanningReview
+        label = (
+            select(case(REVIEW_STATUS_LABELS, value=review.status, else_=review.status))
+            .where(
+                review.project_id == pid,
+                review.kind == kind,
+                review.record_id == func.coalesce(record, rows.c.id),
+            )
+            .correlate(rows)
+            .scalar_subquery()
+        )
+        return case((rows.c.review == "awaiting_stage", "awaiting"), else_=func.lower(label))
     f, c = ConnectionFinding, ProjectConnection
     outgoing = f.source_project == pid
     peer = case((c.first_id == pid, c.second_id), else_=c.first_id)

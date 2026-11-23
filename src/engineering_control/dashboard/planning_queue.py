@@ -10,6 +10,18 @@ from sqlalchemy.orm import Session
 
 from engineering_control.db.models import PlanningReview, WorkspaceCandidate
 
+REVIEW_STATUS_LABELS = {
+    "paused": "Stopped",
+    "queued": "Queued",
+    "running": "Reviewing",
+    "needs_input": "Needs input",
+    "failed": "Review interrupted",
+    "covered": "Already covered",
+    "proposals": "Proposals created",
+    "matched": "Ready for approval",
+    "dismissed": "Dismissed",
+}
+
 
 def reset_review(job: PlanningReview) -> None:
     job.status, job.lease, job.attempts = "paused" if job.status == "paused" else "queued", None, 0
@@ -80,6 +92,7 @@ def review_results(
                 )
         results[job.record_id] = {
             "status": job.status,
+            "status_label": REVIEW_STATUS_LABELS.get(job.status, job.status),
             "control_id": review_id(job),
             "id": str(job.record_id),
             "scanned": job.progress.get("scanned", 0),
