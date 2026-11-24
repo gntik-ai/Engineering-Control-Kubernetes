@@ -309,7 +309,7 @@ One state per open Story, worked out again whenever the scorer is. Only what is 
 
 So an issue opened on GitHub is, within about twenty minutes and without anyone asking, either flagged as a bug, shown with its closest User Story in the worklist, or in a batch to approve. Nothing is linked by that: approval always.
 
-**The trail.** Reviews → Reorganize opens with "Where this project stands": the next steps in order, what moved since the day before, and the issues that arrived in the last two weeks, each with where it stands: a bug, under a Story (and who linked it), in a batch, waiting with its closest Story, or not yet read or scored.
+**The trail.** Reviews → Reorganize opens with "Where this project stands": the next steps in order, what moved since the day before, and the issues that arrived in the last two weeks, each with where it stands: a bug, under a Story (and who linked it), in a batch, waiting with its closest Story, or not yet read or scored. An issue arrived on the day it was opened on GitHub, not on the day the platform first read it (a project's whole history is read on one day), and only issues of the plan are counted: one that is itself an Epic or a User Story is not.
 
 **Drift.** Planning health is measured every day. The latest measurement is compared with the one before, for the numbers that should not grow: changes waiting, records proposed for closing, proposals for the structure, open issues with no Story, issues that fit no Story, delivered Stories still open, Stories with unlinked work, Stories with nothing behind them, bugs still linked, records the scorer abstains on. The chat's daily digest gets one line for each project where something waits or moved.
 
