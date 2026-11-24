@@ -2026,6 +2026,65 @@ def create_app(
             subject=name,
         )
 
+    @app.get("/api/dashboard/projects/{name}/epic-pages")
+    async def epic_pages_api(name: str, request: Request) -> Response:
+        """Every Epic of the project with where it stands, and what having a model write
+        the overviews would ask."""
+        return await documents_read(request, lambda: repo(request).epic_pages.index(name))
+
+    @app.get("/api/dashboard/projects/{name}/epic-pages/{epic}")
+    async def epic_page_api(name: str, epic: UUID, request: Request) -> Response:
+        """The page of one Epic, its earlier versions and its overview."""
+        return await documents_read(request, lambda: repo(request).epic_pages.page(name, epic))
+
+    @app.get("/api/dashboard/projects/{name}/epic-pages/{epic}/markdown")
+    async def epic_page_markdown_api(name: str, epic: UUID, request: Request) -> Response:
+        """The page of one Epic as a Markdown document to keep elsewhere."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            filename, text = await asyncio.to_thread(
+                repo(request).epic_pages.as_markdown, name, epic
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Not found") from None
+        return PlainTextResponse(
+            text,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.post("/api/dashboard/projects/{name}/epic-pages/runs")
+    async def epic_pages_run_api(name: str, request: Request) -> Response:
+        """Have a model write the overview of each Epic, within these tokens."""
+        return await project_change(
+            request,
+            OrphanRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).epic_pages.start,
+                name,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.again,
+            ),
+            event="workspace.epic_overviews_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/epic-pages/runs/{run_id}/control")
+    async def epic_pages_run_control_api(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).epic_pages.control, name, run_id, body.action
+            ),
+            event="workspace.epic_overviews_controlled",
+            subject=name,
+        )
+
     @app.get("/api/dashboard/projects/{name}/reorganize/batches")
     async def reorg_batches_api(name: str, request: Request) -> Response:
         """What the scorer has ready to approve, by kind, and the batches made of it."""
@@ -4552,7 +4611,7 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery|reorganize)"
+                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

@@ -20,6 +20,7 @@ from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.delivery import Delivery
 from engineering_control.dashboard.doc_inventory import DocInventory
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
+from engineering_control.dashboard.epic_pages import EpicPages
 from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.orphans import Orphans
 from engineering_control.dashboard.planning import PlanningRecords
@@ -135,7 +136,10 @@ class DashboardRepository:
         self.scorer = Scorer(self.sessions, self.planning_links)
         self.signals.wanted_for_all = self.scorer.uses_reranker
         self.delivery = Delivery(self.sessions, self.planning_links)
-        self.scorer.after = self.delivery.refresh_all
+        self.epic_pages = EpicPages(self.sessions, self.planning_links)
+        # When what the scorer reads changed, where the Stories stand is worked out
+        # again, and then the Epics' pages, which say it.
+        self.scorer.after = self._after_scoring
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.cleanup = Cleanup(self.sessions, self.planning_links)
         self.structure = Structure(self.sessions, self.planning, self.planning_links)
@@ -172,6 +176,10 @@ class DashboardRepository:
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)
+
+    def _after_scoring(self) -> None:
+        self.delivery.refresh_all()
+        self.epic_pages.refresh_all()
 
     def _ping(self) -> bool:
         with self.sessions() as session:

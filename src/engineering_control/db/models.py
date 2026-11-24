@@ -1196,6 +1196,28 @@ class StructureDecision(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class EpicPage(UUIDPrimaryKey, Timestamps, Base):
+    """One version of the page the platform puts together for an Epic (migration 0082):
+    its User Stories with where they stand, their issues and the documents closest to
+    it, as the records stood. A new version is kept when the records changed, with what
+    changed since the one before."""
+
+    __tablename__ = "epic_pages"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    epic_id: Mapped[UUID] = mapped_column(Uuid)
+    version: Mapped[int] = mapped_column(Integer)
+    # Of the page without what moves although no record changed.
+    digest: Mapped[str] = mapped_column(String(64))
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    # What is different from the version before, in sentences.
+    changes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    __table_args__ = (
+        UniqueConstraint("project_id", "epic_id", "version", name="uq_epic_pages_version"),
+    )
+
+
 class ReorgBatch(UUIDPrimaryKey, Timestamps, Base):
     """Changes of one kind that the scorer would make, put before the administrator to
     approve together (migration 0078). A sample of its lines is judged first; an approved

@@ -10,7 +10,7 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
@@ -29,6 +29,7 @@ import { OrphanWorklist } from './OrphanWorklist';
 import { PrimaryEpics } from './PrimaryEpics';
 import { Documents } from './Documents';
 import { Reorganize } from './Reorganize';
+import { EpicPages } from './EpicPages';
 import { StoryStates } from './StoryStates';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
@@ -39,6 +40,7 @@ const reviewMenu = {
   planning: { label: 'Planning', icon: ListChecks },
   discovery: { label: 'Discovery', icon: Compass },
   reorganize: { label: 'Reorganize', icon: Shuffle },
+  epics: { label: 'Epic pages', icon: BookOpen },
 };
 export function ProjectWorkspace({
   name,
@@ -196,6 +198,7 @@ export function ProjectWorkspace({
                 {view === 'planning' && <StoryStates project={project.project} />}
                 {view === 'planning' && <PlanningReviews project={project.project} />}
                 {view === 'reorganize' && <Reorganize project={project.project} />}
+                {view === 'epics' && <EpicPages project={project.project} />}
                 {view === 'discovery' && <Documents project={project.project} />}
                 {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
               </div>

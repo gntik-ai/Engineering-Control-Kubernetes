@@ -279,6 +279,8 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/structure/stories/{proposal}",
         "/api/dashboard/projects/{name}/structure/{proposal}/dismiss",
         "/api/dashboard/projects/{name}/cleanup/runs",
+        "/api/dashboard/projects/{name}/epic-pages/runs",
+        "/api/dashboard/projects/{name}/epic-pages/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/cleanup/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/orphans/approve",
         "/api/dashboard/projects/{name}/orphans/{key}/link",

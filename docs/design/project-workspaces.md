@@ -250,7 +250,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R9 | Clean-up: records that reasons speak against, proposed for closing on two reasons of different kinds or an exact one; a model's check of the unsupported Stories; Stories and Epics closed by batches to authorize. | Every proposal shows its reasons; nothing is closed without authorization; issues are closed on GitHub as not planned, with a comment. |
 | R10 | Reorganize structure: how each Epic holds together, splits of Epics that hold more than 10% of the Stories, and User Stories proposed from groups of issues that fit none. | Each proposal can be edited, approved or set aside; what is set aside is not made again. |
 | R11 | Continuous and everywhere: one table of every project with its next step, the trail of issues that arrived, a daily refresh with the drift since the day before, and that drift in the daily digest. | A new issue is read, scored and shown with its closest Story within minutes; a project with no plan says so. |
-| R12 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
+| R12 | Epic pages: one page for each Epic from its Stories, their issues and the closest documents, with no model asked, kept in versions with what changed; an overview by a model on request, each sentence with its records. | One cited page per Epic, refreshed when its sources change. |
 
 R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
 
@@ -437,6 +437,12 @@ What is proposed appears as the batch kinds `retire_stories`, `retire_epics` and
 **Reviews → Reorganize** ends with "Structure": how each Epic holds together, the Epics proposed to be split, the User Stories that are missing, and the documents no Story covers. The rules are in [planning-reorganization.md](planning-reorganization.md#the-structure-of-the-plan-r10).
 
 `GET /api/dashboard/projects/{name}/structure` returns the report and the proposals. `POST …/structure/stories/{proposal}` makes a proposed User Story with the title, description and Epic sent, and links its issues; `POST …/structure/splits/{proposal}` splits an Epic with the titles sent; `POST …/structure/{proposal}/dismiss` sets a proposal aside. Decisions are kept in `structure_decisions` (migration 0081). A Story is made through `PlanningRecords.save`, its issues linked through `link_stories` and recorded as found by the scorer and approved by the administrator.
+
+### Epic pages
+
+`epic_pages.compose` puts the page of every Epic of a project together in one pass over the plan, the Stories' states, the issues and the documents' vectors, and keeps the result until one of those tables changed. `EpicPages.refresh` keeps a new row of `epic_pages` (migration 0082) for each page whose digest differs from its last version, with the changes in sentences, and drops versions beyond the last thirty. It runs after the scorer's keeper worked the Stories' states out, and when a page or the list is read.
+
+`GET /api/dashboard/projects/{name}/epic-pages` lists the Epics with their numbers, whether an overview is written and whether the records changed since, and what a run would ask. `GET …/epic-pages/{epic}` returns the page, its last ten versions and its overview; `GET …/epic-pages/{epic}/markdown` returns it as a Markdown document. `POST …/epic-pages/runs` starts a run of kind `epic_overview` in the choice-run engine (usage counted under `epic_page`), and `POST …/epic-pages/runs/{run_id}/control` stops, resumes or ends it. The answer is kept as the review of that Epic: the sentences with their sources as its evidence, `checked` when no sentence had to be dropped. The console shows the pages under Reviews → Epic pages.
 
 ### Across projects, and as records arrive
 
