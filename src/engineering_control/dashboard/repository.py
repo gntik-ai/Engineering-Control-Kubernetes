@@ -27,6 +27,7 @@ from engineering_control.dashboard.planning_links import PlanningLinks
 from engineering_control.dashboard.primary_epics import PrimaryEpics
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
+from engineering_control.dashboard.reorg import Reorg
 from engineering_control.dashboard.schemas import ActivityEventInput
 from engineering_control.dashboard.scorer import Scorer
 from engineering_control.dashboard.session_store import (
@@ -129,6 +130,7 @@ class DashboardRepository:
         self.signals = Signals(self.sessions, self.planning_links)
         self.scorer = Scorer(self.sessions, self.planning_links)
         self.signals.wanted_for_all = self.scorer.uses_reranker
+        self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

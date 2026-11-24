@@ -1,0 +1,621 @@
+"""Batches to approve: what the scorer would do, put before the administrator.
+
+The scorer says of each record what it would do and how sure it is (``scorer.py``); it
+changes nothing. Here its sure cases of one kind are gathered into a batch:
+
+- ``reasons``: an existing link the scorer singles out gets its reason recorded;
+- ``primary``: a User Story under several Epics gets its primary Epic chosen;
+- ``place``: an issue without a User Story is put under one;
+- ``unsupported``: an existing link that both the scorer and the plain rankings speak
+  against is taken off.
+
+Nothing is applied without approval. A batch opens with a sample of its lines to judge
+right or wrong. More wrong ones than its error allows, and the batch is withdrawn. Any line
+can be struck. Approval applies the rest through the same paths the worklists use, each
+line keeping how the link stood before, so that the whole batch can be undone for thirty
+days. Every line judged, right or wrong, is something the scorer learns from.
+
+A bug is never in a batch: it has no User Story.
+"""
+
+from __future__ import annotations
+
+import math
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
+from uuid import UUID
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.planning import PlanningRecords
+from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    ProjectNotFound,
+    active_project,
+)
+from engineering_control.dashboard.scorer import ADD_ERROR, REMOVE_ERROR, SIGNALS
+from engineering_control.dashboard.signals import ISSUE_STORY, STORY_EPIC, _spread
+from engineering_control.db.models import (
+    BacklogItem,
+    PlanningLink,
+    ProjectEpic,
+    ProjectIssueStory,
+    ProjectRecord,
+    ProjectUserStory,
+    ReorgBatch,
+    ReorgLine,
+    ScorerDecision,
+    ScorerReport,
+)
+
+UNDO_DAYS: Final = 30
+SAMPLE_MIN: Final = 5
+SAMPLE_MAX: Final = 20
+# A link is called unsupported only when the plain rankings speak against it too: it
+# stands below the fifth place both by shared words and by meaning.
+LOW_PLACE: Final = 1 / 6
+# kind: the kind of link, the scorer's outcome it gathers, the error it may make, and
+# what it does, as a title and in one sentence.
+KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
+    "reasons": (
+        ISSUE_STORY,
+        "confirmed",
+        ADD_ERROR,
+        "Record why links hold",
+        "Each of these links has no reason recorded. The scorer singles its User Story out "
+        "among all candidates: approving records that as the reason. No link is added or "
+        "removed.",
+    ),
+    "primary": (
+        STORY_EPIC,
+        "primary",
+        ADD_ERROR,
+        "Choose primary Epics",
+        "Each of these User Stories stands under several Epics. Approving makes the Epic "
+        "shown its primary one. Its other Epics stay linked.",
+    ),
+    "place": (
+        ISSUE_STORY,
+        "place",
+        ADD_ERROR,
+        "Place issues under a User Story",
+        "Each of these issues has no User Story. Approving links it to the one shown.",
+    ),
+    "unsupported": (
+        ISSUE_STORY,
+        "unsupported",
+        REMOVE_ERROR,
+        "Take off links nothing supports",
+        "The scorer rules each of these links out, and neither shared words nor meaning "
+        "place the User Story among the issue's first five. Approving takes the link off; "
+        "an issue left with no User Story then waits for one like any other.",
+    ),
+}
+LINK_SIDE: Final = {ISSUE_STORY: "issues", STORY_EPIC: "stories"}
+
+
+def why(kind: str, confidence: float, signals: dict[str, Any], candidates: int) -> str:
+    """The reason a line gives, in words, from the signals the scorer read."""
+    said = []
+    if signals.get("words", 0) >= 0.999:
+        said.append("it shares more words with the record than any other candidate")
+    elif signals.get("words_place", 0) >= 0.33:
+        said.append("it is among the first three by shared words")
+    if signals.get("meaning_gap", -1) >= -1e-9:
+        said.append("it is the closest in meaning")
+    elif signals.get("meaning_place", 0) >= 0.33:
+        said.append("it is among the first three by meaning")
+    if signals.get("reranker_first"):
+        said.append("the reranker reads it as the best fit")
+    if signals.get("siblings", 0) >= 0.7:
+        said.append("the parent's other children resemble the record")
+    share = f"{round(confidence * 100)}%"
+    if kind == "unsupported":
+        places = []
+        for name, label in (("words_place", "shared words"), ("meaning_place", "meaning")):
+            value = float(signals.get(name) or 0)
+            places.append(
+                f"place {round(1 / value)} by {label}" if value else f"unranked by {label}"
+            )
+        return (
+            f"The scorer gives this link a share of belief of {share}, below what a right "
+            f"link has among {candidates} candidates, and it stands at {' and '.join(places)}."
+        )
+    return (
+        f"The scorer leaves this parent alone among {candidates} candidates, with a share "
+        f"of belief of {share}" + (": " + "; ".join(said) + "." if said else ".")
+    )
+
+
+def sample_size(lines: int) -> int:
+    """How many lines are judged before a batch may be approved: more for a larger batch,
+    never fewer than five where there are five."""
+    return min(lines, max(SAMPLE_MIN, min(SAMPLE_MAX, math.ceil(math.sqrt(lines)))))
+
+
+class Reorg:
+    def __init__(
+        self, sessions: sessionmaker[Session], planning: PlanningRecords, links: PlanningLinks
+    ) -> None:
+        self.sessions = sessions
+        self.planning = planning
+        self.links = links
+
+    # ------------------------------------------------------------- what is ready
+
+    def _ready(self, db: Session, project: ProjectRecord, kind: str) -> list[ScorerDecision]:
+        """The scorer's decisions of that kind that can go into a batch: not in one
+        already, not judged wrong before, and still true of the plan."""
+        link_kind, outcome, _error, _title, _about = KINDS[kind]
+        decisions = db.scalars(
+            select(ScorerDecision).where(
+                ScorerDecision.project_id == project.id,
+                ScorerDecision.kind == link_kind,
+                ScorerDecision.outcome == outcome,
+                ScorerDecision.parent_id.is_not(None),
+            )
+        ).all()
+        if not decisions:
+            return []
+        taken = {
+            (line.child_id, line.parent_id)
+            for line, batch in db.execute(
+                select(ReorgLine, ReorgBatch)
+                .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+                .where(ReorgLine.project_id == project.id, ReorgBatch.kind == kind)
+            )
+            if line.verdict == "wrong"
+            or batch.state == "sample"
+            or (batch.state == "approved" and line.state == "applied")
+        }
+        live = {
+            (row.child_id, row.parent_id): row
+            for row in db.scalars(
+                select(PlanningLink).where(
+                    PlanningLink.project_id == project.id,
+                    PlanningLink.kind == link_kind,
+                    PlanningLink.removed_at.is_(None),
+                )
+            )
+        }
+        bugs = set(db.scalars(bugs_with_optional_stories(db, project.id)))
+        with_parent = {child for child, _parent in live}
+        found = []
+        for decision in decisions:
+            pair = (decision.child_id, decision.parent_id)
+            if pair in taken or decision.child_id in bugs:
+                continue
+            link = live.get(pair)  # type: ignore[arg-type]
+            signals = (decision.detail or {}).get("signals") or {}
+            if kind == "reasons" and (link is None or explained(link)):
+                continue
+            if kind == "primary" and (
+                link is None or (link.is_primary and link.primary_by == "administrator")
+            ):
+                continue
+            if kind == "place" and decision.child_id in with_parent:
+                continue
+            if kind == "unsupported" and (
+                link is None
+                or link.origin in ("declared", "administrator")
+                or float(signals.get("words_place") or 0) > LOW_PLACE
+                or float(signals.get("meaning_place") or 0) > LOW_PLACE
+            ):
+                continue
+            found.append(decision)
+        return sorted(found, key=lambda row: (-row.confidence, str(row.child_id)))
+
+    @staticmethod
+    def _measured(db: Session, project: UUID, kind: str) -> dict[str, Any]:
+        """What the scorer measured for that kind of link, as its report says."""
+        link_kind, _outcome, error, _title, _about = KINDS[kind]
+        report = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project))
+        entry = next(
+            (e for e in (report or {}).get("kinds", []) if e.get("kind") == link_kind), None
+        )
+        if not entry:
+            return {"error": error}
+        row = next(
+            (m for m in entry.get("measured", []) if m.get("key") == entry.get("uses")), None
+        )
+        return {
+            "error": error,
+            "measured_here": bool(entry.get("measured_here")),
+            "children": (row or {}).get("children"),
+            "acted_count": (row or {}).get("acted_count"),
+            "acted_right": (row or {}).get("acted_right"),
+            "in_set": (row or {}).get("in_set"),
+        }
+
+    # ------------------------------------------------------------------ reading
+
+    def _titles(
+        self, db: Session, lines: list[ReorgLine]
+    ) -> dict[UUID, tuple[str, str, int | None]]:
+        """The kind, title and number of every record the lines name."""
+        wanted = {line.child_id for line in lines} | {line.parent_id for line in lines}
+        found: dict[UUID, tuple[str, str, int | None]] = {}
+        for key, title, number in db.execute(
+            select(BacklogItem.id, BacklogItem.title, BacklogItem.issue_number).where(
+                BacklogItem.id.in_(wanted)
+            )
+        ):
+            found[key] = ("issues", title, number)
+        for key, title in db.execute(
+            select(ProjectUserStory.id, ProjectUserStory.title).where(
+                ProjectUserStory.id.in_(wanted)
+            )
+        ):
+            found[key] = ("stories", title, None)
+        for key, title in db.execute(
+            select(ProjectEpic.id, ProjectEpic.title).where(ProjectEpic.id.in_(wanted))
+        ):
+            found[key] = ("epics", title, None)
+        return found
+
+    @staticmethod
+    def _line(line: ReorgLine, titles: dict[UUID, tuple[str, str, int | None]]) -> dict[str, Any]:
+        def side(key: UUID) -> dict[str, Any]:
+            kind, title, number = titles.get(key, ("", "", None))
+            return {
+                "kind": kind,
+                "id": str(key),
+                "title": f"#{number} {title}" if number else title,
+            }
+
+        return {
+            "id": str(line.id),
+            "child": side(line.child_id),
+            "parent": side(line.parent_id),
+            "confidence": line.confidence,
+            "reason": line.reason,
+            "signals": {
+                SIGNALS.get(name, name): value for name, value in (line.signals or {}).items()
+            },
+            "sampled": line.sampled,
+            "verdict": line.verdict,
+            "state": line.state,
+            "detail": line.detail,
+        }
+
+    @staticmethod
+    def _batch(batch: ReorgBatch, lines: list[ReorgLine]) -> dict[str, Any]:
+        sampled = [line for line in lines if line.sampled]
+        now = datetime.now(UTC)
+        decided = batch.decided_at
+        if decided is not None and decided.tzinfo is None:
+            decided = decided.replace(tzinfo=UTC)
+        until = decided + timedelta(days=UNDO_DAYS) if decided else None
+        return {
+            "id": str(batch.id),
+            "kind": batch.kind,
+            "title": KINDS[batch.kind][3],
+            "about": KINDS[batch.kind][4],
+            "state": batch.state,
+            "lines": len(lines),
+            "sample": len(sampled),
+            "sample_judged": sum(1 for line in sampled if line.verdict),
+            "sample_wrong": sum(1 for line in sampled if line.verdict == "wrong"),
+            "allowed_wrong": batch.allowed_wrong,
+            "struck": sum(1 for line in lines if line.verdict == "wrong"),
+            "applied": sum(1 for line in lines if line.state == "applied"),
+            "skipped": sum(1 for line in lines if line.state == "skipped"),
+            "undone": sum(1 for line in lines if line.state == "undone"),
+            "measured": batch.measured,
+            "made_at": batch.created_at.isoformat(),
+            "decided_at": decided.isoformat() if decided else None,
+            "undo_until": until.isoformat() if until and batch.state == "approved" else None,
+            "can_undo": bool(batch.state == "approved" and until and now <= until),
+        }
+
+    def overview(self, name: str) -> dict[str, Any]:
+        """For each kind of change: how many the scorer has ready, what it measured, the
+        batch that is open, and the batches decided before."""
+        self.links.reconcile_project(name)
+        with self.sessions() as db:
+            project = active_project(db, name)
+            batches = db.scalars(
+                select(ReorgBatch)
+                .where(ReorgBatch.project_id == project.id)
+                .order_by(ReorgBatch.created_at.desc())
+            ).all()
+            lines: dict[UUID, list[ReorgLine]] = {batch.id: [] for batch in batches}
+            for line in db.scalars(select(ReorgLine).where(ReorgLine.project_id == project.id)):
+                lines.setdefault(line.batch_id, []).append(line)
+            kinds = []
+            for kind, (_link, _outcome, error, title, about) in KINDS.items():
+                opened = next((b for b in batches if b.kind == kind and b.state == "sample"), None)
+                kinds.append(
+                    {
+                        "kind": kind,
+                        "title": title,
+                        "about": about,
+                        "error": error,
+                        "ready": len(self._ready(db, project, kind)),
+                        "measured": self._measured(db, project.id, kind),
+                        "open": self._batch(opened, lines[opened.id]) if opened else None,
+                    }
+                )
+            return {
+                "kinds": kinds,
+                "past": [
+                    self._batch(batch, lines[batch.id])
+                    for batch in batches
+                    if batch.state != "sample"
+                ][:20],
+                "undo_days": UNDO_DAYS,
+            }
+
+    def lines(self, name: str, batch_id: UUID, page: int, page_size: int) -> dict[str, Any]:
+        """A batch's lines: the sampled ones first, then the surest."""
+        with self.sessions() as db:
+            project = active_project(db, name)
+            batch = self._get(db, project, batch_id)
+            every = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
+            ordered = sorted(
+                every, key=lambda line: (not line.sampled, -line.confidence, str(line.id))
+            )
+            pages = max(1, (len(ordered) + page_size - 1) // page_size)
+            page = min(max(1, page), pages)
+            shown = ordered[(page - 1) * page_size : page * page_size]
+            titles = self._titles(db, shown)
+            return {
+                "batch": self._batch(batch, list(every)),
+                "items": [self._line(line, titles) for line in shown],
+                "total": len(ordered),
+                "page": page,
+                "pages": pages,
+            }
+
+    @staticmethod
+    def _get(db: Session, project: ProjectRecord, batch_id: UUID) -> ReorgBatch:
+        batch = db.get(ReorgBatch, batch_id)
+        if batch is None or batch.project_id != project.id:
+            raise ProjectNotFound(str(batch_id))
+        return batch
+
+    # ---------------------------------------------------------------- preparing
+
+    def prepare(self, name: str, kind: str) -> dict[str, Any]:
+        """Gather what the scorer has ready of that kind into a batch, and draw its
+        sample. Nothing of the plan changes."""
+        if kind not in KINDS:
+            raise ProjectInvalid("There is no such kind of batch.")
+        self.links.reconcile_project(name)
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            if db.scalar(
+                select(ReorgBatch.id).where(
+                    ReorgBatch.project_id == project.id,
+                    ReorgBatch.kind == kind,
+                    ReorgBatch.state == "sample",
+                )
+            ):
+                raise ProjectConflict("A batch of this kind is already open.")
+            ready = self._ready(db, project, kind)
+            if not ready:
+                raise ProjectConflict("The scorer has nothing ready of this kind.")
+            count = sample_size(len(ready))
+            error = KINDS[kind][2]
+            batch = ReorgBatch(
+                project_id=project.id,
+                kind=kind,
+                state="sample",
+                measured=self._measured(db, project.id, kind),
+                allowed_wrong=math.floor(error * count),
+            )
+            db.add(batch)
+            db.flush()
+            # The sample is drawn by a mark that does not look at how sure the scorer is.
+            drawn = {
+                row.id
+                for row in sorted(ready, key=lambda row: _spread("sample", batch.id, row.id))[
+                    :count
+                ]
+            }
+            for decision in ready:
+                detail = decision.detail or {}
+                signals = detail.get("signals") or {}
+                assert decision.parent_id is not None
+                db.add(
+                    ReorgLine(
+                        batch_id=batch.id,
+                        project_id=project.id,
+                        link_kind=decision.kind,
+                        child_id=decision.child_id,
+                        parent_id=decision.parent_id,
+                        confidence=decision.confidence,
+                        reason=why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
+                        signals=signals,
+                        sampled=decision.id in drawn,
+                        state="pending",
+                    )
+                )
+            db.flush()
+            return {"id": str(batch.id), "lines": len(ready), "sample": count}
+
+    # ------------------------------------------------------------------ judging
+
+    def judge(
+        self, name: str, batch_id: UUID, line_id: UUID, verdict: str | None
+    ) -> dict[str, Any]:
+        """The administrator's judgment of one line: right, wrong, or taken back. A line
+        judged wrong is not applied. Too many wrong among the sampled, and the batch is
+        withdrawn."""
+        if verdict not in (None, "right", "wrong"):
+            raise ProjectInvalid("A line is judged right or wrong.")
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            batch = self._get(db, project, batch_id)
+            if batch.state != "sample":
+                raise ProjectConflict("This batch is decided already.")
+            line = db.get(ReorgLine, line_id)
+            if line is None or line.batch_id != batch.id:
+                raise ProjectNotFound(str(line_id))
+            line.verdict = verdict
+            db.flush()
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
+            wrong = sum(1 for row in lines if row.sampled and row.verdict == "wrong")
+            if wrong > batch.allowed_wrong:
+                batch.state, batch.decided_at = "withdrawn", datetime.now(UTC)
+            return self._batch(batch, list(lines))
+
+    def withdraw(self, name: str, batch_id: UUID) -> dict[str, Any]:
+        """Set an open batch aside. What was judged in it is kept and learned from."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            batch = self._get(db, project, batch_id)
+            if batch.state != "sample":
+                raise ProjectConflict("This batch is decided already.")
+            batch.state, batch.decided_at = "withdrawn", datetime.now(UTC)
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
+            return self._batch(batch, list(lines))
+
+    # ----------------------------------------------------------------- applying
+
+    def approve(self, name: str, batch_id: UUID) -> dict[str, Any]:
+        """Apply every line of the batch that was not judged wrong, once its sample is
+        judged. Each line keeps how the link stood, so that the batch can be undone. A
+        line the plan has moved away from is skipped and says why."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            batch = self._get(db, project, batch_id)
+            if batch.state != "sample":
+                raise ProjectConflict("This batch is decided already.")
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
+            if any(line.sampled and line.verdict is None for line in lines):
+                raise ProjectConflict("Judge every line of the sample first.")
+            kind = batch.kind
+            todo = [
+                (line.id, line.child_id, line.parent_id, line.reason)
+                for line in lines
+                if line.verdict != "wrong"
+            ]
+            # Decided now, so that nothing else can decide it while the lines are applied.
+            batch.state, batch.decided_at = "approved", datetime.now(UTC)
+        results: dict[UUID, tuple[str, Any, str | None]] = {}
+        for line_id, child, parent, reason in todo:
+            try:
+                before = self._apply(name, kind, child, parent, reason)
+                results[line_id] = ("applied", before, None)
+            except (ProjectConflict, ProjectInvalid, ProjectNotFound) as error:
+                results[line_id] = ("skipped", None, str(error))
+        with self.sessions.begin() as db:
+            for line_id, (state, before, detail) in results.items():
+                line = db.get_one(ReorgLine, line_id)
+                line.state, line.before, line.detail = state, before, detail
+            batch = db.get_one(ReorgBatch, batch_id)
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch_id)).all()
+            return self._batch(batch, list(lines))
+
+    def _apply(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
+        """Make one line's change, and return how the link stood before."""
+        if kind == "reasons":
+            before = self.links.snapshot(name, "issues", child)
+            if not self.links.explain(name, "issues", child, parent, reason):
+                raise ProjectConflict("The link is gone, or says why by now.")
+            return before
+        if kind == "primary":
+            before = self.links.snapshot(name, "stories", child)
+            mine = next((entry for entry in before if entry["parent"] == str(parent)), None)
+            if mine is None:
+                raise ProjectConflict("The User Story is no longer under this Epic.")
+            if any(e["is_primary"] and e["primary_by"] == "administrator" for e in before):
+                raise ProjectConflict("You have chosen this User Story's primary Epic since.")
+            self.links.set_primary(
+                name, "stories", child, parent, why=Note("scorer", reason=reason)
+            )
+            return before
+        if kind == "place":
+            with self.sessions() as db:
+                project = active_project(db, name)
+                linked = db.scalar(
+                    select(func.count())
+                    .select_from(ProjectIssueStory)
+                    .where(
+                        ProjectIssueStory.project_id == project.id,
+                        ProjectIssueStory.item_id == child,
+                    )
+                )
+                if linked:
+                    raise ProjectConflict("The issue has a User Story by now.")
+            self.links.before_change(name, "issues", child)
+            self.planning.link_stories(name, child, [parent])
+            self.links.noted(
+                name, "issues", child, parent, Note("scorer", confirmed=True, reason=reason)
+            )
+            return []
+        before = [
+            entry
+            for entry in self.links.snapshot(name, "issues", child)
+            if entry["parent"] == str(parent)
+        ]
+        if not before or before[0]["origin"] in ("declared", "administrator"):
+            raise ProjectConflict("The link is gone, or is stated or chosen by now.")
+        self.links.before_change(name, "issues", child)
+        if not self.planning.remove_story_link(name, child, parent):
+            raise ProjectConflict("The link is gone.")
+        self.links.after_change(name, "issues", child)
+        return before
+
+    def undo(self, name: str, batch_id: UUID) -> dict[str, Any]:
+        """Put back everything an approved batch changed, within thirty days. A line
+        whose link has changed since is left as it is now and says so."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            batch = self._get(db, project, batch_id)
+            decided = batch.decided_at
+            if decided is not None and decided.tzinfo is None:
+                decided = decided.replace(tzinfo=UTC)
+            if batch.state != "approved" or decided is None:
+                raise ProjectConflict("Only an approved batch can be undone.")
+            if datetime.now(UTC) > decided + timedelta(days=UNDO_DAYS):
+                raise ProjectConflict(f"A batch can be undone for {UNDO_DAYS} days.")
+            kind = batch.kind
+            todo = [
+                (line.id, line.child_id, line.parent_id, line.before)
+                for line in db.scalars(
+                    select(ReorgLine).where(
+                        ReorgLine.batch_id == batch.id, ReorgLine.state == "applied"
+                    )
+                )
+            ]
+            batch.state, batch.undone_at = "undone", datetime.now(UTC)
+        results: dict[UUID, tuple[str, str | None]] = {}
+        for line_id, child, parent, before in todo:
+            try:
+                self._revert(name, kind, child, parent, before or [])
+                results[line_id] = ("undone", None)
+            except (ProjectConflict, ProjectInvalid, ProjectNotFound) as error:
+                results[line_id] = ("applied", f"Not put back: {error}")
+        with self.sessions.begin() as db:
+            for line_id, (state, detail) in results.items():
+                line = db.get_one(ReorgLine, line_id)
+                line.state, line.detail = state, detail
+            batch = db.get_one(ReorgBatch, batch_id)
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch_id)).all()
+            return self._batch(batch, list(lines))
+
+    def _revert(
+        self, name: str, kind: str, child: UUID, parent: UUID, before: list[dict[str, Any]]
+    ) -> None:
+        if kind in ("reasons", "primary"):
+            side = "issues" if kind == "reasons" else "stories"
+            if not self.links.restore(name, side, child, before):
+                raise ProjectConflict("The link is gone.")
+            return
+        if kind == "place":
+            self.links.before_change(name, "issues", child)
+            if not self.planning.remove_story_link(name, child, parent, remember=False):
+                raise ProjectConflict("The link is gone already.")
+            self.links.after_change(name, "issues", child)
+            return
+        self.links.before_change(name, "issues", child)
+        if not self.planning.restore_story_link(name, child, parent):
+            raise ProjectConflict("The User Story is gone, or the issue is a bug by now.")
+        self.links.after_change(name, "issues", child)
+        self.links.restore(name, "issues", child, before)

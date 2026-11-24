@@ -580,6 +580,18 @@ class BugUnlinkInput(PlainChangeInput):
     item_ids: list[UUID] | None = Field(default=None, max_length=500)
 
 
+class BatchInput(PlainChangeInput):
+    """Which kind of change to gather into a batch for approval."""
+
+    kind: Literal["reasons", "primary", "place", "unsupported"]
+
+
+class BatchLineInput(PlainChangeInput):
+    """The administrator's judgment of one line of a batch, or none to take it back."""
+
+    verdict: Literal["right", "wrong"] | None = None
+
+
 class PrimaryParentInput(PlainChangeInput):
     """The administrator's choice of a record's primary parent, among its parents."""
 

@@ -75,6 +75,8 @@ from engineering_control.dashboard.schemas import (
     ActivityEventInput,
     AgentInput,
     BacklogSyncInput,
+    BatchInput,
+    BatchLineInput,
     BudgetInput,
     BugUnlinkInput,
     CacheTrialInput,
@@ -1857,6 +1859,80 @@ def create_app(
         """What the scorer would do with each record, the surest first."""
         return await documents_read(
             request, lambda: repo(request).scorer.decisions(name, kind, outcome, page, page_size)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/reorganize/batches")
+    async def reorg_batches_api(name: str, request: Request) -> Response:
+        """What the scorer has ready to approve, by kind, and the batches made of it."""
+        return await documents_read(request, lambda: repo(request).reorg.overview(name))
+
+    @app.post("/api/dashboard/projects/{name}/reorganize/batches")
+    async def batch_prepare_api(name: str, request: Request) -> Response:
+        """Gather what is ready of one kind into a batch. Nothing of the plan changes."""
+        return await project_change(
+            request,
+            BatchInput,
+            lambda body: asyncio.to_thread(repo(request).reorg.prepare, name, body.kind),
+            event="workspace.batch_prepared",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/reorganize/batches/{batch}")
+    async def batch_lines_api(
+        name: str,
+        batch: UUID,
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+    ) -> Response:
+        return await documents_read(
+            request, lambda: repo(request).reorg.lines(name, batch, page, page_size)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/reorganize/batches/{batch}/lines/{line}")
+    async def batch_line_api(name: str, batch: UUID, line: UUID, request: Request) -> Response:
+        """Judge one line of a batch right or wrong, or take the judgment back."""
+        return await project_change(
+            request,
+            BatchLineInput,
+            lambda body: asyncio.to_thread(
+                repo(request).reorg.judge, name, batch, line, body.verdict
+            ),
+            event="workspace.batch_line_judged",
+            subject=name,
+            record=False,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/reorganize/batches/{batch}/approve")
+    async def batch_approve_api(name: str, batch: UUID, request: Request) -> Response:
+        """Apply every line of the batch that was not judged wrong."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).reorg.approve, name, batch),
+            event="workspace.batch_approved",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/reorganize/batches/{batch}/withdraw")
+    async def batch_withdraw_api(name: str, batch: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).reorg.withdraw, name, batch),
+            event="workspace.batch_withdrawn",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/reorganize/batches/{batch}/undo")
+    async def batch_undo_api(name: str, batch: UUID, request: Request) -> Response:
+        """Put back everything an approved batch changed."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).reorg.undo, name, batch),
+            event="workspace.batch_undone",
+            subject=name,
         )
 
     @app.get("/api/dashboard/projects/{name}/labels/next")

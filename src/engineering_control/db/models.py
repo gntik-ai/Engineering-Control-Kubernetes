@@ -1154,6 +1154,58 @@ class ScorerDecision(UUIDPrimaryKey, Timestamps, Base):
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
+class ReorgBatch(UUIDPrimaryKey, Timestamps, Base):
+    """Changes of one kind that the scorer would make, put before the administrator to
+    approve together (migration 0078). A sample of its lines is judged first; an approved
+    batch can be undone as a whole. Nothing of it touches the plan before it is approved."""
+
+    __tablename__ = "reorg_batches"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # reasons, primary, place or unsupported.
+    kind: Mapped[str] = mapped_column(String(16))
+    # sample (its sample is being judged), approved, withdrawn (the sample failed, or the
+    # administrator set it aside) or undone.
+    state: Mapped[str] = mapped_column(String(16), default="sample")
+    # What the scorer measured when the batch was made, and the error it may make.
+    measured: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # How many of its sampled lines may be judged wrong before it is withdrawn.
+    allowed_wrong: Mapped[int] = mapped_column(Integer, default=0)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReorgLine(UUIDPrimaryKey, Timestamps, Base):
+    """One change of a batch (migration 0078): a link and what would be done with it."""
+
+    __tablename__ = "reorg_lines"
+    batch_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("reorg_batches.id", ondelete="CASCADE"), index=True
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # issue_story or story_epic.
+    link_kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    parent_id: Mapped[UUID] = mapped_column(Uuid)
+    confidence: Mapped[float] = mapped_column(Float)
+    # Why the scorer would do it, in words, and the signals it read.
+    reason: Mapped[str] = mapped_column(Text)
+    signals: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # Whether the line is one of those judged before the batch is approved.
+    sampled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The administrator's judgment of the line: right or wrong. A line judged wrong is
+    # never applied, and is what the scorer learns from.
+    verdict: Mapped[str | None] = mapped_column(String(8))
+    # pending, applied, skipped (the plan had changed) or undone.
+    state: Mapped[str] = mapped_column(String(16), default="pending")
+    # How the link stood before the line was applied, to put it back.
+    before: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    detail: Mapped[str | None] = mapped_column(Text)
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

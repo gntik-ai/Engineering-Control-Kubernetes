@@ -31,6 +31,7 @@ from engineering_control.db.models import (
     ProjectStoryEpic,
     ProjectUserStory,
     ReviewEvidenceJob,
+    ScorerReport,
 )
 
 PAGE: Final = 100
@@ -56,6 +57,7 @@ FOLLOWED: Final = (
     "links_without_reason",
     "primaries_suggested",
     "reviews_waiting",
+    "scorer_abstains",
 )
 
 
@@ -122,6 +124,13 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
             )
         )
         said = planning_links.numbers(db, project.id)
+        # What the scorer would do, as it last reported: where it is sure, and where it
+        # abstains and the case waits for a decision model or the administrator.
+        scorer = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project.id))
+        would: dict[str, int] = {}
+        for entry in (scorer or {}).get("kinds", []):
+            for outcome, count in (entry.get("would") or {}).items():
+                would[outcome] = would.get(outcome, 0) + int(count)
         as_primary = planning_links.primary_stories(db, project.id)
     # Each Story counted once, under its primary Epic.
     titles = {str(row["id"]): str(row["title"]) for row in epics}
@@ -199,6 +208,10 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         "reviews_failed": waiting.get("failed", 0),
         "runs_cut_off": int(cut_off or 0),
         "reviews_waiting": sum(waiting.values()) + int(cut_off or 0),
+        "scorer_sure": sum(
+            would.get(k, 0) for k in ("place", "primary", "confirmed", "unsupported")
+        ),
+        "scorer_abstains": sum(would.get(k, 0) for k in ("unsure", "several", "none")),
     }
 
 

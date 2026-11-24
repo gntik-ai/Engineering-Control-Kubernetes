@@ -1059,6 +1059,103 @@ class PlanningRecords:
             item.updated_at = datetime.now(UTC)
             return {"id": str(key)}
 
+    def remove_story_link(
+        self, name: str, key: UUID, story: UUID, *, remember: bool = True
+    ) -> bool:
+        """Take the issue off one User Story, at the administrator's word, and leave its
+        other Stories. It may be left with none: it then waits for a Story like any issue
+        that has none. ``remember`` keeps the platform from making the same link again."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            item = db.scalar(
+                select(BacklogItem).where(
+                    BacklogItem.id == key,
+                    BacklogItem.project_id == project.id,
+                    BacklogItem.workspace_review.is_distinct_from("planning"),
+                )
+            )
+            if item is None:
+                raise ProjectNotFound(str(key))
+            link = db.scalar(
+                select(ProjectIssueStory).where(
+                    ProjectIssueStory.project_id == project.id,
+                    ProjectIssueStory.item_id == key,
+                    ProjectIssueStory.story_id == story,
+                )
+            )
+            if link is None:
+                return False
+            db.delete(link)
+            db.flush()
+            facts = dict(item.facts or {})
+            if remember:
+                facts["removed_story_links"] = sorted(
+                    {*(facts.get("removed_story_links") or []), str(story)}
+                )
+            item.facts = facts
+            self._mirror_stories(db, project.id, item)
+            record_changed(db, project.id, "issues", key, item.title)
+            item.updated_at = datetime.now(UTC)
+            return True
+
+    def restore_story_link(self, name: str, key: UUID, story: UUID) -> bool:
+        """Put back a link that was taken off, when a batch is undone. Not for a bug, and
+        not when the User Story is gone."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            item = db.scalar(
+                select(BacklogItem).where(
+                    BacklogItem.id == key, BacklogItem.project_id == project.id
+                )
+            )
+            alive = db.scalar(
+                select(ProjectUserStory.id).where(
+                    ProjectUserStory.project_id == project.id,
+                    ProjectUserStory.id == story,
+                    ProjectUserStory.archived_at.is_(None),
+                )
+            )
+            if item is None or alive is None or is_bug(db, project.id, key):
+                return False
+            facts = dict(item.facts or {})
+            facts["removed_story_links"] = [
+                kept for kept in facts.get("removed_story_links") or [] if kept != str(story)
+            ]
+            item.facts = facts
+            there = db.scalar(
+                select(ProjectIssueStory.story_id).where(
+                    ProjectIssueStory.item_id == key, ProjectIssueStory.story_id == story
+                )
+            )
+            if there is None:
+                db.add(ProjectIssueStory(project_id=project.id, item_id=key, story_id=story))
+                db.flush()
+            self._mirror_stories(db, project.id, item)
+            record_changed(db, project.id, "issues", key, item.title)
+            item.updated_at = datetime.now(UTC)
+            return True
+
+    @staticmethod
+    def _mirror_stories(db: Session, project: UUID, item: BacklogItem) -> None:
+        """Keep the pending proposal that stands for the issue in step with its Stories."""
+        if item.issue_number is None:
+            return
+        mirror = db.scalar(
+            select(WorkspaceCandidate).where(
+                WorkspaceCandidate.project_id == project,
+                WorkspaceCandidate.kind == "issues",
+                WorkspaceCandidate.number == item.issue_number,
+                WorkspaceCandidate.decision == "pending",
+            )
+        )
+        if mirror:
+            mirror.parents = sorted(
+                str(story)
+                for story in db.scalars(
+                    select(ProjectIssueStory.story_id).where(ProjectIssueStory.item_id == item.id)
+                )
+            )
+
     def parents(self, name: str, kind: Kind) -> list[dict[str, str]]:
         with self.sessions() as session:
             project = active_project(session, name)

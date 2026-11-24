@@ -658,6 +658,85 @@ class PlanningLinks:
                 ],
             }
 
+    def snapshot(self, name: str, kind: str, child: UUID) -> list[dict[str, Any]]:
+        """How each of the record's links stands now: enough to put it back."""
+        if kind not in _SPECS:
+            return []
+        self._in_step(name, kind, {child})
+        with self.sessions() as db:
+            project = active_project(db, name)
+            return [
+                {
+                    "parent": str(row.parent_id),
+                    "origin": row.origin,
+                    "confirmed": row.confirmed,
+                    "reason": row.reason,
+                    "evidence": row.evidence,
+                    "strength": row.strength,
+                    "is_primary": row.is_primary,
+                    "primary_by": row.primary_by,
+                }
+                for row in db.scalars(
+                    select(PlanningLink).where(
+                        PlanningLink.project_id == project.id,
+                        PlanningLink.kind == _SPECS[kind].name,
+                        PlanningLink.child_id == child,
+                        PlanningLink.removed_at.is_(None),
+                    )
+                )
+            ]
+
+    def restore(self, name: str, kind: str, child: UUID, before: list[dict[str, Any]]) -> int:
+        """Put the record's links back as a snapshot says they stood. Only links that are
+        there now are touched. Returns how many were."""
+        if kind not in _SPECS:
+            return 0
+        self._in_step(name, kind, {child})
+        was = {UUID(str(entry["parent"])): entry for entry in before}
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            rows = db.scalars(
+                select(PlanningLink).where(
+                    PlanningLink.project_id == project.id,
+                    PlanningLink.kind == _SPECS[kind].name,
+                    PlanningLink.child_id == child,
+                    PlanningLink.removed_at.is_(None),
+                )
+            ).all()
+            touched = 0
+            for row in rows:
+                entry = was.get(row.parent_id)
+                if entry is None:
+                    continue
+                row.origin, row.confirmed = entry["origin"], bool(entry["confirmed"])
+                row.reason, row.evidence = entry["reason"], entry["evidence"]
+                row.strength = entry["strength"]
+                row.is_primary, row.primary_by = bool(entry["is_primary"]), entry["primary_by"]
+                touched += 1
+            return touched
+
+    def explain(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> bool:
+        """Record why a link holds, where nothing said so yet. Who made the link stays as
+        it was. False where the link is gone or already says why."""
+        if kind not in _SPECS:
+            return False
+        self._in_step(name, kind, {child})
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.scalar(
+                select(PlanningLink).where(
+                    PlanningLink.project_id == project.id,
+                    PlanningLink.kind == _SPECS[kind].name,
+                    PlanningLink.child_id == child,
+                    PlanningLink.parent_id == parent,
+                    PlanningLink.removed_at.is_(None),
+                )
+            )
+            if row is None or explained(row):
+                return False
+            row.reason, row.confirmed = reason, True
+            return True
+
     def with_links(self) -> list[str]:
         """The projects that have links, for whoever keeps their records in step."""
         with self.sessions() as db:

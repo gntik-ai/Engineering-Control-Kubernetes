@@ -60,6 +60,8 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectUserStory,
     RecordVector,
+    ReorgBatch,
+    ReorgLine,
     ScorerDecision,
     ScorerReport,
 )
@@ -324,6 +326,21 @@ def cases_of(db: Session, project: ProjectRecord) -> tuple[list[_Case], _Plan] |
     texts = plan.texts()
     meaning = _Meaning(plan, vectors)
     wrong: dict[tuple[str, UUID], set[UUID]] = defaultdict(set)
+    # What the administrator judged of a batch's lines is known too. A line of a batch
+    # that takes links off says the opposite of its verdict about the link.
+    for line, batch_kind in db.execute(
+        select(ReorgLine, ReorgBatch.kind)
+        .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+        .where(ReorgLine.project_id == project.id, ReorgLine.verdict.is_not(None))
+    ):
+        children = plan.issues if line.link_kind == ISSUE_STORY else plan.stories
+        parents_ = plan.stories if line.link_kind == ISSUE_STORY else plan.epics
+        if line.child_id not in children or line.parent_id not in parents_:
+            continue
+        if (line.verdict == "right") != (batch_kind == "unsupported"):
+            known[line.link_kind][line.child_id].add(line.parent_id)
+        else:
+            wrong[line.link_kind, line.child_id].add(line.parent_id)
     for pair in db.scalars(
         select(GoldPair).where(
             GoldPair.project_id == project.id, GoldPair.label.in_(("no", "related"))
@@ -567,6 +584,7 @@ class Scorer:
                 BacklogItem,
                 ProjectUserStory,
                 ProjectEpic,
+                ReorgLine,
             )
             parts = [
                 tuple(db.execute(select(func.count(), func.max(table.updated_at))).one())
@@ -775,6 +793,7 @@ class Scorer:
                         model="full" if full else "light",
                         detail={
                             "first": first,
+                            "of": len(case.parents),
                             "signals": {
                                 name: round(float(value), 3)
                                 for name, value in zip(signal_names, table[place], strict=True)

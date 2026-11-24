@@ -126,6 +126,11 @@ def add_story_links(db: Session, project: UUID, item: UUID, stories: set[UUID]) 
     to none: it stands apart from the plan."""
     if not stories or is_bug(db, project, item):
         return 0
+    # A link the administrator had taken off is not made again.
+    facts = db.scalar(select(BacklogItem.facts).where(BacklogItem.id == item)) or {}
+    stories = stories - {UUID(str(v)) for v in facts.get("removed_story_links") or []}
+    if not stories:
+        return 0
     existing = set(
         db.scalars(
             select(ProjectIssueStory.story_id).where(

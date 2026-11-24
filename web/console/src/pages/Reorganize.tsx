@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
+import { ChangeBatches } from './ChangeBatches';
 import { Shadow } from './Shadow';
 
 /** How well one way of finding a parent does against the parents that are known. */
@@ -245,6 +246,7 @@ export function Reorganize({ project }: { project: string }) {
   const data = report.data;
   return (
     <>
+      <ChangeBatches project={project} />
       <Card>
         <CardHeader>
           <CardTitle>How well a parent is found</CardTitle>

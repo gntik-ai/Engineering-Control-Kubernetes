@@ -245,7 +245,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
 | R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
 | R6 | Scorer in shadow mode: one learned judgment from all signals that abstains where it cannot rule the other candidates out. Asking decision models about what it abstains on moved to R7, since it spends money. | A report of every change it would make, with how often it is right when it would act, measured on known links it never saw. Nothing is changed. |
-| R7 | Reorganize links: batches to approve for reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | A sample before each batch and undo of a batch; sampled precision within the allowed error rate. Nothing is applied without approval. |
+| R7 | Reorganize links: the scorer's sure cases as batches to approve for reasons recorded, primary Epics chosen, issues placed and unsupported links taken off. | A sample is judged before each batch; an approved batch can be undone for 30 days; what is judged teaches the scorer. |
 | R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are offered as a batch to close; every Story shows its state with its evidence. |
 | R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
 | R10 | Reorganize structure: split Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
@@ -405,6 +405,16 @@ It is computed in the console's process by a keeper that looks every two minutes
 `GET /api/dashboard/projects/{name}/scorer` returns what it learned from, the measurement, the weights, the counts of what it would do and the first count for the clean-up. `GET …/scorer/decisions?kind=&outcome=&page=` lists the records it speaks of, the surest first, each with the parent, the share of belief and the signals.
 
 The ranking service scores the candidates of every record, not only of the measured ones, where the scorer's measurement shows that the reranker's signals help (`Signals.wanted_for_all`), about 400 pairs a pass.
+
+### Changes to approve
+
+**Reviews → Reorganize** opens with the changes the scorer is sure of, gathered into batches by kind: record why links hold, choose primary Epics, place issues under a User Story, take off links nothing supports. The rules (sample, error allowed, undo) are in [planning-reorganization.md](planning-reorganization.md#batches-to-approve-r7).
+
+A batch is made when the administrator asks to review a kind (`POST …/reorganize/batches`), which changes nothing in the plan. Its lines are read with `GET …/reorganize/batches/{id}`; a line is judged with `POST …/reorganize/batches/{id}/lines/{line}`; `…/approve` applies the lines not judged wrong once the sample is judged, `…/withdraw` sets the batch aside and `…/undo` puts an approved batch back within 30 days. `GET …/reorganize/batches` returns what is ready by kind, the open batches and the decided ones. Batches and lines are kept in `reorg_batches` and `reorg_lines` (migration 0078).
+
+Applying uses the existing paths: `PlanningRecords.link_stories` and `PlanningLinks.noted` to place an issue (origin `scorer`), `PlanningLinks.set_primary` for a primary Epic, `PlanningLinks.explain` for a reason, and `PlanningRecords.remove_story_link` to take one link off, which may leave the issue without a User Story and keeps the platform from making the link again. Bugs are never in a batch.
+
+Planning health gains two numbers under "Reorganization": the changes the scorer is sure of, and the records it abstains on.
 
 ### A review run that was cut off
 

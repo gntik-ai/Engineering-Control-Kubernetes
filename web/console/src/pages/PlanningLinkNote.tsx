@@ -7,7 +7,7 @@ export interface ParentLink {
   parent: string;
   primary: boolean;
   primary_by: 'only' | 'suggested' | 'administrator' | null;
-  origin: 'declared' | 'administrator' | 'model' | 'unknown';
+  origin: 'declared' | 'administrator' | 'model' | 'scorer' | 'unknown';
   confirmed: boolean;
   reason: string | null;
   evidence: { side: string; text: string }[];
@@ -25,6 +25,8 @@ export function madeBy(link: Pick<ParentLink, 'origin' | 'confirmed'>): string {
       return 'Chosen by you';
     case 'model':
       return link.confirmed ? 'Proposed by a review, approved by you' : 'Matched by a review';
+    case 'scorer':
+      return 'Found by the scorer, approved by you in a batch';
     default:
       return 'No reason recorded';
   }

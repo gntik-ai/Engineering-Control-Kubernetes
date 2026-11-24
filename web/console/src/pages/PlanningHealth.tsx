@@ -46,6 +46,8 @@ interface Numbers {
   reviews_failed: number;
   runs_cut_off: number;
   reviews_waiting: number;
+  scorer_sure?: number;
+  scorer_abstains?: number;
 }
 interface Health {
   measured_at: string;
@@ -289,6 +291,29 @@ export function PlanningHealth({ project }: { project: string }) {
                 since={since}
               />
             </Group>
+            {now.scorer_sure !== undefined && now.scorer_sure + (now.scorer_abstains ?? 0) > 0 ? (
+              <Group
+                title="Reorganization"
+                about="The scorer says of each record what it would do. Where it is sure, the change waits in a batch for your approval; where it abstains, the record waits for a decision model or for you."
+              >
+                <Tile
+                  value={now.scorer_sure}
+                  label="Changes the scorer is sure of"
+                  of="Gathered into batches to approve"
+                  was={was?.scorer_sure}
+                  since={since}
+                  href={reviewUrl(project, 'reorganize')}
+                />
+                <Tile
+                  value={now.scorer_abstains ?? 0}
+                  label="Records the scorer abstains on"
+                  of="It learns from every pair you judge and every answer you approve"
+                  was={was?.scorer_abstains}
+                  since={since}
+                  href={reviewUrl(project, 'reorganize')}
+                />
+              </Group>
+            ) : null}
           </>
         )}
       </CardBody>

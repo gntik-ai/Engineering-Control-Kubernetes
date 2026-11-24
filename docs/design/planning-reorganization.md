@@ -215,6 +215,29 @@ An instruction-following reranker or a small language model on the graphics card
 
 **Shadow mode.** The scorer writes only its own two tables (`scorer_reports`, `scorer_decisions`, migration 0077). No link is made, removed or proposed from them. R7 turns what it would do into batches to approve.
 
+## Batches to approve (R7)
+
+What the scorer would do is turned into batches, one per kind of change. A batch is the unit of approval: nothing in it is applied before your word.
+
+| Batch | What it gathers | Extra condition | Error allowed |
+| --- | --- | --- | --- |
+| Record why links hold | Existing links with no reason, whose User Story the scorer singles out among all candidates | The link says nothing yet about why | 5% |
+| Choose primary Epics | User Stories under several Epics for which the scorer leaves one Epic | You have not chosen a primary Epic yourself | 5% |
+| Place issues under a User Story | Issues with no User Story for which the scorer leaves one | The issue still has none | 5% |
+| Take off links nothing supports | Existing links the scorer rules out at the stricter bound | The User Story also stands below the fifth place both by shared words and by meaning (the second, independent signal); never a link the text states or you chose | 2% |
+
+**A sample first.** A batch opens with a sample drawn without regard to how sure the scorer is: the square root of its size, at least five lines and at most twenty, or all of them in a small batch. Each sampled line is judged right or wrong. More wrong ones than the error allows for that sample (with these sizes: one) and the batch is withdrawn; the wrong line is not offered again, the scorer learns from it, and a new batch can be made from what is left. Any other line can be struck without withdrawing the batch.
+
+**Approval.** Every line not judged wrong is applied through the same paths the worklists use: the link, the primary Epic, the link's record with who made it. A link the scorer placed is recorded as found by the scorer and approved by you, with the reason in words (what it shares, where it stands, among how many candidates). A line the plan has moved away from since the batch was made is skipped and says why.
+
+**Undo.** Each applied line keeps how the link stood before. An approved batch can be undone as a whole for 30 days: reasons are taken out again, the earlier primary Epic is restored, a placed issue is taken off its Story, a link that was taken off is put back with its record. A link that changed in the meantime is left as it is now.
+
+**A link taken off stays off.** The platform does not make the same link again by itself (the issue remembers it); undoing the batch lifts that.
+
+**What is learned.** A judged line is known truth for the scorer: right lines of a batch that adds, and wrong lines of the batch that takes links off, are right links; the others are wrong links. Lines applied without being judged are not learned from, so that the scorer does not teach itself.
+
+**What the decision stage is for now.** The worklists of R2 and R3 (Reviews → Related Work, Reviews → Planning) remain the place where a model is asked about records the scorer abstains on; their runs start on your word and within the budget, and every answer you approve becomes known truth that the scorer learns from.
+
 ## Revised plan
 
 R0 to R3 are done and deployed. Their worklists stay: they become the place where the cases the cascade abstains on are decided, and where its batches are approved.
@@ -224,7 +247,7 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived), extracts identifiers from documents, issues and Stories, and keeps which sections were deleted or rewritten, as evidence for removals. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
 | R5 | Signals. The measurement of each way of ranking against known truth, and the pairs to judge (built). Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes. | The true parent is among the top 20 candidates for at least 95% (met by words alone: 99%). Every way of ranking is shown beside word matching on the same known links. The earlier target of 85% first by a reranker alone is dropped: see the first measurements. |
 | R6 | Scorer in shadow mode (built, 24 November 2026). One learned judgment from all signals; a bound per error rate that says which candidates cannot be ruled out; a report per project of what it would do with every record, and a first count of where the clean-up will look. The reranker is asked about every record only where it is measured to help. Not in R6 after all, and moved to R7 with the batches: asking a decision model about the cases the scorer abstains on, which spends money and so starts on your word; and the trial of a local model on the graphics card, which waits until a workload in the cluster is shown to reach the card. | The scorer is measured on known links it never saw, per project where there are enough. Where it would act it is right at least as often as the chosen error allows; how often it abstains is reported, not assumed. Nothing is changed. |
-| R7 | Reorganize links. Batches to approve: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. A sample before each batch, undo of a batch, Planning health redefined. | Falcone, once its batches are approved: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; the sampled precision within the allowed error rate. |
+| R7 | Reorganize links (first part built, 24 November 2026). The scorer's sure cases reach you as batches by kind: reasons recorded, primary Epics chosen, issues placed, unsupported links taken off. A sample is judged before a batch can be approved, any line can be struck, and an approved batch can be undone for 30 days. What you judge teaches the scorer. Planning health follows what the scorer is sure of and what it abstains on. Still to build in R7: using the scorer's order and candidates in the worklists' runs, so that a model is asked only about what the scorer abstains on, with a shorter list. | Each kind of change can be approved in one word after its sample, and undone. On Falcone the batches are empty until the scorer has enough known links there; on Falcone-serverless they hold what the scorer is sure of. |
 | R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories offered as a batch to close. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
 | R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |
 | R10 | Reorganize structure. Epic cohesion; proposals to split a broad Epic; missing Stories from orphan clusters and from document sections; all as one plan to approve. Replaces the earlier R5. | The plan can be approved or edited as a whole; after it, no Epic is the primary Epic of more than 10% of Stories. |
