@@ -555,11 +555,44 @@ class GitHubApp:
             raise GitHubAppError("GitHub has not confirmed the Issue classification")
         return labels
 
-    async def close_workspace_issue(self, repository: str, number: int, *, token: str) -> None:
+    async def comment_workspace_issue(
+        self, repository: str, number: int, body: str, marker: str, *, token: str
+    ) -> bool:
+        """Leave a comment on the issue, once: a comment that carries the marker is not
+        written again. Returns whether it was written now."""
+        if not REPOSITORY_NAME.fullmatch(repository) or number < 1 or not body.strip():
+            raise GitHubAppError("Invalid issue comment")
+        path = f"/repos/{repository}/issues/{number}/comments"
+        page = 1
+        while page <= 10:
+            listed = await self._request(
+                "GET", path, token=token, params={"per_page": 100, "page": page}
+            )
+            if not isinstance(listed, list):
+                raise GitHubAppError("GitHub did not list the issue's comments")
+            if any(marker in str(entry.get("body") or "") for entry in listed):
+                return False
+            if len(listed) < 100:
+                break
+            page += 1
+        made = await self._request(
+            "POST", path, token=token, json={"body": body.rstrip() + "\n\n" + marker}
+        )
+        if not isinstance(made, dict) or not made.get("id"):
+            raise GitHubAppError("GitHub did not confirm the comment")
+        return True
+
+    async def close_workspace_issue(
+        self, repository: str, number: int, *, token: str, reason: str | None = None
+    ) -> None:
+        """Close the issue; ``reason`` tells GitHub why: ``not_planned`` or ``completed``."""
         if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
             raise GitHubAppError("Invalid issue reference")
+        if reason not in (None, "not_planned", "completed"):
+            raise GitHubAppError("Invalid reason for closing an issue")
+        change = {"state": "closed", **({"state_reason": reason} if reason else {})}
         data = await self._request(
-            "PATCH", f"/repos/{repository}/issues/{number}", token=token, json={"state": "closed"}
+            "PATCH", f"/repos/{repository}/issues/{number}", token=token, json=change
         )
         if (
             not isinstance(data, dict)

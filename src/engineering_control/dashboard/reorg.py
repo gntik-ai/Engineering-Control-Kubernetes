@@ -123,8 +123,20 @@ KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
         "Epics. Approving closes the Epic: it is not deleted and can be reopened. No User "
         "Story and no issue is touched.",
     ),
+    "retire_issues": (
+        "issue_retire",
+        "proposed",
+        REMOVE_ERROR,
+        "Close issues nothing stands behind",
+        "Two reasons of different kinds, or an exact one, speak against each of these open "
+        "issues. Approving closes each on GitHub as not planned, with a comment that gives "
+        "the reasons and names the issue that replaced it. This writes on GitHub and is "
+        "not undone from here: an issue closed by mistake is reopened on GitHub.",
+    ),
 }
-RETIRED: Final = {"retire_stories": "stories", "retire_epics": "epics"}
+RETIRED: Final = {"retire_stories": "stories", "retire_epics": "epics", "retire_issues": "issues"}
+# What a batch does that cannot be put back from here.
+FINAL: Final = frozenset({"retire_issues"})
 
 
 def why(kind: str, confidence: float, signals: dict[str, Any], candidates: int) -> str:
@@ -157,6 +169,17 @@ def why(kind: str, confidence: float, signals: dict[str, Any], candidates: int) 
     return (
         f"The scorer leaves this parent alone among {candidates} candidates, with a share "
         f"of belief of {share}" + (": " + "; ".join(said) + "." if said else ".")
+    )
+
+
+def closing_comment(reason: str) -> str:
+    """The comment left on an issue the clean-up closes: what it was closed for, in the
+    words of the line the administrator approved, and how to take it back."""
+    return (
+        "Closed as not planned in a clean-up of the backlog that the project's administrator "
+        "approved in Engineering Control.\n\n"
+        f"Why: {reason}\n\n"
+        "If this issue is still needed, reopen it."
     )
 
 
@@ -333,7 +356,7 @@ class Reorg:
                     outcome="proposed",
                     confidence=1.0,
                     model="rule",
-                    detail={"why": ". ".join(said) + "."},
+                    detail={"why": ". ".join(said) + ".", "said": said},
                 )
             )
         return found
@@ -440,8 +463,13 @@ class Reorg:
             "measured": batch.measured,
             "made_at": batch.created_at.isoformat(),
             "decided_at": decided.isoformat() if decided else None,
-            "undo_until": until.isoformat() if until and batch.state == "approved" else None,
-            "can_undo": bool(batch.state == "approved" and until and now <= until),
+            "undo_until": until.isoformat()
+            if until and batch.state == "approved" and batch.kind not in FINAL
+            else None,
+            "can_undo": bool(
+                batch.state == "approved" and until and now <= until and batch.kind not in FINAL
+            ),
+            "final": batch.kind in FINAL,
         }
 
     def overview(self, name: str) -> dict[str, Any]:
@@ -666,7 +694,20 @@ class Reorg:
                 for entry in impact["items"]
             ):
                 raise ProjectConflict("Closing it would close records under it that are open.")
-            self.planning.lifecycle.confirm(name, side, child, "close", impact["token"])  # type: ignore[arg-type]
+            closure = None
+            if side == "issues":
+                mine = next(entry for entry in impact["items"] if entry["id"] == str(child))
+                if mine["action"] != "close" or mine.get("github") != "close":
+                    raise ProjectConflict("The issue is not an open issue on GitHub any more.")
+                closure = ("not_planned", closing_comment(reason))
+            self.planning.lifecycle.confirm(
+                name,
+                side,  # type: ignore[arg-type]
+                child,
+                "close",
+                impact["token"],
+                closure=closure,
+            )
             return []
         if kind == "close":
             with self.sessions() as db:
@@ -747,6 +788,10 @@ class Reorg:
                 decided = decided.replace(tzinfo=UTC)
             if batch.state != "approved" or decided is None:
                 raise ProjectConflict("Only an approved batch can be undone.")
+            if batch.kind in FINAL:
+                raise ProjectConflict(
+                    "Issues closed on GitHub are not reopened from here. Reopen them on GitHub."
+                )
             if datetime.now(UTC) > decided + timedelta(days=UNDO_DAYS):
                 raise ProjectConflict(f"A batch can be undone for {UNDO_DAYS} days.")
             kind = batch.kind

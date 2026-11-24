@@ -58,7 +58,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0077 keeps the scorer's report and what it would do with each record.
     # 0078 keeps the batches of changes put before the administrator, and their lines.
     # 0079 keeps where each User Story stands, with the evidence for it.
-    assert (head, parent) == ("0079", "0078")
+    # 0080 lets a queued issue closure say why and carry its comment.
+    assert (head, parent) == ("0080", "0079")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -160,8 +161,15 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert "story_delivery" in inspect(engine).get_table_names()
+    assert {"state_reason", "note"} <= {
+        column["name"] for column in inspect(engine).get_columns("workspace_actions")
+    }
     command.downgrade(config, parent)
+    assert "note" not in {
+        column["name"] for column in inspect(engine).get_columns("workspace_actions")
+    }
+    assert "story_delivery" in inspect(engine).get_table_names()
+    command.downgrade(config, "0078")
     assert "story_delivery" not in inspect(engine).get_table_names()
     assert {"reorg_batches", "reorg_lines"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, "0077")

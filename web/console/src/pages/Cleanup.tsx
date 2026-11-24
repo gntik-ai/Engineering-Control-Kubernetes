@@ -59,8 +59,8 @@ const ONE: Record<Kind, string> = { stories: 'User Story', epics: 'Epic', issues
 /**
  * The clean-up: records that reasons speak against. A record is proposed for closing only
  * on two reasons of different kinds or an exact one; with one reason it is listed and
- * nothing more. Nothing is closed here: proposed User Stories and Epics are batches under
- * "Changes to approve", and issues are closed by hand.
+ * nothing more. Nothing is closed here: what is proposed becomes batches under "Changes to
+ * approve".
  */
 export function Cleanup({ project }: { project: string }) {
   const base = 'projects/' + encodeURIComponent(project) + '/cleanup';
@@ -192,8 +192,9 @@ export function Cleanup({ project }: { project: string }) {
                 </div>
                 {kind === 'issues' || (!kind && (data.kinds.issues.proposed ?? 0) > 0) ? (
                   <p className="text-sm text-muted-foreground">
-                    Issues are listed with their reasons and are not closed by a batch: closing one writes on GitHub and
-                    cannot be undone from here. Open an issue to close it yourself.
+                    Proposed issues are closed by the batch &quot;Close issues nothing stands behind&quot; under Changes
+                    to approve: on GitHub, as not planned, with a comment that gives the reasons. That is not undone
+                    from here; an issue closed by mistake is reopened on GitHub.
                   </p>
                 ) : null}
                 <LoadError resource={list} />

@@ -21,10 +21,10 @@ The model's check is a run the administrator starts, within the project's review
 It can also speak *for* a Story: an answer that names a piece of the project as its work,
 or that cannot tell, withdraws the proposal.
 
-What is proposed is always closing, never deleting: a closed Story or Epic can be
-reopened. Proposed Stories and Epics become batches to authorize (``reorg.py``). Open
-issues are listed with their reasons; closing them writes on GitHub and is not done by a
-batch. Bugs are no part of this.
+What is proposed is always closing, never deleting. Everything proposed becomes a batch
+to authorize (``reorg.py``). A closed Story or Epic can be reopened by undoing its batch.
+An issue is closed on GitHub as not planned, with a comment that gives the reasons; that
+is not undone from here. Bugs are no part of this.
 """
 
 from __future__ import annotations

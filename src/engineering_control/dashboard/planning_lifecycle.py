@@ -288,7 +288,7 @@ class Impact:
         self.records[kind, row.id] = row
         self.revisions.append((kind, str(row.id), row.updated_at.isoformat()))
 
-    def apply(self, now: datetime) -> None:
+    def apply(self, now: datetime, closure: tuple[str, str] | None = None) -> None:
         for entry in self.rows:
             action = entry["action"]
             if action not in ("close", "delete"):
@@ -314,6 +314,10 @@ class Impact:
                             a.repository, a.number = entry["repository"], row.issue_number
                             a.detail, a.lease, a.lease_until = None, None, None
                         a.confirmation_token = self.token
+                        # Only the record that was chosen says why; what closes with
+                        # it closes as before.
+                        said = closure if (entry["kind"], row.id) == (self.kind, self.key) else None
+                        a.state_reason, a.note = said if said else (None, None)
                         a.status = "waiting" if row.workspace_review == "publishing" else "pending"
             elif action == "close":
                 row.closed_at = now
@@ -376,8 +380,17 @@ class PlanningLifecycle:
             return {**impact.snapshot, "token": impact.token}
 
     def confirm(
-        self, name: str, kind: Kind, key: UUID, operation: Operation, token: str | None
+        self,
+        name: str,
+        kind: Kind,
+        key: UUID,
+        operation: Operation,
+        token: str | None,
+        *,
+        closure: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
+        """``closure`` is for an issue the clean-up closes: the reason GitHub is told, and
+        the comment left on the issue."""
         if not token:
             raise ProjectConflict("Preview the affected records and confirm this change.")
         try:
@@ -403,7 +416,7 @@ class PlanningLifecycle:
                         "The affected records changed. Review the updated list and confirm again."
                     )
                 now = datetime.now(UTC)
-                impact.apply(now)
+                impact.apply(now, closure)
                 db.add(
                     PlanningLifecycleReceipt(
                         token=token,

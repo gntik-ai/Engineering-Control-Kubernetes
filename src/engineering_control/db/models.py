@@ -582,6 +582,10 @@ class WorkspaceAction(UUIDPrimaryKey, Timestamps, Base):
     lease: Mapped[UUID | None] = mapped_column(Uuid)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     detail: Mapped[str | None] = mapped_column(String(350))
+    # For a closure the clean-up asked for (migration 0080): why GitHub is told the issue
+    # is closed, and the comment that says so on the issue. Empty for every other action.
+    state_reason: Mapped[str | None] = mapped_column(String(16))
+    note: Mapped[str | None] = mapped_column(Text)
     __table_args__ = (
         UniqueConstraint("project_id", "operation", "local_id", name="uq_workspace_action_record"),
     )

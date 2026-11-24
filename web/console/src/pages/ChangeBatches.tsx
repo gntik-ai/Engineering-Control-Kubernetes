@@ -36,6 +36,8 @@ interface Batch {
   decided_at: string | null;
   undo_until: string | null;
   can_undo: boolean;
+  /** What the batch does cannot be put back from here: it writes on GitHub. */
+  final?: boolean;
 }
 interface Overview {
   kinds: {
@@ -201,7 +203,10 @@ function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batc
           title={asking === 'approve' ? `${batch.title}: approve?` : 'Set this batch aside?'}
           about={
             asking === 'approve'
-              ? `${some(now.lines - now.struck, 'change', 'changes')} will be applied. The whole batch can be undone for 30 days.`
+              ? `${some(now.lines - now.struck, 'change', 'changes')} will be applied. ` +
+                (now.final
+                  ? 'Each issue is closed on GitHub as not planned, with a comment that says why. This cannot be undone from here.'
+                  : 'The whole batch can be undone for 30 days.')
               : 'Nothing is applied. What you judged in it is kept, and the scorer learns from it.'
           }
           action={asking === 'approve' ? 'Approve' : 'Set aside'}

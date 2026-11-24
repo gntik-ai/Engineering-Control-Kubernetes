@@ -179,3 +179,106 @@ def test_epics_and_issues_are_judged_by_the_same_rule(tmp_path: Path) -> None:
             assert db.get_one(ProjectEpic, empty.id).closed_at is None
     finally:
         client.close()
+
+
+class GitHub:
+    """Stands in for GitHub: remembers what was written on which issue."""
+
+    def __init__(self) -> None:
+        self.closed: dict[int, str | None] = {}
+        self.comments: dict[int, list[str]] = {}
+
+    async def repository_token(self, repository: str, permissions: dict[str, str]) -> str:
+        assert permissions == {"issues": "write"}
+        return "fixture"
+
+    async def revoke(self, token: str) -> None:
+        pass
+
+    async def workspace_issue(self, repository: str, number: int) -> dict[str, Any]:
+        return {
+            "number": number,
+            "state": "closed" if number in self.closed else "open",
+            "state_reason": self.closed.get(number),
+            "title": "Task",
+            "labels": [],
+            "closed_at": None,
+            "updated_at": "2026-11-24T00:00:00Z",
+        }
+
+    async def comment_workspace_issue(
+        self, repository: str, number: int, body: str, marker: str, *, token: str
+    ) -> bool:
+        said = self.comments.setdefault(number, [])
+        if any(marker in comment for comment in said):
+            return False
+        said.append(body + "\n\n" + marker)
+        return True
+
+    async def close_workspace_issue(
+        self, repository: str, number: int, *, token: str, reason: str | None = None
+    ) -> None:
+        self.closed[number] = reason
+
+
+def test_proposed_issues_are_closed_on_github_by_an_approved_batch(tmp_path: Path) -> None:
+    import asyncio
+    from typing import cast
+
+    from engineering_control.github_app import GitHubApp
+
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data, _made = prepared(repo, client)
+        pid = data["project"]
+        with repo.sessions.begin() as db:
+            items = {
+                item.issue_number: item
+                for item in db.scalars(select(BacklogItem).where(BacklogItem.project_id == pid))
+            }
+            # Issue 45 says the same as issue 62, which was closed as done.
+            ranking.keep_vector(db, pid, "issue", items[45].id, "m", "d", vector(0, 0, 0, 1))
+            ranking.keep_vector(db, pid, "issue", items[62].id, "m", "d", vector(0, 0, 0, 1))
+            twin = items[45].id
+        assert ready(client)["retire_issues"] == 1
+        batch = post(client, "reorganize/batches", kind="retire_issues").json()
+        path = "reorganize/batches/" + batch["id"]
+        lines = client.get(BASE + path).json()
+        assert lines["batch"]["final"] and not lines["batch"]["can_undo"]
+        [line] = lines["items"]
+        assert line["child"]["title"] == "#45 Unrelated work"
+        assert line["parent"]["title"] == "#62 Refund a charge"
+        # Nothing is asked of GitHub before the batch is approved.
+        with repo.sessions() as db:
+            assert db.scalar(select(WorkspaceAction)) is None
+        assert post(client, f"{path}/lines/{line['id']}", verdict="right").status_code == 200
+        done = post(client, path + "/approve")
+        assert done.status_code == 200 and done.json()["applied"] == 1
+        with repo.sessions() as db:
+            [action] = db.scalars(select(WorkspaceAction)).all()
+            assert (action.operation, action.number, action.status) == (
+                "close_issue",
+                45,
+                "pending",
+            )
+            assert action.state_reason == "not_planned"
+            assert "#62 Refund a charge" in (action.note or "")
+            assert "reopen it" in (action.note or "")
+            key = action.id
+
+        github = GitHub()
+        told = asyncio.run(repo.publishing.sync("falcone", key, cast(GitHubApp, github)))
+        assert told["status"] == "done", told
+        # Closed as not planned, with one comment that says why.
+        assert github.closed == {45: "not_planned"}
+        [comment] = github.comments[45]
+        assert "Says nearly the same as another issue (#62 Refund a charge)" in comment
+        assert f"engineering-control:closure:{key}" in comment
+        with repo.sessions() as db:
+            assert db.get_one(BacklogItem, twin).issue_state == "closed"
+        # What was written on GitHub is not taken back from here.
+        undo = post(client, path + "/undo")
+        assert undo.status_code == 409 and "GitHub" in undo.text
+        assert "#45 Unrelated work" not in records(client)
+    finally:
+        client.close()

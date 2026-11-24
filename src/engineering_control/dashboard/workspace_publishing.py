@@ -411,7 +411,27 @@ class WorkspacePublishing:
                 if snapshot["state"] != "closed":
                     token = await github.repository_token(action.repository, {"issues": "write"})
                     try:
-                        await github.close_workspace_issue(action.repository, number, token=token)
+                        if action.note:
+                            # A closure the clean-up asked for says why on the issue,
+                            # once, before it closes it.
+                            await github.comment_workspace_issue(
+                                action.repository,
+                                number,
+                                action.note,
+                                f"<!-- engineering-control:closure:{action.id} -->",
+                                token=token,
+                            )
+                        if action.state_reason:
+                            await github.close_workspace_issue(
+                                action.repository,
+                                number,
+                                token=token,
+                                reason=action.state_reason,
+                            )
+                        else:
+                            await github.close_workspace_issue(
+                                action.repository, number, token=token
+                            )
                     finally:
                         await github.revoke(token)
                     snapshot = await github.workspace_issue(action.repository, number)
