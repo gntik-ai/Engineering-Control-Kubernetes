@@ -11,7 +11,7 @@ Planning health of Falcone, measured on the live plan (63 Epics, 737 User Storie
 | User Stories with no issue | 543 | Delivered without an issue, planned and not broken down, or supported by nothing. The number does not say which. |
 | User Stories under several Epics | 704 (3.6 Epics each, 10 at most) | Stories were generated with "link each to all relevant Epics". |
 | Stories linked to the largest Epic | 273 (37%) | An effect of the same multiple links: it is the primary Epic of 53. |
-| Links with no recorded reason | 887 of about 3,000 | Nobody can check them or trust them. |
+| Links with no recorded reason | 2,887 of 3,005 (first written here as 887, a misreading) | Nobody can check them or trust them. |
 | Open issues with no Story | 70 | Work that is under way outside the plan. |
 | Closed issues with no Story | 209 | Evidence of delivery that no Story can use. |
 | Open Stories whose issues are all closed | 89 | Done, or missing an issue. |
@@ -66,7 +66,7 @@ The service is written so that either can be used, per project.
 1. **Known truth to measure against.** Three sources: links stated in the records' own text (176 on Falcone-serverless); every decision you have made; and one labelled set of about 150 pairs that you judge once, in 30 to 40 minutes, drawn to include easy, hard and wrong cases. Whole Epics are held out for testing, as the existing evaluation notes require.
 2. **Error rates chosen beforehand.** Per kind of change (see the table below), with thresholds derived from the held-out set.
 3. **Shadow mode first.** The cascade runs over the whole project and reports what it would do, with its measured precision, before it changes anything.
-4. **Every change explains itself.** A link made or kept by the cascade records the signals, the score and the two passages that match best. That is also how the 887 links without a reason get one.
+4. **Every change explains itself.** A link made or kept by the cascade records the signals, the score and the two passages that match best. That is also how the 2,887 links without a reason get one.
 5. **Everything approved in bulk can be undone.** Changes are applied in batches; a batch can be reverted for 30 days. Link history is already kept.
 6. **A sample before the batch.** A batch opens with a random sample of its lines to confirm or reject. If the rejected share exceeds the chosen error rate, the batch is withdrawn and the scorer recalibrated before it is offered again.
 7. **The few questions you get are the useful ones.** Cases are sent to a person in order of how many similar cases the answer settles, and each answer recalibrates the scorer.
@@ -88,7 +88,7 @@ An approved batch can be undone as a whole for 30 days. A line you strike from a
 
 ## What happens to each misalignment
 
-**Links without a reason (887).** Every existing link is scored. Those the evidence supports get their reason and passages recorded. Those it contradicts become candidates for removal. Expected to end near zero without a language model.
+**Links without a reason (2,887: 2,674 between Stories and Epics, the rest between issues and Stories).** Every existing link is scored. Those the evidence supports get their reason and passages recorded. Those it contradicts become candidates for removal. Expected to end near zero without a language model.
 
 **Stories under several Epics (704), and the broad Epic (273).** The reranker scores each Story against its Epics; the assignment chooses one primary Epic per Story; related links that score below the contradiction threshold are removed. Target: every Story has a chosen primary Epic, the average falls from 3.6 Epics per Story to under 2, and no Epic is the primary Epic of more than 10% of Stories.
 
