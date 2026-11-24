@@ -28,7 +28,7 @@ from engineering_control.dashboard import parent_choice, review_budget, review_f
 from engineering_control.dashboard.connection_records import digest, finding_links
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
-from engineering_control.dashboard.parent_choice import Unusable, passage, position
+from engineering_control.dashboard.parent_choice import THINKING_ROOM, Unusable, passage, position
 from engineering_control.dashboard.planning import PlanningRecords, _visible_issues
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, _numbers
 from engineering_control.dashboard.project_records import (
@@ -349,7 +349,7 @@ def question(
         system=SYSTEM,
         prompt=json.dumps(asked, ensure_ascii=False, separators=(",", ":")),
         schema=SCHEMA,
-        max_tokens=500,
+        max_tokens=500 + THINKING_ROOM,
         seconds=90,
     )
 

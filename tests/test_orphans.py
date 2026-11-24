@@ -277,3 +277,45 @@ def test_run_limits_and_failures(tmp_path: Path) -> None:
             assert len(db.scalars(select(ChoiceRun)).all()) == 3
     finally:
         client.close()
+
+
+def test_a_thinking_model_has_room_and_resume_asks_what_failed_again(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A model that thinks before it answers spends its thinking against the answer's
+    limit. A run stopped by answers that were cut asks them again when resumed."""
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        with repo.sessions.begin() as db:
+            db.add(
+                ProjectReviewBudget(
+                    project_id=data["project"], token_limit=100_000, used=0, reserved=0
+                )
+            )
+        monkeypatch.setattr(parent_choice, "TRIES", 2)
+        limits: list[int] = []
+
+        class Thinking(Model):
+            async def ask(self, question: Question, *, retry: bool) -> Reply:
+                limits.append(question.max_tokens)
+                return await super().ask(question, retry=retry)
+
+        cut = ModelError("cut", "The answer was longer than the 400 tokens it may have.")
+        assert start(client).status_code == 200
+        run(repo, Thinking({42: cut, 45: cut}))
+        current = listing(client)["run"]
+        assert current["state"] == "paused" and current["failed"] == 2
+        assert "2 calls in a row failed" in current["detail"] and "longer than" in current["detail"]
+        # The limit of each question left room for thinking beside the short answer.
+        assert limits and min(limits) > parent_choice.THINKING_ROOM
+
+        resumed = post(client, f"orphans/runs/{current['id']}/control", action="resume")
+        assert resumed.status_code == 200, resumed.text
+        assert (resumed.json()["state"], resumed.json()["failed"]) == ("queued", 0)
+        run(repo, Thinking({42: respond, 45: answer("none")}))
+        ended = listing(client)["run"]
+        assert ended["state"] == "complete"
+        assert (ended["done"], ended["failed"]) == (2, 0)
+    finally:
+        client.close()

@@ -48,6 +48,11 @@ ASKING: Final = ("queued", "running")
 # when every provider was busy.
 LOST: Final = timedelta(minutes=8)
 TRIES: Final = 3
+# A model that thinks before it answers spends that thinking against the limit its
+# answer has, and how much it thinks is its own choice. The limit of a short answer is
+# therefore the answer plus this room: without it such a model is cut before its answer
+# begins, and the call is paid for nothing.
+THINKING_ROOM: Final = 8000
 BUSY_SECONDS: Final = 60.0
 # No inference ran, or the provider turned the question down before answering: nothing
 # was used. Any other failure leaves unknown what the call used.
@@ -382,6 +387,16 @@ def control(
                 raise ProjectConflict("The run is asking already.")
             review_budget.require_available(db, project.id)
             run.state, run.detail = "queued", ""
+            # What failed is asked again with the rest: a run stops after failures in a
+            # row because something was wrong with the asking, not with the records.
+            again = db.scalars(
+                select(ChoiceReview).where(
+                    ChoiceReview.run_id == run.id, ChoiceReview.state == "failed"
+                )
+            ).all()
+            for review in again:
+                review.state, review.detail = "queued", ""
+            run.failed = max(0, run.failed - len(again))
             _TROUBLE.pop(run.id, None)
             _WAIT.pop(run.id, None)
         else:
