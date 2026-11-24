@@ -87,7 +87,9 @@ QUESTION: Final = {
 }
 CLEAR: Final = 1.5
 # How many candidates of each way of ranking the reranker is asked about, for one record.
-CANDIDATES: Final = 15
+# Thirty of each: with fifteen, one right parent in twenty was no candidate at all, and
+# what is no candidate can never be chosen.
+CANDIDATES: Final = 30
 HELD_OUT_ONE_IN: Final = 5
 
 

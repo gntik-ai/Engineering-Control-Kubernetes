@@ -77,6 +77,8 @@ OWN_FROM: Final = 20
 # Fewer known links than this in all projects together: nothing is learned yet.
 LEARN_FROM: Final = 12
 SIBLINGS: Final = 20
+# One candidate left is acted on only once at least this many such cases were measured.
+ACT_FROM: Final = 10
 L2: Final = 1.0
 # Two texts whose vectors lie this close say nearly the same.
 SAME_TEXT: Final = 0.95
@@ -118,6 +120,7 @@ OUTCOMES: Final = {
     "confirmed": "Would record this link as supported",
     "kept": "Would leave this link as it is",
     "unsupported": "Would call this link unsupported",
+    "unsure": "Abstains: one candidate is left, but not surely enough",
     "several": "Abstains: several candidates cannot be ruled out",
     "none": "Abstains: no candidate is good enough",
 }
@@ -249,7 +252,9 @@ def measure(cases: list[_Case], full: bool, only: UUID | None = None) -> dict[st
             if case.fold == fold:
                 scored[place] = model.shares(case.full if full else case.light)
     misses = {place: _miss(case, scored[place]) for place, case in enumerate(known)}
-    first = inside = acted = acted_right = several = none = 0
+    first = inside = several = none = 0
+    # Where one candidate is left: how sure the scorer was, and whether it was right.
+    alone: list[tuple[float, bool]] = []
     for place, case in enumerate(known):
         shares = scored[place]
         others = [miss for other, miss in misses.items() if known[other].fold != case.fold]
@@ -258,25 +263,43 @@ def measure(cases: list[_Case], full: bool, only: UUID | None = None) -> dict[st
         first += best in case.right
         inside += any(case.parents[i] in case.right for i in left)
         if len(left) == 1:
-            acted += 1
-            acted_right += case.parents[left[0]] in case.right
+            alone.append((float(shares[left[0]]), case.parents[left[0]] in case.right))
         elif left:
             several += 1
         else:
             none += 1
     total = len(known)
+    sure = surely(alone, ADD_ERROR)
+    acting = [right for share, right in alone if sure is not None and share >= sure]
     return {
         "children": total,
         "top1": round(first / total, 3),
         "in_set": round(inside / total, 3),
-        "acted": round(acted / total, 3),
-        "acted_right": round(acted_right / acted, 3) if acted else None,
-        "acted_count": acted,
+        "acted": round(len(acting) / total, 3),
+        "acted_right": round(sum(acting) / len(acting), 3) if acting else None,
+        "acted_count": len(acting),
+        "alone": round(len(alone) / total, 3),
         "several": round(several / total, 3),
         "none": round(none / total, 3),
+        # From this share of belief on, one candidate left is acted on; None: never yet.
+        "sure_from": round(sure, 6) if sure is not None else None,
         "misses": [round(miss, 6) for miss in misses.values()],
         "projects": sorted({str(case.project) for case in known}),
     }
+
+
+def surely(alone: list[tuple[float, bool]], error: float) -> float | None:
+    """The share of belief from which a single candidate left is acted on: the lowest
+    one down to which the scorer was wrong at most ``error`` of the time on the known
+    links. None where even its surest cases are too few or too often wrong to show it."""
+    ranked = sorted(alone, key=lambda entry: -entry[0])
+    found = None
+    right = 0
+    for count, (share, was_right) in enumerate(ranked, start=1):
+        right += was_right
+        if count >= ACT_FROM and right / count >= 1.0 - error:
+            found = share
+    return found
 
 
 def _jaccard(one: set[str], other: set[str]) -> float:
@@ -698,7 +721,11 @@ class Scorer:
                 found = local[key]
                 if found is not None:
                     misses = found["misses"]
-                    bounds[key] = (limit(misses, ADD_ERROR), limit(misses, REMOVE_ERROR))
+                    bounds[key] = (
+                        limit(misses, ADD_ERROR),
+                        limit(misses, REMOVE_ERROR),
+                        found.get("sure_from"),
+                    )
             entry["weights"] = {
                 name: round(float(weight), 3)
                 for name, weight in zip(
@@ -715,7 +742,7 @@ class Scorer:
                 full = use_full and case.full is not None and full_model is not None
                 model = full_model if full and full_model else light_model
                 table = case.full if full else case.light
-                add_bound, remove_bound = bounds["full" if full else "light"]
+                add_bound, remove_bound, sure = bounds["full" if full else "light"]
                 shares = model.shares(table)
                 left = kept(shares, add_bound)
                 plausible = {case.parents[i] for i in kept(shares, remove_bound)}
@@ -759,6 +786,12 @@ class Scorer:
                     )
 
                 best = case.parents[left[0]] if left else case.parents[int(numpy.argmax(shares))]
+                # One candidate left is acted on only where the scorer is sure enough.
+                acts_on = (
+                    case.parents[left[0]]
+                    if len(left) == 1 and sure is not None and float(shares[left[0]]) >= sure
+                    else None
+                )
                 if kind == ISSUE_STORY and case.linked:
                     for parent in case.linked:
                         if parent not in case.parents:
@@ -767,18 +800,26 @@ class Scorer:
                             "unsupported"
                             if parent not in plausible
                             else "confirmed"
-                            if len(left) == 1 and case.parents[left[0]] == parent
+                            if acts_on == parent
                             else "kept"
                         )
                         would[outcome] += 1
                         decisions.append(said(parent, outcome))
                     continue
                 acts = "place" if kind == ISSUE_STORY else "primary"
-                outcome = acts if len(left) == 1 else "several" if left else "none"
+                outcome = (
+                    acts
+                    if acts_on is not None
+                    else "unsure"
+                    if len(left) == 1
+                    else "several"
+                    if left
+                    else "none"
+                )
                 would[outcome] += 1
                 decisions.append(said(best, outcome))
             entry["would"] = dict(would)
-            abstained = would["several"] + would["none"]
+            abstained = would["unsure"] + would["several"] + would["none"]
             entry["to_decide"] = abstained
             entry["tokens_likely"] = abstained * TOKENS_A_QUESTION
         return {

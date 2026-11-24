@@ -16,6 +16,7 @@ from engineering_control.dashboard.scorer import (
     kept,
     limit,
     measure,
+    surely,
 )
 from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.db.models import (
@@ -54,6 +55,18 @@ def test_the_bound_keeps_what_cannot_be_ruled_out() -> None:
     assert kept(shares, 0.85) == [1, 2]
     assert kept(shares, 0.1) == []
     assert kept(shares, 1.0) == [1, 2, 0]
+
+
+def test_one_candidate_left_is_acted_on_only_where_that_was_shown_to_be_right() -> None:
+    right = [(0.9 - 0.01 * place, True) for place in range(12)]
+    wrong = [(0.5, False), (0.4, False)]
+    # Down to the twelfth it was always right; the next two would make it wrong too often.
+    assert surely([*right, *wrong, (0.3, True)], 0.05) == right[-1][0]
+    # Too few cases show nothing, however right they were.
+    assert surely(right[:9], 0.05) is None
+    # One slip among many right ones stays within the error.
+    assert surely([(0.95, False), *[(0.8, True)] * 30], 0.05) == 0.8
+    assert surely([], 0.05) is None
 
 
 def _cases(count: int, noise: float, seed_: int) -> list[_Case]:

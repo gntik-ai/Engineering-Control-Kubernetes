@@ -1849,7 +1849,7 @@ def create_app(
         request: Request,
         kind: Literal["", "issue_story", "story_epic"] = "",
         outcome: Literal[
-            "", "place", "primary", "confirmed", "kept", "unsupported", "several", "none"
+            "", "place", "primary", "confirmed", "kept", "unsupported", "unsure", "several", "none"
         ] = "",
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),

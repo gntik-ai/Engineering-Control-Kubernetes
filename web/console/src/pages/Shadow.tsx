@@ -66,7 +66,7 @@ const KIND: Record<Kind, string> = {
 const MODEL = { light: 'Words and meaning', full: 'Words, meaning and the reranker' } as const;
 const RECORD = { issue: 'Issues', story: 'User Stories', epic: 'Epics' } as const;
 /** The outcomes in the order they are shown, and whether the scorer would act. */
-const ORDER = ['place', 'primary', 'confirmed', 'kept', 'unsupported', 'several', 'none'] as const;
+const ORDER = ['place', 'primary', 'confirmed', 'kept', 'unsupported', 'unsure', 'several', 'none'] as const;
 const ACTS = new Set(['place', 'primary', 'confirmed', 'unsupported']);
 const percent = (value: number | null | undefined) =>
   value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`;
@@ -108,9 +108,10 @@ export function Shadow({ project }: { project: string }) {
             <p className="text-sm text-muted-foreground">
               No way of ranking above is good enough alone, so the scorer learns one judgment from all of them, from the
               links known to be right in every project. It keeps each candidate it cannot rule out
-              {data.errors ? ` at an error of ${percent(data.errors.add)}` : ''}: with one left it would act, with
-              several or none it abstains and the case goes on to a decision model or to you. This is shadow mode: it
-              has changed nothing and proposes nothing yet. Bugs are left out.
+              {data.errors ? ` at an error of ${percent(data.errors.add)}` : ''}: with one left, and where it was
+              measured to be right often enough when that sure, it would act; otherwise it abstains and the case goes on
+              to a decision model or to you. This is shadow mode: it has changed nothing and proposes nothing yet. Bugs
+              are left out.
               {data.computed_at ? ` Computed ${new Date(data.computed_at).toLocaleString('en')}.` : ''}
             </p>
             {!data.ready && !data.kinds ? <p className="text-sm text-foreground">{data.why}</p> : null}
@@ -160,7 +161,7 @@ export function Shadow({ project }: { project: string }) {
                                 {percent(row.acted_right)}
                                 {row.acted_right === null ? '' : ` of ${whole(row.acted_count)}`}
                               </td>
-                              <td className="py-2 text-end tabular-nums">{percent(row.several + row.none)}</td>
+                              <td className="py-2 text-end tabular-nums">{percent(1 - row.acted)}</td>
                             </tr>
                           ))}
                         </tbody>
