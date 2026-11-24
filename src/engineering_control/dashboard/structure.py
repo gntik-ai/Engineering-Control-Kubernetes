@@ -12,8 +12,8 @@ edit or dismiss. Nothing is created without that word.
   the largest would become an Epic of its own.
 - **Missing User Stories.** Issues that belong to no Story, and that the scorer gives no
   existing Story a real share for, are grouped: issues that lie as close to one of them
-  as an issue typically lies to its Story. Each group of three or more with an open issue
-  is proposed as a User Story, worded from its issues and placed under the Epic closest
+  as two issues under the same Story typically lie. Each group of three to twelve with an
+  open issue is proposed as a User Story, worded from its issues and placed under the Epic closest
   to it. The wording is provisional: it is the administrator's to change before approving.
 
 Groups are found from vectors and are the same each time for the same plan. A bug is no
@@ -64,6 +64,10 @@ BROAD_FROM: Final = 20
 PART_MIN: Final = 5
 # A missing Story is proposed from at least this many issues.
 GROUP_MIN: Final = 3
+# And from no more than this many: a larger group is not one Story. Each stricter look
+# at a group that is too large asks for this much more closeness.
+GROUP_MAX: Final = 12
+TIGHTER: Final = 0.02
 LISTED: Final = 12
 PREFIX: Final = re.compile(
     r"^\s*(?:\[[^\]]{1,30}\]|[A-Za-z][\w -]{0,24}(?:\([^)]{0,60}\))?\s*:)\s*"
@@ -106,6 +110,42 @@ def groups(
         left -= set(members)
         found.append([have[place], *(have[other] for other in members if other != place)])
     return found
+
+
+def story_sized(
+    keys: list[UUID],
+    vectors: dict[tuple[str, UUID], Any],
+    kind: str,
+    bound: float,
+    depth: int = 0,
+) -> list[list[UUID]]:
+    """Groups no larger than a User Story holds: a group that is too large is looked at
+    again more strictly, until its parts are small enough. What then lies close to
+    nothing is left out."""
+    found: list[list[UUID]] = []
+    for group in groups(keys, vectors, kind, bound):
+        if len(group) > GROUP_MAX and depth < 12:
+            found.extend(story_sized(group, vectors, kind, bound + TIGHTER, depth + 1))
+        elif len(group) <= GROUP_MAX:
+            found.append(group)
+    return found
+
+
+def siblings_bound(plan: Any, vectors: dict[tuple[str, UUID], Any]) -> float | None:
+    """How close two issues under the same User Story typically lie: the measure for
+    issues that would share a Story. None where too few are linked to say."""
+    under: dict[UUID, list[UUID]] = defaultdict(list)
+    for issue, links in plan.issue_links.items():
+        if ("issue", issue) in vectors:
+            for story, _origin, _primary in links:
+                under[story].append(issue)
+    found = []
+    for story in sorted(under, key=str):
+        mine = sorted(under[story], key=str)[:8]
+        for place, one in enumerate(mine):
+            for other in mine[place + 1 :]:
+                found.append(float(vectors["issue", one] @ vectors["issue", other]))
+    return float(numpy.median(found)) if len(found) >= 10 else None
 
 
 def parts(keys: list[UUID], vectors: dict[tuple[str, UUID], Any]) -> list[list[UUID]]:
@@ -282,7 +322,10 @@ def survey(db: Session, project: ProjectRecord) -> dict[str, Any]:
     epic_table = numpy.stack([vectors["epic", key] for key in epic_keys]) if epic_keys else None
     stories = []
     closed_groups = 0
-    for group in groups(unplaced, vectors, "issue", bound):
+    # Issues are more alike among themselves than an issue is like a Story: what would
+    # share a Story is held to how close issues under one Story lie.
+    grouped_from = max(bound, siblings_bound(plan, vectors) or bound)
+    for group in story_sized(unplaced, vectors, "issue", grouped_from):
         if all(states.get(key) == "closed" for key in group):
             # Work that was done and closed with no Story: nothing to plan from it.
             closed_groups += 1
@@ -354,6 +397,7 @@ def survey(db: Session, project: ProjectRecord) -> dict[str, Any]:
         "uncovered": sorted(uncovered, key=lambda entry: entry["path"])[:LISTED],
         "uncovered_count": len(uncovered),
         "close_from": round(bound, 3),
+        "group_from": round(grouped_from, 3),
         "broad_share": BROAD_SHARE,
     }
 

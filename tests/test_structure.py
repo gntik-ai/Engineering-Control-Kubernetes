@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 
 from engineering_control.dashboard import ranking
-from engineering_control.dashboard.structure import groups, parts, plain_title
+from engineering_control.dashboard.structure import groups, parts, plain_title, story_sized
 from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.db.models import (
     BacklogItem,
@@ -52,6 +52,18 @@ def test_a_title_loses_its_labels_and_groups_are_the_same_each_time() -> None:
     assert set(found) == set(keys[:3])
     assert groups(keys, vectors, "issue", 0.9) == [found]
     assert groups(keys[3:], vectors, "issue", 0.9) == []
+
+    # A group too large for one Story is looked at more strictly until its parts are
+    # small enough: here two tight halves of a loose whole.
+    many = [uuid4() for _ in range(20)]
+    loose = {
+        ("issue", key): unit(1, 0.01 * place, 0) if place < 10 else unit(1, 0.01 * place, 0.5)
+        for place, key in enumerate(many)
+    }
+    assert [len(group) for group in groups(many, loose, "issue", 0.85)] == [20]
+    halves = story_sized(many, loose, "issue", 0.85)
+    assert sorted(map(len, halves)) == [10, 10]
+    assert {frozenset(group) for group in halves} == {frozenset(many[:10]), frozenset(many[10:])}
 
     stories = [uuid4() for _ in range(14)]
     apart = {
