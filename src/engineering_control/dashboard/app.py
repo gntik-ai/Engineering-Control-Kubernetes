@@ -38,6 +38,7 @@ from engineering_control.dashboard import (
     review_budget,
     review_evidence,
     review_flows,
+    scorer,
     signals,
     stats,
 )
@@ -535,6 +536,8 @@ def create_app(
                         signals.worker(resolved_repository.signals, Ranker(resolved.ranker_url))
                     )
                 )
+                # The scorer, in shadow mode: computed again when what it reads changed.
+                keepers.append(asyncio.create_task(scorer.worker(resolved_repository.scorer)))
             if resolved_github is not None:
                 # The documentation of each project is read when its branch moved.
                 keepers.append(
@@ -1833,6 +1836,28 @@ def create_app(
         """What is known to be true in the project and how well each way of finding a
         parent does against it."""
         return await documents_read(request, lambda: repo(request).signals.report(name))
+
+    @app.get("/api/dashboard/projects/{name}/scorer")
+    async def scorer_api(name: str, request: Request) -> Response:
+        """What the scorer learned, how it measures and what it would do. It does none
+        of it: shadow mode."""
+        return await documents_read(request, lambda: repo(request).scorer.report(name))
+
+    @app.get("/api/dashboard/projects/{name}/scorer/decisions")
+    async def scorer_decisions_api(
+        name: str,
+        request: Request,
+        kind: Literal["", "issue_story", "story_epic"] = "",
+        outcome: Literal[
+            "", "place", "primary", "confirmed", "kept", "unsupported", "several", "none"
+        ] = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """What the scorer would do with each record, the surest first."""
+        return await documents_read(
+            request, lambda: repo(request).scorer.decisions(name, kind, outcome, page, page_size)
+        )
 
     @app.get("/api/dashboard/projects/{name}/labels/next")
     async def labels_next_api(name: str, request: Request, after: UUID | None = None) -> Response:

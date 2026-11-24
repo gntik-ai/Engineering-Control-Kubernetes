@@ -28,6 +28,7 @@ from engineering_control.dashboard.primary_epics import PrimaryEpics
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.schemas import ActivityEventInput
+from engineering_control.dashboard.scorer import Scorer
 from engineering_control.dashboard.session_store import (
     SessionAuthorization,
     lock_authentication,
@@ -126,6 +127,8 @@ class DashboardRepository:
         self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
         self.documents = DocInventory(self.sessions)
         self.signals = Signals(self.sessions, self.planning_links)
+        self.scorer = Scorer(self.sessions, self.planning_links)
+        self.signals.wanted_for_all = self.scorer.uses_reranker
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

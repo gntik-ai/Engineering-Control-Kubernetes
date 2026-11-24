@@ -244,7 +244,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R3 | Consolidate the existing plan. | A primary Epic for each User Story under several, chosen by approval in bulk; Epics counted by their primary Stories; a missing Story drafted from an answer; finished Stories listed. Merging Stories and splitting an Epic were measured and found unnecessary. |
 | R4 | Documentation inventory with history and diff. | A scan is kept per commit, and added, modified and deleted documents are listed between two scans without a model call. |
 | R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
-| R6 | Scorer in shadow mode: a calibrated classifier that abstains, with escalation to decision models. | A report of every change it would make, with precision per kind of change measured on held-out cases. Nothing is changed. |
+| R6 | Scorer in shadow mode: one learned judgment from all signals that abstains where it cannot rule the other candidates out. Asking decision models about what it abstains on moved to R7, since it spends money. | A report of every change it would make, with how often it is right when it would act, measured on known links it never saw. Nothing is changed. |
 | R7 | Reorganize links: batches to approve for reasons recorded, primary Epics chosen, unsupported links removed, orphans placed. | A sample before each batch and undo of a batch; sampled precision within the allowed error rate. Nothing is applied without approval. |
 | R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are offered as a batch to close; every Story shows its state with its evidence. |
 | R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
@@ -395,6 +395,16 @@ The pairs of one Epic in five are held out: they are only tested on, never learn
 The console keeps what the service said: a vector for every Epic, User Story and issue (`record_vectors`), and a score for each candidate parent of the records that are measured or judged (`pair_scores`, migration 0076). A text is sent once; it is sent again only when it or the model changed. A line that names a record's parent, and identifiers, are taken out of the text first. The measurement then has four rows: shared words; meaning; the two joined by rank; and the reranker on the first fifteen candidates of each. Neither a vector nor a score decides anything: they are signals that the next phase combines.
 
 `GET /api/dashboard/projects/{name}/signals` returns the measurement and the state of the ranking service; `POST …/labels/draw` draws the pairs; `GET …/labels/next` returns the next pair with both texts; `POST …/labels/{id}` records a judgment. The pairs are kept in `gold_pairs` (migration 0075).
+
+### The scorer, in shadow mode
+
+**Reviews → Reorganize** also shows what the scorer would do. The scorer combines every signal measured above into one judgment, learned from the links known to be right in all projects, and says for each record whether one candidate parent is left that it cannot rule out (it would act) or several or none (it abstains). The method, the signals and the error rates are in [planning-reorganization.md](planning-reorganization.md#the-scorer-r6).
+
+It is computed in the console's process by a keeper that looks every two minutes whether anything it reads has changed, and computes at most every five. It reads the plan while holding no lock and writes only `scorer_reports` and `scorer_decisions` (migration 0077). Nothing reads those tables to change the plan: there is no route that applies a decision.
+
+`GET /api/dashboard/projects/{name}/scorer` returns what it learned from, the measurement, the weights, the counts of what it would do and the first count for the clean-up. `GET …/scorer/decisions?kind=&outcome=&page=` lists the records it speaks of, the surest first, each with the parent, the share of belief and the signals.
+
+The ranking service scores the candidates of every record, not only of the measured ones, where the scorer's measurement shows that the reranker's signals help (`Signals.wanted_for_all`), about 400 pairs a pass.
 
 ### A review run that was cut off
 

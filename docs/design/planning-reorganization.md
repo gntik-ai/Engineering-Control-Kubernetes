@@ -192,6 +192,29 @@ What this says, and what it changes in the plan:
 
 An instruction-following reranker or a small language model on the graphics card, asked the real question (does this issue implement part of this Story?), is the candidate that could replace the paid decision model for most cases. It is to be measured on the labelled set once that exists, not assumed.
 
+## The scorer (R6)
+
+**What it learns from.** Every link whose truth is known: stated in a record's own text, chosen by the administrator, or judged as a pair. A pair judged "no" is a known wrong link. All projects are learned from together, because the signals are relative (a place in a ranking, a share of the best score) and one project may have little truth of its own. Bugs are left out.
+
+**Signals.** For each candidate parent of a record: shared words as a share of the best candidate's, and its place by words; closeness of meaning, the distance from the closest candidate, and its place by meaning; the words the two titles share; how close the record lies to the parent's other children; whether it stands among the first by both words and meaning (for an issue) or the share of all Stories the Epic holds (for a Story's Epic); and, where the reranker has scored every candidate, its score, the distance from its best, and whether it is its first choice.
+
+**The model.** A logistic regression with a penalty on large weights, fitted by Newton's method in the console's own process: no service, no cost, and the weights can be read on the page. Each candidate gets a share of belief that it is the parent; what is left of one is the belief that none of them is.
+
+**Knowing when it does not know.** From the known links, each scored by a model that never saw it or any record of its Epic (five folds, by Epic), the scorer takes how far a right parent's share fell short of certainty. The bound at an error of 5% is the distance within which 95% of right parents lie (split conformal prediction). For a new record every candidate within the bound is kept. One kept: it would act. Several or none: it abstains. An existing link is called unsupported only when its parent falls outside the stricter bound of 2%.
+
+| Error | Used for |
+| --- | --- |
+| 5% | Placing an issue under a Story; choosing a primary Epic; recording an existing link as supported |
+| 2% | Calling an existing link unsupported |
+
+**What it reports** (Reviews → Reorganize, "What the scorer would do"): per kind of link, how many known links it learned from here and elsewhere; measured on this project's own links when it has at least 20, otherwise on all projects together and marked as not yet shown to hold here; how often the right parent is first, is kept, how often it would act and how often it is right when it does; the signals it leans on; and of every record what it would do, the surest first. It also counts the cases that would go on to a decision model, with what they would cost at the price of a question so far.
+
+**The reranker pays its way or is not asked.** Scoring every candidate of every record takes hours on a large project. The scorer is measured with and without the reranker's signals; only where they are measured to help does the ranking service go on to score every record. Until then it scores the measured ones only.
+
+**Where the clean-up will look.** A first count, by reason, of records that one reason speaks against: an issue or a Story that says nearly the same as another, a Story every issue of which was closed as not planned, an Epic no Story has as its primary. One reason never proposes a removal (see above); the count only shows the size of what R9 will examine.
+
+**Shadow mode.** The scorer writes only its own two tables (`scorer_reports`, `scorer_decisions`, migration 0077). No link is made, removed or proposed from them. R7 turns what it would do into batches to approve.
+
 ## Revised plan
 
 R0 to R3 are done and deployed. Their worklists stay: they become the place where the cases the cascade abstains on are decided, and where its batches are approved.
@@ -200,7 +223,7 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | --- | --- | --- |
 | R4 | Documentation inventory (server side built, console page pending). Extended: reads the state of OpenSpec changes (proposed, in progress, archived), extracts identifiers from documents, issues and Stories, and keeps which sections were deleted or rewritten, as evidence for removals. | Every project's documents are listed with what changed since the last reading; identifiers join issues, changes and Stories where they exist. |
 | R5 | Signals. The measurement of each way of ranking against known truth, and the pairs to judge (built). Ranking service with an embedding model and a reranker; vectors kept per record and refreshed when its text changes. | The true parent is among the top 20 candidates for at least 95% (met by words alone: 99%). Every way of ranking is shown beside word matching on the same known links. The earlier target of 85% first by a reranker alone is dropped: see the first measurements. |
-| R6 | Scorer in shadow mode. Calibrated classifier over all signals (82% first in the first measurement), abstention thresholds, escalation to the decision models, and a trial of a local model on the graphics card as the decision model. A report per project of every change it would make, with measured precision per kind of change, and a first count of the records it would propose for removal, by reason. | Precision on the held-out set meets the error rates above; the share of abstentions is under one in five. Nothing is changed yet. |
+| R6 | Scorer in shadow mode (built, 24 November 2026). One learned judgment from all signals; a bound per error rate that says which candidates cannot be ruled out; a report per project of what it would do with every record, and a first count of where the clean-up will look. The reranker is asked about every record only where it is measured to help. Not in R6 after all, and moved to R7 with the batches: asking a decision model about the cases the scorer abstains on, which spends money and so starts on your word; and the trial of a local model on the graphics card, which waits until a workload in the cluster is shown to reach the card. | The scorer is measured on known links it never saw, per project where there are enough. Where it would act it is right at least as often as the chosen error allows; how often it abstains is reported, not assumed. Nothing is changed. |
 | R7 | Reorganize links. Batches to approve: reasons recorded, primary Epics chosen, unsupported links removed, orphans placed, bugs marked. A sample before each batch, undo of a batch, Planning health redefined. | Falcone, once its batches are approved: links without a reason under 50; every Story has a chosen primary Epic; open orphans under 10; the sampled precision within the allowed error rate. |
 | R8 | Reorganize Stories. Delivery state for every Story from issues, OpenSpec, documents and code summaries. Delivered Stories offered as a batch to close. | Every Story has a state with its evidence; "Stories that nothing supports" and "delivered Stories still open" are followed in Planning health. |
 | R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |
@@ -213,3 +236,7 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 1. **Approval always.** Nothing is applied without the administrator's word; the cascade prepares batches and plans.
 2. **The ranking models run in the cluster, with open models.** The node has 32 GB of memory and a graphics card with 6 GB, which is enough for an embedding model and a reranker of the base size on the card, and for larger ones on the CPU.
 3. **A labelled set of about 150 pairs** will be judged once by the administrator.
+
+## Decisions (24 November 2026)
+
+1. **A bug is no part of the plan.** It has no User Story and no Epic, is listed on its own tab and is left out of every stage of the cascade. A link a bug still carries is taken off on approval.

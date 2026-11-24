@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
+import { Shadow } from './Shadow';
 
 /** How well one way of finding a parent does against the parents that are known. */
 interface Method {
@@ -312,6 +313,7 @@ export function Reorganize({ project }: { project: string }) {
         </CardBody>
       </Card>
       <Judge project={project} onJudged={report.reload} />
+      <Shadow project={project} />
     </>
   );
 }

@@ -1118,6 +1118,42 @@ class PairScore(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class ScorerReport(UUIDPrimaryKey, Timestamps, Base):
+    """What the scorer learned and measured for a project, and what it would do, as it
+    was last computed (migration 0077). Shadow mode: a report, never a change."""
+
+    __tablename__ = "scorer_reports"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), unique=True
+    )
+    # A mark of everything the scorer read; it is computed again when the mark changes.
+    state: Mapped[str] = mapped_column(String(64))
+    report: Mapped[dict[str, Any]] = mapped_column(JSON)
+    computed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ScorerDecision(UUIDPrimaryKey, Timestamps, Base):
+    """What the scorer would do with one planning record, were it allowed to (migration
+    0077): place an issue, choose a primary Epic, support or doubt a link, or abstain.
+    Written anew each time the scorer is computed; nothing reads it to change the plan."""
+
+    __tablename__ = "scorer_decisions"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # issue_story or story_epic.
+    kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    # The parent it speaks of: the one it would choose, or the likeliest where it abstains.
+    parent_id: Mapped[UUID | None] = mapped_column(Uuid)
+    outcome: Mapped[str] = mapped_column(String(16), index=True)
+    # The share of belief the scorer gives that parent, between 0 and 1.
+    confidence: Mapped[float] = mapped_column(Float)
+    # Whether the reranker's signals were used: full, or light without them.
+    model: Mapped[str] = mapped_column(String(8))
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

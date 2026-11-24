@@ -19,6 +19,7 @@ import hashlib
 import logging
 import math
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -337,6 +338,14 @@ class Signals:
         self.links = links
         # What the ranking service last said of itself; None where there is no service.
         self.ranker: dict[str, Any] | None = None
+        # Whether the reranker's score is wanted for every record of a project and kind,
+        # not only for the measured ones: the scorer says so where the score was measured
+        # to help. Scoring everything takes hours on a large project, so it is not done
+        # on a guess.
+        self.wanted_for_all: Callable[[UUID, str], bool] | None = None
+        # Records all of whose candidates are scored, so that a pass does not rank them
+        # again: by project, kind, record and the digest of its text.
+        self._settled: set[tuple[UUID, str, UUID, str]] = set()
 
     def _ranked(
         self, db: Session, project: UUID, plan: _Plan, known: dict[str, dict[UUID, set[UUID]]]
@@ -461,10 +470,12 @@ class Signals:
                 ranking.keep_vector(db, project, kind, record, model, wanted, vector)
 
     def _pairs_due(
-        self, name: str, embedding: str, reranker: str
+        self, name: str, embedding: str, reranker: str, limit: int = 400
     ) -> list[tuple[UUID, str, UUID, str, list[tuple[UUID, str, str]]]]:
         """For each record that is measured or judged, the candidate parents the reranker
-        has not scored yet: the record's text, and each parent with its text."""
+        has not scored yet: the record's text, and each parent with its text. Where the
+        scorer uses the reranker's score, every record a parent is looked for follows,
+        the measured ones first. About ``limit`` pairs, so that a pass stays short."""
         self.links.reconcile_project(name)
         with self.sessions() as db:
             project = active_project(db, name)
@@ -480,13 +491,29 @@ class Signals:
             for pair in db.scalars(select(GoldPair).where(GoldPair.project_id == project.id)):
                 drawn[pair.kind][pair.child_id].add(pair.parent_id)
             due = []
+            found = 0
             for kind, child_kind, parent_kind in (
                 (ISSUE_STORY, "issue", "story"),
                 (STORY_EPIC, "story", "epic"),
             ):
                 children = plan.issues if kind == ISSUE_STORY else plan.stories
-                for child in sorted({*known[kind], *drawn[kind]}, key=str):
+                first = sorted({*known[kind], *drawn[kind]}, key=str)
+                rest: list[UUID] = []
+                if self.wanted_for_all is not None and self.wanted_for_all(project.id, kind):
+                    asked = set(first)
+                    rest = [
+                        child
+                        for child in sorted(children, key=str)
+                        if child not in asked
+                        and (kind == ISSUE_STORY or len(plan.own_epics(child)) > 1)
+                    ]
+                for child in [*first, *rest]:
+                    if found >= limit:
+                        break
                     if child not in children:
+                        continue
+                    settled = (project.id, kind, child, digest_of(texts[child_kind, child]))
+                    if settled in self._settled:
                         continue
                     if kind == ISSUE_STORY:
                         words = [parent for parent, _score in plan.by_words(child)]
@@ -497,10 +524,16 @@ class Signals:
                     if close is None:
                         # Its vector is not there yet: it is scored on a later pass.
                         continue
+                    # A link whose truth is not known is scored too, wherever it stands.
+                    linked = (
+                        [parent for parent, _o, _p in plan.issue_links.get(child, [])]
+                        if kind == ISSUE_STORY and child not in known[kind]
+                        else []
+                    )
                     wanted = [
                         parent
                         for parent in dict.fromkeys(
-                            [*_candidates(words, close), *drawn[kind][child]]
+                            [*_candidates(words, close), *drawn[kind][child], *linked]
                         )
                         if (parent_kind, parent) in texts
                     ]
@@ -512,6 +545,9 @@ class Signals:
                             missing.append((parent, texts[parent_kind, parent], both))
                     if missing:
                         due.append((project.id, kind, child, texts[child_kind, child], missing))
+                        found += len(missing)
+                    elif len(self._settled) < 200_000:
+                        self._settled.add(settled)
             return due
 
     def _keep_scores(
