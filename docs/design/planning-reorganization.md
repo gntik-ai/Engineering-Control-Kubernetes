@@ -294,6 +294,29 @@ One state per open Story, worked out again whenever the scorer is. Only what is 
 
 **Documents.** The documents that lie close to no open Story are counted and the first are listed. Nothing is proposed from them yet: a file may be no plan at all, and wording a Story from one needs a language model.
 
+## Continuous and everywhere (R11)
+
+**What runs by itself, and how soon.**
+
+| Step | By | How soon |
+| --- | --- | --- |
+| Issues read from GitHub | the backlog sync | every 15 minutes |
+| Documents read when the branch moved | the documentation inventory | checked every 15 minutes |
+| A vector for a new or changed record | the ranking service | within 2 minutes of the record |
+| The scorer, then the Stories' states | their keeper | looked at every 2 minutes, worked out at most every 5 |
+| Clean-up and structure | on reading | at once |
+| Everything again, whatever changed, and the day's health | the daily refresh | once a day, after 02:00 UTC |
+
+So an issue opened on GitHub is, within about twenty minutes and without anyone asking, either flagged as a bug, shown with its closest User Story in the worklist, or in a batch to approve. Nothing is linked by that: approval always.
+
+**The trail.** Reviews → Reorganize opens with "Where this project stands": the next steps in order, what moved since the day before, and the issues that arrived in the last two weeks, each with where it stands: a bug, under a Story (and who linked it), in a batch, waiting with its closest Story, or not yet read or scored.
+
+**Drift.** Planning health is measured every day. The latest measurement is compared with the one before, for the numbers that should not grow: changes waiting, records proposed for closing, proposals for the structure, open issues with no Story, issues that fit no Story, delivered Stories still open, Stories with unlinked work, Stories with nothing behind them, bugs still linked, records the scorer abstains on. The chat's daily digest gets one line for each project where something waits or moved.
+
+**Every project.** The Administrator Console lists all projects: whether each has a plan, what the ranking service has read, what the scorer is sure of, the pairs judged, and the next steps. Thresholds are each project's own once it has twenty known links of a kind; until then the measurement of all projects together stands in and the row says to judge the pairs.
+
+**A project with no plan.** Musematic, llmwiki, gntik-ui and falcone-workflow have no Epics and no User Stories. The cascade organizes a plan; it does not write one. Their documents are read and have vectors, so that Discovery, when it is run for them, starts from the inventory; until then there is nothing to reorganize.
+
 ## Revised plan
 
 R0 to R3 are done and deployed. Their worklists stay: they become the place where the cases the cascade abstains on are decided, and where its batches are approved.
@@ -307,7 +330,7 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | R8 | Reorganize Stories (built, 24 November 2026). Every open Story has a delivery state from its issues, the OpenSpec changes of those issues, issues with no Story that look like its work, and the repository's documents. Delivered Stories are a batch to close. Code summaries are not read yet: no state depends on them so far. | Every Story has a state with its evidence; "Stories that nothing supports", "delivered Stories still open" and "Stories whose work is not linked" are followed in Planning health. |
 | R9 | Clean-up (built, 24 November 2026). Records that reasons speak against are found among User Stories, Epics and open issues; a record is proposed for closing on two reasons of different kinds or an exact one. A run that asks a model about the Stories nothing supports gives the second reason, or withdraws the Story. Proposed Stories and Epics are batches to authorize, with sample and undo. Proposed issues are closed on GitHub by their own batch, as not planned and with a comment that gives the reasons. | Every proposal shows its reasons and evidence; nothing is closed without authorization; a closed Story or Epic can be reopened by undoing the batch; an issue is reopened on GitHub. |
 | R10 | Reorganize structure (built, 24 November 2026). A report of how each Epic holds together; a split proposed for an Epic that is the primary Epic of more than 10% of the Stories; User Stories proposed from groups of issues that fit no Story. Each proposal is worded provisionally, edited and approved or set aside by the administrator. Not built: Stories proposed from documents no Story covers (they are counted and listed), and wording by a language model. | Each proposal can be edited, approved or set aside; what is set aside is not made again; an Epic above 10% has a split to approve. |
-| R11 | Continuous and everywhere. A new issue or a changed document goes through the cascade when it arrives; a nightly check for drift, which also refreshes the clean-up plan as the repository changes; rollout to the other projects, including those never through Discovery. Replaces the earlier R7. | A new issue is placed, or queued with its shortlist, within minutes; each project has its own thresholds and its health follows the same numbers. |
+| R11 | Continuous and everywhere (built, 24 November 2026). The pieces already ran by themselves; this adds what makes that visible and dependable: one table of every project with its next step, a trail of the issues that arrived with where the cascade put each, a daily refresh of everything with the drift since the day before, and that drift in the chat's daily digest. A project that was never through Discovery has no plan to reorganize: its row says so and points to Discovery. | A new issue is read, scored and shown with its closest Story within minutes, without anyone asking; each project is measured on its own links once it has them, and has its own row with what waits. |
 | R12 | Epic pages written by the platform from the organized plan. The earlier R6, now last because it reads better from a plan that is in order. | Each Epic has a page that cites its Stories, issues and documents. |
 
 ## Decisions (23 November 2026)

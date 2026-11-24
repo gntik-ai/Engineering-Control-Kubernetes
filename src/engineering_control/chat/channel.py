@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.planning_drift import digest_lines
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -387,6 +388,8 @@ class ChatChannel:
             lines.append("Supervisor: not asked.")
         if limited:
             lines.append(f"Accounts that cannot work right now: {', '.join(limited)}.")
+        # What waits in each project's planning, and what moved there since the day before.
+        lines.extend(digest_lines(self.sessions))
         waiting = [
             entry
             for entry in self.toolbox.inbox_entries()

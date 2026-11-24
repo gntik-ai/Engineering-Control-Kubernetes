@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
+import { Arrivals } from './Arrivals';
 import { ChangeBatches } from './ChangeBatches';
 import { Cleanup } from './Cleanup';
 import { Shadow } from './Shadow';
@@ -248,6 +249,7 @@ export function Reorganize({ project }: { project: string }) {
   const data = report.data;
   return (
     <>
+      <Arrivals project={project} />
       <ChangeBatches project={project} />
       <Cleanup project={project} />
       <Structure project={project} />

@@ -249,7 +249,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R8 | Reorganize Stories: a delivery state for every open Story from its issues, OpenSpec changes, similar unlinked issues and documents; delivered Stories as a batch to close. | Every Story has a state with its evidence, followed in Planning health. |
 | R9 | Clean-up: records that reasons speak against, proposed for closing on two reasons of different kinds or an exact one; a model's check of the unsupported Stories; Stories and Epics closed by batches to authorize. | Every proposal shows its reasons; nothing is closed without authorization; issues are closed on GitHub as not planned, with a comment. |
 | R10 | Reorganize structure: how each Epic holds together, splits of Epics that hold more than 10% of the Stories, and User Stories proposed from groups of issues that fit none. | Each proposal can be edited, approved or set aside; what is set aside is not made again. |
-| R11 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; the clean-up plan follows the repository; each project follows the same numbers. |
+| R11 | Continuous and everywhere: one table of every project with its next step, the trail of issues that arrived, a daily refresh with the drift since the day before, and that drift in the daily digest. | A new issue is read, scored and shown with its closest Story within minutes; a project with no plan says so. |
 | R12 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
 
 R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
@@ -437,6 +437,12 @@ What is proposed appears as the batch kinds `retire_stories`, `retire_epics` and
 **Reviews → Reorganize** ends with "Structure": how each Epic holds together, the Epics proposed to be split, the User Stories that are missing, and the documents no Story covers. The rules are in [planning-reorganization.md](planning-reorganization.md#the-structure-of-the-plan-r10).
 
 `GET /api/dashboard/projects/{name}/structure` returns the report and the proposals. `POST …/structure/stories/{proposal}` makes a proposed User Story with the title, description and Epic sent, and links its issues; `POST …/structure/splits/{proposal}` splits an Epic with the titles sent; `POST …/structure/{proposal}/dismiss` sets a proposal aside. Decisions are kept in `structure_decisions` (migration 0081). A Story is made through `PlanningRecords.save`, its issues linked through `link_stories` and recorded as found by the scorer and approved by the administrator.
+
+### Across projects, and as records arrive
+
+`GET /api/dashboard/rollout` returns one row for every project: whether it has a plan, what the ranking service has read, what the scorer is sure of and abstains on, the pairs judged, what moved since the day before, and the next steps in order. The Administrator Console shows it as "Planning across projects". `GET …/projects/{name}/rollout` is one project's row and `GET …/projects/{name}/arrivals?days=` the issues that arrived lately with where each stands; both are the first card of **Reviews → Reorganize**.
+
+`keep_reorganization_fresh` works the scorer, the Stories' states and every planned project's health out again once a day after 02:00 UTC. `planning_drift.drift` compares a project's latest two measurements, and `digest_lines` gives the chat channel's daily digest a line for each project where something waits or moved. Planning health now also keeps `changes_ready`, `structure_proposals` and `issues_unplaced`.
 
 ### A review run that was cut off
 

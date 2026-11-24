@@ -12,7 +12,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal, cast
 from urllib.parse import parse_qs, urlsplit
@@ -461,6 +461,24 @@ def create_app(
                 log_failure("planning-health", "Planning health could not be measured", error)
             await asyncio.sleep(3600)
 
+    async def keep_reorganization_fresh(records: DashboardRepository) -> None:
+        """Once a day, whatever changed or did not: the scorer, the Stories' states and
+        every planned project's health are worked out again, so that the day's numbers
+        stand beside the day before's and drift shows."""
+        done: date | None = None
+        while True:
+            now = datetime.now(UTC)
+            if done != now.date() and now.hour >= 2:
+                try:
+                    await asyncio.to_thread(records.scorer.refresh, force=True)
+                    for name in await asyncio.to_thread(records.planning_health.planned):
+                        await asyncio.to_thread(records.planning_health.record, name)
+                    done = now.date()
+                    log_recovery("planning-health", "Planning refreshed for the day")
+                except Exception as error:  # noqa: BLE001 - tried again at the next pass
+                    log_failure("planning-health", "The daily planning refresh failed", error)
+            await asyncio.sleep(1800)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -542,6 +560,7 @@ def create_app(
                 )
                 # The scorer, in shadow mode: computed again when what it reads changed.
                 keepers.append(asyncio.create_task(scorer.worker(resolved_repository.scorer)))
+                keepers.append(asyncio.create_task(keep_reorganization_fresh(resolved_repository)))
             if resolved_github is not None:
                 # The documentation of each project is read when its branch moved.
                 keepers.append(
@@ -1889,6 +1908,26 @@ def create_app(
         return await documents_read(
             request, lambda: repo(request).delivery.listing(name, state, page, page_size)
         )
+
+    @app.get("/api/dashboard/rollout")
+    async def rollout_api(request: Request) -> Response:
+        """Every project with where its reorganization stands and its next step."""
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await asyncio.to_thread(repo(request).rollout.overview))
+
+    @app.get("/api/dashboard/projects/{name}/rollout")
+    async def rollout_project_api(name: str, request: Request) -> Response:
+        """Where one project's reorganization stands, and what moved since the day before."""
+        return await documents_read(request, lambda: repo(request).rollout.status(name))
+
+    @app.get("/api/dashboard/projects/{name}/arrivals")
+    async def arrivals_api(
+        name: str, request: Request, days: int = Query(14, ge=1, le=90)
+    ) -> Response:
+        """The issues that arrived lately, each with where the cascade put it."""
+        return await documents_read(request, lambda: repo(request).rollout.arrivals(name, days))
 
     @app.get("/api/dashboard/projects/{name}/structure")
     async def structure_api(name: str, request: Request) -> Response:

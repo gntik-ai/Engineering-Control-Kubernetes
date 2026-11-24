@@ -50,6 +50,8 @@ interface Numbers {
   stories_delivered_open?: number;
   stories_with_leads?: number;
   cleanup_proposed?: number;
+  changes_ready?: number;
+  structure_proposals?: number;
   scorer_sure?: number;
   scorer_abstains?: number;
 }
@@ -340,10 +342,11 @@ export function PlanningHealth({ project }: { project: string }) {
                 about="The scorer says of each record what it would do. Where it is sure, the change waits in a batch for your approval; where it abstains, the record waits for a decision model or for you."
               >
                 <Tile
-                  value={now.scorer_sure}
-                  label="Changes the scorer is sure of"
-                  of="Gathered into batches to approve"
-                  was={was?.scorer_sure}
+                  value={now.changes_ready ?? now.scorer_sure}
+                  label="Changes that wait for your approval"
+                  of="Gathered into batches by kind"
+                  note={`${whole(now.structure_proposals ?? 0)} proposals for the structure beside them`}
+                  was={was?.changes_ready}
                   since={since}
                   href={reviewUrl(project, 'reorganize')}
                 />

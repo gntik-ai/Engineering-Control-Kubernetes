@@ -841,7 +841,7 @@ class Signals:
 
 async def worker(signals: Signals, ranker: Ranker) -> None:
     """Keep the ranking service's answers up to date: at once while there is something to
-    ask, every few minutes when there is not."""
+    ask, every two minutes when there is not."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -849,4 +849,5 @@ async def worker(signals: Signals, ranker: Ranker) -> None:
         except Exception:
             log.exception("Asking the ranking service failed")
             asked = 0
-        await asyncio.sleep(5 if asked else 300)
+        # A record that just arrived is read within two minutes.
+        await asyncio.sleep(5 if asked else 120)

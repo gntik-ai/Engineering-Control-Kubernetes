@@ -30,6 +30,7 @@ from engineering_control.dashboard.primary_epics import PrimaryEpics
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.reorg import Reorg
+from engineering_control.dashboard.rollout import Rollout
 from engineering_control.dashboard.schemas import ActivityEventInput
 from engineering_control.dashboard.scorer import Scorer
 from engineering_control.dashboard.session_store import (
@@ -138,6 +139,7 @@ class DashboardRepository:
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.cleanup = Cleanup(self.sessions, self.planning_links)
         self.structure = Structure(self.sessions, self.planning, self.planning_links)
+        self.rollout = Rollout(self.sessions, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

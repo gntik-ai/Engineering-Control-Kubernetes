@@ -1,5 +1,6 @@
 import { Card, CardBody, CardHeader, CardTitle, Link, Page } from '@gntik-ai/ui';
 import { BASE, statsUrl } from '../router';
+import { Rollout } from './Rollout';
 
 export function DashboardPage() {
   return (
@@ -25,6 +26,9 @@ export function DashboardPage() {
             <Link href={statsUrl()}>Global Settings → Stats</Link>
           </CardBody>
         </Card>
+      </div>
+      <div className="mt-4">
+        <Rollout />
       </div>
     </Page>
   );

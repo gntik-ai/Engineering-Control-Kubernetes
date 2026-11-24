@@ -19,9 +19,10 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import cleanup, delivery, planning_links
+from engineering_control.dashboard import cleanup, delivery, planning_links, structure
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
+from engineering_control.dashboard.reorg import Reorg
 from engineering_control.db.models import (
     BacklogItem,
     PlanningHealth,
@@ -60,6 +61,7 @@ FOLLOWED: Final = (
     "scorer_abstains",
     "stories_unsupported",
     "stories_delivered_open",
+    "changes_ready",
 )
 
 
@@ -130,11 +132,18 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         # abstains and the case waits for a decision model or the administrator.
         scorer = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project.id))
         delivered = {**delivery.numbers(db, project.id), **cleanup.numbers(db, project)}
+        # What the structure of the plan proposes, and the issues that fit no Story.
+        shape = structure.survey(db, project)
+        delivered["structure_proposals"] = len(shape["stories"]) + len(shape["splits"])
+        delivered["issues_unplaced"] = int(shape["unplaced"])
         would: dict[str, int] = {}
         for entry in (scorer or {}).get("kinds", []):
             for outcome, count in (entry.get("would") or {}).items():
                 would[outcome] = would.get(outcome, 0) + int(count)
         as_primary = planning_links.primary_stories(db, project.id)
+    # The changes gathered for approval, over every kind of batch.
+    batches = Reorg(sessions, planning, planning_links.PlanningLinks(sessions)).overview(name)
+    delivered["changes_ready"] = sum(int(kind["ready"]) for kind in batches["kinds"])
     # Each Story counted once, under its primary Epic.
     titles = {str(row["id"]): str(row["title"]) for row in epics}
     primary_largest = max(
@@ -368,6 +377,18 @@ class PlanningHealthRecords:
                     for row in rows
                 ],
             }
+
+    def planned(self) -> list[str]:
+        """The projects that have planning records: the ones that are measured."""
+        with self.sessions() as db:
+            linked = select(ProjectIssueStory.project_id).union(select(ProjectStoryEpic.project_id))
+            return list(
+                db.scalars(
+                    select(ProjectRecord.name)
+                    .where(ProjectRecord.archived_at.is_(None), ProjectRecord.id.in_(linked))
+                    .order_by(ProjectRecord.name)
+                )
+            )
 
     def missing_today(self, *, now: datetime | None = None) -> list[str]:
         """The projects that have planning records and no measurement of today yet."""
