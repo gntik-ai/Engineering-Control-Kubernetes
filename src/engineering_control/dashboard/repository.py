@@ -38,6 +38,7 @@ from engineering_control.dashboard.session_store import (
     retire_session,
 )
 from engineering_control.dashboard.signals import Signals
+from engineering_control.dashboard.structure import Structure
 from engineering_control.dashboard.workspace_import import WorkspaceImports
 from engineering_control.dashboard.workspace_issues import WorkspaceIssueInventory
 from engineering_control.dashboard.workspace_metrics import WorkspaceMetrics
@@ -136,6 +137,7 @@ class DashboardRepository:
         self.scorer.after = self.delivery.refresh_all
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.cleanup = Cleanup(self.sessions, self.planning_links)
+        self.structure = Structure(self.sessions, self.planning, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

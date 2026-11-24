@@ -109,6 +109,7 @@ from engineering_control.dashboard.schemas import (
     ItemRouteInput,
     ItemStateInput,
     ManagedCoverageInput,
+    MissingStoryInput,
     NewEpicInput,
     OrphanApproveInput,
     OrphanDraftInput,
@@ -149,6 +150,7 @@ from engineering_control.dashboard.schemas import (
     SectionRunInput,
     SectionUpdateInput,
     SkillInput,
+    SplitInput,
     StoryInput,
     SummariesInput,
     SupervisorDecisionInput,
@@ -1886,6 +1888,53 @@ def create_app(
         """The open User Stories in one state of delivery, each with its evidence."""
         return await documents_read(
             request, lambda: repo(request).delivery.listing(name, state, page, page_size)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/structure")
+    async def structure_api(name: str, request: Request) -> Response:
+        """How each Epic holds together, and the proposals: Epics to split and User
+        Stories that are missing."""
+        return await documents_read(request, lambda: repo(request).structure.overview(name))
+
+    @app.post("/api/dashboard/projects/{name}/structure/stories/{proposal}")
+    async def structure_story_api(name: str, proposal: str, request: Request) -> Response:
+        """Make a proposed User Story, as worded, and put its issues under it."""
+        return await project_change(
+            request,
+            MissingStoryInput,
+            lambda body: asyncio.to_thread(
+                repo(request).structure.add_story,
+                name,
+                proposal,
+                body.title,
+                body.description,
+                body.epic_id,
+            ),
+            event="workspace.missing_story_added",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/structure/splits/{proposal}")
+    async def structure_split_api(name: str, proposal: str, request: Request) -> Response:
+        """Split an Epic as proposed, with these titles for the new Epics."""
+        return await project_change(
+            request,
+            SplitInput,
+            lambda body: asyncio.to_thread(
+                repo(request).structure.split, name, proposal, body.titles
+            ),
+            event="workspace.epic_split",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/structure/{proposal}/dismiss")
+    async def structure_dismiss_api(name: str, proposal: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).structure.dismiss, name, proposal),
+            event="workspace.structure_proposal_dismissed",
+            subject=name,
         )
 
     @app.get("/api/dashboard/projects/{name}/cleanup")

@@ -1174,6 +1174,28 @@ class StoryDelivery(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (UniqueConstraint("project_id", "story_id", name="uq_story_delivery_story"),)
 
 
+class StructureDecision(UUIDPrimaryKey, Timestamps, Base):
+    """What the administrator decided about one proposal for the plan's structure
+    (migration 0081): a missing User Story, or an Epic to split. A proposal is known by a
+    digest of what it is made of, so that the same one is not made again."""
+
+    __tablename__ = "structure_decisions"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    proposal: Mapped[str] = mapped_column(String(32))
+    # stories or splits.
+    kind: Mapped[str] = mapped_column(String(16))
+    # approved or dismissed.
+    decision: Mapped[str] = mapped_column(String(16))
+    # What approving it made: the Story and the issues put under it, or the Epics.
+    made: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("project_id", "proposal", name="uq_structure_decisions_proposal"),
+    )
+
+
 class ReorgBatch(UUIDPrimaryKey, Timestamps, Base):
     """Changes of one kind that the scorer would make, put before the administrator to
     approve together (migration 0078). A sample of its lines is judged first; an approved

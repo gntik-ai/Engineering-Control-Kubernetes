@@ -59,7 +59,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0078 keeps the batches of changes put before the administrator, and their lines.
     # 0079 keeps where each User Story stands, with the evidence for it.
     # 0080 lets a queued issue closure say why and carry its comment.
-    assert (head, parent) == ("0080", "0079")
+    # 0081 keeps what was decided about each proposal for the plan's structure.
+    assert (head, parent) == ("0081", "0080")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -161,10 +162,13 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
+    assert "structure_decisions" in inspect(engine).get_table_names()
+    command.downgrade(config, parent)
+    assert "structure_decisions" not in inspect(engine).get_table_names()
     assert {"state_reason", "note"} <= {
         column["name"] for column in inspect(engine).get_columns("workspace_actions")
     }
-    command.downgrade(config, parent)
+    command.downgrade(config, "0079")
     assert "note" not in {
         column["name"] for column in inspect(engine).get_columns("workspace_actions")
     }

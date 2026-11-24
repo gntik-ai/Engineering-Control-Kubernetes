@@ -7,6 +7,7 @@ import { some, whole } from './ChoiceRun';
 import { ChangeBatches } from './ChangeBatches';
 import { Cleanup } from './Cleanup';
 import { Shadow } from './Shadow';
+import { Structure } from './Structure';
 
 /** How well one way of finding a parent does against the parents that are known. */
 interface Method {
@@ -249,6 +250,7 @@ export function Reorganize({ project }: { project: string }) {
     <>
       <ChangeBatches project={project} />
       <Cleanup project={project} />
+      <Structure project={project} />
       <Card>
         <CardHeader>
           <CardTitle>How well a parent is found</CardTitle>

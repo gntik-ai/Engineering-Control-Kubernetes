@@ -580,6 +580,18 @@ class BugUnlinkInput(PlainChangeInput):
     item_ids: list[UUID] | None = Field(default=None, max_length=500)
 
 
+class MissingStoryInput(EpicInput):
+    """A proposed User Story as the administrator words it, and the Epic it goes under."""
+
+    epic_id: UUID
+
+
+class SplitInput(PlainChangeInput):
+    """The titles of the Epics a split makes, one for each group beyond the largest."""
+
+    titles: list[str] = Field(min_length=1, max_length=4)
+
+
 class BatchInput(PlainChangeInput):
     """Which kind of change to gather into a batch for approval."""
 
