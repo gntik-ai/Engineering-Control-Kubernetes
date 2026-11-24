@@ -428,7 +428,12 @@ class PlanningAnalysis:
                 candidate = db.get(WorkspaceCandidate, job.record_id)
                 if candidate and matched and not current:
                     candidate.parents = matched
-            elif job.kind == "issues" and matched and not current:
+            elif (
+                job.kind == "issues"
+                and matched
+                and not current
+                and not source.get("story_optional")
+            ):
                 replace_parents(db, "issues", project.id, job.record_id, [UUID(v) for v in matched])
             for kind in ("stories", "issues"):
                 if work.scope in ("verify", "intake") or (

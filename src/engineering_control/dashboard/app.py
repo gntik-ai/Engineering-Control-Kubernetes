@@ -75,6 +75,7 @@ from engineering_control.dashboard.schemas import (
     AgentInput,
     BacklogSyncInput,
     BudgetInput,
+    BugUnlinkInput,
     CacheTrialInput,
     CommandProfileInput,
     CommandSelectionInput,
@@ -1551,11 +1552,12 @@ def create_app(
         request: Request,
         issue_state: IssueView | None = None,
         state: PlanningState | None = None,
+        bugs: Literal["", "only", "without"] = "",
     ) -> Response:
         try:
             return JSONResponse(
                 await asyncio.to_thread(
-                    repo(request).planning.pending, name, kind, issue_state, state
+                    repo(request).planning.pending, name, kind, issue_state, state, bugs
                 )
             )
         except ProjectNotFound:
@@ -1658,6 +1660,25 @@ def create_app(
                 repo(request).orphans.control, name, run_id, body.action
             ),
             event="workspace.orphan_run_controlled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/bugs/linked")
+    async def bugs_linked_api(name: str, request: Request) -> Response:
+        """The bugs still linked to a User Story. A bug stands apart from the plan."""
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).bugs.linked, name))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/bugs/unlink")
+    async def bugs_unlink_api(name: str, request: Request) -> Response:
+        """Take bugs off the User Stories they are linked to, by the administrator's word."""
+        return await project_change(
+            request,
+            BugUnlinkInput,
+            lambda body: asyncio.to_thread(repo(request).bugs.unlink, name, body.item_ids),
+            event="workspace.bugs_unlinked",
             subject=name,
         )
 

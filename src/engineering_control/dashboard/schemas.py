@@ -574,6 +574,12 @@ class OrphanApproveInput(PlainChangeInput):
     item_ids: list[UUID] | None = Field(default=None, max_length=500)
 
 
+class BugUnlinkInput(PlainChangeInput):
+    """The bugs to take off their User Stories: these, or every bug that is linked."""
+
+    item_ids: list[UUID] | None = Field(default=None, max_length=500)
+
+
 class PrimaryParentInput(PlainChangeInput):
     """The administrator's choice of a record's primary parent, among its parents."""
 

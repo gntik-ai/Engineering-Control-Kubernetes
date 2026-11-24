@@ -35,7 +35,7 @@ from engineering_control.dashboard.connection_records import (
     connected_story_issues,
     finding_links,
 )
-from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories, is_bug
 from engineering_control.dashboard.planning_lifecycle import (
     ARCHIVED_DRAFT,
     CLOSED_DRAFT,
@@ -73,6 +73,10 @@ from engineering_control.db.models import (
 from engineering_control.table_sort import Direction, sql_order
 
 Kind = Literal["epics", "stories", "issues"]
+BUG_HAS_NO_STORY = (
+    "A bug stands apart from the plan and has no User Story. "
+    "To give this issue one, say first that it is an enhancement."
+)
 PlanningState = Literal["open", "closed"]
 IssueView = Literal["open", "closed", "draft"]
 
@@ -174,14 +178,10 @@ def save_record(
     if isinstance(row, BacklogItem) and execution_type:
         confirm_classification(session, project, row, execution_type)
     if kind != "epics":
-        optional = (
-            kind == "issues"
-            and not parents
-            and session.scalar(
-                bugs_with_optional_stories(session, project.id).where(BacklogItem.id == row.id)
-            )
-            is not None
-        )
+        # A bug stands apart from the plan: it has no User Story.
+        optional = kind == "issues" and is_bug(session, project.id, row.id)
+        if optional and parents:
+            raise ProjectInvalid(BUG_HAS_NO_STORY)
         replace_parents(session, kind, project.id, row.id, parents, allow_empty=optional)
     if key is None:
         queue_review(session, project.id, kind, row.id, row.title, review_scope)
@@ -261,6 +261,34 @@ def coverage_problem(session: Session, project: UUID, stage: str) -> str | None:
             f"{missing} {label} records still need coverage. Add proposals or adjust their links."
         )
     return None
+
+
+def _bug_rows(session: Session, project: UUID, rows: Subquery) -> ColumnElement[bool]:
+    """Which rows of the Issues table are bugs. An issue is one by the administrator's
+    word, else by its GitHub type, label or title; one that is still a proposal by its own
+    type, else by the issue it stands for."""
+    known = bugs_with_optional_stories(session, project).subquery()
+    return cast(
+        ColumnElement[bool],
+        (~rows.c.proposal & rows.c.id.in_(select(known.c.id)))
+        | (
+            rows.c.proposal
+            & (
+                (func.coalesce(rows.c.proposal_type, "") == "bug")
+                | (
+                    rows.c.proposal_type.is_(None)
+                    & rows.c.number.is_not(None)
+                    & rows.c.number.in_(
+                        select(BacklogItem.issue_number).where(
+                            BacklogItem.project_id == project,
+                            BacklogItem.issue_number.is_not(None),
+                            BacklogItem.id.in_(select(known.c.id)),
+                        )
+                    )
+                )
+            )
+        ),
+    )
 
 
 def _approvable(rows: Subquery, kind: Kind) -> ColumnElement[bool]:
@@ -613,33 +641,21 @@ class PlanningRecords:
             # An issue is a bug by the administrator's word, else by its GitHub type or
             # label; one that is still a proposal by its own type, else by the issue it
             # stands for.
-            is_bug: ColumnElement[bool] = false()
+            # Bugs are listed apart from the other issues: each list counts only its own.
+            bug_row: ColumnElement[bool] = false()
+            listed: ColumnElement[bool] = true()
             if kind == "issues":
-                known = bugs_with_optional_stories(session, project.id).subquery()
-                is_bug = (~rows.c.proposal & rows.c.id.in_(select(known.c.id))) | (
-                    rows.c.proposal
-                    & (
-                        (func.coalesce(rows.c.proposal_type, "") == "bug")
-                        | (
-                            rows.c.proposal_type.is_(None)
-                            & rows.c.number.is_not(None)
-                            & rows.c.number.in_(
-                                select(BacklogItem.issue_number).where(
-                                    BacklogItem.project_id == project.id,
-                                    BacklogItem.issue_number.is_not(None),
-                                    BacklogItem.id.in_(select(known.c.id)),
-                                )
-                            )
-                        )
-                    )
-                )
+                bug_row = _bug_rows(session, project.id, rows)
                 if bugs and not focus:
-                    matches = matches & (is_bug if bugs == "only" else ~is_bug)
+                    listed = bug_row if bugs == "only" else ~bug_row
+                    matches = matches & listed
             scope: ColumnElement[bool] = true()
             view = issue_state if kind == "issues" else state
             bucket = _state_bucket(rows, kind)
             state_counts = dict(
-                session.execute(select(bucket, func.count()).select_from(rows).group_by(bucket))
+                session.execute(
+                    select(bucket, func.count()).select_from(rows).where(listed).group_by(bucket)
+                )
                 .tuples()
                 .all()
             )
@@ -686,9 +702,9 @@ class PlanningRecords:
             total, pending, proposed, bug_count = session.execute(
                 select(
                     func.count().filter(matches),
-                    func.count().filter(scope & _approvable(rows, kind)),
+                    func.count().filter(scope & listed & _approvable(rows, kind)),
                     func.count().filter(rows.c.proposal),
-                    func.count().filter(scope & is_bug),
+                    func.count().filter(scope & bug_row),
                 ).select_from(rows)
             ).one()
             pages = max(1, (total + page_size - 1) // page_size)
@@ -950,7 +966,19 @@ class PlanningRecords:
                     for kind in kinds
                 )
             )
-            return dict(session.execute(counts).mappings().one())
+            found = dict(session.execute(counts).mappings().one())
+            # A bug is no part of the plan: it is counted on its own, not with the issues.
+            rows = _table_rows(project.id, "issues")
+            found["bugs"] = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(rows)
+                    .where(_bug_rows(session, project.id, rows))
+                )
+                or 0
+            )
+            found["issues"] -= found["bugs"]
+            return found
 
     def pending(
         self,
@@ -958,6 +986,7 @@ class PlanningRecords:
         kind: Kind,
         issue_state: IssueView | None = None,
         state: PlanningState | None = None,
+        bugs: str = "",
     ) -> dict[str, Any]:
         with self._snapshot() as session:
             project = active_project(session, name)
@@ -967,6 +996,9 @@ class PlanningRecords:
                 .where(_approvable(rows, kind))
                 .order_by(rows.c.proposal.desc(), rows.c.created_at, rows.c.id)
             )
+            if kind == "issues" and bugs:
+                bug_row = _bug_rows(session, project.id, rows)
+                query = query.where(bug_row if bugs == "only" else ~bug_row)
             view = issue_state if kind == "issues" else state
             if view:
                 query = query.where(_state_bucket(rows, kind) == view)
@@ -1000,10 +1032,10 @@ class PlanningRecords:
                 raise ProjectNotFound(str(key))
             if execution_type:
                 confirm_classification(db, project, item, execution_type)
-            optional = (
-                db.scalar(bugs_with_optional_stories(db, project.id).where(BacklogItem.id == key))
-                is not None
-            )
+            # A bug stands apart from the plan: it has no User Story.
+            optional = is_bug(db, project.id, key)
+            if optional and stories:
+                raise ProjectInvalid(BUG_HAS_NO_STORY)
             # A reclassified standalone bug can return to the list of Issues needing a Story.
             empty_before = execution_type == "enhancement" and not db.scalar(
                 select(ProjectIssueStory.story_id).where(ProjectIssueStory.item_id == key).limit(1)

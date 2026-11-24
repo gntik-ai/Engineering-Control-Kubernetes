@@ -269,6 +269,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/planning/{kind}/{key}/primary",
         "/api/dashboard/projects/{name}/orphans/runs",
         "/api/dashboard/projects/{name}/orphans/runs/{run_id}/control",
+        "/api/dashboard/projects/{name}/bugs/unlink",
         "/api/dashboard/projects/{name}/orphans/approve",
         "/api/dashboard/projects/{name}/orphans/{key}/link",
         "/api/dashboard/projects/{name}/orphans/{key}/draft",

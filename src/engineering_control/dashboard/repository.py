@@ -13,6 +13,7 @@ from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
+from engineering_control.dashboard.bugs import Bugs
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.doc_inventory import DocInventory
@@ -121,6 +122,7 @@ class DashboardRepository:
         self.planning_health = PlanningHealthRecords(self.sessions)
         self.planning_links = PlanningLinks(self.sessions)
         self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
+        self.bugs = Bugs(self.sessions, self.planning, self.planning_links)
         self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
         self.documents = DocInventory(self.sessions)
         self.signals = Signals(self.sessions, self.planning_links)

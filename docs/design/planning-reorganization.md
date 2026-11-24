@@ -112,6 +112,10 @@ Planning health then follows "Stories that nothing supports" and "delivered Stor
 
 **Missing Stories and Epics.** Orphans that fit no Story are clustered; each cluster and each document section that no Story covers yields one proposed Story, worded by a language model and placed under an Epic by the same cascade. This is the earlier phase "Epics and Stories grounded in documents and issues".
 
+## Bugs are not part of the plan
+
+A bug is no piece of a User Story's work: it has no User Story and no Epic (decided on 24 November 2026). Every stage of the cascade leaves bugs out: no candidate parents are looked for, no pair is drawn or scored, and no batch proposes a link for one. What the cascade does with bugs is two things only: it proposes that an issue is a bug when the texts say so (the orphan review's "it is a bug" answer, approved like every other), and it lists bugs that still carry a link so the link is taken off on approval. How a bug is recognised and handled is described in [project-workspaces.md](project-workspaces.md#bugs-stand-apart-from-the-plan).
+
 ## Proposing what to remove
 
 A backlog fills with records that no longer matter: an issue for a dependency that was replaced, a Story drawn from a document section that was deleted, an Epic whose Stories all moved elsewhere. The process proposes their removal, for Epics, User Stories and individual issues alike. It never removes anything by itself.

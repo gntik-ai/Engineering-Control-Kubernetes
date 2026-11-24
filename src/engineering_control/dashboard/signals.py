@@ -25,12 +25,12 @@ from typing import Any, Final
 from uuid import UUID
 
 import numpy
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import ranking
 from engineering_control.dashboard.issue_coverage import excerpt
-from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.issue_types import bugs_with_optional_stories, is_bug
 from engineering_control.dashboard.planning import _visible_issues
 from engineering_control.dashboard.planning_links import PlanningLinks, likeness
 from engineering_control.dashboard.project_records import (
@@ -187,7 +187,9 @@ def _plan(db: Session, project: ProjectRecord) -> _Plan:
             BacklogItem.issue_number.is_not(None),
         )
     ):
-        issues[key] = (title, body or "", number)
+        # A bug stands apart from the plan: no parent is looked for, measured or judged.
+        if key not in bugs:
+            issues[key] = (title, body or "", number)
     issue_links: dict[UUID, list[tuple[UUID, str, bool]]] = defaultdict(list)
     story_links: dict[UUID, list[tuple[UUID, str, bool, str | None]]] = defaultdict(list)
     for kind, child, parent, origin, primary, by in db.execute(
@@ -210,7 +212,7 @@ def _plan(db: Session, project: ProjectRecord) -> _Plan:
         issues,
         issue_links,
         story_links,
-        {key for key in issues if key not in issue_links and key not in bugs},
+        {key for key in issues if key not in issue_links},
     )
     postings: dict[str, list[tuple[UUID, int]]] = defaultdict(list)
     for key in sorted(stories, key=str):
@@ -564,12 +566,20 @@ class Signals:
 
     # ----------------------------------------------------------- pairs to judge
 
+    def _pairs(self, db: Session, project: UUID) -> tuple[list[GoldPair], int]:
+        """The pairs that stand, and how many were set aside because their issue is a
+        bug: a bug has no User Story, so there is nothing to judge."""
+        bugs = set(db.scalars(bugs_with_optional_stories(db, project)))
+        pairs = db.scalars(select(GoldPair).where(GoldPair.project_id == project)).all()
+        stand = [p for p in pairs if not (p.kind == ISSUE_STORY and p.child_id in bugs)]
+        return stand, len(pairs) - len(stand)
+
     def _progress(self, db: Session, project: UUID) -> dict[str, Any]:
-        rows = db.execute(
-            select(GoldPair.bucket, GoldPair.label, func.count())
-            .where(GoldPair.project_id == project)
-            .group_by(GoldPair.bucket, GoldPair.label)
-        ).all()
+        pairs, set_aside = self._pairs(db, project)
+        rows = [
+            (bucket, label, count)
+            for (bucket, label), count in Counter((p.bucket, p.label) for p in pairs).items()
+        ]
         drawn = sum(count for _b, _l, count in rows)
         judged = sum(count for _b, label, count in rows if label is not None)
         by_label: Counter[str] = Counter()
@@ -580,6 +590,7 @@ class Signals:
             "drawn": drawn,
             "judged": judged,
             "wanted": sum(count for _kind, count in BUCKETS.values()),
+            "set_aside": set_aside,
             "by_label": dict(by_label),
             "buckets": [
                 {
@@ -600,10 +611,10 @@ class Signals:
             project = active_project(db, name, lock=True)
             plan = _plan(db, project)
             known, _sources = _truth(db, project.id, plan)
-            have = {
-                (pair.kind, pair.child_id, pair.parent_id): pair.bucket
-                for pair in db.scalars(select(GoldPair).where(GoldPair.project_id == project.id))
-            }
+            # A pair whose issue turned out to be a bug is set aside, and its place in
+            # the set is drawn again.
+            standing, _set_aside = self._pairs(db, project.id)
+            have = {(pair.kind, pair.child_id, pair.parent_id): pair.bucket for pair in standing}
             taken: Counter[str] = Counter(have.values())
             drawn_children = {(kind, child) for kind, child, _parent in have}
             found: dict[str, list[tuple[UUID, UUID]]] = defaultdict(list)
@@ -745,7 +756,7 @@ class Signals:
         with self.sessions() as db:
             project = active_project(db, name)
             plan = _plan(db, project)
-            pairs = db.scalars(select(GoldPair).where(GoldPair.project_id == project.id)).all()
+            pairs, _set_aside = self._pairs(db, project.id)
             waiting = sorted(
                 (pair for pair in pairs if pair.label is None and pair.id != after),
                 key=lambda pair: _spread("order", pair.id),
@@ -768,6 +779,8 @@ class Signals:
             pair = db.get(GoldPair, pair_id)
             if pair is None or pair.project_id != project.id:
                 raise ProjectNotFound(str(pair_id))
+            if pair.kind == ISSUE_STORY and is_bug(db, project.id, pair.child_id):
+                raise ProjectInvalid("This issue is a bug: it has no User Story to judge.")
             if label is not None and label not in LABELS[pair.kind]:
                 raise ProjectInvalid("That is no answer to this question.")
             pair.label = label

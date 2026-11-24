@@ -17,6 +17,7 @@ from engineering_control.dashboard.backlog_items import (
     clean_description,
     normalized_description,
 )
+from engineering_control.dashboard.issue_types import is_bug
 from engineering_control.dashboard.planning_queue import queue_review, record_changed
 from engineering_control.dashboard.project_records import ProjectConflict, active_project
 from engineering_control.db.models import (
@@ -121,7 +122,9 @@ def _story_numbers(issue: dict[str, Any], repository: str) -> set[int]:
 
 
 def add_story_links(db: Session, project: UUID, item: UUID, stories: set[UUID]) -> int:
-    if not stories:
+    """Link the issue to those User Stories, as the platform finds them. A bug is linked
+    to none: it stands apart from the plan."""
+    if not stories or is_bug(db, project, item):
         return 0
     existing = set(
         db.scalars(
@@ -309,8 +312,7 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
         if item.facts.get("manual_story_links"):
             continue
         refs = {stories[n] for n in _story_numbers(issue, repo) if n in stories}
-        if refs:
-            db.flush()
+        if refs and not is_bug(db, project.id, item.id):
             added_links += add_story_links(db, project.id, item.id, refs)
             if cand and cand.kind == "issues" and cand.decision == "pending":
                 cand.parents = sorted(set(cand.parents or []) | {str(v) for v in refs})

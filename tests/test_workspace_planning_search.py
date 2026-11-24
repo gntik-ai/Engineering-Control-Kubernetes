@@ -266,7 +266,7 @@ def test_tab_counts_track_all_visible_project_records(tmp_path: Path) -> None:
             assert response.status_code == 200, response.text
             return response.json()
 
-        assert counts() == {"epics": 0, "stories": 0, "issues": 0}
+        assert counts() == {"epics": 0, "stories": 0, "issues": 0, "bugs": 0}
         epic = repo.planning.save("falcone", "epics", "Payments", None, [])["id"]
         story = repo.planning.save("falcone", "stories", "Checkout", None, [UUID(epic)])["id"]
         repo.planning.save("falcone", "issues", "Draft", None, [UUID(story)])
@@ -288,7 +288,7 @@ def test_tab_counts_track_all_visible_project_records(tmp_path: Path) -> None:
                 )
                 for n, kind in enumerate(("epics", "epics", "stories"))
             )
-        assert counts() == {"epics": 3, "stories": 1, "issues": 1}
+        assert counts() == {"epics": 3, "stories": 1, "issues": 1, "bugs": 0}
         assert client.get(BASE + "epics", params={"search": "Payments"}).json()["total"] == 1
         csrf = client.get("/api/dashboard/session").json()["csrf_token"]
         pending = client.get(BASE + "epics/pending").json()
@@ -310,6 +310,7 @@ def test_tab_counts_track_all_visible_project_records(tmp_path: Path) -> None:
             "epics": 1,
             "stories": 0,
             "issues": 0,
+            "bugs": 0,
         }
         assert client.get(BASE.replace("falcone", "unknown") + "counts").status_code == 404
         client.cookies.clear()

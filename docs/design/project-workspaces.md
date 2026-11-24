@@ -233,7 +233,7 @@ The administrator agreed these rules and phases. Every change to existing record
 - A User Story has one primary Epic and a technical Issue one primary User Story. Any other connection is a related link, kept apart.
 - A link is a record: who made it (stated in the text, the administrator, or a model), the passages on both sides that justify it, its strength, its status and its history.
 - A User Story cites the document lines or the issues it groups. One with neither is unsupported.
-- An issue's parent is chosen from a ranked shortlist in one question, which may answer that none fits or that the issue is a bug. Only open orphans are resolved; a bug may stand alone and is labelled as one.
+- An issue's parent is chosen from a ranked shortlist in one question, which may answer that none fits or that the issue is a bug. Only open orphans are resolved; a bug stands apart from the plan and is labelled as one.
 - Documentation is read incrementally, from `openspec/` and `docs-site/` as well as the usual folders.
 
 | Phase | Deliverable | Acceptance criterion |
@@ -261,7 +261,7 @@ R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a proj
 | Number | What it counts |
 | --- | --- |
 | Open and closed issues with no User Story | Issues that are no bugs and have neither a saved parent nor an approved connection to a Story. |
-| Bugs standing alone | Issues classified as bugs, by the administrator or by their GitHub type or label, that have no Story. A Story is optional for them. |
+| Bugs still linked to a User Story | Bugs that carry a link to a Story from before they were known as bugs. A bug has no Story, so the number should be zero. Bugs are counted on their own: the counts of issues on this page leave them out. |
 | Issues under several User Stories | Issues with more than one parent. |
 | User Stories with no issue | Stories no issue is linked to. |
 | User Stories under several Epics | Stories with more than one Epic, with the average and the maximum. |
@@ -294,7 +294,7 @@ Planning health counts the links that say why, by who made them, and the records
 
 ### Open issues with no User Story
 
-**Reviews → Related Work** lists the project's open issues that have no User Story and are no bug: the issues the Issues table marks as orphans. A closed issue is not listed, and a bug may stand alone.
+**Reviews → Related Work** lists the project's open issues that have no User Story and are no bug: the issues the Issues table marks as orphans. A closed issue is not listed, and neither is a bug: a bug has no User Story.
 
 Each issue is shown with a shortlist of at most eight open User Stories, best first. A Story the issue's own text names on a `Story:` line comes first. The others are ranked by the words the two texts share, where a word counts for more the fewer Stories have it; each entry shows its score, the words it shares and its primary Epic, and one below 2.0 is marked a weak match. No model is asked for the shortlist, so it costs nothing and is the same every time it is computed. A closed or archived Story is never offered.
 
@@ -303,7 +303,7 @@ A run asks a model one question per issue: the issue, its shortlist, and four po
 | Answer | Meaning | What approval does |
 | --- | --- | --- |
 | This User Story | Delivering the issue is part of delivering one Story of the shortlist. | Puts the issue under that Story. The link is recorded as proposed by a review and approved by you, with the review's reason and passages. |
-| It is a bug | The issue reports that existing behaviour is wrong. | Confirms the issue as a bug, as the Issues table does: it may stand alone, and the bug label is applied on GitHub. |
+| It is a bug | The issue reports that existing behaviour is wrong. | Confirms the issue as a bug, as the planning tables do: it leaves the plan for the Bugs tab, and the bug label is applied on GitHub. |
 | None fits | It is planned work that no listed Story covers. The answer names the Story that is missing. | Nothing by itself. The answer opens a form with the missing Story's title and description, to word as wanted, and the project's Epics with those most like it first. **Make this User Story** creates it under the chosen Epic and puts the issue under it (`POST …/orphans/{issue}/draft`). |
 | The texts do not say | No decision is possible from the two texts. | Nothing. |
 
@@ -319,7 +319,21 @@ A run is started by the administrator with a model and a token limit, and shows 
 
 `GET /api/dashboard/projects/{name}/orphans` returns the list, the counts, what a run would hold and the last run. `POST …/orphans/runs` starts a run, `…/orphans/runs/{id}/control` stops, resumes or ends it, `…/orphans/{issue}/link`, `…/bug` and `…/dismiss` record the administrator's decision on one issue, and `…/orphans/approve` approves many answers at once. The runs and answers are kept in `choice_runs` and `choice_reviews` (migration 0073), which also hold the runs that choose primary Epics.
 
-The Issues table marks every bug with a **Bug** badge beside its title and can list bugs only, or everything but bugs (`bugs=only` or `bugs=without` on the planning listing).
+### Bugs stand apart from the plan
+
+A bug reports that something built is wrong. It is not a piece of a User Story's work, so it belongs to no User Story and, through none, to no Epic. The platform keeps the two apart everywhere:
+
+| Where | What happens with a bug |
+|---|---|
+| Planning tabs | **Bugs** is a tab of its own beside Epics, User Stories and Issues. The Issues tab lists no bug and does not count them. |
+| Recognising one | The administrator's word comes first (the issue's type set to Bug or Enhancement). Without it: the GitHub issue type; without that: a bug label, or a title that calls the issue a bug (`[Bug] …`, `bug: …`, `bug(scope): …`), unless the issue carries an enhancement label. A word such as "fix" in a title is no claim. |
+| Linking | Nothing links a bug to a User Story. What the platform finds by itself (a Story named in the text, a match of a review, a proposal's parents) is skipped for a bug; saving a User Story for a bug by hand is refused with the way out: set the type to Enhancement first. |
+| Reviews and worklists | A bug is no orphan and is not asked about. It is left out of the pairs to judge and of every measurement on **Reviews → Reorganize**; a pair drawn before its issue was known as a bug is set aside and its place drawn again. |
+| Health | Bugs are counted on their own. The page follows how many still carry a link to a User Story. |
+
+A bug can still carry a link from before it was known as a bug. The Bugs tab lists those with the User Story and who linked it, and takes the links off on the administrator's word, one bug or all at once (`GET …/bugs/linked`, `POST …/bugs/unlink`). Unlinking changes nothing else: the issue keeps its type and nothing is written on GitHub. The link's record is closed, not deleted, so the history of the issue still shows it. An issue wrongly taken for a bug is set to Enhancement in the table and keeps its User Stories.
+
+The planning listing takes `bugs=only` or `bugs=without`, and `planning/counts` returns `bugs` beside `issues`.
 
 ### Consolidating the plan: one primary Epic for each User Story
 

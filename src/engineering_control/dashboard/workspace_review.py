@@ -21,6 +21,7 @@ from engineering_control.dashboard.coverage_preview import proposal_version, rem
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import (
+    BUG_HAS_NO_STORY,
     Kind,
     coverage_problem,
     replace_parents,
@@ -1054,6 +1055,8 @@ class WorkspaceReview:
                 clean_description(description),
             )
             previous_parents = set(candidate.parents or [])
+            if kind == "issues" and parents and candidate.execution_type == "bug":
+                raise ProjectInvalid(BUG_HAS_NO_STORY)
             candidate.parents = [
                 str(p)
                 for p in _parents(
@@ -1081,6 +1084,8 @@ class WorkspaceReview:
                 if item and session.scalar(
                     bugs_with_optional_stories(session, project.id).where(BacklogItem.id == item.id)
                 ):
+                    if parents:
+                        raise ProjectInvalid(BUG_HAS_NO_STORY)
                     previous_parents.update(
                         str(story)
                         for story in session.scalars(

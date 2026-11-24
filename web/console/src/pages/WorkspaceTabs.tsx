@@ -36,6 +36,7 @@ import { LayoutSwitch, PlanningGrid, type Layout } from './PlanningGrid';
 import { NewEpicDialog } from './NewEpicDialog';
 import { PlanningLinkNote, type ParentLink } from './PlanningLinkNote';
 import { PlanningHealth } from './PlanningHealth';
+import { BugLinks } from './BugLinks';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { RecordReview, type ReviewResult } from './PlanningReviews';
 import { useSubmit } from './ProjectDialogs';
@@ -45,6 +46,7 @@ const sections = {
   epics: 'Epics',
   stories: 'User Stories',
   issues: 'Issues',
+  bugs: 'Bugs',
   architecture: 'Architecture',
 };
 const singular = { epics: 'Epic', stories: 'User Story', issues: 'Issue' };
@@ -126,10 +128,12 @@ function ParentChoices({ path, kind, parents, setParents, optional = false, bug 
   setParents: (parents: string[]) => void;
 }) {
   const choices = useResource<{ id: string; title: string }[]>(apiUrl(path + '/parents'));
+  // A bug stands apart from the plan: it is given no User Story.
+  if (bug) return <p className="text-sm text-muted-foreground">A bug stands apart from the plan: it has no User Story and no Epic. To give this issue a User Story, set its type to Enhancement.</p>;
   return (
     <fieldset className="grid gap-2">
       <legend className="mb-2 text-sm font-medium">
-        {kind === 'stories' ? 'Epics' : 'User Stories'} {bug ? '(optional for bugs)' : optional ? '(optional · automatic review can identify a parent)' : '(choose at least one)'}
+        {kind === 'stories' ? 'Epics' : 'User Stories'} {optional ? '(optional · automatic review can identify a parent)' : '(choose at least one)'}
       </legend>
       <LoadError resource={choices} />
       {choices.error && <RefreshButton resource={choices} />}
@@ -170,10 +174,10 @@ function LinkStories({ path, issue, saved, close }: {
   const [classification, setClassification] = useState<IssueType>();
   const bug = classification ? classification === 'bug' : Boolean(issue.story_optional);
   const canSave = stories.length > 0 || bug || (classification === 'enhancement' && !issue.story_ids?.length);
-  const save = useSubmit(() => postJson(path + '/' + issue.id + '/stories', { story_ids: stories, execution_type: classification }), () => { saved(); close(); });
+  const save = useSubmit(() => postJson(path + '/' + issue.id + '/stories', { story_ids: bug ? [] : stories, execution_type: classification }), () => { saved(); close(); });
   return <Dialog open onOpenChange={open => { if (!open) close(); }}>
     <DialogContent size="md">
-      <DialogHeader><DialogTitle>{issue.number ? 'Link User Stories to #' + issue.number : 'Link User Stories'}</DialogTitle></DialogHeader>
+      <DialogHeader><DialogTitle>{bug ? (issue.number ? 'Bug #' + issue.number : 'Bug') : issue.number ? 'Link User Stories to #' + issue.number : 'Link User Stories'}</DialogTitle></DialogHeader>
       <DialogBody className="grid gap-3">
         <p>{issue.title}</p>
         <IssueTypeField row={issue} selected={classification} onSelect={setClassification} />
@@ -195,9 +199,12 @@ function RecordEditor({
   version,
   close,
   saved,
+  newBug = false,
 }: {
   kind: Kind;
   path: string;
+  /** A record made on the Bugs tab starts as a bug. */
+  newBug?: boolean;
   row?: PlanRow;
   version?: number;
   close: () => void;
@@ -207,7 +214,7 @@ function RecordEditor({
   const [description, setDescription] = useState(row?.description ?? '');
   const [parents, setParents] = useState(row?.epic_ids ?? row?.story_ids ?? []);
   const label = singular[kind];
-  const [classification, setClassification] = useState<IssueType>();
+  const [classification, setClassification] = useState<IssueType | undefined>(newBug ? 'bug' : undefined);
   const bug = classification ? classification === 'bug' : Boolean(row?.story_optional);
   const allowUnassigned = bug || !row || Boolean(row.proposal && row.automatic_review);
   const save = useSubmit(
@@ -216,7 +223,7 @@ function RecordEditor({
         title,
         description,
         execution_type: kind === 'issues' ? classification : undefined,
-        ...(row?.proposal ? { version, parents } : kind === 'stories' ? { epic_ids: parents } : kind === 'issues' ? { story_ids: parents } : {}),
+        ...(row?.proposal ? { version, parents: kind === 'issues' && bug ? [] : parents } : kind === 'stories' ? { epic_ids: parents } : kind === 'issues' ? { story_ids: bug ? [] : parents } : {}),
       }),
     () => {
       saved();
@@ -375,7 +382,7 @@ function ReopenAction({ path, row, locked, saved }: { path: string; row: PlanRow
   </Button>{change.problem && <Alert tone="destructive" title={change.problem} />}</div>;
 }
 
-function Records({ kind, project, onRead }: { kind: Kind; project: string; onRead: ReadDescription }) {
+function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; project: string; onRead: ReadDescription; bugsOnly?: boolean }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning/' + kind;
   const importPath = 'projects/' + encodeURIComponent(project) + '/import';
   const { query } = useLocation();
@@ -385,7 +392,10 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const recordId = query.get('record')?.toLowerCase() || null;
   const focus = recordId || epic;
   const connected = query.get('connected') ?? '';
-  const bugs = kind === 'issues' && !focus && ['only', 'without'].includes(query.get('bugs') ?? '') ? query.get('bugs')! : '';
+  // Bugs are listed on their own tab, apart from the issues of the plan.
+  const bugs = kind === 'issues' && !focus ? (bugsOnly ? 'only' : 'without') : '';
+  const named = bugsOnly ? 'Bugs' : sections[kind];
+  const one = bugsOnly ? 'Bug' : singular[kind];
   const searchValue = query.get('search') ?? '';
   const search = focus ? '' : searchValue.trim().slice(0, 200);
   const requested = Number(pageValue);
@@ -463,7 +473,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
   const [impact, setImpact] = useState<{ row: PlanRow; operation: LifecycleAction } | null>(null);
   const [removing, setRemoving] = useState<PlanRow | null>(null);
   const selectAll = useSubmit(
-    () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { [stateKey]: view }), new AbortController().signal),
+    () => getJson<PendingSnapshot>(apiUrl(path + '/pending', { [stateKey]: view, bugs }), new AbortController().signal),
     (snapshot) => { if (snapshot.ids.length) setApproving(snapshot); else reload(); },
   );
   const locked = Boolean(changingPage || data?.busy);
@@ -513,7 +523,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             <li key={link.connection + link.record}><Link href={recordUrl(link.project, 'stories', link.record!)}>{link.display_name} · {link.title ?? 'User Story'}</Link></li>
           )}
           {kind === 'issues' && record.orphan && <li><span className="rounded bg-warning/15 px-2 py-1 text-sm font-medium">Orphan · No linked User Story</span></li>}
-          {kind === 'issues' && record.standalone_bug && <li>Standalone bug · User Story optional</li>}
+          {kind === 'issues' && record.story_optional && <li>{record.story_ids?.length ? 'Bug · still linked to a User Story' : 'Bug · stands apart from the plan'}</li>}
           {/* The primary parent first; under each, who linked it and why. */}
           {[...(record.epic_ids ?? record.story_ids ?? [])]
             .sort((a, b) => Number(Boolean(record.parent_links?.find(l => l.parent === b)?.primary)) - Number(Boolean(record.parent_links?.find(l => l.parent === a)?.primary)))
@@ -587,7 +597,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
             </Button>
           )}
           {kind === 'issues' && !record.proposal && <Button size="sm" variant="ghost" disabled={rowLocked(record)}
-            onClick={() => setLinking(record)}>Link User Stories</Button>}
+            onClick={() => setLinking(record)}>{record.story_optional ? 'Bug or enhancement' : 'Link User Stories'}</Button>}
           {kind === 'issues' && !record.proposal && <Link href={connectionsUrl(project) + '?issue=' + record.id} className="self-center text-xs">Link project</Link>}
           {(record.proposal || kind !== 'issues' || record.review === 'pending') && (
             <Button size="sm" variant="ghost" iconOnly={kind !== 'issues'} disabled={rowLocked(record)}
@@ -611,13 +621,13 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
       ),
     },
   );
-  const empty = view === 'draft' ? 'No drafts.' : 'No ' + view + ' ' + sections[kind] + '.';
+  const empty = view === 'draft' ? 'No drafts.' : 'No ' + view + ' ' + named + '.';
   const table = (
       <DataTable
         className="min-w-0 [&_tr:has([aria-current=location])]:bg-accent/50"
-        caption={sections[kind]}
+        caption={named}
         rows={rows ?? []} columns={columns} sort={sort}
-        renderGrid={layout === 'grid' ? records => <PlanningGrid rows={records} columns={columns} label={sections[kind]} /> : undefined}
+        renderGrid={layout === 'grid' ? records => <PlanningGrid rows={records} columns={columns} label={named} /> : undefined}
         selectionMode="none" showColumnMenu={false} showDensityToggle={false}
         showQuickFilter quickFilter={search} quickFilterDebounceMs={350}
         labels={{ quickFilter: (caption) => 'Search ' + caption }}
@@ -634,15 +644,12 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
               </Button>}
             </>}
             {kind === 'issues' && <>
-              <SimpleSelect className="w-56" aria-label="Filter by bugs" size="sm" value={bugs || 'all'}
-                items={[{ value: 'all', label: 'Bugs and other issues' }, { value: 'only', label: 'Bugs only' + (data?.bug_count != null ? ' (' + data.bug_count + ')' : '') }, { value: 'without', label: 'Without bugs' }]}
-                onValueChange={v => setQuery({ bugs: v === 'all' ? null : String(v), page: null, record: null, epic: null })} />
               <ConnectionFilter project={project} value={connected}/>
               <Button size="sm" variant="secondary" disabled={refreshIssues.pending} loading={refreshIssues.pending} onClick={() => void refreshIssues.submit()}>Refresh from GitHub</Button>
             </>}
             {data && data.pending > 0 && (
               <Button size="sm" variant="secondary" loading={selectAll.pending} disabled={locked || selectAll.pending} onClick={() => void selectAll.submit()}>
-                Approve all {sections[kind]} in {issueViews[view]} ({data.pending})
+                Approve all {named} in {issueViews[view]} ({data.pending})
               </Button>
             )}
             {data?.can_continue && !locked && (
@@ -650,7 +657,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
                 {nextStageLabel[kind]}
               </Button>
             )}
-            <Button size="sm" disabled={!rows} onClick={() => setEditor({})}>New {singular[kind]}</Button>
+            <Button size="sm" disabled={!rows} onClick={() => setEditor({})}>New {one}</Button>
           </div>
         }
         paginationMode="server" paginated={Boolean(currentFilter && data.total)}
@@ -664,12 +671,14 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         loading={!rows && plan.loading ? true : changingPage && plan.loading ? 'refresh' : false}
         emptyState={<p role="status" className="text-sm text-muted-foreground">{empty}</p>}
         filtered={Boolean(search)}
-        noResultsState={<p role="status" className="text-sm text-muted-foreground">No {sections[kind]} match “{search}”.</p>}
+        noResultsState={<p role="status" className="text-sm text-muted-foreground">No {named} match “{search}”.</p>}
       />
   );
   return (
     <section className="grid min-w-0 grid-cols-1 gap-4">
-      <h2 className="text-xl font-semibold">{sections[kind]}</h2>
+      <h2 className="text-xl font-semibold">{named}</h2>
+      {bugsOnly && <p className="max-w-prose text-sm text-muted-foreground">A bug reports that something built is wrong. It stands apart from the plan: it belongs to no User Story and no Epic, and is handled on its own. An issue is a bug by your word, else by its GitHub type, its bug label, or a title that calls it one.</p>}
+      {bugsOnly && <BugLinks project={project} onChanged={plan.reload} />}
       <LoadError resource={plan} />
       {focus && currentFilter && !foundRecord && (
         <p role="status" className="text-sm text-muted-foreground">This {singular[kind]} is unavailable in this project.</p>
@@ -712,6 +721,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
         <RecordEditor
           kind={kind}
           path={path}
+          newBug={bugsOnly && !editor.row}
           row={editor.row}
           version={editor.version}
           close={() => setEditor(null)}
@@ -733,7 +743,7 @@ function Records({ kind, project, onRead }: { kind: Kind; project: string; onRea
 }
 
 export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
-  const counts = useResource<Record<Kind, number>>(apiUrl('projects/' + encodeURIComponent(project.project) + '/planning/counts'), 5000);
+  const counts = useResource<Record<Kind | 'bugs', number>>(apiUrl('projects/' + encodeURIComponent(project.project) + '/planning/counts'), 5000);
   useEffect(() => {
     window.addEventListener(CHANGED, counts.reload);
     return () => window.removeEventListener(CHANGED, counts.reload);
@@ -788,6 +798,9 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
             {tab === kind && <Records kind={kind} project={project.project} onRead={setReading} />}
           </TabsPanel>
         ))}
+        <TabsPanel value="bugs" className="pt-5">
+          {tab === 'bugs' && <Records kind="issues" bugsOnly project={project.project} onRead={setReading} />}
+        </TabsPanel>
         <TabsPanel value="architecture" />
       </Tabs>
       {reading && (

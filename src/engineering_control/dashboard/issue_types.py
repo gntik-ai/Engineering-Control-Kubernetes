@@ -1,18 +1,53 @@
-"""Identify technical issues for which a User Story is optional."""
+"""Tell the bugs from the other issues.
+
+A bug stands apart from the plan: it belongs to no User Story and, through none, to no
+Epic. It is flagged as a bug and handled on its own. An issue is a bug by the
+administrator's word; else by its GitHub type; else by a bug label or a title that calls
+it one (``[Bug] …``, ``bug: …``, ``bug(scope): …``), unless it carries an enhancement label.
+"""
 
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import JSON, Select, String, case, cast, column, func, literal_column, select
+from sqlalchemy import (
+    JSON,
+    Select,
+    String,
+    case,
+    cast,
+    column,
+    func,
+    literal_column,
+    or_,
+    select,
+)
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import Exists
 
 from engineering_control.db.models import BacklogItem, ProjectRecord, WorkspaceSource
 
+# How a title calls its issue a bug, as it starts once blanks are taken off and in lower case.
+TITLE_STARTS: tuple[str, ...] = ("[bug]", "bug:", "bug :", "bug(", "bugfix:", "bug report:")
+
+
+def titled_bug(title: Any) -> ColumnElement[bool]:
+    """Whether the title in that column calls its record a bug."""
+    start = func.lower(func.ltrim(func.coalesce(title, "")))
+    return or_(*(start.like(marker.replace("%", "") + "%") for marker in TITLE_STARTS))
+
+
+def is_bug(db: Session, project: UUID, item: UUID) -> bool:
+    """Whether that issue is a bug, counting what the session has not written yet."""
+    db.flush()
+    found = db.scalar(bugs_with_optional_stories(db, project).where(BacklogItem.id == item))
+    return found is not None
+
 
 def bugs_with_optional_stories(db: Session, project: UUID) -> Select[tuple[UUID]]:
-    """Use the administrator's decision first, then explicit GitHub types and labels."""
+    """The project's bugs: the administrator's decision first, then the GitHub type, then
+    a bug label or a title that says so. (The name is from when a User Story was optional
+    for a bug; now a bug has none.)"""
     item = BacklogItem
     value: ColumnElement[Any]
     if db.get_bind().dialect.name == "postgresql":
@@ -58,7 +93,7 @@ def bugs_with_optional_stories(db: Session, project: UUID) -> Select[tuple[UUID]
                 (item.type_confirmed, item.execution_type == "bug"),
                 (github_type == "bug", True),
                 (github_type.in_(("enhancement", "feature")), False),
-                else_=has_label("bug") & ~has_label("enhancement"),
+                else_=(has_label("bug") | titled_bug(item.title)) & ~has_label("enhancement"),
             ),
         )
         .correlate(None)

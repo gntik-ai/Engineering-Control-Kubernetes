@@ -14,7 +14,9 @@ interface Numbers {
   issues_closed: number;
   orphans_open: number;
   orphans_closed: number;
-  bugs_without_story: number;
+  bugs?: number;
+  bugs_open?: number;
+  bugs_linked?: number;
   bugs_confirmed: number;
   issues_under_several_stories: number;
   stories_without_issue: number;
@@ -159,7 +161,7 @@ export function PlanningHealth({ project }: { project: string }) {
             </p>
             <Group
               title="Issues and their User Stories"
-              about="An issue that is no bug should belong to a User Story. A bug may stand alone."
+              about="An issue should belong to a User Story. A bug stands apart from the plan: it has no User Story and no Epic, and is not counted here with the issues."
             >
               <Tile
                 value={now.orphans_open}
@@ -178,12 +180,13 @@ export function PlanningHealth({ project }: { project: string }) {
                 href={`${home}?tab=issues&issue_state=closed`}
               />
               <Tile
-                value={now.bugs_without_story}
-                label="Bugs standing alone"
-                of="A User Story is optional for a bug"
-                note={`${whole(now.bugs_confirmed)} confirmed as bugs by you; the others by their GitHub label`}
-                was={was?.bugs_without_story}
+                value={now.bugs_linked ?? 0}
+                label="Bugs still linked to a User Story"
+                of={`of ${some(now.bugs ?? 0, 'bug', 'bugs')}, ${whole(now.bugs_open ?? 0)} open`}
+                note={`${whole(now.bugs_confirmed)} confirmed as bugs by you; the others by their GitHub type, label or title`}
+                was={was?.bugs_linked}
                 since={since}
+                href={`${home}?tab=bugs`}
               />
               <Tile
                 value={now.issues_under_several_stories}

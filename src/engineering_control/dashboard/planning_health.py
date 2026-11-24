@@ -47,7 +47,7 @@ CATCH_ALL_FROM: Final = 20
 FOLLOWED: Final = (
     "orphans_open",
     "orphans_closed",
-    "bugs_without_story",
+    "bugs_linked",
     "stories_without_issue",
     "stories_under_several_epics",
     "largest_epic_stories",
@@ -82,8 +82,14 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
     stories = [
         row for state in ("open", "closed") for row in _rows(planning, name, "stories", state=state)
     ]
-    issues = {
+    listed = {
         state: _rows(planning, name, "issues", issue_state=state) for state in ("open", "closed")
+    }
+    # A bug stands apart from the plan: it is counted on its own, not with the issues.
+    bugs = [row for rows in listed.values() for row in rows if row.get("story_optional")]
+    issues = {
+        state: [row for row in rows if not row.get("story_optional")]
+        for state, rows in listed.items()
     }
     every_issue = [*issues["open"], *issues["closed"]]
     per_story = [len(row.get("epic_ids") or []) for row in stories]
@@ -91,7 +97,7 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
     largest_count = int(largest.get("story_count") or 0) if largest else 0
     share = largest_count / len(stories) if stories else 0.0
     waiting: dict[str, int] = {}
-    for row in [*epics, *stories, *every_issue]:
+    for row in [*epics, *stories, *every_issue, *bugs]:
         review = row.get("automatic_review")
         status = review.get("status") if isinstance(review, dict) else None
         if status in ("queued", "needs_input", "failed"):
@@ -138,12 +144,13 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         # Issues that should have a User Story and have none.
         "orphans_open": sum(1 for row in issues["open"] if row.get("orphan")),
         "orphans_closed": sum(1 for row in issues["closed"] if row.get("orphan")),
-        # Bugs, for which a User Story is optional, that have none.
-        "bugs_without_story": sum(1 for row in every_issue if row.get("standalone_bug")),
+        # Bugs, and those that still carry a link to a User Story from before they were
+        # known as bugs.
+        "bugs": len(bugs),
+        "bugs_open": sum(1 for row in listed["open"] if row.get("story_optional")),
+        "bugs_linked": sum(1 for row in bugs if row.get("story_ids")),
         "bugs_confirmed": sum(
-            1
-            for row in every_issue
-            if row.get("type_confirmed") and row.get("execution_type") == "bug"
+            1 for row in bugs if row.get("type_confirmed") and row.get("execution_type") == "bug"
         ),
         "issues_under_several_stories": sum(
             1 for row in every_issue if len(row.get("story_ids") or []) > 1

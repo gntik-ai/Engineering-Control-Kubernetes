@@ -88,7 +88,9 @@ def test_the_numbers_are_the_ones_the_planning_tables_show(tmp_path: Path) -> No
             )
         after = measure(repo.sessions, "falcone")
         assert after["orphans_open"] == _orphans(client, "open") == 0
-        assert (after["bugs_without_story"], after["bugs_confirmed"]) == (1, 1)
+        # The bug stands apart: it is counted on its own, and carries no link to a Story.
+        assert (after["bugs"], after["bugs_linked"], after["bugs_confirmed"]) == (1, 0, 1)
+        assert after["issues"] == 4
         assert after["issue_story_links"] == 2 and after["stories_without_issue"] == 1
         assert (after["epics"], after["stories_under_several_epics"]) == (2, 1)
         assert (after["epics_per_story"], after["most_epics_of_a_story"]) == (1.3, 2)

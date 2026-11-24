@@ -1,4 +1,5 @@
-"""A defect can stand alone or cover a Story through an established link."""
+"""A bug stands apart from the plan; a link it carries from before still shows until it is
+taken off."""
 
 from pathlib import Path
 from uuid import UUID
@@ -9,6 +10,7 @@ from engineering_control.dashboard import issue_coverage, review_graph
 from engineering_control.dashboard.workspace_issues import import_issues
 from engineering_control.db.models import (
     BacklogItem,
+    ProjectIssueStory,
     ProjectRecord,
     ProjectUserStory,
     WorkspaceAction,
@@ -74,7 +76,13 @@ def test_bug_sources_optional_links_and_counts(tmp_path: Path) -> None:
 
         check_coverage(False)
         path = "planning/issues/" + rows[1]["id"] + "/stories"
-        assert post(client, path, story_ids=[story]).status_code == 200
+        # A bug stands apart from the plan: it is given no User Story.
+        assert post(client, path, story_ids=[story]).status_code == 422
+        # A link from before the issue was known as a bug still counts until it is taken off.
+        with repo.sessions.begin() as db:
+            db.add(
+                ProjectIssueStory(project_id=pid, item_id=UUID(rows[1]["id"]), story_id=UUID(story))
+            )
         check_coverage(True)
         assert client.get(BASE.replace("/issues", "/epics")).json()["items"][0]["issue_count"] == 1
         assert post(client, path, story_ids=[]).status_code == 200
@@ -107,12 +115,11 @@ def test_pending_github_bug_shows_its_established_links(tmp_path: Path) -> None:
             db.flush()
             import_issues(db, db.get_one(ProjectRecord, pid), [snapshot(12, labels=["bug"])])
         [issue] = client.get(BASE).json()["items"]
-        assert (
-            post(
-                client, "planning/issues/" + issue["id"] + "/stories", story_ids=[story]
-            ).status_code
-            == 200
-        )
+        # The link was made before the issue was known as a bug.
+        with repo.sessions.begin() as db:
+            db.add(
+                ProjectIssueStory(project_id=pid, item_id=UUID(issue["id"]), story_id=UUID(story))
+            )
         with repo.sessions.begin() as db:
             candidate = WorkspaceCandidate(
                 project_id=pid,

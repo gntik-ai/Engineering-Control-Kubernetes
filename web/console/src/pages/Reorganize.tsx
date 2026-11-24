@@ -25,6 +25,8 @@ interface Progress {
   drawn: number;
   judged: number;
   wanted: number;
+  /** Pairs left out because their issue is a bug: a bug has no User Story. */
+  set_aside?: number;
   by_label: Record<string, number>;
   buckets: { bucket: string; why: string; drawn: number; judged: number }[];
 }
@@ -143,6 +145,15 @@ function Judge({ project, onJudged }: { project: string; onJudged: () => void })
                 ? `${whole(data.judged)} of ${whole(data.drawn)} are judged.`
                 : 'None is drawn yet for this project.'}
             </p>
+            {data.set_aside ? (
+              <Alert
+                tone="info"
+                title={`${some(data.set_aside, 'pair was', 'pairs were')} set aside: the issue is a bug`}
+              >
+                A bug stands apart from the plan and has no User Story, so there is nothing to judge.{' '}
+                {data.drawn < data.wanted ? 'Draw the pairs that are missing to put others in their place.' : ''}
+              </Alert>
+            ) : null}
             {data.drawn < data.wanted ? (
               <div>
                 <Button
@@ -155,7 +166,9 @@ function Judge({ project, onJudged }: { project: string; onJudged: () => void })
                 </Button>
                 {data.drawn ? (
                   <span className="ms-3 text-sm text-muted-foreground">
-                    The project has fewer pairs of some situations than the set asks for.
+                    {data.set_aside
+                      ? 'Some pairs were set aside, or the project has fewer pairs of some situations than the set asks for.'
+                      : 'The project has fewer pairs of some situations than the set asks for.'}
                   </span>
                 ) : null}
               </div>
