@@ -10,7 +10,13 @@ from sqlalchemy import select
 
 from engineering_control.dashboard import ranking
 from engineering_control.dashboard.planning_drift import digest_lines, drift
-from engineering_control.db.models import BacklogItem, PlanningHealth, ScorerDecision
+from engineering_control.dashboard.workspace_issues import import_issues
+from engineering_control.db.models import (
+    BacklogItem,
+    PlanningHealth,
+    ProjectRecord,
+    ScorerDecision,
+)
 from tests.test_dashboard_web import _authenticated_client
 from tests.test_delivery import vector
 from tests.test_project_coverage import seed
@@ -86,7 +92,7 @@ def test_every_project_has_a_row_and_a_next_step(tmp_path: Path) -> None:
         row = client.get(BASE + "rollout").json()
         said = [step["says"] for step in row["steps"]]
         assert any("Judge the pairs" in text for text in said)
-        assert any("open issues have no User Story" in text for text in said)
+        assert any("2 open issues have no User Story" in text for text in said)
         assert row["drift"]["numbers"]["orphans_open"] == 2
         assert client.get("/api/dashboard/projects/unknown/rollout").status_code == 404
     finally:
@@ -120,8 +126,13 @@ def test_an_issue_that_arrived_is_shown_where_the_cascade_put_it(tmp_path: Path)
                         detail={},
                     )
                 )
-            # An issue that came in long ago is no arrival.
-            items[43].created_at = datetime.now(UTC) - timedelta(days=40)
+            # An issue arrived when it was opened on GitHub, whenever the platform read
+            # it. One opened long ago is no arrival; one with no date cannot be placed.
+            recent = (datetime.now(UTC) - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+            for number in (41, 42, 44, 45):
+                items[number].facts = {**(items[number].facts or {}), "github_created_at": recent}
+            old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+            items[43].facts = {**(items[43].facts or {}), "github_created_at": old}
         found = client.get(BASE + "arrivals")
         assert found.status_code == 200, found.text
         arrivals = found.json()
@@ -139,5 +150,23 @@ def test_an_issue_that_arrived_is_shown_where_the_cascade_put_it(tmp_path: Path)
                 db.delete(row)
         counts = client.get(BASE + "arrivals", params={"days": 90}).json()["counts"]
         assert counts == {"bug": 1, "linked": 1, "unscored": 3}
+        # The import keeps the day an issue was opened.
+        with repo.sessions.begin() as db:
+            import_issues(
+                db,
+                db.get_one(ProjectRecord, pid),
+                [
+                    {
+                        "number": 91,
+                        "state": "open",
+                        "title": "Opened today",
+                        "body": "",
+                        "labels": [],
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                ],
+            )
+        newest = client.get(BASE + "arrivals").json()["items"][0]
+        assert newest["title"] == "#91 Opened today" and newest["stands"] == "unread"
     finally:
         client.close()

@@ -303,7 +303,14 @@ def import_issues(db: Session, project: ProjectRecord, issues: list[dict[str, An
         item.issue_url = issue.get("html_url") or f"https://github.com/{repo}/issues/{n}"
         item.issue_labels = issue.get("labels") or []
         item.issue_updated_at = date
-        item.facts = {**(item.facts or {}), "github_state_reason": issue.get("state_reason")}
+        item.facts = {
+            **(item.facts or {}),
+            "github_state_reason": issue.get("state_reason"),
+            # When the issue was opened on GitHub: what "arrived" is counted from. Kept
+            # from an earlier import where this one does not say.
+            "github_created_at": issue.get("created_at")
+            or (item.facts or {}).get("github_created_at"),
+        }
         if item.issue_state == "closed" and item.state in ("proposed", "accepted", "done"):
             item.state = "done"
             item.done_at = item.github_closed_at

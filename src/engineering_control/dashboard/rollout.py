@@ -28,6 +28,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.planning import _visible_issues
 from engineering_control.dashboard.planning_drift import drift
 from engineering_control.dashboard.planning_links import PlanningLinks
 from engineering_control.dashboard.project_records import active_project
@@ -46,10 +47,15 @@ from engineering_control.db.models import (
     ScorerDecision,
     ScorerReport,
     StoryDelivery,
+    WorkspaceSource,
 )
 
 ARRIVED_DAYS: Final = 14
 LISTED: Final = 50
+
+
+def _some(count: int, one: str, many: str) -> str:
+    return f"{count:,} {one if count == 1 else many}"
 
 
 def _count(db: Session, model: Any, *where: Any) -> int:
@@ -122,15 +128,20 @@ def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
             steps.append(
                 {
                     "view": "reorganize",
-                    "says": f"{numbers['changes_ready']:,} changes wait for your approval.",
+                    "says": _some(numbers["changes_ready"], "change waits", "changes wait")
+                    + " for your approval.",
                 }
             )
         if numbers.get("structure_proposals"):
             steps.append(
                 {
                     "view": "reorganize",
-                    "says": f"{numbers['structure_proposals']:,} proposals for the structure "
-                    "wait for your word.",
+                    "says": _some(
+                        numbers["structure_proposals"],
+                        "proposal for the structure waits",
+                        "proposals for the structure wait",
+                    )
+                    + " for your word.",
                 }
             )
         if unsupported > answered:
@@ -155,14 +166,16 @@ def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
             steps.append(
                 {
                     "view": "bugs",
-                    "says": f"{numbers['bugs_linked']:,} bugs still carry a link to a User Story.",
+                    "says": _some(numbers["bugs_linked"], "bug still carries", "bugs still carry")
+                    + " a link to a User Story.",
                 }
             )
         if numbers.get("orphans_open"):
             steps.append(
                 {
                     "view": "related-work",
-                    "says": f"{numbers['orphans_open']:,} open issues have no User Story.",
+                    "says": _some(numbers["orphans_open"], "open issue has", "open issues have")
+                    + " no User Story.",
                 }
             )
     return {
@@ -218,15 +231,40 @@ class Rollout:
         with self.sessions() as db:
             project = active_project(db, name)
             pid = project.id
-            rows = db.scalars(
-                select(BacklogItem)
-                .where(
+            # An issue arrived when it was opened on GitHub, not when the platform first
+            # read it: a project's whole history is read on one day. Only issues of the
+            # plan are counted; one that is itself an Epic or a Story is not.
+            opened: dict[UUID, datetime] = {}
+            rows = []
+            # What Discovery read of each issue says when it was opened, for the issues
+            # that have not been read again since.
+            read_before = {
+                key: (evidence or {}).get("created_at")
+                for key, evidence in db.execute(
+                    select(WorkspaceSource.key, WorkspaceSource.evidence).where(
+                        WorkspaceSource.project_id == pid, WorkspaceSource.key.like("issue:%")
+                    )
+                )
+            }
+            for row in db.scalars(
+                select(BacklogItem).where(
                     BacklogItem.project_id == pid,
                     BacklogItem.issue_number.is_not(None),
-                    BacklogItem.created_at >= since,
+                    _visible_issues(pid),
+                    BacklogItem.workspace_review.is_distinct_from("planning"),
                 )
-                .order_by(BacklogItem.created_at.desc(), BacklogItem.id)
-            ).all()
+            ):
+                said = (row.facts or {}).get("github_created_at") or read_before.get(
+                    f"issue:{row.issue_number}"
+                )
+                if not said:
+                    continue
+                at = datetime.fromisoformat(str(said).replace("Z", "+00:00"))
+                at = at if at.tzinfo else at.replace(tzinfo=UTC)
+                if at >= since:
+                    opened[row.id] = at
+                    rows.append(row)
+            rows.sort(key=lambda row: (-opened[row.id].timestamp(), str(row.id)))
             keys = [row.id for row in rows]
             bugs = set(
                 db.scalars(bugs_with_optional_stories(db, pid).where(BacklogItem.id.in_(keys)))
@@ -305,15 +343,12 @@ class Rollout:
                     stands = "unread"
                 counts[stands] += 1
                 if len(items) < LISTED:
-                    created = row.created_at
                     items.append(
                         {
                             "id": str(row.id),
                             "title": f"#{row.issue_number} {row.title}",
                             "state": "closed" if row.issue_state == "closed" else "open",
-                            "arrived_at": (
-                                created if created.tzinfo else created.replace(tzinfo=UTC)
-                            ).isoformat(),
+                            "arrived_at": opened[row.id].isoformat(),
                             "stands": stands,
                             "story": story,
                             "share": share,
