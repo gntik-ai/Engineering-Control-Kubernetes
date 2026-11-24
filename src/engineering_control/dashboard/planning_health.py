@@ -19,7 +19,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import planning_links
+from engineering_control.dashboard import delivery, planning_links
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
 from engineering_control.db.models import (
@@ -58,6 +58,8 @@ FOLLOWED: Final = (
     "primaries_suggested",
     "reviews_waiting",
     "scorer_abstains",
+    "stories_unsupported",
+    "stories_delivered_open",
 )
 
 
@@ -127,6 +129,7 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         # What the scorer would do, as it last reported: where it is sure, and where it
         # abstains and the case waits for a decision model or the administrator.
         scorer = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project.id))
+        delivered = delivery.numbers(db, project.id)
         would: dict[str, int] = {}
         for entry in (scorer or {}).get("kinds", []):
             for outcome, count in (entry.get("would") or {}).items():
@@ -208,6 +211,8 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         "reviews_failed": waiting.get("failed", 0),
         "runs_cut_off": int(cut_off or 0),
         "reviews_waiting": sum(waiting.values()) + int(cut_off or 0),
+        # Where the Stories stand, from evidence: the two that should be zero.
+        **delivered,
         "scorer_sure": sum(
             would.get(k, 0) for k in ("place", "primary", "confirmed", "unsupported")
         ),

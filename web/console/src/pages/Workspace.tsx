@@ -29,7 +29,7 @@ import { OrphanWorklist } from './OrphanWorklist';
 import { PrimaryEpics } from './PrimaryEpics';
 import { Documents } from './Documents';
 import { Reorganize } from './Reorganize';
-import { FinishedStories } from './FinishedStories';
+import { StoryStates } from './StoryStates';
 import { PlanningReviews } from './PlanningReviews';
 import { WorkspaceImport } from './WorkspaceImport';
 
@@ -193,7 +193,7 @@ export function ProjectWorkspace({
                 {view === 'related-work' && <OrphanWorklist project={project.project} />}
                 {view === 'related-work' && <EvidencePanel project={project.project} />}
                 {view === 'planning' && <PrimaryEpics project={project.project} />}
-                {view === 'planning' && <FinishedStories project={project.project} />}
+                {view === 'planning' && <StoryStates project={project.project} />}
                 {view === 'planning' && <PlanningReviews project={project.project} />}
                 {view === 'reorganize' && <Reorganize project={project.project} />}
                 {view === 'discovery' && <Documents project={project.project} />}

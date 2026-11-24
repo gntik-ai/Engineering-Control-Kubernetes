@@ -46,6 +46,9 @@ interface Numbers {
   reviews_failed: number;
   runs_cut_off: number;
   reviews_waiting: number;
+  stories_unsupported?: number;
+  stories_delivered_open?: number;
+  stories_with_leads?: number;
   scorer_sure?: number;
   scorer_abstains?: number;
 }
@@ -291,6 +294,37 @@ export function PlanningHealth({ project }: { project: string }) {
                 since={since}
               />
             </Group>
+            {now.stories_unsupported !== undefined ? (
+              <Group
+                title="Where the User Stories stand"
+                about="Each open User Story has a state from evidence. A Story with no issue is not one thing: it may be delivered, planned, or supported by nothing."
+              >
+                <Tile
+                  value={now.stories_delivered_open ?? 0}
+                  label="Delivered User Stories still open"
+                  of="Their issues are closed and the whole Story is shown covered"
+                  was={was?.stories_delivered_open}
+                  since={since}
+                  href={reviewUrl(project, 'planning')}
+                />
+                <Tile
+                  value={now.stories_with_leads ?? 0}
+                  label="User Stories whose work is not linked"
+                  of="Issues with no User Story look like their work"
+                  was={was?.stories_with_leads}
+                  since={since}
+                  href={reviewUrl(project, 'planning')}
+                />
+                <Tile
+                  value={now.stories_unsupported}
+                  label="User Stories that nothing supports"
+                  of="No issue and no document was found"
+                  was={was?.stories_unsupported}
+                  since={since}
+                  href={reviewUrl(project, 'planning')}
+                />
+              </Group>
+            ) : null}
             {now.scorer_sure !== undefined && now.scorer_sure + (now.scorer_abstains ?? 0) > 0 ? (
               <Group
                 title="Reorganization"

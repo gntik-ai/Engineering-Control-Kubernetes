@@ -246,7 +246,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R5 | Signals: identifiers, an embedding model and a reranker, joined recall, a labelled set to measure against. | The true parent is among the top 20 candidates for at least 95% of held-out links and ranked first for at least 85%. |
 | R6 | Scorer in shadow mode: one learned judgment from all signals that abstains where it cannot rule the other candidates out. Asking decision models about what it abstains on moved to R7, since it spends money. | A report of every change it would make, with how often it is right when it would act, measured on known links it never saw. Nothing is changed. |
 | R7 | Reorganize links: the scorer's sure cases as batches to approve for reasons recorded, primary Epics chosen, issues placed and unsupported links taken off. | A sample is judged before each batch; an approved batch can be undone for 30 days; what is judged teaches the scorer. |
-| R8 | Reorganize Stories: a delivery state for each from issues, OpenSpec, documents and code. | Delivered Stories are offered as a batch to close; every Story shows its state with its evidence. |
+| R8 | Reorganize Stories: a delivery state for every open Story from its issues, OpenSpec changes, similar unlinked issues and documents; delivered Stories as a batch to close. | Every Story has a state with its evidence, followed in Planning health. |
 | R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
 | R10 | Reorganize structure: split Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
 | R11 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; the clean-up plan follows the repository; each project follows the same numbers. |
@@ -415,6 +415,14 @@ A batch is made when the administrator asks to review a kind (`POST …/reorgani
 Applying uses the existing paths: `PlanningRecords.link_stories` and `PlanningLinks.noted` to place an issue (origin `scorer`), `PlanningLinks.set_primary` for a primary Epic, `PlanningLinks.explain` for a reason, and `PlanningRecords.remove_story_link` to take one link off, which may leave the issue without a User Story and keeps the platform from making the link again. Bugs are never in a batch.
 
 Planning health gains two numbers under "Reorganization": the changes the scorer is sure of, and the records it abstains on.
+
+### Where each User Story stands
+
+**Reviews → Planning** shows one state for every open User Story: delivered, work closed, in progress, dropped, work not linked, planned, or nothing supports it. The rules are in [planning-reorganization.md](planning-reorganization.md#where-each-user-story-stands-r8). It replaces the earlier list of open Stories whose issues are all closed, which is now the first two states.
+
+`Delivery.refresh` works the states out after each computation of the scorer and keeps them in `story_delivery` (migration 0079) with their evidence. `GET /api/dashboard/projects/{name}/delivery` returns the count per state; `GET …/delivery/stories?state=&page=` lists the Stories of a state with their issues, OpenSpec changes, leads and documents. The ranking service gives each document of the inventory a vector (`record_vectors`, kind `doc`).
+
+The batch kind `close` on **Reviews → Reorganize** closes the delivered Stories on approval, through `PlanningLifecycle.preview` and `confirm`, and only where closing touches no open issue. Planning health gains "Where the User Stories stand": delivered Stories still open, Stories whose work is not linked, and Stories that nothing supports.
 
 ### A review run that was cut off
 

@@ -43,6 +43,7 @@ from engineering_control.dashboard.ranking import Ranker, RankerError, digest_of
 from engineering_control.dashboard.review_graph import terms
 from engineering_control.db.models import (
     BacklogItem,
+    DocFile,
     GoldPair,
     PairScore,
     PlanningLink,
@@ -458,7 +459,18 @@ class Signals:
             project = active_project(db, name)
             have = ranking.vector_digests(db, project.id, model)
             due = []
-            for (kind, record), text in _plan(db, project).texts().items():
+            texts = _plan(db, project).texts()
+            # Each document of the inventory too: what a User Story is like among them
+            # is evidence of where the Story stands.
+            for key, path, title, body in db.execute(
+                select(DocFile.id, DocFile.path, DocFile.title, DocFile.text).where(
+                    DocFile.project_id == project.id,
+                    DocFile.removed_scan_id.is_(None),
+                    DocFile.text.is_not(None),
+                )
+            ):
+                texts["doc", key] = text_of(title or path, body)
+            for (kind, record), text in texts.items():
                 wanted = digest_of(text)
                 if have.get((kind, record)) != wanted:
                     due.append((project.id, kind, record, text, wanted))

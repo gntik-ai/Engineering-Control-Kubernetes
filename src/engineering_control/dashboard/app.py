@@ -1861,6 +1861,33 @@ def create_app(
             request, lambda: repo(request).scorer.decisions(name, kind, outcome, page, page_size)
         )
 
+    @app.get("/api/dashboard/projects/{name}/delivery")
+    async def delivery_api(name: str, request: Request) -> Response:
+        """How many open User Stories stand in each state of delivery."""
+        return await documents_read(request, lambda: repo(request).delivery.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/delivery/stories")
+    async def delivery_stories_api(
+        name: str,
+        request: Request,
+        state: Literal[
+            "",
+            "delivered",
+            "closed_work",
+            "in_progress",
+            "dropped",
+            "leads",
+            "planned",
+            "unsupported",
+        ] = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """The open User Stories in one state of delivery, each with its evidence."""
+        return await documents_read(
+            request, lambda: repo(request).delivery.listing(name, state, page, page_size)
+        )
+
     @app.get("/api/dashboard/projects/{name}/reorganize/batches")
     async def reorg_batches_api(name: str, request: Request) -> Response:
         """What the scorer has ready to approve, by kind, and the batches made of it."""

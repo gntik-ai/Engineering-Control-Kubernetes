@@ -16,6 +16,7 @@ from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.bugs import Bugs
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
+from engineering_control.dashboard.delivery import Delivery
 from engineering_control.dashboard.doc_inventory import DocInventory
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
 from engineering_control.dashboard.execution_plans import ExecutionPlans
@@ -130,6 +131,8 @@ class DashboardRepository:
         self.signals = Signals(self.sessions, self.planning_links)
         self.scorer = Scorer(self.sessions, self.planning_links)
         self.signals.wanted_for_all = self.scorer.uses_reranker
+        self.delivery = Delivery(self.sessions, self.planning_links)
+        self.scorer.after = self.delivery.refresh_all
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)

@@ -101,7 +101,13 @@ def test_an_issue_is_placed_by_an_approved_batch_and_the_batch_can_be_undone(
         # A bug is never in a batch: it has no User Story.
         with repo.sessions.begin() as db:
             db.get_one(BacklogItem, other).title = "bug: dependencies are stale"
-        assert ready(client) == {"reasons": 0, "primary": 0, "place": 1, "unsupported": 0}
+        assert ready(client) == {
+            "reasons": 0,
+            "primary": 0,
+            "place": 1,
+            "unsupported": 0,
+            "close": 0,
+        }
 
         batch = prepared(client, "place")
         assert batch["batch"]["state"] == "sample" and batch["total"] == 1
@@ -192,7 +198,13 @@ def test_reasons_are_recorded_and_unsupported_links_taken_off(tmp_path: Path) ->
         decide(repo, pid, "issue_story", "unsupported", doubtful, respond)
         # The administrator's own link is never called unsupported, whatever is said of it.
         decide(repo, pid, "issue_story", "unsupported", issue(repo, 44), respond)
-        assert ready(client) == {"reasons": 1, "primary": 0, "place": 0, "unsupported": 1}
+        assert ready(client) == {
+            "reasons": 1,
+            "primary": 0,
+            "place": 0,
+            "unsupported": 1,
+            "close": 0,
+        }
         without = measure(repo.sessions, "falcone")["links_without_reason"]
 
         reasons = prepared(client, "reasons")

@@ -9,6 +9,8 @@ import { some, whole } from './ChoiceRun';
 type RecordKind = 'issues' | 'stories' | 'epics';
 interface Measured {
   error: number;
+  /** The lines follow from a rule, not from the scorer's measurement. */
+  rule?: boolean;
   measured_here?: boolean;
   children?: number | null;
   acted_count?: number | null;
@@ -80,6 +82,8 @@ const STATE = {
 /** What the scorer measured for this kind of change, in a sentence. */
 function measuredText(measured: Measured): string {
   const allowed = `It may be wrong in at most ${percent(measured.error)} of them.`;
+  if (measured.rule)
+    return 'These follow from a rule, not from the scorer: the sample is the check. At most one in fifty may be wrong.';
   if (!measured.acted_count) return `The scorer has not been measured acting on this kind of link yet. ${allowed}`;
   return (
     `On ${whole(measured.acted_count)} known links it had never seen, the scorer was right in ${percent(measured.acted_right)} of the cases it would act on` +
@@ -163,7 +167,7 @@ function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batc
             </div>
             <div>
               <Link href={recordUrl(project, line.child.kind, line.child.id)}>{line.child.title}</Link>
-              {batch.kind === 'unsupported' ? ' ✕ ' : ' → '}
+              {batch.kind === 'unsupported' ? ' ✕ ' : batch.kind === 'close' ? ' · delivered, as shown by ' : ' → '}
               <Link href={recordUrl(project, line.parent.kind, line.parent.id)}>{line.parent.title}</Link>
             </div>
             <div className="text-xs text-muted-foreground">{line.reason}</div>

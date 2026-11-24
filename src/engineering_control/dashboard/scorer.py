@@ -27,6 +27,7 @@ import hashlib
 import logging
 import math
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -53,6 +54,7 @@ from engineering_control.dashboard.signals import (
 )
 from engineering_control.db.models import (
     BacklogItem,
+    DocFile,
     GoldPair,
     PairScore,
     PlanningLink,
@@ -333,6 +335,8 @@ def cases_of(db: Session, project: ProjectRecord) -> tuple[list[_Case], _Plan] |
         .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
         .where(ReorgLine.project_id == project.id, ReorgLine.verdict.is_not(None))
     ):
+        if line.link_kind not in (ISSUE_STORY, STORY_EPIC):
+            continue
         children = plan.issues if line.link_kind == ISSUE_STORY else plan.stories
         parents_ = plan.stories if line.link_kind == ISSUE_STORY else plan.epics
         if line.child_id not in children or line.parent_id not in parents_:
@@ -560,6 +564,8 @@ class Scorer:
         self.sessions = sessions
         self.links = links
         self.computed_at: datetime | None = None
+        # What is worked out from the scorer's answers, done again whenever they are.
+        self.after: Callable[[], Any] | None = None
 
     # ------------------------------------------------------------- computing
 
@@ -585,6 +591,7 @@ class Scorer:
                 ProjectUserStory,
                 ProjectEpic,
                 ReorgLine,
+                DocFile,
             )
             parts = [
                 tuple(db.execute(select(func.count(), func.max(table.updated_at))).one())
@@ -654,6 +661,8 @@ class Scorer:
                 row.computed_at = datetime.now(UTC)
                 written += len(decisions)
         self.computed_at = datetime.now(UTC)
+        if self.after is not None:
+            self.after()
         return written
 
     @staticmethod

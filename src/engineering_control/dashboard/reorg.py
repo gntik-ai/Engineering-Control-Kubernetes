@@ -50,6 +50,7 @@ from engineering_control.db.models import (
     ReorgLine,
     ScorerDecision,
     ScorerReport,
+    StoryDelivery,
 )
 
 UNDO_DAYS: Final = 30
@@ -94,8 +95,16 @@ KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
         "place the User Story among the issue's first five. Approving takes the link off; "
         "an issue left with no User Story then waits for one like any other.",
     ),
+    "close": (
+        "story_close",
+        "delivered",
+        REMOVE_ERROR,
+        "Close delivered User Stories",
+        "Each of these User Stories has issues, all of them closed as done, and something "
+        "shows the whole Story was covered: a review, or an OpenSpec change with every task "
+        "done. Approving closes the Story. No issue is touched.",
+    ),
 }
-LINK_SIDE: Final = {ISSUE_STORY: "issues", STORY_EPIC: "stories"}
 
 
 def why(kind: str, confidence: float, signals: dict[str, Any], candidates: int) -> str:
@@ -151,6 +160,8 @@ class Reorg:
         """The scorer's decisions of that kind that can go into a batch: not in one
         already, not judged wrong before, and still true of the plan."""
         link_kind, outcome, _error, _title, _about = KINDS[kind]
+        if kind == "close":
+            return self._delivered(db, project)
         decisions = db.scalars(
             select(ScorerDecision).where(
                 ScorerDecision.project_id == project.id,
@@ -209,10 +220,64 @@ class Reorg:
             found.append(decision)
         return sorted(found, key=lambda row: (-row.confidence, str(row.child_id)))
 
+    def _delivered(self, db: Session, project: ProjectRecord) -> list[ScorerDecision]:
+        """The open User Stories that stand as delivered, as lines to close: each with
+        the issue that shows it. Shaped like the scorer's decisions, which they are not."""
+        taken = {
+            line.child_id
+            for line, batch in db.execute(
+                select(ReorgLine, ReorgBatch)
+                .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+                .where(ReorgLine.project_id == project.id, ReorgBatch.kind == "close")
+            )
+            if line.verdict == "wrong"
+            or batch.state == "sample"
+            or (batch.state == "approved" and line.state == "applied")
+        }
+        found = []
+        for row, title in db.execute(
+            select(StoryDelivery, ProjectUserStory.title)
+            .join(ProjectUserStory, ProjectUserStory.id == StoryDelivery.story_id)
+            .where(
+                StoryDelivery.project_id == project.id,
+                StoryDelivery.state == "delivered",
+                ProjectUserStory.closed_at.is_(None),
+                ProjectUserStory.archived_at.is_(None),
+            )
+            .order_by(ProjectUserStory.title, StoryDelivery.story_id)
+        ):
+            evidence = row.evidence or {}
+            linked = evidence.get("linked") or []
+            if row.story_id in taken or not linked:
+                continue
+            shows = next((entry for entry in linked if entry.get("strength") == "full"), linked[0])
+            found.append(
+                ScorerDecision(
+                    id=row.id,
+                    project_id=project.id,
+                    kind="story_close",
+                    child_id=row.story_id,
+                    parent_id=UUID(shows["id"]),
+                    outcome="delivered",
+                    confidence=1.0,
+                    model="rule",
+                    detail={
+                        "why": (
+                            f"{title}: all {len(linked)} of its issues are closed as done. "
+                            + str(evidence.get("shown_by") or "")
+                        )
+                    },
+                )
+            )
+        return found
+
     @staticmethod
     def _measured(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         """What the scorer measured for that kind of link, as its report says."""
         link_kind, _outcome, error, _title, _about = KINDS[kind]
+        if kind == "close":
+            # A rule, not the scorer: nothing was measured, and the sample is the check.
+            return {"error": error, "rule": True}
         report = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project))
         entry = next(
             (e for e in (report or {}).get("kinds", []) if e.get("kind") == link_kind), None
@@ -429,7 +494,9 @@ class Reorg:
                         child_id=decision.child_id,
                         parent_id=decision.parent_id,
                         confidence=decision.confidence,
-                        reason=why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
+                        reason=str(detail.get("why"))
+                        if kind == "close"
+                        else why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
                         signals=signals,
                         sampled=decision.id in drawn,
                         state="pending",
@@ -514,6 +581,26 @@ class Reorg:
 
     def _apply(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
         """Make one line's change, and return how the link stood before."""
+        if kind == "close":
+            with self.sessions() as db:
+                project = active_project(db, name)
+                state = db.scalar(
+                    select(StoryDelivery.state).where(
+                        StoryDelivery.project_id == project.id, StoryDelivery.story_id == child
+                    )
+                )
+            if state != "delivered":
+                raise ProjectConflict("The User Story no longer stands as delivered.")
+            impact = self.planning.lifecycle.preview(name, "stories", child, "close")
+            # Closing a Story closes the issues that are only its own. A delivered Story
+            # has none open; were one open by now, closing would reach GitHub: not here.
+            if any(
+                entry["action"] == "close" and entry["kind"] != "stories"
+                for entry in impact["items"]
+            ):
+                raise ProjectConflict("An issue of the User Story is open by now.")
+            self.planning.lifecycle.confirm(name, "stories", child, "close", impact["token"])
+            return []
         if kind == "reasons":
             before = self.links.snapshot(name, "issues", child)
             if not self.links.explain(name, "issues", child, parent, reason):
@@ -603,6 +690,9 @@ class Reorg:
     def _revert(
         self, name: str, kind: str, child: UUID, parent: UUID, before: list[dict[str, Any]]
     ) -> None:
+        if kind == "close":
+            self.planning.set_state(name, "stories", child, "open")
+            return
         if kind in ("reasons", "primary"):
             side = "issues" if kind == "reasons" else "stories"
             if not self.links.restore(name, side, child, before):

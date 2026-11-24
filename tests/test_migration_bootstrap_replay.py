@@ -57,7 +57,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0076 keeps the ranking service's vectors and scores.
     # 0077 keeps the scorer's report and what it would do with each record.
     # 0078 keeps the batches of changes put before the administrator, and their lines.
-    assert (head, parent) == ("0078", "0077")
+    # 0079 keeps where each User Story stands, with the evidence for it.
+    assert (head, parent) == ("0079", "0078")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -159,8 +160,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert {"reorg_batches", "reorg_lines"} <= set(inspect(engine).get_table_names())
+    assert "story_delivery" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
+    assert "story_delivery" not in inspect(engine).get_table_names()
+    assert {"reorg_batches", "reorg_lines"} <= set(inspect(engine).get_table_names())
+    command.downgrade(config, "0077")
     assert not {"reorg_batches", "reorg_lines"} & set(inspect(engine).get_table_names())
     assert {"scorer_reports", "scorer_decisions"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, "0076")

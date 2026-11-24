@@ -1154,6 +1154,22 @@ class ScorerDecision(UUIDPrimaryKey, Timestamps, Base):
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
+class StoryDelivery(UUIDPrimaryKey, Timestamps, Base):
+    """Where a User Story stands, as the evidence shows it (migration 0079): delivered,
+    in progress, planned, or supported by nothing. Computed from the Story's issues, the
+    OpenSpec changes, similar work and the documents; written anew when they change.
+    It says where a Story stands and changes nothing about it."""
+
+    __tablename__ = "story_delivery"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    story_id: Mapped[UUID] = mapped_column(Uuid)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    __table_args__ = (UniqueConstraint("project_id", "story_id", name="uq_story_delivery_story"),)
+
+
 class ReorgBatch(UUIDPrimaryKey, Timestamps, Base):
     """Changes of one kind that the scorer would make, put before the administrator to
     approve together (migration 0078). A sample of its lines is judged first; an approved
