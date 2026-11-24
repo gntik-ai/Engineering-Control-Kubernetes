@@ -167,8 +167,18 @@ function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batc
             </div>
             <div>
               <Link href={recordUrl(project, line.child.kind, line.child.id)}>{line.child.title}</Link>
-              {batch.kind === 'unsupported' ? ' ✕ ' : batch.kind === 'close' ? ' · delivered, as shown by ' : ' → '}
-              <Link href={recordUrl(project, line.parent.kind, line.parent.id)}>{line.parent.title}</Link>
+              {line.parent.id === line.child.id ? null : (
+                <>
+                  {batch.kind === 'unsupported'
+                    ? ' ✕ '
+                    : batch.kind === 'close'
+                      ? ' · delivered, as shown by '
+                      : batch.kind.startsWith('retire_')
+                        ? ' · says the same as '
+                        : ' → '}
+                  <Link href={recordUrl(project, line.parent.kind, line.parent.id)}>{line.parent.title}</Link>
+                </>
+              )}
             </div>
             <div className="text-xs text-muted-foreground">{line.reason}</div>
           </li>

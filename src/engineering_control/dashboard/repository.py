@@ -14,6 +14,7 @@ from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.bugs import Bugs
+from engineering_control.dashboard.cleanup import Cleanup
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.delivery import Delivery
@@ -134,6 +135,7 @@ class DashboardRepository:
         self.delivery = Delivery(self.sessions, self.planning_links)
         self.scorer.after = self.delivery.refresh_all
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
+        self.cleanup = Cleanup(self.sessions, self.planning_links)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)
         self.bring_over = BringOver(self.sessions, self.backlog)

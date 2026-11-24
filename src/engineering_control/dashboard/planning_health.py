@@ -19,7 +19,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import delivery, planning_links
+from engineering_control.dashboard import cleanup, delivery, planning_links
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
 from engineering_control.db.models import (
@@ -129,7 +129,7 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         # What the scorer would do, as it last reported: where it is sure, and where it
         # abstains and the case waits for a decision model or the administrator.
         scorer = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project.id))
-        delivered = delivery.numbers(db, project.id)
+        delivered = {**delivery.numbers(db, project.id), **cleanup.numbers(db, project)}
         would: dict[str, int] = {}
         for entry in (scorer or {}).get("kinds", []):
             for outcome, count in (entry.get("would") or {}).items():

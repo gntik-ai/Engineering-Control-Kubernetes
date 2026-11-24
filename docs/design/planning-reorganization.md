@@ -258,6 +258,30 @@ One state per open Story, worked out again whenever the scorer is. Only what is 
 
 **Shown where.** Reviews → Planning, "Where each User Story stands": the count per state, and each Story with its issues, OpenSpec changes, leads and documents.
 
+## The clean-up as built (R9)
+
+**Reasons, by kind.** Two reasons count as two only when they are of different kinds.
+
+| Kind | Reason | For |
+| --- | --- | --- |
+| Absence | No issue and no document supports it (its delivery state) | User Story |
+| Model | A model, shown the Story with the issues and documents closest to it, found nothing that has to do with it | User Story |
+| Alike | It says nearly the same as another record (vectors at 0.95 or closer). Of two Stories the one with more work stays; of two open issues the older | User Story, issue |
+| State | Every issue under it was closed as not planned; every Story under the Epic is closed; every Story the issue is under is closed; the issue it says the same as was closed as done | all three |
+| Age | Open, under no Story, untouched for more than 180 days | Issue |
+| Structure | No Story has the Epic as its primary one | Epic |
+| Stated (exact) | The issue's own text says it duplicates another; the Epic holds no Story | Issue, Epic |
+
+**Proposed or only listed.** A record with an exact reason, or with reasons of two kinds, is proposed for closing. With one reason it is listed and nothing more. Closing is never deleting: a closed Story or Epic can be reopened.
+
+**The model's check.** A run the administrator starts, with a model and a token limit, over the Stories that nothing supports. One question per Story: the Story, the four issues with no Story and the three documents that lie closest to it, and three answers. "None has to do with it" is the second reason. "This one is its work" names the piece and withdraws the Story from the proposals, as does "cannot tell". An answer whose quoted passage is not in the Story's text gives no reason. The run uses the same engine, budget and controls as the worklists.
+
+**Batches.** "Close User Stories nothing stands behind" and "Close Epics nothing stands behind" on Reviews → Reorganize, at the error of 2%, with the sample, the strike and the undo of every batch. A line is applied only if the reasons still hold and closing touches nothing but the record itself.
+
+**Issues.** Listed with their reasons and the issue they say the same as. Not closed by a batch: closing an issue writes on GitHub and cannot be undone from here, and the plan asks for it to be closed there as not planned with a comment that names the reason. That comment is not built; until it is, an issue is closed by hand.
+
+**Not built.** Reasons that need what the project does not have yet: a Story's source document being gone (Stories do not record their source), an issue's subject no longer existing in the repository, an Epic overlapping another (R10). No code is read: the project has no code summaries.
+
 ## Revised plan
 
 R0 to R3 are done and deployed. Their worklists stay: they become the place where the cases the cascade abstains on are decided, and where its batches are approved.
@@ -269,7 +293,7 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | R6 | Scorer in shadow mode (built, 24 November 2026). One learned judgment from all signals; a bound per error rate that says which candidates cannot be ruled out; a report per project of what it would do with every record, and a first count of where the clean-up will look. The reranker is asked about every record only where it is measured to help. Not in R6 after all, and moved to R7 with the batches: asking a decision model about the cases the scorer abstains on, which spends money and so starts on your word; and the trial of a local model on the graphics card, which waits until a workload in the cluster is shown to reach the card. | The scorer is measured on known links it never saw, per project where there are enough. Where it would act it is right at least as often as the chosen error allows; how often it abstains is reported, not assumed. Nothing is changed. |
 | R7 | Reorganize links (first part built, 24 November 2026). The scorer's sure cases reach you as batches by kind: reasons recorded, primary Epics chosen, issues placed, unsupported links taken off. A sample is judged before a batch can be approved, any line can be struck, and an approved batch can be undone for 30 days. What you judge teaches the scorer. Planning health follows what the scorer is sure of and what it abstains on. Still to build in R7: using the scorer's order and candidates in the worklists' runs, so that a model is asked only about what the scorer abstains on, with a shorter list. | Each kind of change can be approved in one word after its sample, and undone. On Falcone the batches are empty until the scorer has enough known links there; on Falcone-serverless they hold what the scorer is sure of. |
 | R8 | Reorganize Stories (built, 24 November 2026). Every open Story has a delivery state from its issues, the OpenSpec changes of those issues, issues with no Story that look like its work, and the repository's documents. Delivered Stories are a batch to close. Code summaries are not read yet: no state depends on them so far. | Every Story has a state with its evidence; "Stories that nothing supports", "delivered Stories still open" and "Stories whose work is not linked" are followed in Planning health. |
-| R9 | Clean-up. Proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates: found by rules and ranking models, checked by a decision model, presented as one plan grouped by reason, applied through the existing close and delete actions only after your authorization. | Every proposal shows its reasons, its evidence and its impact; nothing is removed without authorization; a removed record can be restored; struck lines change what is proposed next. |
+| R9 | Clean-up (built, 24 November 2026). Records that reasons speak against are found among User Stories, Epics and open issues; a record is proposed for closing on two reasons of different kinds or an exact one. A run that asks a model about the Stories nothing supports gives the second reason, or withdraws the Story. Proposed Stories and Epics are batches to authorize, with sample and undo. Open issues are listed with their reasons and not closed by a batch: that writes on GitHub and waits for your decision on how it should be said there. | Every proposal shows its reasons and evidence; nothing is closed without authorization; a closed Story or Epic can be reopened by undoing the batch. |
 | R10 | Reorganize structure. Epic cohesion; proposals to split a broad Epic; missing Stories from orphan clusters and from document sections; all as one plan to approve. Replaces the earlier R5. | The plan can be approved or edited as a whole; after it, no Epic is the primary Epic of more than 10% of Stories. |
 | R11 | Continuous and everywhere. A new issue or a changed document goes through the cascade when it arrives; a nightly check for drift, which also refreshes the clean-up plan as the repository changes; rollout to the other projects, including those never through Discovery. Replaces the earlier R7. | A new issue is placed, or queued with its shortlist, within minutes; each project has its own thresholds and its health follows the same numbers. |
 | R12 | Epic pages written by the platform from the organized plan. The earlier R6, now last because it reads better from a plan that is in order. | Each Epic has a page that cites its Stories, issues and documents. |

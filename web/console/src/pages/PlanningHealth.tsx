@@ -49,6 +49,7 @@ interface Numbers {
   stories_unsupported?: number;
   stories_delivered_open?: number;
   stories_with_leads?: number;
+  cleanup_proposed?: number;
   scorer_sure?: number;
   scorer_abstains?: number;
 }
@@ -322,6 +323,14 @@ export function PlanningHealth({ project }: { project: string }) {
                   was={was?.stories_unsupported}
                   since={since}
                   href={reviewUrl(project, 'planning')}
+                />
+                <Tile
+                  value={now.cleanup_proposed ?? 0}
+                  label="Records proposed for closing"
+                  of="Two reasons of different kinds, or an exact one, speak against each"
+                  was={was?.cleanup_proposed}
+                  since={since}
+                  href={reviewUrl(project, 'reorganize')}
                 />
               </Group>
             ) : null}

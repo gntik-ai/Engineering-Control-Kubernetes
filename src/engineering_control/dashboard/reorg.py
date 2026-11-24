@@ -28,6 +28,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import cleanup
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
@@ -104,7 +105,26 @@ KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
         "shows the whole Story was covered: a review, or an OpenSpec change with every task "
         "done. Approving closes the Story. No issue is touched.",
     ),
+    "retire_stories": (
+        "story_retire",
+        "proposed",
+        REMOVE_ERROR,
+        "Close User Stories nothing stands behind",
+        "Two reasons of different kinds, or an exact one, speak against each of these User "
+        "Stories; each line says which. Approving closes the Story: it is not deleted and "
+        "can be reopened. No issue is touched.",
+    ),
+    "retire_epics": (
+        "epic_retire",
+        "proposed",
+        REMOVE_ERROR,
+        "Close Epics nothing stands behind",
+        "Two reasons of different kinds, or an exact one, speak against each of these "
+        "Epics. Approving closes the Epic: it is not deleted and can be reopened. No User "
+        "Story and no issue is touched.",
+    ),
 }
+RETIRED: Final = {"retire_stories": "stories", "retire_epics": "epics"}
 
 
 def why(kind: str, confidence: float, signals: dict[str, Any], candidates: int) -> str:
@@ -162,6 +182,8 @@ class Reorg:
         link_kind, outcome, _error, _title, _about = KINDS[kind]
         if kind == "close":
             return self._delivered(db, project)
+        if kind in RETIRED:
+            return self._retirable(db, project, kind)
         decisions = db.scalars(
             select(ScorerDecision).where(
                 ScorerDecision.project_id == project.id,
@@ -271,11 +293,56 @@ class Reorg:
             )
         return found
 
+    def _retirable(self, db: Session, project: ProjectRecord, kind: str) -> list[ScorerDecision]:
+        """The User Stories or Epics the clean-up proposes to close, as lines: each with
+        its reasons in words. Shaped like the scorer's decisions, which they are not."""
+        taken = {
+            line.child_id
+            for line, batch in db.execute(
+                select(ReorgLine, ReorgBatch)
+                .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+                .where(ReorgLine.project_id == project.id, ReorgBatch.kind == kind)
+            )
+            if line.verdict == "wrong"
+            or batch.state == "sample"
+            or (batch.state == "approved" and line.state == "applied")
+        }
+        found = []
+        for entry in cleanup.candidates(db, project):
+            key = UUID(entry["id"])
+            if entry["kind"] != RETIRED[kind] or not entry["proposed"] or key in taken:
+                continue
+            said = []
+            twin: UUID | None = None
+            for reason in entry["reasons"]:
+                text = str(reason["says"])
+                if reason.get("twin"):
+                    twin = twin or UUID(reason["twin"]["id"])
+                    text += f" ({reason['twin']['title']})"
+                if reason.get("why"):
+                    text += f": {reason['why']}"
+                said.append(text)
+            found.append(
+                ScorerDecision(
+                    id=key,
+                    project_id=project.id,
+                    kind=KINDS[kind][0],
+                    child_id=key,
+                    # The record that says the same, where there is one; else itself.
+                    parent_id=twin or key,
+                    outcome="proposed",
+                    confidence=1.0,
+                    model="rule",
+                    detail={"why": ". ".join(said) + "."},
+                )
+            )
+        return found
+
     @staticmethod
     def _measured(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         """What the scorer measured for that kind of link, as its report says."""
         link_kind, _outcome, error, _title, _about = KINDS[kind]
-        if kind == "close":
+        if kind == "close" or kind in RETIRED:
             # A rule, not the scorer: nothing was measured, and the sample is the check.
             return {"error": error, "rule": True}
         report = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project))
@@ -495,7 +562,7 @@ class Reorg:
                         parent_id=decision.parent_id,
                         confidence=decision.confidence,
                         reason=str(detail.get("why"))
-                        if kind == "close"
+                        if kind == "close" or kind in RETIRED
                         else why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
                         signals=signals,
                         sampled=decision.id in drawn,
@@ -581,6 +648,26 @@ class Reorg:
 
     def _apply(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
         """Make one line's change, and return how the link stood before."""
+        if kind in RETIRED:
+            side = RETIRED[kind]
+            with self.sessions() as db:
+                project = active_project(db, name)
+                still = any(
+                    entry["proposed"] and entry["kind"] == side and entry["id"] == str(child)
+                    for entry in cleanup.candidates(db, project)
+                )
+            if not still:
+                raise ProjectConflict("The reasons against it no longer hold.")
+            impact = self.planning.lifecycle.preview(name, side, child, "close")  # type: ignore[arg-type]
+            # Closing may reach the record's own children. Nothing but the record itself
+            # is closed here: were a child still open, the line is left alone.
+            if any(
+                entry["action"] == "close" and entry["id"] != str(child)
+                for entry in impact["items"]
+            ):
+                raise ProjectConflict("Closing it would close records under it that are open.")
+            self.planning.lifecycle.confirm(name, side, child, "close", impact["token"])  # type: ignore[arg-type]
+            return []
         if kind == "close":
             with self.sessions() as db:
                 project = active_project(db, name)
@@ -690,8 +777,9 @@ class Reorg:
     def _revert(
         self, name: str, kind: str, child: UUID, parent: UUID, before: list[dict[str, Any]]
     ) -> None:
-        if kind == "close":
-            self.planning.set_state(name, "stories", child, "open")
+        if kind == "close" or kind in RETIRED:
+            side = RETIRED.get(kind, "stories")
+            self.planning.set_state(name, side, child, "open")  # type: ignore[arg-type]
             return
         if kind in ("reasons", "primary"):
             side = "issues" if kind == "reasons" else "stories"

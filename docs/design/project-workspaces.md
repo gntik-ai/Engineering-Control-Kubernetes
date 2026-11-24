@@ -247,7 +247,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R6 | Scorer in shadow mode: one learned judgment from all signals that abstains where it cannot rule the other candidates out. Asking decision models about what it abstains on moved to R7, since it spends money. | A report of every change it would make, with how often it is right when it would act, measured on known links it never saw. Nothing is changed. |
 | R7 | Reorganize links: the scorer's sure cases as batches to approve for reasons recorded, primary Epics chosen, issues placed and unsupported links taken off. | A sample is judged before each batch; an approved batch can be undone for 30 days; what is judged teaches the scorer. |
 | R8 | Reorganize Stories: a delivery state for every open Story from its issues, OpenSpec changes, similar unlinked issues and documents; delivered Stories as a batch to close. | Every Story has a state with its evidence, followed in Planning health. |
-| R9 | Clean-up: proposals to remove issues, User Stories and Epics that are no longer relevant, and to merge duplicates. | One plan grouped by reason, each line with evidence and impact; nothing is removed without authorization; a removed record can be restored. |
+| R9 | Clean-up: records that reasons speak against, proposed for closing on two reasons of different kinds or an exact one; a model's check of the unsupported Stories; Stories and Epics closed by batches to authorize. | Every proposal shows its reasons; nothing is closed without authorization; issues are listed, not closed by a batch. |
 | R10 | Reorganize structure: split Epics, missing Stories from orphans and documents, as one plan. | The plan can be approved as a whole; no Epic is the primary Epic of more than 10% of Stories. |
 | R11 | Continuous and everywhere: new issues and changed documents go through the same process; rollout to every project. | A new issue is placed or queued within minutes; the clean-up plan follows the repository; each project follows the same numbers. |
 | R12 | Epic pages written by the platform. | One cited page per Epic, refreshed when its sources change. |
@@ -423,6 +423,14 @@ Planning health gains two numbers under "Reorganization": the changes the scorer
 `Delivery.refresh` works the states out after each computation of the scorer and keeps them in `story_delivery` (migration 0079) with their evidence. `GET /api/dashboard/projects/{name}/delivery` returns the count per state; `GET …/delivery/stories?state=&page=` lists the Stories of a state with their issues, OpenSpec changes, leads and documents. The ranking service gives each document of the inventory a vector (`record_vectors`, kind `doc`).
 
 The batch kind `close` on **Reviews → Reorganize** closes the delivered Stories on approval, through `PlanningLifecycle.preview` and `confirm`, and only where closing touches no open issue. Planning health gains "Where the User Stories stand": delivered Stories still open, Stories whose work is not linked, and Stories that nothing supports.
+
+### Clean-up
+
+**Reviews → Reorganize** lists, under "Clean-up", the records that reasons speak against, by reason, with how many of them are proposed for closing. The rule (two reasons of different kinds, or an exact one) and the reasons are in [planning-reorganization.md](planning-reorganization.md#the-clean-up-as-built-r9).
+
+`GET /api/dashboard/projects/{name}/cleanup` returns the reasons with their counts and what a model's check would ask and use; `GET …/cleanup/records?kind=&show=&page=` lists the records with their reasons and evidence. `POST …/cleanup/runs` starts the check of the User Stories that nothing supports and `…/cleanup/runs/{id}/control` stops, resumes or ends it; it is the kind `story_needed` of the choice-run engine (`parent_choice.py`), counted under the workflow `cleanup_check`.
+
+Proposed User Stories and Epics appear as the batch kinds `retire_stories` and `retire_epics`. Applying a line closes the record through `PlanningLifecycle`, only where that closes nothing else. Issues are listed and not closed by a batch. Planning health gains "Records proposed for closing".
 
 ### A review run that was cut off
 

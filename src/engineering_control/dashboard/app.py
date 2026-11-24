@@ -1888,6 +1888,56 @@ def create_app(
             request, lambda: repo(request).delivery.listing(name, state, page, page_size)
         )
 
+    @app.get("/api/dashboard/projects/{name}/cleanup")
+    async def cleanup_api(name: str, request: Request) -> Response:
+        """The reasons that speak against records of the project, and what a model's
+        check of the unsupported User Stories would ask."""
+        return await documents_read(request, lambda: repo(request).cleanup.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/cleanup/records")
+    async def cleanup_records_api(
+        name: str,
+        request: Request,
+        kind: Literal["", "stories", "epics", "issues"] = "",
+        show: Literal["", "proposed", "withdrawn"] = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """The records a reason speaks against, the proposed ones first."""
+        return await documents_read(
+            request, lambda: repo(request).cleanup.listing(name, kind, show, page, page_size)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/cleanup/runs")
+    async def cleanup_run_api(name: str, request: Request) -> Response:
+        """Ask a model about the User Stories that nothing supports, within these tokens."""
+        return await project_change(
+            request,
+            OrphanRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).cleanup.start,
+                name,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.again,
+            ),
+            event="workspace.cleanup_check_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/cleanup/runs/{run_id}/control")
+    async def cleanup_run_control_api(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).cleanup.control, name, run_id, body.action
+            ),
+            event="workspace.cleanup_check_controlled",
+            subject=name,
+        )
+
     @app.get("/api/dashboard/projects/{name}/reorganize/batches")
     async def reorg_batches_api(name: str, request: Request) -> Response:
         """What the scorer has ready to approve, by kind, and the batches made of it."""

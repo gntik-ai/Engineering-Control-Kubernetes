@@ -275,6 +275,8 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/reorganize/batches/{batch}/undo",
         "/api/dashboard/projects/{name}/reorganize/batches/{batch}/withdraw",
         "/api/dashboard/projects/{name}/bugs/unlink",
+        "/api/dashboard/projects/{name}/cleanup/runs",
+        "/api/dashboard/projects/{name}/cleanup/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/orphans/approve",
         "/api/dashboard/projects/{name}/orphans/{key}/link",
         "/api/dashboard/projects/{name}/orphans/{key}/draft",

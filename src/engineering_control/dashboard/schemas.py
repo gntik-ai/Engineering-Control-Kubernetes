@@ -583,7 +583,9 @@ class BugUnlinkInput(PlainChangeInput):
 class BatchInput(PlainChangeInput):
     """Which kind of change to gather into a batch for approval."""
 
-    kind: Literal["reasons", "primary", "place", "unsupported", "close"]
+    kind: Literal[
+        "reasons", "primary", "place", "unsupported", "close", "retire_stories", "retire_epics"
+    ]
 
 
 class BatchLineInput(PlainChangeInput):

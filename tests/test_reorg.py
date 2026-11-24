@@ -54,9 +54,11 @@ def decide(repo: Any, pid: UUID, kind: str, outcome: str, child: UUID, parent: U
 
 
 def ready(client: Any) -> dict[str, int]:
+    """How many changes the scorer has ready, by the kinds of batch that come from it."""
     found = client.get(BASE + "reorganize/batches")
     assert found.status_code == 200, found.text
-    return {kind["kind"]: kind["ready"] for kind in found.json()["kinds"]}
+    mine = ("reasons", "primary", "place", "unsupported")
+    return {kind["kind"]: kind["ready"] for kind in found.json()["kinds"] if kind["kind"] in mine}
 
 
 def prepared(client: Any, kind: str) -> dict[str, Any]:
@@ -106,7 +108,6 @@ def test_an_issue_is_placed_by_an_approved_batch_and_the_batch_can_be_undone(
             "primary": 0,
             "place": 1,
             "unsupported": 0,
-            "close": 0,
         }
 
         batch = prepared(client, "place")
@@ -203,7 +204,6 @@ def test_reasons_are_recorded_and_unsupported_links_taken_off(tmp_path: Path) ->
             "primary": 0,
             "place": 0,
             "unsupported": 1,
-            "close": 0,
         }
         without = measure(repo.sessions, "falcone")["links_without_reason"]
 
