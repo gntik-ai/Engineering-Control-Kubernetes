@@ -22,6 +22,8 @@ interface Numbers {
   stories_without_issue: number;
   stories_under_several_epics: number;
   epics_per_story: number;
+  epic_links_extra?: number;
+  epic_links_to_judge?: number;
   most_epics_of_a_story: number;
   epics_without_story: number;
   largest_epic_stories: number;
@@ -220,9 +222,10 @@ export function PlanningHealth({ project }: { project: string }) {
                 value={now.stories_under_several_epics}
                 label="User Stories under several Epics"
                 of={`of ${whole(now.stories)} User Stories`}
-                note={`Epics per Story: ${now.epics_per_story.toLocaleString('en')} on average, ${whole(now.most_epics_of_a_story)} at most`}
+                note={`Epics per Story: ${now.epics_per_story.toLocaleString('en')} on average, ${whole(now.most_epics_of_a_story)} at most${now.epic_links_extra !== undefined ? `; ${whole(now.epic_links_extra)} links beyond the primary Epic, ${whole(now.epic_links_to_judge ?? 0)} not judged` : ''}`}
                 was={was?.stories_under_several_epics}
                 since={since}
+                href={reviewUrl(project, 'reorganize')}
               />
               <Tile
                 value={now.largest_epic_stories}

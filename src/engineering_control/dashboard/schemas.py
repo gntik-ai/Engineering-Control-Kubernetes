@@ -600,6 +600,7 @@ class BatchInput(PlainChangeInput):
         "primary",
         "place",
         "unsupported",
+        "extra_epics",
         "close",
         "retire_stories",
         "retire_epics",

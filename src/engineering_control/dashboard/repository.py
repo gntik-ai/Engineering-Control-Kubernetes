@@ -20,6 +20,7 @@ from engineering_control.dashboard.connections import Connections
 from engineering_control.dashboard.delivery import Delivery
 from engineering_control.dashboard.doc_inventory import DocInventory
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
+from engineering_control.dashboard.epic_links import EpicLinks
 from engineering_control.dashboard.epic_pages import EpicPages
 from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.orphans import Orphans
@@ -137,6 +138,7 @@ class DashboardRepository:
         self.signals.wanted_for_all = self.scorer.uses_reranker
         self.delivery = Delivery(self.sessions, self.planning_links)
         self.epic_pages = EpicPages(self.sessions, self.planning_links)
+        self.epic_links = EpicLinks(self.sessions, self.planning_links)
         # When what the scorer reads changed, where the Stories stand is worked out
         # again, and then the Epics' pages, which say it.
         self.scorer.after = self._after_scoring

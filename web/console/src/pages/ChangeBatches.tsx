@@ -85,7 +85,7 @@ const STATE = {
 function measuredText(measured: Measured): string {
   const allowed = `It may be wrong in at most ${percent(measured.error)} of them.`;
   if (measured.rule)
-    return 'These follow from a rule, not from the scorer: the sample is the check. At most one in fifty may be wrong.';
+    return "These follow from a rule or from a model's answers, not from the scorer: the sample is the check. At most one in fifty may be wrong.";
   if (!measured.acted_count) return `The scorer has not been measured acting on this kind of link yet. ${allowed}`;
   return (
     `On ${whole(measured.acted_count)} known links it had never seen, the scorer was right in ${percent(measured.acted_right)} of the cases it would act on` +
@@ -171,7 +171,7 @@ function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batc
               <Link href={recordUrl(project, line.child.kind, line.child.id)}>{line.child.title}</Link>
               {line.parent.id === line.child.id ? null : (
                 <>
-                  {batch.kind === 'unsupported'
+                  {batch.kind === 'unsupported' || batch.kind === 'extra_epics'
                     ? ' ✕ '
                     : batch.kind === 'close'
                       ? ' · delivered, as shown by '

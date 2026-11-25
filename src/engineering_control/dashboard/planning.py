@@ -1135,6 +1135,67 @@ class PlanningRecords:
             item.updated_at = datetime.now(UTC)
             return True
 
+    def remove_epic_link(self, name: str, story: UUID, epic: UUID) -> bool:
+        """Take the User Story off one Epic and leave its other Epics. Its last Epic is
+        not taken off: a Story stands under at least one."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.scalar(
+                select(ProjectUserStory).where(
+                    ProjectUserStory.id == story,
+                    ProjectUserStory.project_id == project.id,
+                    ProjectUserStory.archived_at.is_(None),
+                )
+            )
+            if row is None:
+                raise ProjectNotFound(str(story))
+            links = db.scalars(
+                select(ProjectStoryEpic).where(
+                    ProjectStoryEpic.project_id == project.id, ProjectStoryEpic.story_id == story
+                )
+            ).all()
+            link = next((entry for entry in links if entry.epic_id == epic), None)
+            if link is None or len(links) < 2:
+                return False
+            db.delete(link)
+            record_changed(db, project.id, "stories", story, row.title)
+            row.updated_at = datetime.now(UTC)
+            return True
+
+    def restore_epic_link(self, name: str, story: UUID, epic: UUID) -> bool:
+        """Put back a link of a User Story to an Epic that was taken off, when a batch is
+        undone. Not when the Story or the Epic is gone."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.scalar(
+                select(ProjectUserStory).where(
+                    ProjectUserStory.id == story,
+                    ProjectUserStory.project_id == project.id,
+                    ProjectUserStory.archived_at.is_(None),
+                )
+            )
+            alive = db.scalar(
+                select(ProjectEpic.id).where(
+                    ProjectEpic.id == epic,
+                    ProjectEpic.project_id == project.id,
+                    ProjectEpic.archived_at.is_(None),
+                )
+            )
+            if row is None or alive is None:
+                return False
+            there = db.scalar(
+                select(ProjectStoryEpic.epic_id).where(
+                    ProjectStoryEpic.project_id == project.id,
+                    ProjectStoryEpic.story_id == story,
+                    ProjectStoryEpic.epic_id == epic,
+                )
+            )
+            if there is None:
+                db.add(ProjectStoryEpic(project_id=project.id, story_id=story, epic_id=epic))
+            record_changed(db, project.id, "stories", story, row.title)
+            row.updated_at = datetime.now(UTC)
+            return True
+
     @staticmethod
     def _mirror_stories(db: Session, project: UUID, item: BacklogItem) -> None:
         """Keep the pending proposal that stands for the issue in step with its Stories."""

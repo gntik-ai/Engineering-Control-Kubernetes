@@ -152,6 +152,19 @@ def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
                     "nothing supports and that have no answer yet.",
                 }
             )
+        if numbers.get("epic_links_to_judge"):
+            steps.append(
+                {
+                    "view": "reorganize",
+                    "says": "Ask a model about "
+                    + _some(
+                        numbers["epic_links_to_judge"],
+                        "link of a User Story to an Epic",
+                        "links of User Stories to Epics",
+                    )
+                    + " beyond the primary one: whether the Story has to do with that Epic.",
+                }
+            )
         if vectors and not all(measured.get(kind) for kind in (ISSUE_STORY, "story_epic")):
             steps.append(
                 {

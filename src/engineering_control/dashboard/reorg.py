@@ -7,7 +7,9 @@ changes nothing. Here its sure cases of one kind are gathered into a batch:
 - ``primary``: a User Story under several Epics gets its primary Epic chosen;
 - ``place``: an issue without a User Story is put under one;
 - ``unsupported``: an existing link that both the scorer and the plain rankings speak
-  against is taken off.
+  against is taken off;
+- ``extra_epics``: a link of a User Story to an Epic that is not its primary one, and
+  that a model found to have nothing to do with it, is taken off (``epic_links.py``).
 
 Nothing is applied without approval. A batch opens with a sample of its lines to judge
 right or wrong. More wrong ones than its error allows, and the batch is withdrawn. Any line
@@ -28,7 +30,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import cleanup
+from engineering_control.dashboard import cleanup, epic_links
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
@@ -96,6 +98,16 @@ KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
         "place the User Story among the issue's first five. Approving takes the link off; "
         "an issue left with no User Story then waits for one like any other.",
     ),
+    "extra_epics": (
+        STORY_EPIC,
+        "unrelated",
+        REMOVE_ERROR,
+        "Take off Epic links a model found unrelated",
+        "Each of these User Stories is linked to an Epic that is not its primary one, and "
+        "a model that read both found the Story to have nothing to do with that Epic's "
+        "goal; each line gives its reason and the passages it read. Approving takes the "
+        "link off. The Story keeps its primary Epic and its other Epics.",
+    ),
     "close": (
         "story_close",
         "delivered",
@@ -135,6 +147,9 @@ KINDS: Final[dict[str, tuple[str, str, float, str, str]]] = {
     ),
 }
 RETIRED: Final = {"retire_stories": "stories", "retire_epics": "epics", "retire_issues": "issues"}
+# The kinds whose lines come from a rule or a model's answer, not from the scorer: each
+# line brings its own reason, nothing was measured, and the sample is the check.
+RULED: Final = frozenset({"close", "extra_epics", *RETIRED})
 # What a batch does that cannot be put back from here.
 FINAL: Final = frozenset({"retire_issues"})
 
@@ -207,6 +222,8 @@ class Reorg:
             return self._delivered(db, project)
         if kind in RETIRED:
             return self._retirable(db, project, kind)
+        if kind == "extra_epics":
+            return self._unrelated(db, project)
         decisions = db.scalars(
             select(ScorerDecision).where(
                 ScorerDecision.project_id == project.id,
@@ -264,6 +281,27 @@ class Reorg:
                 continue
             found.append(decision)
         return sorted(found, key=lambda row: (-row.confidence, str(row.child_id)))
+
+    @staticmethod
+    def _unrelated(db: Session, project: ProjectRecord) -> list[ScorerDecision]:
+        """The links of a User Story to an Epic that a model found unrelated, as lines:
+        not in a batch already, and not judged wrong before."""
+        taken = {
+            (line.child_id, line.parent_id)
+            for line, batch in db.execute(
+                select(ReorgLine, ReorgBatch)
+                .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+                .where(ReorgLine.project_id == project.id, ReorgBatch.kind == "extra_epics")
+            )
+            if line.verdict == "wrong"
+            or batch.state == "sample"
+            or (batch.state == "approved" and line.state == "applied")
+        }
+        return [
+            row
+            for row in epic_links.ready(db, project)
+            if (row.child_id, row.parent_id) not in taken
+        ]
 
     def _delivered(self, db: Session, project: ProjectRecord) -> list[ScorerDecision]:
         """The open User Stories that stand as delivered, as lines to close: each with
@@ -365,8 +403,9 @@ class Reorg:
     def _measured(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         """What the scorer measured for that kind of link, as its report says."""
         link_kind, _outcome, error, _title, _about = KINDS[kind]
-        if kind == "close" or kind in RETIRED:
-            # A rule, not the scorer: nothing was measured, and the sample is the check.
+        if kind in RULED:
+            # A rule or a model's answer, not the scorer: nothing was measured, and the
+            # sample is the check.
             return {"error": error, "rule": True}
         report = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project))
         entry = next(
@@ -590,7 +629,7 @@ class Reorg:
                         parent_id=decision.parent_id,
                         confidence=decision.confidence,
                         reason=str(detail.get("why"))
-                        if kind == "close" or kind in RETIRED
+                        if kind in RULED
                         else why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
                         signals=signals,
                         sampled=decision.id in drawn,
@@ -729,6 +768,23 @@ class Reorg:
                 raise ProjectConflict("An issue of the User Story is open by now.")
             self.planning.lifecycle.confirm(name, "stories", child, "close", impact["token"])
             return []
+        if kind == "extra_epics":
+            before = [
+                entry
+                for entry in self.links.snapshot(name, "stories", child)
+                if entry["parent"] == str(parent)
+            ]
+            if not before or not epic_links.questionable(
+                before[0]["origin"], bool(before[0]["confirmed"]), bool(before[0]["is_primary"])
+            ):
+                raise ProjectConflict(
+                    "The link is gone, or is the primary one, stated or yours by now."
+                )
+            self.links.before_change(name, "stories", child)
+            if not self.planning.remove_epic_link(name, child, parent):
+                raise ProjectConflict("The link is gone, or it is the User Story's last Epic.")
+            self.links.after_change(name, "stories", child)
+            return before
         if kind == "reasons":
             before = self.links.snapshot(name, "issues", child)
             if not self.links.explain(name, "issues", child, parent, reason):
@@ -825,6 +881,13 @@ class Reorg:
         if kind == "close" or kind in RETIRED:
             side = RETIRED.get(kind, "stories")
             self.planning.set_state(name, side, child, "open")  # type: ignore[arg-type]
+            return
+        if kind == "extra_epics":
+            self.links.before_change(name, "stories", child)
+            if not self.planning.restore_epic_link(name, child, parent):
+                raise ProjectConflict("The User Story or the Epic is gone.")
+            self.links.after_change(name, "stories", child)
+            self.links.restore(name, "stories", child, before)
             return
         if kind in ("reasons", "primary"):
             side = "issues" if kind == "reasons" else "stories"

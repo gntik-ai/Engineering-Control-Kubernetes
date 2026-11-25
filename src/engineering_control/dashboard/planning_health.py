@@ -19,7 +19,13 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import cleanup, delivery, planning_links, structure
+from engineering_control.dashboard import (
+    cleanup,
+    delivery,
+    epic_links,
+    planning_links,
+    structure,
+)
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.project_records import active_project
 from engineering_control.dashboard.reorg import Reorg
@@ -62,6 +68,7 @@ FOLLOWED: Final = (
     "stories_unsupported",
     "stories_delivered_open",
     "changes_ready",
+    "epic_links_extra",
 )
 
 
@@ -131,7 +138,12 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
         # What the scorer would do, as it last reported: where it is sure, and where it
         # abstains and the case waits for a decision model or the administrator.
         scorer = db.scalar(select(ScorerReport.report).where(ScorerReport.project_id == project.id))
-        delivered = {**delivery.numbers(db, project.id), **cleanup.numbers(db, project)}
+        delivered = {
+            **delivery.numbers(db, project.id),
+            **cleanup.numbers(db, project),
+            # The links of Stories to Epics beyond their primary one.
+            **epic_links.numbers(db, project),
+        }
         # What the structure of the plan proposes, and the issues that fit no Story.
         shape = structure.survey(db, project)
         delivered["structure_proposals"] = len(shape["stories"]) + len(shape["splits"])

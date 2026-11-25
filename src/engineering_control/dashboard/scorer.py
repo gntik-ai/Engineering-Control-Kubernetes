@@ -341,6 +341,12 @@ def cases_of(db: Session, project: ProjectRecord) -> tuple[list[_Case], _Plan] |
         parents_ = plan.stories if line.link_kind == ISSUE_STORY else plan.epics
         if line.child_id not in children or line.parent_id not in parents_:
             continue
+        if batch_kind == "extra_epics":
+            # An Epic judged to have nothing to do with a Story is not its primary Epic.
+            # One judged to have to do with it is related, which says nothing of primary.
+            if line.verdict == "right":
+                wrong[line.link_kind, line.child_id].add(line.parent_id)
+            continue
         if (line.verdict == "right") != (batch_kind == "unsupported"):
             known[line.link_kind][line.child_id].add(line.parent_id)
         else:

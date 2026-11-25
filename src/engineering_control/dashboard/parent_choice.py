@@ -149,11 +149,13 @@ def tokens_of(reply: Reply) -> int | None:
 
 def sizes(asked: Question) -> tuple[int, int]:
     """What a question holds of the project's review tokens while it is asked, counted by
-    the size of its text, and what it is likely to use, at four characters a token and a
-    short answer."""
+    the size of its text, and what it is likely to use. The first runs used about 1.8
+    times what four characters a token and a short answer gave: the texts are dense, the
+    shape of the answer is counted too, and a model that thinks writes more than its
+    answer. So: two and a half characters a token, and an answer with its thinking."""
     return (
         review_budget.reservation_size(asked),
-        (len(asked.system) + len(asked.prompt)) // 4 + 350,
+        (len(asked.system) + len(asked.prompt)) * 2 // 5 + 700,
     )
 
 

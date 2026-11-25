@@ -2026,6 +2026,55 @@ def create_app(
             subject=name,
         )
 
+    @app.get("/api/dashboard/projects/{name}/epic-links")
+    async def epic_links_api(name: str, request: Request) -> Response:
+        """How many Epics the open User Stories stand under, what a model said of the
+        links beyond the primary one, and what asking about the rest would use."""
+        return await documents_read(request, lambda: repo(request).epic_links.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/epic-links/records")
+    async def epic_links_records_api(
+        name: str,
+        request: Request,
+        show: Literal["", "part", "unrelated", "unclear"] = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """The User Stories a model was asked about, with what it said of each link."""
+        return await documents_read(
+            request, lambda: repo(request).epic_links.listing(name, show, page, page_size)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/epic-links/runs")
+    async def epic_links_run_api(name: str, request: Request) -> Response:
+        """Ask a model what each Epic beyond the primary one is to its User Story."""
+        return await project_change(
+            request,
+            OrphanRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).epic_links.start,
+                name,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.again,
+            ),
+            event="workspace.epic_links_check_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/epic-links/runs/{run_id}/control")
+    async def epic_links_run_control_api(name: str, run_id: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).epic_links.control, name, run_id, body.action
+            ),
+            event="workspace.epic_links_check_controlled",
+            subject=name,
+        )
+
     @app.get("/api/dashboard/projects/{name}/epic-pages")
     async def epic_pages_api(name: str, request: Request) -> Response:
         """Every Epic of the project with where it stands, and what having a model write

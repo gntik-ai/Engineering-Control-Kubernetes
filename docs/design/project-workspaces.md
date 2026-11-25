@@ -251,6 +251,7 @@ The administrator agreed these rules and phases. Every change to existing record
 | R10 | Reorganize structure: how each Epic holds together, splits of Epics that hold more than 10% of the Stories, and User Stories proposed from groups of issues that fit none. | Each proposal can be edited, approved or set aside; what is set aside is not made again. |
 | R11 | Continuous and everywhere: one table of every project with its next step, the trail of issues that arrived, a daily refresh with the drift since the day before, and that drift in the daily digest. | A new issue is read, scored and shown with its closest Story within minutes; a project with no plan says so. |
 | R12 | Epic pages: one page for each Epic from its Stories, their issues and the closest documents, with no model asked, kept in versions with what changed; an overview by a model on request, each sentence with its records. | One cited page per Epic, refreshed when its sources change. |
+| R13 | The Epics a Story is also linked to: a model judges each link beyond the primary Epic; the links found unrelated are a batch to approve. | Epics per Story fall as batches are approved; no Story loses its primary Epic. |
 
 R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a project's plan automatically](planning-reorganization.md): a cascade from rules to ranking models to decision models, so that a language model and a person see only the cases cheaper evidence cannot settle.
 
@@ -437,6 +438,12 @@ What is proposed appears as the batch kinds `retire_stories`, `retire_epics` and
 **Reviews → Reorganize** ends with "Structure": how each Epic holds together, the Epics proposed to be split, the User Stories that are missing, and the documents no Story covers. The rules are in [planning-reorganization.md](planning-reorganization.md#the-structure-of-the-plan-r10).
 
 `GET /api/dashboard/projects/{name}/structure` returns the report and the proposals. `POST …/structure/stories/{proposal}` makes a proposed User Story with the title, description and Epic sent, and links its issues; `POST …/structure/splits/{proposal}` splits an Epic with the titles sent; `POST …/structure/{proposal}/dismiss` sets a proposal aside. Decisions are kept in `structure_decisions` (migration 0081). A Story is made through `PlanningRecords.save`, its issues linked through `link_stories` and recorded as found by the scorer and approved by the administrator.
+
+### The Epics a Story is also linked to
+
+`epic_links` registers the kind `epic_links` in the choice-run engine (usage counted under `epic_links`). Its scope is the open Stories with a link to judge (`questionable`: not primary, not declared, not the administrator's and not confirmed), those with the most first. The review of a Story keeps the Story's quoted passage and, for each Epic judged, the answer, the reason, the quoted passage and whether it is in the Epic's text.
+
+`GET /api/dashboard/projects/{name}/epic-links` returns the Stories, links and Epics per Story, the links to judge, the answers that still stand, how many links are ready for a batch, and what a run would ask. `GET …/epic-links/records?show=` lists the Stories asked about with what was said of each link. `POST …/epic-links/runs` and `POST …/epic-links/runs/{run_id}/control` start and control a run. The batch kind `extra_epics` of `reorg` takes its lines from `epic_links.ready`; approving a line calls `PlanningRecords.remove_epic_link`, which never takes a Story's last Epic off, and undoing calls `restore_epic_link` and puts the link's record back as it stood.
 
 ### Epic pages
 

@@ -7,6 +7,7 @@ import { some, whole } from './ChoiceRun';
 import { Arrivals } from './Arrivals';
 import { ChangeBatches } from './ChangeBatches';
 import { Cleanup } from './Cleanup';
+import { EpicLinks } from './EpicLinks';
 import { Shadow } from './Shadow';
 import { Structure } from './Structure';
 
@@ -251,6 +252,7 @@ export function Reorganize({ project }: { project: string }) {
     <>
       <Arrivals project={project} />
       <ChangeBatches project={project} />
+      <EpicLinks project={project} />
       <Cleanup project={project} />
       <Structure project={project} />
       <Card>

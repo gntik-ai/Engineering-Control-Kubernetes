@@ -40,6 +40,10 @@ WATCHED: Final = {
     ),
     "bugs_linked": ("bug is still linked to a User Story", "bugs are still linked to a User Story"),
     "scorer_abstains": ("record the scorer abstains on", "records the scorer abstains on"),
+    "epic_links_to_judge": (
+        "link of a User Story to an Epic beyond its primary one is not judged",
+        "links of User Stories to Epics beyond their primary one are not judged",
+    ),
 }
 # What waits for the administrator's word, of the numbers above.
 WAITING: Final = ("changes_ready", "cleanup_proposed", "structure_proposals")
