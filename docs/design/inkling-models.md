@@ -102,7 +102,7 @@ The 41.8 M tokens of the Anthropic key, at list price, if nine in ten are read a
 
 Either way the window is not the million tokens of the hosted model: on 16 GB it is some tens of thousands. That suits the short questions the platform asks about the plan, which are 2,000 to 4,000 tokens each. It does not suit a delivery run, which reads far more.
 
-**So: feasible to try, not shown to work.** I could not try it. The node has a 6 GB card today, the cluster does not hand the card to any workload (the ranking service runs on the processors), and this session has no graphics card. The plan below makes the local model the preferred first tier on one condition: that it passes a measured gate on the 16 GB card. If it does not, the same model through OpenRouter takes its place at $0.075 and $0.30, and nothing else in the plan changes.
+**So: feasible to try, not shown to work.** I could not try it. The cluster does not hand a card to any workload today (the ranking service runs on the processors), and this session has no graphics card. The plan below makes the local model the preferred first tier on one condition: that it passes a measured gate on the 16 GB card. If it does not, the same model through OpenRouter takes its place at $0.075 and $0.30, and nothing else in the plan changes.
 
 ### Three nodes with 16 GB each (added 25 November 2026)
 
@@ -121,12 +121,22 @@ Two things follow for the plan:
 - **M0 also measures one or two open models that fit whole in 16 GB**, so that if no build of Inkling 2 Mini passes the gate there is a model that does, measured on the same questions.
 - **The card that the language model does not use can serve the ranking models.** They run on processors today, at 3 to 8 texts a second; on a card that is some tens of times faster, with models that fit in a few GB. If all three cards serve the language model, each still has room for them only with the smaller build.
 
-All of this assumes 16 GB of graphics memory on each node. If the 16 GB is the node's ordinary memory and there is no such card, none of it holds: a 20 GB model does not fit in the memory of any one node.
+Confirmed on 25 November 2026: the cards are NVIDIA, 16 GB of graphics memory each. Every server named here runs on NVIDIA cards, so nothing above changes.
+
+What Argo CD shows of the nodes, read the same day:
+
+| Node | Processors | Memory | Note |
+| --- | ---: | ---: | --- |
+| `kind` | 12 | 32.5 GB | All eight pods of the platform run here |
+| `github-actions` | 12 | 32.4 GB | |
+| `mus-srv-0` | 4 | 8.1 GB | Too little memory to hold part of the model beside the card: only a build that fits whole in 16 GB can run here, and its server must load it without first holding it in memory |
+
+No application in Argo CD installs anything of NVIDIA's, and no workload asks for a card. Whether the drivers are on the nodes I cannot see from here.
 
 **What it needs from you.**
 
-- The 16 GB card in the node.
-- The cluster handing the card to a workload: NVIDIA's device plugin and runtime class. That is set up for the whole cluster, outside the three applications I manage, so it is yours to install or to allow.
+- On each node, on the machine itself: NVIDIA's driver and NVIDIA's container toolkit, then a restart of k3s, which finds the toolkit when it starts and adds the `nvidia` runtime by itself. This is outside the cluster and is yours.
+- In the cluster: the runtime class `nvidia` and NVIDIA's device plugin, which makes each node offer `nvidia.com/gpu: 1`. That is set up for the whole cluster, outside the three applications I manage, so it is yours to install or to allow me as a fourth application.
 - About 30 GB of disk for the weights, and one download of them from Hugging Face or Ollama's registry.
 - A choice: the card holds the language model or the ranking models, not both. The ranking service works on the processors today, so the card would go to the language model.
 
