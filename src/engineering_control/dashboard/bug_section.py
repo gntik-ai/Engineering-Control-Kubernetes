@@ -50,6 +50,7 @@ from engineering_control.db.models import (
     ProjectIssueStory,
     ProjectRecord,
     WorkspaceAction,
+    WorkspaceSource,
 )
 from engineering_control.github_app import GitHubApp, GitHubAppError
 
@@ -135,12 +136,33 @@ def _bugs(db: Session, project: ProjectRecord) -> list[BacklogItem]:
     )
 
 
-def _reported(item: BacklogItem) -> datetime:
-    said = _when((item.facts or {}).get("github_created_at")) or _when(item.created_at)
-    return said or datetime.now(UTC)
+def _opened(db: Session, project: ProjectRecord) -> dict[int, Any]:
+    """When each issue was opened on GitHub, as the reading of the repository's history
+    kept it: for the issues whose own record does not say."""
+    found: dict[int, Any] = {}
+    for key, evidence in db.execute(
+        select(WorkspaceSource.key, WorkspaceSource.evidence).where(
+            WorkspaceSource.project_id == project.id, WorkspaceSource.key.like("issue:%")
+        )
+    ):
+        number = key.removeprefix("issue:")
+        if number.isdigit() and (evidence or {}).get("created_at"):
+            found[int(number)] = evidence["created_at"]
+    return found
 
 
-def _row(item: BacklogItem, problems: dict[UUID, str]) -> dict[str, Any]:
+def _reported(item: BacklogItem, opened: dict[int, Any] | None = None) -> datetime:
+    """When the bug was reported: the day its issue was opened on GitHub, and only where
+    nothing says so the day it was first read here."""
+    said = _when((item.facts or {}).get("github_created_at"))
+    if said is None and item.issue_number is not None:
+        said = _when((opened or {}).get(item.issue_number))
+    return said or _when(item.created_at) or datetime.now(UTC)
+
+
+def _row(
+    item: BacklogItem, problems: dict[UUID, str], opened: dict[int, Any] | None = None
+) -> dict[str, Any]:
     stands = _stands(item)
     reason = (item.facts or {}).get("github_state_reason") if stands == "closed" else None
     updated = _when(item.issue_updated_at)
@@ -155,7 +177,7 @@ def _row(item: BacklogItem, problems: dict[UUID, str]) -> dict[str, Any]:
         "reason": reason if reason in ("completed", "not_planned") else None,
         "confirmed": bool(item.type_confirmed and item.execution_type == "bug"),
         "labels": _labels(item),
-        "reported_at": _reported(item).isoformat(),
+        "reported_at": _reported(item, opened).isoformat(),
         "updated_at": updated.isoformat() if updated else None,
         "closed_at": closed.isoformat() if closed else None,
         "problem": problems.get(item.id),
@@ -207,8 +229,10 @@ class BugSection:
                 )
                 or 0
             )
+            opened = _opened(db, project)
             oldest = min(
-                (_reported(item) for item in found if _stands(item) == "open"), default=None
+                (_reported(item, opened) for item in found if _stands(item) == "open"),
+                default=None,
             )
             return {
                 "repository": project.source_repository or None,
@@ -228,6 +252,7 @@ class BugSection:
         with self.sessions() as db:
             project = active_project(db, name)
             problems = self._problems(db, project)
+            opened = _opened(db, project)
             rows = []
             for item in _bugs(db, project):
                 stands = _stands(item)
@@ -243,15 +268,17 @@ class BugSection:
                 rows.append(item)
             if sort == "updated":
                 rows.sort(
-                    key=lambda item: _when(item.issue_updated_at) or _reported(item), reverse=True
+                    key=lambda item: _when(item.issue_updated_at) or _reported(item, opened),
+                    reverse=True,
                 )
             else:
-                rows.sort(key=_reported, reverse=sort != "oldest")
+                rows.sort(key=lambda item: _reported(item, opened), reverse=sort != "oldest")
             pages = max(1, (len(rows) + page_size - 1) // page_size)
             page = min(max(1, page), pages)
             return {
                 "items": [
-                    _row(item, problems) for item in rows[(page - 1) * page_size : page * page_size]
+                    _row(item, problems, opened)
+                    for item in rows[(page - 1) * page_size : page * page_size]
                 ],
                 "total": len(rows),
                 "page": page,

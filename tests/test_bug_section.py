@@ -259,3 +259,38 @@ def test_bugs_are_read_from_the_issues_whatever_the_plan_knows(tmp_path: Path) -
         assert post(client, "falcone", f"bugs/{other}/close", reason="fixed").status_code == 404
     finally:
         client.close()
+
+
+def test_a_bug_is_dated_by_the_day_it_was_opened_on_github(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from engineering_control.db.models import WorkspaceSource
+    from engineering_control.github_app import Issue
+
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        # A project without a plan: the reading of its open issues says when each was opened.
+        opened = datetime(2026, 5, 6, 7, 8, tzinfo=UTC)
+        issue = Issue(7, "Crash on start", "https://x/7", ("bug",), None, created_at=opened)
+        repo.backlog.apply_import("llmwiki", [issue], complete=True)
+        [bug] = listed(client, "llmwiki")["items"]
+        assert bug["reported_at"].startswith("2026-05-06T07:08")
+        shown = client.get("/api/dashboard/projects/llmwiki/bugs").json()
+        assert shown["oldest_open"].startswith("2026-05-06")
+
+        # A project with a plan: where the issue's own record does not say, what
+        # Discovery kept of the repository's history does.
+        data = seed(repo)
+        with repo.sessions.begin() as db:
+            item = db.scalars(
+                select(BacklogItem).where(
+                    BacklogItem.project_id == data["project"], BacklogItem.issue_number == 42
+                )
+            ).one()
+            item.issue_labels, item.facts = ["bug"], {}
+            source = db.get_one(WorkspaceSource, (data["project"], "issue:42"))
+            source.evidence = {**source.evidence, "created_at": "2025-12-24T10:00:00Z"}
+        [mine] = listed(client, "falcone")["items"]
+        assert mine["reported_at"].startswith("2025-12-24")
+    finally:
+        client.close()

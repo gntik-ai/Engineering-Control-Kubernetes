@@ -763,6 +763,12 @@ class BacklogItems:
                 item.github_closed_at = None
                 item.issue_labels = labels
                 item.issue_updated_at = issue.updated_at
+                if issue.created_at and not (item.facts or {}).get("github_created_at"):
+                    # The day it was opened on GitHub, not the day it was first read here.
+                    item.facts = {
+                        **(item.facts or {}),
+                        "github_created_at": issue.created_at.isoformat(),
+                    }
                 if item.routed_by != "administrator":
                     section, reason = route_by_labels(sections, labels)
                     if section is None and item.routed_by == "supervisor":

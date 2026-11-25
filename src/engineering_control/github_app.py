@@ -79,6 +79,8 @@ class Issue:
     url: str
     labels: tuple[str, ...]
     updated_at: datetime | None
+    # When it was opened on GitHub, where the listing said so.
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +287,15 @@ class GitHubApp:
                     for label in item.get("labels") or []
                     if isinstance(label, dict) and isinstance(label.get("name"), str)
                 )
+                opened = item.get("created_at")
+                try:
+                    created_at = (
+                        datetime.fromisoformat(opened.replace("Z", "+00:00"))
+                        if isinstance(opened, str)
+                        else None
+                    )
+                except ValueError:
+                    created_at = None
                 issues.append(
                     Issue(
                         number=number,
@@ -292,6 +303,7 @@ class GitHubApp:
                         url=str(item.get("html_url") or ""),
                         labels=labels,
                         updated_at=updated_at,
+                        created_at=created_at,
                     )
                 )
             if len(body) < PAGE_SIZE:
