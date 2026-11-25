@@ -520,6 +520,15 @@ class OrphanRunInput(PlainChangeInput):
     token_cap: int = Field(ge=1_000, le=5_000_000, strict=True)
     # Ask about every one of them, also those that have an answer already.
     again: bool = False
+    # A cheaper model that is asked first: what it settles is kept, and the rest is
+    # asked of the model above. Both empty for a run with one model.
+    first_provider: str = Field(default="", max_length=32)
+    first_model: str = Field(default="", max_length=200)
+
+    def first(self) -> tuple[str, str] | None:
+        if not self.first_provider and not self.first_model:
+            return None
+        return (self.first_provider, self.first_model)
 
 
 class GoldLabelInput(PlainChangeInput):

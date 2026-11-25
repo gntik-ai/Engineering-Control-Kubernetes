@@ -5,15 +5,18 @@ counts of the check stay as they were."""
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select
 
+from engineering_control.dashboard import parent_choice
 from engineering_control.db.models import (
     ChoiceReview,
     ModelTrialLine,
     PlanningLink,
     ProjectReviewBudget,
+    ProviderAccount,
 )
 from engineering_control.models.service import Question, Reply
 from tests.test_automatic_planning import post
@@ -175,5 +178,178 @@ def test_a_trial_is_compared_with_the_answer_on_record_and_changes_nothing(
 
         unknown = post(client, "model-trials/nothing/runs/" + trial["run"]["id"] + "/control")
         assert unknown.status_code in (400, 404, 422)
+    finally:
+        client.close()
+
+
+class Two:
+    """Two models behind one account: each answers by its own table, per User Story."""
+
+    COST = {"cheaper": (50, 0.0002), "analysis": (70, 0.004)}
+
+    def __init__(self, says: dict[tuple[str, str], dict[str, tuple[str, str]]]) -> None:
+        self.says = says
+        self.calls: list[tuple[str, str]] = []
+
+    async def ask(self, question: Question, *, retry: bool) -> Reply:
+        ((_provider, model),) = question.choices
+        asked = json.loads(question.prompt)
+        story = asked["story"]["title"]
+        self.calls.append((model, story))
+        answers = self.says[model, story]
+        said = {
+            "story_quote": asked["story"]["text"],
+            "epics": [
+                {
+                    "id": entry["id"],
+                    "answer": answers[entry["title"]][0],
+                    "reason": "It reads so.",
+                    "epic_quote": answers[entry["title"]][1],
+                }
+                for entry in asked["epics"]
+                if entry["title"] in answers
+            ],
+        }
+        tokens, cost = self.COST[model]
+        usage = {"tokens": tokens, "cost": cost}
+        return Reply(said, "", "fixture", model, uuid4(), "Test", usage, 0.2, 1)
+
+
+BILLING = ("unrelated", "Invoices and payments.")
+PART = ("part", "Operate the runtime.")
+AUDIT, FAILURES = "Audit executions", "Respond to failures"
+# Which Epic is the second Story's primary one is not fixed: the other is judged.
+BOTH_PART = {"Operations": PART, "Audit trail": PART}
+BOTH_NOT = {"Operations": BILLING, "Audit trail": BILLING}
+
+
+def two_stories_to_judge(repo: Any) -> None:
+    """Both open Stories have links to judge, and the account offers a second model."""
+    data = seed(repo)
+    more_epics(repo, data)
+    with repo.sessions.begin() as db:
+        db.add(
+            ProjectReviewBudget(project_id=data["project"], token_limit=200_000, used=0, reserved=0)
+        )
+        db.scalars(select(ProviderAccount)).one().models = ["analysis", "cheaper"]
+    repo.planning_links.reconcile_project("falcone")
+    with repo.sessions.begin() as db:
+        for link in db.scalars(select(PlanningLink).where(PlanningLink.kind == "story_epic")):
+            if not link.is_primary:
+                link.origin, link.confirmed = "model", True
+
+
+def test_a_first_model_keeps_what_it_settles_and_the_rest_goes_on(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        two_stories_to_judge(repo)
+        both = {"first_provider": "fixture", "first_model": "cheaper"}
+        # The first model is another model, and one that can be asked.
+        same = post(
+            client, "epic-links/runs", **START, first_provider="fixture", first_model="analysis"
+        )
+        assert same.status_code == 422 and "own model" in same.text
+        gone = post(
+            client, "epic-links/runs", **START, first_provider="fixture", first_model="none"
+        )
+        assert gone.status_code == 422
+        # A trial asks one model: that is what it is for.
+        assert post(client, "epic-links/runs", **START, **both).status_code == 200
+        model = Two(
+            {
+                # It cannot tell about one link of the first Story: that Story goes on.
+                ("cheaper", AUDIT): {"Billing": BILLING, "Operations": ("unclear", "")},
+                ("analysis", AUDIT): {"Billing": BILLING, "Operations": PART},
+                ("cheaper", FAILURES): BOTH_PART,
+            }
+        )
+        run(repo, model)
+        assert model.calls == [("cheaper", AUDIT), ("analysis", AUDIT), ("cheaper", FAILURES)]
+        shown = client.get(BASE + "epic-links").json()
+        done = shown["check"]["run"]
+        assert (done["state"], done["done"], done["total"], done["failed"]) == ("complete", 2, 2, 0)
+        assert done["spent"] == 170
+        assert done["first"] == {
+            "provider": "fixture",
+            "model": "cheaper",
+            "asked": 2,
+            "settled": 1,
+            "tokens": 100,
+            "cost": 0.0004,
+        }
+        # What it cost, and what the run's own model would have cost for both.
+        assert (done["cost"], done["alone"]) == (0.0044, 0.008)
+        assert shown["answers"] == {"part": 2, "unrelated": 1, "unclear": 0}
+        with repo.sessions() as db:
+            by = {review.model: review.passed for review in db.scalars(select(ChoiceReview))}
+        # Each answer says which model gave it.
+        assert by == {"analysis": True, "cheaper": False}
+
+        # A run with one model reports no first model.
+        assert post(client, "epic-links/runs", **START, again=True).status_code == 200
+        run(repo, Two({("analysis", AUDIT): {"Billing": BILLING}, ("analysis", FAILURES): {}}))
+        plain = client.get(BASE + "epic-links").json()["check"]["run"]
+        assert plain["first"] is None and plain["alone"] is None
+    finally:
+        client.close()
+
+
+def test_a_model_whose_trial_agreed_is_the_first_model_by_default(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(parent_choice, "GATE_SETTLED", 2)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        two_stories_to_judge(repo)
+        record = {
+            ("analysis", AUDIT): {"Billing": BILLING, "Operations": PART},
+            ("analysis", FAILURES): BOTH_PART,
+        }
+        assert post(client, "epic-links/runs", **START).status_code == 200
+        run(repo, Two(record))
+        assert client.get(BASE + "epic-links").json()["check"]["first"] is None
+
+        trial = {"provider": "fixture", "model": "cheaper", "token_cap": 60_000}
+        # It cannot tell about one Story: one answer settled is too few to go by.
+        assert post(client, "model-trials/epic_links/runs", **trial).status_code == 200
+        run(
+            repo,
+            Two(
+                {
+                    ("cheaper", AUDIT): {"Billing": BILLING, "Operations": ("unclear", "")},
+                    ("cheaper", FAILURES): BOTH_PART,
+                }
+            ),
+        )
+        report = client.get(BASE + "model-trials").json()
+        (first,) = report["trials"]
+        assert (first["answered"], first["settled"], first["settled_same"]) == (2, 1, 1)
+        assert not first["gate"] and report["gate"] == {"settled": 2, "same": 0.9}
+        assert client.get(BASE + "epic-links").json()["check"]["first"] is None
+
+        # It settles both and says the same as on record: it is asked first from now on.
+        assert post(client, "model-trials/epic_links/runs", **trial).status_code == 200
+        run(repo, Two({("cheaper", story): says for (_m, story), says in record.items()}))
+        report = client.get(BASE + "model-trials").json()
+        assert report["trials"][0]["gate"]
+        chosen = {"provider": "fixture", "model": "cheaper", "answers": 2, "settled": 2, "same": 2}
+        assert client.get(BASE + "epic-links").json()["check"]["first"] == chosen
+        check = next(c for c in report["checks"] if c["check"] == "epic_links")
+        assert check["first"] == chosen
+        # Only for the check it was tried on.
+        assert client.get(BASE + "cleanup").json()["check"]["first"] is None
+
+        # Its latest trial counts: one that says otherwise takes the default away.
+        assert post(client, "model-trials/epic_links/runs", **trial).status_code == 200
+        run(
+            repo,
+            Two(
+                {
+                    ("cheaper", AUDIT): {"Billing": PART, "Operations": BILLING},
+                    ("cheaper", FAILURES): BOTH_NOT,
+                }
+            ),
+        )
+        assert client.get(BASE + "epic-links").json()["check"]["first"] is None
     finally:
         client.close()

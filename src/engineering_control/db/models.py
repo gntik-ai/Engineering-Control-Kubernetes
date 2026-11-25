@@ -897,6 +897,18 @@ class ChoiceRun(UUIDPrimaryKey, Timestamps, Base):
     current_child: Mapped[UUID | None] = mapped_column(Uuid)
     reserved: Mapped[int] = mapped_column(BigInteger, default=0)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A cheaper model that is asked first, when the run names one (migration 0085): what
+    # it settles is kept, and the rest is asked of the run's own model. How many
+    # questions it was asked and settled, and what that used and cost.
+    first_provider: Mapped[str | None] = mapped_column(String(32))
+    first_model: Mapped[str | None] = mapped_column(String(200))
+    first_asked: Mapped[int] = mapped_column(Integer, default=0)
+    first_done: Mapped[int] = mapped_column(Integer, default=0)
+    first_spent: Mapped[int] = mapped_column(BigInteger, default=0)
+    first_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    # What the calls of the run's own model cost, and how many of them said so.
+    cost: Mapped[float] = mapped_column(Float, default=0.0)
+    priced: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
@@ -940,6 +952,8 @@ class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
     # pending until the administrator approves or dismisses the answer.
     decision: Mapped[str] = mapped_column(String(16), default="pending")
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The run's first model could not settle it: its own model is asked (migration 0085).
+    passed: Mapped[bool] = mapped_column(Boolean, default=False)
     __table_args__ = (
         UniqueConstraint("project_id", "kind", "child_id", name="uq_choice_reviews_child"),
     )
@@ -1251,6 +1265,9 @@ class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):
     # pending, approved or dismissed: what the administrator did with that answer.
     ref_decision: Mapped[str] = mapped_column(String(16), default="pending")
     agrees: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Whether the answer is one a run would keep from a first model: clear, and with its
+    # quoted passages in the texts (migration 0085).
+    settled: Mapped[bool] = mapped_column(Boolean, default=False)
     # For a check that judges several links in one question: how many, how many alike,
     # and the ones it said otherwise about.
     links: Mapped[int] = mapped_column(Integer, default=0)

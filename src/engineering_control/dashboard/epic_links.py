@@ -317,6 +317,8 @@ class _Scope:
 class _Kind:
     name = "epic_links"
     workflow = "epic_links"
+    # A run may ask a cheaper model first and keep what it settles.
+    two_models = True
     actionable: tuple[str, ...] = ("unrelated",)
     nothing_to_ask = (
         "A model has judged every link of a User Story to an Epic that is to be judged. "
@@ -329,6 +331,15 @@ class _Kind:
 
     def scope(self, db: Session, project: ProjectRecord) -> _Scope:
         return _Scope(db, project)
+
+    def settles(self, read: dict[str, Any]) -> bool:
+        """A first model's answer is kept when it judged every link and its passages
+        are in the texts: a link it could not tell about goes to the run's own model."""
+        return bool(read["checked"]) and all(
+            entry.get("answer") != "unclear"
+            for entry in read["evidence"]
+            if entry.get("side") == "epic"
+        )
 
 
 KIND: Final = _Kind()
@@ -460,6 +471,7 @@ class EpicLinks:
                     "largest": largest,
                     "run": parent_choice.latest_run(db, project.id, KIND.name),
                     "models": review_flows.model_choices(db),
+                    "first": parent_choice.suggested_first(db, project.id, KIND.name),
                     "budget": review_budget.status(db, project.id),
                 },
             }
@@ -528,13 +540,19 @@ class EpicLinks:
             }
 
     def start(
-        self, name: str, provider: str, model: str, token_cap: int, again: bool = False
+        self,
+        name: str,
+        provider: str,
+        model: str,
+        token_cap: int,
+        again: bool = False,
+        first: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run that asks a model, about each open User Story that has links to
         Epics to judge and no answer yet, what each of those Epics is to it."""
         self.links.reconcile_project(name)
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again, None
+            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

@@ -178,8 +178,8 @@ This is the same cascade the reorganization uses, one step longer: rules, rankin
 | Phase | What | Done when |
 | --- | --- | --- |
 | M0 | **Try a model on questions already answered** (built, 25 November 2026). A trial asks another model the questions a check has an answer to, keeps what it says apart, and reports agreement and cost. | For each model tried: how often it says the same as the answer on record, how often it says "unclear", how often its quotes are in the texts, and what a question costs. |
-| M1 | **Two models in a run.** A run names a first model and a second. What the first cannot settle goes to the second. The run's report shows what each settled and what was saved. | A run of the Epic-links check with Inkling first and your model second costs less than the same run with your model alone, and its batch passes its sample. |
-| M2 | **The cheaper model first, by default,** for the checks where its trial agreed, the summaries of the code, the Epic overviews and bug triage. Never for writing code. | The share of questions the first model settled is on the Dashboard, and no batch's sample got worse. |
+| M1 | **Two models in a run** (built, 25 November 2026). A run of a check may name a first model. What it settles is kept; the rest is asked of the run's own model. The run reports what each did and what it cost. | A run of the Epic-links check with Inkling first and your model second costs less than the same run with your model alone, and its batch passes its sample. Not yet shown on live: no such run has been started. |
+| M2 | **The cheaper model first, by default** (built for the four checks, 25 November 2026). A check asks first the model whose trial on that check passed a gate, unless you choose otherwise. Never for writing code. | A check with a passed trial preselects that model; one without preselects none. Not built: the same for the summaries of the code, the Epic overviews and bug triage, which have no trial to go by, and a Dashboard tile. |
 
 ## M0 as built
 
@@ -202,6 +202,24 @@ This is the same cascade the reorganization uses, one step longer: rules, rankin
 **What it does not say.** The answer on record is another model's, not the truth. A trial measures agreement. Where the two differ, the lines show both reasons, and which is right is yours to judge.
 
 **What it costs.** A trial counts against the project's review tokens like any run, stops at the limit you give it, and can be stopped, resumed and ended.
+
+## M1 as built
+
+**Where.** In the form that starts a run of a check, beside the model: "Ask a cheaper model first". On the four checks that judge: the User Story of an issue, the primary Epic, whether anything supports a User Story, and the Epics a User Story is also linked to. Not on the run that writes Epic overviews, and not on a trial.
+
+**What the first model's answer must be to be kept.** Clear: it says something other than that it cannot tell. Not given with low confidence. And every passage it quotes is in the texts. For the Epic-links check, which judges several links in one question: it judged every link. Anything else, and an answer that cannot be read at all, sends the question on to the run's own model, which is asked as if nobody had been asked before.
+
+**What stays the same.** Every answer waits for you as before, whichever model gave it, and says which model gave it. Batches, samples and undo are unchanged. Both models count against the run's token limit and the project's review tokens; a question that goes on is paid twice, which is why the limit suggested for a run with a first model is higher.
+
+**What the run reports.** How many questions the first model was asked and how many it settled by itself; what the run cost; and what it would have cost had the run's own model answered everything, worked out from what that model's calls in the same run cost.
+
+## M2 as built
+
+**The gate.** A trial now also reports how many of the model's answers a run would have kept from it as a first model, and how many of those say the same as the answer on record. A model passes for a check when its latest trial on that check, in that project, kept at least 30 answers and at least 90% of them were as on record.
+
+**The default.** A check whose trial a model passed asks that model first unless you choose otherwise: the form opens with it chosen and says why, with the numbers. Among several that passed, the one whose questions cost least. A model's latest trial counts, so a later trial that does worse takes the default away. A check with no passed trial asks no model first, and says so.
+
+**What it does not cover.** The summaries of the code and the Epic overviews are prose, and nothing here measures a cheaper model's prose; bug triage (B5) is not built. They keep the model you choose. Nothing that writes code has a first model at all. The share of questions a first model settled is on each run and on the trials table, not on the Dashboard.
 
 **On live, 25 November 2026.** Deployed. Falcone has answers on record to try a model on: 129 User Stories for "whether anything supports a User Story" (by Claude Fable 5 and Claude Opus 5.5), 351 for "the Epics a User Story is also linked to" and 51 for "the primary Epic" (both by Claude Fable 5). A sample of 100 is likely to use about 315,000 tokens for the first and 353,000 for the second. Falcone-serverless and musematic have no answers on record yet. No trial has run: Falcone has used 2.98 of its 3.00 million review tokens, and a trial counts against them, so it waits for the limit to be raised.
 

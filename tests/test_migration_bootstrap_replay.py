@@ -63,7 +63,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0082 keeps the versions of the page put together for each Epic.
     # 0083 keeps what was decided about each bug.
     # 0084 keeps what a model said in a trial, beside the answer on record.
-    assert (head, parent) == ("0084", "0083")
+    # 0085 lets a run ask a cheaper model first.
+    assert (head, parent) == ("0085", "0084")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -165,8 +166,14 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert "model_trial_lines" in inspect(engine).get_table_names()
+    runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
+    assert {"first_model", "first_done", "first_cost", "cost", "priced"} <= runs
     command.downgrade(config, parent)
+    runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
+    assert "first_model" not in runs and "token_cap" in runs
+    assert "passed" not in {c["name"] for c in inspect(engine).get_columns("choice_reviews")}
+    assert "model_trial_lines" in inspect(engine).get_table_names()
+    command.downgrade(config, "0083")
     assert "model_trial_lines" not in inspect(engine).get_table_names()
     assert "bug_records" in inspect(engine).get_table_names()
     command.downgrade(config, "0082")

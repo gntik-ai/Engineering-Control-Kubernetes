@@ -257,6 +257,8 @@ class _Scope:
 class _Kind:
     name = "story_epic"
     workflow = "primary_epic"
+    # A run may ask a cheaper model first and keep what it settles.
+    two_models = True
     actionable: tuple[str, ...] = ("epic",)
     nothing_to_ask = (
         "Every User Story that waits for a primary Epic already has an answer. "
@@ -393,6 +395,7 @@ class PrimaryEpics:
                 "largest": largest,
                 "run": parent_choice.latest_run(db, project.id, KIND.name),
                 "models": review_flows.model_choices(db),
+                "first": parent_choice.suggested_first(db, project.id, KIND.name),
                 "budget": review_budget.status(db, project.id),
             }
 
@@ -404,6 +407,7 @@ class PrimaryEpics:
         token_cap: int,
         again: bool = False,
         unclear_only: bool = False,
+        first: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run over the User Stories that wait for a primary Epic and have no
         answer yet: all of them, or only those whose texts do not point to one Epic."""
@@ -417,6 +421,7 @@ class PrimaryEpics:
             token_cap,
             again,
             lambda child, listed: not child.stated and not (unclear_only and clear(listed)),
+            first,
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

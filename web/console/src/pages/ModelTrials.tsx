@@ -13,7 +13,7 @@ import {
 import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { isAsking, RunPanel, some, whole, type Model, type Run } from './ChoiceRun';
+import { dollars, isAsking, RunPanel, some, whole, type FirstModel, type Model, type Run } from './ChoiceRun';
 
 interface Check {
   check: string;
@@ -27,6 +27,8 @@ interface Check {
   likely_all: number;
   largest: number;
   run: Run | null;
+  /** The model this check asks first by default, from its trials. */
+  first: FirstModel | null;
 }
 interface Trial {
   run: Run;
@@ -39,6 +41,10 @@ interface Trial {
   links: { total: number; same: number } | null;
   unclear: number;
   checked: number;
+  /** Answers a run would keep from it as a first model, and how many of those are as on record. */
+  settled: number;
+  settled_same: number;
+  gate: boolean;
   tokens_each: number | null;
   cost: number | null;
   cost_each: number | null;
@@ -58,6 +64,7 @@ interface Overview {
   trials: Trial[];
   models: Model[];
   sample: number;
+  gate: { settled: number; same: number };
 }
 interface Side {
   answer: string;
@@ -92,10 +99,6 @@ const SAYS: Record<string, string> = {
 };
 const says = (answer: string) => SAYS[answer] ?? answer;
 const share = (part: number, of: number) => (of ? `${Math.round((part / of) * 100)}%` : '—');
-/** A cost in US dollars, with the digits a fraction of a cent needs. */
-const dollars = (value: number | null) =>
-  value === null ? 'not priced' : '$' + (value >= 0.01 ? value.toFixed(2) : value.toFixed(5));
-
 function Answer({ who, side }: { who: string; side: Side }) {
   return (
     <div className="grid gap-0.5">
@@ -219,6 +222,7 @@ export function ModelTrials({ project }: { project: string }) {
                       <th className="py-2 pe-3 text-end font-medium">Same as on record</th>
                       <th className="py-2 pe-3 text-end font-medium">Cannot tell</th>
                       <th className="py-2 pe-3 text-end font-medium">Quotes in the texts</th>
+                      <th className="py-2 pe-3 text-end font-medium">Kept as a first model</th>
                       <th className="py-2 pe-3 text-end font-medium">Tokens a question</th>
                       <th className="py-2 pe-3 text-end font-medium">Cost a question</th>
                       <th className="py-2 text-end font-medium" />
@@ -277,6 +281,19 @@ export function ModelTrials({ project }: { project: string }) {
                           </div>
                         </td>
                         <td className="py-2 pe-3 text-end tabular-nums">
+                          {share(trial.settled, trial.answered)}
+                          <div className="text-xs text-muted-foreground">
+                            {trial.settled
+                              ? `${share(trial.settled_same, trial.settled)} of those as on record`
+                              : 'none to go by'}
+                          </div>
+                          {trial.gate ? (
+                            <Badge tone="success" size="sm">
+                              Passes
+                            </Badge>
+                          ) : null}
+                        </td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
                           {trial.tokens_each === null ? '—' : whole(trial.tokens_each)}
                           <div className="text-xs text-muted-foreground">
                             on record {trial.record.tokens_each === null ? '—' : whole(trial.record.tokens_each)}
@@ -304,6 +321,25 @@ export function ModelTrials({ project }: { project: string }) {
                   </tbody>
                 </table>
               </div>
+            ) : null}
+            <p className="text-sm text-muted-foreground">
+              A run of a check can ask a cheaper model first and keep what it settles: an answer that is clear and whose
+              quoted passages are in the texts. “Kept as a first model” is the share of its answers that are such, and
+              how many of those say the same as on record. A model passes for a check when its latest trial there kept
+              at least {whole(data.gate.settled)} answers and {Math.round(data.gate.same * 100)}% of them were as on
+              record; that check then asks it first unless you choose otherwise. No model is asked first for anything
+              that writes code.
+            </p>
+            {usable.some((entry) => entry.first) ? (
+              <ul className="grid gap-1 text-sm text-foreground">
+                {usable
+                  .filter((entry) => entry.first)
+                  .map((entry) => (
+                    <li key={entry.check}>
+                      “{entry.label}” asks {entry.first?.model} first by default.
+                    </li>
+                  ))}
+              </ul>
             ) : null}
             {shown ? <TrialLines key={shown.run.id} base={base} trial={shown} /> : null}
             {check ? (

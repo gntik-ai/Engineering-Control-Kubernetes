@@ -436,6 +436,8 @@ class _Scope:
 class _Kind:
     name = "issue_story"
     workflow = "orphan_parent"
+    # A run may ask a cheaper model first and keep what it settles.
+    two_models = True
     actionable: tuple[str, ...] = ("story", "bug")
     nothing_to_ask = (
         "Every open issue without a User Story already has an answer. "
@@ -573,16 +575,23 @@ class Orphans:
                 "largest": largest,
                 "run": parent_choice.latest_run(db, project.id, KIND.name),
                 "models": review_flows.model_choices(db),
+                "first": parent_choice.suggested_first(db, project.id, KIND.name),
                 "budget": review_budget.status(db, project.id),
             }
 
     def start(
-        self, name: str, provider: str, model: str, token_cap: int, again: bool = False
+        self,
+        name: str,
+        provider: str,
+        model: str,
+        token_cap: int,
+        again: bool = False,
+        first: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run over the open issues without a User Story that have no answer yet,
         or over all of them when asked to ask ``again``."""
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again
+            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

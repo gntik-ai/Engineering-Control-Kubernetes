@@ -367,8 +367,8 @@ Asked for on 25 November. The analysis and the prices are in [inkling-models.md]
 | Phase | What | Done when |
 | --- | --- | --- |
 | M0 | Try a model on questions already answered (built, 25 November 2026). A trial asks another model the questions a check has an answer to, on a sample that is the same for every model, keeps what it says apart from the plan, and reports agreement with the answer on record, the share of "unclear", the share of quotes found in the texts, and the cost of a question. | Each model tried has those numbers for each check it was tried on. |
-| M1 | Two models in a run: a first and a second; what the first cannot settle goes to the second. The run reports what each settled and what was saved. | A run of the Epic-links check with two models costs less than the same run with the second alone, and its batch passes its sample. |
-| M2 | The cheaper model first, by default, for the checks where its trial agreed, the summaries of the code, the Epic overviews and bug triage. Never for writing code. | The share of questions the first model settled is on the Dashboard, and no batch's sample got worse. |
+| M1 | Two models in a run (built, 25 November 2026). A run of a check may name a first model; an answer of it is kept when it is clear and its quoted passages are in the texts, and everything else is asked of the run's own model. The run reports what each did and what it cost against the run's own model alone. | A run of the Epic-links check with two models costs less than the same run with the second alone, and its batch passes its sample. Not yet shown on live. |
+| M2 | The cheaper model first, by default (built for the four checks, 25 November 2026). A check asks first the model whose latest trial on it kept at least 30 answers by itself with 90% of them as on record. Never for writing code. Not built: the same for summaries, Epic overviews and bug triage, and a Dashboard tile. | A check with a passed trial preselects that model; one without preselects none. |
 
 ## Decisions (23 November 2026)
 

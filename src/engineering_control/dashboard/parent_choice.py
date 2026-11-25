@@ -34,6 +34,7 @@ from engineering_control.dashboard.workspace_costs import add_project_usage
 from engineering_control.db.models import (
     ChoiceReview,
     ChoiceRun,
+    ModelTrialLine,
     ProjectRecord,
     ProjectReviewBudget,
 )
@@ -53,6 +54,10 @@ TRIES: Final = 3
 # therefore the answer plus this room: without it such a model is cut before its answer
 # begins, and the call is paid for nothing.
 THINKING_ROOM: Final = 8000
+# What a model's trial on a check must show before a run asks it first by default: this
+# many questions settled by itself, and this share of them the same as on record.
+GATE_SETTLED: Final = 30
+GATE_SAME: Final = 0.9
 BUSY_SECONDS: Final = 60.0
 # No inference ran, or the provider turned the question down before answering: nothing
 # was used. Any other failure leaves unknown what the call used.
@@ -138,6 +143,74 @@ def position(named: Any, letter: str, listed: list[dict[str, Any]]) -> UUID | No
     return UUID(listed[place - 1]["id"]) if 1 <= place <= len(listed) else None
 
 
+def settles(spec: Any, read: dict[str, Any]) -> bool:
+    """Whether an answer of a run's first model is kept, or the question goes on to the
+    run's own model: it is kept when it says something other than that it cannot tell,
+    is not given with low confidence, and every passage it quotes is in the texts. A
+    kind may say otherwise for its own answers."""
+    own = getattr(spec, "settles", None)
+    if own is not None:
+        return bool(own(read))
+    return (
+        read.get("answer") != "unclear"
+        and bool(read.get("checked"))
+        and read.get("confidence") != "low"
+    )
+
+
+def trial_gate(settled: int, same: int) -> bool:
+    """Whether a model's trial on a check lets it be asked first by default: it settled
+    enough questions by itself, and of those it said the same as the answer on record
+    often enough."""
+    return settled >= GATE_SETTLED and same >= GATE_SAME * settled
+
+
+def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | None:
+    """The model a run of this check asks first unless told otherwise: the one whose
+    latest trial on the check, in this project, passed the gate. Among several, the one
+    whose questions cost least. None when no trial passed: nothing is asked first then."""
+    seen: set[tuple[str, str]] = set()
+    passed: list[tuple[float, int, dict[str, Any]]] = []
+    runs = db.scalars(
+        select(ChoiceRun)
+        .where(
+            ChoiceRun.project_id == project,
+            ChoiceRun.kind == "try_" + kind,
+            ChoiceRun.state == "complete",
+        )
+        .order_by(ChoiceRun.created_at.desc(), ChoiceRun.id)
+        .limit(20)
+    ).all()
+    for place, run in enumerate(runs):
+        if (run.provider, run.model) in seen:
+            continue
+        seen.add((run.provider, run.model))
+        lines = db.execute(
+            select(ModelTrialLine.settled, ModelTrialLine.agrees, ModelTrialLine.cost).where(
+                ModelTrialLine.run_id == run.id
+            )
+        ).all()
+        settled = sum(1 for kept, _same, _cost in lines if kept)
+        same = sum(1 for kept, agrees, _cost in lines if kept and agrees)
+        if not trial_gate(settled, same):
+            continue
+        priced = [cost for _kept, _same, cost in lines if cost is not None]
+        passed.append(
+            (
+                sum(priced) / len(priced) if priced else float("inf"),
+                place,
+                {
+                    "provider": run.provider,
+                    "model": run.model,
+                    "answers": len(lines),
+                    "settled": settled,
+                    "same": same,
+                },
+            )
+        )
+    return min(passed, key=lambda entry: entry[:2])[2] if passed else None
+
+
 def tokens_of(reply: Reply) -> int | None:
     tokens = reply.usage.get("tokens")
     if tokens is None and all(
@@ -200,6 +273,25 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
         "uncounted": run.uncounted,
         "detail": run.detail,
         "asking": run.claimed_at is not None,
+        # With a first model: what it was asked and settled, what the run cost, and
+        # what it would have cost had the run's own model answered all of it, from
+        # what that model's calls cost.
+        "first": {
+            "provider": run.first_provider,
+            "model": run.first_model,
+            "asked": run.first_asked,
+            "settled": run.first_done,
+            "tokens": run.first_spent,
+            "cost": round(run.first_cost or 0.0, 6),
+        }
+        if run.first_model
+        else None,
+        "cost": round((run.cost or 0.0) + (run.first_cost or 0.0), 6)
+        if run.priced or run.first_cost
+        else None,
+        "alone": round(run.cost / run.priced * run.done, 6)
+        if run.first_model and run.priced and run.done
+        else None,
         "started_at": run.created_at.isoformat(),
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
     }
@@ -310,15 +402,25 @@ def start(
     token_cap: int,
     again: bool = False,
     only: Any = None,
+    first: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Begin a run over the records that wait and have no answer yet, or over all of them
     when asked to ask ``again``. ``only`` narrows them: it is given each record and its
-    shortlist and says whether the run asks about it."""
+    shortlist and says whether the run asks about it. ``first`` names a cheaper model
+    that is asked before the run's own: what it settles is kept, the rest goes on."""
     spec = KINDS[kind]
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
-        if {"provider": provider, "model": model} not in review_flows.model_choices(db):
+        choices = review_flows.model_choices(db)
+        if {"provider": provider, "model": model} not in choices:
             raise ProjectInvalid("Choose a model of an account that can be asked.")
+        if first is not None:
+            if not getattr(spec, "two_models", False):
+                raise ProjectInvalid("This kind of run asks one model only.")
+            if {"provider": first[0], "model": first[1]} not in choices:
+                raise ProjectInvalid("Choose a first model of an account that can be asked.")
+            if first == (provider, model):
+                raise ProjectInvalid("The first model is the run's own model. Leave it out.")
         if db.scalar(
             select(ChoiceRun.id).where(
                 ChoiceRun.project_id == project.id,
@@ -339,6 +441,8 @@ def start(
             provider=provider,
             model=model,
             token_cap=token_cap,
+            first_provider=first[0] if first else None,
+            first_model=first[1] if first else None,
         )
         db.add(run)
         db.flush()
@@ -361,7 +465,7 @@ def start(
             review.answer = review.parent_id = review.confidence = review.reason = None
             review.evidence = review.missing = review.tokens = None
             review.provider = review.model = None
-            review.checked, review.detail = False, ""
+            review.checked, review.detail, review.passed = False, "", False
             review.decision, review.decided_at = "pending", None
             run.total += 1
         if not run.total:
@@ -418,6 +522,8 @@ class _Call:
     project: UUID
     asked: Question
     needed: int
+    # Asked of the run's first model, not of its own.
+    first: bool = False
 
 
 # What a tick did when it asked nothing: there was nothing to do, or it moved a run on.
@@ -504,7 +610,14 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             return _MOVED
         listed = scope.shortlist(child)
         review.shortlist, review.revision = listed, scope.revision(child, listed)
-        asked = scope.question(run, child, listed)
+        # The first model is asked about what it has not passed on yet.
+        first = bool(run.first_model) and not review.passed
+        asker = (
+            ChoiceRun(provider=run.first_provider or "", model=run.first_model or "")
+            if first
+            else run
+        )
+        asked = scope.question(asker, child, listed)
         needed = review_budget.reservation_size(asked)
         if run.spent + needed > run.token_cap:
             left = run.total - run.done - run.failed
@@ -516,7 +629,7 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
                 f"not asked about. Run again to ask the rest.",
             )
             return _MOVED
-        return _Call(run.id, review.id, project.id, asked, needed)
+        return _Call(run.id, review.id, project.id, asked, needed, first)
 
 
 def _admit(sessions: sessionmaker[Session], call: _Call) -> bool:
@@ -558,8 +671,21 @@ def _settle(
         tokens = tokens_of(reply) if reply is not None else None
         if reply is not None:
             add_project_usage(
-                db, run.project_id, run.model, reply, spec.workflow, held if tokens else 0, None
+                db,
+                run.project_id,
+                run.first_model if call.first else run.model,
+                reply,
+                spec.workflow,
+                held if tokens else 0,
+                None,
             )
+            cost = reply.usage.get("cost")
+            if call.first:
+                run.first_asked += 1
+                run.first_spent += tokens or 0
+                run.first_cost += float(cost) if isinstance(cost, int | float) else 0.0
+            elif isinstance(cost, int | float):
+                run.cost, run.priced = run.cost + float(cost), run.priced + 1
         if tokens:
             run.spent += tokens
         else:
@@ -576,7 +702,17 @@ def _settle(
                 read = scope.read(reply.data, child, review.shortlist)
             except (Unusable, KeyError, ValueError) as unusable:
                 problem = str(unusable) or "The answer could not be read."
+                if call.first and child is not None:
+                    # Nothing usable from the first model: the run's own is asked.
+                    review.passed = True
+                    _TROUBLE.pop(run.id, None)
+                    return
             else:
+                if call.first and not settles(spec, read):
+                    review.passed = True
+                    _TROUBLE.pop(run.id, None)
+                    return
+                run.first_done += 1 if call.first else 0
                 review.state, review.detail = "answered", ""
                 review.answer, review.parent_id = read["answer"], read["parent_id"]
                 review.confidence, review.reason = read["confidence"], read["reason"]

@@ -17,6 +17,20 @@ export interface Run {
   detail: string;
   started_at: string;
   ended_at: string | null;
+  /** A cheaper model that was asked first: what it was asked and settled by itself. */
+  first?: { provider: string; model: string; asked: number; settled: number; tokens: number; cost: number } | null;
+  /** What the run cost, when its accounts say what their models cost. */
+  cost?: number | null;
+  /** What it would have cost had the run's own model answered every question. */
+  alone?: number | null;
+}
+/** The model a check asks first by default: the one whose trial on the check agreed. */
+export interface FirstModel {
+  provider: string;
+  model: string;
+  answers: number;
+  settled: number;
+  same: number;
 }
 export interface Model {
   provider: string;
@@ -48,6 +62,9 @@ export interface Review {
 export const whole = (value: number) => value.toLocaleString('en');
 /** A number with what it counts, in the singular for one. */
 export const some = (value: number, one: string, many: string) => `${whole(value)} ${value === 1 ? one : many}`;
+/** A cost in US dollars, with the digits a fraction of a cent needs. */
+export const dollars = (value: number | null | undefined) =>
+  value === null || value === undefined ? 'not priced' : '$' + (value >= 0.01 ? value.toFixed(2) : value.toFixed(5));
 const keyOf = (model: Model) => JSON.stringify([model.provider, model.model]);
 const LIVE = ['queued', 'running', 'paused', 'held'];
 const ASKING = ['queued', 'running'];
@@ -85,6 +102,8 @@ export function RunPanel({
   largest,
   noun,
   note,
+  twoModels,
+  first,
   onChanged,
   onProblem,
 }: {
@@ -104,22 +123,31 @@ export function RunPanel({
   noun: [string, string];
   /** What becomes of the answers, said before the run starts. */
   note?: string;
+  /** Whether the run may ask a cheaper model first, and the one it asks by default. */
+  twoModels?: boolean;
+  first?: FirstModel | null;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
   const [picked, setPicked] = useState('');
   const [cap, setCap] = useState('');
   const [chosen, setChosen] = useState<Record<string, boolean>>({});
+  // Until the administrator chooses, the model whose trial on this check agreed.
+  const [firstPicked, setFirstPicked] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const live = run ? LIVE.includes(run.state) : false;
   const asking = isAsking(run);
   const model = models.find((entry) => keyOf(entry) === picked) ?? models[0];
+  const others = twoModels && model ? models.filter((entry) => keyOf(entry) !== keyOf(model)) : [];
+  const firstKey = firstPicked ?? (first ? keyOf(first) : '');
+  const firstModel = others.find((entry) => keyOf(entry) === firstKey) ?? null;
   const count = asked(chosen);
   const use = likely(chosen);
   // Half as much again as the run is likely to use, and room for the last question: a
   // question holds its whole size until the provider says what it used.
-  const suggested = Math.max(10_000, Math.ceil((use * 1.5 + largest) / 10_000) * 10_000);
+  // With a first model, what it passes on is asked twice.
+  const suggested = Math.max(10_000, Math.ceil((use * (firstModel ? 2.2 : 1.5) + largest) / 10_000) * 10_000);
   const limit = Number(cap || suggested);
   const control = (action: 'stop' | 'resume' | 'end') => {
     if (!run) return;
@@ -145,6 +173,18 @@ export function RunPanel({
               {whole(run.token_cap)} tokens · {run.model}
             </span>
           </div>
+          {run.first ? (
+            <p className="text-muted-foreground">
+              {run.first.model} was asked first about {whole(run.first.asked)} and settled {whole(run.first.settled)} by
+              itself; the rest went to {run.model}.
+              {run.cost !== null && run.cost !== undefined ? ` The run cost ${dollars(run.cost)}` : ''}
+              {run.cost !== null && run.cost !== undefined && run.alone
+                ? `; with ${run.model} alone it would have cost about ${dollars(run.alone)}.`
+                : run.cost !== null && run.cost !== undefined
+                  ? '.'
+                  : ''}
+            </p>
+          ) : null}
           {run.detail ? <p className="text-muted-foreground">{run.detail}</p> : null}
           {run.uncounted ? (
             <p className="text-muted-foreground">
@@ -191,6 +231,20 @@ export function RunPanel({
                 onValueChange={(value) => setPicked(String(value))}
               />
             </label>
+            {twoModels ? (
+              <label className="grid gap-1 text-sm">
+                Ask a cheaper model first
+                <SimpleSelect
+                  aria-label="Model that is asked first"
+                  value={firstModel ? keyOf(firstModel) : ''}
+                  items={[
+                    { value: '', label: 'No: only the model beside this' },
+                    ...others.map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
+                  ]}
+                  onValueChange={(value) => setFirstPicked(String(value))}
+                />
+              </label>
+            ) : null}
             <label className="grid gap-1 text-sm">
               Stop at this many tokens
               <Input
@@ -217,6 +271,18 @@ export function RunPanel({
               Ask about {some(count, noun[0], noun[1])}
             </Button>
           </div>
+          {twoModels ? (
+            <p className="text-sm text-muted-foreground">
+              {firstModel
+                ? `${firstModel.model} is asked first. An answer of it is kept when it is clear and every passage it quotes is in the texts; everything else is asked of ${model?.model ?? 'the model beside it'}, so the run can use up to twice the tokens. `
+                : ''}
+              {first && firstModel && keyOf(first) === keyOf(firstModel)
+                ? `It is chosen because in its trial on this check it settled ${whole(first.settled)} of ${whole(first.answers)} questions by itself and said the same as the answer on record in ${whole(first.same)} of those.`
+                : first
+                  ? ''
+                  : 'No model has passed a trial on this check, so none is asked first by default. Try one under “Try another model on questions already answered”, on the Reorganize page.'}
+            </p>
+          ) : null}
         </div>
       )}
       {confirming && model ? (
@@ -224,13 +290,22 @@ export function RunPanel({
           title={`Ask about ${some(count, noun[0], noun[1])}?`}
           about={
             <>
-              {model.model} is asked one question per {noun[0]}. The run stops at {whole(limit)} tokens and counts
-              against the project’s review tokens. {note ?? 'It changes nothing: every answer waits for you.'}
+              {firstModel
+                ? `${firstModel.model} is asked first, one question per ${noun[0]}; what it does not settle is asked of ${model.model}.`
+                : `${model.model} is asked one question per ${noun[0]}.`}{' '}
+              The run stops at {whole(limit)} tokens and counts against the project’s review tokens.{' '}
+              {note ?? 'It changes nothing: every answer waits for you.'}
             </>
           }
           action="Start asking"
           run={() =>
-            postJson(`${path}/runs`, { provider: model.provider, model: model.model, token_cap: limit, ...chosen })
+            postJson(`${path}/runs`, {
+              provider: model.provider,
+              model: model.model,
+              token_cap: limit,
+              ...(firstModel ? { first_provider: firstModel.provider, first_model: firstModel.model } : {}),
+              ...chosen,
+            })
           }
           onClose={() => setConfirming(false)}
           onDone={() => {

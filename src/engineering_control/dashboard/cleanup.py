@@ -273,6 +273,8 @@ class _Scope:
 class _Kind:
     name = "story_needed"
     workflow = "cleanup_check"
+    # A run may ask a cheaper model first and keep what it settles.
+    two_models = True
     actionable: tuple[str, ...] = ("unsupported",)
     nothing_to_ask = (
         "A model has answered about every User Story that nothing supports. "
@@ -620,6 +622,7 @@ class Cleanup:
                     "answers": {answer: answers[answer] for answer in ANSWERS},
                     "run": parent_choice.latest_run(db, project.id, KIND.name),
                     "models": review_flows.model_choices(db),
+                    "first": parent_choice.suggested_first(db, project.id, KIND.name),
                     "budget": review_budget.status(db, project.id),
                 },
                 "stale_days": STALE_DAYS,
@@ -647,12 +650,18 @@ class Cleanup:
             }
 
     def start(
-        self, name: str, provider: str, model: str, token_cap: int, again: bool = False
+        self,
+        name: str,
+        provider: str,
+        model: str,
+        token_cap: int,
+        again: bool = False,
+        first: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run that asks a model, about each User Story that nothing supports and
         that has no answer yet, whether anything close to it in the project is its work."""
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again, None
+            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

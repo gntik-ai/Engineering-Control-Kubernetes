@@ -190,6 +190,15 @@ class _Trial:
                 agrees=review.answer == record.answer
                 and review.parent_id == record.parent_id
                 and not differs,
+                settled=parent_choice.settles(
+                    self.base,
+                    {
+                        "answer": review.answer,
+                        "checked": review.checked,
+                        "confidence": review.confidence,
+                        "evidence": review.evidence or [],
+                    },
+                ),
                 links=len(on_record),
                 links_same=len(on_record) - len(differs),
                 differs=differs or None,
@@ -262,6 +271,8 @@ def _report(
         for decision in ("approved", "dismissed")
     }
     links = sum(line.links for line in lines)
+    settled = sum(1 for line in lines if line.settled)
+    kept_same = sum(1 for line in lines if line.settled and line.agrees)
     return {
         "run": parent_choice.shown_run(run),
         "check": trial.base.name,
@@ -275,6 +286,11 @@ def _report(
         else None,
         "unclear": sum(1 for line in lines if line.answer == "unclear"),
         "checked": sum(1 for line in lines if line.checked),
+        # As a run's first model: the answers it would have kept by itself, how many
+        # of those are the same as on record, and whether that passes the gate.
+        "settled": settled,
+        "settled_same": kept_same,
+        "gate": parent_choice.trial_gate(settled, kept_same),
         "tokens_each": round(sum(counted) / len(counted)) if counted else None,
         "cost": round(sum(priced), 6) if priced else None,
         "cost_each": round(sum(priced) / len(priced), 6) if priced else None,
@@ -332,6 +348,7 @@ class ModelTrials:
                         "likely_all": sum(used),
                         "largest": largest,
                         "run": parent_choice.latest_run(db, project.id, trial.name),
+                        "first": parent_choice.suggested_first(db, project.id, trial.base.name),
                     }
                 )
             runs = db.scalars(
@@ -352,6 +369,10 @@ class ModelTrials:
                 "models": review_flows.model_choices(db),
                 "budget": review_budget.status(db, project.id),
                 "sample": SAMPLE,
+                "gate": {
+                    "settled": parent_choice.GATE_SETTLED,
+                    "same": parent_choice.GATE_SAME,
+                },
             }
 
     def listing(
