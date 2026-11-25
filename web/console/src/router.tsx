@@ -17,6 +17,7 @@ export function workspaceTabUrl(project: string, tab: string, issueState?: 'draf
   if (issueState) query.set('issue_state', issueState);
   return workspaceUrl(project) + '?' + query;
 }
+export const bugsUrl = (name: string) => workspaceUrl(name) + '/bugs';
 export const queueUrl = (name: string, id?: string) => workspaceUrl(name) + '/queue' + (id ? '?id=' + encodeURIComponent(id) : '');
 export const statsUrl = (project?: string | null) => BASE + '/settings/stats' + (project ? '?' + new URLSearchParams({project}) : '');
 export const connectionsUrl = (name: string, id?: string) => workspaceUrl(name) + '/settings/connections' + (id ? '?connection=' + encodeURIComponent(id) : '');

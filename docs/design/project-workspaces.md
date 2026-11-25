@@ -445,6 +445,12 @@ What is proposed appears as the batch kinds `retire_stories`, `retire_epics` and
 
 `GET /api/dashboard/projects/{name}/epic-links` returns the Stories, links and Epics per Story, the links to judge, the answers that still stand, how many links are ready for a batch, and what a run would ask. `GET …/epic-links/records?show=` lists the Stories asked about with what was said of each link. `POST …/epic-links/runs` and `POST …/epic-links/runs/{run_id}/control` start and control a run. The batch kind `extra_epics` of `reorg` takes its lines from `epic_links.ready`; approving a line calls `PlanningRecords.remove_epic_link`, which never takes a Story's last Epic off, and undoing calls `restore_epic_link` and puts the link's record back as it stood.
 
+### The Bugs section
+
+Proposed in [A section for bugs](bugs-section.md); its first phase is built. `bug_section.BugSection` reads a project's bugs from `backlog_items` through `issue_types.bugs_with_optional_stories`, so the plan's visibility rules do not apply and a project without a plan has the section.
+
+`GET /api/dashboard/projects/{name}/bugs` returns the counts, the repository and the parts of a report; `GET …/bugs/records?state=&sort=&search=` lists the bugs. `POST …/bugs` reports one: an item is made with `workspace_review="publishing"` and its type confirmed as `bug`, a `create` action is queued and carried out in the same request, and `create_workspace_issue` sends the label with the issue. `POST …/bugs/{key}/edit` and `…/reopen` write to GitHub in the request and keep what GitHub answers; `…/close` goes through `PlanningLifecycle` with the reason and the comment; `…/not-a-bug` confirms the type as enhancement, which queues the label change. The console shows the section at `/console/workspace/{project}/bugs`.
+
 ### Epic pages
 
 `epic_pages.compose` puts the page of every Epic of a project together in one pass over the plan, the Stories' states, the issues and the documents' vectors, and keeps the result until one of those tables changed. `EpicPages.refresh` keeps a new row of `epic_pages` (migration 0082) for each page whose digest differs from its last version, with the changes in sentences, and drops versions beyond the last thirty. It runs after the scorer's keeper worked the Stories' states out, and when a page or the list is read.

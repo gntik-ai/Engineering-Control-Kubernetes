@@ -10,10 +10,10 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen } from '@gntik-ai/icons';
+import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
-import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
+import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, bugsUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
 import { ProjectSupervisor } from './ProjectSupervisor';
 import { SupervisorPage } from './Supervisor';
 import { StatsPage } from './Stats';
@@ -21,6 +21,7 @@ import { AccountsPage } from './Accounts';
 import { ConnectionsPage } from './Connections';
 import { NewProjectDialog } from './ProjectDialogs';
 import { ProjectQueue } from './ProjectQueue';
+import { BugsPage } from './Bugs';
 import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
 import { EvidencePanel } from './ReviewEvidence';
@@ -50,7 +51,7 @@ export function ProjectWorkspace({
   notice,
 }: {
   name: string;
-  view: 'dashboard' | 'supervisor' | 'supervisor-settings' | 'queue' | 'connections' | 'accounts' | 'stats' | AutomationView | ReviewView;
+  view: 'dashboard' | 'supervisor' | 'supervisor-settings' | 'queue' | 'bugs' | 'connections' | 'accounts' | 'stats' | AutomationView | ReviewView;
   global?: boolean;
   actions: ReactNode;
   notice: ReactNode;
@@ -71,6 +72,7 @@ export function ProjectWorkspace({
     supervisor: 'Supervisor · ' + projectTitle,
     'supervisor-settings': 'Supervisor · Global settings',
     queue: 'Queue · ' + projectTitle,
+    bugs: 'Bugs · ' + projectTitle,
     connections: 'Connections · ' + projectTitle,
     accounts: 'Accounts · Global settings',
     stats: 'Stats · Global settings',
@@ -86,6 +88,7 @@ export function ProjectWorkspace({
   if (context) {
     primary.items.push({label: 'Supervisor', href: workspaceUrl(context) + '/supervisor', icon: Sparkles});
     primary.items.push({ label: 'Queue', href: queueUrl(context), icon: ListOrdered });
+    primary.items.push({ label: 'Bugs', href: bugsUrl(context), icon: Bug });
     groups.push({
       id: 'project-reviews',
       label: 'Reviews',
@@ -124,6 +127,7 @@ export function ProjectWorkspace({
       case 'stats': return statsUrl(projectName);
       case 'accounts': return accountsUrl(projectName);
       case 'queue': return queueUrl(projectName);
+      case 'bugs': return bugsUrl(projectName);
       case 'connections': return connectionsUrl(projectName);
       case 'dashboard': return projectName ? workspaceUrl(projectName) : BASE;
     }
@@ -186,7 +190,7 @@ export function ProjectWorkspace({
         <Page width="wide">
           <LoadError resource={projects} />
           {project ? (
-            view === 'supervisor' ? <ProjectSupervisor key={name} project={project.project} projects={items} /> : view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'connections' ? (
+            view === 'supervisor' ? <ProjectSupervisor key={name} project={project.project} projects={items} /> : view === 'queue' ? <ProjectQueue key={name} project={name} /> : view === 'bugs' ? <BugsPage key={name} project={name} /> : view === 'connections' ? (
               <ConnectionsPage key={project.project} project={project} projects={items} />
             ) : isReviewView(view) ? (
               <div className="grid min-w-0 gap-5" key={project.project}>

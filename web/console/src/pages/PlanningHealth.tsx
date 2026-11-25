@@ -3,7 +3,7 @@ import { RefreshCw } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { apiUrl, getJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { reviewUrl, workspaceUrl } from '../router';
+import { bugsUrl, reviewUrl, workspaceUrl } from '../router';
 
 /** What is counted of a project's planning. Every number is one the planning tables show. */
 interface Numbers {
@@ -196,7 +196,7 @@ export function PlanningHealth({ project }: { project: string }) {
                 note={`${whole(now.bugs_confirmed)} confirmed as bugs by you; the others by their GitHub type, label or title`}
                 was={was?.bugs_linked}
                 since={since}
-                href={`${home}?tab=bugs`}
+                href={bugsUrl(project)}
               />
               <Tile
                 value={now.issues_under_several_stories}

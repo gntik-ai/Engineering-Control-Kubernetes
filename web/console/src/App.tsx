@@ -174,7 +174,7 @@ export default function App() {
     if (rest[0] === 'automation' && rest.length === 2 && isAutomation(rest[1] ?? '')) {
       return <ProjectWorkspace name={name} view={rest[1] as import('./router').AutomationView} actions={actions} notice={notice} />;
     }
-    if (subpath !== '' && subpath !== 'queue' && subpath !== 'supervisor' && subpath !== 'settings/connections') return <NotFoundPage />;
+    if (subpath !== '' && subpath !== 'queue' && subpath !== 'bugs' && subpath !== 'supervisor' && subpath !== 'settings/connections') return <NotFoundPage />;
     const view = subpath === 'settings/connections' ? 'connections' : subpath || 'dashboard';
     return <ProjectWorkspace name={name} view={view} actions={actions} notice={notice} />;
   }

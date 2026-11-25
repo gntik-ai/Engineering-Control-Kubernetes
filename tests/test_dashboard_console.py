@@ -145,6 +145,7 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             "/console/workspace/falcone/reviews/planning",
             "/console/workspace/falcone/reviews/discovery",
             "/console/workspace/falcone/reviews/epics",
+            "/console/workspace/falcone/bugs",
             "/console/projects",
             "/console/backlog",
             "/console/settings/accounts",

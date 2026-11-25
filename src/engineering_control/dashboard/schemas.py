@@ -574,6 +574,30 @@ class OrphanApproveInput(PlainChangeInput):
     item_ids: list[UUID] | None = Field(default=None, max_length=500)
 
 
+class BugReportInput(PlainChangeInput):
+    """A bug as the administrator reports it. Its parts become the text of its issue."""
+
+    title: str = Field(min_length=1, max_length=300)
+    happens: str = Field(min_length=1, max_length=10_000)
+    expected: str = Field(default="", max_length=10_000)
+    steps: str = Field(default="", max_length=10_000)
+    seen_in: str = Field(default="", max_length=2_000)
+
+
+class BugEditInput(PlainChangeInput):
+    """A bug's title and text as the administrator changed them."""
+
+    title: str = Field(min_length=1, max_length=300)
+    text: str = Field(default="", max_length=40_000)
+
+
+class BugCloseInput(PlainChangeInput):
+    """Why a bug is closed, and what is left on its issue as a comment."""
+
+    reason: Literal["fixed", "wont_fix"]
+    note: str = Field(default="", max_length=4_000)
+
+
 class BugUnlinkInput(PlainChangeInput):
     """The bugs to take off their User Stories: these, or every bug that is linked."""
 

@@ -29,7 +29,7 @@ import { DataTable } from '../components/blocks/tables/data-table/DataTable';
 import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 import { Confirm } from '../confirm';
 import { LoadError, RefreshButton } from '../parts';
-import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl, navigate, reviewUrl } from '../router';
+import { setQuery, useLocation, workspaceUrl, connectionsUrl, recordUrl, navigate, reviewUrl, bugsUrl } from '../router';
 import { nextStageLabel, WorkspaceSync } from './WorkspaceReview';
 import { querySort, sortParams } from '../components/table-order';
 import { LayoutSwitch, PlanningGrid, type Layout } from './PlanningGrid';
@@ -46,7 +46,6 @@ const sections = {
   epics: 'Epics',
   stories: 'User Stories',
   issues: 'Issues',
-  bugs: 'Bugs',
   architecture: 'Architecture',
 };
 const singular = { epics: 'Epic', stories: 'User Story', issues: 'Issue' };
@@ -749,6 +748,8 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
     return () => window.removeEventListener(CHANGED, counts.reload);
   }, [counts.reload]);
   const requested = useLocation().query.get('tab') ?? 'home';
+  // Bugs have a section of their own: a link to the tab they once had leads there.
+  useEffect(() => { if (requested === 'bugs') navigate(bugsUrl(project.project), { replace: true }); }, [requested, project.project]);
   const tab = Object.hasOwn(sections, requested) ? requested : 'home';
   const [reading, setReading] = useState<DescriptionContent | null>(null);
   useEffect(() => { setReading(null); }, [tab]);
@@ -798,9 +799,6 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
             {tab === kind && <Records kind={kind} project={project.project} onRead={setReading} />}
           </TabsPanel>
         ))}
-        <TabsPanel value="bugs" className="pt-5">
-          {tab === 'bugs' && <Records kind="issues" bugsOnly project={project.project} onRead={setReading} />}
-        </TabsPanel>
         <TabsPanel value="architecture" />
       </Tabs>
       {reading && (

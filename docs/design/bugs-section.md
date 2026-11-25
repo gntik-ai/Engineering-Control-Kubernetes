@@ -1,6 +1,6 @@
 # A section for bugs
 
-Proposal, 25 November 2026. Nothing in it is built yet.
+Proposal, 25 November 2026. Phase B1 is built (25 November 2026); B2 to B5 are not.
 
 ## What is asked for
 
@@ -107,7 +107,17 @@ Each phase is deployed and usable on its own.
 | B4 | **Seen and told.** Numbers: open by severity and area, age, time from report to fix, reopened bugs, regressions. Dashboard tiles, the table of all projects, digest lines, the alert for a critical bug, reporting from the chat. | The numbers match the list. A critical bug reaches the chat within minutes. |
 | B5 | **Help with triage, on your word.** A run in which a model suggests severity, area and a likely duplicate for the bugs that are New, and says what is missing from a report. You accept or change each suggestion. Optional: a failing check on the default branch becomes a draft bug. | Suggestions are shown with their reasons and nothing is set without you. |
 
-B1 and B2 change no flow and spend no model tokens. B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
+B1 and B2 change no flow and spend no model tokens.
+
+### B1 as built
+
+- **The page.** Bugs is an entry of every project's menu, beside Queue. It lists the project's bugs from its issues and not from its plan: open, closed or all; the newest, the oldest or the last changed first; search by title or number. The Bugs tab of the project's page is gone, and a link to it leads to the section.
+- **Reporting.** One form: the title, what happens, what was expected, how to reproduce it, where it was seen. Each part that is filled in becomes a heading of the issue's text. **Report** creates the issue with the `bug` label in the same request to GitHub, and the list shows it with its number at once. Where GitHub cannot be reached the bug is kept, shown as being created, and created by the worker that already retries what GitHub did not take. A bug with the same title as an open one is refused; looking for bugs that are merely alike is B2.
+- **Changing.** Title and text are changed on GitHub and kept here as GitHub answered. If the text was changed on GitHub since it was read here, nothing is overwritten: it is read again and the change is made once more.
+- **Closing and opening again.** Closed as fixed or as not going to be fixed, with an optional comment left on the issue; GitHub is told "completed" or "not planned". It goes through the same confirmed closure as every other issue the platform closes. A closed bug is opened again from its row.
+- **Not a bug.** The issue becomes ordinary work by your word, and its `bug` label is taken off. The opposite, "It is a bug", stays where it was: on an issue of the plan.
+- **Not in B1.** States beyond open and closed, severity, area, duplicates and bulk changes (B2). The numbers on the Dashboard (B4).
+ B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
 
 ## What changes underneath
 

@@ -78,6 +78,9 @@ from engineering_control.dashboard.schemas import (
     BatchInput,
     BatchLineInput,
     BudgetInput,
+    BugCloseInput,
+    BugEditInput,
+    BugReportInput,
     BugUnlinkInput,
     CacheTrialInput,
     CommandProfileInput,
@@ -1686,6 +1689,96 @@ def create_app(
                 repo(request).orphans.control, name, run_id, body.action
             ),
             event="workspace.orphan_run_controlled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/bugs")
+    async def bugs_api(name: str, request: Request) -> Response:
+        """How many bugs the project has, and whether one can be reported."""
+        return await documents_read(request, lambda: repo(request).bug_section.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/bugs/records")
+    async def bugs_records_api(
+        name: str,
+        request: Request,
+        state: Literal["", "open", "closed"] = "open",
+        search: str = Query("", max_length=200),
+        sort: Literal["newest", "oldest", "updated"] = "newest",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+    ) -> Response:
+        """The project's bugs, read from its issues whatever its plan knows of them."""
+        return await documents_read(
+            request,
+            lambda: repo(request).bug_section.listing(name, state, search, sort, page, page_size),
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs")
+    async def bug_report_api(name: str, request: Request) -> Response:
+        """Report a bug: its issue is created on GitHub at once, with the bug label."""
+        return await project_change(
+            request,
+            BugReportInput,
+            lambda body: repo(request).bug_section.report(
+                name,
+                body.title,
+                {
+                    "happens": body.happens,
+                    "expected": body.expected,
+                    "steps": body.steps,
+                    "seen_in": body.seen_in,
+                },
+                github(request),
+            ),
+            event="workspace.bug_reported",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/edit")
+    async def bug_edit_api(name: str, key: UUID, request: Request) -> Response:
+        """Change a bug's title and text, on GitHub and here."""
+        return await project_change(
+            request,
+            BugEditInput,
+            lambda body: repo(request).bug_section.edit(
+                name, key, body.title, body.text, github(request)
+            ),
+            event="workspace.bug_edited",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/close")
+    async def bug_close_api(name: str, key: UUID, request: Request) -> Response:
+        """Close a bug as fixed or as not going to be fixed."""
+        return await project_change(
+            request,
+            BugCloseInput,
+            lambda body: asyncio.to_thread(
+                repo(request).bug_section.close, name, key, body.reason, body.note
+            ),
+            event="workspace.bug_closed",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/reopen")
+    async def bug_reopen_api(name: str, key: UUID, request: Request) -> Response:
+        """Open a closed bug again."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: repo(request).bug_section.reopen(name, key, github(request)),
+            event="workspace.bug_reopened",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/not-a-bug")
+    async def bug_not_a_bug_api(name: str, key: UUID, request: Request) -> Response:
+        """Say that the issue is ordinary work and no bug."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: asyncio.to_thread(repo(request).bug_section.not_a_bug, name, key),
+            event="workspace.bug_reclassified",
             subject=name,
         )
 
@@ -4660,7 +4753,7 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics)"
+                    r"/(?:settings/connections|queue|bugs|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

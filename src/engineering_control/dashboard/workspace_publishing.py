@@ -232,6 +232,14 @@ class WorkspacePublishing:
             session.expunge(action)
             return action, title, body
 
+    def _confirmed_type(self, action: WorkspaceAction) -> str | None:
+        """Bug or enhancement, where the administrator said which the new issue is."""
+        with self.sessions() as db:
+            item = db.get(BacklogItem, action.local_id)
+            if item and item.type_confirmed and item.execution_type in ("bug", "enhancement"):
+                return item.execution_type
+            return None
+
     def _approved_planning_kind(self, action: WorkspaceAction) -> str | None:
         with self.sessions() as db:
             candidate = db.scalar(
@@ -318,6 +326,12 @@ class WorkspacePublishing:
                     else datetime.now(UTC)
                 )
                 item.state, item.done_at = "done", item.github_closed_at
+                # Why it was closed, as GitHub has it now: known here at once, not only
+                # after the repository is read again.
+                item.facts = {
+                    **(item.facts or {}),
+                    "github_state_reason": (snapshot or {}).get("state_reason"),
+                }
                 if updated:
                     item.issue_updated_at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                 source = session.get(WorkspaceSource, (project.id, f"issue:{number}"))
@@ -468,9 +482,19 @@ class WorkspacePublishing:
                             action.repository, number, title, token=token
                         )
                     elif action.operation == "create":
+                        kind = await asyncio.to_thread(self._confirmed_type, action)
                         await asyncio.to_thread(self._update, name, action, sent=True)
-                        number = await github.create_workspace_issue(
-                            action.repository, title, body.rstrip() + "\n\n" + marker, token=token
+                        text = body.rstrip() + "\n\n" + marker
+                        number = await (
+                            # What you called a bug or an enhancement is one from the
+                            # moment it is created.
+                            github.create_workspace_issue(
+                                action.repository, title, text, token=token, labels=[kind]
+                            )
+                            if kind
+                            else github.create_workspace_issue(
+                                action.repository, title, text, token=token
+                            )
                         )
                     else:
                         raise GitHubAppError("Invalid GitHub approval record")

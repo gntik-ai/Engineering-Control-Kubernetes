@@ -1,7 +1,7 @@
 import { Badge, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { reviewUrl, workspaceUrl, type ReviewView } from '../router';
+import { bugsUrl, reviewUrl, workspaceUrl, type ReviewView } from '../router';
 import { whole } from './ChoiceRun';
 
 interface Moved {
@@ -27,7 +27,7 @@ export interface ProjectRow {
 
 /** Where a step is done: a view of Reviews, or the Bugs tab of the project. */
 export const stepUrl = (project: string, view: ReviewView | 'bugs') =>
-  view === 'bugs' ? workspaceUrl(project) + '?tab=bugs' : reviewUrl(project, view);
+  view === 'bugs' ? bugsUrl(project) : reviewUrl(project, view);
 
 /** What moved since the day before, as short phrases with the change. */
 export function moved(entries: Moved[]): string {

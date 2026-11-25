@@ -602,16 +602,61 @@ class GitHubApp:
             raise GitHubAppError("GitHub did not confirm the issue closure")
 
     async def create_workspace_issue(
-        self, repository: str, title: str, body: str, *, token: str
+        self,
+        repository: str,
+        title: str,
+        body: str,
+        *,
+        token: str,
+        labels: list[str] | None = None,
     ) -> int:
+        """Create the issue. ``labels`` are set in the same request, so that an issue
+        reported as a bug is one from its first moment."""
         if not REPOSITORY_NAME.fullmatch(repository):
             raise GitHubAppError("Invalid issue repository")
-        data = await self._request(
-            "POST", f"/repos/{repository}/issues", token=token, json={"title": title, "body": body}
-        )
+        new: dict[str, Any] = {"title": title, "body": body}
+        if labels:
+            new["labels"] = labels
+        data = await self._request("POST", f"/repos/{repository}/issues", token=token, json=new)
         if not isinstance(data, dict) or not isinstance(data.get("number"), int):
             raise GitHubAppError("GitHub did not return the new issue number")
         return int(data["number"])
+
+    async def update_workspace_issue(
+        self, repository: str, number: int, *, token: str, title: str, body: str
+    ) -> dict[str, Any]:
+        """Change the title and the text of an issue, and return it as GitHub has it."""
+        if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
+            raise GitHubAppError("Invalid issue reference")
+        data = await self._request(
+            "PATCH",
+            f"/repos/{repository}/issues/{number}",
+            token=token,
+            json={"title": title, "body": body},
+        )
+        if not isinstance(data, dict) or data.get("number") != number:
+            raise GitHubAppError("GitHub did not confirm the change to the issue")
+        return data
+
+    async def reopen_workspace_issue(
+        self, repository: str, number: int, *, token: str
+    ) -> dict[str, Any]:
+        """Open a closed issue again, and return it as GitHub has it."""
+        if not REPOSITORY_NAME.fullmatch(repository) or number < 1:
+            raise GitHubAppError("Invalid issue reference")
+        data = await self._request(
+            "PATCH",
+            f"/repos/{repository}/issues/{number}",
+            token=token,
+            json={"state": "open", "state_reason": "reopened"},
+        )
+        if (
+            not isinstance(data, dict)
+            or data.get("state") != "open"
+            or data.get("number") != number
+        ):
+            raise GitHubAppError("GitHub did not confirm that the issue is open again")
+        return data
 
     async def workspace_published(self, repository: str, marker: str) -> int | None:
         """Find this app's marker in open and closed issues of this repository."""
