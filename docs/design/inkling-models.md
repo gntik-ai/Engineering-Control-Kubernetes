@@ -104,6 +104,25 @@ Either way the window is not the million tokens of the hosted model: on 16 GB it
 
 **So: feasible to try, not shown to work.** I could not try it. The node has a 6 GB card today, the cluster does not hand the card to any workload (the ranking service runs on the processors), and this session has no graphics card. The plan below makes the local model the preferred first tier on one condition: that it passes a measured gate on the 16 GB card. If it does not, the same model through OpenRouter takes its place at $0.075 and $0.30, and nothing else in the plan changes.
 
+### Three nodes with 16 GB each (added 25 November 2026)
+
+The cluster has three nodes, each with a 16 GB card. That is not one card of 48 GB: a model runs in one process on one machine, and memory on different machines adds up only if the model itself is cut in pieces that talk over the network.
+
+| Way | Fits? | What it costs | Known? |
+| --- | --- | --- | --- |
+| **A copy on each node**, of a build that fits whole in 16 GB (about 13 GB, leaving room for the texts) | Yes, if such a build of Inkling 2 Mini answers well enough | Nothing in speed. Three questions at a time, and a node can fail. | The quality of the smaller build has to be measured |
+| **A copy on each node**, the 18 GB build with the rest in the node's memory | Yes | Slower by an amount nobody has published | To be measured |
+| **One copy cut across two nodes** (llama.cpp's RPC server, or vLLM over several machines) | Yes: 20 GB over two cards of 16 | Every token crosses the network between the nodes. Inkling is a looped model, which may cross it several times for one token. One node failing stops it. | Whether these servers cut this model at all is not confirmed |
+
+The first two are preferred, in that order. The platform's work is thousands of short questions that do not depend on each other (1,567 links in Falcone), and three copies answer three at a time: that is what three nodes are good for. Cutting one copy across nodes is the last thing to try, and only if both others fail the gate.
+
+Two things follow for the plan:
+
+- **M0 also measures one or two open models that fit whole in 16 GB**, so that if no build of Inkling 2 Mini passes the gate there is a model that does, measured on the same questions.
+- **The card that the language model does not use can serve the ranking models.** They run on processors today, at 3 to 8 texts a second; on a card that is some tens of times faster, with models that fit in a few GB. If all three cards serve the language model, each still has room for them only with the smaller build.
+
+All of this assumes 16 GB of graphics memory on each node. If the 16 GB is the node's ordinary memory and there is no such card, none of it holds: a 20 GB model does not fit in the memory of any one node.
+
 **What it needs from you.**
 
 - The 16 GB card in the node.
@@ -145,7 +164,7 @@ This is the same cascade the reorganization uses, one step longer: rules, rankin
 | M0 | **Measure on what we have.** Inkling 2 Mini and Inkling 2 Small, through OpenRouter, asked the questions the platform already has answers to: the 223 Stories the check answered, the pairs you judged, the accuracy study's held-out decisions. No new answer is kept or acted on. | For each model: how often it agrees with the answer on record, how often it says "unclear", how often its quotes are in the texts, and what a question costs. A few dollars of OpenRouter credit. |
 | M1 | **Tiers in a run.** A run names a first model and a second. What the first cannot settle goes to the second. The run's report shows what each settled and what was saved. | A run of the Epic-links check with Inkling 2 Mini first and your model second costs less than the same run with your model alone, and its batch passes its sample. |
 | M2 | **A model on the node.** A ninth provider, Local: a model server in the cluster with the card, the weights on a volume, no key, no price, one question at a time. The Accounts page shows it with its health and its window. | A question asked of the local model is answered from inside the cluster and metered at no cost. |
-| M3 | **The gate on 16 GB.** The two ways above, measured on the card: memory, tokens a second, and agreement against M0's numbers for the same model through OpenRouter. | Passed when it writes at least 15 tokens a second and agrees within 3 points of the hosted model. If it fails, M4 uses the hosted Inkling 2 Mini and says so. |
+| M3 | **The gate on 16 GB.** The ways above, a copy on each node first, measured on the card: memory, tokens a second, and agreement against M0's numbers for the same model through OpenRouter. | Passed when it writes at least 15 tokens a second and agrees within 3 points of the hosted model. If it fails, M4 uses the hosted Inkling 2 Mini and says so. |
 | M4 | **First tier by default** for the checks of the plan, the summaries, the overviews and bug triage. | The share of questions settled at no cost is on the Dashboard, and no batch's sample got worse. |
 | M5 | **Code generation.** The Lab replays past delivery runs with Inkling 2 Small writing and another family reviewing, beside what was done. Then per flow: which step each model takes. | Per flow: the share of runs whose tests pass and whose review agrees, and the cost of a finished task, for each arrangement. A flow changes its default only where the cheaper arrangement finishes as many tasks. |
 
