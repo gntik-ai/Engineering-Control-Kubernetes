@@ -1217,6 +1217,50 @@ class BugRecord(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (UniqueConstraint("project_id", "item_id", name="uq_bug_records_item"),)
 
 
+class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):
+    """What a model said to one question of a trial, beside the answer on record
+    (migration 0084). A trial asks another model the questions a check already has an
+    answer to; nothing but the trial's report reads these lines."""
+
+    __tablename__ = "model_trial_lines"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("choice_runs.id", ondelete="CASCADE"), index=True
+    )
+    # The check the question is of: ``story_needed``, ``epic_links`` and so on.
+    kind: Mapped[str] = mapped_column(String(16))
+    child_id: Mapped[UUID] = mapped_column(Uuid)
+    title: Mapped[str] = mapped_column(String(500), default="")
+    answer: Mapped[str] = mapped_column(String(16))
+    parent: Mapped[str | None] = mapped_column(String(500))
+    reason: Mapped[str | None] = mapped_column(Text)
+    # Whether every passage it quoted is in the text it says it is from.
+    checked: Mapped[bool] = mapped_column(Boolean, default=False)
+    tokens: Mapped[int | None] = mapped_column(Integer)
+    # What the call cost, when the account says what its model costs.
+    cost: Mapped[float | None] = mapped_column(Float)
+    # The answer on record when the question was asked, and who gave it.
+    ref_model: Mapped[str | None] = mapped_column(String(200))
+    ref_answer: Mapped[str] = mapped_column(String(16))
+    ref_parent: Mapped[str | None] = mapped_column(String(500))
+    ref_reason: Mapped[str | None] = mapped_column(Text)
+    ref_checked: Mapped[bool] = mapped_column(Boolean, default=False)
+    ref_tokens: Mapped[int | None] = mapped_column(Integer)
+    # pending, approved or dismissed: what the administrator did with that answer.
+    ref_decision: Mapped[str] = mapped_column(String(16), default="pending")
+    agrees: Mapped[bool] = mapped_column(Boolean, default=False)
+    # For a check that judges several links in one question: how many, how many alike,
+    # and the ones it said otherwise about.
+    links: Mapped[int] = mapped_column(Integer, default=0)
+    links_same: Mapped[int] = mapped_column(Integer, default=0)
+    differs: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    __table_args__ = (
+        UniqueConstraint("run_id", "child_id", name="uq_model_trial_lines_run_child"),
+    )
+
+
 class EpicPage(UUIDPrimaryKey, Timestamps, Base):
     """One version of the page the platform puts together for an Epic (migration 0082):
     its User Stories with where they stand, their issues and the documents closest to

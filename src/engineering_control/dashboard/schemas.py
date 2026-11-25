@@ -537,6 +537,13 @@ class DocFoldersInput(PlainChangeInput):
     exclude: list[str] = Field(default_factory=list, max_length=40)
 
 
+class ModelTrialRunInput(OrphanRunInput):
+    """A trial of a model on the questions of a check that have an answer on record."""
+
+    # Ask every one of them, not a sample.
+    everything: bool = False
+
+
 class PrimaryEpicRunInput(OrphanRunInput):
     """A run that asks which Epic is the primary one of each User Story under several."""
 

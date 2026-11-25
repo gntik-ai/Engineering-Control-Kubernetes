@@ -84,6 +84,7 @@ export function RunPanel({
   likely,
   largest,
   noun,
+  note,
   onChanged,
   onProblem,
 }: {
@@ -101,6 +102,8 @@ export function RunPanel({
   /** The most one question holds of the project's review tokens while it is asked. */
   largest: number;
   noun: [string, string];
+  /** What becomes of the answers, said before the run starts. */
+  note?: string;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
@@ -222,7 +225,7 @@ export function RunPanel({
           about={
             <>
               {model.model} is asked one question per {noun[0]}. The run stops at {whole(limit)} tokens and counts
-              against the project’s review tokens. It changes nothing: every answer waits for you.
+              against the project’s review tokens. {note ?? 'It changes nothing: every answer waits for you.'}
             </>
           }
           action="Start asking"

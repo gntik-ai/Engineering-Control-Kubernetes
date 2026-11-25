@@ -24,6 +24,7 @@ from engineering_control.dashboard.epic_descriptions import EpicDescriptions
 from engineering_control.dashboard.epic_links import EpicLinks
 from engineering_control.dashboard.epic_pages import EpicPages
 from engineering_control.dashboard.execution_plans import ExecutionPlans
+from engineering_control.dashboard.model_trials import ModelTrials
 from engineering_control.dashboard.orphans import Orphans
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_analysis import PlanningAnalysis
@@ -141,6 +142,7 @@ class DashboardRepository:
         self.delivery = Delivery(self.sessions, self.planning_links)
         self.epic_pages = EpicPages(self.sessions, self.planning_links)
         self.epic_links = EpicLinks(self.sessions, self.planning_links)
+        self.model_trials = ModelTrials(self.sessions)
         # When what the scorer reads changed, where the Stories stand is worked out
         # again, and then the Epics' pages, which say it.
         self.scorer.after = self._after_scoring

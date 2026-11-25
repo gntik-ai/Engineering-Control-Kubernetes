@@ -586,6 +586,10 @@ def _settle(
                 review.decision, review.decided_at = "pending", None
                 run.done += 1
                 _TROUBLE.pop(run.id, None)
+                # A kind may keep more of an answer than the review holds.
+                keep = getattr(spec, "answered", None)
+                if keep is not None:
+                    keep(db, run, review, child, reply)
                 return
         if label in NO_ACCOUNT:
             if run.state in ASKING:

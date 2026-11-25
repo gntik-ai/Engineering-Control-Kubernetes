@@ -115,6 +115,7 @@ from engineering_control.dashboard.schemas import (
     ItemStateInput,
     ManagedCoverageInput,
     MissingStoryInput,
+    ModelTrialRunInput,
     NewEpicInput,
     OrphanApproveInput,
     OrphanDraftInput,
@@ -2227,6 +2228,60 @@ def create_app(
                 repo(request).epic_links.control, name, run_id, body.action
             ),
             event="workspace.epic_links_check_controlled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/model-trials")
+    async def model_trials_api(name: str, request: Request) -> Response:
+        """The checks another model can be tried on, and the report of each trial."""
+        return await documents_read(request, lambda: repo(request).model_trials.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/model-trials/runs/{run_id}/records")
+    async def model_trial_records_api(
+        name: str,
+        run_id: UUID,
+        request: Request,
+        show: Literal["", "differs", "same"] = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> Response:
+        """What the model of a trial said to each question, beside the answer on record."""
+        return await documents_read(
+            request,
+            lambda: repo(request).model_trials.listing(name, run_id, show, page, page_size),
+        )
+
+    @app.post("/api/dashboard/projects/{name}/model-trials/{check}/runs")
+    async def model_trial_run_api(name: str, check: str, request: Request) -> Response:
+        """Ask another model the questions of a check that have an answer on record.
+        What it says is kept as the trial's lines and changes nothing else."""
+        return await project_change(
+            request,
+            ModelTrialRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).model_trials.start,
+                name,
+                check,
+                body.provider,
+                body.model,
+                body.token_cap,
+                body.everything,
+            ),
+            event="workspace.model_trial_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/model-trials/{check}/runs/{run_id}/control")
+    async def model_trial_run_control_api(
+        name: str, check: str, run_id: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).model_trials.control, name, check, run_id, body.action
+            ),
+            event="workspace.model_trial_controlled",
             subject=name,
         )
 

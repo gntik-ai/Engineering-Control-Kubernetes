@@ -453,6 +453,10 @@ Proposed in [A section for bugs](bugs-section.md); its first phase is built. `bu
 
 Triage is kept in `bug_records` (migration 0083): severity, area, where it was seen, the bug it duplicates and when it was confirmed. `triage_of` works a bug's state out from its issue and that record. `POST …/bugs/{key}/triage` sets severity, area and where it was seen, and `label_workspace_issue` mirrors the severity; `POST …/bugs/several` does one decision, or a closure, for up to a hundred bugs; `…/close` takes `duplicate` with the number of the other bug; `GET …/bugs/similar?title=` returns the open bugs that share a new title's words. `signals._vectors_due` gives every bug a vector of kind `bug`, and `alike_by_meaning` compares open bugs with one another.
 
+### Trying another model
+
+At the foot of Reorganize. A trial asks another model the questions a check already has an answer to, on a sample of 100 records that is the same for every model, and reports how often it says the same as the answer on record, how often it cannot tell, how often its quotes are in the texts, and what a question costs beside what it cost with the model on record. A trial's answers are its own lines: no worklist shows them, no batch is made from them, and the answer on record stays. It counts against the project's review tokens. The reasoning and the plan it belongs to are in [inkling-models.md](inkling-models.md).
+
 ### Epic pages
 
 `epic_pages.compose` puts the page of every Epic of a project together in one pass over the plan, the Stories' states, the issues and the documents' vectors, and keeps the result until one of those tables changed. `EpicPages.refresh` keeps a new row of `epic_pages` (migration 0082) for each page whose digest differs from its last version, with the changes in sentences, and drops versions beyond the last thirty. It runs after the scorer's keeper worked the Stories' states out, and when a page or the list is read.
