@@ -360,6 +360,19 @@ R0 to R3 are done and deployed. Their worklists stay: they become the place wher
 | R12 | Epic pages (built, 25 November 2026). One page for each Epic, put together from its Stories with where they stand, their issues and the closest documents, with no model asked; kept in versions with what changed; refreshed when a record changes. On request a model writes an overview in which every sentence names its records. Not built: a page for a component of the code, and sending the pages to a wiki outside the platform. | Each Epic has a page that cites its Stories, issues and documents. |
 | R13 | The Epics a Story is also linked to (built, 25 November 2026). Added after the plan was through, because its target for Stories under several Epics was not reached. A model says of each link beyond the primary Epic whether the Story is part of that Epic, unrelated or unclear, with quoted passages; links found unrelated are a batch to approve, with sample and undo. Not built: learning relatedness in the scorer from the lines you judge, so that it proposes such removals itself. | The average number of Epics per Story falls as batches are approved; no Story loses its primary Epic. |
 
+### After it: a cheaper tier, and a model on our own node (25 November 2026)
+
+Asked for on 25 November. The analysis, the prices and what is not yet known are in [inkling-models.md](inkling-models.md). In 90 days, 98.5% of the tokens went to the reviews of this plan and next to nothing to code, so the first saving is here. None of it is built.
+
+| Phase | What | Done when |
+| --- | --- | --- |
+| M0 | Measure Inkling 2 Mini and Inkling 2 Small, through OpenRouter, on questions the platform already has answers to. Nothing they answer is kept or acted on. | Agreement with the answers on record, the share of "unclear", the share of quotes found in the texts, and the cost of a question, for each model. |
+| M1 | Tiers in a run: a first model and a second; what the first cannot settle goes to the second. The run reports what each settled and what was saved. | A run of the Epic-links check with tiers costs less than the same run with the second model alone, and its batch passes its sample. |
+| M2 | A model on the node: a ninth provider, Local, served in the cluster from the graphics card, with no key and no price. Needs the 16 GB card and the cluster handing it to a workload. | A question is answered from inside the cluster and metered at no cost. |
+| M3 | The gate on 16 GB: memory, speed and agreement against M0's numbers for the same model. | Passed at 15 tokens a second or more and within 3 points of the hosted model. If it fails, the hosted Inkling 2 Mini is the first tier. |
+| M4 | The first tier by default for the checks of the plan, the summaries of the code, the Epic overviews and bug triage. The local model where it passed the gate. | The share of questions settled at no cost is on the Dashboard, and no batch's sample got worse. |
+| M5 | Code generation: the Lab replays past delivery runs with Inkling 2 Small writing and another family reviewing. After B3 of the Bugs section. | Per flow: the share of runs that pass their tests and review, and the cost of a finished task. A flow changes its default only where the cheaper arrangement finishes as many. |
+
 ## Decisions (23 November 2026)
 
 1. **Approval always.** Nothing is applied without the administrator's word; the cascade prepares batches and plans.

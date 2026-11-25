@@ -129,6 +129,8 @@ B1 and B2 change no flow and spend no model tokens.
 - **The list.** Narrowed by state, severity and area, and ordered by severity as well as by age. The page opens with the open bugs by severity and the count of new ones nobody looked at.
  B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
 
+Added 25 November 2026: the models for B3 and B5 are the subject of [inkling-models.md](inkling-models.md). B5's suggestions are a use for its first tier (M4), and the flow B3 builds is what its last phase (M5) measures with a cheaper model writing.
+
 ## What changes underneath
 
 - **Records.** One new table for what a bug carries beyond its issue (state, severity, area, seen in, duplicate of, fixed by, caused by, who decided and when). The issue itself stays where it is.
