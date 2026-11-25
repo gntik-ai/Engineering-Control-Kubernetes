@@ -203,6 +203,8 @@ This is the same cascade the reorganization uses, one step longer: rules, rankin
 
 **What it costs.** A trial counts against the project's review tokens like any run, stops at the limit you give it, and can be stopped, resumed and ended.
 
+**On live, 25 November 2026.** Deployed. Falcone has answers on record to try a model on: 129 User Stories for "whether anything supports a User Story" (by Claude Fable 5 and Claude Opus 5.5), 351 for "the Epics a User Story is also linked to" and 51 for "the primary Epic" (both by Claude Fable 5). A sample of 100 is likely to use about 315,000 tokens for the first and 353,000 for the second. Falcone-serverless and musematic have no answers on record yet. No trial has run: Falcone has used 2.98 of its 3.00 million review tokens, and a trial counts against them, so it waits for the limit to be raised.
+
 ## Sources
 
 - OpenRouter's public list of models, read 25 November 2026: prices, windows and what each model accepts.
