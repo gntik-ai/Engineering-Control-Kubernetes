@@ -181,13 +181,22 @@ def test_a_quote_that_is_not_in_the_text_proposes_nothing(tmp_path: Path) -> Non
     client, repo = _authenticated_client(tmp_path)
     try:
         data = seed(repo)
-        more_epics(repo, data)
+        epics = more_epics(repo, data)
         with repo.sessions.begin() as db:
             db.add(
                 ProjectReviewBudget(
                     project_id=data["project"], token_limit=200_000, used=0, reserved=0
                 )
             )
+        repo.planning_links.reconcile_project("falcone")
+        # Which of two Epics is suggested as primary where the texts favour neither is
+        # not fixed: here it is Operations, so that the audit trail is the one judged.
+        with repo.sessions.begin() as db:
+            for link in db.scalars(
+                select(PlanningLink).where(PlanningLink.child_id == data["Respond to failures"])
+            ):
+                link.is_primary = link.parent_id == epics["Operations"]
+                link.primary_by = "suggested" if link.is_primary else None
         start = {"provider": "fixture", "model": "analysis", "token_cap": 60_000}
         assert post(client, "epic-links/runs", **start).status_code == 200
         run(
