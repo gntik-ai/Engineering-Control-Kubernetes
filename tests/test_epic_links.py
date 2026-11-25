@@ -79,13 +79,14 @@ def test_unrelated_epics_are_taken_off_by_an_approved_batch(tmp_path: Path) -> N
             )
         repo.planning_links.reconcile_project("falcone")
         # The administrator made the link of one Story to its other Epic: not judged.
+        # The links of the other Story came with a proposal that was approved as a
+        # whole: nobody looked at each, and they are judged.
         with repo.sessions.begin() as db:
-            for link in db.scalars(
-                select(PlanningLink).where(
-                    PlanningLink.child_id == failures, PlanningLink.is_primary.is_(False)
-                )
-            ):
-                link.origin, link.confirmed = "administrator", True
+            for link in db.scalars(select(PlanningLink).where(PlanningLink.kind == "story_epic")):
+                if link.child_id == failures and not link.is_primary:
+                    link.origin, link.confirmed = "administrator", True
+                elif link.child_id == audit:
+                    link.origin, link.confirmed = "model", True
 
         shown = client.get(BASE + "epic-links").json()
         # Two open Stories under five Epics in all; the closed Story is not counted.
@@ -163,8 +164,8 @@ def test_unrelated_epics_are_taken_off_by_an_approved_batch(tmp_path: Path) -> N
                     PlanningLink.removed_at.is_(None),
                 )
             ).one()
-            # It stands as it stood: nobody's, and not the primary one.
-            assert (back.origin, back.confirmed, back.is_primary) == ("unknown", False, False)
+            # It stands as it stood: from an approved proposal, and not the primary one.
+            assert (back.origin, back.confirmed, back.is_primary) == ("model", True, False)
             primary = db.scalars(
                 select(PlanningLink).where(
                     PlanningLink.child_id == audit,

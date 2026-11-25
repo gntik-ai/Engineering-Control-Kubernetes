@@ -8,7 +8,9 @@ is not something the judged pairs are enough to learn from. So this is asked of 
 
 - One question for each open User Story that has links to judge: a link to an Epic that
   is not its primary one, that its own text does not state, and that the administrator
-  neither made nor confirmed.
+  did not make by hand. A link that came with a proposal the administrator approved is
+  judged: approving a proposal as a whole did not look at each of its links, and those
+  links are the ones nothing explains.
 - The model is shown the Story and every Epic it is linked to, and says of each link to
   judge: ``part`` (delivering the Story is part of reaching that Epic's goal),
   ``unrelated`` (the Story has nothing to do with that goal) or ``unclear``. It is told to
@@ -106,10 +108,10 @@ SCHEMA: Final[dict[str, Any]] = {
 }
 
 
-def questionable(origin: str, confirmed: bool, primary: bool) -> bool:
+def questionable(origin: str, primary: bool) -> bool:
     """Whether a link of a Story to an Epic is one to judge: not its primary Epic, not
-    stated in the Story's own text, and neither made nor confirmed by the administrator."""
-    return not primary and not confirmed and origin not in ("declared", "administrator")
+    stated in the Story's own text, and not made by the administrator by hand."""
+    return not primary and origin not in ("declared", "administrator")
 
 
 @dataclass
@@ -149,13 +151,12 @@ class _Scope:
         if self._waiting is not None:
             return self._waiting
         linked: dict[UUID, list[tuple[UUID, bool, bool]]] = defaultdict(list)
-        for child, parent, primary, origin, confirmed in self.db.execute(
+        for child, parent, primary, origin in self.db.execute(
             select(
                 PlanningLink.child_id,
                 PlanningLink.parent_id,
                 PlanningLink.is_primary,
                 PlanningLink.origin,
-                PlanningLink.confirmed,
             ).where(
                 PlanningLink.project_id == self.project.id,
                 PlanningLink.kind == "story_epic",
@@ -163,7 +164,7 @@ class _Scope:
             )
         ):
             if parent in self.epics:
-                linked[child].append((parent, primary, questionable(origin, confirmed, primary)))
+                linked[child].append((parent, primary, questionable(origin, primary)))
         found = []
         for key, title, body in self.db.execute(
             select(ProjectUserStory.id, ProjectUserStory.title, ProjectUserStory.description)
@@ -323,7 +324,7 @@ class _Kind:
     )
     nothing_waits = (
         "No open User Story has a link to an Epic to judge: each is its primary Epic, "
-        "stated in the Story's own text, or yours."
+        "stated in the Story's own text, or made by you."
     )
 
     def scope(self, db: Session, project: ProjectRecord) -> _Scope:

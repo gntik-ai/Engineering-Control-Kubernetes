@@ -775,7 +775,7 @@ class Reorg:
                 if entry["parent"] == str(parent)
             ]
             if not before or not epic_links.questionable(
-                before[0]["origin"], bool(before[0]["confirmed"]), bool(before[0]["is_primary"])
+                before[0]["origin"], bool(before[0]["is_primary"])
             ):
                 raise ProjectConflict(
                     "The link is gone, or is the primary one, stated or yours by now."

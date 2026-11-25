@@ -441,7 +441,7 @@ What is proposed appears as the batch kinds `retire_stories`, `retire_epics` and
 
 ### The Epics a Story is also linked to
 
-`epic_links` registers the kind `epic_links` in the choice-run engine (usage counted under `epic_links`). Its scope is the open Stories with a link to judge (`questionable`: not primary, not declared, not the administrator's and not confirmed), those with the most first. The review of a Story keeps the Story's quoted passage and, for each Epic judged, the answer, the reason, the quoted passage and whether it is in the Epic's text.
+`epic_links` registers the kind `epic_links` in the choice-run engine (usage counted under `epic_links`). Its scope is the open Stories with a link to judge (`questionable`: not primary, not declared and not made by the administrator by hand; a link confirmed with an approved proposal is judged), those with the most first. The review of a Story keeps the Story's quoted passage and, for each Epic judged, the answer, the reason, the quoted passage and whether it is in the Epic's text.
 
 `GET /api/dashboard/projects/{name}/epic-links` returns the Stories, links and Epics per Story, the links to judge, the answers that still stand, how many links are ready for a batch, and what a run would ask. `GET …/epic-links/records?show=` lists the Stories asked about with what was said of each link. `POST …/epic-links/runs` and `POST …/epic-links/runs/{run_id}/control` start and control a run. The batch kind `extra_epics` of `reorg` takes its lines from `epic_links.ready`; approving a line calls `PlanningRecords.remove_epic_link`, which never takes a Story's last Epic off, and undoing calls `restore_epic_link` and puts the link's record back as it stood.
 

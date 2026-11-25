@@ -101,7 +101,7 @@ export function EpicLinks({ project }: { project: string }) {
               {data.per_story.toLocaleString('en')} Epics each on average: {whole(data.extra)} links go to an Epic that
               is not the primary one, and they are what makes an Epic look broader than it is.{' '}
               {some(data.to_judge.links, 'of them is', 'of them are')} to be judged: neither stated in the Story&apos;s
-              own text nor made or confirmed by you. The primary Epic is never judged, so no Story is left without one.
+              own text nor made by you by hand. The primary Epic is never judged, so no Story is left without one.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[32rem] text-sm">
