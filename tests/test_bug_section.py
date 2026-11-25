@@ -21,6 +21,7 @@ class GitHub:
     def __init__(self) -> None:
         self.issues: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[str]] = {}
+        self.colours: dict[str, str] = {}
         self.down = False
 
     async def repository_token(self, repository: str, permissions: dict[str, str]) -> str:
@@ -74,6 +75,16 @@ class GitHub:
     ) -> dict[str, Any]:
         self.issues[number].update(state="open", state_reason="reopened", closed_at=None)
         return dict(self.issues[number])
+
+    async def label_workspace_issue(
+        self, repository: str, number: int, *, token: str, add: dict[str, str], remove: list[str]
+    ) -> list[str]:
+        if self.down:
+            raise GitHubAppError("GitHub did not answer")
+        kept = [name for name in self.issues[number]["labels"] if name not in remove]
+        self.issues[number]["labels"] = [*kept, *(name for name in add if name not in kept)]
+        self.colours.update(add)
+        return list(self.issues[number]["labels"])
 
     async def comment_workspace_issue(
         self, repository: str, number: int, body: str, marker: str, *, token: str
@@ -186,7 +197,7 @@ def test_a_bug_is_reported_in_one_step_in_a_project_without_a_plan(tmp_path: Pat
         assert github.comments[100] == ["Works as designed."]
         assert listed(client, "llmwiki")["items"] == []
         [gone] = listed(client, "llmwiki", state="closed")["items"]
-        assert (gone["state"], gone["reason"]) == ("closed", "not_planned")
+        assert (gone["state"], gone["triage"]) == ("closed", "wont_fix")
         assert post(client, "llmwiki", f"bugs/{key}/close", reason="fixed").status_code == 409
 
         # Opened again, and closed as fixed.
@@ -197,7 +208,7 @@ def test_a_bug_is_reported_in_one_step_in_a_project_without_a_plan(tmp_path: Pat
         assert post(client, "llmwiki", f"bugs/{key}/close", reason="fixed").status_code == 200
         synchronize(repo, github)
         assert github.issues[100]["state_reason"] == "completed"
-        assert listed(client, "llmwiki", state="closed")["items"][0]["reason"] == "completed"
+        assert listed(client, "llmwiki", state="closed")["items"][0]["triage"] == "fixed"
 
         # Not a bug after all: it leaves the section and loses the label.
         assert post(client, "llmwiki", f"bugs/{key}/reopen").status_code == 200
@@ -292,5 +303,161 @@ def test_a_bug_is_dated_by_the_day_it_was_opened_on_github(tmp_path: Path) -> No
             source.evidence = {**source.evidence, "created_at": "2025-12-24T10:00:00Z"}
         [mine] = listed(client, "falcone")["items"]
         assert mine["reported_at"].startswith("2025-12-24")
+    finally:
+        client.close()
+
+
+def test_a_bug_is_triaged_and_its_severity_is_on_github(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        github = GitHub()
+        cast(Any, client.app).state.github_app = github
+        # Reported with a severity: it is on the issue from its first moment, and the
+        # bug is confirmed.
+        first = post(client, "llmwiki", "bugs", **REPORT, severity="high", seen_in="v1.4")
+        assert first.status_code == 200, first.text
+        assert github.issues[100]["labels"] == ["bug", "severity: high"]
+        second = post(client, "llmwiki", "bugs", title="Export is empty", happens="No rows.")
+        assert second.json()["number"] == 101
+        rows = {bug["number"]: bug for bug in listed(client, "llmwiki")["items"]}
+        assert (rows[100]["triage"], rows[100]["severity"], rows[100]["seen_in"]) == (
+            "confirmed",
+            "high",
+            "v1.4",
+        )
+        assert (rows[101]["triage"], rows[101]["severity"]) == ("new", None)
+        other = rows[101]["id"]
+
+        # A severity confirms a bug and replaces the one it had on GitHub.
+        decided = post(
+            client, "llmwiki", f"bugs/{other}/triage", severity="critical", area=" Console "
+        )
+        assert decided.status_code == 200, decided.text
+        assert github.issues[101]["labels"] == ["bug", "severity: critical"]
+        assert github.colours["severity: critical"] == "b60205"
+        again = post(client, "llmwiki", f"bugs/{other}/triage", severity="low")
+        assert again.status_code == 200 and github.issues[101]["labels"] == ["bug", "severity: low"]
+        shown = client.get("/api/dashboard/projects/llmwiki/bugs").json()
+        assert {s["state"]: s["count"] for s in shown["states"]}["confirmed"] == 2
+        assert {s["severity"]: s["open"] for s in shown["severities"]} == {
+            "critical": 0,
+            "high": 1,
+            "medium": 0,
+            "low": 1,
+            "none": 0,
+        }
+        assert shown["areas"] == ["Console"]
+        # The list is narrowed by state, severity and area, and ordered by severity.
+        assert [b["number"] for b in listed(client, "llmwiki", severity="low")["items"]] == [101]
+        assert [b["number"] for b in listed(client, "llmwiki", area="console")["items"]] == [101]
+        assert listed(client, "llmwiki", state="new")["total"] == 0
+        assert [b["number"] for b in listed(client, "llmwiki", sort="severity")["items"]] == [
+            100,
+            101,
+        ]
+
+        # Where GitHub does not take the label, nothing is changed here either.
+        github.down = True
+        refused = post(client, "llmwiki", f"bugs/{other}/triage", severity="critical")
+        assert refused.status_code == 409
+        github.down = False
+        assert listed(client, "llmwiki", severity="low")["total"] == 1
+        # An empty severity takes the confirmation back, and the label off.
+        assert post(client, "llmwiki", f"bugs/{other}/triage", severity="").status_code == 200
+        assert github.issues[101]["labels"] == ["bug"]
+        assert listed(client, "llmwiki", state="new")["total"] == 1
+        # The area alone changes nothing on GitHub.
+        assert post(client, "llmwiki", f"bugs/{other}/triage", area="api").status_code == 200
+        assert github.issues[101]["labels"] == ["bug"]
+
+        # Several at once: a severity for both, then both closed.
+        ids = [rows[100]["id"], other]
+        several = post(client, "llmwiki", "bugs/several", item_ids=ids, severity="medium")
+        assert several.status_code == 200 and several.json() == {"done": 2, "failed": []}
+        assert github.issues[100]["labels"] == ["bug", "severity: medium"]
+        closed = post(client, "llmwiki", "bugs/several", item_ids=ids, close="fixed")
+        assert closed.json() == {"done": 2, "failed": []}
+        synchronize(repo, github)
+        assert listed(client, "llmwiki", state="fixed")["total"] == 2
+        assert (
+            post(client, "llmwiki", "bugs/several", item_ids=ids, close="fixed").json()["done"] == 0
+        )
+    finally:
+        client.close()
+
+
+def test_a_duplicate_is_shown_before_and_named_when_it_is_closed(tmp_path: Path) -> None:
+    from engineering_control.dashboard import ranking
+    from tests.test_delivery import vector
+
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        github = GitHub()
+        cast(Any, client.app).state.github_app = github
+        assert post(client, "llmwiki", "bugs", **REPORT).status_code == 200
+        # While a new bug is written, the open one that shares its words is shown.
+        like = client.get(
+            "/api/dashboard/projects/llmwiki/bugs/similar",
+            params={"title": "Signing in fails when the session expired", "text": ""},
+        ).json()["items"]
+        assert [(bug["number"], bug["shared"] >= 0.5) for bug in like] == [(100, True)]
+        unlike = client.get(
+            "/api/dashboard/projects/llmwiki/bugs/similar", params={"title": "Export is slow"}
+        ).json()["items"]
+        assert unlike == []
+        assert (
+            post(
+                client, "llmwiki", "bugs", title="Cannot sign in again", happens="An empty error."
+            ).status_code
+            == 200
+        )
+        rows = {bug["number"]: bug for bug in listed(client, "llmwiki")["items"]}
+        # The ranking service reads bugs as their own kind.
+        due = {
+            (kind, str(record))
+            for _p, kind, record, _t, _d in repo.signals._vectors_due("llmwiki", "m")
+        }
+        assert {("bug", rows[100]["id"]), ("bug", rows[101]["id"])} <= due
+        with repo.sessions.begin() as db:
+            pid = repo.projects.identity_of("llmwiki")
+            for number, values in ((100, (1, 0.02, 0, 0)), (101, (1, 0, 0, 0))):
+                item = db.scalars(
+                    select(BacklogItem).where(
+                        BacklogItem.project_id == pid, BacklogItem.issue_number == number
+                    )
+                ).one()
+                ranking.keep_vector(db, pid, "bug", item.id, "m", "d", vector(*values))
+        rows = {bug["number"]: bug for bug in listed(client, "llmwiki")["items"]}
+        assert [bug["number"] for bug in rows[101]["alike"]] == [100]
+        assert rows[101]["alike"][0]["likeness"] >= 0.9
+
+        # Closed as a duplicate: the other bug is named on GitHub and here.
+        key = rows[101]["id"]
+        assert post(client, "llmwiki", f"bugs/{key}/close", reason="duplicate").status_code == 422
+        assert (
+            post(
+                client, "llmwiki", f"bugs/{key}/close", reason="duplicate", duplicate_of=101
+            ).status_code
+            == 422
+        )
+        done = post(
+            client,
+            "llmwiki",
+            f"bugs/{key}/close",
+            reason="duplicate",
+            duplicate_of=100,
+            note="Same error.",
+        )
+        assert done.status_code == 200, done.text
+        synchronize(repo, github)
+        assert github.comments[101] == ["Duplicate of #100.\n\nSame error."]
+        assert github.issues[101]["state_reason"] == "not_planned"
+        [gone] = listed(client, "llmwiki", state="duplicate")["items"]
+        assert (gone["number"], gone["duplicate_of"]["number"]) == (101, 100)
+        assert listed(client, "llmwiki", state="wont_fix")["total"] == 0
+        # Opened again, it is no duplicate any more.
+        assert post(client, "llmwiki", f"bugs/{key}/reopen").status_code == 200
+        [back] = [bug for bug in listed(client, "llmwiki")["items"] if bug["number"] == 101]
+        assert (back["triage"], back["duplicate_of"]) == ("new", None)
     finally:
         client.close()

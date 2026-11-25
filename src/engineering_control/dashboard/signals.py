@@ -470,6 +470,16 @@ class Signals:
                 )
             ):
                 texts["doc", key] = text_of(title or path, body)
+            # Each bug too, as its own kind: bugs are compared with one another, to
+            # show which may be the same, and with nothing of the plan.
+            for key, title, body in db.execute(
+                select(BacklogItem.id, BacklogItem.title, BacklogItem.description).where(
+                    BacklogItem.project_id == project.id,
+                    BacklogItem.id.in_(bugs_with_optional_stories(db, project.id)),
+                    BacklogItem.workspace_review.is_distinct_from("planning"),
+                )
+            ):
+                texts["bug", key] = text_of(title, body)
             for (kind, record), text in texts.items():
                 wanted = digest_of(text)
                 if have.get((kind, record)) != wanted:

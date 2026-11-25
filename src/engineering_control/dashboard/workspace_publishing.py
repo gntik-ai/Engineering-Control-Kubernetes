@@ -21,6 +21,7 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.workspace_issues import planning_kind
 from engineering_control.db.models import (
     BacklogItem,
+    BugRecord,
     PlanningLifecycleReceipt,
     ProjectEpic,
     ProjectRecord,
@@ -232,13 +233,22 @@ class WorkspacePublishing:
             session.expunge(action)
             return action, title, body
 
-    def _confirmed_type(self, action: WorkspaceAction) -> str | None:
-        """Bug or enhancement, where the administrator said which the new issue is."""
+    def _first_labels(self, action: WorkspaceAction) -> list[str]:
+        """The labels a new issue is created with: bug or enhancement, where the
+        administrator said which it is, and for a bug the severity it was given."""
         with self.sessions() as db:
             item = db.get(BacklogItem, action.local_id)
-            if item and item.type_confirmed and item.execution_type in ("bug", "enhancement"):
-                return item.execution_type
-            return None
+            if not (item and item.type_confirmed and item.execution_type in ("bug", "enhancement")):
+                return []
+            labels = [item.execution_type]
+            severity = db.scalar(
+                select(BugRecord.severity).where(
+                    BugRecord.project_id == item.project_id, BugRecord.item_id == item.id
+                )
+            )
+            if item.execution_type == "bug" and severity:
+                labels.append(f"severity: {severity}")
+            return labels
 
     def _approved_planning_kind(self, action: WorkspaceAction) -> str | None:
         with self.sessions() as db:
@@ -482,16 +492,16 @@ class WorkspacePublishing:
                             action.repository, number, title, token=token
                         )
                     elif action.operation == "create":
-                        kind = await asyncio.to_thread(self._confirmed_type, action)
+                        first = await asyncio.to_thread(self._first_labels, action)
                         await asyncio.to_thread(self._update, name, action, sent=True)
                         text = body.rstrip() + "\n\n" + marker
                         number = await (
                             # What you called a bug or an enhancement is one from the
-                            # moment it is created.
+                            # moment it is created, and a bug has its severity then too.
                             github.create_workspace_issue(
-                                action.repository, title, text, token=token, labels=[kind]
+                                action.repository, title, text, token=token, labels=first
                             )
-                            if kind
+                            if first
                             else github.create_workspace_issue(
                                 action.repository, title, text, token=token
                             )

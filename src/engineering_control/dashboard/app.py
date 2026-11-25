@@ -81,6 +81,8 @@ from engineering_control.dashboard.schemas import (
     BugCloseInput,
     BugEditInput,
     BugReportInput,
+    BugSeveralInput,
+    BugTriageInput,
     BugUnlinkInput,
     CacheTrialInput,
     CommandProfileInput,
@@ -1701,16 +1703,34 @@ def create_app(
     async def bugs_records_api(
         name: str,
         request: Request,
-        state: Literal["", "open", "closed"] = "open",
+        state: Literal[
+            "", "open", "closed", "new", "confirmed", "fixed", "duplicate", "wont_fix"
+        ] = "open",
         search: str = Query("", max_length=200),
-        sort: Literal["newest", "oldest", "updated"] = "newest",
+        sort: Literal["newest", "oldest", "updated", "severity"] = "newest",
+        severity: Literal["", "critical", "high", "medium", "low", "none"] = "",
+        area: str = Query("", max_length=60),
         page: int = Query(1, ge=1),
         page_size: int = Query(20, ge=1, le=100),
     ) -> Response:
         """The project's bugs, read from its issues whatever its plan knows of them."""
         return await documents_read(
             request,
-            lambda: repo(request).bug_section.listing(name, state, search, sort, page, page_size),
+            lambda: repo(request).bug_section.listing(
+                name, state, search, sort, page, page_size, severity, area
+            ),
+        )
+
+    @app.get("/api/dashboard/projects/{name}/bugs/similar")
+    async def bugs_similar_api(
+        name: str,
+        request: Request,
+        title: str = Query("", max_length=300),
+        text: str = Query("", max_length=4000),
+    ) -> Response:
+        """The open bugs most like one that is being written, by the words they share."""
+        return await documents_read(
+            request, lambda: repo(request).bug_section.similar(name, title, text)
         )
 
     @app.post("/api/dashboard/projects/{name}/bugs")
@@ -1729,6 +1749,7 @@ def create_app(
                     "seen_in": body.seen_in,
                 },
                 github(request),
+                body.severity,
             ),
             event="workspace.bug_reported",
             subject=name,
@@ -1754,10 +1775,51 @@ def create_app(
             request,
             BugCloseInput,
             lambda body: asyncio.to_thread(
-                repo(request).bug_section.close, name, key, body.reason, body.note
+                repo(request).bug_section.close,
+                name,
+                key,
+                body.reason,
+                body.note,
+                body.duplicate_of,
             ),
             event="workspace.bug_closed",
             subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/triage")
+    async def bug_triage_api(name: str, key: UUID, request: Request) -> Response:
+        """Say how severe a bug is, which area it is in and where it was seen."""
+        return await project_change(
+            request,
+            BugTriageInput,
+            lambda body: repo(request).bug_section.triage(
+                name,
+                key,
+                github(request),
+                severity=body.severity,
+                area=body.area,
+                seen_in=body.seen_in,
+            ),
+            event="workspace.bug_triaged",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/several")
+    async def bugs_several_api(name: str, request: Request) -> Response:
+        """One decision for several bugs: a severity, an area, or closing them."""
+
+        async def decide(body: BugSeveralInput) -> dict[str, Any]:
+            section = repo(request).bug_section
+            if body.close:
+                return await asyncio.to_thread(
+                    section.close_several, name, body.item_ids, body.close, body.note
+                )
+            return await section.triage_several(
+                name, body.item_ids, github(request), severity=body.severity, area=body.area
+            )
+
+        return await project_change(
+            request, BugSeveralInput, decide, event="workspace.bugs_triaged", subject=name
         )
 
     @app.post("/api/dashboard/projects/{name}/bugs/{key}/reopen")

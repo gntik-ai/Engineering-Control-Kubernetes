@@ -6,6 +6,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
+  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -15,32 +16,47 @@ import {
   Field,
   FieldLabel,
   Input,
+  Link,
   Pagination,
   Skeleton,
   Textarea,
 } from '@gntik-ai/ui';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { ApiError, apiUrl, postJson, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
 import { BugLinks } from './BugLinks';
 import { some, whole } from './ChoiceRun';
 
+type Severity = 'critical' | 'high' | 'medium' | 'low';
+type Triage = 'new' | 'confirmed' | 'fixed' | 'duplicate' | 'wont_fix' | 'closed';
+type PartKey = 'happens' | 'expected' | 'steps' | 'seen_in';
 interface Overview {
   repository: string | null;
   can_report: boolean;
   counts: { open: number; closed: number; creating: number; draft: number };
+  states: { state: Triage; says: string; count: number }[];
+  severities: { severity: Severity | 'none'; open: number }[];
+  areas: string[];
   linked: number;
   oldest_open: string | null;
-  parts: { key: 'happens' | 'expected' | 'steps' | 'seen_in'; heading: string }[];
+  parts: { key: PartKey; heading: string }[];
 }
-interface Bug {
+interface Brief {
   id: string;
   number: number | null;
-  url: string | null;
   title: string;
+}
+interface Bug extends Brief {
+  url: string | null;
   text: string;
   state: 'open' | 'closed' | 'creating' | 'draft';
-  reason: 'completed' | 'not_planned' | null;
+  triage: Triage;
+  says: string;
+  severity: Severity | null;
+  area: string | null;
+  seen_in: string | null;
+  duplicate_of: Brief | null;
+  alike: (Brief & { likeness: number })[];
   confirmed: boolean;
   labels: string[];
   reported_at: string;
@@ -54,19 +70,77 @@ interface Listing {
   page: number;
   pages: number;
 }
-type Shown = 'open' | 'closed' | '';
-type Sort = 'newest' | 'oldest' | 'updated';
+type Shown = 'open' | 'new' | 'confirmed' | 'closed' | '';
+type Sort = 'newest' | 'oldest' | 'updated' | 'severity';
+type Reason = 'fixed' | 'wont_fix' | 'duplicate';
 
-const HINT: Record<Overview['parts'][number]['key'], string> = {
+const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low'];
+const SEVERE: Record<Severity, { says: string; tone: 'destructive' | 'warning' | 'info' | 'neutral' }> = {
+  critical: { says: 'Critical', tone: 'destructive' },
+  high: { says: 'High', tone: 'warning' },
+  medium: { says: 'Medium', tone: 'info' },
+  low: { says: 'Low', tone: 'neutral' },
+};
+const STATE_TONE: Record<Triage, 'success' | 'info' | 'neutral' | 'warning'> = {
+  new: 'warning',
+  confirmed: 'info',
+  fixed: 'success',
+  duplicate: 'neutral',
+  wont_fix: 'neutral',
+  closed: 'neutral',
+};
+const HINT: Record<PartKey, string> = {
   happens: 'What you see that is wrong.',
   expected: 'What should have happened instead.',
   steps: 'The steps that lead to it, one on each line.',
   seen_in: 'The version, the commit or the place it was seen. Optional.',
 };
+const CLOSED_AS: Record<Reason, string> = {
+  fixed: 'fixed',
+  wont_fix: 'not going to be fixed',
+  duplicate: 'a duplicate',
+};
 
 function said(error: unknown): string {
   return error instanceof ApiError ? error.message : 'The change could not be made. Try again.';
 }
+
+const named = (bug: Brief) => (bug.number ? `#${bug.number} ${bug.title}` : bug.title);
+
+/** One of several choices, as buttons of which one is pressed. */
+function Choice<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: [T, string][];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" role="group" aria-label={label}>
+      {options.map(([key, text]) => (
+        <Button
+          key={key || 'none'}
+          type="button"
+          size="sm"
+          variant={value === key ? 'primary' : 'secondary'}
+          aria-pressed={value === key}
+          onClick={() => onChange(key)}
+        >
+          {text}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+const SEVERITY_OPTIONS: [Severity | '', string][] = [
+  ['', 'Not decided'],
+  ...SEVERITIES.map((key): [Severity, string] => [key, SEVERE[key].says]),
+];
 
 /** A dialog with one form: what it asks, and the button that does it. */
 function FormDialog({
@@ -123,6 +197,24 @@ function FormDialog({
   );
 }
 
+/** What a dialog needs to do its change and say how it went. */
+function useChange(onDone: (told: string) => void) {
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const run = async (change: () => Promise<string>) => {
+    setBusy(true);
+    setProblem(null);
+    try {
+      onDone(await change());
+    } catch (error) {
+      setProblem(said(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, problem, run };
+}
+
 function Report({
   base,
   overview,
@@ -136,30 +228,37 @@ function Report({
 }) {
   const [title, setTitle] = useState('');
   const [parts, setParts] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const submit = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      const made = await postJson<{ status: string; number?: number; detail?: string }>(base, { title, ...parts });
-      onDone(
-        made.status === 'done'
-          ? `Reported as #${made.number} on GitHub, with the bug label.`
-          : `The bug is kept and is created on GitHub as soon as it can be: ${made.detail ?? 'GitHub did not answer.'}`,
-      );
-    } catch (error) {
-      setProblem(said(error));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [severity, setSeverity] = useState<Severity | ''>('');
+  // The open bugs like it are looked for once the typing has stopped for a moment.
+  const [settled, setSettled] = useState('');
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSettled(title.trim()), 500);
+    return () => window.clearTimeout(timer);
+  }, [title]);
+  const alike = useResource<{ items: (Brief & { url: string | null; shared: number })[] }>(
+    apiUrl(base + '/similar', { title: settled.length >= 8 ? settled : '' }),
+    null,
+    { keepPreviousData: true },
+  );
+  const change = useChange(onDone);
+  const submit = () =>
+    change.run(async () => {
+      const made = await postJson<{ status: string; number?: number; detail?: string }>(base, {
+        title,
+        ...parts,
+        severity: severity || null,
+      });
+      return made.status === 'done'
+        ? `Reported as #${made.number} on GitHub, with the bug label${severity ? ' and its severity' : ''}.`
+        : `The bug is kept and is created on GitHub as soon as it can be: ${made.detail ?? 'GitHub did not answer.'}`;
+    });
+  const like = settled.length >= 8 ? (alike.data?.items ?? []) : [];
   return (
     <FormDialog
       title="Report a bug"
       doing="Report"
-      busy={busy}
-      problem={problem}
+      busy={change.busy}
+      problem={change.problem}
       disabled={!title.trim() || !(parts.happens ?? '').trim()}
       onSubmit={() => void submit()}
       onClose={onClose}
@@ -172,6 +271,28 @@ function Report({
         <FieldLabel htmlFor="bug-title">Title</FieldLabel>
         <Input id="bug-title" value={title} onValueChange={setTitle} maxLength={300} required autoFocus />
       </Field>
+      {like.length ? (
+        <Alert
+          tone="warning"
+          title={like.length === 1 ? 'An open bug shares most of these words.' : 'Open bugs share most of these words.'}
+          description={
+            <ul className="grid gap-1">
+              {like.map((bug) => (
+                <li key={bug.id}>
+                  {bug.url ? (
+                    <Link href={bug.url} target="_blank" rel="noreferrer">
+                      {named(bug)}
+                    </Link>
+                  ) : (
+                    named(bug)
+                  )}
+                </li>
+              ))}
+              <li>If it is the same bug, cancel and add what you saw to that one.</li>
+            </ul>
+          }
+        />
+      ) : null}
       {overview.parts.map((part) => (
         <Field key={part.key}>
           <FieldLabel htmlFor={'bug-' + part.key}>{part.heading}</FieldLabel>
@@ -179,13 +300,20 @@ function Report({
             id={'bug-' + part.key}
             value={parts[part.key] ?? ''}
             onValueChange={(value) => setParts((before) => ({ ...before, [part.key]: value }))}
-            maxLength={part.key === 'seen_in' ? 2000 : 10000}
+            maxLength={part.key === 'seen_in' ? 200 : 10000}
             rows={part.key === 'seen_in' ? 1 : 3}
             placeholder={HINT[part.key]}
             required={part.key === 'happens'}
           />
         </Field>
       ))}
+      <div className="grid gap-1">
+        <span className="text-sm font-medium">Severity</span>
+        <Choice label="Severity" value={severity} options={SEVERITY_OPTIONS} onChange={setSeverity} />
+        <p className="text-xs text-muted-foreground">
+          A bug with a severity is confirmed; without one it is new and waits to be looked at.
+        </p>
+      </div>
     </FormDialog>
   );
 }
@@ -203,26 +331,18 @@ function Edit({
 }) {
   const [title, setTitle] = useState(bug.title);
   const [text, setText] = useState(bug.text);
-  const [busy, setBusy] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const submit = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
+  const change = useChange(onDone);
+  const submit = () =>
+    change.run(async () => {
       await postJson(`${base}/${bug.id}/edit`, { title, text });
-      onDone(`#${bug.number} was changed on GitHub.`);
-    } catch (error) {
-      setProblem(said(error));
-    } finally {
-      setBusy(false);
-    }
-  };
+      return `#${bug.number} was changed on GitHub.`;
+    });
   return (
     <FormDialog
       title={`Change #${bug.number}`}
       doing="Save on GitHub"
-      busy={busy}
-      problem={problem}
+      busy={change.busy}
+      problem={change.problem}
       disabled={!title.trim()}
       onSubmit={() => void submit()}
       onClose={onClose}
@@ -243,6 +363,65 @@ function Edit({
   );
 }
 
+function Decide({
+  base,
+  bug,
+  areas,
+  onDone,
+  onClose,
+}: {
+  base: string;
+  bug: Bug;
+  areas: string[];
+  onDone: (told: string) => void;
+  onClose: () => void;
+}) {
+  const [severity, setSeverity] = useState<Severity | ''>(bug.severity ?? '');
+  const [area, setArea] = useState(bug.area ?? '');
+  const [seen, setSeen] = useState(bug.seen_in ?? '');
+  const change = useChange(onDone);
+  const submit = () =>
+    change.run(async () => {
+      await postJson(`${base}/${bug.id}/triage`, { severity, area, seen_in: seen });
+      return severity
+        ? `${named(bug)} is confirmed, with severity ${SEVERE[severity].says.toLowerCase()}${bug.number ? ', which is on the issue as a label' : ''}.`
+        : `${named(bug)} has no severity and stands as new.`;
+    });
+  return (
+    <FormDialog
+      title={`Triage ${bug.number ? '#' + bug.number : 'this bug'}`}
+      doing="Save"
+      busy={change.busy}
+      problem={change.problem}
+      onSubmit={() => void submit()}
+      onClose={onClose}
+    >
+      <p className="text-sm text-foreground">{bug.title}</p>
+      <div className="grid gap-1">
+        <span className="text-sm font-medium">Severity</span>
+        <Choice label="Severity" value={severity} options={SEVERITY_OPTIONS} onChange={setSeverity} />
+        <p className="text-xs text-muted-foreground">
+          Giving a severity confirms the bug and puts the label &quot;severity: …&quot; on its issue. &quot;Not
+          decided&quot; takes both back.
+        </p>
+      </div>
+      <Field>
+        <FieldLabel htmlFor="bug-area">Area of the code (optional)</FieldLabel>
+        <Input id="bug-area" value={area} onValueChange={setArea} maxLength={60} list="bug-areas" />
+        <datalist id="bug-areas">
+          {areas.map((entry) => (
+            <option key={entry} value={entry} />
+          ))}
+        </datalist>
+      </Field>
+      <Field>
+        <FieldLabel htmlFor="bug-seen">Where it was seen (optional)</FieldLabel>
+        <Input id="bug-seen" value={seen} onValueChange={setSeen} maxLength={200} />
+      </Field>
+    </FormDialog>
+  );
+}
+
 function Close({
   base,
   bug,
@@ -254,59 +433,55 @@ function Close({
   onDone: (told: string) => void;
   onClose: () => void;
 }) {
-  const [reason, setReason] = useState<'fixed' | 'wont_fix'>('fixed');
+  const [reason, setReason] = useState<Reason>('fixed');
+  const [other, setOther] = useState(bug.alike[0]?.number ? String(bug.alike[0].number) : '');
   const [note, setNote] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const submit = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      await postJson(`${base}/${bug.id}/close`, { reason, note });
-      onDone(`#${bug.number} is being closed on GitHub as ${reason === 'fixed' ? 'fixed' : 'not going to be fixed'}.`);
-    } catch (error) {
-      setProblem(said(error));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const change = useChange(onDone);
+  const number = Number(other.replace('#', '').trim());
+  const submit = () =>
+    change.run(async () => {
+      await postJson(`${base}/${bug.id}/close`, {
+        reason,
+        note,
+        duplicate_of: reason === 'duplicate' ? number : null,
+      });
+      return `#${bug.number} is being closed on GitHub as ${CLOSED_AS[reason]}${reason === 'duplicate' ? ` of #${number}` : ''}.`;
+    });
   return (
     <FormDialog
       title={`Close #${bug.number}`}
       doing="Close on GitHub"
-      busy={busy}
-      problem={problem}
+      busy={change.busy}
+      problem={change.problem}
+      disabled={reason === 'duplicate' && !(Number.isInteger(number) && number > 0)}
       onSubmit={() => void submit()}
       onClose={onClose}
     >
       <p className="text-sm text-foreground">{bug.title}</p>
-      <div className="flex flex-wrap gap-2" role="group" aria-label="Why it is closed">
-        <Button
-          type="button"
-          size="sm"
-          variant={reason === 'fixed' ? 'primary' : 'secondary'}
-          aria-pressed={reason === 'fixed'}
-          onClick={() => setReason('fixed')}
-        >
-          Fixed
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant={reason === 'wont_fix' ? 'primary' : 'secondary'}
-          aria-pressed={reason === 'wont_fix'}
-          onClick={() => setReason('wont_fix')}
-        >
-          Not going to be fixed
-        </Button>
-      </div>
+      <Choice
+        label="Why it is closed"
+        value={reason}
+        options={[
+          ['fixed', 'Fixed'],
+          ['wont_fix', 'Not going to be fixed'],
+          ['duplicate', 'Duplicate of another bug'],
+        ]}
+        onChange={setReason}
+      />
+      {reason === 'duplicate' ? (
+        <Field>
+          <FieldLabel htmlFor="bug-close-other">Number of the bug it duplicates</FieldLabel>
+          <Input id="bug-close-other" value={other} onValueChange={setOther} maxLength={12} inputMode="numeric" />
+        </Field>
+      ) : null}
       <Field>
         <FieldLabel htmlFor="bug-close-note">Comment left on the issue (optional)</FieldLabel>
         <Textarea id="bug-close-note" value={note} onValueChange={setNote} maxLength={4000} rows={3} />
       </Field>
       <p className="text-xs text-muted-foreground">
-        GitHub is told {reason === 'fixed' ? 'the issue is completed' : 'the issue is not planned'}. A closed bug can be
-        opened again from here.
+        GitHub is told {reason === 'fixed' ? 'the issue is completed' : 'the issue is not planned'}
+        {reason === 'duplicate' ? ', and a comment names the bug it duplicates' : ''}. A closed bug can be opened again
+        from here.
       </p>
     </FormDialog>
   );
@@ -315,20 +490,34 @@ function Close({
 function Row({
   base,
   bug,
+  selected,
+  onSelect,
   act,
   onEdit,
+  onDecide,
   onClose,
 }: {
   base: string;
   bug: Bug;
+  selected: boolean;
+  onSelect: (selected: boolean) => void;
   act: (path: string, told: string) => void;
   onEdit: () => void;
+  onDecide: () => void;
   onClose: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const live = bug.state !== 'closed';
   return (
     <li className="grid gap-2 rounded-lg border border-border p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
+        {live ? (
+          <Checkbox
+            aria-label={`Select ${named(bug)}`}
+            checked={selected}
+            onCheckedChange={(checked) => onSelect(checked === true)}
+          />
+        ) : null}
         {bug.number ? <IssueRef number={bug.number} url={bug.url} /> : null}
         <span className="font-medium text-foreground">{bug.title}</span>
         {bug.state === 'creating' ? (
@@ -339,18 +528,20 @@ function Row({
           <Badge tone="neutral" size="sm">
             Not on GitHub
           </Badge>
-        ) : bug.state === 'closed' ? (
-          <Badge tone={bug.reason === 'not_planned' ? 'neutral' : 'success'} size="sm">
-            {bug.reason === 'not_planned' ? 'Not going to be fixed' : bug.reason === 'completed' ? 'Fixed' : 'Closed'}
+        ) : null}
+        <Badge tone={STATE_TONE[bug.triage]} size="sm">
+          {bug.says}
+        </Badge>
+        {bug.severity ? (
+          <Badge tone={SEVERE[bug.severity].tone} size="sm">
+            {SEVERE[bug.severity].says}
           </Badge>
         ) : null}
-        {bug.labels
-          .filter((label) => label.toLowerCase() !== 'bug')
-          .map((label) => (
-            <Badge key={label} tone="neutral" size="sm">
-              {label}
-            </Badge>
-          ))}
+        {bug.area ? (
+          <Badge tone="neutral" size="sm">
+            {bug.area}
+          </Badge>
+        ) : null}
       </div>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
         <span>
@@ -361,8 +552,22 @@ function Row({
             Closed <When value={bug.closed_at} />
           </span>
         ) : null}
+        {bug.seen_in ? <span>Seen in {bug.seen_in}</span> : null}
         <span>{bug.confirmed ? 'A bug by your word' : 'A bug by its label, type or title'}</span>
       </div>
+      {bug.duplicate_of ? <p className="text-muted-foreground">Duplicate of {named(bug.duplicate_of)}.</p> : null}
+      {live && bug.alike.length ? (
+        <p className="text-muted-foreground">
+          May be the same as{' '}
+          {bug.alike.map((other, place) => (
+            <span key={other.id}>
+              {place ? '; ' : ''}
+              {named(other)} ({Math.round(other.likeness * 100)}% alike)
+            </span>
+          ))}
+          . Close one as the duplicate of the other if it is.
+        </p>
+      ) : null}
       {bug.problem ? (
         <Alert
           tone="warning"
@@ -379,7 +584,7 @@ function Row({
                 </p>
               ) : (
                 <p key={place} className="whitespace-pre-wrap">
-                  {line || '\u00a0'}
+                  {line || ' '}
                 </p>
               ),
             )
@@ -392,6 +597,11 @@ function Row({
         <Button size="sm" variant="ghost" onClick={() => setOpen(!open)} aria-expanded={open}>
           {open ? 'Hide the text' : 'Read'}
         </Button>
+        {live ? (
+          <Button size="sm" variant="ghost" onClick={onDecide}>
+            Triage
+          </Button>
+        ) : null}
         {bug.number && bug.state !== 'creating' ? (
           <Button size="sm" variant="ghost" onClick={onEdit}>
             Change
@@ -432,22 +642,29 @@ function Row({
 
 /**
  * The Bugs section of a project: its bugs read from the repository's issues, whatever its
- * plan knows of them. A bug is reported in one step, changed, closed with a reason and
- * opened again; it belongs to no User Story and no Epic.
+ * plan knows of them. A bug is reported in one step, triaged, changed, closed with a
+ * reason and opened again; it belongs to no User Story and no Epic.
  */
 export function BugsPage({ project }: { project: string }) {
   const base = 'projects/' + encodeURIComponent(project) + '/bugs';
   const [shown, setShown] = useState<Shown>('open');
+  const [severity, setSeverity] = useState<Severity | 'none' | ''>('');
+  const [area, setArea] = useState('');
   const [sort, setSort] = useState<Sort>('newest');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
-  const [dialog, setDialog] = useState<{ kind: 'report' } | { kind: 'edit' | 'close'; bug: Bug } | null>(null);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [dialog, setDialog] = useState<{ kind: 'report' } | { kind: 'edit' | 'close' | 'decide'; bug: Bug } | null>(
+    null,
+  );
   const [told, setTold] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const overview = useResource<Overview>(apiUrl(base), 15000, { keepPreviousData: true });
-  const list = useResource<Listing>(apiUrl(base + '/records', { state: shown, sort, search, page }), 15000, {
-    keepPreviousData: true,
-  });
+  const list = useResource<Listing>(
+    apiUrl(base + '/records', { state: shown, severity, area, sort, search, page }),
+    15000,
+    { keepPreviousData: true },
+  );
   const reload = () => {
     overview.reload();
     list.reload();
@@ -456,6 +673,7 @@ export function BugsPage({ project }: { project: string }) {
     setDialog(null);
     setProblem(null);
     setTold(message);
+    setPicked(new Set());
     reload();
   };
   const act = (path: string, message: string) => {
@@ -465,11 +683,31 @@ export function BugsPage({ project }: { project: string }) {
       .then(() => done(message))
       .catch((error: unknown) => setProblem(said(error)));
   };
-  const data = overview.data;
-  const pick = (next: Shown) => {
-    setShown(next);
-    setPage(1);
+  const several = (body: Record<string, unknown>, doing: string) => {
+    setProblem(null);
+    setTold(null);
+    postJson<{ done: number; failed: { id: string; detail: string }[] }>(base + '/several', {
+      item_ids: [...picked],
+      ...body,
+    })
+      .then((result) => {
+        done(`${some(result.done, 'bug', 'bugs')} ${doing}.`);
+        if (result.failed.length)
+          setProblem(
+            `${some(result.failed.length, 'bug was', 'bugs were')} left as before: ${result.failed[0]?.detail ?? ''}`,
+          );
+      })
+      .catch((error: unknown) => setProblem(said(error)));
   };
+  const data = overview.data;
+  const narrow = (change: () => void) => {
+    change();
+    setPage(1);
+    setPicked(new Set());
+  };
+  const states = Object.fromEntries((data?.states ?? []).map((entry) => [entry.state, entry.count]));
+  const severe = Object.fromEntries((data?.severities ?? []).map((entry) => [entry.severity, entry.open]));
+  const open = data ? data.counts.open + data.counts.creating + data.counts.draft : 0;
   return (
     <div className="grid min-w-0 gap-5">
       <div className="flex flex-wrap items-center gap-3">
@@ -494,19 +732,36 @@ export function BugsPage({ project }: { project: string }) {
               <p className="text-sm text-muted-foreground">
                 A bug reports that something built is wrong. It stands apart from the plan: it belongs to no User Story
                 and no Epic, and is handled here. It is an issue of {data.repository ?? 'the repository'} with the bug
-                label; one opened on GitHub arrives here by itself within a quarter of an hour.
+                label; one opened on GitHub arrives here by itself within a quarter of an hour, as new.
               </p>
               <p className="text-sm text-foreground">
-                {some(data.counts.open, 'bug is', 'bugs are')} open
+                {some(open, 'bug is', 'bugs are')} open
                 {data.oldest_open ? (
                   <>
                     , the oldest reported <When value={data.oldest_open} />
                   </>
                 ) : null}
-                ; {whole(data.counts.closed)} closed
-                {data.counts.creating ? `; ${whole(data.counts.creating)} being created on GitHub` : ''}
-                {data.counts.draft ? `; ${whole(data.counts.draft)} not on GitHub` : ''}.
+                : {whole(states.new ?? 0)} new and not looked at yet, {whole(states.confirmed ?? 0)} confirmed.{' '}
+                {whole(data.counts.closed)} closed: {whole(states.fixed ?? 0)} fixed, {whole(states.duplicate ?? 0)}{' '}
+                duplicates, {whole(states.wont_fix ?? 0)} not going to be fixed
+                {states.closed ? `, ${whole(states.closed)} closed before the reason was kept` : ''}.
               </p>
+              {open ? (
+                <ul className="flex flex-wrap gap-2 text-sm">
+                  {SEVERITIES.map((key) => (
+                    <li key={key}>
+                      <Badge tone={SEVERE[key].tone} size="sm">
+                        {SEVERE[key].says}: {whole(severe[key] ?? 0)}
+                      </Badge>
+                    </li>
+                  ))}
+                  <li>
+                    <Badge tone="neutral" size="sm">
+                      No severity yet: {whole(severe.none ?? 0)}
+                    </Badge>
+                  </li>
+                </ul>
+              ) : null}
               {!data.can_report ? (
                 <Alert tone="info" title="This project has no repository, so no bug can be reported from here." />
               ) : null}
@@ -519,68 +774,116 @@ export function BugsPage({ project }: { project: string }) {
             </CardHeader>
             <CardBody className="grid gap-4">
               <div className="flex flex-wrap items-end gap-2">
-                {(
-                  [
-                    ['open', `Open (${whole(data.counts.open + data.counts.creating + data.counts.draft)})`],
+                <Choice
+                  label="Which bugs"
+                  value={shown}
+                  options={[
+                    ['open', `Open (${whole(open)})`],
+                    ['new', `New (${whole(states.new ?? 0)})`],
+                    ['confirmed', `Confirmed (${whole(states.confirmed ?? 0)})`],
                     ['closed', `Closed (${whole(data.counts.closed)})`],
                     ['', 'All'],
-                  ] as [Shown, string][]
-                ).map(([key, label]) => (
-                  <Button
-                    key={key || 'all'}
-                    size="sm"
-                    variant={shown === key ? 'primary' : 'secondary'}
-                    aria-pressed={shown === key}
-                    onClick={() => pick(key)}
-                  >
-                    {label}
-                  </Button>
-                ))}
-                <span className="mx-1 self-center text-muted-foreground">·</span>
-                {(
-                  [
-                    ['newest', 'Newest first'],
-                    ['oldest', 'Oldest first'],
-                    ['updated', 'Last changed'],
-                  ] as [Sort, string][]
-                ).map(([key, label]) => (
-                  <Button
-                    key={key}
-                    size="sm"
-                    variant={sort === key ? 'primary' : 'ghost'}
-                    aria-pressed={sort === key}
-                    onClick={() => {
-                      setSort(key);
-                      setPage(1);
-                    }}
-                  >
-                    {label}
-                  </Button>
-                ))}
+                  ]}
+                  onChange={(next) => narrow(() => setShown(next))}
+                />
                 <span className="flex-1" />
                 <Field className="w-full max-w-xs">
                   <FieldLabel htmlFor="bug-search">Search by title or number</FieldLabel>
                   <Input
                     id="bug-search"
                     value={search}
-                    onValueChange={(value) => {
-                      setSearch(value);
-                      setPage(1);
-                    }}
+                    onValueChange={(value) => narrow(() => setSearch(value))}
                     maxLength={200}
                   />
                 </Field>
               </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">Severity</span>
+                <Choice
+                  label="Severity"
+                  value={severity}
+                  options={[
+                    ['', 'Any'],
+                    ...SEVERITIES.map((key): [Severity, string] => [key, SEVERE[key].says]),
+                    ['none', 'None yet'],
+                  ]}
+                  onChange={(next) => narrow(() => setSeverity(next))}
+                />
+                {data.areas.length ? (
+                  <>
+                    <span className="ms-2 text-xs text-muted-foreground">Area</span>
+                    <Choice
+                      label="Area"
+                      value={area}
+                      options={[
+                        ['', 'Any'],
+                        ...data.areas.slice(0, 8).map((entry): [string, string] => [entry, entry]),
+                      ]}
+                      onChange={(next) => narrow(() => setArea(next))}
+                    />
+                  </>
+                ) : null}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">Order</span>
+                <Choice
+                  label="Order"
+                  value={sort}
+                  options={[
+                    ['newest', 'Newest first'],
+                    ['oldest', 'Oldest first'],
+                    ['severity', 'Most severe first'],
+                    ['updated', 'Last changed'],
+                  ]}
+                  onChange={(next) => narrow(() => setSort(next))}
+                />
+              </div>
+              {picked.size ? (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-3">
+                  <span className="text-sm font-medium">{some(picked.size, 'bug', 'bugs')} selected</span>
+                  <span className="text-xs text-muted-foreground">Give severity</span>
+                  {SEVERITIES.map((key) => (
+                    <Button
+                      key={key}
+                      size="sm"
+                      variant="secondary"
+                      onClick={() =>
+                        several({ severity: key }, `confirmed with severity ${SEVERE[key].says.toLowerCase()}`)
+                      }
+                    >
+                      {SEVERE[key].says}
+                    </Button>
+                  ))}
+                  <span className="mx-1 text-muted-foreground">·</span>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => several({ close: 'fixed' }, 'being closed as fixed')}
+                  >
+                    Close as fixed
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => several({ close: 'wont_fix' }, 'being closed as not going to be fixed')}
+                  >
+                    Close as not going to be fixed
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setPicked(new Set())}>
+                    Clear
+                  </Button>
+                </div>
+              ) : null}
               <LoadError resource={list} />
               {list.data && !list.data.total ? (
                 <p className="text-sm text-foreground">
-                  {search
+                  {search || severity || area
                     ? 'No bug matches.'
-                    : shown === 'open'
-                      ? 'No bug is open.'
-                      : shown === 'closed'
-                        ? 'No bug is closed.'
-                        : 'This project has no bugs.'}
+                    : shown === 'closed'
+                      ? 'No bug is closed.'
+                      : shown === ''
+                        ? 'This project has no bugs.'
+                        : 'No bug here.'}
                 </p>
               ) : null}
               <ul className="grid gap-2">
@@ -589,8 +892,18 @@ export function BugsPage({ project }: { project: string }) {
                     key={bug.id}
                     base={base}
                     bug={bug}
+                    selected={picked.has(bug.id)}
+                    onSelect={(on) =>
+                      setPicked((before) => {
+                        const next = new Set(before);
+                        if (on) next.add(bug.id);
+                        else next.delete(bug.id);
+                        return next;
+                      })
+                    }
                     act={act}
                     onEdit={() => setDialog({ kind: 'edit', bug })}
+                    onDecide={() => setDialog({ kind: 'decide', bug })}
                     onClose={() => setDialog({ kind: 'close', bug })}
                   />
                 ))}
@@ -605,6 +918,9 @@ export function BugsPage({ project }: { project: string }) {
           ) : null}
           {dialog?.kind === 'edit' ? (
             <Edit base={base} bug={dialog.bug} onDone={done} onClose={() => setDialog(null)} />
+          ) : null}
+          {dialog?.kind === 'decide' ? (
+            <Decide base={base} bug={dialog.bug} areas={data.areas} onDone={done} onClose={() => setDialog(null)} />
           ) : null}
           {dialog?.kind === 'close' ? (
             <Close base={base} bug={dialog.bug} onDone={done} onClose={() => setDialog(null)} />

@@ -61,7 +61,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0080 lets a queued issue closure say why and carry its comment.
     # 0081 keeps what was decided about each proposal for the plan's structure.
     # 0082 keeps the versions of the page put together for each Epic.
-    assert (head, parent) == ("0082", "0081")
+    # 0083 keeps what was decided about each bug.
+    assert (head, parent) == ("0083", "0082")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -163,8 +164,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     links = {index["name"] for index in inspect(engine).get_indexes("planning_links")}
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
-    assert "epic_pages" in inspect(engine).get_table_names()
+    assert "bug_records" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
+    assert "bug_records" not in inspect(engine).get_table_names()
+    assert "epic_pages" in inspect(engine).get_table_names()
+    command.downgrade(config, "0081")
     assert "epic_pages" not in inspect(engine).get_table_names()
     assert "structure_decisions" in inspect(engine).get_table_names()
     command.downgrade(config, "0080")

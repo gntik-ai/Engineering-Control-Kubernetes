@@ -1196,6 +1196,27 @@ class StructureDecision(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class BugRecord(UUIDPrimaryKey, Timestamps, Base):
+    """What the administrator decided about one bug beyond what its issue says (migration
+    0083): its severity, the area of the code it is in, where it was seen, and the bug it
+    duplicates. Whether it is open or closed, and why, stays with its issue."""
+
+    __tablename__ = "bug_records"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # The backlog item that is the bug's issue.
+    item_id: Mapped[UUID] = mapped_column(Uuid)
+    # critical, high, medium or low.
+    severity: Mapped[str | None] = mapped_column(String(16))
+    area: Mapped[str | None] = mapped_column(String(60))
+    seen_in: Mapped[str | None] = mapped_column(String(200))
+    duplicate_of: Mapped[UUID | None] = mapped_column(Uuid)
+    # When the administrator said it is a bug to be dealt with, by giving it a severity.
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (UniqueConstraint("project_id", "item_id", name="uq_bug_records_item"),)
+
+
 class EpicPage(UUIDPrimaryKey, Timestamps, Base):
     """One version of the page the platform puts together for an Epic (migration 0082):
     its User Stories with where they stand, their issues and the documents closest to

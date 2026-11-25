@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import quote
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -565,6 +566,54 @@ class GitHubApp:
             name.casefold() for name in labels
         }:
             raise GitHubAppError("GitHub has not confirmed the Issue classification")
+        return labels
+
+    async def label_workspace_issue(
+        self,
+        repository: str,
+        number: int,
+        *,
+        token: str,
+        add: dict[str, str],
+        remove: list[str],
+    ) -> list[str]:
+        """Put labels on an issue and take others off, and return the labels it then
+        has. ``add`` gives each label with the colour it gets where the repository does
+        not have it yet. A label that is not on the issue is not an error to take off."""
+        await self.workspace_issue(repository, number)
+        root = f"/repos/{repository}"
+        path = f"{root}/issues/{number}/labels"
+
+        def names(data: Any) -> list[str]:
+            if not isinstance(data, list):
+                raise GitHubAppError("GitHub did not return the labels of the issue")
+            return [
+                row["name"]
+                for row in data
+                if isinstance(row, dict) and isinstance(row.get("name"), str)
+            ]
+
+        labels = names(await self._request("GET", path, token=token))
+        for name, colour in add.items():
+            if name.casefold() in {label.casefold() for label in labels}:
+                continue
+            # A repository does not have a label until somebody makes it. Making one
+            # that is there already is refused, which is as good.
+            with contextlib.suppress(GitHubAppError):
+                await self._request(
+                    "POST", root + "/labels", token=token, json={"name": name, "color": colour}
+                )
+            labels = names(await self._request("POST", path, token=token, json={"labels": [name]}))
+        for name in remove:
+            if name.casefold() in {label.casefold() for label in labels}:
+                labels = names(
+                    await self._request("DELETE", f"{path}/{quote(name, safe='')}", token=token)
+                )
+        have = {label.casefold() for label in labels}
+        if any(name.casefold() not in have for name in add) or any(
+            name.casefold() in have for name in remove
+        ):
+            raise GitHubAppError("GitHub has not confirmed the labels of the issue")
         return labels
 
     async def comment_workspace_issue(

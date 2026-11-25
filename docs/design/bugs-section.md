@@ -1,6 +1,6 @@
 # A section for bugs
 
-Proposal, 25 November 2026. Phase B1 is built (25 November 2026); B2 to B5 are not.
+Proposal, 25 November 2026. Phases B1 and B2 are built (25 November 2026); B3 to B5 are not.
 
 ## What is asked for
 
@@ -117,6 +117,16 @@ B1 and B2 change no flow and spend no model tokens.
 - **Closing and opening again.** Closed as fixed or as not going to be fixed, with an optional comment left on the issue; GitHub is told "completed" or "not planned". It goes through the same confirmed closure as every other issue the platform closes. A closed bug is opened again from its row.
 - **Not a bug.** The issue becomes ordinary work by your word, and its `bug` label is taken off. The opposite, "It is a bug", stays where it was: on an issue of the plan.
 - **Not in B1.** States beyond open and closed, severity, area, duplicates and bulk changes (B2). The numbers on the Dashboard (B4).
+
+### B2 as built
+
+- **States.** New, confirmed, fixed, duplicate, not going to be fixed. A state is worked out from the bug's issue and from what was decided here, and is not kept beside them, so it cannot differ from GitHub: open with no severity is new, open with a severity is confirmed, closed as completed is fixed, closed with a duplicate named is a duplicate, closed as not planned is not going to be fixed. A bug closed before the reason was kept shows as closed. "In progress" comes with B3, when a fix can be started from a bug.
+- **Severity.** Critical, high, medium or low, given when the bug is reported or in its triage. Giving one confirms the bug. It is put on the issue as the label `severity: high`, with the other severity labels taken off, and the label is made in the repository where it is missing. GitHub is written first: where it does not take the label, nothing is changed here. A severity label that somebody set on GitHub is read as the bug's severity; the bug stays new until you confirm it.
+- **Area and where it was seen.** Kept here. The area is offered from those the project's bugs already have, and an `area: …` or `component: …` label on the issue is read as its area. The area is not written to GitHub.
+- **Alike.** While a bug is being written, the open bugs that have at least half of its title's words are shown, the ones sharing the rarer words first. The ranking service reads every bug as its own kind, compared only with other bugs: an open bug is shown with up to three open bugs that lie as close to it in meaning as 0.9, as possible duplicates. No language model is asked, and likeness closes nothing.
+- **Duplicates.** A bug is closed as the duplicate of another, named by its number. GitHub gets the comment "Duplicate of #n", with your note under it, and the issue is closed as not planned. Opened again, it is no duplicate any more.
+- **Several at once.** Bugs are selected in the list and given a severity together, or closed together as fixed or as not going to be fixed. Each is done on its own: one that GitHub does not take is told, and the others are done.
+- **The list.** Narrowed by state, severity and area, and ordered by severity as well as by age. The page opens with the open bugs by severity and the count of new ones nobody looked at.
  B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
 
 ## What changes underneath

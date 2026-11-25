@@ -582,6 +582,7 @@ class BugReportInput(PlainChangeInput):
     expected: str = Field(default="", max_length=10_000)
     steps: str = Field(default="", max_length=10_000)
     seen_in: str = Field(default="", max_length=2_000)
+    severity: Literal["critical", "high", "medium", "low"] | None = None
 
 
 class BugEditInput(PlainChangeInput):
@@ -592,9 +593,30 @@ class BugEditInput(PlainChangeInput):
 
 
 class BugCloseInput(PlainChangeInput):
-    """Why a bug is closed, and what is left on its issue as a comment."""
+    """Why a bug is closed, and what is left on its issue as a comment. A duplicate
+    names the bug it duplicates by its number."""
 
-    reason: Literal["fixed", "wont_fix"]
+    reason: Literal["fixed", "wont_fix", "duplicate"]
+    note: str = Field(default="", max_length=4_000)
+    duplicate_of: int | None = Field(default=None, ge=1)
+
+
+class BugTriageInput(PlainChangeInput):
+    """What is decided about a bug. A field that is left out stays as it is; an empty
+    severity takes the confirmation back."""
+
+    severity: Literal["", "critical", "high", "medium", "low"] | None = None
+    area: str | None = Field(default=None, max_length=60)
+    seen_in: str | None = Field(default=None, max_length=200)
+
+
+class BugSeveralInput(PlainChangeInput):
+    """One decision for several bugs: a severity or an area, or closing them."""
+
+    item_ids: list[UUID] = Field(min_length=1, max_length=100)
+    severity: Literal["", "critical", "high", "medium", "low"] | None = None
+    area: str | None = Field(default=None, max_length=60)
+    close: Literal["fixed", "wont_fix"] | None = None
     note: str = Field(default="", max_length=4_000)
 
 
