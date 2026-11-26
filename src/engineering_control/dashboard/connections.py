@@ -394,11 +394,19 @@ class Connections:
             total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
             pages = max(1, (total + 24) // 25)
             page = min(page, pages)
-            findings = db.scalars(
-                query.order_by(ConnectionFinding.created_at.desc(), ConnectionFinding.id)
-                .offset((page - 1) * 25)
-                .limit(25)
+            # What a judge did not suggest too comes first: it is in doubt.
+            ordered = sorted(
+                db.scalars(
+                    query.order_by(ConnectionFinding.created_at.desc(), ConnectionFinding.id)
+                ).all(),
+                key=lambda f: (
+                    0
+                    if f.status == "pending"
+                    and ((f.evidence or {}).get("judge") or {}).get("agreed") is False
+                    else 1
+                ),
             )
+            findings = ordered[(page - 1) * 25 : page * 25]
             projects = {p.id: p, peer.id: peer}
             # The button covers all pages. Its cutoff keeps later or revised suggestions
             # pending, including when the same request is retried after a lost response.

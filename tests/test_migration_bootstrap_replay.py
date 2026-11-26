@@ -71,7 +71,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0090 keeps the third model a run asks where two differ.
     # 0091 keeps how far each kind of change goes without the administrator.
     # 0092 keeps which checks a project runs by itself.
-    assert (head, parent) == ("0092", "0091")
+    # 0093 keeps what a judge said to each proposed planning record.
+    assert (head, parent) == ("0093", "0092")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -180,6 +181,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     command.downgrade(config, parent)
+    assert "judged" not in {
+        column["name"] for column in inspect(engine).get_columns("workspace_candidates")
+    }
+    command.downgrade(config, "0091")
     settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
     assert "runs" not in settings and "alone" in settings
     assert "auto" not in {c["name"] for c in inspect(engine).get_columns("choice_runs")}

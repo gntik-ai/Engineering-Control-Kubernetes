@@ -33,7 +33,7 @@ interface Row {
   attention: number;
   version: number;
   changed_at: string | null;
-  overview: 'none' | 'written' | 'stale';
+  overview: 'none' | 'written' | 'stale' | 'doubt';
 }
 interface Index {
   epics: Row[];
@@ -106,6 +106,12 @@ interface Shown {
     detail: string;
     stale: boolean;
     answered_at: string;
+    /** With a judge: whether it found every sentence supported, and its word on each, by number. */
+    agreed?: boolean | null;
+    judge?: {
+      model?: string;
+      sentences?: Record<string, { verdict: 'supported' | 'unsupported' | 'unclear'; reason: string }>;
+    } | null;
   } | null;
   can_be_written: boolean;
 }
@@ -246,6 +252,10 @@ function EpicIndex({ project }: { project: string }) {
                           ) : row.overview === 'stale' ? (
                             <Badge tone="warning" size="sm">
                               Records changed since
+                            </Badge>
+                          ) : row.overview === 'doubt' ? (
+                            <Badge tone="warning" size="sm">
+                              In doubt: needs you
                             </Badge>
                           ) : (
                             <span className="text-muted-foreground">—</span>
@@ -415,6 +425,11 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
                 Written by {overview.model} <When value={overview.answered_at} /> from the records named with each
                 sentence. The records are what counts; this is a reading of them.
                 {overview.checked ? '' : ' Sentences that named no record they were shown were dropped.'}
+                {overview.agreed === true
+                  ? ` ${overview.judge?.model ?? 'A second model'} checked every sentence against the records it names and found each supported.`
+                  : overview.agreed === false
+                    ? ` ${overview.judge?.model ?? 'A second model'} checked every sentence against the records it names: what it did not find there is marked.`
+                    : ''}
               </p>
               {overview.stale ? (
                 <Alert tone="warning" title="The records have changed since this overview was written." />
@@ -433,6 +448,17 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
                       ))}
                       )
                     </span>
+                    {(() => {
+                      const said = overview.judge?.sentences?.[String(place + 1)];
+                      return said && said.verdict !== 'supported' ? (
+                        <span className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                          <Badge tone="warning" size="sm">
+                            {said.verdict === 'unsupported' ? 'In doubt: not in the records it names' : 'In doubt: could not be checked'}
+                          </Badge>
+                          <span className="text-muted-foreground">{said.reason}</span>
+                        </span>
+                      ) : null;
+                    })()}
                   </li>
                 ))}
               </ul>

@@ -74,6 +74,8 @@ export interface PlanRow {
   type_confirmed?: boolean;
   automatic_review?: ReviewResult | null;
   review_reason?: string | null;
+  /** With a judge: its model, and whether it proposed the same. */
+  judged?: { model: string; agreed: boolean } | null;
   github_state?: string | null;
   number?: number | null;
   url?: string | null;
@@ -502,6 +504,7 @@ function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; proj
               </div>
             )}
             {record.review_reason && <p className="mt-1 text-sm">Reason for proposal · {record.review_reason}</p>}
+            {record.judged && <p className="mt-1 text-sm">{record.judged.agreed ? `${record.judged.model}, asked the same without seeing this, proposed the same.` : `In doubt · ${record.judged.model}, asked the same without seeing this, did not propose it.`}</p>}
             {record.description && (
               <p className="mt-1 break-words text-sm text-muted-foreground">
                 <DescriptionPreview title={record.title} text={record.description} onRead={onRead} />

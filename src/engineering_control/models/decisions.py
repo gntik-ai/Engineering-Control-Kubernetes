@@ -120,15 +120,20 @@ def consistent(verdict: Row) -> bool:
     )
 
 
-def needs_second_opinion(primary: Row, human: str | None = None) -> bool:
+def needs_second_opinion(primary: Row, human: str | None = None, always: bool = False) -> bool:
+    """Whether the second model is asked. ``always`` where it serves as the judge of
+    every verdict: a contribution the first model found is checked too."""
     return (
-        primary.get("scope") == "unrelated"
+        always
+        or primary.get("scope") == "unrelated"
         or not consistent(primary)
         or (human in ("full", "partial", "unrelated") and primary.get("scope") != human)
     )
 
 
-def advisory(primary: Row, second: Row | None, human: str | None = None) -> Row:
+def advisory(
+    primary: Row, second: Row | None, human: str | None = None, always: bool = False
+) -> Row:
     if human in ("full", "partial", "unrelated") and any(
         verdict and verdict.get("scope") != human for verdict in (primary, second)
     ):
@@ -140,7 +145,7 @@ def advisory(primary: Row, second: Row | None, human: str | None = None) -> Row:
         }
     if not consistent(primary):
         reason = "The first model returned an incomplete or conflicting judgment."
-    elif not needs_second_opinion(primary):
+    elif not always and not needs_second_opinion(primary):
         return {
             "status": "advisory",
             "scope": primary["scope"],
@@ -154,7 +159,9 @@ def advisory(primary: Row, second: Row | None, human: str | None = None) -> Row:
         return {
             "status": "advisory",
             "scope": primary["scope"],
-            "reason": "Both models judged this issue unrelated to the Story.",
+            "reason": "Both models judged this issue unrelated to the Story."
+            if primary["scope"] == "unrelated"
+            else "Both models found the same contribution.",
         }
     return {"status": "needs_review", "scope": None, "reason": reason}
 

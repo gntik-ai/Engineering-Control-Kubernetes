@@ -40,7 +40,14 @@ type Finding = {
   origin: string;
   status: string;
   version: string;
-  evidence: { reason: string; title?: string; description?: string; source_excerpt?: string };
+  evidence: {
+    reason: string;
+    title?: string;
+    description?: string;
+    source_excerpt?: string;
+    /** With a judge: its model, and whether it made the suggestion too. */
+    judge?: { model: string; agreed: boolean };
+  };
   proposal: string | null;
 };
 type Connection = {
@@ -386,6 +393,13 @@ function FindingRow({
             : 'Model suggestion'}{' '}
         · {f.status}
       </p>
+      {f.evidence.judge && (
+        <p className="text-sm">
+          {f.evidence.judge.agreed
+            ? `${f.evidence.judge.model}, asked the same without seeing this, suggested it too.`
+            : `In doubt: ${f.evidence.judge.model}, asked the same without seeing this, did not suggest it.`}
+        </p>
+      )}
       <p className="break-words">{f.evidence.reason}</p>
       {f.evidence.source_excerpt && (
         <blockquote className="border-s-2 ps-2 text-muted-foreground">{f.evidence.source_excerpt}</blockquote>

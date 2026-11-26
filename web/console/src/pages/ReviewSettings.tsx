@@ -14,6 +14,8 @@ interface Settings {
   own_makers: boolean;
   models: Model[];
   cheaper_first: boolean;
+  /** Whether the judge is asked in the reviews that use the planning model; null where none is chosen. */
+  planning_judged?: boolean | null;
   numbers: {
     key: string;
     value: number;
@@ -360,11 +362,15 @@ export function ReviewSettings({ project }: { project: string }) {
               <p className="text-sm text-muted-foreground">
                 A run of a check takes these: it is started from its worklist without choosing anything. The judge is
                 asked the same question without seeing the answer and has to be of another maker than the model that
-                answers. Review evidence asks the model that answers too. Models that write code only are not offered:
-                they are never asked in a review. A third model, which can be a stronger one, is asked only about what
-                the two did not agree on: it decides nothing, and you are shown which of the two it sides with. What it
-                may cost a month is among the numbers below. Measured on Falcone on 26 November 2026, the side a third
-                model took was right 4 times in 13, at about a cent an issue: none is recommended.
+                answers. Review evidence asks the model that answers too. The judge is asked in the other reviews as
+                well, wherever it is of another maker than the model that answered: the automatic planning reviews,
+                Discovery, the coverage of Stories by issues, connections between projects, the execution order and the
+                check of a new Epic. There it costs one more call for each call of the review. Models that write code
+                only are not offered: they are never asked in a review. A third model, which can be a stronger one, is
+                asked only about what the two did not agree on: it decides nothing, and you are shown which of the two
+                it sides with. What it may cost a month is among the numbers below. Measured on Falcone on 26 November
+                2026, the side a third model took was right 4 times in 13, at about a cent an issue: none is
+                recommended.
               </p>
               <div className="flex flex-wrap items-end gap-3">
                 <label className="grid gap-1 text-sm">
@@ -455,6 +461,13 @@ export function ReviewSettings({ project }: { project: string }) {
                     Save this model
                   </Button>
                 </div>
+              ) : null}
+              {plan && data.planning_judged === false && data.roles.judge ? (
+                <p className="text-sm text-foreground">
+                  The judge is not asked in the planning reviews, Discovery, the execution order or the check of a new
+                  Epic: {data.roles.judge.model} is of the same maker as their model. Choose a model of another maker
+                  for one of the two to have these judged.
+                </p>
               ) : null}
             </CardBody>
           </Card>

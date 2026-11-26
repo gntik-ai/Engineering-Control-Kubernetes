@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0 to J4 are built, J5 and J6 are not.
+Plan, 26 November 2026. Decided the same day; J0 to J5 are built, J6 is not.
 
 ## What is asked for
 
@@ -468,3 +468,35 @@ Every ten minutes what is settled is then applied as a batch that can be undone 
 - **The readings that ask no model have no switch.** The backlog, the documents, the meaning of records, the scorer and where each Story stands cost nothing, and the candidates, the ranking by the texts and the batches rest on them. Stopping one would only make the checks worse. Pausing a project stops its work as a whole.
 
 **Not exercised on live:** every project has every check on "Only when you start it", so nothing has started by itself yet.
+
+## J5 as built
+
+**One step for all of them.** Wherever a review asks a model, the project's judge can be asked the same question without seeing the answer. It is asked when Settings names a judge, the judge can be asked, its maker is one the project's texts may be sent to, and it is of another maker than the model that answered. A judge that gives no usable answer leaves the first answer as it would be without one. What the judge used is counted under the review's own name with "judge" beside it, so Settings shows what judging each review costs.
+
+**What agreeing means differs, review by review.**
+
+| Review | What the judge is asked | Where the two differ |
+| --- | --- | --- |
+| Epic overviews | Not to write it again: to check each sentence against the records the sentence names | The sentence is marked in doubt with the judge's reason, the Epic's row says "In doubt: needs you", and nothing goes back or to a third model |
+| Coverage of User Stories by issues | The same matching | A match becomes a link without your approval, so only a match the judge makes too is kept, and it counts as covering the whole Story only where both say so. An issue left with no Story waits in its worklist |
+| Automatic planning reviews | The same review | Where the judge names other parents, nothing is linked: the review asks you, saying what each named. A Story or issue the review proposes says whether the judge proposed one like it |
+| Discovery | The same review step | An issue that is there says whether the judge gave it the same parents; a record proposed anew, whether the judge proposed one whose title shares half its words |
+| Connections between projects | The same analysis | Each suggestion says whether the judge made it too; those it did not make are listed first |
+| Execution order | The same classification | An Issue the judge reads as the other type, bug or enhancement, is marked ambiguous, which you confirm before the plan can start |
+| Review evidence | Its second opinion, which the flow names | Where the project has a judge, the second opinion is asked about every verdict, not only one that says unrelated. A contribution the first model finds counts as advisory only when the second finds the same; else it needs your review |
+| Check of a new Epic | The same check | Where one finds the description ready and the other would ask a question, the dialog says so |
+
+**What needs you comes first** in the list of Epics (by its mark), the connection's suggestions, the planning reviews and the candidates of a Discovery stage. In the planning tables a proposal says that it is in doubt, and is not moved up.
+
+**Where the judge is not asked.**
+
+- **Where it is of the maker that answered.** On Falcone the planning model is Claude Sonnet 5.5 and the judge Claude Haiku 5.5: the planning reviews, Discovery, the execution order and the check of a new Epic are not judged there until one of the two is of another maker. Settings says so.
+- **The structure of the plan** asks no model: its proposals come from the ranking service.
+- **The description of the repository** in Discovery is a text you approve as a whole.
+- **The supervisor's advice** is outside Reviews.
+
+**What it costs.** One more call for each call of the review, to the judge's model. With a judge that is cheaper than the model that answers, less than twice.
+
+**Not measured.** That two models agreeing are right more often was measured for issues and their User Stories. For proposals, suggestions, classifications and sentences it is assumed, not measured: there the judge marks and orders, and what was applied without approval before (coverage links, the parents a planning review names) is now applied only where both agree.
+
+**Not exercised on live.** No review has run with a judge on live. The judge's step and each review's rule for agreeing are covered by tests; the judge of Epic overviews is tested from the run to the page.

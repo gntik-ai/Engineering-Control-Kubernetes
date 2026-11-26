@@ -849,6 +849,18 @@ class PlanningRecords:
                 .tuples()
                 .all()
             )
+            # What a judge said to each proposal: whether it proposed the same.
+            judged = dict(
+                session.execute(
+                    select(WorkspaceCandidate.id, WorkspaceCandidate.judged).where(
+                        WorkspaceCandidate.project_id == project.id,
+                        WorkspaceCandidate.id.in_(row_ids),
+                        WorkspaceCandidate.judged.is_not(None),
+                    )
+                )
+                .tuples()
+                .all()
+            )
             for item in items:
                 key = item["id"]
                 if kind != "issues":
@@ -864,6 +876,7 @@ class PlanningRecords:
                 item["closing"] = mirror in closing
                 item["automatic_review"] = reviews.get(mirror)
                 item["review_reason"] = reasons.get(key)
+                item["judged"] = judged.get(key) if item["proposal"] else None
                 item["connections"] = external[mirror]
                 rels = item.pop("parents")
                 proposal_type = item.pop("proposal_type")

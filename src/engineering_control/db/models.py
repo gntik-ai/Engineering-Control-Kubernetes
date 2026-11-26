@@ -537,6 +537,9 @@ class WorkspaceCandidate(UUIDPrimaryKey, Timestamps, Base):
     description: Mapped[str | None] = mapped_column(Text)
     parents: Mapped[list[str]] = mapped_column(JSON, default=list)
     decision: Mapped[str] = mapped_column(String(16), default="pending")
+    # With a judge (migration 0093): its model, and whether it, asked the same without
+    # seeing the proposal, proposed the same. None where no judge was asked.
+    judged: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     local_id: Mapped[UUID | None] = mapped_column(Uuid)
     __table_args__ = (
         UniqueConstraint("project_id", "kind", "identity", name="uq_workspace_candidate_identity"),

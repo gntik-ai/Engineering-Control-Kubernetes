@@ -309,6 +309,9 @@ def _to_third(db: Session, run: ChoiceRun, review: ChoiceReview) -> bool:
     it was not asked about this record yet, and its dollars are not used up."""
     if not run.third_model or (review.judge or {}).get("third") is not None:
         return False
+    if getattr(KINDS[run.kind], "verifies", False):
+        # Its judge checks what was written; a third writing of it settles nothing.
+        return False
     # A measurement stops at its own dollars instead.
     if not in_dollars(KINDS[run.kind]) and third_left(db, run.project_id) <= 0:
         return False
@@ -1114,7 +1117,14 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             # So is the third model, about what the two did not agree on.
             first = False
             asker = ChoiceRun(provider=run.third_provider or "", model=run.third_model or "")
-        asked = scope.question(asker, child, listed)
+        # A kind whose answers are written, not chosen, has its judge check what was
+        # written against the records, instead of writing it again.
+        checking = getattr(scope, "judge_question", None) if phase == "judge" else None
+        asked = (
+            checking(asker, child, listed, review)
+            if checking is not None
+            else scope.question(asker, child, listed)
+        )
         # The makers may have changed since the run began.
         named = asked.choices[0]
         if getattr(spec, "more_choices", None) is None and not review_settings.permits(
@@ -1237,7 +1247,12 @@ def _settle(
             try:
                 if child is None:
                     raise Unusable("It was decided while the question was asked.")
-                read = scope.read(reply.data, child, review.shortlist)
+                checked = getattr(scope, "judge_read", None) if call.phase == "judge" else None
+                read = (
+                    checked(reply.data, child, review.shortlist, review)
+                    if checked is not None
+                    else scope.read(reply.data, child, review.shortlist)
+                )
             except (Unusable, KeyError, ValueError) as unusable:
                 problem = str(unusable) or "The answer could not be read."
                 if call.phase and child is not None:
@@ -1276,7 +1291,10 @@ def _settle(
                     review.judge = _said(spec, read, reply, tokens)
                     if agreeing(spec, _answer(review), read):
                         _conclude(db, spec, run, review, child, reply, True)
-                    elif review.rounds < review_settings.of(db, run.project_id).rounds:
+                    elif (
+                        not getattr(spec, "verifies", False)
+                        and review.rounds < review_settings.of(db, run.project_id).rounds
+                    ):
                         # The two differ: the answer goes back, told what the other chose.
                         review.phase, review.rounds = "back", review.rounds + 1
                         _TROUBLE.pop(run.id, None)

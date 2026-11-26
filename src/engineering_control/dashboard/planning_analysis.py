@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import review_budget, review_flows
@@ -408,6 +408,29 @@ class PlanningAnalysis:
         current = set(source["parents"])
         if current and set(matched) - current:
             questions.append("Review the additional parent matches and confirm the intended links.")
+        # A judge of another maker was asked the same without seeing this answer. Where
+        # it names other parents, nothing is linked: the review asks the administrator.
+        judged = answer.get("judge") if isinstance(answer.get("judge"), dict) else None
+        second: list[str] | None = None
+        if judged is not None and job.kind != "epics" and not source.get("story_optional"):
+            second = [
+                value
+                for value in dict.fromkeys(judged.get("parents") or [])
+                if isinstance(value, str)
+                and value in rows
+                and rows[value]["kind"] == parent_kind
+                and (value in work.ids or value == source["id"])
+            ]
+            if set(second) != set(matched):
+
+                def named(values: list[str]) -> str:
+                    return ", ".join(f"“{rows[v]['title']}”" for v in values) or "no parent"
+
+                questions.append(
+                    f"In doubt: this review names {named(matched)}, and {judged.get('model')}, "
+                    f"asked the same without seeing it, names {named(second)}. Confirm the "
+                    "intended links."[:700]
+                )
         proposals = list(job.result.get("proposals", []))
         if (
             job.kind != "epics"
@@ -494,6 +517,15 @@ class PlanningAnalysis:
                         review_reason=reason,
                         parents=linked,
                         origin="review",
+                        # Whether the judge, asked the same, proposed a record like it.
+                        judged={
+                            "model": judged.get("model"),
+                            "agreed": review_budget.also_proposed(
+                                title, (judged.get("titles") or {}).get(kind) or []
+                            ),
+                        }
+                        if judged is not None
+                        else None,
                     )
                     db.add(candidate)
                     db.flush()
@@ -509,6 +541,12 @@ class PlanningAnalysis:
             "scanned": work.scanned,
             "parents": [{"id": i, "kind": parent_kind, "title": rows[i]["title"]} for i in matched],
             "proposals": proposals,
+            # With a judge: its model, and whether it named the same parents.
+            **(
+                {"judge": {"model": judged.get("model"), "agreed": set(second) == set(matched)}}
+                if judged is not None and second is not None
+                else {}
+            ),
         }
 
     def fail(self, key: Key, name: str, token: UUID, message: str, transient: bool) -> None:
@@ -593,23 +631,59 @@ class PlanningAnalysis:
                 # starting a second, separately billed request.
                 if not await asyncio.to_thread(self.owns, key, token):
                     return True
+                asked = Question(
+                    choices=((work.provider, work.model),),
+                    system=instruction,
+                    prompt=json.dumps(work.prompt, ensure_ascii=False, separators=(",", ":")),
+                    schema=SCREEN if work.screen else REVIEW,
+                    max_tokens=2500 if work.screen else 8000,
+                    seconds=150,
+                )
+                stage = "screening" if work.screen else work.key[1]
                 reply = await review_budget.ask_review(
                     self.sessions,
                     key[0],
                     models,
-                    Question(
-                        choices=((work.provider, work.model),),
-                        system=instruction,
-                        prompt=json.dumps(work.prompt, ensure_ascii=False, separators=(",", ":")),
-                        schema=SCREEN if work.screen else REVIEW,
-                        max_tokens=2500 if work.screen else 8000,
-                        seconds=150,
-                    ),
+                    asked,
                     "automatic_review_screen" if work.screen else "automatic_review",
                     run_id=work.run_id,
-                    stage="screening" if work.screen else work.key[1],
+                    stage=stage,
                 )
-                await asyncio.to_thread(self.apply, work, reply.data)
+                answer = reply.data
+                # The parents a review names are linked without the administrator's
+                # word: where the project has a judge, it is asked the same, unseen.
+                if (
+                    not work.screen
+                    and work.key[1] != "epics"
+                    and not work.prompt["source"].get("story_optional")
+                ):
+                    second = await review_budget.ask_judge(
+                        self.sessions,
+                        key[0],
+                        models,
+                        asked,
+                        reply,
+                        "automatic_review",
+                        run_id=work.run_id,
+                        stage=stage,
+                    )
+                    if second is not None and isinstance(second.data, dict):
+                        answer = {
+                            **answer,
+                            "judge": {
+                                "model": second.model,
+                                "parents": second.data.get("parents") or [],
+                                "titles": {
+                                    kind: [
+                                        entry.get("title")
+                                        for entry in second.data.get(kind) or []
+                                        if isinstance(entry, dict)
+                                    ]
+                                    for kind in ("stories", "issues")
+                                },
+                            },
+                        }
+                await asyncio.to_thread(self.apply, work, answer)
         except review_budget.ReviewBudgetHeld:
             await asyncio.to_thread(self.defer_for_budget, key, token)
         except ModelError as exc:
@@ -681,7 +755,13 @@ class PlanningAnalysis:
             pages = max(1, (sum(counts.values()) + 9) // 10)
             page = min(max(1, page), pages)
             jobs = db.scalars(
-                query.order_by(PlanningReview.updated_at.desc(), PlanningReview.record_id)
+                # What needs the administrator first: a review that asks, which is also
+                # where a judge named other parents.
+                query.order_by(
+                    case((PlanningReview.status == "needs_input", 0), else_=1),
+                    PlanningReview.updated_at.desc(),
+                    PlanningReview.record_id,
+                )
                 .limit(10)
                 .offset((page - 1) * 10)
             ).all()

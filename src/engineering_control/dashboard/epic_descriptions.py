@@ -227,6 +227,35 @@ class EpicDescriptions:
                     stage="epics",
                 )
                 result = response(reply.data)
+                # Where the project has a judge, it is asked the same without seeing the
+                # answer. Where one finds the description ready and the other would ask,
+                # the result says so: it is in doubt, and the administrator's to settle.
+                second = await review_budget.ask_judge(
+                    self.sessions,
+                    pid,
+                    models,
+                    question,
+                    reply,
+                    "epic_description_validation",
+                    run_id=request,
+                    stage="epics",
+                )
+                if second is not None:
+                    try:
+                        other = response(second.data)
+                    except (ProjectInvalid, ValueError, KeyError, TypeError):
+                        other = {}
+                    if other and other.get("status") != result.get("status"):
+                        result = {
+                            **result,
+                            "doubt": (
+                                f"{second.model}, asked the same without seeing this, would "
+                                f"first ask: {other.get('question')}"
+                                if other.get("status") == "clarification"
+                                else f"{second.model}, asked the same without seeing this, "
+                                "finds the description ready as it is."
+                            )[:900],
+                        }
             except ModelError as exc:
                 raise ProjectConflict(str(exc)) from exc
             finally:

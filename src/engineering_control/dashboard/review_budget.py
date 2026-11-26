@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import Select, select, update
@@ -191,6 +193,68 @@ def not_sent(
         f"This project's texts are not sent to {maker(*named)}. Allow the maker under "
         "Reviews, Settings, or choose another model there."
     )
+
+
+def judge_for(
+    sessions: sessionmaker[Session], project_id: UUID, answered: tuple[str, str]
+) -> tuple[str, str] | None:
+    """The judge the project's settings name, where it can judge an answer of this
+    model: one that can be asked, of a maker the project's texts may be sent to, and of
+    another family than the model that answered. None otherwise."""
+    from engineering_control.dashboard import review_settings
+
+    with sessions() as db:
+        return review_settings.judge_of(db, project_id, answered)
+
+
+async def ask_judge(
+    sessions: sessionmaker[Session],
+    project_id: UUID,
+    models: Models,
+    question: Question,
+    answered: Reply,
+    workflow: str,
+    *,
+    run_id: UUID | None = None,
+    stage: str = "all",
+    budgeted: bool = True,
+) -> Reply | None:
+    """Ask the project's judge the question another model just answered, without showing
+    it the answer. None where the project names no judge for that model, or the judge
+    gave no usable answer: the first answer then stands as it would without a judge.
+    What the judge used is counted under the workflow's name with ``_judge``."""
+    judge = await asyncio.to_thread(
+        judge_for, sessions, project_id, (answered.provider, answered.model)
+    )
+    if judge is None:
+        return None
+    if run_id:
+        # The same instructions and limits as the first model had; not its model.
+        question = await asyncio.to_thread(
+            review_flows.question_for_run, sessions, project_id, run_id, stage, question
+        )
+    try:
+        return await ask_review(
+            sessions,
+            project_id,
+            models,
+            replace(question, choices=(judge,)),
+            workflow + "_judge",
+            budgeted=budgeted,
+        )
+    except (ModelError, ReviewBudgetHeld):
+        return None
+
+
+def also_proposed(title: Any, theirs: list[Any]) -> bool:
+    """Whether a judge proposed a record like this one: one of its titles shares at
+    least half of this title's words."""
+
+    def words(text: Any) -> set[str]:
+        return set("".join(c if c.isalnum() else " " for c in str(text or "").lower()).split())
+
+    mine = words(title)
+    return bool(mine) and any(2 * len(mine & words(other)) >= len(mine) for other in theirs)
 
 
 def release_unused(sessions: sessionmaker[Session], project_id: UUID, reserved: int) -> None:

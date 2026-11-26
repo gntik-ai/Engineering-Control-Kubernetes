@@ -280,6 +280,18 @@ def models(db: Session, project: UUID) -> list[dict[str, str]]:
     ]
 
 
+def judge_of(db: Session, project: UUID, answered: tuple[str, str]) -> tuple[str, str] | None:
+    """The judge the project's settings name, where it can judge an answer of this
+    model: one that can be asked, of a maker the project's texts may be sent to, and of
+    another family than the model that answered. None otherwise."""
+    judge = of(db, project).judge
+    if judge is None or family_of(*judge) == family_of(*answered):
+        return None
+    if {"provider": judge[0], "model": judge[1]} not in models(db, project):
+        return None
+    return judge
+
+
 def roles(db: Session, project: UUID) -> dict[str, Any]:
     """The models a run takes unless it is told otherwise, where they can be asked."""
     mine, offered = of(db, project), models(db, project)
@@ -357,8 +369,21 @@ WORKFLOWS: Final = {
     "repository_review": "Discovery",
     "project_planning": "Discovery and planning",
     "epic_description_validation": "Epic descriptions",
+    "connection_review": "Connections between projects",
+    "execution_planning": "Execution order",
+    "issue_linking": "Issues and their User Stories: coverage",
+    "project_coverage": "Discovery: coverage",
     "supervisor_advice": "Supervisor: advice on the plan",
 }
+
+
+def _label(workflow: str) -> str:
+    """What a workflow is called; a judge's calls are counted under its name with
+    ``_judge``."""
+    judge = workflow.endswith("_judge")
+    base = workflow[: -len("_judge")] if judge else workflow
+    said = WORKFLOWS.get(base) or base.replace("_", " ").capitalize()
+    return f"{said}: judge" if judge else said
 
 
 def costs(db: Session, project: UUID, since: datetime) -> list[dict[str, Any]]:
@@ -379,7 +404,7 @@ def costs(db: Session, project: UUID, since: datetime) -> list[dict[str, Any]]:
             (workflow, model),
             {
                 "workflow": workflow,
-                "label": WORKFLOWS.get(workflow) or workflow.replace("_", " ").capitalize(),
+                "label": _label(workflow),
                 "model": model,
                 "calls": 0,
                 "tokens": 0,
@@ -434,6 +459,17 @@ class ReviewSettingsService:
                     "over": total >= mine.dollars,
                 },
                 "roles": roles(db, project.id),
+                # Whether the judge is asked in the planning reviews, Discovery, the
+                # execution order and the check of a new Epic: it has to be of another
+                # maker than the model those ask. None where there is no such model.
+                "planning_judged": (
+                    judge_of(
+                        db, project.id, (project.planning_provider or "", project.planning_model)
+                    )
+                    is not None
+                )
+                if project.planning_model
+                else None,
                 "rounds": mine.rounds,
                 "cheaper_first": mine.cheaper_first,
                 "numbers": [

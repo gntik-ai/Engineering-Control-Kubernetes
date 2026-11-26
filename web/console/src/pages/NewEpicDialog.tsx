@@ -16,8 +16,8 @@ import { useRef, useState } from 'react';
 import { ApiError, postJson } from '../api';
 
 type Review =
-  | { review_id: string; status: 'clarification'; question: string }
-  | { review_id: string; status: 'ready'; description: string };
+  | { review_id: string; status: 'clarification'; question: string; doubt?: string }
+  | { review_id: string; status: 'ready'; description: string; doubt?: string };
 
 export function NewEpicDialog({
   path,
@@ -154,6 +154,7 @@ export function NewEpicDialog({
                 ))}
               </details>
             )}
+            {review?.doubt && <Alert tone="warning" title={'In doubt: ' + review.doubt} />}
             {review?.status === 'clarification' && (
               <Field>
                 <FieldLabel htmlFor="epic-answer">{review.question}</FieldLabel>

@@ -10,12 +10,13 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
-from engineering_control.dashboard import epic_pages
+from engineering_control.dashboard import epic_pages, parent_choice
 from engineering_control.db.models import (
     BacklogItem,
     EpicPage,
     ProjectEpic,
     ProjectReviewBudget,
+    ProviderAccount,
 )
 from engineering_control.models.service import Question, Reply
 from tests.test_automatic_planning import post
@@ -218,5 +219,88 @@ def test_an_overview_keeps_only_sentences_that_name_a_record(tmp_path: Path) -> 
         run(repo, Writer([{"text": "It is a fine Epic.", "sources": []}]))
         failed = client.get(BASE + "epic-pages/" + epic).json()["overview"]
         assert failed["state"] == "failed" and "named a record" in failed["detail"]
+    finally:
+        client.close()
+
+
+class Checked:
+    """A writer and a judge behind one account: the writer writes what it is told, the
+    judge gives the verdicts it is told for the sentences it is shown."""
+
+    def __init__(self, sentences: list[dict[str, Any]], verdicts: list[tuple[str, str]]) -> None:
+        self.sentences, self.verdicts = sentences, verdicts
+        self.shown: list[dict[str, Any]] = []
+
+    async def ask(self, question: Question, *, retry: bool) -> Reply:
+        ((_provider, model),) = question.choices
+        asked = json.loads(question.prompt)
+        if model == "analysis":
+            said: dict[str, Any] = {"sentences": self.sentences}
+        else:
+            # The judge is not asked to write: it is shown what was written.
+            assert "check the overview" in question.system
+            self.shown.append(asked)
+            said = {
+                "sentences": [
+                    {"number": place, "verdict": verdict, "reason": reason}
+                    for place, (verdict, reason) in enumerate(self.verdicts, start=1)
+                ]
+            }
+        return Reply(said, "", "fixture", model, uuid4(), "Test", {"tokens": 90}, 0.2, 1)
+
+
+def test_a_judge_checks_each_sentence_of_an_overview(tmp_path: Path, monkeypatch: Any) -> None:
+    # In this test each model is a family of its own.
+    monkeypatch.setattr(parent_choice, "family_of", lambda provider, model: model)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = prepared(repo)
+        epic = str(data["epic"])
+        with repo.sessions.begin() as db:
+            db.add(
+                ProjectReviewBudget(
+                    project_id=data["project"], token_limit=200_000, used=0, reserved=0
+                )
+            )
+            db.scalars(select(ProviderAccount)).one().models = ["analysis", "other"]
+        start = {"provider": "fixture", "model": "analysis", "token_cap": 60_000}
+        judge = {"judge_provider": "fixture", "judge_model": "other"}
+        written = [
+            {"text": "The Epic is about operating the runtime.", "sources": ["E"]},
+            {"text": "Failures are fully delivered.", "sources": ["S1"]},
+        ]
+        assert post(client, "epic-pages/runs", **start, **judge).status_code == 200
+        model = Checked(
+            written, [("supported", ""), ("unsupported", "The Story is still in progress.")]
+        )
+        run(repo, model)
+        (shown,) = model.shown
+        # It is shown the same records, and each sentence with the records it names.
+        assert shown["stories"][0]["id"] == "S1" and shown["overview"] == [
+            {"number": 1, "text": "The Epic is about operating the runtime.", "sources": ["E"]},
+            {"number": 2, "text": "Failures are fully delivered.", "sources": ["S1"]},
+        ]
+        overview = client.get(BASE + "epic-pages/" + epic).json()["overview"]
+        assert overview["agreed"] is False and overview["judge"]["model"] == "other"
+        assert overview["judge"]["sentences"] == {
+            "1": {"verdict": "supported", "reason": ""},
+            "2": {"verdict": "unsupported", "reason": "The Story is still in progress."},
+        }
+        listed = client.get(BASE + "epic-pages").json()
+        assert listed["epics"][0]["overview"] == "doubt"
+        assert listed["write"]["run"]["judge"] == {
+            "provider": "fixture",
+            "model": "other",
+            "asked": 1,
+            "agreed": 0,
+            "cost": 0.0,
+        }
+
+        # Written again, and every sentence found in the records it names: it stands.
+        assert post(client, "epic-pages/runs", **start, **judge, again=True).status_code == 200
+        run(repo, Checked(written[:1], [("supported", "")]))
+        overview = client.get(BASE + "epic-pages/" + epic).json()["overview"]
+        assert overview["agreed"] is True
+        assert client.get(BASE + "epic-pages").json()["epics"][0]["overview"] == "written"
     finally:
         client.close()

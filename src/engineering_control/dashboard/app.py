@@ -2455,6 +2455,7 @@ def create_app(
                 body.model,
                 body.token_cap,
                 body.again,
+                body.judge(),
             ),
             event="workspace.epic_overviews_started",
             subject=name,

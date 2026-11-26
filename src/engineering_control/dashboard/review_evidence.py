@@ -701,6 +701,13 @@ def eligible_pairs(result: Row) -> list[Row]:
     )
 
 
+def judged(db: Session, project: UUID) -> bool:
+    """Whether the second opinion serves as a judge here: asked about every verdict, not
+    only one that says unrelated. So where the project's settings name a judge for its
+    reviews; the second opinion itself stays the decision model the flow names."""
+    return review_settings.of(db, project).judge is not None
+
+
 def complete_native_step(
     db: Session, job: ReviewEvidenceJob, node: Row, result: Row, calls: int, *, reused: bool = False
 ) -> None:
@@ -715,7 +722,9 @@ def complete_native_step(
         connection = job.source["decisions"].get(issue, {}).get(story)
         linked = story in job.source["records"][issue]["parents"] or connection == "approved"
         human = result.get("previous_human_scope")
-        advisory = decisions.advisory(result["native"], result.get("second_opinion"), human)
+        advisory = decisions.advisory(
+            result["native"], result.get("second_opinion"), human, judged(db, job.project_id)
+        )
         advisory["existing_link"] = linked
         if linked and advisory["scope"] == "unrelated":
             advisory.update(
@@ -759,7 +768,9 @@ def admit_decision(db: Session, j: ReviewEvidenceJob, r: ReviewFlowRun, node: Ro
     result = dict(j.result)
     if second and (
         not result.get("native")
-        or not decisions.needs_second_opinion(result["native"], result.get("previous_human_scope"))
+        or not decisions.needs_second_opinion(
+            result["native"], result.get("previous_human_scope"), judged(db, j.project_id)
+        )
     ):
         complete_native_step(db, j, node, result, 0)
         return None

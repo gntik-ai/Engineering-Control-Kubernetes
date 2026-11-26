@@ -84,6 +84,24 @@ INSTRUCTION = (
 )
 
 
+def both_matched(matches: list[Row], judged: Any) -> list[Row]:
+    """The matches a judge made too, by issue and Story. All of them where no judge
+    answered. A match is full only where both say so."""
+    given = judged.get("matches") if isinstance(judged, dict) else None
+    if not isinstance(given, list):
+        return matches
+    theirs = {
+        (str(match.get("issue")), str(match.get("story"))): bool(match.get("full"))
+        for match in given
+        if isinstance(match, dict)
+    }
+    return [
+        {**match, "full": bool(match.get("full")) and theirs[match["issue"], match["story"]]}
+        for match in matches
+        if (match.get("issue"), match.get("story")) in theirs
+    ]
+
+
 def excerpt(text: str | None) -> str:
     body = text or ""
     return body if len(body) <= EXCERPT_CHARACTERS else body[:2400] + " … " + body[-1180:]
@@ -595,22 +613,22 @@ class IssueCoverage:
             )
             if isinstance(page, Coverage):
                 return page
+            asked = Question(
+                choices=((provider, model),),
+                system=INSTRUCTION,
+                prompt=page.prompt(),
+                schema=MATCHES,
+                max_tokens=6000,
+                seconds=150,
+            )
             reply = await review_budget.ask_review(
-                self.sessions,
-                pid,
-                models,
-                Question(
-                    choices=((provider, model),),
-                    system=INSTRUCTION,
-                    prompt=page.prompt(),
-                    schema=MATCHES,
-                    max_tokens=6000,
-                    seconds=150,
-                ),
-                workflow,
-                run_id=run_id,
-                stage="matching",
+                self.sessions, pid, models, asked, workflow, run_id=run_id, stage="matching"
             )
-            await asyncio.to_thread(
-                self.persist, name, provider, model, page, reply.data["matches"], guard
+            # These matches become links without the administrator's word: where the
+            # project has a judge, only a match it makes too, asked unseen, is kept. An
+            # issue left without a User Story then waits in its worklist.
+            second = await review_budget.ask_judge(
+                self.sessions, pid, models, asked, reply, workflow, run_id=run_id, stage="matching"
             )
+            matches = both_matched(reply.data["matches"], second.data if second else None)
+            await asyncio.to_thread(self.persist, name, provider, model, page, matches, guard)

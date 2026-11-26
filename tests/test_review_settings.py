@@ -172,9 +172,9 @@ def test_a_run_started_without_a_form_takes_what_the_settings_say(
         assert plan["answer"] == {"provider": "fixture", "model": "analysis"}
         assert plan["judge"] == {"provider": "fixture", "model": "other"}
         assert (plan["first"], plan["tokens"], plan["rounds"]) == (None, 50_000, 0)
-        # A check that has no judge takes the model that answers alone.
+        # Every check takes them, the Epic overviews with the judge that checks them too.
         pages = client.get(BASE + "epic-pages").json()["write"]["plan"]
-        assert pages["answer"] == plan["answer"] and pages["judge"] is None
+        assert pages["answer"] == plan["answer"] and pages["judge"] == plan["judge"]
 
         assert post(client, "orphans/runs").status_code == 200
         started = client.get(BASE + "orphans").json()["run"]
