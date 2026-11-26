@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0 is built, J1 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0 and most of J1 are built, J2 to J6 are not.
 
 ## What is asked for
 
@@ -298,6 +298,33 @@ Both measurements together have cost $0.89 of the $3.
 4. Where they disagree, the answer goes back once with the other's choice among the candidates; still no agreement, and it is in doubt and yours.
 
 This is measured again on the same 60 issues before anything is applied without you. Until a measurement shows 5%, what is agreed arrives as one batch with its sample, as batches do today.
+
+## What better candidates changed (26 November 2026)
+
+The candidates of the check are now the Stories closest in meaning joined with those that share the most words, twelve in place of eight. On the same 60 issues the right Story is among them for 55, up from 50.
+
+It did not lower the error. Asked again with the new candidates, GPT-5.6 Luna chose wrongly 11 times, Gemini 3.1 Flash Lite 14 and Claude Haiku 5.5 10, as before. Two that agree are wrong 7 or 8 times in 45 to 49; all three, 5 times in 42. What changed is where the errors lie: with the right Story shown, the models now agree on another one in 3 to 6 cases. The five issues gained are hard ones, and showing a model the right Story is not the same as its choosing it.
+
+So the reading above, that most of what is left comes from the candidates, was wrong, and is kept here as it was written. The candidates were worth repairing all the same: the right Story is now nearly always shown, to the models and to you.
+
+**Where this leaves the 5%.** Two cheap models agreeing are right about 85 times in 100 on these issues, and nothing measured so far reaches 95. One caution about the yardstick: the "right" Story is the one you set, and many of those links were approved from an earlier model's answer, so some of what counts as wrong here may be a second Story that also fits. That can be settled only by you reading the cases, which the batch's sample asks of you anyway.
+
+## J1 as built
+
+**A judge in a run.** The form that starts the check of issues with no User Story, of primary Epics, or of the clean-up has "Judge: a second answer, unseen". The judge has to be of another maker than the model that answers; a run has a judge or a cheaper model first, not both.
+
+- The answering model answers as before.
+- The judge is asked the same question with the same candidates, and is not shown the answer.
+- Where both say the same, the answer is **agreed**.
+- Where they differ, the answer goes back once: the answering model is told which candidate another reader chose, and to decide by the texts alone. If it now says what the judge said, agreed. If not, **in doubt**.
+- An answer that says it cannot tell is in doubt without a judge being asked.
+- For the clean-up, two answers agree when both say supported or both unsupported, whichever piece each read.
+
+**What you see.** Each answer says whether a second model answered the same, or that it is in doubt and what the judge said. Both worklists list what is in doubt first, the primary Epics in the order of how close the two best Epics lie, and can show only what is in doubt or only what was agreed. The run says how many answers the judge was asked for, how many the two agreed on, and what the run cost.
+
+**What is agreed is one batch.** Answers the two agreed on, that name a parent and whose passages are in the texts, go into the batches "Place issues under a User Story" and "Choose primary Epics" under Changes to approve, beside what the scorer is sure of. A batch opens with its sample; more wrong in the sample than 5% allows withdraws it; an approved batch can be undone for thirty days. Nothing is applied without you: that waits for a measurement that shows 5%, and the sample you judge is that measurement.
+
+**Not built of J1:** the comparison by a stronger model where the scorer disagrees, and the judge for the Epics a User Story is also linked to, whose answers judge several links at once.
 
 **Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
 
