@@ -219,6 +219,25 @@ def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | N
     return min(passed, key=lambda entry: entry[:2])[2] if passed else None
 
 
+def standing(
+    scope: Any, child: Any, listed: list[dict[str, Any]], review: ChoiceReview | None
+) -> str:
+    """What an answer is compared with to see whether it still answers the question:
+    the question as it stands now, or, where the kind says the answer still stands
+    although the candidates it would be shown today are others, the answer's own."""
+    current = str(scope.revision(child, listed))
+    stands = getattr(scope, "stands", None)
+    if (
+        review is not None
+        and stands is not None
+        and review.state == "answered"
+        and review.revision != current
+        and stands(child, review)
+    ):
+        return review.revision
+    return current
+
+
 def agreeing(spec: Any, mine: dict[str, Any], theirs: dict[str, Any]) -> bool:
     """Whether two answers to the same question say the same: the same answer and the
     same parent. A kind may say otherwise for its own answers."""
@@ -311,7 +330,7 @@ def agreed_lines(
             or review.decision != "pending"
             or review.parent_id is None
             or not review.checked
-            or review.revision != scope.revision(child, scope.shortlist(child))
+            or review.revision != standing(scope, child, scope.shortlist(child), review)
         ):
             continue
         judge = (review.judge or {}).get("model") or "a second model"
@@ -628,8 +647,8 @@ def start(
         answered = False
         for child in scope.children():
             listed = scope.shortlist(child)
-            current = scope.revision(child, listed)
             review = known.get(child.id)
+            current = standing(scope, child, listed, review)
             if not to_ask(review, current, again):
                 answered = True
                 continue

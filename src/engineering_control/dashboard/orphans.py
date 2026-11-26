@@ -470,6 +470,18 @@ class _Scope:
     def revision(self, child: BacklogItem, listed: list[dict[str, Any]]) -> str:
         return revision(child, listed)
 
+    def stands(self, child: BacklogItem, review: Any) -> bool:
+        """An answer that chose a User Story still stands when the issue's text is as it
+        was and that Story is still open, whatever candidates the issue would be shown
+        with today: the candidates are chosen by rules that are improved, and an answer
+        that was paid for is not thrown away for that. An answer that none fits does not
+        stand: a Story that was not shown may fit."""
+        return (
+            review.answer == "story"
+            and review.parent_id in self.stories.rows
+            and revision(child, review.shortlist or []) == review.revision
+        )
+
     def question(
         self, run: ChoiceRun, child: BacklogItem, listed: list[dict[str, Any]]
     ) -> Question:
@@ -549,8 +561,8 @@ class Orphans:
             placeholder = ChoiceRun(provider="", model="")
             for issue in scope.children():
                 listed = scope.shortlist(issue)
-                current = scope.revision(issue, listed)
                 review = known.get(issue.id)
+                current = parent_choice.standing(scope, issue, listed, review)
                 titles = {entry["id"]: entry["title"] for entry in listed}
                 if review is not None:
                     titles.update({entry["id"]: entry["title"] for entry in review.shortlist or []})
@@ -783,7 +795,7 @@ class Orphans:
                 review = known.get(issue.id)
                 if review is None:
                     continue
-                current = scope.revision(issue, scope.shortlist(issue))
+                current = parent_choice.standing(scope, issue, scope.shortlist(issue), review)
                 shown = parent_choice.shown_answer(review, current, {})
                 if parent_choice.approvable(shown, KIND.actionable) and review.answer:
                     chosen.append((issue.id, review.answer, review.parent_id))

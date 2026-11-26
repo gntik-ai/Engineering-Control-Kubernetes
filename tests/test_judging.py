@@ -13,6 +13,7 @@ from sqlalchemy import select
 from engineering_control.dashboard import judging, orphans, parent_choice, review_flows
 from engineering_control.db.models import (
     BacklogItem,
+    ChoiceReview,
     ProjectReviewBudget,
     ProviderAccount,
     RecordVector,
@@ -502,5 +503,59 @@ def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
         # Only what the two agreed on at once: 42 was agreed after it went back.
         assert titles == ["#41 Append the invocation ledger"]
         assert "analysis and other each chose" in json.dumps(batch)
+    finally:
+        client.close()
+
+
+def test_an_answer_stands_when_only_the_candidates_of_today_are_others(tmp_path: Path) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        with repo.sessions.begin() as db:
+            db.add(ProjectReviewBudget(project_id=data["project"], token_limit=200_000, used=0))
+            for number in (41, 42):
+                item = db.scalars(
+                    select(BacklogItem).where(BacklogItem.issue_number == number)
+                ).one()
+                item.issue_state = "open"
+                item.description = "Show failed runs to the operator and keep an audit entry."
+        start = {"provider": "fixture", "model": "analysis", "token_cap": 90_000}
+        assert post(client, "orphans/runs", **start).status_code == 200
+        run(
+            repo,
+            Readers(
+                {
+                    ("analysis", 41): ["Audit executions"],
+                    ("analysis", 42): ["Audit executions"],
+                    ("analysis", 45): ["unclear"],
+                }
+            ),
+        )
+        # As if both had been asked when one User Story fewer was shown as a candidate.
+        with repo.sessions.begin() as db:
+            issues = {
+                row.id: row
+                for row in db.scalars(select(BacklogItem).where(BacklogItem.issue_number < 43))
+            }
+            for review in db.scalars(select(ChoiceReview)):
+                if review.child_id not in issues:
+                    continue
+                issue = issues[review.child_id]
+                shown = [e for e in review.shortlist if e["title"] == "Audit executions"]
+                review.shortlist = shown
+                review.revision = orphans.revision(issue, shown)
+                if issue.issue_number == 42:
+                    # This one said that none of what it was shown fits.
+                    review.answer, review.parent_id = "none", None
+        listed = client.get(BASE + "orphans", params={"page_size": 50}).json()
+        by_number = {row["number"]: row for row in listed["items"]}
+        # The answer that chose a User Story stands: the issue's text is as it was.
+        assert not by_number[41]["review"]["stale"] and by_number[41]["approvable"]
+        # "None fits" does not: a Story it was not shown may fit.
+        assert by_number[42]["review"]["stale"]
+        # A run asks again about the one that does not stand, and no other.
+        assert listed["counts"]["to_ask"] == 1
+        approved = post(client, "orphans/approve", item_ids=[by_number[41]["id"]])
+        assert approved.status_code == 200 and approved.json()["linked"] == 1
     finally:
         client.close()
