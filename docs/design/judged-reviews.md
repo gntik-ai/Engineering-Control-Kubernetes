@@ -250,6 +250,55 @@ The reference was stopped at 22 of 79 pairs when OpenRouter asked for a pause. A
 
 What is measured for each: how often they agree, and when they agree, how often it is the parent that is known. Only a way that reaches 5% is given the right to apply without you; until one does, everything waits for you as today.
 
+## What the second measurement found (26 November 2026)
+
+On Falcone, the 60 issues whose User Story you set and whose own text does not name it. The link was hidden and the check's own question asked, with the eight candidates the check would show. For 50 of the 60, the right Story was among those eight; for 10 it was not.
+
+**A model answering alone**
+
+| Model | Maker | Chose a Story | Right | Wrong | Wrong with the right one shown | Cost of an answer |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| GPT-5.6 Luna | OpenAI | 53 | 43 | 10 | 5 | $0.00074 |
+| Gemini 3.1 Flash Lite | Google | 57 | 46 | 11 | 4 | $0.00091 |
+| Claude Haiku 5.5 | Anthropic | 51 | 40 | 11 | 6 | $0.00073 |
+
+Each is wrong about one time in five when it chooses.
+
+**Two or three models, each answering alone**
+
+| Models | Chose the same Story | Right | Wrong | Wrong with the right one shown | Cost of both |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Luna and Haiku | 44 | 38 | 6 | 3 | $0.0015 |
+| Luna and Gemini Flash Lite | 48 | 41 | 7 | 2 | $0.0016 |
+| Haiku and Gemini Flash Lite | 47 | 40 | 7 | 3 | $0.0016 |
+| All three | 43 | 38 | 5 | 2 | $0.0024 |
+
+**A comparison**, over Luna's 53 answers, 43 of them right
+
+| Model comparing | Confirmed | Right | Wrong | Wrong answers it did not confirm | Cost of a comparison |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Claude Haiku 5.5 | 47 | 39 | 8 | 2 of 10 | $0.00065 |
+| Gemini 3.8 Flash | 44 | 40 | 4 | 6 of 10 | $0.0047 |
+
+Both measurements together have cost $0.89 of the $3.
+
+**What this says.**
+
+- **Agreement alone is not enough.** Two cheap models that agree are wrong about one time in seven; three, one in nine.
+- **Most of what is left is not the models' error.** Of the 5 wrong answers all three agreed on, 3 are issues whose right Story was not among the candidates: shown eight Stories without the right one, three models pick the same best of the rest. With the right Story shown, three models that agree are wrong 2 times in 40, which is the 5% you accept. Two models, 2 or 3 in 41 to 44.
+- **The candidates are the first thing to repair, and it costs nothing.** They are chosen by shared words alone. The ranking service in the cluster, which also finds Stories that mean the same in other words, is not used for them yet.
+- **A comparison is worth its price only with a stronger model.** Haiku confirms nearly everything. Gemini 3.8 Flash caught 6 of the 10 wrong answers, at six times the cost of an answer.
+- **None of it is proven to 5% yet.** These are 60 issues; a difference of two answers moves every figure here by several points.
+
+**The judge of J1, from this.**
+
+1. Candidates from the ranking service joined with the words, twelve in place of eight, so that the right Story is nearly always shown.
+2. An answer from a cheap model, and a second answer from a cheap model of another maker that does not see the first. Agreed when both choose the same Story, clearly, with their passages in the texts.
+3. Where they agree and the scorer's own first candidate is another Story, a comparison by a stronger model of a third maker.
+4. Where they disagree, the answer goes back once with the other's choice among the candidates; still no agreement, and it is in doubt and yours.
+
+This is measured again on the same 60 issues before anything is applied without you. Until a measurement shows 5%, what is agreed arrives as one batch with its sample, as batches do today.
+
 **Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
 
 ## Sources
