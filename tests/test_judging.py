@@ -314,6 +314,11 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
             ),
         )
         latest = client.get(BASE + "judge-trials").json()["answers"]["runs"][0]
+        # The texts alone put a Story first for this issue: whether it is the one the
+        # two agreed on is said beside how often that is right.
+        texts = latest["judged"].pop("texts")
+        assert (texts["known"], texts["first"] + texts["other"]) == (1, 1)
+        assert texts["first_right"] + texts["other_right"] == 1
         assert latest["judged"] == {
             "judge": "other",
             "agreed": 1,

@@ -592,6 +592,7 @@ class _Answers:
                         # how many rounds back.
                         "agreed": review.agreed,
                         "rounds": review.rounds,
+                        **by_texts(review.shortlist, chose),
                         **others,
                         **more,
                     }
@@ -633,6 +634,16 @@ class _Compares(_Answers):
         return bool(chose and str(chose) == more.get("first"))
 
 
+def by_texts(listed: list[dict[str, Any]] | None, chose: Any) -> dict[str, Any]:
+    """Where the texts alone put the Story an answer chose: its place among the
+    candidates, which are in the order of words and meaning joined, and its place by
+    meaning alone. Nothing for an answer that chose none of them."""
+    for place, entry in enumerate(listed or [], start=1):
+        if chose is not None and str(entry.get("id")) == str(chose):
+            return {"place": place, "meaning": entry.get("meaning")}
+    return {}
+
+
 MEASURES: Final[dict[str, _Answers]] = {
     measure.kind: measure for measure in (_Answers(), _Compares())
 }
@@ -645,7 +656,11 @@ def _detail(line: ModelTrialLine) -> dict[str, Any]:
     return (line.differs or [{}])[0]
 
 
-def _answers_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any]:
+def _answers_report(
+    run: ChoiceRun,
+    lines: list[ModelTrialLine],
+    texts: dict[UUID, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     priced = [line.cost for line in lines if line.cost is not None]
     chose = [line for line in lines if line.answer == "story"]
     right = [line for line in chose if _detail(line).get("right")]
@@ -673,15 +688,32 @@ def _answers_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, An
         "cost": round(sum(priced), 6) if priced else None,
         # With a judge: what the two agreed on in the end, how much of it is right,
         # and what is left in doubt. The cost is then of both, for each issue.
-        "judged": _judged(run, lines),
+        "judged": _judged(run, lines, texts or {}),
     }
 
 
-def _judged(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any] | None:
+def _judged(
+    run: ChoiceRun, lines: list[ModelTrialLine], texts: dict[UUID, dict[str, Any]]
+) -> dict[str, Any] | None:
     if not run.judge_model:
         return None
     agreed = [line for line in lines if _detail(line).get("agreed") and line.answer == "story"]
     at_once = [line for line in agreed if not _detail(line).get("rounds")]
+
+    def placed(line: ModelTrialLine, key: str) -> Any:
+        """Where the texts put what it chose: kept with the line, or read from the
+        run's answers where the line is older than that."""
+        kept = _detail(line).get(key)
+        return kept if kept is not None else texts.get(line.child_id, {}).get(key)
+
+    known = [line for line in at_once if placed(line, "place") is not None]
+    first = [line for line in known if placed(line, "place") == 1]
+    closest = [line for line in known if placed(line, "meaning") == 1]
+    both = [line for line in first if placed(line, "meaning") == 1]
+
+    def right(some: list[ModelTrialLine]) -> int:
+        return sum(1 for line in some if _detail(line).get("right"))
+
     paid = (run.cost or 0.0) + (run.judge_cost or 0.0) + (run.third_cost or 0.0)
     asked = [line for line in lines if _detail(line).get("third_sides")]
 
@@ -708,6 +740,22 @@ def _judged(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any] | Non
             "cost": round(run.third_cost or 0.0, 6),
         }
         if run.third_model
+        else None,
+        # Of what the two agreed on at once: whether the texts alone put the same Story
+        # first, and how often it is right then and otherwise. None where it is not
+        # known where the texts put it.
+        "texts": {
+            "known": len(known),
+            "first": len(first),
+            "first_right": right(first),
+            "other": len(known) - len(first),
+            "other_right": right(known) - right(first),
+            "closest": len(closest),
+            "closest_right": right(closest),
+            "both": len(both),
+            "both_right": right(both),
+        }
+        if known
         else None,
         "judge": run.judge_model,
         "agreed": len(agreed),
@@ -964,6 +1012,20 @@ class Judging:
                 lines[line.run_id].append(line)
             asked = MEASURES[ANSWERS].scope(db, project).children()
             first_run, first = _first_answers(db, project.id)
+            # Where the texts put what each answer of the latest measurement chose: its
+            # answers are still there, with the candidates each was shown.
+            texts: dict[UUID, dict[UUID, dict[str, Any]]] = defaultdict(dict)
+            for review in db.scalars(
+                select(ChoiceReview).where(
+                    ChoiceReview.project_id == project.id,
+                    ChoiceReview.kind == "ans_issue_story",
+                    ChoiceReview.answer == "story",
+                )
+            ):
+                if review.run_id is not None:
+                    texts[review.run_id][review.child_id] = by_texts(
+                        review.shortlist, review.parent_id
+                    )
             return {
                 "kinds": kinds,
                 "trials": [_report(run, lines[run.id]) for run in runs if run.kind in JUDGE_NAMES],
@@ -974,7 +1036,7 @@ class Judging:
                     "first": first_run.model if first_run is not None else None,
                     "to_compare": sum(1 for row in asked if row.id in first),
                     "runs": [
-                        _answers_report(run, lines[run.id])
+                        _answers_report(run, lines[run.id], texts.get(run.id))
                         for run in runs
                         if run.kind == "ans_issue_story"
                     ],
