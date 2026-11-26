@@ -2361,6 +2361,7 @@ def create_app(
                 body.model,
                 body.dollars,
                 body.judge(),
+                body.third(),
             ),
             event="workspace.judge_trial_started",
             subject=name,

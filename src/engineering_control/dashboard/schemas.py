@@ -611,11 +611,19 @@ class JudgeTrialRunInput(PlainChangeInput):
     # For an answer from the candidates: a judge that answers unseen, as in a run.
     judge_provider: str = Field(default="", max_length=32)
     judge_model: str = Field(default="", max_length=200)
+    # And a third model, asked about what the two do not agree on.
+    third_provider: str = Field(default="", max_length=32)
+    third_model: str = Field(default="", max_length=200)
 
     def judge(self) -> tuple[str, str] | None:
         if not self.judge_provider and not self.judge_model:
             return None
         return (self.judge_provider, self.judge_model)
+
+    def third(self) -> tuple[str, str] | None:
+        if not self.third_provider and not self.third_model:
+            return None
+        return (self.third_provider, self.third_model)
 
 
 class PrimaryEpicRunInput(OrphanRunInput):

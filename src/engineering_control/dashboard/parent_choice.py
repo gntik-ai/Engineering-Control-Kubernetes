@@ -292,11 +292,13 @@ def third_left(db: Session, project: UUID) -> float:
     month = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     spent = sum(
         float(cost or 0.0)
-        for (cost,) in db.execute(
-            select(ChoiceRun.third_cost).where(
+        for kind, cost in db.execute(
+            select(ChoiceRun.kind, ChoiceRun.third_cost).where(
                 ChoiceRun.project_id == project, ChoiceRun.created_at >= month
             )
         )
+        # A measurement is limited in its own dollars and is not counted here.
+        if kind in KINDS and not in_dollars(KINDS[kind])
     )
     return review_settings.number(db, project, "doubt_dollars") - spent
 
@@ -306,7 +308,8 @@ def _to_third(db: Session, run: ChoiceRun, review: ChoiceReview) -> bool:
     it was not asked about this record yet, and its dollars are not used up."""
     if not run.third_model or (review.judge or {}).get("third") is not None:
         return False
-    if third_left(db, run.project_id) <= 0:
+    # A measurement stops at its own dollars instead.
+    if not in_dollars(KINDS[run.kind]) and third_left(db, run.project_id) <= 0:
         return False
     review.phase = "third"
     _TROUBLE.pop(run.id, None)
@@ -1071,7 +1074,12 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             )
             return _MOVED
         free = in_dollars(spec)
-        paid = (run.cost or 0.0) + (run.first_cost or 0.0) + (run.judge_cost or 0.0)
+        paid = (
+            (run.cost or 0.0)
+            + (run.first_cost or 0.0)
+            + (run.judge_cost or 0.0)
+            + (run.third_cost or 0.0)
+        )
         if free and run.dollar_cap is not None and paid >= run.dollar_cap:
             left = run.total - run.done - run.failed
             _finish(

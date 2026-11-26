@@ -537,6 +537,21 @@ class _Answers:
         in_list = any(str(story) in listed for story in known)
         chose = review.parent_id if review.answer == "story" else None
         more = self._more(db, run, child, chose, known)
+        # What the judge and a third model chose, and whether each is right.
+        others: dict[str, Any] = {}
+        for who, said in (
+            ("judge", review.judge or {}),
+            ("third", (review.judge or {}).get("third") or {}),
+        ):
+            if said.get("answer") is None:
+                continue
+            try:
+                picked = UUID(str(said.get("parent_id"))) if said.get("parent_id") else None
+            except ValueError:
+                picked = None
+            others[who + "_right"] = bool(said.get("answer") == "story" and picked in known)
+            if who == "third":
+                others["third_sides"] = said.get("sides")
         cost = reply.usage.get("cost")
         db.add(
             ModelTrialLine(
@@ -577,6 +592,7 @@ class _Answers:
                         # how many rounds back.
                         "agreed": review.agreed,
                         "rounds": review.rounds,
+                        **others,
                         **more,
                     }
                 ],
@@ -666,8 +682,33 @@ def _judged(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any] | Non
         return None
     agreed = [line for line in lines if _detail(line).get("agreed") and line.answer == "story"]
     at_once = [line for line in agreed if not _detail(line).get("rounds")]
-    paid = (run.cost or 0.0) + (run.judge_cost or 0.0)
+    paid = (run.cost or 0.0) + (run.judge_cost or 0.0) + (run.third_cost or 0.0)
+    asked = [line for line in lines if _detail(line).get("third_sides")]
+
+    def sided(side: str) -> list[ModelTrialLine]:
+        return [line for line in asked if _detail(line).get("third_sides") == side]
+
     return {
+        # With a third model, asked about what the two did not agree on: with which of
+        # them it went, and how often the one it went with had the right Story; where
+        # it went with neither, how often its own choice was right.
+        "third": {
+            "model": run.third_model,
+            "asked": len(asked),
+            "with_answer": len(sided("answer")),
+            "with_answer_right": sum(1 for line in sided("answer") if _detail(line).get("right")),
+            "with_judge": len(sided("judge")),
+            "with_judge_right": sum(
+                1 for line in sided("judge") if _detail(line).get("judge_right")
+            ),
+            "neither": len(sided("neither")),
+            "neither_right": sum(
+                1 for line in sided("neither") if _detail(line).get("third_right")
+            ),
+            "cost": round(run.third_cost or 0.0, 6),
+        }
+        if run.third_model
+        else None,
         "judge": run.judge_model,
         "agreed": len(agreed),
         "agreed_right": sum(1 for line in agreed if _detail(line).get("right")),
@@ -826,11 +867,14 @@ def _spent(db: Session, project: UUID) -> float:
     """What a project's measurements of judges have cost so far."""
     return float(
         sum(
-            (cost or 0.0) + (first or 0.0)
-            for cost, first in db.execute(
-                select(ChoiceRun.cost, ChoiceRun.first_cost).where(
-                    ChoiceRun.project_id == project, ChoiceRun.kind.in_(BY_NAME)
-                )
+            (cost or 0.0) + (first or 0.0) + (judge or 0.0) + (third or 0.0)
+            for cost, first, judge, third in db.execute(
+                select(
+                    ChoiceRun.cost,
+                    ChoiceRun.first_cost,
+                    ChoiceRun.judge_cost,
+                    ChoiceRun.third_cost,
+                ).where(ChoiceRun.project_id == project, ChoiceRun.kind.in_(BY_NAME))
             )
         )
     )
@@ -992,9 +1036,11 @@ class Judging:
         model: str,
         dollars: float,
         second: tuple[str, str] | None = None,
+        third: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a measurement of one model: as a judge of one sort of pair, or answering
-        from the candidates, alone or with ``second`` as its judge."""
+        from the candidates, alone or with ``second`` as its judge, and with ``third``
+        asked about what those two do not agree on."""
         measure = JUDGES.get(kind) or MEASURES.get(kind)
         if measure is None:
             raise ProjectInvalid("A judge cannot be measured on this.")
@@ -1055,6 +1101,7 @@ class Judging:
             None,
             dollars,
             second,
+            third,
         )
 
     def control(self, name: str, kind: str, run_id: UUID, action: str) -> dict[str, Any]:

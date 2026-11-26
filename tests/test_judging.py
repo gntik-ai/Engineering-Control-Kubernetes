@@ -323,6 +323,7 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
             "doubt": 0,
             "doubt_right": 0,
             "cost_each": 0.002,
+            "third": None,
         }
     finally:
         client.close()
@@ -559,5 +560,72 @@ def test_an_answer_stands_when_only_the_candidates_of_today_are_others(tmp_path:
         assert listed["counts"]["to_ask"] == 1
         approved = post(client, "orphans/approve", item_ids=[by_number[41]["id"]])
         assert approved.status_code == 200 and approved.json()["linked"] == 1
+    finally:
+        client.close()
+
+
+def test_a_third_model_is_measured_on_what_two_do_not_agree_on(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # In this test each model is a family of its own.
+    monkeypatch.setattr(parent_choice, "family_of", lambda provider, model: model)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        seed(repo)
+        # Issue 44 was put under "Respond to failures" by hand; its words fit both Stories.
+        with repo.sessions.begin() as db:
+            issue = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 44)).one()
+            issue.description = "Show failed runs to the operator and keep an audit entry."
+        repo.planning_links.reconcile_project("falcone")
+        priced(repo, ["analysis", "other", "strong"])
+        right, wrong = "Respond to failures", "Audit executions"
+        start = {
+            "provider": "fixture",
+            "model": "analysis",
+            "dollars": 0.5,
+            "judge_provider": "fixture",
+            "judge_model": "other",
+            "third_provider": "fixture",
+            "third_model": "strong",
+        }
+        # The third model is another than the two.
+        twice = post(client, "judge-trials/answers/runs", **{**start, "third_model": "other"})
+        assert twice.status_code == 422
+
+        # The answer is wrong and the judge right: the third goes with the judge.
+        started = post(client, "judge-trials/answers/runs", **start)
+        assert started.status_code == 200, started.text
+        says = {("analysis", 44): [wrong], ("other", 44): [right], ("strong", 44): [right]}
+        run(repo, Readers(says))
+        shown = client.get(BASE + "judge-trials").json()
+        judged = shown["answers"]["runs"][0]["judged"]
+        assert (judged["at_once"], judged["doubt"], judged["doubt_right"]) == (0, 1, 0)
+        assert judged["third"] == {
+            "model": "strong",
+            "asked": 1,
+            "with_answer": 0,
+            "with_answer_right": 0,
+            "with_judge": 1,
+            "with_judge_right": 1,
+            "neither": 0,
+            "neither_right": 0,
+            "cost": 0.001,
+        }
+        # What the measurements cost counts all three models.
+        assert shown["spent"] == 0.003
+
+        # The answer is right and the judge wrong: the third goes with the answer.
+        assert post(client, "judge-trials/answers/runs", **start).status_code == 200
+        says = {("analysis", 44): [right], ("other", 44): [wrong], ("strong", 44): [right]}
+        run(repo, Readers(says))
+        third = client.get(BASE + "judge-trials").json()["answers"]["runs"][0]["judged"]["third"]
+        assert (third["with_answer"], third["with_answer_right"], third["with_judge"]) == (1, 1, 0)
+
+        # Two that agree at once: the third model is not asked.
+        assert post(client, "judge-trials/answers/runs", **start).status_code == 200
+        agreeing = Readers({("analysis", 44): [right], ("other", 44): [right]})
+        run(repo, agreeing)
+        third = client.get(BASE + "judge-trials").json()["answers"]["runs"][0]["judged"]["third"]
+        assert third["asked"] == 0 and [call[0] for call in agreeing.calls] == ["analysis", "other"]
     finally:
         client.close()

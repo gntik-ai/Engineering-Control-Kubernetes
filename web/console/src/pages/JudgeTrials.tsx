@@ -75,6 +75,18 @@ interface AnswerRun {
     doubt: number;
     doubt_right: number;
     cost_each: number | null;
+    /** A third model, asked about what the two did not agree on: with whom it went, and how often rightly. */
+    third?: {
+      model: string;
+      asked: number;
+      with_answer: number;
+      with_answer_right: number;
+      with_judge: number;
+      with_judge_right: number;
+      neither: number;
+      neither_right: number;
+      cost: number;
+    } | null;
   } | null;
 }
 interface Agreement {
@@ -427,7 +439,19 @@ export function JudgeTrials({ project }: { project: string }) {
                                 With {entry.judged.judge} as its judge: agreed on {whole(entry.judged.agreed)}, of which{' '}
                                 {whole(entry.judged.agreed_right)} right (
                                 {wrongShare(entry.judged.agreed_right, entry.judged.agreed) || 'none to go by'}); in
-                                doubt {whole(entry.judged.doubt)}; {dollars(entry.judged.cost_each)} an issue for both.
+                                doubt {whole(entry.judged.doubt)}; {dollars(entry.judged.cost_each)} an issue for
+                                {entry.judged.third ? ' all three' : ' both'}.
+                              </div>
+                            ) : null}
+                            {entry.judged?.third ? (
+                              <div className="text-xs text-foreground">
+                                {entry.judged.third.model} as the third, asked about {whole(entry.judged.third.asked)}{' '}
+                                in doubt: it went with the answer {whole(entry.judged.third.with_answer)} times (
+                                {whole(entry.judged.third.with_answer_right)} right), with the judge{' '}
+                                {whole(entry.judged.third.with_judge)} times (
+                                {whole(entry.judged.third.with_judge_right)} right), with neither{' '}
+                                {whole(entry.judged.third.neither)} times ({whole(entry.judged.third.neither_right)} of
+                                its own choices right); {dollars(entry.judged.third.cost)} for the third.
                               </div>
                             ) : null}
                           </td>
