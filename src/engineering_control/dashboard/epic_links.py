@@ -323,6 +323,8 @@ class _Kind:
     workflow = "epic_links"
     # A run may ask a cheaper model first and keep what it settles.
     two_models = True
+    # Or a judge: a model of another maker that judges the same links unseen.
+    judged = True
     actionable: tuple[str, ...] = ("unrelated",)
     nothing_to_ask = (
         "A model has judged every link of a User Story to an Epic that is to be judged. "
@@ -344,6 +346,28 @@ class _Kind:
             for entry in read["evidence"]
             if entry.get("side") == "epic"
         )
+
+    def kept(self, read: dict[str, Any]) -> dict[str, Any]:
+        """What is kept of a judge's answer beside the answer itself: what it said of
+        each link."""
+        return {"links": said_of_links(read)}
+
+    def agreeing(self, mine: dict[str, Any], theirs: dict[str, Any]) -> bool:
+        """Two answers agree when they say the same of every link."""
+        return said_of_links(mine) == said_of_links(theirs)
+
+
+def said_of_links(answer: dict[str, Any]) -> dict[str, str]:
+    """What an answer said of each Epic it judged, by the Epic: from what was kept of a
+    judge's answer, or from the passages of the answer itself."""
+    kept = answer.get("links")
+    if isinstance(kept, dict):
+        return {str(epic): str(said) for epic, said in kept.items()}
+    return {
+        str(entry.get("epic")): str(entry.get("answer"))
+        for entry in answer.get("evidence") or []
+        if isinstance(entry, dict) and entry.get("side") == "epic"
+    }
 
 
 KIND: Final = _Kind()
@@ -379,6 +403,16 @@ def _findings(
     return found
 
 
+def second_opinion(review: ChoiceReview, entry: dict[str, Any]) -> str | None:
+    """What the judge said of this link; none where no judge was asked about it."""
+    judge = review.judge or {}
+    if not isinstance(judge.get("links"), dict):
+        return None
+    said = judge["links"].get(str(entry.get("epic")))
+    # A link the judge left out was not judged by it: it stands as unclear.
+    return str(said) if said else "unclear"
+
+
 def ready(db: Session, project: ProjectRecord) -> list[ScorerDecision]:
     """The links a model found unrelated, as lines for a batch: each with its reason and
     the passages it quoted. Shaped like the scorer's decisions, which they are not."""
@@ -386,6 +420,10 @@ def ready(db: Session, project: ProjectRecord) -> list[ScorerDecision]:
     lines = []
     for story, review, entry, stands in _findings(db, project, scope):
         if not stands or entry.get("answer") != "unrelated" or not entry.get("found"):
+            continue
+        # Where a judge was asked, only a link it calls unrelated too is proposed.
+        second = second_opinion(review, entry)
+        if second is not None and second != "unrelated":
             continue
         quote = next((e["text"] for e in review.evidence or [] if e.get("side") == "story"), "")
         epic = UUID(str(entry["epic"]))
@@ -404,6 +442,12 @@ def ready(db: Session, project: ProjectRecord) -> list[ScorerDecision]:
                         f"{review.model} found this Epic to have nothing to do with the User "
                         f"Story: {entry.get('reason') or 'no reason given'} "
                         f"The Story says: “{quote}”. The Epic says: “{entry.get('text')}”."
+                        + (
+                            f" {(review.judge or {}).get('model') or 'A second model'}, asked "
+                            "without seeing that, said the same."
+                            if second is not None
+                            else ""
+                        )
                     )
                 },
             )
@@ -515,6 +559,10 @@ class EpicLinks:
                         ),
                         "model": review.model,
                         "stale": not stands,
+                        # With a judge: its model, and whether it said the same of
+                        # every link.
+                        "judge": (review.judge or {}).get("model"),
+                        "agreed": review.agreed,
                         "links": [],
                     },
                 )
@@ -526,6 +574,8 @@ class EpicLinks:
                         "reason": entry.get("reason"),
                         "quote": entry.get("text"),
                         "found": bool(entry.get("found")),
+                        # What the judge said of this link; none where none was asked.
+                        "second": second_opinion(review, entry),
                     }
                 )
             found = sorted(
@@ -553,12 +603,23 @@ class EpicLinks:
         token_cap: int | None,
         again: bool = False,
         first: tuple[str, str] | None = None,
+        judge: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run that asks a model, about each open User Story that has links to
         Epics to judge and no answer yet, what each of those Epics is to it."""
         self.links.reconcile_project(name)
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
+            self.sessions,
+            name,
+            KIND.name,
+            provider,
+            model,
+            token_cap,
+            again,
+            None,
+            first,
+            None,
+            judge,
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

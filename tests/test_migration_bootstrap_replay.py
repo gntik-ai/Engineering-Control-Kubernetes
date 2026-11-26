@@ -68,7 +68,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0087 keeps what a judge said to each answer, and whether the two agreed.
     # 0088 keeps what each project's reviews are set to.
     # 0089 keeps the numbers a project set for its reviews.
-    assert (head, parent) == ("0089", "0088")
+    # 0090 keeps the third model a run asks where two differ.
+    assert (head, parent) == ("0090", "0089")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -177,6 +178,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     command.downgrade(config, parent)
+    settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
+    assert "doubt_model" not in settings and "numbers" in settings
+    assert "third_model" not in {c["name"] for c in inspect(engine).get_columns("choice_runs")}
+    command.downgrade(config, "0088")
     settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
     assert "numbers" not in settings and "cheaper_first" not in settings and "rounds" in settings
     command.downgrade(config, "0087")

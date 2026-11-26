@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0, most of J1 and J2 are built, J3 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0, J1 and J2 are built, J3 to J6 are not.
 
 ## What is asked for
 
@@ -324,7 +324,12 @@ So the reading above, that most of what is left comes from the candidates, was w
 
 **What is agreed is one batch.** Answers the two agreed on, that name a parent and whose passages are in the texts, go into the batches "Place issues under a User Story" and "Choose primary Epics" under Changes to approve, beside what the scorer is sure of. A batch opens with its sample; more wrong in the sample than 5% allows withdraws it; an approved batch can be undone for thirty days. Nothing is applied without you: that waits for a measurement that shows 5%, and the sample you judge is that measurement.
 
-**Not built of J1:** the comparison by a stronger model where the scorer disagrees, and the judge for the Epics a User Story is also linked to, whose answers judge several links at once.
+**J1 completed (26 November 2026).** The two parts first left open are built.
+
+- **A judge for the Epics a User Story is also linked to.** An answer of that check judges several links at once, so the two are compared link by link: the judge's word on each link is kept, and the two agree when they say the same of every one. A link is proposed for taking off only where the judge, asked unseen, calls it unrelated too; a link the two differ on is shown as in doubt with what the judge said, and is not proposed.
+- **A third model for what stays in doubt** (decision 5). Settings can name one, which can be a stronger model: it is asked the same question, unseen, only about answers the two did not agree on and answers that could not tell. It decides nothing. The answer stays in doubt and says whether the third went with the answer, with the judge, or with neither, so that what reaches you comes with a third reading. It has its own sum in dollars a month, $1 unless changed, and is not asked once that is used. It replaces "a comparison where the scorer disagrees" of the first plan: the comparison measured no better than a second answer, and a third reading needs no new question.
+
+**Not measured:** how often the side the third model takes is right. Until it is, its word orders and informs what you see and puts nothing into a batch.
 
 ## What sending an answer back does (26 November 2026)
 

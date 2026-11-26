@@ -921,6 +921,12 @@ class ChoiceRun(UUIDPrimaryKey, Timestamps, Base):
     judge_asked: Mapped[int] = mapped_column(Integer, default=0)
     agreed: Mapped[int] = mapped_column(Integer, default=0)
     judge_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    # A third model, asked about what the two did not agree on (migration 0090): how
+    # many answers it was asked for, and what asking it cost.
+    third_provider: Mapped[str | None] = mapped_column(String(32))
+    third_model: Mapped[str | None] = mapped_column(String(200))
+    third_asked: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    third_cost: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
 
 
 class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
@@ -1268,6 +1274,9 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     answer_model: Mapped[str | None] = mapped_column(String(200))
     judge_provider: Mapped[str | None] = mapped_column(String(32))
     judge_model: Mapped[str | None] = mapped_column(String(200))
+    # The model asked where the two differ (migration 0090); none for no third model.
+    doubt_provider: Mapped[str | None] = mapped_column(String(32))
+    doubt_model: Mapped[str | None] = mapped_column(String(200))
     # The makers its texts may be sent to; none for the defaults.
     makers: Mapped[list[str] | None] = mapped_column(JSON)
     rounds: Mapped[int] = mapped_column(Integer, default=0)

@@ -34,6 +34,9 @@ interface Records {
     quote: string;
     model: string | null;
     stale: boolean;
+    /** With a judge: its model, and whether it said the same of every link. */
+    judge?: string | null;
+    agreed?: boolean | null;
     links: {
       epic: { id: string; title: string };
       answer: Answer;
@@ -41,6 +44,8 @@ interface Records {
       reason: string | null;
       quote: string | null;
       found: boolean;
+      /** What the judge said of this link; null where none was asked. */
+      second?: Answer | null;
     }[];
   }[];
   total: number;
@@ -52,6 +57,12 @@ const TONE: Record<Answer, 'success' | 'warning' | 'neutral'> = {
   part: 'success',
   unrelated: 'warning',
   unclear: 'neutral',
+};
+/** What a second model said of a link, in a sentence. */
+const SECOND: Record<Answer, string> = {
+  part: 'the Story is part of the Epic',
+  unrelated: 'it has nothing to do with the Epic',
+  unclear: 'it cannot tell',
 };
 const SHOW: [Answer | '', string][] = [
   ['unrelated', 'Nothing to do with it'],
@@ -233,6 +244,16 @@ export function EpicLinks({ project }: { project: string }) {
                                   Its quote is not in the Epic&apos;s text: not proposed
                                 </Badge>
                               ) : null}
+                              {link.second && link.second === link.answer ? (
+                                <Badge tone="success" size="sm">
+                                  A second model said the same
+                                </Badge>
+                              ) : link.second ? (
+                                <Badge tone="warning" size="sm">
+                                  In doubt: a second model said {SECOND[link.second]}
+                                  {link.answer === 'unrelated' ? ', so it is not proposed' : ''}
+                                </Badge>
+                              ) : null}
                             </div>
                             {link.reason ? <p className="text-muted-foreground">{link.reason}</p> : null}
                             {link.quote && link.found ? (
@@ -241,7 +262,10 @@ export function EpicLinks({ project }: { project: string }) {
                           </li>
                         ))}
                       </ul>
-                      <p className="text-xs text-muted-foreground">Answered by {story.model}.</p>
+                      <p className="text-xs text-muted-foreground">
+                        Answered by {story.model}
+                        {story.judge ? `; ${story.judge} judged the same links without seeing the answers` : ''}.
+                      </p>
                     </li>
                   ))}
                 </ul>

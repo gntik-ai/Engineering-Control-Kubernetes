@@ -259,16 +259,23 @@ def agreeing(spec: Any, mine: dict[str, Any], theirs: dict[str, Any]) -> bool:
 
 
 def _answer(review: ChoiceReview) -> dict[str, Any]:
-    return {"answer": review.answer, "parent_id": review.parent_id}
+    return {
+        "answer": review.answer,
+        "parent_id": review.parent_id,
+        "evidence": review.evidence or [],
+    }
 
 
 def _answer_of(said: dict[str, Any]) -> dict[str, Any]:
-    return {"answer": said.get("answer"), "parent_id": said.get("parent_id")}
+    return {**said, "answer": said.get("answer"), "parent_id": said.get("parent_id")}
 
 
-def _said(read: dict[str, Any], reply: Reply, tokens: int | None) -> dict[str, Any]:
-    """What a judge answered, as it is kept beside the answer."""
+def _said(spec: Any, read: dict[str, Any], reply: Reply, tokens: int | None) -> dict[str, Any]:
+    """What a judge answered, as it is kept beside the answer. A kind whose answers say
+    more than one thing keeps that too."""
+    kept = getattr(spec, "kept", None)
     return {
+        **(kept(read) if kept is not None else {}),
         "answer": read["answer"],
         "parent_id": str(read["parent_id"]) if read["parent_id"] else None,
         "reason": read["reason"],
@@ -277,6 +284,33 @@ def _said(read: dict[str, Any], reply: Reply, tokens: int | None) -> dict[str, A
         "model": reply.model,
         "tokens": tokens,
     }
+
+
+def third_left(db: Session, project: UUID) -> float:
+    """What the third model may still cost this month, in US dollars: what the project's
+    settings give it, less what the runs begun this month spent on it."""
+    month = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    spent = sum(
+        float(cost or 0.0)
+        for (cost,) in db.execute(
+            select(ChoiceRun.third_cost).where(
+                ChoiceRun.project_id == project, ChoiceRun.created_at >= month
+            )
+        )
+    )
+    return review_settings.number(db, project, "doubt_dollars") - spent
+
+
+def _to_third(db: Session, run: ChoiceRun, review: ChoiceReview) -> bool:
+    """Whether what stays in doubt goes to the run's third model first: there is one,
+    it was not asked about this record yet, and its dollars are not used up."""
+    if not run.third_model or (review.judge or {}).get("third") is not None:
+        return False
+    if third_left(db, run.project_id) <= 0:
+        return False
+    review.phase = "third"
+    _TROUBLE.pop(run.id, None)
+    return True
 
 
 def _sent_back(review: ChoiceReview, listed: list[dict[str, Any]]) -> str:
@@ -444,8 +478,14 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
         }
         if run.first_model
         else None,
-        "cost": round((run.cost or 0.0) + (run.first_cost or 0.0) + (run.judge_cost or 0.0), 6)
-        if run.priced or run.first_cost or run.judge_cost
+        "cost": round(
+            (run.cost or 0.0)
+            + (run.first_cost or 0.0)
+            + (run.judge_cost or 0.0)
+            + (run.third_cost or 0.0),
+            6,
+        )
+        if run.priced or run.first_cost or run.judge_cost or run.third_cost
         else None,
         "alone": round(run.cost / run.priced * run.done, 6)
         if run.first_model and run.priced and run.done
@@ -461,6 +501,15 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
             "cost": round(run.judge_cost or 0.0, 6),
         }
         if run.judge_model
+        else None,
+        # A third model, asked about what the two did not agree on.
+        "third": {
+            "provider": run.third_provider,
+            "model": run.third_model,
+            "asked": run.third_asked,
+            "cost": round(run.third_cost or 0.0, 6),
+        }
+        if run.third_model
         else None,
         "started_at": run.created_at.isoformat(),
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
@@ -581,12 +630,17 @@ def planned(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         return role if role and {"provider": role[0], "model": role[1]} in offered else None
 
     answer = usable(mine.answer)
-    judge = first = None
+    judge = first = third = None
     if answer is not None:
         if getattr(spec, "judged", False):
             judge = usable(mine.judge)
             if judge is not None and family_of(*judge) == family_of(*answer):
                 judge = None
+        if judge is not None:
+            # Asked only where the two differ: another model than both.
+            third = usable(mine.doubt)
+            if third in (answer, judge):
+                third = None
         if judge is None and mine.cheaper_first and getattr(spec, "two_models", False):
             found = suggested_first(db, project, kind)
             named = (found["provider"], found["model"]) if found else None
@@ -600,6 +654,7 @@ def planned(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         "answer": shown(answer),
         "judge": shown(judge),
         "first": shown(first),
+        "third": shown(third),
         "tokens": mine.count("run_tokens"),
         "rounds": mine.rounds,
     }
@@ -698,6 +753,7 @@ def start(
     first: tuple[str, str] | None = None,
     dollars: float | None = None,
     judge: tuple[str, str] | None = None,
+    third: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Begin a run over the records that wait and have no answer yet, or over all of them
     when asked to ask ``again``. ``only`` narrows them: it is given each record and its
@@ -725,6 +781,9 @@ def start(
                 judge = (
                     (plan["judge"]["provider"], plan["judge"]["model"]) if plan["judge"] else None
                 )
+                third = (
+                    (plan["third"]["provider"], plan["third"]["model"]) if plan["third"] else None
+                )
         if token_cap is None:
             token_cap = review_settings.of(db, project.id).count("run_tokens")
         choices = review_flows.model_choices(db)
@@ -734,7 +793,7 @@ def start(
         if {"provider": provider, "model": model} not in choices:
             raise ProjectInvalid("Choose a model of an account that can be asked.")
         # A project's texts go only to the makers its settings allow.
-        for named in (first, judge, (provider, model)):
+        for named in (first, judge, third, (provider, model)):
             if named is not None and not review_settings.permits(db, project.id, *named):
                 raise ProjectInvalid(
                     f"This project's texts are not sent to {maker(*named)}. Allow the maker "
@@ -757,6 +816,17 @@ def start(
             if family_of(*judge) == family_of(provider, model):
                 raise ProjectInvalid(
                     "The judge is of the family that answers. Choose a model of another maker."
+                )
+        if third is not None:
+            if judge is None:
+                raise ProjectInvalid("A third model is asked only where a judge differs.")
+            if {"provider": third[0], "model": third[1]} not in choices or third in (
+                judge,
+                (provider, model),
+            ):
+                raise ProjectInvalid(
+                    "The third model has to be one that can be asked, and another than the "
+                    "model that answers and the judge."
                 )
         if db.scalar(
             select(ChoiceRun.id).where(
@@ -784,6 +854,8 @@ def start(
             dollar_cap=dollars if free else None,
             judge_provider=judge[0] if judge else None,
             judge_model=judge[1] if judge else None,
+            third_provider=third[0] if third else None,
+            third_model=third[1] if third else None,
         )
         db.add(run)
         db.flush()
@@ -969,6 +1041,10 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             # The judge is asked the same question and is not shown the answer.
             first = False
             asker = ChoiceRun(provider=run.judge_provider or "", model=run.judge_model or "")
+        if phase == "third":
+            # So is the third model, about what the two did not agree on.
+            first = False
+            asker = ChoiceRun(provider=run.third_provider or "", model=run.third_model or "")
         asked = scope.question(asker, child, listed)
         # The makers may have changed since the run began.
         named = asked.choices[0]
@@ -1051,6 +1127,8 @@ def _settle(
                 run.project_id,
                 run.judge_model
                 if call.phase == "judge"
+                else run.third_model
+                if call.phase == "third"
                 else run.first_model
                 if call.first
                 else run.model,
@@ -1063,6 +1141,9 @@ def _settle(
             if call.phase == "judge":
                 run.judge_asked += 1
                 run.judge_cost += float(cost) if isinstance(cost, int | float) else 0.0
+            elif call.phase == "third":
+                run.third_asked += 1
+                run.third_cost += float(cost) if isinstance(cost, int | float) else 0.0
             elif call.first:
                 run.first_asked += 1
                 run.first_spent += tokens or 0
@@ -1101,15 +1182,31 @@ def _settle(
                     _TROUBLE.pop(run.id, None)
                     return
                 run.first_done += 1 if call.first else 0
+                if call.phase == "third":
+                    # It decides nothing: the answer stays in doubt, and says with which
+                    # of the two the third reader went, if with either.
+                    said = _said(spec, read, reply, tokens)
+                    earlier = review.judge or {}
+                    said["sides"] = (
+                        "answer"
+                        if agreeing(spec, _answer(review), read)
+                        else "judge"
+                        if earlier.get("answer") is not None
+                        and agreeing(spec, _answer_of(earlier), read)
+                        else "neither"
+                    )
+                    review.judge = {**earlier, "third": said}
+                    _conclude(db, spec, run, review, child, reply, False)
+                    return
                 if call.phase == "judge":
-                    review.judge = _said(read, reply, tokens)
+                    review.judge = _said(spec, read, reply, tokens)
                     if agreeing(spec, _answer(review), read):
                         _conclude(db, spec, run, review, child, reply, True)
                     elif review.rounds < review_settings.of(db, run.project_id).rounds:
                         # The two differ: the answer goes back, told what the other chose.
                         review.phase, review.rounds = "back", review.rounds + 1
                         _TROUBLE.pop(run.id, None)
-                    else:
+                    elif not _to_third(db, run, review):
                         _conclude(db, spec, run, review, child, reply, False)
                     return
                 review.detail = ""
@@ -1121,7 +1218,8 @@ def _settle(
                 review.decision, review.decided_at = "pending", None
                 if call.phase == "back":
                     same = agreeing(spec, read, _answer_of(review.judge or {}))
-                    _conclude(db, spec, run, review, child, reply, same)
+                    if same or not _to_third(db, run, review):
+                        _conclude(db, spec, run, review, child, reply, same)
                     return
                 if run.judge_model and read["answer"] != "unclear":
                     # Kept, and not counted as done until the judge has answered too.
@@ -1131,6 +1229,8 @@ def _settle(
                 if run.judge_model:
                     # An answer that cannot tell is in doubt without asking a judge.
                     review.agreed = False
+                    if _to_third(db, run, review):
+                        return
                 review.state = "answered"
                 run.done += 1
                 _TROUBLE.pop(run.id, None)
@@ -1146,6 +1246,12 @@ def _settle(
             return
         if label == "busy":
             _WAIT[run.id] = time.monotonic() + BUSY_SECONDS
+        elif review is not None and review.state == "queued" and call.phase == "third":
+            # The third model gave no answer: the record stays in doubt without it.
+            review.judge = {**(review.judge or {}), "third": {"failed": problem or "No answer."}}
+            review.state, review.phase, review.detail = "answered", "", ""
+            review.agreed = False
+            run.done += 1
         elif review is not None and review.state == "queued":
             review.state, review.detail = "failed", problem or "The model gave no answer."
             run.failed += 1

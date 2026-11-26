@@ -10,10 +10,12 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from engineering_control.dashboard import epic_links, parent_choice
 from engineering_control.db.models import (
     ChoiceReview,
     ModelTrialLine,
     PlanningLink,
+    ProjectRecord,
     ProjectReviewBudget,
     ProviderAccount,
 )
@@ -353,5 +355,55 @@ def test_a_model_whose_trial_agreed_is_the_first_model_by_default(
             ),
         )
         assert client.get(BASE + "epic-links").json()["check"]["first"] is None
+    finally:
+        client.close()
+
+
+def test_a_judge_of_epic_links_is_compared_link_by_link(tmp_path: Path, monkeypatch: Any) -> None:
+    # In this test each model is a family of its own.
+    monkeypatch.setattr(parent_choice, "family_of", lambda provider, model: model)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        two_stories_to_judge(repo)
+        judge = {"judge_provider": "fixture", "judge_model": "cheaper"}
+        assert post(client, "epic-links/runs", **START, **judge).status_code == 200
+        gone = {
+            "Operations": ("unrelated", "Operate the runtime."),
+            "Audit trail": ("unrelated", "Durable audit entries of executions."),
+        }
+        run(
+            repo,
+            Two(
+                {
+                    # Both say the same of both links of the first Story.
+                    ("analysis", AUDIT): {"Billing": BILLING, "Operations": PART},
+                    ("cheaper", AUDIT): {"Billing": BILLING, "Operations": PART},
+                    # Of the second Story's link the judge says otherwise.
+                    ("analysis", FAILURES): gone,
+                    ("cheaper", FAILURES): BOTH_PART,
+                }
+            ),
+        )
+        shown = client.get(BASE + "epic-links").json()
+        ran = shown["check"]["run"]
+        assert (ran["state"], ran["done"]) == ("complete", 2)
+        assert (ran["judge"]["asked"], ran["judge"]["agreed"]) == (2, 1)
+        # Two links were found unrelated; only the one the judge calls unrelated too
+        # is proposed.
+        assert shown["answers"]["unrelated"] == 2 and shown["ready"] == 1
+        records = client.get(BASE + "epic-links/records").json()["items"]
+        by = {row["title"]: row for row in records}
+        assert by[AUDIT]["agreed"] is True and by[AUDIT]["judge"] == "cheaper"
+        assert {link["epic"]["title"]: link["second"] for link in by[AUDIT]["links"]} == {
+            "Billing": "unrelated",
+            "Operations": "part",
+        }
+        assert by[FAILURES]["agreed"] is False
+        (doubted,) = by[FAILURES]["links"]
+        assert (doubted["answer"], doubted["second"]) == ("unrelated", "part")
+        with repo.sessions() as db:
+            project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+            (line,) = epic_links.ready(db, project)
+            assert "said the same" in line.detail["why"]
     finally:
         client.close()

@@ -25,6 +25,8 @@ export interface Run {
   alone?: number | null;
   /** A judge: a model of another maker that answered the same questions unseen. */
   judge?: { provider: string; model: string; asked: number; agreed: number; cost: number } | null;
+  /** A third model, asked about what the two did not agree on. */
+  third?: { provider: string; model: string; asked: number; cost: number } | null;
 }
 /** The model a check asks first by default: the one whose trial on the check agreed. */
 export interface FirstModel {
@@ -61,7 +63,20 @@ export interface Review {
   stale: boolean;
   /** With a judge: whether its own answer was the same. False is in doubt; null, no judge was asked. */
   agreed?: boolean | null;
-  judge?: { answer: string; parent_id: string | null; reason: string | null; model: string } | null;
+  judge?: {
+    answer?: string;
+    parent_id?: string | null;
+    reason?: string | null;
+    model?: string;
+    /** What a third model said, asked the same where the two differed, and whose side it took. */
+    third?: {
+      answer?: string;
+      reason?: string | null;
+      model?: string;
+      sides?: 'answer' | 'judge' | 'neither';
+      failed?: string;
+    } | null;
+  } | null;
   rounds?: number;
 }
 
@@ -99,6 +114,8 @@ export interface RunPlan {
   judge: Model | null;
   /** A cheaper model asked first: the one whose trial on the check agreed. */
   first: Model | null;
+  /** A third model, asked only about what the two did not agree on. */
+  third?: Model | null;
   /** The tokens the run stops at. */
   tokens: number;
   /** How often an answer goes back when the judge says otherwise. */
@@ -227,6 +244,7 @@ export function RunPanel({
             <p className="text-muted-foreground">
               {run.judge.model} answered {whole(run.judge.asked)} of them again without seeing the answer: the two
               agreed on {whole(run.judge.agreed)}. What they did not agree on is in doubt.
+              {run.third ? ` ${run.third.model} was asked about ${whole(run.third.asked)} of those.` : ''}
               {run.cost !== null && run.cost !== undefined ? ` The run cost ${dollars(run.cost)}.` : ''}
             </p>
           ) : null}
@@ -318,6 +336,9 @@ export function RunPanel({
               : plan.first
                 ? `${plan.first.model} is asked first, because its trial on this check agreed; what it does not settle goes to ${plan.answer.model}. `
                 : 'No judge is asked. '}
+            {plan.judge && plan.third
+              ? `${plan.third.model} is then asked about what stays in doubt, and you are shown which of the two it sides with. `
+              : ''}
             The run stops at {whole(plan.tokens)} tokens.{' '}
             <span className="text-muted-foreground">Set under {inSettings}.</span>
           </p>
@@ -415,7 +436,7 @@ export function ReviewAnswer({
           </Badge>
         ) : null}
       </div>
-      {review.agreed === false && review.judge ? (
+      {review.agreed === false && review.judge?.model ? (
         <p className="text-foreground">
           {review.judge.model}, asked the same without seeing this answer, said otherwise
           {review.judge.reason ? `: ${review.judge.reason}` : '.'}
@@ -423,6 +444,19 @@ export function ReviewAnswer({
         </p>
       ) : review.agreed === false ? (
         <p className="text-foreground">The answer could not tell, so no second model was asked.</p>
+      ) : null}
+      {review.agreed === false && review.judge?.third ? (
+        <p className="text-foreground">
+          {review.judge.third.failed
+            ? 'A third model was asked and gave no usable answer.'
+            : `${review.judge.third.model ?? 'A third model'}, asked the same, ${
+                review.judge.third.sides === 'answer'
+                  ? 'said the same as this answer'
+                  : review.judge.third.sides === 'judge'
+                    ? 'said the same as the second model'
+                    : 'said something else again'
+              }${review.judge.third.reason ? `: ${review.judge.third.reason}` : '.'}`}
+        </p>
       ) : null}
       {review.reason ? <p className="text-foreground">{review.reason}</p> : null}
       {review.evidence.map((passage, index) => (

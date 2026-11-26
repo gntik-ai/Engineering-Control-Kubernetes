@@ -143,6 +143,14 @@ NUMBERS: Final[dict[str, Number]] = {
     "judge_sample": Number(
         60, 10, 200, "pairs", "Right pairs, and as many wrong ones, a measurement of a judge asks."
     ),
+    "doubt_dollars": Number(
+        1,
+        0,
+        100,
+        "$",
+        "What the third model, asked where two differ, may cost a month.",
+        whole=False,
+    ),
     "measure_dollars": Number(
         3,
         0,
@@ -163,6 +171,8 @@ class Settings:
     # None: the default makers.
     makers: frozenset[str] | None
     rounds: int
+    # The model asked about what the two did not agree on; none for no third model.
+    doubt: tuple[str, str] | None = None
     # Where there is no judge: whether the model whose trial on a check agreed is asked
     # before the model that answers.
     cheaper_first: bool = True
@@ -194,6 +204,7 @@ def of(db: Session, project: UUID) -> Settings:
         (row.judge_provider or "", row.judge_model) if row.judge_model else None,
         frozenset(row.makers) if row.makers is not None else None,
         row.rounds,
+        (row.doubt_provider or "", row.doubt_model) if row.doubt_model else None,
         row.cheaper_first,
         dict(row.numbers or {}),
     )
@@ -240,7 +251,11 @@ def roles(db: Session, project: UUID) -> dict[str, Any]:
         entry = {"provider": role[0], "model": role[1]} if role else None
         return entry if entry in offered else None
 
-    return {"answer": shown(mine.answer), "judge": shown(mine.judge)}
+    return {
+        "answer": shown(mine.answer),
+        "judge": shown(mine.judge),
+        "third": shown(mine.doubt),
+    }
 
 
 def _from(mine: Settings, now: datetime) -> datetime:
@@ -425,6 +440,7 @@ class ReviewSettingsService:
         rounds: int,
         cheaper_first: bool = True,
         numbers: Mapping[str, float] | None = None,
+        third: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Keep what the project's reviews are set to. ``numbers`` none leaves the
         numbers as they are; given, a number that is its default is not kept, so that
@@ -458,7 +474,11 @@ class ReviewSettingsService:
             row.makers = sorted(set(allowed)) if allowed is not None else None
             db.flush()
             offered = models(db, project.id)
-            for role, what in ((answer, "The model that answers"), (judge, "The judge")):
+            for role, what in (
+                (answer, "The model that answers"),
+                (judge, "The judge"),
+                (third, "The third model"),
+            ):
                 if role and {"provider": role[0], "model": role[1]} not in offered:
                     raise ProjectInvalid(
                         f"{what} has to be a model of an account that can be asked and of "
@@ -470,7 +490,13 @@ class ReviewSettingsService:
                 )
             row.dollar_limit = dollars
             row.answer_provider, row.answer_model = answer or (None, None)
+            if third is not None and (judge is None or third in (answer, judge)):
+                raise ProjectInvalid(
+                    "The third model is asked where the judge differs: it needs a judge, and "
+                    "has to be another model than the one that answers and the judge."
+                )
             row.judge_provider, row.judge_model = judge or (None, None)
+            row.doubt_provider, row.doubt_model = third or (None, None)
             row.rounds = rounds
             row.cheaper_first = cheaper_first
             if own is not None:

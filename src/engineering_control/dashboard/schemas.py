@@ -570,6 +570,15 @@ class ReviewSettingsInput(PlainChangeInput):
 
     # Where there is no judge: the model whose trial on a check agreed is asked first.
     cheaper_first: bool = True
+    # The model asked about what the two did not agree on; empty for none.
+    third_provider: str = Field(default="", max_length=32)
+    third_model: str = Field(default="", max_length=200)
+
+    def third(self) -> tuple[str, str] | None:
+        if not self.third_provider and not self.third_model:
+            return None
+        return (self.third_provider, self.third_model)
+
     # The numbers the reviews work to, by their key; none leaves them as they are.
     numbers: dict[str, float] | None = Field(default=None, max_length=40)
 

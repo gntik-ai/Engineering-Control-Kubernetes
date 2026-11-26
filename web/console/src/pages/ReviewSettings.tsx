@@ -7,7 +7,7 @@ import { TokenBudget } from './PlanningReviews';
 
 interface Settings {
   dollars: { limit: number; spent: number; since: string; over: boolean };
-  roles: { answer: Model | null; judge: Model | null };
+  roles: { answer: Model | null; judge: Model | null; third?: Model | null };
   rounds: number;
   makers: { maker: string; models: number; allowed: boolean; by_default: boolean; at_your_word: boolean }[];
   own_makers: boolean;
@@ -63,6 +63,7 @@ export function ReviewSettings({ project }: { project: string }) {
   const [limit, setLimit] = useState('');
   const [answer, setAnswer] = useState('');
   const [judge, setJudge] = useState('');
+  const [third, setThird] = useState('');
   const [rounds, setRounds] = useState('0');
   const [allowed, setAllowed] = useState<Record<string, boolean>>({});
   const [planner, setPlanner] = useState('');
@@ -77,6 +78,7 @@ export function ReviewSettings({ project }: { project: string }) {
     setLimit(String(data.dollars.limit));
     setAnswer(keyOf(data.roles.answer));
     setJudge(keyOf(data.roles.judge));
+    setThird(keyOf(data.roles.third ?? null));
     setRounds(String(data.rounds));
     setAllowed(Object.fromEntries(data.makers.map((entry) => [entry.maker, entry.allowed])));
     setCheaper(data.cheaper_first);
@@ -99,6 +101,7 @@ export function ReviewSettings({ project }: { project: string }) {
     if (!data) return;
     const [answerProvider, answerModel] = pick(answer);
     const [judgeProvider, judgeModel] = pick(judge);
+    const [thirdProvider, thirdModel] = pick(judge ? third : '');
     const makers = data.makers.filter((entry) => allowed[entry.maker]).map((entry) => entry.maker);
     const asDefault = data.makers.every((entry) => Boolean(allowed[entry.maker]) === entry.by_default);
     act(
@@ -110,6 +113,8 @@ export function ReviewSettings({ project }: { project: string }) {
           answer_model: answerModel,
           judge_provider: judgeProvider,
           judge_model: judgeModel,
+          third_provider: thirdProvider,
+          third_model: thirdModel,
           // The defaults follow the accounts; a list of the project's own stays as it is.
           makers: asDefault ? null : makers,
           rounds: Number(rounds),
@@ -291,7 +296,9 @@ export function ReviewSettings({ project }: { project: string }) {
                 A run of a check takes these: it is started from its worklist without choosing anything. The judge is
                 asked the same question without seeing the answer and has to be of another maker than the model that
                 answers. Review evidence asks the model that answers too. Models that write code only are not offered:
-                they are never asked in a review.
+                they are never asked in a review. A third model, which can be a stronger one, is asked only about what
+                the two did not agree on: it decides nothing, and you are shown which of the two it sides with. What it
+                may cost a month is among the numbers below.
               </p>
               <div className="flex flex-wrap items-end gap-3">
                 <label className="grid gap-1 text-sm">
@@ -310,6 +317,19 @@ export function ReviewSettings({ project }: { project: string }) {
                     value={judge || 'none'}
                     items={[{ value: 'none', label: 'No judge' }, ...models]}
                     onValueChange={(value) => setJudge(value === 'none' ? '' : String(value ?? ''))}
+                  />
+                </label>
+                <label className="grid gap-1 text-sm">
+                  A third model, for what stays in doubt
+                  <SimpleSelect
+                    aria-label="Third model, asked where the two differ"
+                    value={(judge && third) || 'none'}
+                    disabled={!judge}
+                    items={[
+                      { value: 'none', label: judge ? 'None: it goes to you as it is' : 'Needs a judge' },
+                      ...models.filter((entry) => entry.value !== answer && entry.value !== judge),
+                    ]}
+                    onValueChange={(value) => setThird(value === 'none' ? '' : String(value ?? ''))}
                   />
                 </label>
                 <label className="grid gap-1 text-sm">

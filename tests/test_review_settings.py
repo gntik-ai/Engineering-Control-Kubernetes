@@ -56,7 +56,7 @@ def test_settings_give_runs_their_models_makers_and_rounds(
         shown = client.get(BASE + "review-settings").json()
         assert shown["dollars"]["limit"] == 3.0 and shown["dollars"]["spent"] == 0
         assert not shown["dollars"]["over"] and shown["rounds"] == 0
-        assert shown["roles"] == {"answer": None, "judge": None}
+        assert shown["roles"] == {"answer": None, "judge": None, "third": None}
         fixture = next(entry for entry in shown["makers"] if entry["maker"] == "fixture")
         # The maker of the test account is among the defaults in every test.
         assert fixture["allowed"] and fixture["by_default"] and fixture["models"] == 2
@@ -78,6 +78,7 @@ def test_settings_give_runs_their_models_makers_and_rounds(
         roles = {
             "answer": {"provider": "fixture", "model": "analysis"},
             "judge": {"provider": "fixture", "model": "other"},
+            "third": None,
         }
         assert saved.json()["roles"] == roles and saved.json()["rounds"] == 2
         assert post(client, "review-settings", **{**save, "rounds": 0}).status_code == 200
@@ -301,5 +302,88 @@ def test_no_review_asks_a_model_of_a_maker_the_project_does_not_allow(
                 )
             )
         assert held.value.label == "configuration" and "not sent to fixture" in str(held.value)
+    finally:
+        client.close()
+
+
+def test_a_third_model_is_asked_about_what_stays_in_doubt_within_its_dollars(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        ready(repo, monkeypatch)
+        priced(repo, ["analysis", "other", "strong"])
+        save = {
+            "dollar_limit": 5,
+            "answer_provider": "fixture",
+            "answer_model": "analysis",
+            "judge_provider": "fixture",
+            "judge_model": "other",
+            "makers": ["fixture"],
+            "rounds": 0,
+        }
+        third = {"third_provider": "fixture", "third_model": "strong"}
+        # It needs a judge, and is another model than the two.
+        alone = {**save, "judge_provider": "", "judge_model": ""}
+        assert post(client, "review-settings", **alone, **third).status_code == 422
+        same = post(
+            client, "review-settings", **save, third_provider="fixture", third_model="other"
+        )
+        assert same.status_code == 422
+        saved = post(client, "review-settings", **save, **third)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["roles"]["third"] == {"provider": "fixture", "model": "strong"}
+        plan = client.get(BASE + "orphans").json()["plan"]
+        assert plan["third"] == {"provider": "fixture", "model": "strong"}
+
+        assert post(client, "orphans/runs").status_code == 200
+        readers = Readers(
+            {
+                ("analysis", 41): [AUDIT],
+                ("other", 41): [AUDIT],
+                # The two differ: the third model is asked, and goes with the judge.
+                ("analysis", 42): [AUDIT],
+                ("other", 42): [FAILURES],
+                ("strong", 42): [FAILURES],
+                # An answer that cannot tell: no judge is asked, the third model is,
+                # and cannot tell either.
+                ("analysis", 45): ["unclear"],
+                ("strong", 45): ["unclear"],
+            }
+        )
+        run(repo, readers)
+        shown = client.get(BASE + "orphans").json()
+        assert (shown["run"]["state"], shown["run"]["done"]) == ("complete", 3)
+        assert shown["run"]["third"] == {
+            "provider": "fixture",
+            "model": "strong",
+            "asked": 2,
+            "cost": 0.002,
+        }
+        # It decides nothing: both stay in doubt, each saying with whom the third went.
+        assert (shown["counts"]["agreed"], shown["counts"]["doubt"]) == (1, 2)
+        listed = client.get(BASE + "orphans", params={"show": "doubt"}).json()["items"]
+        sides = {item["number"]: item["review"]["judge"]["third"]["sides"] for item in listed}
+        assert sides == {42: "judge", 45: "answer"}
+        assert all(item["review"]["judge"]["third"]["model"] == "strong" for item in listed)
+
+        # Its dollars are its own: with none left it is not asked, and nothing else changes.
+        numbers = {"doubt_dollars": 0}
+        assert post(client, "review-settings", **save, **third, numbers=numbers).status_code == 200
+        assert post(client, "orphans/runs", again=True).status_code == 200
+        again = Readers(
+            {
+                ("analysis", 41): [AUDIT],
+                ("other", 41): [AUDIT],
+                ("analysis", 42): [AUDIT],
+                ("other", 42): [FAILURES],
+                ("analysis", 45): ["unclear"],
+            }
+        )
+        run(repo, again)
+        shown = client.get(BASE + "orphans").json()
+        assert shown["run"]["third"]["asked"] == 0
+        assert (shown["counts"]["agreed"], shown["counts"]["doubt"]) == (1, 2)
+        assert not [call for call in again.calls if call[0] == "strong"]
     finally:
         client.close()
