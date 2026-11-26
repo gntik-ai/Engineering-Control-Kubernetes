@@ -61,6 +61,7 @@ interface AnswerRun {
   chose: number;
   right: number;
   wrong: number;
+  wrong_in_list: number;
   none: number;
   unclear: number;
   kept: number;
@@ -68,10 +69,11 @@ interface AnswerRun {
   cost_each: number | null;
 }
 interface Agreement {
-  models: [string, string];
+  models: string[];
   issues: number;
   same: number;
   same_right: number;
+  same_wrong_in_list: number;
   kept: number;
   kept_right: number;
   cost_each: number | null;
@@ -419,7 +421,10 @@ export function JudgeTrials({ project }: { project: string }) {
                           <td className="py-2 pe-3 text-end tabular-nums">{whole(entry.chose)}</td>
                           <td className="py-2 pe-3 text-end tabular-nums">
                             {of(entry.right, entry.chose)}
-                            <div className="text-xs text-muted-foreground">{wrongShare(entry.right, entry.chose)}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {wrongShare(entry.right, entry.chose)}
+                              {entry.wrong ? `, ${whole(entry.wrong_in_list)} with the right one shown` : ''}
+                            </div>
                           </td>
                           <td className="py-2 pe-3 text-end tabular-nums">
                             {of(entry.kept_right, entry.kept)}
@@ -457,6 +462,9 @@ export function JudgeTrials({ project }: { project: string }) {
                             {of(pair.same_right, pair.same)}
                             <div className="text-xs text-muted-foreground">
                               {wrongShare(pair.same_right, pair.same)}
+                              {pair.same - pair.same_right
+                                ? `, ${whole(pair.same_wrong_in_list)} with the right one shown`
+                                : ''}
                             </div>
                           </td>
                           <td className="py-2 pe-3 text-end tabular-nums">

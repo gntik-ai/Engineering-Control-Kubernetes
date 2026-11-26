@@ -258,6 +258,8 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
         assert (right_run["answers"], right_run["in_list"], right_run["right"]) == (1, 1, 1)
         assert (right_run["kept"], right_run["kept_right"], right_run["cost_each"]) == (1, 1, 0.001)
         assert (wrong_run["chose"], wrong_run["right"], wrong_run["wrong"]) == (1, 0, 1)
+        # The right Story was among its candidates: the error is the model's.
+        assert wrong_run["wrong_in_list"] == 1
         # They do not agree, so nothing would pass as agreed.
         (pair,) = shown["agreements"]
         assert sorted(pair["models"]) == ["analysis", "other"]

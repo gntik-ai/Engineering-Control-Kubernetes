@@ -656,6 +656,11 @@ def _answers_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, An
         "chose": len(chose),
         "right": len(right),
         "wrong": len(chose) - len(right),
+        # Wrong although the right Story was among the candidates: an error of the
+        # model, not of the candidates it was given.
+        "wrong_in_list": sum(
+            1 for line in chose if not _detail(line).get("right") and _detail(line).get("in_list")
+        ),
         "none": sum(1 for line in lines if line.answer in ("none", "bug")),
         "unclear": sum(1 for line in lines if line.answer == "unclear"),
         # What a run would keep from it: a clear answer whose quotes are in the texts.
@@ -703,12 +708,44 @@ def _agreements(
                     "issues": len(both),
                     "same": len(same),
                     "same_right": sum(1 for a, _b in same if _detail(a).get("right")),
+                    "same_wrong_in_list": sum(
+                        1
+                        for a, _b in same
+                        if not _detail(a).get("right") and _detail(a).get("in_list")
+                    ),
                     # Both also clear and with their quotes in the texts.
                     "kept": len(kept),
                     "kept_right": sum(1 for a, _b in kept if _detail(a).get("right")),
                     "cost_each": round(sum(costs) / len(costs), 6) if costs else None,
                 }
             )
+    # Every model at once, when there are three or more of different families.
+    families = {family_of(*model) for model in models}
+    if len(models) >= 3 and len(families) == len(models):
+        by_model = [{line.child_id: line for line in lines[latest[model].id]} for model in models]
+        shared = [key for key in by_model[0] if all(key in mine for mine in by_model[1:])]
+        every = [
+            by_model[0][key]
+            for key in shared
+            if all(mine[key].answer == "story" for mine in by_model)
+            and len({_detail(mine[key]).get("parent_id") for mine in by_model}) == 1
+        ]
+        found.append(
+            {
+                "models": [model[1] for model in models],
+                "issues": len(shared),
+                "same": len(every),
+                "same_right": sum(1 for line in every if _detail(line).get("right")),
+                "same_wrong_in_list": sum(
+                    1
+                    for line in every
+                    if not _detail(line).get("right") and _detail(line).get("in_list")
+                ),
+                "kept": 0,
+                "kept_right": 0,
+                "cost_each": None,
+            }
+        )
     return found
 
 
