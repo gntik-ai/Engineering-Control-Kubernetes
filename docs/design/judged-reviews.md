@@ -216,6 +216,40 @@ Order with the rest of the roadmap: J0 to J3, then B3 of the Bugs section, then 
 
 A measurement changes nothing in the plan.
 
+## What J0 measured (26 November 2026)
+
+On Falcone, an issue and a User Story: 60 right pairs and 19 wrong ones, the same for every judge. All 60 right pairs and 18 of the 19 wrong ones are your own links and judgments; one is presumed. The wrong pairs are hard ones: you were shown them because they looked plausible.
+
+| Judge | Maker | Wrong pairs let through | Right pairs refused | Could not tell | Cost of a verdict |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Gemini Decision 1 | Google | 14 of 19 | 3 of 60 | 1 | $0.00011 |
+| Jev 1.14 | TypeSafe | 13 of 19 | 1 of 60 | 4 | $0.00006 |
+| D1.2 Ultra | Liquid | 13 of 19 | 6 of 60 | 1 | $0.00004 |
+| GPT-6 Luna, decisions | OpenAI | 14 of 19 | 3 of 60 | 5 | $0.00012 |
+| Decisions Fast | Parallel | 10 of 19 | 2 of 60 | 7 | $0.0010 |
+| Claude Haiku 5.5 | Anthropic | 13 of 19 | 3 of 60 | 5 | $0.00028 |
+| Gemini 3.1 Flash Lite | Google | 15 of 19 | 6 of 60 | 0 | $0.00038 |
+| Gemini 3.8 Flash | Google | 8 of 19 | 7 of 60 | 2 | $0.0026 |
+| Claude Sonnet 5.5, as a reference | Anthropic | 3 of 5 | 0 of 17 | 0 | $0.0045 |
+
+The reference was stopped at 22 of 79 pairs when OpenRouter asked for a pause. All of it cost $0.46.
+
+**A stricter threshold does not rescue it.** A decision model gives a probability. Asked to be 95% sure, the five decision models let 2 or 3 of the 19 wrong pairs through and no longer pass 22 to 28 of the 60 right ones.
+
+**What this says.**
+
+- No judge asked "is this pair right?" comes near the 5% you accept. The cheapest let through two wrong pairs in three; the best, one in two and a half.
+- It is the question more than the models. A strong model lets them through as well. Asked whether an issue is work towards a Story, a model finds a contribution where you said "not this Story": the issue belongs to a neighbouring Story, and that is something the judge is not shown.
+- The cost is as hoped: a hundredth of a cent a verdict for the decision models.
+- 19 wrong pairs is few. Two of 19 could be anything from 1% to 33% over many. The direction is clear all the same.
+
+**What changes in the plan.** The judge of J1 is not asked about one pair alone. Two ways are to be measured next, on the issues whose User Story is known, before either is built into the checks:
+
+1. **A second answer.** Another family's model answers the same question from the same candidates, without seeing the first answer. They agree when they choose the same parent. Two models that do not see each other rarely choose the same wrong one.
+2. **A comparison.** The judge is shown the chosen parent beside the next best candidates and says which fits best, or none. That shows it the neighbouring Story it was missing here.
+
+What is measured for each: how often they agree, and when they agree, how often it is the parent that is known. Only a way that reaches 5% is given the right to apply without you; until one does, everything waits for you as today.
+
 **Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
 
 ## Sources
