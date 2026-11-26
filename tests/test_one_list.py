@@ -1,6 +1,7 @@
 """One list of what waits for the administrator across Reviews: each row says how many,
 what, and in which view it is decided; a project's next steps are its rows."""
 
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -160,5 +161,33 @@ def test_what_stopped_and_what_asks_is_in_the_list(tmp_path: Path, monkeypatch: 
         (only,) = listed(client, "llmwiki")["rows"]
         assert (only["key"], only["view"]) == ("discovery", "discovery")
         assert client.get("/api/dashboard/projects/unknown/needs-you").status_code == 404
+    finally:
+        client.close()
+
+
+def test_doubt_that_decides_nothing_is_listed_apart_and_is_no_step(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        ready(repo, monkeypatch)
+        # Two answers the models differ on, of every check.
+        monkeypatch.setattr(
+            needs_you.parent_choice, "standings", lambda db, project, kind: Counter(differ=2)
+        )
+        found = rows(client)
+        # An issue with no User Story and a Story with no primary Epic wait for a word.
+        for kind in ("issue_story", "story_epic"):
+            assert found["doubt:" + kind]["group"] == "decide"
+        # Elsewhere the record is left as it is: nothing waits, and the row says so.
+        links = found["doubt:epic_links"]
+        assert (links["group"], links["count"]) == ("doubt", 2)
+        assert "did not say the same of every link" in links["says"]
+        assert "stays" in links["detail"]
+        assert found["doubt:story_needed"]["group"] == "doubt"
+        assert found["doubt:epic_overview"]["group"] == "doubt"
+        assert list(found)[-1].startswith("doubt:")
+        said = [step["says"] for step in client.get(BASE + "rollout").json()["steps"]]
+        assert links["says"] not in said and found["doubt:story_epic"]["says"] in said
     finally:
         client.close()

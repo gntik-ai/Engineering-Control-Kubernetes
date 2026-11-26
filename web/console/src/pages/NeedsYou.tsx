@@ -6,7 +6,7 @@ import { LoadError } from '../parts';
 import { bugsUrl, reviewUrl, workspaceTabUrl, type ReviewView } from '../router';
 import { some, whole } from './ChoiceRun';
 
-type Group = 'decide' | 'held' | 'start';
+type Group = 'decide' | 'held' | 'start' | 'doubt';
 /** One thing that waits: how many, what, and the view and panel it is decided in. */
 export interface Step {
   view: ReviewView | 'bugs' | 'tables';
@@ -66,6 +66,13 @@ const GROUPS: { key: Group; title: string; about: string; tone: 'warning' | 'neu
     title: 'Not asked yet',
     about: 'Records no model was asked about. These checks do not start by themselves in this project.',
     tone: 'info',
+  },
+  {
+    key: 'doubt',
+    title: 'In doubt, and left as it is',
+    about:
+      'Two models did not agree, so nothing was proposed and nothing changes. These do not wait for you: they are here to be looked at.',
+    tone: 'neutral',
   },
 ];
 const WHERE: Record<Step['view'], string> = {

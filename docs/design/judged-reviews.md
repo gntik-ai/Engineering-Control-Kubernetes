@@ -503,15 +503,15 @@ Every ten minutes what is settled is then applied as a batch that can be undone 
 
 ## J6 as built
 
-**Reviews opens on "Needs you".** It is the first view of Reviews, per project. One list says everything in Reviews that waits for you, in rows: how many, what, why, and a link to the panel where it is decided. Nothing is decided in the list, and no number is counted in a way of its own: each is the one its own view shows (`needs_you.py`, `GET /api/dashboard/projects/{name}/needs-you`).
+**Reviews opens on "Needs you".** It is the first view of Reviews, per project. One list says everything in Reviews that waits for you, in rows: how many, what, why, and a link to the panel where it is decided. Nothing is decided in the list, and no number is counted in a way of its own: each is the one its own view shows, or, for what was left in doubt, counts the records its view marks as in doubt (`needs_you.py`, `GET /api/dashboard/projects/{name}/needs-you`).
 
-The rows come in three groups, in this order.
+The rows come in four groups, in this order.
 
 | Group | What is in it | Where it leads |
 | --- | --- | --- |
 | **Yours to decide** | Changes that wait for approval, one row for all kinds, each kind with its number and how far the sample of its open batch is judged | Reorganize, Changes to approve |
 | | Lines applied without you that wait to be judged | Reorganize, Changes to approve |
-| | For each of the five checks, the answers that need you. For issues with no User Story and for primary Epics these are the answers the worklist opens on, with how many stand for which reason. For the clean-up, the extra Epic links and the Epic overviews, those the two models differ on | The check's own panel |
+| | For issues with no User Story and for primary Epics: the answers that need you, which are the ones the worklist opens on, with how many stand for which reason | The check's own panel |
 | | Planning reviews that ask a question | Planning, the reviews |
 | | Proposals that wait in the planning tables, by kind, and how many of them the judge did not make | The planning tables |
 | | Verdicts of Review evidence that wait for your review | Related Work |
@@ -525,6 +525,7 @@ The rows come in three groups, in this order.
 | | Runs of Review evidence that were cut off and keep their tokens reserved | Related Work |
 | | The ranking service has not read the project's records | Reorganize |
 | **Not asked yet** | For each check that does not run by itself in the project: the records no model was asked about | The check's own panel |
+| **In doubt, and left as it is** | For the clean-up, the extra Epic links and the Epic overviews: the records the two models did not agree on. Nothing was proposed for them and nothing changes: a Story is not proposed for closing, a link stays, a sentence is marked on the Epic's page. They do not wait for you, and are no next step on the dashboard | The check's own panel |
 
 A check that is set to run by itself is not listed under "Not asked yet": it starts without you. A project that was never through Discovery has one row, which says so.
 
@@ -549,3 +550,5 @@ A check that is set to run by itself is not listed under "Not asked yet": it sta
 - **The daily digest** still says what waits from the day's measurement, in its own words.
 
 **How long it takes.** The list reads every check's records and candidates, as each view does for itself. It is worked out when the view is opened and every two minutes while it is open.
+
+**Read on live (26 November 2026).** Falcone's list has six rows: 37 changes to approve (13 primary Epics, 24 Epic links to take off), 18 answers about a primary Epic that need you, 256 planning reviews queued while the reviews are stopped, 38 Epic overviews not written or out of date, and, left in doubt, 5 Stories of the clean-up and 180 Stories with extra Epic links. Its numbers are the ones the worklist and the batches show. Working it out took 3.7 seconds there, 1.2 for falcone-serverless (ten rows), and 0.2 for a project with no plan. The first reading put the answers left in doubt under "Yours to decide", which said that 180 answers about extra Epic links needed you: they do not, a link the models differ on stays. They were given their own group the same day.

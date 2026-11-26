@@ -9,6 +9,9 @@ them all and says it once, in rows of three groups:
   a question, proposals.
 - ``held``: what stopped at a limit, a pause or a failure and goes on at their word.
 - ``start``: records no model was asked about yet, where the check is started by hand.
+- ``doubt``: answers two models did not agree on where that decides nothing: the record
+  is left as it is and nothing is proposed. Not a decision that waits, and not a next
+  step: it is there to be looked at.
 
 A row says how many, what, and where it is decided: a view of Reviews and the panel in
 it. Nothing is decided here and nothing is counted in a way of its own: each number is
@@ -55,7 +58,7 @@ from engineering_control.db.models import (
     WorkspaceImport,
 )
 
-GROUPS: Final = ("decide", "held", "start")
+GROUPS: Final = ("decide", "held", "start", "doubt")
 # The all-projects table reads every project's list: a list is used again for this long
 # there. A project's own view always works it out anew.
 FRESH: Final = timedelta(minutes=5)
@@ -104,6 +107,22 @@ CHECKS: Final[dict[str, dict[str, str]]] = {
 # others, an answer needs them where the two models differ.
 WORKLISTS: Final = frozenset(reorg.ALONE.values())
 DIFFER: Final = ("differ", "unclear")
+# For those others: what the two models differ on, and what follows from it. Nothing
+# does: the record is left as it is.
+LEFT: Final = {
+    "story_needed": (
+        "the two models did not agree whether it is still needed.",
+        "None of them is proposed for closing.",
+    ),
+    "epic_links": (
+        "the two models did not say the same of every link.",
+        "A link they differ on stays, and is marked in doubt there.",
+    ),
+    "epic_overview": (
+        "the judge found a sentence the records do not support.",
+        "The sentence is marked on the Epic's page.",
+    ),
+}
 TABLES: Final = {"epics": ("Epic", "Epics"), "stories": ("User Story", "User Stories")}
 
 
@@ -217,7 +236,9 @@ def _checks(db: Session, project: ProjectRecord) -> list[dict[str, Any]]:
         found: Counter[str] = parent_choice.standings(db, project, kind)
         needs = parent_choice.NEEDS if kind in WORKLISTS else DIFFER
         doubt = sum(found[key] for key in needs)
-        if doubt:
+        if doubt and kind in WORKLISTS:
+            # An issue with no User Story, a Story with no primary Epic: it stays
+            # undecided until the administrator says.
             why = "; ".join(
                 f"{found[key]:,}: {parent_choice.SAID[key].lower()}" for key in needs if found[key]
             )
@@ -226,18 +247,26 @@ def _checks(db: Session, project: ProjectRecord) -> list[dict[str, Any]]:
                     "doubt:" + kind,
                     "decide",
                     doubt,
-                    (
-                        _some(doubt, "Epic overview has", "Epic overviews have")
-                        + " a sentence the judge found unsupported."
-                        if kind == "epic_overview"
-                        else _some(doubt, "answer", "answers")
-                        + f" about {said['about']} "
-                        + ("needs" if doubt == 1 else "need")
-                        + " you."
-                    ),
+                    _some(doubt, "answer", "answers")
+                    + f" about {said['about']} "
+                    + ("needs" if doubt == 1 else "need")
+                    + " you.",
                     said["view"],
                     said["anchor"],
-                    "" if kind == "epic_overview" else why + ".",
+                    why + ".",
+                )
+            )
+        elif doubt:
+            says, left = LEFT[kind]
+            rows.append(
+                _row(
+                    "doubt:" + kind,
+                    "doubt",
+                    doubt,
+                    _some(doubt, said["one"], said["many"]) + ": " + says,
+                    said["view"],
+                    said["anchor"],
+                    left,
                 )
             )
         run = db.scalar(
@@ -654,9 +683,11 @@ class NeedsYou:
         return found
 
     def steps(self, name: str, *, fresh: bool = True) -> list[dict[str, str]]:
-        """A project's next steps: its rows. For the table of all projects they are
-        taken as they were worked out at most a few minutes ago."""
+        """A project's next steps: its rows that wait for something. For the table of
+        all projects they are taken as they were worked out at most a few minutes ago."""
         return [
             {"view": row["view"], "says": row["says"], "anchor": row["anchor"], "tab": row["tab"]}
             for row in self.listed(name, fresh=fresh)["rows"]
+            # What was left in doubt and decides nothing is no step.
+            if row["group"] != "doubt"
         ]
