@@ -912,6 +912,14 @@ class ChoiceRun(UUIDPrimaryKey, Timestamps, Base):
     # For a run that is limited in money and not in the project's review tokens
     # (migration 0086): the US dollars it stops at.
     dollar_cap: Mapped[float | None] = mapped_column(Float)
+    # A judge (migration 0087): a model of another maker that answers the same question
+    # without seeing the first answer. How often it was asked, how many answers the two
+    # agreed on, and what asking it cost.
+    judge_provider: Mapped[str | None] = mapped_column(String(32))
+    judge_model: Mapped[str | None] = mapped_column(String(200))
+    judge_asked: Mapped[int] = mapped_column(Integer, default=0)
+    agreed: Mapped[int] = mapped_column(Integer, default=0)
+    judge_cost: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
@@ -957,6 +965,14 @@ class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The run's first model could not settle it: its own model is asked (migration 0085).
     passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # With a judge (migration 0087). ``phase`` is where the record stands while its run
+    # asks: empty for the answer, ``judge`` for the judge's own answer, ``back`` when the
+    # answer went back after the two differed. ``judge`` is what the judge said.
+    # ``agreed`` is set when both are in: true when they say the same; false is in doubt.
+    phase: Mapped[str] = mapped_column(String(8), default="")
+    judge: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    agreed: Mapped[bool | None] = mapped_column(Boolean)
+    rounds: Mapped[int] = mapped_column(Integer, default=0)
     __table_args__ = (
         UniqueConstraint("project_id", "kind", "child_id", name="uq_choice_reviews_child"),
     )

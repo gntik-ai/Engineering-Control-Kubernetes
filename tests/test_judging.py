@@ -10,7 +10,7 @@ from uuid import uuid4
 import numpy
 from sqlalchemy import select
 
-from engineering_control.dashboard import judging, orphans, review_flows
+from engineering_control.dashboard import judging, orphans, parent_choice, review_flows
 from engineering_control.db.models import (
     BacklogItem,
     ProjectReviewBudget,
@@ -300,6 +300,26 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
         run(repo, Chooser("Respond to failures", "analysis"))
         # Measurements of every sort count towards the project's sum.
         assert client.get(BASE + "judge-trials").json()["spent"] == 0.005
+
+        # The whole of it, as a run of the check does it: an answer and a judge unseen.
+        monkeypatch.setattr(parent_choice, "family_of", lambda provider, model: model)
+        judged = {**start, "judge_provider": "fixture", "judge_model": "other"}
+        assert post(client, "judge-trials/answers/runs", **judged).status_code == 200
+        run(
+            repo,
+            Readers(
+                {("analysis", 44): ["Respond to failures"], ("other", 44): ["Respond to failures"]}
+            ),
+        )
+        latest = client.get(BASE + "judge-trials").json()["answers"]["runs"][0]
+        assert latest["judged"] == {
+            "judge": "other",
+            "agreed": 1,
+            "agreed_right": 1,
+            "doubt": 0,
+            "doubt_right": 0,
+            "cost_each": 0.002,
+        }
     finally:
         client.close()
 
@@ -344,5 +364,137 @@ def test_a_story_that_means_the_same_in_other_words_is_among_the_candidates(
         ]
         # Close in meaning, so not a weak match for want of shared words.
         assert not listed[0]["weak"] and listed[0]["score"] == 0.0
+    finally:
+        client.close()
+
+
+class Readers:
+    """Two models behind one account, each choosing the User Story it is told for an
+    issue, by the issue's number; a list of titles is what it says each time it is asked."""
+
+    def __init__(self, says: dict[tuple[str, int], list[str]]) -> None:
+        self.says = {key: list(titles) for key, titles in says.items()}
+        self.calls: list[tuple[str, int, bool]] = []
+
+    async def ask(self, question: Question, *, retry: bool) -> Reply:
+        ((_provider, model),) = question.choices
+        asked = json.loads(question.prompt)
+        number = int(asked["issue"]["source"].rsplit("#", 1)[1])
+        self.calls.append((model, number, "Another reader" in question.system))
+        title = self.says[model, number].pop(0)
+        if title == "unclear":
+            said = {"answer": "unclear", "story": "", "confidence": "low", "reason": "Cannot tell."}
+        else:
+            chosen = next(story for story in asked["stories"] if story["title"] == title)
+            said = {
+                "answer": "story",
+                "story": chosen["id"],
+                "confidence": "high",
+                "reason": "It reads so.",
+                "story_quote": chosen["text"],
+            }
+        said = {
+            "issue_quote": asked["issue"]["text"],
+            "story_quote": "",
+            "missing_title": "",
+            "missing_description": "",
+            **said,
+        }
+        usage = {"tokens": 40, "cost": 0.001}
+        return Reply(said, "", "fixture", model, uuid4(), "Test", usage, 0.1, 1)
+
+
+def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # In this test each model is a family of its own.
+    monkeypatch.setattr(parent_choice, "family_of", lambda provider, model: model)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        priced(repo, ["analysis", "other"])
+        with repo.sessions.begin() as db:
+            db.add(ProjectReviewBudget(project_id=data["project"], token_limit=200_000, used=0))
+            # Three open issues with no User Story, each with words of both Stories.
+            for number in (41, 42, 43, 45):
+                item = db.scalars(
+                    select(BacklogItem).where(BacklogItem.issue_number == number)
+                ).one()
+                item.issue_state = "open"
+                item.description = "Show failed runs to the operator and keep an audit entry."
+        start = {"provider": "fixture", "model": "analysis", "token_cap": 90_000}
+        judge = {"judge_provider": "fixture", "judge_model": "other"}
+        # The judge is another model, and a run has a judge or a cheaper model first.
+        same = post(
+            client, "orphans/runs", **start, judge_provider="fixture", judge_model="analysis"
+        )
+        assert same.status_code == 422 and "another maker" in same.text
+        both = post(
+            client, "orphans/runs", **start, **judge, first_provider="fixture", first_model="other"
+        )
+        assert both.status_code == 422 and "not both" in both.text
+
+        assert post(client, "orphans/runs", **start, **judge).status_code == 200
+        audit, failures = "Audit executions", "Respond to failures"
+        readers = Readers(
+            {
+                # 41: both choose the same. 42: they differ, and the answer changes when it
+                # goes back. 43: they differ, and it stays. 45: the answer cannot tell.
+                ("analysis", 41): [audit],
+                ("other", 41): [audit],
+                ("analysis", 42): [audit, failures],
+                ("other", 42): [failures],
+                ("analysis", 43): [audit, audit],
+                ("other", 43): [failures],
+                ("analysis", 45): ["unclear"],
+            }
+        )
+        run(repo, readers)
+        assert readers.calls == [
+            ("analysis", 41, False),
+            ("other", 41, False),
+            ("analysis", 42, False),
+            ("other", 42, False),
+            # Sent back, told what the other chose; the judge is never shown an answer.
+            ("analysis", 42, True),
+            ("analysis", 43, False),
+            ("other", 43, False),
+            ("analysis", 43, True),
+            ("analysis", 45, False),
+        ]
+        listed = client.get(BASE + "orphans", params={"page_size": 50}).json()
+        done = listed["run"]
+        assert (done["state"], done["done"], done["total"], done["failed"]) == ("complete", 4, 4, 0)
+        assert done["judge"] == {
+            "provider": "fixture",
+            "model": "other",
+            "asked": 3,
+            "agreed": 2,
+            "cost": 0.003,
+        }
+        assert done["cost"] == 0.009
+        counts = listed["counts"]
+        assert (counts["waiting"], counts["agreed"], counts["doubt"]) == (4, 2, 2)
+        by_number = {row["number"]: row["review"] for row in listed["items"]}
+        assert (by_number[41]["agreed"], by_number[41]["rounds"]) == (True, 0)
+        # It changed its answer when it went back: the Story both chose in the end.
+        assert (by_number[42]["agreed"], by_number[42]["rounds"]) == (True, 1)
+        assert by_number[42]["parent"] == failures and by_number[42]["judge"]["model"] == "other"
+        assert (by_number[43]["agreed"], by_number[43]["parent"]) == (False, audit)
+        assert (by_number[45]["agreed"], by_number[45]["answer"]) == (False, "unclear")
+        # What is in doubt comes first, and can be shown alone.
+        assert [row["number"] for row in listed["items"]][:2] == [43, 45]
+        doubt = client.get(BASE + "orphans", params={"show": "doubt"}).json()
+        assert sorted(row["number"] for row in doubt["items"]) == [43, 45]
+        agreed = client.get(BASE + "orphans", params={"show": "agreed"}).json()
+        assert sorted(row["number"] for row in agreed["items"]) == [41, 42]
+
+        # What the two agreed on is one batch to approve, with its sample; what is in
+        # doubt is not in it.
+        made = post(client, "reorganize/batches", kind="place")
+        assert made.status_code == 200, made.text
+        batch = client.get(BASE + "reorganize/batches/" + made.json()["id"]).json()
+        titles = sorted(item["child"]["title"] for item in batch["items"])
+        assert len(titles) == 2 and "analysis and other each chose" in json.dumps(batch)
     finally:
         client.close()

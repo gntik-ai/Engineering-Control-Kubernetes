@@ -58,6 +58,8 @@ interface Worklist {
     unanswered: number;
     approvable: number;
     to_ask: number;
+    doubt: number;
+    agreed: number;
     to_ask_unclear: number;
     answer_epic: number;
     answer_none: number;
@@ -144,6 +146,7 @@ export function PrimaryEpics({ project }: { project: string }) {
               run={data.run}
               models={data.models}
               twoModels
+              judged
               first={data.first}
               options={[
                 { key: 'unclear_only', label: 'Only where the texts do not point to one Epic' },
@@ -195,6 +198,8 @@ export function PrimaryEpics({ project }: { project: string }) {
                     value={show || 'all'}
                     items={[
                       { value: 'all', label: `All (${whole(data.counts.total)})` },
+                      { value: 'doubt', label: `In doubt: needs you (${whole(data.counts.doubt)})` },
+                      { value: 'agreed', label: `Two models agreed (${whole(data.counts.agreed)})` },
                       { value: 'waiting', label: `With an answer waiting (${whole(data.counts.waiting)})` },
                       { value: 'differs', label: `Answer differs from the suggestion (${whole(data.counts.differ)})` },
                       { value: 'unanswered', label: `Without an answer (${whole(data.counts.unanswered)})` },

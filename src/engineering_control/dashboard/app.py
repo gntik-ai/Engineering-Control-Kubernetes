@@ -1653,7 +1653,7 @@ def create_app(
         request: Request,
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),
-        show: Literal["", "waiting", "unanswered"] = "",
+        show: Literal["", "waiting", "unanswered", "doubt", "agreed"] = "",
     ) -> Response:
         """The open issues without a User Story: each with the Stories most like it and
         what a review answered, and the run that asks."""
@@ -1680,6 +1680,7 @@ def create_app(
                 body.token_cap,
                 body.again,
                 body.first(),
+                body.judge(),
             ),
             event="workspace.orphan_run_started",
             subject=name,
@@ -2168,6 +2169,7 @@ def create_app(
                 body.token_cap,
                 body.again,
                 body.first(),
+                body.judge(),
             ),
             event="workspace.cleanup_check_started",
             subject=name,
@@ -2314,7 +2316,13 @@ def create_app(
             request,
             JudgeTrialRunInput,
             lambda body: asyncio.to_thread(
-                repo(request).judging.start, name, kind, body.provider, body.model, body.dollars
+                repo(request).judging.start,
+                name,
+                kind,
+                body.provider,
+                body.model,
+                body.dollars,
+                body.judge(),
             ),
             event="workspace.judge_trial_started",
             subject=name,
@@ -2521,7 +2529,7 @@ def create_app(
         request: Request,
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),
-        show: Literal["", "waiting", "unanswered", "differs", "unclear"] = "",
+        show: Literal["", "waiting", "unanswered", "differs", "unclear", "doubt", "agreed"] = "",
     ) -> Response:
         """The User Stories under several Epics whose primary Epic nobody chose: each
         with its Epics and what a review answered, and the run that asks."""
@@ -2551,6 +2559,7 @@ def create_app(
                 body.again,
                 body.unclear_only,
                 body.first(),
+                body.judge(),
             ),
             event="workspace.primary_epic_run_started",
             subject=name,

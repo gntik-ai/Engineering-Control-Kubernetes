@@ -275,6 +275,8 @@ class _Kind:
     workflow = "cleanup_check"
     # A run may ask a cheaper model first and keep what it settles.
     two_models = True
+    # A run may have a judge: a model of another maker that answers unseen.
+    judged = True
     actionable: tuple[str, ...] = ("unsupported",)
     nothing_to_ask = (
         "A model has answered about every User Story that nothing supports. "
@@ -284,6 +286,11 @@ class _Kind:
 
     def scope(self, db: Session, project: ProjectRecord) -> _Scope:
         return _Scope(db, project)
+
+    def agreeing(self, mine: dict[str, Any], theirs: dict[str, Any]) -> bool:
+        """Two answers agree when both say supported, or both unsupported: which piece
+        each read as its support may differ."""
+        return mine.get("answer") == theirs.get("answer")
 
 
 KIND: Final = _Kind()
@@ -657,11 +664,22 @@ class Cleanup:
         token_cap: int,
         again: bool = False,
         first: tuple[str, str] | None = None,
+        judge: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run that asks a model, about each User Story that nothing supports and
         that has no answer yet, whether anything close to it in the project is its work."""
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
+            self.sessions,
+            name,
+            KIND.name,
+            provider,
+            model,
+            token_cap,
+            again,
+            None,
+            first,
+            None,
+            judge,
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

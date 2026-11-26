@@ -533,6 +533,8 @@ class _Answers:
 
     name = "ans_issue_story"
     kind = ANSWERS
+    # It can be measured with a judge, as a run of the check has one.
+    judged = True
     label = "An answer from the candidates: the User Story of an issue"
     workflow = "answer_trial"
     actionable: tuple[str, ...] = ()
@@ -590,6 +592,8 @@ class _Answers:
                         "parent_id": str(chose) if chose else None,
                         "right": bool(chose and chose in known),
                         "in_list": in_list,
+                        # With a judge: whether the two agreed in the end.
+                        "agreed": review.agreed,
                         **more,
                     }
                 ],
@@ -668,6 +672,29 @@ def _answers_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, An
         "kept_right": sum(1 for line in kept if _detail(line).get("right")),
         "cost_each": round(sum(priced) / len(priced), 6) if priced else None,
         "cost": round(sum(priced), 6) if priced else None,
+        # With a judge: what the two agreed on in the end, how much of it is right,
+        # and what is left in doubt. The cost is then of both, for each issue.
+        "judged": _judged(run, lines),
+    }
+
+
+def _judged(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any] | None:
+    if not run.judge_model:
+        return None
+    agreed = [line for line in lines if _detail(line).get("agreed") and line.answer == "story"]
+    paid = (run.cost or 0.0) + (run.judge_cost or 0.0)
+    return {
+        "judge": run.judge_model,
+        "agreed": len(agreed),
+        "agreed_right": sum(1 for line in agreed if _detail(line).get("right")),
+        "doubt": sum(1 for line in lines if _detail(line).get("agreed") is False),
+        # Of what is in doubt, how much the answer had right all the same.
+        "doubt_right": sum(
+            1
+            for line in lines
+            if _detail(line).get("agreed") is False and _detail(line).get("right")
+        ),
+        "cost_each": round(paid / len(lines), 6) if lines and paid else None,
     }
 
 
@@ -969,11 +996,18 @@ class Judging:
             return {"items": found[:200], "total": len(found)}
 
     def start(
-        self, name: str, kind: str, provider: str, model: str, dollars: float
+        self,
+        name: str,
+        kind: str,
+        provider: str,
+        model: str,
+        dollars: float,
+        second: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Begin a measurement of one model as a judge of one sort of pair."""
-        judge = JUDGES.get(kind) or MEASURES.get(kind)
-        if judge is None:
+        """Begin a measurement of one model: as a judge of one sort of pair, or answering
+        from the candidates, alone or with ``second`` as its judge."""
+        measure = JUDGES.get(kind) or MEASURES.get(kind)
+        if measure is None:
             raise ProjectInvalid("A judge cannot be measured on this.")
         with self.sessions() as db:
             project = active_project(db, name)
@@ -1020,7 +1054,17 @@ class Judging:
                     f"together, and ${max(left, 0):,.2f} is left."
                 )
         return parent_choice.start(
-            self.sessions, name, judge.name, provider, model, 5_000_000, True, None, None, dollars
+            self.sessions,
+            name,
+            measure.name,
+            provider,
+            model,
+            5_000_000,
+            True,
+            None,
+            None,
+            dollars,
+            second,
         )
 
     def control(self, name: str, kind: str, run_id: UUID, action: str) -> dict[str, Any]:

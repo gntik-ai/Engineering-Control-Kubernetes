@@ -525,10 +525,20 @@ class OrphanRunInput(PlainChangeInput):
     first_provider: str = Field(default="", max_length=32)
     first_model: str = Field(default="", max_length=200)
 
+    # A judge: a model of another maker that answers the same question without seeing
+    # the first answer. Both empty for a run without one.
+    judge_provider: str = Field(default="", max_length=32)
+    judge_model: str = Field(default="", max_length=200)
+
     def first(self) -> tuple[str, str] | None:
         if not self.first_provider and not self.first_model:
             return None
         return (self.first_provider, self.first_model)
+
+    def judge(self) -> tuple[str, str] | None:
+        if not self.judge_provider and not self.judge_model:
+            return None
+        return (self.judge_provider, self.judge_model)
 
 
 class GoldLabelInput(PlainChangeInput):
@@ -559,6 +569,14 @@ class JudgeTrialRunInput(PlainChangeInput):
     provider: str = Field(min_length=1, max_length=32)
     model: str = Field(min_length=1, max_length=200)
     dollars: float = Field(ge=0.05, le=3.0)
+    # For an answer from the candidates: a judge that answers unseen, as in a run.
+    judge_provider: str = Field(default="", max_length=32)
+    judge_model: str = Field(default="", max_length=200)
+
+    def judge(self) -> tuple[str, str] | None:
+        if not self.judge_provider and not self.judge_model:
+            return None
+        return (self.judge_provider, self.judge_model)
 
 
 class PrimaryEpicRunInput(OrphanRunInput):

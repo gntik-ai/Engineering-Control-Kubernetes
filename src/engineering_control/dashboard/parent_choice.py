@@ -15,10 +15,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_OID, UUID, uuid5
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -37,7 +37,9 @@ from engineering_control.db.models import (
     ModelTrialLine,
     ProjectRecord,
     ProjectReviewBudget,
+    ScorerDecision,
 )
+from engineering_control.models.providers import family_of
 from engineering_control.models.service import ModelError, Models, Question, Reply
 
 log = logging.getLogger(__name__)
@@ -54,6 +56,8 @@ TRIES: Final = 3
 # therefore the answer plus this room: without it such a model is cut before its answer
 # begins, and the call is paid for nothing.
 THINKING_ROOM: Final = 8000
+# How often an answer goes back when the judge's own answer differs from it.
+BACK: Final = 1
 # What a model's trial on a check must show before a run asks it first by default: this
 # many questions settled by itself, and this share of them the same as on record.
 GATE_SETTLED: Final = 30
@@ -217,6 +221,124 @@ def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | N
     return min(passed, key=lambda entry: entry[:2])[2] if passed else None
 
 
+def agreeing(spec: Any, mine: dict[str, Any], theirs: dict[str, Any]) -> bool:
+    """Whether two answers to the same question say the same: the same answer and the
+    same parent. A kind may say otherwise for its own answers."""
+    own = getattr(spec, "agreeing", None)
+    if own is not None:
+        return bool(own(mine, theirs))
+    return mine.get("answer") == theirs.get("answer") and str(mine.get("parent_id")) == str(
+        theirs.get("parent_id")
+    )
+
+
+def _answer(review: ChoiceReview) -> dict[str, Any]:
+    return {"answer": review.answer, "parent_id": review.parent_id}
+
+
+def _answer_of(said: dict[str, Any]) -> dict[str, Any]:
+    return {"answer": said.get("answer"), "parent_id": said.get("parent_id")}
+
+
+def _said(read: dict[str, Any], reply: Reply, tokens: int | None) -> dict[str, Any]:
+    """What a judge answered, as it is kept beside the answer."""
+    return {
+        "answer": read["answer"],
+        "parent_id": str(read["parent_id"]) if read["parent_id"] else None,
+        "reason": read["reason"],
+        "checked": bool(read["checked"]),
+        "provider": reply.provider,
+        "model": reply.model,
+        "tokens": tokens,
+    }
+
+
+def _sent_back(review: ChoiceReview, listed: list[dict[str, Any]]) -> str:
+    """What an answer is told when it goes back: what another reader chose, by its
+    title, and that the texts decide."""
+    said = review.judge or {}
+    title = next(
+        (str(entry.get("title")) for entry in listed if entry.get("id") == said.get("parent_id")),
+        "",
+    )
+    chose = f"chose “{title}”" if title else f"answered “{said.get('answer')}”"
+    return (
+        f" You answered this before. Another reader, who did not see your answer, {chose}. "
+        "Read the texts again and answer by them alone: keep your answer where they support "
+        "it, change it where they support the other."
+    )
+
+
+def _conclude(
+    db: Session,
+    spec: Any,
+    run: ChoiceRun,
+    review: ChoiceReview,
+    child: Any,
+    reply: Reply | None,
+    agreed: bool | None,
+) -> None:
+    """Both are in: the record's answer is agreed or in doubt, and counts as done."""
+    review.state, review.phase, review.detail = "answered", "", ""
+    review.agreed = bool(agreed)
+    run.done += 1
+    run.agreed += 1 if agreed else 0
+    _TROUBLE.pop(run.id, None)
+    keep = getattr(spec, "answered", None)
+    if keep is not None and reply is not None:
+        keep(db, run, review, child, reply)
+
+
+def agreed_lines(
+    db: Session, project: ProjectRecord, kind: str, link_kind: str, outcome: str
+) -> list[Any]:
+    """The answers of a check that a judge agreed with, as lines for a batch: the record,
+    the parent both chose, and why. Only answers that name a parent, whose passages are
+    in the texts, that still are about the texts as they stand and that wait for the
+    administrator. Shaped like the scorer's decisions, which they are not."""
+    spec = KINDS[kind]
+    scope = spec.scope(db, project)
+    known = reviews(db, project.id, kind)
+    lines = []
+    for child in scope.children():
+        review = known.get(child.id)
+        if (
+            review is None
+            or review.state != "answered"
+            or not review.agreed
+            or review.decision != "pending"
+            or review.parent_id is None
+            or not review.checked
+            or review.revision != scope.revision(child, scope.shortlist(child))
+        ):
+            continue
+        judge = (review.judge or {}).get("model") or "a second model"
+        quotes = " ".join(
+            f"The {entry.get('side')} says: “{entry.get('text')}”."
+            for entry in review.evidence or []
+            if entry.get("found")
+        )
+        lines.append(
+            ScorerDecision(
+                id=uuid5(NAMESPACE_OID, f"agreed:{review.id}:{review.parent_id}"),
+                project_id=project.id,
+                kind=link_kind,
+                child_id=child.id,
+                parent_id=review.parent_id,
+                outcome=outcome,
+                confidence=1.0,
+                model="model",
+                detail={
+                    "why": (
+                        f"{review.model} and {judge} each chose this without seeing the "
+                        f"other's answer. {review.reason or ''} {quotes}"
+                    ).strip()
+                },
+            )
+        )
+    return lines
+
+
 def tokens_of(reply: Reply) -> int | None:
     tokens = reply.usage.get("tokens")
     if tokens is None and all(
@@ -292,13 +414,24 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
         }
         if run.first_model
         else None,
-        "cost": round((run.cost or 0.0) + (run.first_cost or 0.0), 6)
-        if run.priced or run.first_cost
+        "cost": round((run.cost or 0.0) + (run.first_cost or 0.0) + (run.judge_cost or 0.0), 6)
+        if run.priced or run.first_cost or run.judge_cost
         else None,
         "alone": round(run.cost / run.priced * run.done, 6)
         if run.first_model and run.priced and run.done
         else None,
         "dollar_cap": run.dollar_cap,
+        # With a judge: how many answers it was asked for, how many the two agreed on,
+        # and what asking it cost.
+        "judge": {
+            "provider": run.judge_provider,
+            "model": run.judge_model,
+            "asked": run.judge_asked,
+            "agreed": run.agreed,
+            "cost": round(run.judge_cost or 0.0, 6),
+        }
+        if run.judge_model
+        else None,
         "started_at": run.created_at.isoformat(),
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
     }
@@ -352,6 +485,11 @@ def shown_answer(review: ChoiceReview, current: str, titles: dict[str, str]) -> 
         "tokens": review.tokens,
         "detail": review.detail,
         "decision": review.decision,
+        # With a judge: whether its own answer was the same, and what it said. False is
+        # in doubt; none where no judge was asked.
+        "agreed": review.agreed,
+        "judge": review.judge,
+        "rounds": review.rounds,
         # The record or its shortlist changed since it was asked about.
         "stale": review.state == "answered" and review.revision != current,
         "answered_at": review.updated_at.isoformat(),
@@ -411,6 +549,7 @@ def start(
     only: Any = None,
     first: tuple[str, str] | None = None,
     dollars: float | None = None,
+    judge: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Begin a run over the records that wait and have no answer yet, or over all of them
     when asked to ask ``again``. ``only`` narrows them: it is given each record and its
@@ -436,6 +575,17 @@ def start(
                 raise ProjectInvalid("Choose a first model of an account that can be asked.")
             if first == (provider, model):
                 raise ProjectInvalid("The first model is the run's own model. Leave it out.")
+        if judge is not None:
+            if not getattr(spec, "judged", False):
+                raise ProjectInvalid("This kind of run has no judge.")
+            if first is not None:
+                raise ProjectInvalid("A run has a judge or a cheaper model first, not both.")
+            if {"provider": judge[0], "model": judge[1]} not in choices:
+                raise ProjectInvalid("Choose a judge of an account that can be asked.")
+            if family_of(*judge) == family_of(provider, model):
+                raise ProjectInvalid(
+                    "The judge is of the family that answers. Choose a model of another maker."
+                )
         if db.scalar(
             select(ChoiceRun.id).where(
                 ChoiceRun.project_id == project.id,
@@ -460,6 +610,8 @@ def start(
             first_provider=first[0] if first else None,
             first_model=first[1] if first else None,
             dollar_cap=dollars if free else None,
+            judge_provider=judge[0] if judge else None,
+            judge_model=judge[1] if judge else None,
         )
         db.add(run)
         db.flush()
@@ -483,6 +635,7 @@ def start(
             review.evidence = review.missing = review.tokens = None
             review.provider = review.model = None
             review.checked, review.detail, review.passed = False, "", False
+            review.phase, review.judge, review.agreed, review.rounds = "", None, None, 0
             review.decision, review.decided_at = "pending", None
             run.total += 1
         if not run.total:
@@ -544,6 +697,8 @@ class _Call:
     first: bool = False
     # Of a run limited in dollars: it holds none of the project's review tokens.
     free: bool = False
+    # Where the record stands: "" for the answer, "judge", or "back".
+    phase: str = ""
 
 
 # What a tick did when it asked nothing: there was nothing to do, or it moved a run on.
@@ -637,7 +792,14 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             if first
             else run
         )
+        phase = review.phase if run.judge_model else ""
+        if phase == "judge":
+            # The judge is asked the same question and is not shown the answer.
+            first = False
+            asker = ChoiceRun(provider=run.judge_provider or "", model=run.judge_model or "")
         asked = scope.question(asker, child, listed)
+        if phase == "back":
+            asked = replace(asked, system=asked.system + _sent_back(review, listed))
         needed = review_budget.reservation_size(asked)
         if run.spent + needed > run.token_cap:
             left = run.total - run.done - run.failed
@@ -650,7 +812,7 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             )
             return _MOVED
         free = in_dollars(spec)
-        paid = (run.cost or 0.0) + (run.first_cost or 0.0)
+        paid = (run.cost or 0.0) + (run.first_cost or 0.0) + (run.judge_cost or 0.0)
         if free and run.dollar_cap is not None and paid >= run.dollar_cap:
             left = run.total - run.done - run.failed
             _finish(
@@ -660,7 +822,7 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
                 f"Stopped at its limit of ${run.dollar_cap:,.2f} with {left:,} not asked about.",
             )
             return _MOVED
-        return _Call(run.id, review.id, project.id, asked, needed, first, free)
+        return _Call(run.id, review.id, project.id, asked, needed, first, free, phase)
 
 
 def _admit(sessions: sessionmaker[Session], call: _Call) -> bool:
@@ -704,14 +866,21 @@ def _settle(
             add_project_usage(
                 db,
                 run.project_id,
-                run.first_model if call.first else run.model,
+                run.judge_model
+                if call.phase == "judge"
+                else run.first_model
+                if call.first
+                else run.model,
                 reply,
                 spec.workflow,
                 held if tokens else 0,
                 None,
             )
             cost = reply.usage.get("cost")
-            if call.first:
+            if call.phase == "judge":
+                run.judge_asked += 1
+                run.judge_cost += float(cost) if isinstance(cost, int | float) else 0.0
+            elif call.first:
                 run.first_asked += 1
                 run.first_spent += tokens or 0
                 run.first_cost += float(cost) if isinstance(cost, int | float) else 0.0
@@ -733,6 +902,11 @@ def _settle(
                 read = scope.read(reply.data, child, review.shortlist)
             except (Unusable, KeyError, ValueError) as unusable:
                 problem = str(unusable) or "The answer could not be read."
+                if call.phase and child is not None:
+                    # The judge, or the answer that went back, gave nothing usable:
+                    # the two did not agree, and the first answer stands in doubt.
+                    _conclude(db, spec, run, review, child, reply, None)
+                    return
                 if call.first and child is not None:
                     # Nothing usable from the first model: the run's own is asked.
                     review.passed = True
@@ -744,13 +918,37 @@ def _settle(
                     _TROUBLE.pop(run.id, None)
                     return
                 run.first_done += 1 if call.first else 0
-                review.state, review.detail = "answered", ""
+                if call.phase == "judge":
+                    review.judge = _said(read, reply, tokens)
+                    if agreeing(spec, _answer(review), read):
+                        _conclude(db, spec, run, review, child, reply, True)
+                    elif review.rounds < BACK:
+                        # The two differ: the answer goes back, told what the other chose.
+                        review.phase, review.rounds = "back", review.rounds + 1
+                        _TROUBLE.pop(run.id, None)
+                    else:
+                        _conclude(db, spec, run, review, child, reply, False)
+                    return
+                review.detail = ""
                 review.answer, review.parent_id = read["answer"], read["parent_id"]
                 review.confidence, review.reason = read["confidence"], read["reason"]
                 review.evidence, review.checked = read["evidence"], read["checked"]
                 review.missing = read["missing"]
                 review.provider, review.model, review.tokens = reply.provider, reply.model, tokens
                 review.decision, review.decided_at = "pending", None
+                if call.phase == "back":
+                    same = agreeing(spec, read, _answer_of(review.judge or {}))
+                    _conclude(db, spec, run, review, child, reply, same)
+                    return
+                if run.judge_model and read["answer"] != "unclear":
+                    # Kept, and not counted as done until the judge has answered too.
+                    review.phase = "judge"
+                    _TROUBLE.pop(run.id, None)
+                    return
+                if run.judge_model:
+                    # An answer that cannot tell is in doubt without asking a judge.
+                    review.agreed = False
+                review.state = "answered"
                 run.done += 1
                 _TROUBLE.pop(run.id, None)
                 # A kind may keep more of an answer than the review holds.

@@ -30,7 +30,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import cleanup, epic_links
+from engineering_control.dashboard import cleanup, epic_links, parent_choice
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
@@ -232,6 +232,19 @@ class Reorg:
                 ScorerDecision.parent_id.is_not(None),
             )
         ).all()
+        # What a check answered and its judge agreed with goes into the same batch as
+        # what the scorer is sure of: one thing to approve, with one sample.
+        check = {"place": "issue_story", "primary": "story_epic"}.get(kind)
+        if check is not None:
+            mine = {(row.child_id, row.parent_id) for row in decisions}
+            decisions = [
+                *decisions,
+                *(
+                    row
+                    for row in parent_choice.agreed_lines(db, project, check, link_kind, outcome)
+                    if (row.child_id, row.parent_id) not in mine
+                ),
+            ]
         if not decisions:
             return []
         taken = {
@@ -628,8 +641,10 @@ class Reorg:
                         child_id=decision.child_id,
                         parent_id=decision.parent_id,
                         confidence=decision.confidence,
+                        # A line a model made says why itself; the scorer's is worded
+                        # from its signals.
                         reason=str(detail.get("why"))
-                        if kind in RULED
+                        if kind in RULED or detail.get("why")
                         else why(kind, decision.confidence, signals, int(detail.get("of") or 0)),
                         signals=signals,
                         sampled=decision.id in drawn,

@@ -67,6 +67,15 @@ interface AnswerRun {
   kept: number;
   kept_right: number;
   cost_each: number | null;
+  /** With a judge, as a run of the check has one: what the two agreed on in the end. */
+  judged: {
+    judge: string;
+    agreed: number;
+    agreed_right: number;
+    doubt: number;
+    doubt_right: number;
+    cost_each: number | null;
+  } | null;
 }
 interface Agreement {
   models: string[];
@@ -413,6 +422,14 @@ export function JudgeTrials({ project }: { project: string }) {
                               made by {entry.maker}
                               {entry.run.detail ? ` · ${entry.run.detail}` : ''}
                             </div>
+                            {entry.judged ? (
+                              <div className="text-xs text-foreground">
+                                With {entry.judged.judge} as its judge: agreed on {whole(entry.judged.agreed)}, of which{' '}
+                                {whole(entry.judged.agreed_right)} right (
+                                {wrongShare(entry.judged.agreed_right, entry.judged.agreed) || 'none to go by'}); in
+                                doubt {whole(entry.judged.doubt)}; {dollars(entry.judged.cost_each)} an issue for both.
+                              </div>
+                            ) : null}
                           </td>
                           <td className="py-2 pe-3 text-end tabular-nums">
                             {whole(entry.answers)} of {whole(entry.run.total)}

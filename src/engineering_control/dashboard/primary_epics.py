@@ -259,6 +259,8 @@ class _Kind:
     workflow = "primary_epic"
     # A run may ask a cheaper model first and keep what it settles.
     two_models = True
+    # A run may have a judge: a model of another maker that answers unseen.
+    judged = True
     actionable: tuple[str, ...] = ("epic",)
     nothing_to_ask = (
         "Every User Story that waits for a primary Epic already has an answer. "
@@ -337,14 +339,34 @@ class PrimaryEpics:
                         counts["to_ask_unclear"] += 1
                         likely_unclear += use
                 differs = bool(waiting and shown and shown["answer"] == "epic" and not agrees)
+                # With a judge: agreed with by the judge, or in doubt.
+                doubt = bool(waiting and shown and shown["agreed"] is False)
+                agreed = bool(waiting and shown and shown["agreed"])
+                counts["doubt"] += doubt
+                counts["agreed"] += agreed
                 if (
                     (show == "waiting" and not waiting)
                     or (show == "unanswered" and waiting)
                     or (show == "differs" and not differs)
                     or (show == "unclear" and plain)
+                    or (show == "doubt" and not doubt)
+                    or (show == "agreed" and not agreed)
                 ):
                     continue
-                rows.append((0 if waiting else 1, story, listed, shown, plain, agrees))
+                # What is in doubt first, and of that the Stories whose two best Epics
+                # lie closest: the most ambiguous need the administrator most.
+                scores = sorted((float(entry.get("score") or 0) for entry in listed), reverse=True)
+                margin = scores[0] / scores[1] if len(scores) > 1 and scores[1] else 9.0
+                rows.append(
+                    (
+                        (0 if doubt else 1 if waiting else 2, margin if doubt else 0.0),
+                        story,
+                        listed,
+                        shown,
+                        plain,
+                        agrees,
+                    )
+                )
             rows.sort(key=lambda row: (row[0], row[1].title, str(row[1].id)))
             pages = max(1, (len(rows) + page_size - 1) // page_size)
             page = min(max(1, page), pages)
@@ -387,6 +409,8 @@ class PrimaryEpics:
                         "answer_unclear",
                         "agree",
                         "differ",
+                        "doubt",
+                        "agreed",
                     )
                 },
                 "likely": likely,
@@ -408,6 +432,7 @@ class PrimaryEpics:
         again: bool = False,
         unclear_only: bool = False,
         first: tuple[str, str] | None = None,
+        judge: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run over the User Stories that wait for a primary Epic and have no
         answer yet: all of them, or only those whose texts do not point to one Epic."""
@@ -422,6 +447,8 @@ class PrimaryEpics:
             again,
             lambda child, listed: not child.stated and not (unclear_only and clear(listed)),
             first,
+            None,
+            judge,
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

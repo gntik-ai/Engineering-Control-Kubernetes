@@ -481,6 +481,8 @@ class _Kind:
     workflow = "orphan_parent"
     # A run may ask a cheaper model first and keep what it settles.
     two_models = True
+    # A run may have a judge: a model of another maker that answers unseen.
+    judged = True
     actionable: tuple[str, ...] = ("story", "bug")
     nothing_to_ask = (
         "Every open issue without a User Story already has an answer. "
@@ -557,6 +559,11 @@ class Orphans:
                 counts["waiting" if waiting else "unanswered"] += 1
                 if waiting and shown:
                     counts[shown["answer"]] += 1
+                # With a judge: agreed with by the judge, or in doubt.
+                doubt = bool(waiting and shown and shown["agreed"] is False)
+                agreed = bool(waiting and shown and shown["agreed"])
+                counts["doubt"] += doubt
+                counts["agreed"] += agreed
                 if parent_choice.approvable(shown, KIND.actionable):
                     counts["approvable"] += 1
                 held, use = parent_choice.sizes(scope.question(placeholder, issue, listed))
@@ -568,7 +575,10 @@ class Orphans:
                     continue
                 if show == "unanswered" and waiting:
                     continue
-                rows.append((0 if waiting else 1, issue, listed, shown))
+                if (show == "doubt" and not doubt) or (show == "agreed" and not agreed):
+                    continue
+                # What is in doubt first: that is what needs the administrator.
+                rows.append((0 if doubt else 1 if waiting else 2, issue, listed, shown))
             rows.sort(key=lambda row: (row[0], row[1].issue_number or 0))
             pages = max(1, (len(rows) + page_size - 1) // page_size)
             page = min(max(1, page), pages)
@@ -609,7 +619,16 @@ class Orphans:
                 "show": show,
                 "counts": {
                     key: counts[key]
-                    for key in ("total", "waiting", "unanswered", "approvable", "to_ask", *ANSWERS)
+                    for key in (
+                        "total",
+                        "waiting",
+                        "unanswered",
+                        "approvable",
+                        "to_ask",
+                        "doubt",
+                        "agreed",
+                        *ANSWERS,
+                    )
                 },
                 "stories": len(scope.stories.rows),
                 "estimate": estimate,
@@ -630,11 +649,22 @@ class Orphans:
         token_cap: int,
         again: bool = False,
         first: tuple[str, str] | None = None,
+        judge: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Begin a run over the open issues without a User Story that have no answer yet,
         or over all of them when asked to ask ``again``."""
         return parent_choice.start(
-            self.sessions, name, KIND.name, provider, model, token_cap, again, None, first
+            self.sessions,
+            name,
+            KIND.name,
+            provider,
+            model,
+            token_cap,
+            again,
+            None,
+            first,
+            None,
+            judge,
         )
 
     def control(self, name: str, run_id: UUID, action: str) -> dict[str, Any]:

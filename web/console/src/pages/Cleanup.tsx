@@ -151,6 +151,7 @@ export function Cleanup({ project }: { project: string }) {
                 run={data.check.run}
                 models={data.check.models}
                 twoModels
+                judged
                 first={data.check.first}
                 options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
                 asked={(chosen) => (chosen.again ? data.check.stories : data.check.to_ask)}

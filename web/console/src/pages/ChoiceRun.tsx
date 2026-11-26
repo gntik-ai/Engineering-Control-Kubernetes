@@ -23,6 +23,8 @@ export interface Run {
   cost?: number | null;
   /** What it would have cost had the run's own model answered every question. */
   alone?: number | null;
+  /** A judge: a model of another maker that answered the same questions unseen. */
+  judge?: { provider: string; model: string; asked: number; agreed: number; cost: number } | null;
 }
 /** The model a check asks first by default: the one whose trial on the check agreed. */
 export interface FirstModel {
@@ -57,6 +59,10 @@ export interface Review {
   detail: string;
   decision: 'pending' | 'approved' | 'dismissed';
   stale: boolean;
+  /** With a judge: whether its own answer was the same. False is in doubt; null, no judge was asked. */
+  agreed?: boolean | null;
+  judge?: { answer: string; parent_id: string | null; reason: string | null; model: string } | null;
+  rounds?: number;
 }
 
 export const whole = (value: number) => value.toLocaleString('en');
@@ -103,6 +109,7 @@ export function RunPanel({
   noun,
   note,
   twoModels,
+  judged,
   first,
   onChanged,
   onProblem,
@@ -125,6 +132,8 @@ export function RunPanel({
   note?: string;
   /** Whether the run may ask a cheaper model first, and the one it asks by default. */
   twoModels?: boolean;
+  /** Whether the run may have a judge: a model of another maker that answers unseen. */
+  judged?: boolean;
   first?: FirstModel | null;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
@@ -134,6 +143,7 @@ export function RunPanel({
   const [chosen, setChosen] = useState<Record<string, boolean>>({});
   // Until the administrator chooses, the model whose trial on this check agreed.
   const [firstPicked, setFirstPicked] = useState<string | null>(null);
+  const [judgePicked, setJudgePicked] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const live = run ? LIVE.includes(run.state) : false;
@@ -141,13 +151,18 @@ export function RunPanel({
   const model = models.find((entry) => keyOf(entry) === picked) ?? models[0];
   const others = twoModels && model ? models.filter((entry) => keyOf(entry) !== keyOf(model)) : [];
   const firstKey = firstPicked ?? (first ? keyOf(first) : '');
-  const firstModel = others.find((entry) => keyOf(entry) === firstKey) ?? null;
+  const judgeModel = judged ? (models.find((entry) => keyOf(entry) === judgePicked) ?? null) : null;
+  // A run has a judge or a cheaper model first, not both.
+  const firstModel = judgeModel ? null : (others.find((entry) => keyOf(entry) === firstKey) ?? null);
   const count = asked(chosen);
   const use = likely(chosen);
   // Half as much again as the run is likely to use, and room for the last question: a
   // question holds its whole size until the provider says what it used.
   // With a first model, what it passes on is asked twice.
-  const suggested = Math.max(10_000, Math.ceil((use * (firstModel ? 2.2 : 1.5) + largest) / 10_000) * 10_000);
+  const suggested = Math.max(
+    10_000,
+    Math.ceil((use * (judgeModel ? 3 : firstModel ? 2.2 : 1.5) + largest) / 10_000) * 10_000,
+  );
   const limit = Number(cap || suggested);
   const control = (action: 'stop' | 'resume' | 'end') => {
     if (!run) return;
@@ -183,6 +198,13 @@ export function RunPanel({
                 : run.cost !== null && run.cost !== undefined
                   ? '.'
                   : ''}
+            </p>
+          ) : null}
+          {run.judge ? (
+            <p className="text-muted-foreground">
+              {run.judge.model} answered {whole(run.judge.asked)} of them again without seeing the answer: the two
+              agreed on {whole(run.judge.agreed)}. What they did not agree on is in doubt.
+              {run.cost !== null && run.cost !== undefined ? ` The run cost ${dollars(run.cost)}.` : ''}
             </p>
           ) : null}
           {run.detail ? <p className="text-muted-foreground">{run.detail}</p> : null}
@@ -245,6 +267,22 @@ export function RunPanel({
                 />
               </label>
             ) : null}
+            {judged ? (
+              <label className="grid gap-1 text-sm">
+                Judge: a second answer, unseen
+                <SimpleSelect
+                  aria-label="Model that judges"
+                  value={judgeModel ? keyOf(judgeModel) : ''}
+                  items={[
+                    { value: '', label: 'No judge' },
+                    ...models
+                      .filter((entry) => !model || keyOf(entry) !== keyOf(model))
+                      .map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
+                  ]}
+                  onValueChange={(value) => setJudgePicked(String(value))}
+                />
+              </label>
+            ) : null}
             <label className="grid gap-1 text-sm">
               Stop at this many tokens
               <Input
@@ -271,7 +309,16 @@ export function RunPanel({
               Ask about {some(count, noun[0], noun[1])}
             </Button>
           </div>
-          {twoModels ? (
+          {judgeModel ? (
+            <p className="text-sm text-muted-foreground">
+              {judgeModel.model} is asked the same question about each answer, without being shown it. Where the two say
+              the same, the answer is agreed and goes into one batch for you to approve with a sample. Where they
+              differ, the answer goes back once, told what the other chose; if they still differ it is in doubt and is
+              shown to you first. The judge has to be of another maker than the model that answers. A run with a judge
+              can use up to three times the tokens.
+            </p>
+          ) : null}
+          {twoModels && !judgeModel ? (
             <p className="text-sm text-muted-foreground">
               {firstModel
                 ? `${firstModel.model} is asked first. An answer of it is kept when it is clear and every passage it quotes is in the texts; everything else is asked of ${model?.model ?? 'the model beside it'}, so the run can use up to twice the tokens. `
@@ -304,6 +351,7 @@ export function RunPanel({
               model: model.model,
               token_cap: limit,
               ...(firstModel ? { first_provider: firstModel.provider, first_model: firstModel.model } : {}),
+              ...(judgeModel ? { judge_provider: judgeModel.provider, judge_model: judgeModel.model } : {}),
               ...chosen,
             })
           }
@@ -362,7 +410,25 @@ export function ReviewAnswer({
             {changed}
           </Badge>
         ) : null}
+        {review.agreed === true ? (
+          <Badge tone="success" size="sm">
+            A second model answered the same
+          </Badge>
+        ) : review.agreed === false ? (
+          <Badge tone="warning" size="sm">
+            In doubt
+          </Badge>
+        ) : null}
       </div>
+      {review.agreed === false && review.judge ? (
+        <p className="text-foreground">
+          {review.judge.model}, asked the same without seeing this answer, said otherwise
+          {review.judge.reason ? `: ${review.judge.reason}` : '.'}
+          {review.rounds ? ' The answer went back once and stayed.' : ''}
+        </p>
+      ) : review.agreed === false ? (
+        <p className="text-foreground">The answer could not tell, so no second model was asked.</p>
+      ) : null}
       {review.reason ? <p className="text-foreground">{review.reason}</p> : null}
       {review.evidence.map((passage, index) => (
         <p key={index} className="text-muted-foreground">

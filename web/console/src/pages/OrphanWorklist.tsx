@@ -55,6 +55,8 @@ interface Worklist {
     unanswered: number;
     approvable: number;
     to_ask: number;
+    doubt: number;
+    agreed: number;
     story: number;
     none: number;
     bug: number;
@@ -217,6 +219,7 @@ export function OrphanWorklist({ project }: { project: string }) {
               run={data.run}
               models={data.models}
               twoModels
+              judged
               first={data.first}
               options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
               asked={(chosen) => (chosen.again ? data.counts.total : data.counts.to_ask)}
@@ -246,6 +249,8 @@ export function OrphanWorklist({ project }: { project: string }) {
                     value={show || 'all'}
                     items={[
                       { value: 'all', label: `All (${whole(data.counts.total)})` },
+                      { value: 'doubt', label: `In doubt: needs you (${whole(data.counts.doubt)})` },
+                      { value: 'agreed', label: `Two models agreed (${whole(data.counts.agreed)})` },
                       { value: 'waiting', label: `With an answer waiting (${whole(data.counts.waiting)})` },
                       { value: 'unanswered', label: `Without one (${whole(data.counts.unanswered)})` },
                     ]}

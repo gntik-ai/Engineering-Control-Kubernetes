@@ -65,7 +65,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0084 keeps what a model said in a trial, beside the answer on record.
     # 0085 lets a run ask a cheaper model first.
     # 0086 lets a run be limited in US dollars.
-    assert (head, parent) == ("0086", "0085")
+    # 0087 keeps what a judge said to each answer, and whether the two agreed.
+    assert (head, parent) == ("0087", "0086")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -168,8 +169,14 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
     runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
-    assert {"first_model", "first_done", "first_cost", "cost", "priced", "dollar_cap"} <= runs
+    assert {"first_model", "cost", "priced", "dollar_cap", "judge_model", "agreed"} <= runs
+    reviews = {column["name"] for column in inspect(engine).get_columns("choice_reviews")}
+    assert {"phase", "judge", "agreed", "rounds"} <= reviews
     command.downgrade(config, parent)
+    runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
+    assert "judge_model" not in runs and "dollar_cap" in runs
+    assert "phase" not in {c["name"] for c in inspect(engine).get_columns("choice_reviews")}
+    command.downgrade(config, "0085")
     runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
     assert "dollar_cap" not in runs and "first_model" in runs
     command.downgrade(config, "0084")
