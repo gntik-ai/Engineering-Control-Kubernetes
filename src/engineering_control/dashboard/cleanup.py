@@ -41,7 +41,12 @@ import numpy
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import parent_choice, ranking, review_budget, review_flows
+from engineering_control.dashboard import (
+    parent_choice,
+    ranking,
+    review_budget,
+    review_settings,
+)
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.parent_choice import THINKING_ROOM, Unusable, passage, position
 from engineering_control.dashboard.planning_links import PlanningLinks
@@ -628,7 +633,8 @@ class Cleanup:
                     "largest": largest,
                     "answers": {answer: answers[answer] for answer in ANSWERS},
                     "run": parent_choice.latest_run(db, project.id, KIND.name),
-                    "models": review_flows.model_choices(db),
+                    "models": review_settings.models(db, project.id),
+                    "roles": review_settings.roles(db, project.id),
                     "first": parent_choice.suggested_first(db, project.id, KIND.name),
                     "budget": review_budget.status(db, project.id),
                 },

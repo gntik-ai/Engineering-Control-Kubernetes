@@ -23,6 +23,7 @@ interface Overview {
     run: Run | null;
     models: Model[];
     first: FirstModel | null;
+    roles?: { answer: Model | null; judge: Model | null } | null;
   };
 }
 interface Records {
@@ -163,6 +164,7 @@ export function EpicLinks({ project }: { project: string }) {
                 models={data.check.models}
                 twoModels
                 first={data.check.first}
+                roles={data.check.roles}
                 options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
                 asked={(chosen) => (chosen.again ? data.check.stories : data.check.to_ask)}
                 likely={(chosen) => (chosen.again ? data.check.likely_all : data.check.likely)}

@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0 and most of J1 are built, J2 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0, most of J1 and most of J2 are built, J3 to J6 are not.
 
 ## What is asked for
 
@@ -325,6 +325,36 @@ So the reading above, that most of what is left comes from the candidates, was w
 **What is agreed is one batch.** Answers the two agreed on, that name a parent and whose passages are in the texts, go into the batches "Place issues under a User Story" and "Choose primary Epics" under Changes to approve, beside what the scorer is sure of. A batch opens with its sample; more wrong in the sample than 5% allows withdraws it; an approved batch can be undone for thirty days. Nothing is applied without you: that waits for a measurement that shows 5%, and the sample you judge is that measurement.
 
 **Not built of J1:** the comparison by a stronger model where the scorer disagrees, and the judge for the Epics a User Story is also linked to, whose answers judge several links at once.
+
+## What sending an answer back does (26 November 2026)
+
+The whole of it was measured on the same 60 issues: an answer, a judge that answers unseen, and the answer sent back once where they differ.
+
+| Answers | Judge | Agreed at once | Right | Agreed in the end, after going back | Right | In doubt | Cost of an issue |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-5.6 Luna | Claude Haiku 5.5 | 45 | 38 | 52 | 42 | 5 | $0.0018 |
+| Gemini 3.1 Flash Lite | GPT-5.6 Luna | 49 | 41 | 55 | 44 | 5 | $0.0015 |
+
+Sending an answer back makes the two agree more often and not more rightly. Of the 7 answers the first pair agreed on only after one was told what the other chose, 4 were right; of the 6 of the second pair, 3. A disagreement between two readers is the best sign there is that an issue is hard, and the round back talks one of them out of it.
+
+So, differently from what was asked for:
+
+- **An answer does not go back by default.** Reviews, Settings has the choice: in doubt at once, back once, back twice.
+- **What was agreed only after going back is not put into a batch.** It is shown as agreed, with the round it took, and waits for you like any answer.
+
+## J2 as built
+
+**Reviews, Settings**, for each project.
+
+- **What the reviews may cost.** A limit in US dollars a month, beside the limit in tokens, which has moved here from Planning. The limit counts what the project's reviews have cost since the month began, or since the limit was first put in force for the project, whichever is later: for the projects there are, that is the moment this was deployed, so that nothing spent before is held against them. When it is reached no review of the project asks a model: a run is held and says so, a new one does not start, and the automatic reviews wait. Measurements of judges have their own sum.
+- **Which models are asked.** The model that answers and the judge: a run's form opens with them. What happens when the two differ. The model of the automatic planning reviews.
+- **To whom the project's texts may be sent.** Each maker an account offers, ticked or not. A review asks only models of ticked makers; a run that names another is refused. By default Anthropic, OpenAI, Google and the makers of the decision models; the makers kept for your word are never ticked by default.
+- **What runs by itself.** The switch of the automatic planning reviews.
+- **Numbers that are fixed**, each with what it is for.
+
+**The limit decided, $3 a month.** Every project has it from the deployment on.
+
+**Not in J2 yet:** a run still shows its model and its token limit when it starts, filled in from Settings, and they can be changed there. The model and the switch of the automatic reviews are also still on the Planning page. The makers are enforced for the checks and the measurements; the planning reviews, Discovery and Review evidence still take any model an account offers. The fixed numbers are shown and cannot be changed. What each workflow cost is still under Global settings, Stats.
 
 **Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
 

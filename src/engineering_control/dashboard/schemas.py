@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -561,6 +561,29 @@ class ModelTrialRunInput(OrphanRunInput):
 
     # Ask every one of them, not a sample.
     everything: bool = False
+
+
+class ReviewSettingsInput(PlainChangeInput):
+    """What a project's reviews are set to."""
+
+    dollar_limit: float = Field(ge=0, le=1000)
+    # The models a run takes unless it is told otherwise; empty for none.
+    answer_provider: str = Field(default="", max_length=32)
+    answer_model: str = Field(default="", max_length=200)
+    judge_provider: str = Field(default="", max_length=32)
+    judge_model: str = Field(default="", max_length=200)
+    # The makers the project's texts may be sent to; none for the defaults.
+    makers: list[Annotated[str, Field(min_length=1, max_length=60)]] | None = Field(
+        default=None, max_length=200
+    )
+    # How often an answer goes back when its judge says otherwise.
+    rounds: int = Field(default=0, ge=0, le=2)
+
+    def answer(self) -> tuple[str, str] | None:
+        return (self.answer_provider, self.answer_model) if self.answer_model else None
+
+    def judge(self) -> tuple[str, str] | None:
+        return (self.judge_provider, self.judge_model) if self.judge_model else None
 
 
 class JudgeTrialRunInput(PlainChangeInput):

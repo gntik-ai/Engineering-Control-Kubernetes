@@ -36,6 +36,11 @@ def status(db: Session, project_id: UUID) -> dict[str, int | None]:
 
 
 def require_available(db: Session, project_id: UUID) -> None:
+    from engineering_control.dashboard import review_settings
+
+    reached = review_settings.over(db, project_id)
+    if reached:
+        raise ReviewBudgetHeld(reached)
     row = db.get(ProjectReviewBudget, project_id)
     if row and row.required is not None:
         raise ReviewBudgetHeld("Authorize review tokens on the owning project’s Home tab first.")
@@ -98,7 +103,13 @@ def reservation_size(question: Question) -> int:
 
 
 def reserve(sessions: sessionmaker[Session], project_id: UUID, needed: int) -> int:
+    from engineering_control.dashboard import review_settings
+
     with sessions.begin() as db:
+        # The limit in dollars comes first: it holds whatever the tokens say.
+        reached = review_settings.over(db, project_id)
+        if reached:
+            raise ReviewBudgetHeld(reached)
         row = locked_budget(db, project_id)
         if not row:
             return 0

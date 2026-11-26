@@ -35,6 +35,7 @@ from engineering_control.dashboard.primary_epics import PrimaryEpics
 from engineering_control.dashboard.project_records import ProjectRecords
 from engineering_control.dashboard.project_sections import SectionRecords
 from engineering_control.dashboard.reorg import Reorg
+from engineering_control.dashboard.review_settings import ReviewSettingsService
 from engineering_control.dashboard.rollout import Rollout
 from engineering_control.dashboard.schemas import ActivityEventInput
 from engineering_control.dashboard.scorer import Scorer
@@ -145,6 +146,7 @@ class DashboardRepository:
         self.epic_links = EpicLinks(self.sessions, self.planning_links)
         self.model_trials = ModelTrials(self.sessions)
         self.judging = Judging(self.sessions)
+        self.review_settings = ReviewSettingsService(self.sessions)
         # When what the scorer reads changed, where the Stories stand is worked out
         # again, and then the Epics' pages, which say it.
         self.scorer.after = self._after_scoring

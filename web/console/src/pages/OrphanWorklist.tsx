@@ -71,6 +71,7 @@ interface Worklist {
   run: Run | null;
   models: Model[];
   first: FirstModel | null;
+  roles?: { answer: Model | null; judge: Model | null } | null;
 }
 
 const SAID: Record<string, string> = {
@@ -221,6 +222,7 @@ export function OrphanWorklist({ project }: { project: string }) {
               twoModels
               judged
               first={data.first}
+              roles={data.roles}
               options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
               asked={(chosen) => (chosen.again ? data.counts.total : data.counts.to_ask)}
               likely={(chosen) => (chosen.again ? data.likely_all : data.likely)}

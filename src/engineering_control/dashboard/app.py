@@ -147,6 +147,7 @@ from engineering_control.dashboard.schemas import (
     RecordsInput,
     ReviewBudgetInput,
     ReviewPauseInput,
+    ReviewSettingsInput,
     RunDecisionInput,
     RunsRemoveInput,
     SavedTaskInput,
@@ -2288,6 +2289,29 @@ def create_app(
                 repo(request).model_trials.control, name, check, run_id, body.action
             ),
             event="workspace.model_trial_controlled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/review-settings")
+    async def review_settings_api(name: str, request: Request) -> Response:
+        """What the project's reviews are set to, and what they have cost."""
+        return await documents_read(request, lambda: repo(request).review_settings.shown(name))
+
+    @app.post("/api/dashboard/projects/{name}/review-settings")
+    async def review_settings_save_api(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            ReviewSettingsInput,
+            lambda body: asyncio.to_thread(
+                repo(request).review_settings.save,
+                name,
+                body.dollar_limit,
+                body.answer(),
+                body.judge(),
+                body.makers,
+                body.rounds,
+            ),
+            event="project.review_settings_changed",
             subject=name,
         )
 
@@ -4929,7 +4953,7 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|bugs|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics)"
+                    r"/(?:settings/connections|queue|bugs|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics|settings)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

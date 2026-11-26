@@ -70,7 +70,9 @@ export const whole = (value: number) => value.toLocaleString('en');
 export const some = (value: number, one: string, many: string) => `${whole(value)} ${value === 1 ? one : many}`;
 /** A cost in US dollars, with the digits a fraction of a cent needs. */
 export const dollars = (value: number | null | undefined) =>
-  value === null || value === undefined ? 'not priced' : '$' + (value >= 0.01 ? value.toFixed(2) : value.toFixed(5));
+  value === null || value === undefined
+    ? 'not priced'
+    : '$' + (value >= 0.01 || value === 0 ? value.toFixed(2) : value.toFixed(5));
 const keyOf = (model: Model) => JSON.stringify([model.provider, model.model]);
 const LIVE = ['queued', 'running', 'paused', 'held'];
 const ASKING = ['queued', 'running'];
@@ -111,6 +113,7 @@ export function RunPanel({
   twoModels,
   judged,
   first,
+  roles,
   onChanged,
   onProblem,
 }: {
@@ -135,6 +138,8 @@ export function RunPanel({
   /** Whether the run may have a judge: a model of another maker that answers unseen. */
   judged?: boolean;
   first?: FirstModel | null;
+  /** What Reviews, Settings names as the model that answers and the judge. */
+  roles?: { answer: Model | null; judge: Model | null } | null;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
@@ -143,15 +148,23 @@ export function RunPanel({
   const [chosen, setChosen] = useState<Record<string, boolean>>({});
   // Until the administrator chooses, the model whose trial on this check agreed.
   const [firstPicked, setFirstPicked] = useState<string | null>(null);
-  const [judgePicked, setJudgePicked] = useState('');
+  // Until the administrator chooses: what the project's settings name.
+  const [judgePicked, setJudgePicked] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const live = run ? LIVE.includes(run.state) : false;
   const asking = isAsking(run);
-  const model = models.find((entry) => keyOf(entry) === picked) ?? models[0];
+  const model =
+    models.find((entry) => keyOf(entry) === picked) ??
+    (roles?.answer ? models.find((entry) => keyOf(entry) === keyOf(roles.answer as Model)) : undefined) ??
+    models[0];
   const others = twoModels && model ? models.filter((entry) => keyOf(entry) !== keyOf(model)) : [];
   const firstKey = firstPicked ?? (first ? keyOf(first) : '');
-  const judgeModel = judged ? (models.find((entry) => keyOf(entry) === judgePicked) ?? null) : null;
+  const judgeKey = judgePicked ?? (roles?.judge ? keyOf(roles.judge) : '');
+  const judgeModel =
+    judged && model
+      ? (models.find((entry) => keyOf(entry) === judgeKey && keyOf(entry) !== keyOf(model)) ?? null)
+      : null;
   // A run has a judge or a cheaper model first, not both.
   const firstModel = judgeModel ? null : (others.find((entry) => keyOf(entry) === firstKey) ?? null);
   const count = asked(chosen);
@@ -258,12 +271,12 @@ export function RunPanel({
                 Ask a cheaper model first
                 <SimpleSelect
                   aria-label="Model that is asked first"
-                  value={firstModel ? keyOf(firstModel) : ''}
+                  value={firstModel ? keyOf(firstModel) : 'none'}
                   items={[
-                    { value: '', label: 'No: only the model beside this' },
+                    { value: 'none', label: 'No: only the model beside this' },
                     ...others.map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
                   ]}
-                  onValueChange={(value) => setFirstPicked(String(value))}
+                  onValueChange={(value) => setFirstPicked(value === 'none' ? '' : String(value))}
                 />
               </label>
             ) : null}
@@ -272,14 +285,14 @@ export function RunPanel({
                 Judge: a second answer, unseen
                 <SimpleSelect
                   aria-label="Model that judges"
-                  value={judgeModel ? keyOf(judgeModel) : ''}
+                  value={judgeModel ? keyOf(judgeModel) : 'none'}
                   items={[
-                    { value: '', label: 'No judge' },
+                    { value: 'none', label: 'No judge' },
                     ...models
                       .filter((entry) => !model || keyOf(entry) !== keyOf(model))
                       .map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
                   ]}
-                  onValueChange={(value) => setJudgePicked(String(value))}
+                  onValueChange={(value) => setJudgePicked(value === 'none' ? '' : String(value))}
                 />
               </label>
             ) : null}

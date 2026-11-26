@@ -2,7 +2,7 @@ import { Alert, Button, Field, FieldLabel, Input, Link, SimpleSelect } from '@gn
 import { useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { recordUrl } from '../router';
+import { recordUrl, reviewUrl } from '../router';
 import { useSubmit } from './ProjectDialogs';
 
 type RecordLink = { kind: string; id: string; title: string; decision?: string };
@@ -63,7 +63,7 @@ export function RecordReview({ project, kind, id, result, reload, showPrefix = t
   </details>;
 }
 
-function TokenBudget({ project, budget, reload }: { project: string; budget: ReviewBudget; reload: () => void }) {
+export function TokenBudget({ project, budget, reload }: { project: string; budget: ReviewBudget; reload: () => void }) {
   const [entry, setEntry] = useState('');
   const [previous, setPrevious] = useState<number | null>(budget.limit);
   const limit = Number(entry);
@@ -109,7 +109,7 @@ export function PlanningReviews({ project }: { project: string }) {
     return postJson(path + '/model', { provider, model });
   }, () => { setChoice(''); resource.reload(); });
   return <>
-    {data?.review_budget && <TokenBudget project={project} budget={data.review_budget} reload={resource.reload} />}
+    <p className="text-sm text-muted-foreground">The token budget, the limit in dollars, the model of these reviews and the switch that stops them are under <Link href={reviewUrl(project, 'settings')} underline="always">Reviews, Settings</Link>.</p>
     <section className="grid gap-3 rounded-xl border border-border bg-card p-5">
     <div className="flex flex-wrap items-center justify-between gap-2">
       <h3 className="font-semibold">Automatic planning reviews</h3>

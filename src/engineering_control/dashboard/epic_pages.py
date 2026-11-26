@@ -39,7 +39,12 @@ import numpy
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import parent_choice, ranking, review_budget, review_flows
+from engineering_control.dashboard import (
+    parent_choice,
+    ranking,
+    review_budget,
+    review_settings,
+)
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.delivery import _typical
 from engineering_control.dashboard.parent_choice import THINKING_ROOM, Unusable
@@ -992,7 +997,8 @@ class EpicPages:
                     "likely_all": likely_all,
                     "largest": largest,
                     "run": parent_choice.latest_run(db, pid, KIND.name),
-                    "models": review_flows.model_choices(db),
+                    "models": review_settings.models(db, project.id),
+                    "roles": review_settings.roles(db, project.id),
                     "budget": review_budget.status(db, pid),
                 },
             }

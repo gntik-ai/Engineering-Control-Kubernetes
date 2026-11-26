@@ -16,6 +16,7 @@ from engineering_control.db.models import (
     ProjectReviewBudget,
     ProviderAccount,
     RecordVector,
+    ReviewSettings,
 )
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import STARTERS
@@ -59,7 +60,6 @@ def priced(repo: Any, models: list[str]) -> None:
 def test_a_judge_is_measured_on_known_pairs_within_dollars(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    monkeypatch.setattr(judging, "MAKERS", frozenset({"fixture"}))
     client, repo = _authenticated_client(tmp_path)
     try:
         data = seed(repo)
@@ -232,7 +232,6 @@ class Chooser:
 def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_story(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    monkeypatch.setattr(judging, "MAKERS", frozenset({"fixture"}))
     # In this test each model is a family of its own.
     monkeypatch.setattr(judging, "family_of", lambda provider, model: model)
     client, repo = _authenticated_client(tmp_path)
@@ -316,6 +315,8 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
             "judge": "other",
             "agreed": 1,
             "agreed_right": 1,
+            "at_once": 1,
+            "at_once_right": 1,
             "doubt": 0,
             "doubt_right": 0,
             "cost_each": 0.002,
@@ -422,6 +423,9 @@ def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
                 ).one()
                 item.issue_state = "open"
                 item.description = "Show failed runs to the operator and keep an audit entry."
+        # This project's settings let an answer go back once.
+        with repo.sessions.begin() as db:
+            db.scalars(select(ReviewSettings)).one().rounds = 1
         start = {"provider": "fixture", "model": "analysis", "token_cap": 90_000}
         judge = {"judge_provider": "fixture", "judge_model": "other"}
         # The judge is another model, and a run has a judge or a cheaper model first.
@@ -494,7 +498,9 @@ def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
         made = post(client, "reorganize/batches", kind="place")
         assert made.status_code == 200, made.text
         batch = client.get(BASE + "reorganize/batches/" + made.json()["id"]).json()
-        titles = sorted(item["child"]["title"] for item in batch["items"])
-        assert len(titles) == 2 and "analysis and other each chose" in json.dumps(batch)
+        titles = [item["child"]["title"] for item in batch["items"]]
+        # Only what the two agreed on at once: 42 was agreed after it went back.
+        assert titles == ["#41 Append the invocation ledger"]
+        assert "analysis and other each chose" in json.dumps(batch)
     finally:
         client.close()

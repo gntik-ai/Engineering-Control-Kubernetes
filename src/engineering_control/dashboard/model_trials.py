@@ -34,7 +34,7 @@ from engineering_control.dashboard import (
     parent_choice,
     primary_epics,
     review_budget,
-    review_flows,
+    review_settings,
 )
 from engineering_control.dashboard.project_records import (
     ProjectInvalid,
@@ -366,7 +366,8 @@ class ModelTrials:
             return {
                 "checks": checks,
                 "trials": [_report(run, lines[run.id], paid) for run in runs],
-                "models": review_flows.model_choices(db),
+                "models": review_settings.models(db, project.id),
+                "roles": review_settings.roles(db, project.id),
                 "budget": review_budget.status(db, project.id),
                 "sample": SAMPLE,
                 "gate": {

@@ -1250,6 +1250,26 @@ class BugRecord(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (UniqueConstraint("project_id", "item_id", name="uq_bug_records_item"),)
 
 
+class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
+    """What one project's reviews are set to (migration 0088): a limit in US dollars a
+    month and since when it counts, the models that answer and judge unless a run says
+    otherwise, the makers its texts may be sent to, and how often an answer goes back."""
+
+    __tablename__ = "review_settings"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), unique=True
+    )
+    dollar_limit: Mapped[float] = mapped_column(Float, default=3.0)
+    dollars_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answer_provider: Mapped[str | None] = mapped_column(String(32))
+    answer_model: Mapped[str | None] = mapped_column(String(200))
+    judge_provider: Mapped[str | None] = mapped_column(String(32))
+    judge_model: Mapped[str | None] = mapped_column(String(200))
+    # The makers its texts may be sent to; none for the defaults.
+    makers: Mapped[list[str] | None] = mapped_column(JSON)
+    rounds: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):
     """What a model said to one question of a trial, beside the answer on record
     (migration 0084). A trial asks another model the questions a check already has an

@@ -74,6 +74,7 @@ interface Worklist {
   run: Run | null;
   models: Model[];
   first: FirstModel | null;
+  roles?: { answer: Model | null; judge: Model | null } | null;
 }
 
 /**
@@ -148,6 +149,7 @@ export function PrimaryEpics({ project }: { project: string }) {
               twoModels
               judged
               first={data.first}
+              roles={data.roles}
               options={[
                 { key: 'unclear_only', label: 'Only where the texts do not point to one Epic' },
                 { key: 'again', label: 'Ask again about those that have an answer' },

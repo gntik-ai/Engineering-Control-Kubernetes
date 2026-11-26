@@ -23,7 +23,7 @@ from uuid import NAMESPACE_OID, UUID, uuid5
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard import review_budget, review_flows, review_settings
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
     ProjectInvalid,
@@ -39,7 +39,7 @@ from engineering_control.db.models import (
     ProjectReviewBudget,
     ScorerDecision,
 )
-from engineering_control.models.providers import family_of
+from engineering_control.models.providers import family_of, maker
 from engineering_control.models.service import ModelError, Models, Question, Reply
 
 log = logging.getLogger(__name__)
@@ -56,8 +56,6 @@ TRIES: Final = 3
 # therefore the answer plus this room: without it such a model is cut before its answer
 # begins, and the call is paid for nothing.
 THINKING_ROOM: Final = 8000
-# How often an answer goes back when the judge's own answer differs from it.
-BACK: Final = 1
 # What a model's trial on a check must show before a run asks it first by default: this
 # many questions settled by itself, and this share of them the same as on record.
 GATE_SETTLED: Final = 30
@@ -306,6 +304,10 @@ def agreed_lines(
             review is None
             or review.state != "answered"
             or not review.agreed
+            # Agreed only after the answer went back is not agreed enough for a batch:
+            # measured on issues whose Story is known, such answers were right little
+            # more than half the time.
+            or review.rounds
             or review.decision != "pending"
             or review.parent_id is None
             or not review.checked
@@ -568,6 +570,13 @@ def start(
             choices = [*choices, *more(db)]
         if {"provider": provider, "model": model} not in choices:
             raise ProjectInvalid("Choose a model of an account that can be asked.")
+        # A project's texts go only to the makers its settings allow.
+        for named in (first, judge, (provider, model)):
+            if named is not None and not review_settings.permits(db, project.id, *named):
+                raise ProjectInvalid(
+                    f"This project's texts are not sent to {maker(*named)}. Allow the maker "
+                    "under Reviews, Settings, or choose another model."
+                )
         if first is not None:
             if not getattr(spec, "two_models", False):
                 raise ProjectInvalid("This kind of run asks one model only.")
@@ -922,7 +931,7 @@ def _settle(
                     review.judge = _said(read, reply, tokens)
                     if agreeing(spec, _answer(review), read):
                         _conclude(db, spec, run, review, child, reply, True)
-                    elif review.rounds < BACK:
+                    elif review.rounds < review_settings.of(db, run.project_id).rounds:
                         # The two differ: the answer goes back, told what the other chose.
                         review.phase, review.rounds = "back", review.rounds + 1
                         _TROUBLE.pop(run.id, None)

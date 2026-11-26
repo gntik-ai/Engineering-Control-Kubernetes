@@ -23,6 +23,7 @@ from engineering_control.db.models import (
     ProjectStoryEpic,
     ProjectUserStory,
     ProviderAccount,
+    ReviewSettings,
     StoryIssueCoverage,
     WorkspaceAction,
     WorkspaceCandidate,
@@ -164,6 +165,8 @@ def seed(repo: Any) -> dict[str, Any]:
                 sealed_key="test",
             )
         )
+        # The test account's models are of the maker "fixture": the project allows it.
+        db.add(ReviewSettings(project_id=pid, makers=["fixture"]))
         db.add(
             WorkspaceImport(
                 project_id=pid,
