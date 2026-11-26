@@ -2,6 +2,7 @@ import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Input, SimpleSele
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
+import type { Alone } from './ChangeBatches';
 import { dollars, whole, type Model, type RunPlan } from './ChoiceRun';
 import { TokenBudget } from './PlanningReviews';
 
@@ -33,6 +34,8 @@ interface Settings {
     unpriced: number;
     counted: boolean;
   }[];
+  /** How far each kind of change goes without the administrator, and the record that decides it. */
+  alone: Alone[];
   checks: {
     check: string;
     label: string;
@@ -69,12 +72,13 @@ export function ReviewSettings({ project }: { project: string }) {
   const [planner, setPlanner] = useState('');
   const [cheaper, setCheaper] = useState(true);
   const [numbers, setNumbers] = useState<Record<string, string>>({});
+  const [alone, setAlone] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const data = settings.data;
   // What the form holds, and what it held when it was last filled from what is saved.
-  const form = JSON.stringify([limit, answer, judge, judge ? third : '', rounds, allowed, cheaper, numbers]);
+  const form = JSON.stringify([limit, answer, judge, judge ? third : '', rounds, allowed, cheaper, numbers, alone]);
   const filled = useRef<string | null>(null);
   const fill = (from: Settings) => {
     const next = {
@@ -86,6 +90,7 @@ export function ReviewSettings({ project }: { project: string }) {
       allowed: Object.fromEntries(from.makers.map((entry) => [entry.maker, entry.allowed])),
       cheaper: from.cheaper_first,
       numbers: Object.fromEntries(from.numbers.map((entry) => [entry.key, String(entry.value)])),
+      alone: Object.fromEntries(from.alone.map((entry) => [entry.kind, entry.setting as string])),
     };
     setLimit(next.limit);
     setAnswer(next.answer);
@@ -95,6 +100,7 @@ export function ReviewSettings({ project }: { project: string }) {
     setAllowed(next.allowed);
     setCheaper(next.cheaper);
     setNumbers(next.numbers);
+    setAlone(next.alone);
     filled.current = JSON.stringify([
       next.limit,
       next.answer,
@@ -104,6 +110,7 @@ export function ReviewSettings({ project }: { project: string }) {
       next.allowed,
       next.cheaper,
       next.numbers,
+      next.alone,
     ]);
   };
   // The page reads what is saved again every minute. That must not take away what was
@@ -148,6 +155,7 @@ export function ReviewSettings({ project }: { project: string }) {
           rounds: Number(rounds),
           cheaper_first: cheaper,
           numbers: Object.fromEntries(data.numbers.map((entry) => [entry.key, Number(numbers[entry.key])])),
+          alone,
         }),
       () => {
         // What is saved is what the form holds: the next reading fills it again.
@@ -453,6 +461,50 @@ export function ReviewSettings({ project }: { project: string }) {
                   </li>
                 ))}
               </ul>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>How far a change goes without you</CardTitle>
+            </CardHeader>
+            <CardBody className="grid gap-4">
+              <p className="text-sm text-muted-foreground">
+                What two models choose alike, and the texts alone put first as well, is settled: it is not shown to you
+                one by one. It can wait in a batch you approve after judging a sample of it, or be applied without you.
+                Applying is only for changes that add or correct and can be undone, and only while this project’s own
+                record allows it: the sampled lines you judged, and how many of them were wrong. A share of what was
+                applied is put before you afterwards; a line you judge wrong is put back, and when the record no longer
+                holds, applying stops by itself.
+              </p>
+              {data.alone.map((entry) => (
+                <div key={entry.kind} className="grid gap-1">
+                  <label className="grid gap-1 text-sm sm:max-w-md">
+                    {entry.title}
+                    <SimpleSelect
+                      aria-label={`How far “${entry.title}” goes without you`}
+                      value={alone[entry.kind] ?? 'propose'}
+                      items={[
+                        { value: 'propose', label: 'Waits as one batch for your approval' },
+                        { value: 'apply', label: 'Applied without you, where the record allows' },
+                        { value: 'off', label: 'Not gathered: each answer waits in its worklist' },
+                      ]}
+                      onValueChange={(value) => setAlone({ ...alone, [entry.kind]: String(value ?? 'propose') })}
+                    />
+                  </label>
+                  <p className="text-sm text-muted-foreground">
+                    The record: {whole(entry.judged)} sampled {entry.judged === 1 ? 'line' : 'lines'} judged,{' '}
+                    {whole(entry.wrong)} wrong; applying needs {whole(entry.needed)} judged and no more than{' '}
+                    {(entry.accepted * 100).toLocaleString('en')}% wrong.{' '}
+                    {entry.in_force
+                      ? 'Applying is in force.'
+                      : (alone[entry.kind] ?? 'propose') === 'apply'
+                        ? entry.why || 'Applying comes into force once this is saved.'
+                        : entry.allowed
+                          ? 'The record would allow applying.'
+                          : ''}
+                  </p>
+                </div>
+              ))}
             </CardBody>
           </Card>
           <Card>

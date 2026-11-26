@@ -78,6 +78,11 @@ export interface Review {
     } | null;
   } | null;
   rounds?: number;
+  /** Where the answer stands: one of what needs the administrator, settled, or stale; and in words. */
+  stands?: string;
+  stands_says?: string;
+  /** Whether the texts alone put the same candidate first; null where that is not known. */
+  texts_same?: boolean | null;
 }
 
 export const whole = (value: number) => value.toLocaleString('en');
@@ -444,6 +449,9 @@ export function ReviewAnswer({
         </p>
       ) : review.agreed === false ? (
         <p className="text-foreground">The answer could not tell, so no second model was asked.</p>
+      ) : null}
+      {review.stands && ['back', 'texts', 'unchecked', 'nothing', 'single'].includes(review.stands) ? (
+        <p className="text-foreground">{review.stands_says}.</p>
       ) : null}
       {review.agreed === false && review.judge?.third ? (
         <p className="text-foreground">

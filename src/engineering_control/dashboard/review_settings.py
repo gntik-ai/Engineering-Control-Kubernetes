@@ -59,6 +59,10 @@ AT_YOUR_WORD: Final = frozenset(
         "zhipu",
     }
 )
+# How far what two models agree on goes without the administrator: it stays in the
+# worklist, it is put into a batch to approve, or it is applied where the project's
+# record of judged samples allows.
+ALONE: Final = ("off", "propose", "apply")
 # What measuring a judge is counted under: it has its own sum.
 MEASURED: Final = frozenset({"judge_trial", "answer_trial", "compare_trial"})
 # How long what a project has spent is remembered before it is added up again.
@@ -143,6 +147,28 @@ NUMBERS: Final[dict[str, Number]] = {
     "judge_sample": Number(
         60, 10, 200, "pairs", "Right pairs, and as many wrong ones, a measurement of a judge asks."
     ),
+    "alone_from": Number(
+        40,
+        1,
+        500,
+        "lines",
+        "Lines of batches you must have judged before what is agreed is applied without you.",
+    ),
+    "alone_sample": Number(
+        5,
+        1,
+        50,
+        "%",
+        "The share of what was applied without you that is put before you to judge.",
+        whole=False,
+    ),
+    "alone_waiting": Number(
+        20,
+        1,
+        200,
+        "lines",
+        "Lines to judge that may wait before applying without you pauses.",
+    ),
     "doubt_dollars": Number(
         1,
         0,
@@ -178,6 +204,13 @@ class Settings:
     cheaper_first: bool = True
     # The numbers the project set for itself; the others are the defaults.
     own: Mapping[str, float] = field(default_factory=dict)
+    # How far each kind of change goes without the administrator, by the kind of batch.
+    alone: Mapping[str, str] = field(default_factory=dict)
+
+    def goes(self, kind: str) -> str:
+        """ "off", "propose" or "apply" for that kind of batch; proposing unless set."""
+        said = self.alone.get(kind)
+        return said if said in ALONE else "propose"
 
     def number(self, key: str) -> float:
         known = NUMBERS[key]
@@ -207,6 +240,7 @@ def of(db: Session, project: UUID) -> Settings:
         (row.doubt_provider or "", row.doubt_model) if row.doubt_model else None,
         row.cheaper_first,
         dict(row.numbers or {}),
+        dict(row.alone or {}),
     )
 
 
@@ -387,7 +421,7 @@ class ReviewSettingsService:
             for entry in review_flows.decision_models(db):
                 offered.setdefault(maker(entry["provider"], entry["model"]), 0)
             defaults = default_makers(db)
-            from engineering_control.dashboard import parent_choice
+            from engineering_control.dashboard import parent_choice, reorg
 
             return {
                 "dollars": {
@@ -416,6 +450,9 @@ class ReviewSettingsService:
                 # and what a run of each check would ask and is likely to cost.
                 "costs": costs(db, project.id, since),
                 "checks": parent_choice.estimates(db, project),
+                # How far each kind of change goes without the administrator, with the
+                # record that decides whether applying is in force.
+                "alone": [reorg.alone_standing(db, project.id, kind) for kind in reorg.ALONE],
                 "makers": [
                     {
                         "maker": made_by,
@@ -441,6 +478,7 @@ class ReviewSettingsService:
         cheaper_first: bool = True,
         numbers: Mapping[str, float] | None = None,
         third: tuple[str, str] | None = None,
+        alone: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Keep what the project's reviews are set to. ``numbers`` none leaves the
         numbers as they are; given, a number that is its default is not kept, so that
@@ -501,5 +539,11 @@ class ReviewSettingsService:
             row.cheaper_first = cheaper_first
             if own is not None:
                 row.numbers = own or None
+            if alone is not None:
+                from engineering_control.dashboard import reorg
+
+                if any(k not in reorg.ALONE or v not in ALONE for k, v in alone.items()):
+                    raise ProjectInvalid("That is not a way a change can go on.")
+                row.alone = {k: v for k, v in alone.items() if v != "propose"} or None
             forget(project.id)
         return self.shown(name)

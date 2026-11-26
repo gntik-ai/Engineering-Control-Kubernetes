@@ -1283,6 +1283,9 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     cheaper_first: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     # The numbers the project set for itself, by their key; the others are the defaults.
     numbers: Mapped[dict[str, float] | None] = mapped_column(JSON)
+    # How far each kind of change goes without the administrator (migration 0091), by
+    # the kind of batch: "off", "propose" or "apply". None for proposing everywhere.
+    alone: Mapped[dict[str, str] | None] = mapped_column(JSON)
 
 
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):
@@ -1374,6 +1377,9 @@ class ReorgBatch(UUIDPrimaryKey, Timestamps, Base):
     allowed_wrong: Mapped[int] = mapped_column(Integer, default=0)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Applied without the administrator, on the project's record of judged samples
+    # (migration 0091): its sample is judged afterwards.
+    alone: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class ReorgLine(UUIDPrimaryKey, Timestamps, Base):

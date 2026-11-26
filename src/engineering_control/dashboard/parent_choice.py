@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Protocol
@@ -352,6 +353,78 @@ def _conclude(
         keep(db, run, review, child, reply)
 
 
+# Why an answer needs the administrator, the most doubtful first: the two models differ;
+# the answer could not tell; they agreed only after one was told what the other chose;
+# they agree and the texts alone point elsewhere; they agree and a passage quoted is not
+# in the texts; they agree that nothing fits, which is the administrator's to act on;
+# and an answer no second model was asked about.
+NEEDS: Final = ("differ", "unclear", "back", "texts", "unchecked", "nothing", "single")
+SAID: Final = {
+    "differ": "The two models chose differently",
+    "unclear": "The answer could not tell",
+    "back": "They agreed only after one was told what the other chose",
+    "texts": "The two models agree, and the texts alone point to another",
+    "unchecked": "The two models agree, and a passage quoted is not in the texts",
+    "nothing": "The two models agree on an answer that is yours to act on",
+    "single": "One model answered, and no second was asked",
+    "settled": "Two models agreed, and it waits in a batch",
+    "stale": "The texts changed since it was answered",
+}
+
+
+def texts_same(spec: Any, child: Any, review: ChoiceReview) -> bool | None:
+    """Whether the texts alone point to the parent the answer chose: it is the first of
+    the candidates the answer was shown, which a kind that ranks them lists by how well
+    the texts fit. None where the kind does not rank them or the answer chose none."""
+    listed = review.shortlist or []
+    if not getattr(spec, "ranked", False) or review.parent_id is None or not listed:
+        return None
+    return str(listed[0].get("id")) == str(review.parent_id)
+
+
+def where(spec: Any, child: Any, review: ChoiceReview | None, current: str) -> str:
+    """Where an answer stands: one of NEEDS when it needs the administrator, "settled"
+    when two models agreed at once and it can go on in a batch, "stale" when the texts
+    changed, and nothing where there is no answer waiting."""
+    if review is None or review.state != "answered" or review.decision != "pending":
+        return ""
+    if review.revision != current:
+        return "stale"
+    if review.agreed is False:
+        return "unclear" if review.answer == "unclear" else "differ"
+    if review.agreed is None:
+        return "single"
+    if review.rounds:
+        # Measured on issues whose Story is known: answers agreed only after going back
+        # were right little more than half the time.
+        return "back"
+    if review.parent_id is None:
+        return "nothing"
+    if not review.checked:
+        return "unchecked"
+    if getattr(spec, "texts_decide", False) and texts_same(spec, child, review) is False:
+        return "texts"
+    return "settled"
+
+
+def standings(db: Session, project: ProjectRecord, kind: str) -> Counter[str]:
+    """How many answers of a check stand where: for the numbers of a project."""
+    spec = KINDS[kind]
+    scope = spec.scope(db, project)
+    known = reviews(db, project.id, kind)
+    found: Counter[str] = Counter()
+    if scope.refusal():
+        return found
+    for child in scope.children():
+        review = known.get(child.id)
+        if review is None:
+            found["unasked"] += 1
+            continue
+        current = standing(scope, child, scope.shortlist(child), review)
+        found[where(spec, child, review, current) or "unasked"] += 1
+    return found
+
+
 def agreed_lines(
     db: Session, project: ProjectRecord, kind: str, link_kind: str, outcome: str
 ) -> list[Any]:
@@ -365,19 +438,10 @@ def agreed_lines(
     lines = []
     for child in scope.children():
         review = known.get(child.id)
-        if (
-            review is None
-            or review.state != "answered"
-            or not review.agreed
-            # Agreed only after the answer went back is not agreed enough for a batch:
-            # measured on issues whose Story is known, such answers were right little
-            # more than half the time.
-            or review.rounds
-            or review.decision != "pending"
-            or review.parent_id is None
-            or not review.checked
-            or review.revision != standing(scope, child, scope.shortlist(child), review)
-        ):
+        if review is None or review.parent_id is None:
+            continue
+        current = standing(scope, child, scope.shortlist(child), review)
+        if where(spec, child, review, current) != "settled":
             continue
         judge = (review.judge or {}).get("model") or "a second model"
         quotes = " ".join(

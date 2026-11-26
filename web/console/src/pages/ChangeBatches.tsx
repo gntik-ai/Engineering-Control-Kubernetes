@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { ApiError, apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
-import { recordUrl } from '../router';
+import { recordUrl, reviewUrl } from '../router';
 import { some, whole } from './ChoiceRun';
 
 type RecordKind = 'issues' | 'stories' | 'epics';
@@ -38,6 +38,22 @@ interface Batch {
   can_undo: boolean;
   /** What the batch does cannot be put back from here: it writes on GitHub. */
   final?: boolean;
+  /** Applied without the administrator, on the project's record: its sample is judged afterwards. */
+  alone?: boolean;
+}
+/** How far a kind of change goes without the administrator, and the record that decides it. */
+export interface Alone {
+  kind: string;
+  title: string;
+  setting: 'off' | 'propose' | 'apply';
+  judged: number;
+  wrong: number;
+  needed: number;
+  accepted: number;
+  waiting: number;
+  allowed: boolean;
+  in_force: boolean;
+  why: string;
 }
 interface Overview {
   kinds: {
@@ -48,6 +64,8 @@ interface Overview {
     ready: number;
     measured: Measured;
     open: Batch | null;
+    /** For what may be applied without the administrator: how far it goes, and the record. */
+    alone?: Alone | null;
   }[];
   past: Batch[];
   undo_days: number;
@@ -97,7 +115,18 @@ function measuredText(measured: Measured): string {
 }
 
 /** One open batch: its sample to judge, every line to strike, and the word that applies it. */
-function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batch; onChanged: () => void }) {
+function OpenBatch({
+  project,
+  batch,
+  onChanged,
+  after = false,
+}: {
+  project: string;
+  batch: Batch;
+  onChanged: () => void;
+  /** The batch was applied without the administrator: only its sample is left to judge. */
+  after?: boolean;
+}) {
   const base = 'projects/' + encodeURIComponent(project) + '/reorganize/batches/' + batch.id;
   const [page, setPage] = useState(1);
   const list = useResource<Lines>(apiUrl(base, { page }), 30000, { keepPreviousData: true });
@@ -124,72 +153,83 @@ function OpenBatch({ project, batch, onChanged }: { project: string; batch: Batc
   return (
     <div className="grid gap-3 rounded-lg border border-border p-4">
       {problem ? <Alert tone="destructive" title={problem} /> : null}
-      <p className="text-sm text-foreground">
-        {some(now.lines, 'change', 'changes')} in this batch. Judge the {some(now.sample, 'line', 'lines')} of its
-        sample first: {whole(now.sample_judged)} of {whole(now.sample)} judged.{' '}
-        {now.allowed_wrong
-          ? `More than ${whole(now.allowed_wrong)} wrong among them withdraws the batch.`
-          : 'One wrong among them withdraws the batch.'}{' '}
-        Any other line can be struck; a struck line is not applied.
-      </p>
+      {after ? (
+        <p className="text-sm text-foreground">
+          {some(now.applied, 'change was', 'changes were')} applied without you on {day(now.decided_at)}, because this
+          project’s record of judged samples allowed it. Judge the {some(now.sample, 'line', 'lines')} of its sample:{' '}
+          {whole(now.sample_judged)} of {whole(now.sample)} judged. A line you judge wrong is put back at once, and
+          counts in the record that decides whether applying goes on. The whole batch can be undone below.
+        </p>
+      ) : (
+        <p className="text-sm text-foreground">
+          {some(now.lines, 'change', 'changes')} in this batch. Judge the {some(now.sample, 'line', 'lines')} of its
+          sample first: {whole(now.sample_judged)} of {whole(now.sample)} judged.{' '}
+          {now.allowed_wrong
+            ? `More than ${whole(now.allowed_wrong)} wrong among them withdraws the batch.`
+            : 'One wrong among them withdraws the batch.'}{' '}
+          Any other line can be struck; a struck line is not applied.
+        </p>
+      )}
       <LoadError resource={list} />
       {!list.data ? <Skeleton className="h-24 w-full" /> : null}
       <ul className="grid gap-2">
-        {(list.data?.items ?? []).map((line) => (
-          <li key={line.id} className="grid gap-1 rounded-lg border border-border p-3 text-sm">
-            <div className="flex flex-wrap items-center gap-2">
-              {line.sampled ? (
-                <Badge tone={line.verdict ? 'neutral' : 'warning'} size="sm">
-                  {line.verdict ? 'Sample · judged' : 'Sample · to judge'}
-                </Badge>
-              ) : null}
-              <span className="tabular-nums text-muted-foreground">{percent(line.confidence)}</span>
-              <span className="ms-auto flex gap-2">
+        {(list.data?.items ?? [])
+          .filter((line) => !after || line.sampled)
+          .map((line) => (
+            <li key={line.id} className="grid gap-1 rounded-lg border border-border p-3 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
                 {line.sampled ? (
+                  <Badge tone={line.verdict ? 'neutral' : 'warning'} size="sm">
+                    {line.verdict ? 'Sample · judged' : 'Sample · to judge'}
+                  </Badge>
+                ) : null}
+                <span className="tabular-nums text-muted-foreground">{percent(line.confidence)}</span>
+                <span className="ms-auto flex gap-2">
+                  {line.sampled ? (
+                    <Button
+                      size="sm"
+                      variant={line.verdict === 'right' ? 'primary' : 'secondary'}
+                      loading={busy === line.id + 'right'}
+                      disabled={Boolean(busy)}
+                      onClick={() => void judge(line, line.verdict === 'right' ? null : 'right')}
+                    >
+                      Right
+                    </Button>
+                  ) : null}
                   <Button
                     size="sm"
-                    variant={line.verdict === 'right' ? 'primary' : 'secondary'}
-                    loading={busy === line.id + 'right'}
+                    variant={line.verdict === 'wrong' ? 'destructive' : 'secondary'}
+                    loading={busy === line.id + 'wrong'}
                     disabled={Boolean(busy)}
-                    onClick={() => void judge(line, line.verdict === 'right' ? null : 'right')}
+                    onClick={() => void judge(line, line.verdict === 'wrong' ? null : 'wrong')}
                   >
-                    Right
+                    {line.sampled ? 'Wrong' : line.verdict === 'wrong' ? 'Struck' : 'Strike'}
                   </Button>
-                ) : null}
-                <Button
-                  size="sm"
-                  variant={line.verdict === 'wrong' ? 'destructive' : 'secondary'}
-                  loading={busy === line.id + 'wrong'}
-                  disabled={Boolean(busy)}
-                  onClick={() => void judge(line, line.verdict === 'wrong' ? null : 'wrong')}
-                >
-                  {line.sampled ? 'Wrong' : line.verdict === 'wrong' ? 'Struck' : 'Strike'}
-                </Button>
-              </span>
-            </div>
-            <div>
-              <Link href={recordUrl(project, line.child.kind, line.child.id)}>{line.child.title}</Link>
-              {line.parent.id === line.child.id ? null : (
-                <>
-                  {batch.kind === 'unsupported' || batch.kind === 'extra_epics'
-                    ? ' ✕ '
-                    : batch.kind === 'close'
-                      ? ' · delivered, as shown by '
-                      : batch.kind.startsWith('retire_')
-                        ? ' · says the same as '
-                        : ' → '}
-                  <Link href={recordUrl(project, line.parent.kind, line.parent.id)}>{line.parent.title}</Link>
-                </>
-              )}
-            </div>
-            <div className="text-xs text-muted-foreground">{line.reason}</div>
-          </li>
-        ))}
+                </span>
+              </div>
+              <div>
+                <Link href={recordUrl(project, line.child.kind, line.child.id)}>{line.child.title}</Link>
+                {line.parent.id === line.child.id ? null : (
+                  <>
+                    {batch.kind === 'unsupported' || batch.kind === 'extra_epics'
+                      ? ' ✕ '
+                      : batch.kind === 'close'
+                        ? ' · delivered, as shown by '
+                        : batch.kind.startsWith('retire_')
+                          ? ' · says the same as '
+                          : ' → '}
+                    <Link href={recordUrl(project, line.parent.kind, line.parent.id)}>{line.parent.title}</Link>
+                  </>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground">{line.reason}</div>
+            </li>
+          ))}
       </ul>
       {list.data && list.data.pages > 1 ? (
         <Pagination page={list.data.page} pageCount={list.data.pages} onPageChange={setPage} />
       ) : null}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className={after ? 'hidden' : 'flex flex-wrap items-center gap-2'}>
         <Button size="sm" disabled={!judged} onClick={() => setAsking('approve')}>
           Approve {whole(now.lines - now.struck)} {now.lines - now.struck === 1 ? 'change' : 'changes'}
         </Button>
@@ -299,6 +339,28 @@ export function ChangeBatches({ project }: { project: string }) {
                       {some(kind.ready, 'more change is', 'more changes are')} ready for a next batch.
                     </p>
                   ) : null}
+                  {kind.alone ? (
+                    <p className="text-sm text-muted-foreground">
+                      {kind.alone.in_force
+                        ? 'In this project these are applied without you within ten minutes, with a share of them to judge afterwards. '
+                        : kind.alone.setting === 'apply'
+                          ? `Applying without you is asked for and not in force. ${kind.alone.why} `
+                          : kind.alone.setting === 'off'
+                            ? 'What two models agree on is kept out of these batches: it waits in its worklist. '
+                            : `Each batch waits for your approval. So far you judged ${whole(kind.alone.judged)} sampled ${kind.alone.judged === 1 ? 'line' : 'lines'} of these batches, ${whole(kind.alone.wrong)} of them wrong. `}
+                      <Link href={reviewUrl(project, 'settings')}>Reviews, Settings</Link> says how far they go alone.
+                    </p>
+                  ) : null}
+                </section>
+              ))}
+            {data.past
+              .filter((batch) => batch.alone && batch.state === 'approved' && batch.sample_judged < batch.sample)
+              .map((batch) => (
+                <section key={batch.id} className="grid gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">
+                    {batch.title}: applied without you, its sample to judge
+                  </h3>
+                  <OpenBatch project={project} batch={batch} onChanged={overview.reload} after />
                 </section>
               ))}
             {data.past.length ? (
@@ -315,6 +377,7 @@ export function ChangeBatches({ project }: { project: string }) {
                       </Badge>
                       <span className="font-medium text-foreground">{batch.title}</span>
                       <span className="text-muted-foreground">
+                        {batch.alone ? 'applied without you · ' : ''}
                         {day(batch.decided_at)} ·{' '}
                         {batch.state === 'withdrawn'
                           ? `${some(batch.lines, 'line', 'lines')}, none applied; ${whole(batch.sample_wrong)} of the sample judged wrong`

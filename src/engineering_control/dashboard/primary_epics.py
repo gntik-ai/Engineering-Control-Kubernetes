@@ -265,6 +265,12 @@ class _Kind:
     two_models = True
     # A run may have a judge: a model of another maker that answers unseen.
     judged = True
+    # Its candidates are listed by how well the texts alone fit, the best first.
+    ranked = True
+    # What two models agree on goes on only where the texts put the same Epic first: the
+    # rule measured for issues and their Stories, taken over here without a measurement
+    # of its own.
+    texts_decide = True
     actionable: tuple[str, ...] = ("epic",)
     nothing_to_ask = (
         "Every User Story that waits for a primary Epic already has an answer. "
@@ -349,6 +355,19 @@ class PrimaryEpics:
                 agreed = bool(waiting and shown and shown["agreed"])
                 counts["doubt"] += doubt
                 counts["agreed"] += agreed
+                # Where the answer stands: what needs the administrator, and what two
+                # models agreed on and goes on in a batch.
+                stands = parent_choice.where(KIND, story, review, current)
+                needs = stands in parent_choice.NEEDS
+                counts["needs"] += needs
+                counts["settled"] += stands == "settled"
+                if shown is not None:
+                    shown["stands"] = stands
+                    shown["stands_says"] = parent_choice.SAID.get(stands, "")
+                    if review is not None:
+                        shown["texts_same"] = parent_choice.texts_same(KIND, story, review)
+                if (show == "needs" and not needs) or (show == "settled" and stands != "settled"):
+                    continue
                 if (
                     (show == "waiting" and not waiting)
                     or (show == "unanswered" and waiting)
@@ -364,7 +383,14 @@ class PrimaryEpics:
                 margin = scores[0] / scores[1] if len(scores) > 1 and scores[1] else 9.0
                 rows.append(
                     (
-                        (0 if doubt else 1 if waiting else 2, margin if doubt else 0.0),
+                        (
+                            parent_choice.NEEDS.index(stands)
+                            if needs
+                            else len(parent_choice.NEEDS) + (0 if waiting else 1),
+                            # Of what needs the administrator, the Stories whose two
+                            # best Epics lie closest first.
+                            margin if needs else 0.0,
+                        ),
                         story,
                         listed,
                         shown,
@@ -416,6 +442,8 @@ class PrimaryEpics:
                         "differ",
                         "doubt",
                         "agreed",
+                        "needs",
+                        "settled",
                     )
                 },
                 "likely": likely,

@@ -197,8 +197,8 @@ export function ProjectWorkspace({
             ) : isReviewView(view) ? (
               <div className="grid min-w-0 gap-5" key={project.project}>
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
-                {view === 'related-work' && <PlanningHealth project={project.project} />}
                 {view === 'related-work' && <OrphanWorklist project={project.project} />}
+                {view === 'related-work' && <PlanningHealth project={project.project} />}
                 {view === 'related-work' && <EvidencePanel project={project.project} />}
                 {view === 'planning' && <PrimaryEpics project={project.project} />}
                 {view === 'planning' && <StoryStates project={project.project} />}

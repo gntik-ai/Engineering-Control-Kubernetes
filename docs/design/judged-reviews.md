@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0, J1 and J2 are built, J3 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0 to J3 are built, J4 to J6 are not.
 
 ## What is asked for
 
@@ -393,3 +393,49 @@ What the first part left open is built.
 - OpenRouter's public list of models, read 25 November 2026, for prices.
 - OpenRouter on decision models: [the Decisions interface](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md), [their use](https://openrouter.ai/skills/openrouter-decisions), [which are used most](https://openrouter.ai/rankings/decisions?view=day).
 - On judges: [JudgeBench](https://benchlm.ai/benchmarks/judgebench), and a [roundup of 2026 studies of their reliability](https://dev.to/bean_bean/llm-as-judge-reliability-in-2026-what-8-june-studies-actually-show-eca). Both are secondary; neither ranks the models named here.
+
+## What joining the texts measured (26 November 2026)
+
+The candidates of an issue are listed by how well the texts alone fit: shared words and closeness in meaning, joined. That ranking costs nothing and no model made it. On the 50 answers GPT-5.6 Luna and Claude Haiku 5.5 agreed on at once, of Falcone's 60 issues with a known User Story:
+
+| What the two agreed on | Answers | Right |
+| --- | ---: | ---: |
+| The Story the texts alone rank first | 35 | 32 |
+| Another Story than the texts rank first | 15 | 10 |
+| The Story closest in meaning | 24 | 21 |
+
+- **Where the texts say the same, the two are right 9 times in 10; where the texts point elsewhere, 2 times in 3.** So the texts are the third reader a third model was not: independent, and free.
+- **It is still not the 5% you accept.** Three wrong in 35 is too few to tell 91% from 95%, and some of the "wrong" may be a second Story that fits as well as the one on record. Nothing is applied on this measurement. What decides is the project's own record: the sampled lines you judge.
+
+## J3 as built
+
+**Where an answer stands.** Each answer of the two worklists is one of:
+
+- **Settled**: two models chose alike at once, every passage quoted is in the texts, and the texts alone rank the same candidate first. It is not shown one by one. It goes on in a batch.
+- **Needs you**, the most doubtful first: the two chose differently; the answer could not tell; they agreed only after one was told what the other chose; they agree and the texts point elsewhere; they agree and a quoted passage is not in the texts; they agree on an answer that is yours to act on, such as "none fits" or "a bug"; and an answer no second model was asked about.
+- **Changed**: the texts changed since it was answered. The next run asks again.
+
+For primary Epics the rule about the texts is taken over from the issues: it was not measured there.
+
+**The worklists open on what needs you.** Issues with no User Story, on Related Work, and primary Epics, on Planning, list what needs you and say why for each, the primary Epics in the order of how close the two best Epics lie. A line above says how many are settled and where they went, and how many were not asked about yet. On Related Work the worklist now comes before Planning health.
+
+**What is settled goes on together.** In Reviews, Settings, for placing issues under a User Story and for choosing primary Epics, one of:
+
+- **Waits as one batch for your approval** (as it was): a sample to judge, then one word.
+- **Applied without you, where the record allows**: decision 1.
+- **Not gathered**: each answer waits in its worklist.
+
+**The record, the sample and the stop.** Applying without you is in force for a kind of change only while all of this holds:
+
+- The settings ask for it.
+- You judged at least 40 sampled lines of that kind's batches in this project.
+- Of the latest hundred you judged, no more than 5% were wrong.
+- No more than 20 lines applied before still wait to be judged.
+
+Every ten minutes what is settled is then applied as a batch that can be undone for thirty days like any other. One in twenty of its lines is put before you to judge afterwards, under Changes to approve. A line you judge wrong is put back at once and counts in the record; when the record no longer holds, applying stops by itself, the kind proposes batches again, and Settings says why. The four numbers can be changed in Settings.
+
+**No project applies anything today.** Every project proposes, and none has a record yet.
+
+**The digest.** The daily digest in the chat says for each project how many answers need you and how many lines applied without you wait to be judged; Planning health keeps both numbers day by day.
+
+**Not exercised on live:** a run with a judge on Falcone's worklists, a batch of settled answers, and applying on a record. The first two wait for a run you start; the third for 40 lines you judge.

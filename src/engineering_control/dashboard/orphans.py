@@ -504,6 +504,12 @@ class _Kind:
     two_models = True
     # A run may have a judge: a model of another maker that answers unseen.
     judged = True
+    # Its candidates are listed by how well the texts alone fit, the best first.
+    ranked = True
+    # What two models agree on goes on only where the texts put the same Story first.
+    # Measured on Falcone on 26 November 2026: 32 of 35 such answers were right, and 10
+    # of the 15 where the texts put another first.
+    texts_decide = True
     actionable: tuple[str, ...] = ("story", "bug")
     nothing_to_ask = (
         "Every open issue without a User Story already has an answer. "
@@ -585,6 +591,11 @@ class Orphans:
                 agreed = bool(waiting and shown and shown["agreed"])
                 counts["doubt"] += doubt
                 counts["agreed"] += agreed
+                # Where the answer stands: what needs the administrator, and what two
+                # models agreed on and goes on in a batch.
+                stands = parent_choice.where(KIND, issue, review, current)
+                counts["needs"] += stands in parent_choice.NEEDS
+                counts["settled"] += stands == "settled"
                 if parent_choice.approvable(shown, KIND.actionable):
                     counts["approvable"] += 1
                 held, use = parent_choice.sizes(scope.question(placeholder, issue, listed))
@@ -598,8 +609,22 @@ class Orphans:
                     continue
                 if (show == "doubt" and not doubt) or (show == "agreed" and not agreed):
                     continue
-                # What is in doubt first: that is what needs the administrator.
-                rows.append((0 if doubt else 1 if waiting else 2, issue, listed, shown))
+                if (show == "needs" and stands not in parent_choice.NEEDS) or (
+                    show == "settled" and stands != "settled"
+                ):
+                    continue
+                # What needs the administrator first, the most doubtful of it first.
+                order = (
+                    parent_choice.NEEDS.index(stands)
+                    if stands in parent_choice.NEEDS
+                    else len(parent_choice.NEEDS) + (0 if waiting else 1)
+                )
+                if shown is not None:
+                    shown["stands"] = stands
+                    shown["stands_says"] = parent_choice.SAID.get(stands, "")
+                    if review is not None:
+                        shown["texts_same"] = parent_choice.texts_same(KIND, issue, review)
+                rows.append((order, issue, listed, shown))
             rows.sort(key=lambda row: (row[0], row[1].issue_number or 0))
             pages = max(1, (len(rows) + page_size - 1) // page_size)
             page = min(max(1, page), pages)
@@ -648,6 +673,8 @@ class Orphans:
                         "to_ask",
                         "doubt",
                         "agreed",
+                        "needs",
+                        "settled",
                         *ANSWERS,
                     )
                 },

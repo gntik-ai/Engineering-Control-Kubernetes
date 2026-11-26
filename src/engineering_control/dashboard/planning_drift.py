@@ -18,6 +18,14 @@ from engineering_control.db.models import PlanningHealth, ProjectRecord
 
 # The numbers that are watched, with what each counts. All are better when lower.
 WATCHED: Final = {
+    "answers_need_you": (
+        "answer of a check needs you",
+        "answers of the checks need you",
+    ),
+    "applied_to_judge": (
+        "line applied without you waits to be judged",
+        "lines applied without you wait to be judged",
+    ),
     "changes_ready": ("change waits for approval", "changes wait for approval"),
     "cleanup_proposed": ("record is proposed for closing", "records are proposed for closing"),
     "structure_proposals": ("proposal for the structure", "proposals for the structure"),
@@ -46,7 +54,13 @@ WATCHED: Final = {
     ),
 }
 # What waits for the administrator's word, of the numbers above.
-WAITING: Final = ("changes_ready", "cleanup_proposed", "structure_proposals")
+WAITING: Final = (
+    "answers_need_you",
+    "applied_to_judge",
+    "changes_ready",
+    "cleanup_proposed",
+    "structure_proposals",
+)
 
 
 def said(key: str, count: int) -> str:

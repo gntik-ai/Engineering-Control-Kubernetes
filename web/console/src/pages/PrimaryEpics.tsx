@@ -60,6 +60,9 @@ interface Worklist {
     to_ask: number;
     doubt: number;
     agreed: number;
+    /** Answers that need the administrator, and those two models and the texts agree on. */
+    needs?: number;
+    settled?: number;
     to_ask_unclear: number;
     answer_epic: number;
     answer_none: number;
@@ -86,7 +89,8 @@ interface Worklist {
 export function PrimaryEpics({ project }: { project: string }) {
   const path = 'projects/' + encodeURIComponent(project) + '/primary-epics';
   const [page, setPage] = useState(1);
-  const [show, setShow] = useState('');
+  // The view opens on what needs the administrator.
+  const [show, setShow] = useState('needs');
   const [fast, setFast] = useState(false);
   const list = useResource<Worklist>(apiUrl(path, { page, show }), fast ? 4000 : 30000, { keepPreviousData: true });
   const data = list.data;
@@ -197,8 +201,8 @@ export function PrimaryEpics({ project }: { project: string }) {
                     value={show || 'all'}
                     items={[
                       { value: 'all', label: `All (${whole(data.counts.total)})` },
-                      { value: 'doubt', label: `In doubt: needs you (${whole(data.counts.doubt)})` },
-                      { value: 'agreed', label: `Two models agreed (${whole(data.counts.agreed)})` },
+                      { value: 'needs', label: `Needs you (${whole(data.counts.needs ?? 0)})` },
+                      { value: 'settled', label: `Agreed: waits in a batch (${whole(data.counts.settled ?? 0)})` },
                       { value: 'waiting', label: `With an answer waiting (${whole(data.counts.waiting)})` },
                       { value: 'differs', label: `Answer differs from the suggestion (${whole(data.counts.differ)})` },
                       { value: 'unanswered', label: `Without an answer (${whole(data.counts.unanswered)})` },
@@ -222,11 +226,25 @@ export function PrimaryEpics({ project }: { project: string }) {
                 </div>
               </div>
 
+              <p className="text-sm text-muted-foreground">
+                {some(data.counts.needs ?? 0, 'answer needs', 'answers need')} you, the most doubtful first: of those, the
+                Stories whose two best Epics lie closest.{' '}
+                {data.counts.settled
+                  ? `${some(data.counts.settled, 'answer', 'answers')} two models and the texts agree on ${data.counts.settled === 1 ? 'is' : 'are'} not listed here: ${data.counts.settled === 1 ? 'it goes' : 'they go'} on together as the batch “Choose primary Epics”, under Changes to approve on the `
+                  : ''}
+                {data.counts.settled ? <Link href={reviewUrl(project, 'reorganize')}>Reorganize page</Link> : null}
+                {data.counts.settled ? '. ' : ''}
+                {data.counts.to_ask
+                  ? `${some(data.counts.to_ask, 'User Story has', 'User Stories have')} not been asked about yet.`
+                  : ''}
+              </p>
               {data.items.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
                   {data.counts.total === 0
                     ? 'Every User Story under several Epics has a primary Epic that you chose.'
-                    : 'No User Story is listed under this choice.'}
+                    : show === 'needs'
+                      ? 'Nothing here needs you now.'
+                      : 'No User Story is listed under this choice.'}
                 </p>
               ) : null}
               {data.items.map((story) => {

@@ -51,6 +51,7 @@ from engineering_control.db.models import (
     ProjectUserStory,
     ReorgBatch,
     ReorgLine,
+    ReviewSettings,
     ScorerDecision,
     ScorerReport,
     StoryDelivery,
@@ -204,6 +205,68 @@ def sample_size(lines: int, least: int = SAMPLE_MIN, most: int = SAMPLE_MAX) -> 
     return min(lines, max(least, min(max(least, most), math.ceil(math.sqrt(lines)))))
 
 
+# The kinds of change that may be applied without the administrator: they add or
+# correct, and can be undone. With the check whose agreed answers feed each.
+ALONE: Final = {"place": "issue_story", "primary": "story_epic"}
+# The judged lines the record of a kind goes by: the latest of them.
+RECORD: Final = 100
+
+
+def alone_standing(db: Session, project: UUID, kind: str) -> dict[str, Any]:
+    """How far that kind of change goes without the administrator in this project, and
+    the record that decides it: the sampled lines of its batches the administrator
+    judged, the latest hundred, and how many of them wrong. Applying is in force when
+    the settings ask for it, enough lines were judged, the share of wrong ones is within
+    what the settings accept, and not too many lines applied before wait to be judged."""
+    mine = review_settings.of(db, project)
+    rows = db.execute(
+        select(ReorgLine.verdict, ReorgBatch.state, ReorgBatch.alone)
+        .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
+        .where(ReorgLine.project_id == project, ReorgBatch.kind == kind, ReorgLine.sampled)
+        .order_by(ReorgLine.updated_at.desc(), ReorgLine.id)
+    ).all()
+    judged = [verdict for verdict, _state, _alone in rows if verdict in ("right", "wrong")][:RECORD]
+    wrong = sum(1 for verdict in judged if verdict == "wrong")
+    waiting = sum(
+        1
+        for verdict, state, alone in rows
+        if alone and state == "approved" and verdict not in ("right", "wrong")
+    )
+    needed, accepted = mine.count("alone_from"), error_of(db, project, kind)
+    setting = mine.goes(kind)
+    why = ""
+    if len(judged) < needed:
+        why = (
+            f"You judged {len(judged):,} sampled {'line' if len(judged) == 1 else 'lines'} of "
+            f"these batches; applying without you begins after {needed:,}."
+        )
+    elif wrong > accepted * len(judged):
+        why = (
+            f"Of the last {len(judged):,} sampled lines you judged, {wrong:,} were wrong: "
+            f"more than the {accepted:.0%} the settings accept. It stopped, and proposes "
+            "batches until the record is within that again."
+        )
+    elif waiting > mine.count("alone_waiting"):
+        why = (
+            f"{waiting:,} lines applied without you wait to be judged. Applying goes on "
+            "once you have judged them."
+        )
+    return {
+        "kind": kind,
+        "title": KINDS[kind][3],
+        "setting": setting,
+        "judged": len(judged),
+        "wrong": wrong,
+        "needed": needed,
+        "accepted": accepted,
+        "waiting": waiting,
+        # Whether the record would allow it, and whether it is in force now.
+        "allowed": not why,
+        "in_force": setting == "apply" and not why,
+        "why": why,
+    }
+
+
 def error_of(db: Session, project: UUID, kind: str) -> float:
     """The share of wrong lines a batch of this kind may have: what the project's
     settings say for what adds or corrects, and for what removes or closes."""
@@ -241,8 +304,9 @@ class Reorg:
         ).all()
         # What a check answered and its judge agreed with goes into the same batch as
         # what the scorer is sure of: one thing to approve, with one sample.
-        check = {"place": "issue_story", "primary": "story_epic"}.get(kind)
-        if check is not None:
+        check = ALONE.get(kind)
+        # Unless the settings keep them in the worklist, to be approved one by one.
+        if check is not None and review_settings.of(db, project.id).goes(kind) != "off":
             mine = {(row.child_id, row.parent_id) for row in decisions}
             decisions = [
                 *decisions,
@@ -515,6 +579,8 @@ class Reorg:
         return {
             "id": str(batch.id),
             "kind": batch.kind,
+            # Applied without the administrator: its sample is judged afterwards.
+            "alone": bool(batch.alone),
             "title": KINDS[batch.kind][3],
             "about": KINDS[batch.kind][4],
             "state": batch.state,
@@ -563,6 +629,9 @@ class Reorg:
                         "about": about,
                         "error": error,
                         "ready": len(self._ready(db, project, kind)),
+                        # For what may be applied without the administrator: how far
+                        # it goes in this project, and the record that decides it.
+                        "alone": alone_standing(db, project.id, kind) if kind in ALONE else None,
                         "measured": self._measured(db, project.id, kind),
                         "open": self._shown(db, opened, lines[opened.id]) if opened else None,
                     }
@@ -607,9 +676,10 @@ class Reorg:
 
     # ---------------------------------------------------------------- preparing
 
-    def prepare(self, name: str, kind: str) -> dict[str, Any]:
+    def prepare(self, name: str, kind: str, alone: bool = False) -> dict[str, Any]:
         """Gather what the scorer has ready of that kind into a batch, and draw its
-        sample. Nothing of the plan changes."""
+        sample. Nothing of the plan changes. A batch that is to be applied without the
+        administrator draws the share of it the settings say, to be judged afterwards."""
         if kind not in KINDS:
             raise ProjectInvalid("There is no such kind of batch.")
         self.links.reconcile_project(name)
@@ -627,12 +697,17 @@ class Reorg:
             if not ready:
                 raise ProjectConflict("The scorer has nothing ready of this kind.")
             mine = review_settings.of(db, project.id)
-            count = sample_size(len(ready), mine.count("sample_least"), mine.count("sample_most"))
+            count = (
+                min(len(ready), max(1, math.ceil(len(ready) * mine.share("alone_sample"))))
+                if alone
+                else sample_size(len(ready), mine.count("sample_least"), mine.count("sample_most"))
+            )
             error = error_of(db, project.id, kind)
             batch = ReorgBatch(
                 project_id=project.id,
                 kind=kind,
                 state="sample",
+                alone=alone,
                 measured=self._measured(db, project.id, kind),
                 allowed_wrong=math.floor(error * count),
             )
@@ -683,7 +758,9 @@ class Reorg:
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             batch = self._get(db, project, batch_id)
-            if batch.state != "sample":
+            # A batch applied without the administrator is judged after it was applied.
+            after = batch.alone and batch.state == "approved"
+            if batch.state != "sample" and not after:
                 raise ProjectConflict("This batch is decided already.")
             line = db.get(ReorgLine, line_id)
             if line is None or line.batch_id != batch.id:
@@ -692,8 +769,27 @@ class Reorg:
             db.flush()
             lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
             wrong = sum(1 for row in lines if row.sampled and row.verdict == "wrong")
-            if wrong > batch.allowed_wrong:
+            if wrong > batch.allowed_wrong and not after:
                 batch.state, batch.decided_at = "withdrawn", datetime.now(UTC)
+            back = (
+                (batch.kind, line.child_id, line.parent_id, line.before)
+                if after and verdict == "wrong" and line.state == "applied"
+                else None
+            )
+            if back is None:
+                return self._shown(db, batch, list(lines))
+        # A line that was applied and is judged wrong is put back at once.
+        kind, child, parent, before = back
+        try:
+            self._revert(name, kind, child, parent, before or [])
+            state, detail = "undone", "Judged wrong after it was applied, and put back."
+        except (ProjectConflict, ProjectInvalid, ProjectNotFound) as error:
+            state, detail = "applied", f"Judged wrong, and not put back: {error}"
+        with self.sessions.begin() as db:
+            row = db.get_one(ReorgLine, line_id)
+            row.state, row.detail = state, detail
+            batch = db.get_one(ReorgBatch, batch_id)
+            lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch_id)).all()
             return self._shown(db, batch, list(lines))
 
     def withdraw(self, name: str, batch_id: UUID) -> dict[str, Any]:
@@ -709,17 +805,63 @@ class Reorg:
 
     # ----------------------------------------------------------------- applying
 
+    def apply_alone(self, name: str, kind: str) -> dict[str, Any] | None:
+        """Apply what is ready of that kind without the administrator, where the
+        project's settings ask for it and its record allows it. The batch can be undone
+        like any other, and a share of its lines is marked for judging afterwards.
+        Nothing where applying is not in force, a batch of the kind is open, or nothing
+        is ready."""
+        if kind not in ALONE:
+            return None
+        self.links.reconcile_project(name)
+        with self.sessions() as db:
+            project = active_project(db, name)
+            if not alone_standing(db, project.id, kind)["in_force"]:
+                return None
+            if db.scalar(
+                select(ReorgBatch.id).where(
+                    ReorgBatch.project_id == project.id,
+                    ReorgBatch.kind == kind,
+                    ReorgBatch.state == "sample",
+                )
+            ):
+                return None
+            if not self._ready(db, project, kind):
+                return None
+        try:
+            made = self.prepare(name, kind, alone=True)
+        except ProjectConflict:
+            return None
+        return self.approve(name, UUID(made["id"]))
+
+    def apply_all_alone(self) -> int:
+        """Every project and kind where applying without the administrator is in force:
+        apply what is ready. How many batches were applied."""
+        with self.sessions() as db:
+            asking = [
+                (name, kind)
+                for name, alone in db.execute(
+                    select(ProjectRecord.name, ReviewSettings.alone)
+                    .join(ReviewSettings, ReviewSettings.project_id == ProjectRecord.id)
+                    .where(ProjectRecord.archived_at.is_(None), ReviewSettings.alone.is_not(None))
+                )
+                for kind, said in (alone or {}).items()
+                if said == "apply"
+            ]
+        return sum(1 for name, kind in asking if self.apply_alone(name, kind) is not None)
+
     def approve(self, name: str, batch_id: UUID) -> dict[str, Any]:
         """Apply every line of the batch that was not judged wrong, once its sample is
         judged. Each line keeps how the link stood, so that the batch can be undone. A
-        line the plan has moved away from is skipped and says why."""
+        line the plan has moved away from is skipped and says why. A batch that is
+        applied without the administrator has its sample judged afterwards."""
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             batch = self._get(db, project, batch_id)
             if batch.state != "sample":
                 raise ProjectConflict("This batch is decided already.")
             lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
-            if any(line.sampled and line.verdict is None for line in lines):
+            if not batch.alone and any(line.sampled and line.verdict is None for line in lines):
                 raise ProjectConflict("Judge every line of the sample first.")
             kind = batch.kind
             todo = [

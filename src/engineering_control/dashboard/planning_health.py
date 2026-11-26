@@ -23,7 +23,9 @@ from engineering_control.dashboard import (
     cleanup,
     delivery,
     epic_links,
+    parent_choice,
     planning_links,
+    reorg,
     structure,
 )
 from engineering_control.dashboard.planning import PlanningRecords
@@ -144,6 +146,17 @@ def measure(sessions: sessionmaker[Session], name: str) -> dict[str, Any]:
             # The links of Stories to Epics beyond their primary one.
             **epic_links.numbers(db, project),
         }
+        # The answers of the two worklists that need the administrator, and the lines
+        # applied without the administrator that wait to be judged.
+        delivered["answers_need_you"] = sum(
+            count
+            for kind in reorg.ALONE.values()
+            for stands, count in parent_choice.standings(db, project, kind).items()
+            if stands in parent_choice.NEEDS
+        )
+        delivered["applied_to_judge"] = sum(
+            int(reorg.alone_standing(db, project.id, kind)["waiting"]) for kind in reorg.ALONE
+        )
         # What the structure of the plan proposes, and the issues that fit no Story.
         shape = structure.survey(db, project)
         delivered["structure_proposals"] = len(shape["stories"]) + len(shape["splits"])

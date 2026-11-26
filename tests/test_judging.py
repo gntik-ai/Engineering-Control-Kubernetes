@@ -449,12 +449,16 @@ def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
 
         assert post(client, "orphans/runs", **start, **judge).status_code == 200
         audit, failures = "Audit executions", "Respond to failures"
+        shown = client.get(BASE + "orphans", params={"page_size": 50}).json()["items"]
+        # The Story the texts alone put first for issue 41: what two models agree on goes
+        # into a batch only where the texts say the same.
+        first = next(row["shortlist"][0]["title"] for row in shown if row["number"] == 41)
         readers = Readers(
             {
                 # 41: both choose the same. 42: they differ, and the answer changes when it
                 # goes back. 43: they differ, and it stays. 45: the answer cannot tell.
-                ("analysis", 41): [audit],
-                ("other", 41): [audit],
+                ("analysis", 41): [first],
+                ("other", 41): [first],
                 ("analysis", 42): [audit, failures],
                 ("other", 42): [failures],
                 ("analysis", 43): [audit, audit],

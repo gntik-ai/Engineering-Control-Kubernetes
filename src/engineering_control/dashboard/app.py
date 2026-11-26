@@ -487,6 +487,19 @@ def create_app(
                     log_failure("planning-health", "The daily planning refresh failed", error)
             await asyncio.sleep(1800)
 
+    async def keep_agreed_applied(records: DashboardRepository) -> None:
+        """Where a project's settings ask for it and its record allows it: what two
+        models and the texts agree on is applied without the administrator, as a batch
+        that can be undone and whose sample is judged afterwards."""
+        while True:
+            await asyncio.sleep(600)
+            try:
+                applied = await asyncio.to_thread(records.reorg.apply_all_alone)
+                if applied:
+                    log_recovery("applied-alone", f"{applied} batch(es) applied on their record")
+            except Exception as error:  # noqa: BLE001 - tried again at the next pass
+                log_failure("applied-alone", "Applying what is agreed failed", error)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -569,6 +582,7 @@ def create_app(
                 # The scorer, in shadow mode: computed again when what it reads changed.
                 keepers.append(asyncio.create_task(scorer.worker(resolved_repository.scorer)))
                 keepers.append(asyncio.create_task(keep_reorganization_fresh(resolved_repository)))
+                keepers.append(asyncio.create_task(keep_agreed_applied(resolved_repository)))
             if resolved_github is not None:
                 # The documentation of each project is read when its branch moved.
                 keepers.append(
@@ -1664,7 +1678,7 @@ def create_app(
         request: Request,
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),
-        show: Literal["", "waiting", "unanswered", "doubt", "agreed"] = "",
+        show: Literal["", "waiting", "unanswered", "doubt", "agreed", "needs", "settled"] = "",
     ) -> Response:
         """The open issues without a User Story: each with the Stories most like it and
         what a review answered, and the run that asks."""
@@ -2324,6 +2338,7 @@ def create_app(
                 body.cheaper_first,
                 body.numbers,
                 body.third(),
+                body.alone,
             ),
             event="project.review_settings_changed",
             subject=name,
@@ -2568,7 +2583,9 @@ def create_app(
         request: Request,
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=100),
-        show: Literal["", "waiting", "unanswered", "differs", "unclear", "doubt", "agreed"] = "",
+        show: Literal[
+            "", "waiting", "unanswered", "differs", "unclear", "doubt", "agreed", "needs", "settled"
+        ] = "",
     ) -> Response:
         """The User Stories under several Epics whose primary Epic nobody chose: each
         with its Epics and what a review answered, and the run that asks."""
