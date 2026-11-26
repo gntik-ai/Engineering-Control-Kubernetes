@@ -370,6 +370,22 @@ Asked for on 25 November. The analysis and the prices are in [inkling-models.md]
 | M1 | Two models in a run (built, 25 November 2026). A run of a check may name a first model; an answer of it is kept when it is clear and its quoted passages are in the texts, and everything else is asked of the run's own model. The run reports what each did and what it cost against the run's own model alone. | A run of the Epic-links check with two models costs less than the same run with the second alone, and its batch passes its sample. Not yet shown on live. |
 | M2 | The cheaper model first, by default (built for the four checks, 25 November 2026). A check asks first the model whose latest trial on it kept at least 30 answers by itself with 90% of them as on record. Never for writing code. Not built: the same for summaries, Epic overviews and bug triage, and a Dashboard tile. | A check with a passed trial preselects that model; one without preselects none. |
 
+### After it: judged reviews (26 November 2026)
+
+Asked for on 26 November: a judge in every Reviews workflow, one Settings view, and only the uncertain cases shown. The inventory, the models, the costs and the decisions it needs are in [judged-reviews.md](judged-reviews.md). Decided the same day: Inkling is for writing code only and is never asked in a review ([inkling-models.md](inkling-models.md)); M0 to M2 above stay as built, for other models, and go into J0 and J1. None of J0 to J6 is built.
+
+| Phase | What | Done when |
+| --- | --- | --- |
+| J0 | Rules and measurement. Inkling refused in every review. A model's family is its maker. Each candidate judge is asked about pairs whose truth is known. | For each judge, and each pairing with an answering model: how often it accepts a wrong answer, how often it refuses a right one, and the cost of a verdict. |
+| J1 | The judge in the checks: answer, checks without a model, judge of another family, sent back twice at most. For issues with no User Story, primary Epics, clean-up and Epic links. | A run ends with every answer agreed or in doubt, with its cost for each record settled beside the same run without a judge. |
+| J2 | Settings in Reviews: every limit, model, switch and threshold of Reviews in one view; a limit in dollars; the makers a project's texts may be sent to. | No model, token limit or switch of Reviews is set anywhere else. |
+| J3 | Only what is in doubt. The scorer joined to the two worklists; both open on "Needs you", ordered by doubt. What is agreed is applied or waits as one batch, as decided. A sample, a stop, a digest. | On Falcone, the Stories shown for a primary Epic are those in doubt and the sample. |
+| J4 | By itself: new and changed records are answered and judged as they arrive, within Settings, in the night's batch where it can wait. | Nothing in Related Work or Planning needs a run started by hand. |
+| J5 | The judge in every other workflow that asks a model: Review evidence, planning reviews, Discovery, connections, execution order, structure, Epic overviews. | Every such workflow has its answers judged and shows what is in doubt first. |
+| J6 | One list of what needs you across Reviews, with each workflow's view behind it; panels that say the same twice merged. | Reviews opens on one short list of decisions. |
+
+"Approval always" (decision of 23 November, below) stands until you decide question 1 of judged-reviews.md.
+
 ## Decisions (23 November 2026)
 
 1. **Approval always.** Nothing is applied without the administrator's word; the cascade prepares batches and plans.
