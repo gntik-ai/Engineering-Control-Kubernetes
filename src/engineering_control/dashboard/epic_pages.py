@@ -40,6 +40,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import (
+    auto_checks,
     parent_choice,
     ranking,
     review_budget,
@@ -1000,6 +1001,8 @@ class EpicPages:
                     "models": review_settings.models(db, project.id),
                     "roles": review_settings.roles(db, project.id),
                     "plan": parent_choice.planned(db, project.id, KIND.name),
+                    # Whether the check runs by itself here, and what it waits for.
+                    "auto": auto_checks.standing(db, project, KIND.name),
                     "budget": review_budget.status(db, pid),
                 },
             }

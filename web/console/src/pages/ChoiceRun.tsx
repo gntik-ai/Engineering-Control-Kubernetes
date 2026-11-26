@@ -27,6 +27,15 @@ export interface Run {
   judge?: { provider: string; model: string; asked: number; agreed: number; cost: number } | null;
   /** A third model, asked about what the two did not agree on. */
   third?: { provider: string; model: string; asked: number; cost: number } | null;
+  /** Started by itself, because the project's settings ask for it. */
+  auto?: boolean;
+}
+/** Whether a check runs by itself in the project, and what it waits for. */
+export interface RunsAlone {
+  mode: 'off' | 'arrive' | 'night';
+  due: boolean;
+  why: string;
+  waiting: number;
 }
 /** The model a check asks first by default: the one whose trial on the check agreed. */
 export interface FirstModel {
@@ -141,6 +150,7 @@ export function RunPanel({
   models,
   plan,
   settings,
+  auto,
   options,
   asked,
   likely,
@@ -162,6 +172,8 @@ export function RunPanel({
   plan?: RunPlan | null;
   /** Where Reviews, Settings is. */
   settings?: string;
+  /** Whether the check runs by itself here. */
+  auto?: RunsAlone | null;
   options: RunOption[];
   /** How many records the run asks about, and what it is likely to use, under the chosen options. */
   asked: (chosen: Record<string, boolean>) => number;
@@ -253,6 +265,7 @@ export function RunPanel({
               {run.cost !== null && run.cost !== undefined ? ` The run cost ${dollars(run.cost)}.` : ''}
             </p>
           ) : null}
+          {run.auto ? <p className="text-muted-foreground">It started by itself, as the settings ask.</p> : null}
           {run.detail ? <p className="text-muted-foreground">{run.detail}</p> : null}
           {run.uncounted ? (
             <p className="text-muted-foreground">
@@ -277,6 +290,15 @@ export function RunPanel({
             </div>
           ) : null}
         </div>
+      ) : null}
+      {auto && auto.mode !== 'off' ? (
+        <p className="text-sm text-foreground">
+          This check runs by itself{auto.mode === 'night' ? ', each night' : ', as records arrive'}.{' '}
+          {auto.due
+            ? `${whole(auto.waiting)} ${auto.waiting === 1 ? 'record waits' : 'records wait'}: it starts within five minutes.`
+            : auto.why}{' '}
+          <span className="text-muted-foreground">Set under {inSettings}. You can still start it here.</span>
+        </p>
       ) : null}
       {live ? null : trial ? (
         offered.length === 0 ? (

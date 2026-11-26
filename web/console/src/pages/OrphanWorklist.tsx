@@ -17,7 +17,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { recordUrl, reviewUrl } from '../router';
-import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan } from './ChoiceRun';
+import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan, type RunsAlone } from './ChoiceRun';
 
 /** One open User Story an issue is shown with, and how alike the two are. */
 interface Candidate {
@@ -75,6 +75,7 @@ interface Worklist {
   models: Model[];
   first: FirstModel | null;
   plan?: RunPlan | null;
+  auto?: RunsAlone | null;
 }
 
 const SAID: Record<string, string> = {
@@ -224,6 +225,7 @@ export function OrphanWorklist({ project }: { project: string }) {
               run={data.run}
               plan={data.plan ?? null}
               settings={reviewUrl(project, 'settings')}
+              auto={data.auto ?? null}
               options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
               asked={(chosen) => (chosen.again ? data.counts.total : data.counts.to_ask)}
               likely={(chosen) => (chosen.again ? data.likely_all : data.likely)}

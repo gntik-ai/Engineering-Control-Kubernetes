@@ -16,7 +16,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { recordUrl, reviewUrl } from '../router';
-import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan } from './ChoiceRun';
+import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan, type RunsAlone } from './ChoiceRun';
 
 /** One of the Epics a User Story is linked to, and how alike the two texts are. */
 interface Epic {
@@ -78,6 +78,7 @@ interface Worklist {
   models: Model[];
   first: FirstModel | null;
   plan?: RunPlan | null;
+  auto?: RunsAlone | null;
 }
 
 /**
@@ -151,6 +152,7 @@ export function PrimaryEpics({ project }: { project: string }) {
               run={data.run}
               plan={data.plan ?? null}
               settings={reviewUrl(project, 'settings')}
+              auto={data.auto ?? null}
               options={[
                 { key: 'unclear_only', label: 'Only where the texts do not point to one Epic' },
                 { key: 'again', label: 'Ask again about those that have an answer' },

@@ -927,6 +927,8 @@ class ChoiceRun(UUIDPrimaryKey, Timestamps, Base):
     third_model: Mapped[str | None] = mapped_column(String(200))
     third_asked: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     third_cost: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    # Started by itself, because the project's settings ask for it (migration 0092).
+    auto: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):
@@ -1286,6 +1288,9 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     # How far each kind of change goes without the administrator (migration 0091), by
     # the kind of batch: "off", "propose" or "apply". None for proposing everywhere.
     alone: Mapped[dict[str, str] | None] = mapped_column(JSON)
+    # Which checks run by themselves (migration 0092), by the check: "off", "arrive"
+    # or "night". None where none does.
+    runs: Mapped[dict[str, str] | None] = mapped_column(JSON)
 
 
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):

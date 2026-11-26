@@ -70,7 +70,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0089 keeps the numbers a project set for its reviews.
     # 0090 keeps the third model a run asks where two differ.
     # 0091 keeps how far each kind of change goes without the administrator.
-    assert (head, parent) == ("0091", "0090")
+    # 0092 keeps which checks a project runs by itself.
+    assert (head, parent) == ("0092", "0091")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -179,6 +180,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     command.downgrade(config, parent)
+    settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
+    assert "runs" not in settings and "alone" in settings
+    assert "auto" not in {c["name"] for c in inspect(engine).get_columns("choice_runs")}
+    command.downgrade(config, "0090")
     settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
     assert "alone" not in settings and "doubt_model" in settings
     assert "alone" not in {c["name"] for c in inspect(engine).get_columns("reorg_batches")}

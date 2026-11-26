@@ -500,6 +500,20 @@ def create_app(
             except Exception as error:  # noqa: BLE001 - tried again at the next pass
                 log_failure("applied-alone", "Applying what is agreed failed", error)
 
+    async def keep_checks_asked(records: DashboardRepository) -> None:
+        """Where a project's settings ask for it, a check is started by itself over the
+        records that have no answer: as they arrive, or once a night. Within what the
+        settings allow, like a run the administrator starts."""
+        while True:
+            await asyncio.sleep(300)
+            try:
+                started = await asyncio.to_thread(records.auto_checks.start_due)
+                if started:
+                    said = ", ".join(f"{name}/{kind}" for name, kind in started)
+                    log_recovery("checks-by-themselves", f"Started by themselves: {said}")
+            except Exception as error:  # noqa: BLE001 - tried again at the next pass
+                log_failure("checks-by-themselves", "Starting a check by itself failed", error)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -572,6 +586,8 @@ def create_app(
                     parent_choice.worker(resolved_repository.sessions, app.state.models)
                 )
             )
+            # The checks a project's settings ask to run by themselves.
+            keepers.append(asyncio.create_task(keep_checks_asked(resolved_repository)))
             if resolved.ranker_url:
                 # Vectors and scores of the planning records, from the ranking service.
                 keepers.append(
@@ -2339,6 +2355,7 @@ def create_app(
                 body.numbers,
                 body.third(),
                 body.alone,
+                body.runs,
             ),
             event="project.review_settings_changed",
             subject=name,

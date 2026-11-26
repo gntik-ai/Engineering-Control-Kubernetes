@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0 to J3 are built, J4 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0 to J4 are built, J5 and J6 are not.
 
 ## What is asked for
 
@@ -439,3 +439,32 @@ Every ten minutes what is settled is then applied as a batch that can be undone 
 **The digest.** The daily digest in the chat says for each project how many answers need you and how many lines applied without you wait to be judged; Planning health keeps both numbers day by day.
 
 **Not exercised on live:** a run with a judge on Falcone's worklists, a batch of settled answers, and applying on a record. The first two wait for a run you start; the third for 40 lines you judge.
+
+## J4 as built
+
+**A check can run by itself.** In Reviews, Settings, for each of the five checks (issues with no User Story, primary Epics, the clean-up check, extra Epic links, Epic overviews), one of:
+
+- **Only when you start it** (as it was, and the default).
+- **By itself, as records arrive**: within half an hour of a record that has no answer, or whose texts changed since it was answered.
+- **By itself, each night**: once, between 1 and 5 UTC, over what waits by then.
+
+**It is a run like any other.** It takes the model that answers, the judge and the tokens it stops at from Settings, stops at the project's limit in dollars and at its token budget, appears in its worklist with "It started by itself", and can be stopped and ended there. The worklist says whether the check runs by itself and what it waits for; a run can still be started by hand.
+
+**What keeps it from spending without need.**
+
+- Nothing runs by itself unless Settings says so, check by check: asking a model costs money.
+- No run starts while one of the same check is under way, stopped or on hold. A run that stopped after three failed calls in a row therefore waits for you.
+- A record a model gave no usable answer about is not asked about again by itself for a day.
+- Without a model chosen to answer, or at the limit in dollars, nothing starts, and Settings says which.
+- A project that is paused or archived is left alone.
+
+**With J3, the path is whole.** A new issue is read and ranked without a model, answered and judged within half an hour, and then either goes on in a batch, or is applied where the record allows, or is listed under "Needs you" with its reason.
+
+**The digest** says each day, for each project, how many runs started by themselves, how many answers they gave and what they cost.
+
+**Two things of the plan left out, and why.**
+
+- **The night run is not handed to the providers as a batch at half price.** The run at night asks as a run by day does. Handing the questions in as a provider batch would halve what is already small: Falcone's first pass over everything is about a dollar, and a day's new records a few cents. It would need the answer, the judge and what goes back to wait for each other across hours, which the run that asks one question at a time does not do. It can be built if a project's volume makes it worth it.
+- **The readings that ask no model have no switch.** The backlog, the documents, the meaning of records, the scorer and where each Story stands cost nothing, and the candidates, the ranking by the texts and the batches rest on them. Stopping one would only make the checks worse. Pausing a project stops its work as a whole.
+
+**Not exercised on live:** every project has every check on "Only when you start it", so nothing has started by itself yet.

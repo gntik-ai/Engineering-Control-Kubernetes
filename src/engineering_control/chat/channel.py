@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import auto_checks
 from engineering_control.dashboard.planning_drift import digest_lines
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -390,6 +391,8 @@ class ChatChannel:
             lines.append(f"Accounts that cannot work right now: {', '.join(limited)}.")
         # What waits in each project's planning, and what moved there since the day before.
         lines.extend(digest_lines(self.sessions))
+        # What the checks that run by themselves asked, and what it cost.
+        lines.extend(auto_checks.digest_lines(self.sessions, since))
         waiting = [
             entry
             for entry in self.toolbox.inbox_entries()

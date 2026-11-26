@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl, reviewUrl } from '../router';
-import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan } from './ChoiceRun';
+import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan, type RunsAlone } from './ChoiceRun';
 
 type Kind = 'stories' | 'epics' | 'issues';
 interface Twin {
@@ -37,6 +37,7 @@ interface Overview {
     models: Model[];
     first: FirstModel | null;
     plan?: RunPlan | null;
+    auto?: RunsAlone | null;
   };
   stale_days: number;
 }
@@ -152,6 +153,7 @@ export function Cleanup({ project }: { project: string }) {
                 run={data.check.run}
                 plan={data.check.plan ?? null}
                 settings={reviewUrl(project, 'settings')}
+                auto={data.check.auto ?? null}
                 options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
                 asked={(chosen) => (chosen.again ? data.check.stories : data.check.to_ask)}
                 likely={(chosen) => (chosen.again ? data.check.likely_all : data.check.likely)}

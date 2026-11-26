@@ -206,6 +206,8 @@ class Settings:
     own: Mapping[str, float] = field(default_factory=dict)
     # How far each kind of change goes without the administrator, by the kind of batch.
     alone: Mapping[str, str] = field(default_factory=dict)
+    # Which checks run by themselves, by the check: as records arrive, or at night.
+    runs: Mapping[str, str] = field(default_factory=dict)
 
     def goes(self, kind: str) -> str:
         """ "off", "propose" or "apply" for that kind of batch; proposing unless set."""
@@ -241,6 +243,7 @@ def of(db: Session, project: UUID) -> Settings:
         row.cheaper_first,
         dict(row.numbers or {}),
         dict(row.alone or {}),
+        dict(row.runs or {}),
     )
 
 
@@ -421,7 +424,7 @@ class ReviewSettingsService:
             for entry in review_flows.decision_models(db):
                 offered.setdefault(maker(entry["provider"], entry["model"]), 0)
             defaults = default_makers(db)
-            from engineering_control.dashboard import parent_choice, reorg
+            from engineering_control.dashboard import auto_checks, parent_choice, reorg
 
             return {
                 "dollars": {
@@ -453,6 +456,15 @@ class ReviewSettingsService:
                 # How far each kind of change goes without the administrator, with the
                 # record that decides whether applying is in force.
                 "alone": [reorg.alone_standing(db, project.id, kind) for kind in reorg.ALONE],
+                # Which checks run by themselves, and what each waits for now.
+                "runs": [
+                    {
+                        **auto_checks.standing(db, project, kind, datetime.now(UTC)),
+                        "label": label,
+                    }
+                    for kind, label in parent_choice.CHECKS.items()
+                    if kind in parent_choice.KINDS
+                ],
                 "makers": [
                     {
                         "maker": made_by,
@@ -479,6 +491,7 @@ class ReviewSettingsService:
         numbers: Mapping[str, float] | None = None,
         third: tuple[str, str] | None = None,
         alone: Mapping[str, str] | None = None,
+        runs: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Keep what the project's reviews are set to. ``numbers`` none leaves the
         numbers as they are; given, a number that is its default is not kept, so that
@@ -545,5 +558,14 @@ class ReviewSettingsService:
                 if any(k not in reorg.ALONE or v not in ALONE for k, v in alone.items()):
                     raise ProjectInvalid("That is not a way a change can go on.")
                 row.alone = {k: v for k, v in alone.items() if v != "propose"} or None
+            if runs is not None:
+                from engineering_control.dashboard import auto_checks, parent_choice
+
+                if any(
+                    k not in parent_choice.CHECKS or v not in auto_checks.MODES
+                    for k, v in runs.items()
+                ):
+                    raise ProjectInvalid("That is not a check, or not a way it can run.")
+                row.runs = {k: v for k, v in runs.items() if v != "off"} or None
             forget(project.id)
         return self.shown(name)

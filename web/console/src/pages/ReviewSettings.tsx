@@ -36,6 +36,15 @@ interface Settings {
   }[];
   /** How far each kind of change goes without the administrator, and the record that decides it. */
   alone: Alone[];
+  /** Which checks run by themselves, and what each waits for now. */
+  runs: {
+    check: string;
+    label: string;
+    mode: 'off' | 'arrive' | 'night';
+    due: boolean;
+    why: string;
+    waiting: number;
+  }[];
   checks: {
     check: string;
     label: string;
@@ -73,12 +82,24 @@ export function ReviewSettings({ project }: { project: string }) {
   const [cheaper, setCheaper] = useState(true);
   const [numbers, setNumbers] = useState<Record<string, string>>({});
   const [alone, setAlone] = useState<Record<string, string>>({});
+  const [runs, setRuns] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const data = settings.data;
   // What the form holds, and what it held when it was last filled from what is saved.
-  const form = JSON.stringify([limit, answer, judge, judge ? third : '', rounds, allowed, cheaper, numbers, alone]);
+  const form = JSON.stringify([
+    limit,
+    answer,
+    judge,
+    judge ? third : '',
+    rounds,
+    allowed,
+    cheaper,
+    numbers,
+    alone,
+    runs,
+  ]);
   const filled = useRef<string | null>(null);
   const fill = (from: Settings) => {
     const next = {
@@ -91,6 +112,7 @@ export function ReviewSettings({ project }: { project: string }) {
       cheaper: from.cheaper_first,
       numbers: Object.fromEntries(from.numbers.map((entry) => [entry.key, String(entry.value)])),
       alone: Object.fromEntries(from.alone.map((entry) => [entry.kind, entry.setting as string])),
+      runs: Object.fromEntries(from.runs.map((entry) => [entry.check, entry.mode as string])),
     };
     setLimit(next.limit);
     setAnswer(next.answer);
@@ -101,6 +123,7 @@ export function ReviewSettings({ project }: { project: string }) {
     setCheaper(next.cheaper);
     setNumbers(next.numbers);
     setAlone(next.alone);
+    setRuns(next.runs);
     filled.current = JSON.stringify([
       next.limit,
       next.answer,
@@ -111,6 +134,7 @@ export function ReviewSettings({ project }: { project: string }) {
       next.cheaper,
       next.numbers,
       next.alone,
+      next.runs,
     ]);
   };
   // The page reads what is saved again every minute. That must not take away what was
@@ -156,6 +180,7 @@ export function ReviewSettings({ project }: { project: string }) {
           cheaper_first: cheaper,
           numbers: Object.fromEntries(data.numbers.map((entry) => [entry.key, Number(numbers[entry.key])])),
           alone,
+          runs,
         }),
       () => {
         // What is saved is what the form holds: the next reading fills it again.
@@ -509,6 +534,46 @@ export function ReviewSettings({ project }: { project: string }) {
           </Card>
           <Card>
             <CardHeader>
+              <CardTitle>Which checks run by themselves</CardTitle>
+            </CardHeader>
+            <CardBody className="grid gap-4">
+              <p className="text-sm text-muted-foreground">
+                A check that runs by itself is started over the records that have no answer, with the models chosen
+                above, and stops at this project’s limits like a run you start. As records arrive means within half an
+                hour of a record without an answer; each night means once, between 1 and 5 UTC. A record no model could
+                answer is not asked about again for a day. None runs by itself unless you say so here: asking a model
+                costs money.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {data.runs.map((entry) => (
+                  <div key={entry.check} className="grid gap-1">
+                    <label className="grid gap-1 text-sm">
+                      {entry.label}
+                      <SimpleSelect
+                        aria-label={`When “${entry.label}” runs by itself`}
+                        value={runs[entry.check] ?? 'off'}
+                        items={[
+                          { value: 'off', label: 'Only when you start it' },
+                          { value: 'arrive', label: 'By itself, as records arrive' },
+                          { value: 'night', label: 'By itself, each night' },
+                        ]}
+                        onValueChange={(value) => setRuns({ ...runs, [entry.check]: String(value ?? 'off') })}
+                      />
+                    </label>
+                    {entry.mode !== 'off' ? (
+                      <p className="text-sm text-muted-foreground">
+                        {entry.due
+                          ? `${whole(entry.waiting)} ${entry.waiting === 1 ? 'record waits' : 'records wait'}: it starts within five minutes.`
+                          : entry.why}
+                      </p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardHeader>
               <CardTitle>The numbers the reviews work to</CardTitle>
             </CardHeader>
             <CardBody className="grid gap-3">
@@ -603,8 +668,8 @@ export function ReviewSettings({ project }: { project: string }) {
               ) : null}
               <p className="text-sm text-muted-foreground">
                 Reading the backlog, the documents and the meaning of records, the scorer, and where each User Story
-                stands run by themselves and ask no model, so they cost nothing and have no switch. A check that asks a
-                model runs when you start it from its worklist, with what is set above.
+                stands run by themselves and ask no model, so they cost nothing and have no switch. Which checks that
+                ask a model run by themselves is chosen above, check by check.
               </p>
             </CardBody>
           </Card>

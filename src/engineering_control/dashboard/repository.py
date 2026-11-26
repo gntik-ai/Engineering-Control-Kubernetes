@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.auth import PasswordService
+from engineering_control.dashboard.auto_checks import AutoChecks
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.bug_section import BugSection
@@ -152,6 +153,17 @@ class DashboardRepository:
         self.scorer.after = self._after_scoring
         self.reorg = Reorg(self.sessions, self.planning, self.planning_links)
         self.cleanup = Cleanup(self.sessions, self.planning_links)
+        # The checks that run by themselves start as a worklist's button starts them.
+        self.auto_checks = AutoChecks(
+            self.sessions,
+            {
+                "issue_story": self.orphans.start,
+                "story_epic": self.primary_epics.start,
+                "story_needed": self.cleanup.start,
+                "epic_links": self.epic_links.start,
+                "epic_overview": self.epic_pages.start,
+            },
+        )
         self.structure = Structure(self.sessions, self.planning, self.planning_links)
         self.rollout = Rollout(self.sessions, self.planning_links)
         self.sections = SectionRecords(self.sessions)

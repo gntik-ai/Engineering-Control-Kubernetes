@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import (
+    auto_checks,
     parent_choice,
     review_budget,
     review_settings,
@@ -454,6 +455,8 @@ class PrimaryEpics:
                 "models": review_settings.models(db, project.id),
                 "roles": review_settings.roles(db, project.id),
                 "plan": parent_choice.planned(db, project.id, KIND.name),
+                # Whether the check runs by itself here, and what it waits for.
+                "auto": auto_checks.standing(db, project, KIND.name),
                 "first": parent_choice.suggested_first(db, project.id, KIND.name),
                 "budget": review_budget.status(db, project.id),
             }

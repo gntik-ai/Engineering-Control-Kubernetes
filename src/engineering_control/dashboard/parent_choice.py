@@ -525,6 +525,8 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
         "provider": run.provider,
         "model": run.model,
         "token_cap": run.token_cap,
+        # Started by itself, because the project's settings ask for it.
+        "auto": bool(run.auto),
         "spent": run.spent,
         "total": run.total,
         "done": run.done,
