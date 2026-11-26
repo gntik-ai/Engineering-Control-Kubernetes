@@ -7,10 +7,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy
 from sqlalchemy import select
 
-from engineering_control.dashboard import judging, review_flows
-from engineering_control.db.models import BacklogItem, ProjectReviewBudget, ProviderAccount
+from engineering_control.dashboard import judging, orphans, review_flows
+from engineering_control.db.models import (
+    BacklogItem,
+    ProjectReviewBudget,
+    ProviderAccount,
+    RecordVector,
+)
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import STARTERS
 from engineering_control.engine.document import parse
@@ -294,5 +300,49 @@ def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_st
         run(repo, Chooser("Respond to failures", "analysis"))
         # Measurements of every sort count towards the project's sum.
         assert client.get(BASE + "judge-trials").json()["spent"] == 0.005
+    finally:
+        client.close()
+
+
+def test_a_story_that_means_the_same_in_other_words_is_among_the_candidates(
+    tmp_path: Path,
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        data = seed(repo)
+        with repo.sessions.begin() as db:
+            issue = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 45)).one()
+            # "Unrelated work: Refresh dependencies." shares no word with either Story.
+            by_words = orphans.shortlist(
+                issue, "gntik-ai/falcone", orphans._stories(db, data["project"])
+            )
+            assert by_words == []
+            # The ranking service read it and both Stories: the issue lies close to one.
+            for kind, key, vector in (
+                ("issue", issue.id, [1.0, 0.0]),
+                ("story", data["Audit executions"], [0.1, 0.9]),
+                ("story", data["Respond to failures"], [0.9, 0.1]),
+            ):
+                db.add(
+                    RecordVector(
+                        project_id=data["project"],
+                        kind=kind,
+                        record_id=key,
+                        model="fixture-embedding",
+                        digest="d",
+                        vector=numpy.asarray(vector, dtype=numpy.float32).tobytes(),
+                    )
+                )
+        with repo.sessions() as db:
+            issue = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 45)).one()
+            listed = orphans.shortlist(
+                issue, "gntik-ai/falcone", orphans._stories(db, data["project"])
+            )
+        assert [(entry["title"], entry["meaning"]) for entry in listed] == [
+            ("Respond to failures", 1),
+            ("Audit executions", 2),
+        ]
+        # Close in meaning, so not a weak match for want of shared words.
+        assert not listed[0]["weak"] and listed[0]["score"] == 0.0
     finally:
         client.close()

@@ -21,10 +21,11 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 from uuid import UUID
 
+import numpy
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import parent_choice, review_budget, review_flows
+from engineering_control.dashboard import parent_choice, ranking, review_budget, review_flows
 from engineering_control.dashboard.connection_records import digest, finding_links
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
@@ -48,13 +49,21 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectStoryEpic,
     ProjectUserStory,
+    RecordVector,
     WorkspaceCandidate,
 )
 from engineering_control.models.service import Question
 
 # How many User Stories an issue is shown with, and below which score a match is weak:
 # the two then share few words, or only words that many Stories have.
-SHORTLIST: Final = 8
+# Twelve since 26 November 2026, with the Stories closest in meaning joined to those that
+# share the most words: measured on issues whose Story is known, the right one was among
+# eight chosen by words alone for five issues in six, and models that are shown a list
+# without it agree on the best of the rest.
+SHORTLIST: Final = 12
+# How many of each way of ranking are joined, and what a place in a ranking counts for.
+JOINED: Final = 30
+RANK: Final = 60
 WEAK: Final = 2.0
 # How much of a Story's text the question carries.
 STORY_TEXT: Final = 1000
@@ -120,6 +129,11 @@ class _Stories:
     average: float
     # The shortlists already ranked against this index, by issue and its text.
     ranked: dict[tuple[UUID, str], list[dict[str, Any]]] = field(default_factory=dict)
+    # What the ranking service kept: the Stories that have a vector, their vectors as
+    # rows, and the vectors of the issues. Empty where the service has not read them.
+    meant: list[UUID] = field(default_factory=list)
+    matrix: Any = None
+    issues: dict[UUID, Any] = field(default_factory=dict)
 
 
 # The index of each project's Stories, kept for as long as nothing it is made of changed.
@@ -153,6 +167,7 @@ def _stamp(db: Session, project: UUID) -> tuple[Any, ...]:
             WorkspaceCandidate.kind == "stories",
             WorkspaceCandidate.decision == "approved",
         ),
+        of(RecordVector),
     )
 
 
@@ -214,9 +229,25 @@ def _index(db: Session, project: UUID) -> _Stories:
         for word, count in words.items():
             postings[word].append((key, count))
     numbers = {number: key for key, number in _numbers(db, project, "stories", set(rows)).items()}
-    return _Stories(
+    index = _Stories(
         rows, epics, numbers, postings, lengths, sum(lengths.values()) / max(1, len(rows)) or 1.0
     )
+    embedding = ranking.stored_model(db, RecordVector, project)
+    kept = ranking.vectors(db, project, embedding) if embedding else {}
+    index.meant = [key for key in sorted(rows, key=str) if ("story", key) in kept]
+    if index.meant:
+        index.matrix = numpy.stack([kept["story", key] for key in index.meant])
+        index.issues = {key: vector for (kind, key), vector in kept.items() if kind == "issue"}
+    return index
+
+
+def _by_meaning(issue: UUID, stories: _Stories) -> list[UUID]:
+    """The Stories whose meaning is closest to the issue's, closest first, where the
+    ranking service has read both."""
+    mine = stories.issues.get(issue)
+    if mine is None or stories.matrix is None or mine.shape[0] != stories.matrix.shape[1]:
+        return []
+    return [stories.meant[place] for place in numpy.argsort(-(stories.matrix @ mine))]
 
 
 def _named(issue: BacklogItem, repository: str, stories: _Stories) -> list[UUID]:
@@ -233,8 +264,10 @@ def _named(issue: BacklogItem, repository: str, stories: _Stories) -> list[UUID]
 
 
 def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[dict[str, Any]]:
-    """The Stories most like the issue, best first: those its text names, then by the
-    words the two share, where a word counts for more the fewer Stories have it."""
+    """The Stories most like the issue, best first: those its text names, then those that
+    stand high by the words the two share, where a word counts for more the fewer
+    Stories have it, or by how close they are in meaning. The two rankings are joined by
+    reciprocal rank, so that a Story that says the same in other words is shown too."""
     known = (issue.id, digest([repository, issue.title, issue.description or ""]))
     if known in stories.ranked:
         return [dict(entry) for entry in stories.ranked[known]]
@@ -255,6 +288,14 @@ def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[di
             shared[key].append((part, word))
     named = _named(issue, repository, stories)
     ranked = sorted(scores, key=lambda key: (-scores[key], str(key)))
+    close = _by_meaning(issue.id, stories)
+    if close:
+        points: dict[UUID, float] = defaultdict(float)
+        for ranks in (ranked[:JOINED], close[:JOINED]):
+            for place, key in enumerate(ranks):
+                points[key] += 1.0 / (RANK + place)
+        ranked = sorted(points, key=lambda key: (-points[key], str(key)))
+    nearest = set(close[:3])
     chosen = named + [key for key in ranked if key not in named]
     listed = []
     for key in chosen[:SHORTLIST]:
@@ -268,7 +309,9 @@ def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[di
                 "score": round(scores.get(key, 0.0), 1),
                 "words": [word for _part, word in sorted(shared[key], reverse=True)[:5]],
                 "named": key in named,
-                "weak": key not in named and scores.get(key, 0.0) < WEAK,
+                # Few words in common, and not among the closest in meaning either.
+                "weak": key not in named and scores.get(key, 0.0) < WEAK and key not in nearest,
+                "meaning": close.index(key) + 1 if key in close[:JOINED] else None,
             }
         )
     stories.ranked[known] = listed

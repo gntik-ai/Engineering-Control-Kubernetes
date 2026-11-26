@@ -30,6 +30,8 @@ interface Candidate {
   named: boolean;
   /** The two share few words, or only words many Stories have. */
   weak: boolean;
+  /** Its place among the Stories closest in meaning, when the ranking service has read both. */
+  meaning?: number | null;
 }
 interface Orphan {
   id: string;
@@ -337,7 +339,8 @@ export function OrphanWorklist({ project }: { project: string }) {
                                 {candidate.named
                                   ? 'Named in the issue’s own text'
                                   : `${candidate.weak ? 'Weak match' : 'Match'} ${candidate.score.toLocaleString('en')}` +
-                                    (candidate.words.length ? ` · shares: ${candidate.words.join(', ')}` : '')}
+                                    (candidate.words.length ? ` · shares: ${candidate.words.join(', ')}` : '') +
+                                    (candidate.meaning ? ` · ${candidate.meaning}. closest in meaning` : '')}
                               </span>
                             </span>
                           </li>
