@@ -85,7 +85,7 @@ CHECKS: Final[dict[str, dict[str, str]]] = {
         "view": "reorganize",
         "anchor": "clean-up",
         "one": "User Story that nothing supports",
-        "many": "User Stories that nothing support",
+        "many": "User Stories that nothing supports",
         "about": "whether a User Story that nothing supports is still needed",
     },
     "epic_links": {
@@ -112,13 +112,16 @@ DIFFER: Final = ("differ", "unclear")
 LEFT: Final = {
     "story_needed": (
         "the two models did not agree whether it is still needed.",
-        "None of them is proposed for closing.",
+        "the two models did not agree whether they are still needed.",
+        "A Story they differ on is not proposed for closing.",
     ),
     "epic_links": (
+        "the two models did not say the same of every link.",
         "the two models did not say the same of every link.",
         "A link they differ on stays, and is marked in doubt there.",
     ),
     "epic_overview": (
+        "the judge found a sentence the records do not support.",
         "the judge found a sentence the records do not support.",
         "The sentence is marked on the Epic's page.",
     ),
@@ -257,13 +260,13 @@ def _checks(db: Session, project: ProjectRecord) -> list[dict[str, Any]]:
                 )
             )
         elif doubt:
-            says, left = LEFT[kind]
+            one, many, left = LEFT[kind]
             rows.append(
                 _row(
                     "doubt:" + kind,
                     "doubt",
                     doubt,
-                    _some(doubt, said["one"], said["many"]) + ": " + says,
+                    _some(doubt, said["one"], said["many"]) + ": " + (one if doubt == 1 else many),
                     said["view"],
                     said["anchor"],
                     left,

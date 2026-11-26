@@ -184,7 +184,11 @@ def test_doubt_that_decides_nothing_is_listed_apart_and_is_no_step(
         assert (links["group"], links["count"]) == ("doubt", 2)
         assert "did not say the same of every link" in links["says"]
         assert "stays" in links["detail"]
-        assert found["doubt:story_needed"]["group"] == "doubt"
+        needed = found["doubt:story_needed"]
+        assert needed["group"] == "doubt" and needed["says"] == (
+            "2 User Stories that nothing supports: the two models did not agree whether "
+            "they are still needed."
+        )
         assert found["doubt:epic_overview"]["group"] == "doubt"
         assert list(found)[-1].startswith("doubt:")
         said = [step["says"] for step in client.get(BASE + "rollout").json()["steps"]]
