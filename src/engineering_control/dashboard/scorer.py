@@ -37,7 +37,7 @@ import numpy
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import ranking
+from engineering_control.dashboard import ranking, review_settings
 from engineering_control.dashboard.planning_links import PlanningLinks
 from engineering_control.dashboard.project_records import ProjectNotFound, active_project
 from engineering_control.dashboard.ranking import digest_of
@@ -64,6 +64,7 @@ from engineering_control.db.models import (
     RecordVector,
     ReorgBatch,
     ReorgLine,
+    ReviewSettings,
     ScorerDecision,
     ScorerReport,
 )
@@ -232,7 +233,9 @@ def _miss(case: _Case, shares: Any) -> float:
     return 1.0 - max(right) if right else 1.0
 
 
-def measure(cases: list[_Case], full: bool, only: UUID | None = None) -> dict[str, Any] | None:
+def measure(
+    cases: list[_Case], full: bool, only: UUID | None = None, error: float = ADD_ERROR
+) -> dict[str, Any] | None:
     """How the scorer does on records whose right parent is known, each scored by a
     model that never saw it or any other record of its Epic, and with a bound drawn
     from the other folds. It learns from every project's cases; ``only`` measures on one
@@ -262,7 +265,7 @@ def measure(cases: list[_Case], full: bool, only: UUID | None = None) -> dict[st
     for place, case in enumerate(known):
         shares = scored[place]
         others = [miss for other, miss in misses.items() if known[other].fold != case.fold]
-        left = kept(shares, limit(others, ADD_ERROR))
+        left = kept(shares, limit(others, error))
         best = case.parents[int(numpy.argmax(shares))]
         first += best in case.right
         inside += any(case.parents[i] in case.right for i in left)
@@ -273,7 +276,7 @@ def measure(cases: list[_Case], full: bool, only: UUID | None = None) -> dict[st
         else:
             none += 1
     total = len(known)
-    sure = surely(alone, ADD_ERROR)
+    sure = surely(alone, error)
     acting = [right for share, right in alone if sure is not None and share >= sure]
     return {
         "children": total,
@@ -598,6 +601,8 @@ class Scorer:
                 ProjectEpic,
                 ReorgLine,
                 DocFile,
+                # The errors a project accepts are part of what the scorer says.
+                ReviewSettings,
             )
             parts = [
                 tuple(db.execute(select(func.count(), func.max(table.updated_at))).one())
@@ -695,6 +700,9 @@ class Scorer:
         _id, cases, plan = bundle
         decisions: list[ScorerDecision] = []
         kinds = []
+        # The errors the project's settings accept: where it adds, and where it removes.
+        accepted = review_settings.of(db, project.id)
+        add, remove = accepted.share("add_error"), accepted.share("remove_error")
         for kind in (ISSUE_STORY, STORY_EPIC):
             mine = [case for case in cases if case.kind == kind]
             pooled = [case for case in every if case.kind == kind]
@@ -706,9 +714,8 @@ class Scorer:
             for key, full in (("light", False), ("full", True)):
                 # Where the project's own links are too few to measure on, or cannot be
                 # split, the measurement on all projects stands in.
-                local[key] = (measure(pooled, full, project.id) if own else None) or learned[kind][
-                    key
-                ][1]
+                here = measure(pooled, full, project.id, add) if own else None
+                local[key] = here or learned[kind][key][1]
                 found = local[key] if learned[kind][key][0] else None
                 if found is not None:
                     measured.append(
@@ -755,8 +762,8 @@ class Scorer:
                 if found is not None:
                     misses = found["misses"]
                     bounds[key] = (
-                        limit(misses, ADD_ERROR),
-                        limit(misses, REMOVE_ERROR),
+                        limit(misses, add),
+                        limit(misses, remove),
                         found.get("sure_from"),
                     )
             entry["weights"] = {
@@ -859,7 +866,7 @@ class Scorer:
         return {
             "ready": any(entry["ready"] for entry in kinds),
             "kinds": kinds,
-            "errors": {"add": ADD_ERROR, "remove": REMOVE_ERROR},
+            "errors": {"add": add, "remove": remove},
             "removal": _removal(db, project, plan),
         }, decisions
 

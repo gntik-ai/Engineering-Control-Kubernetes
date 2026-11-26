@@ -23,6 +23,7 @@ from sqlalchemy import (
     Uuid,
     false,
     text,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -1253,7 +1254,9 @@ class BugRecord(UUIDPrimaryKey, Timestamps, Base):
 class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     """What one project's reviews are set to (migration 0088): a limit in US dollars a
     month and since when it counts, the models that answer and judge unless a run says
-    otherwise, the makers its texts may be sent to, and how often an answer goes back."""
+    otherwise, the makers its texts may be sent to, and how often an answer goes back.
+    And (migration 0089) whether a cheaper model is asked first, and the numbers the
+    project set for itself."""
 
     __tablename__ = "review_settings"
     project_id: Mapped[UUID] = mapped_column(
@@ -1268,6 +1271,9 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     # The makers its texts may be sent to; none for the defaults.
     makers: Mapped[list[str] | None] = mapped_column(JSON)
     rounds: Mapped[int] = mapped_column(Integer, default=0)
+    cheaper_first: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    # The numbers the project set for itself, by their key; the others are the defaults.
+    numbers: Mapped[dict[str, float] | None] = mapped_column(JSON)
 
 
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):

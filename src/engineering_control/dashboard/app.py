@@ -1267,7 +1267,9 @@ def create_app(
         try:
             records = repo(request)
             result = await asyncio.to_thread(records.connections.listing, name)
-            result["models"] = await asyncio.to_thread(records.workspace_imports.model_choices)
+            result["models"] = await asyncio.to_thread(
+                records.workspace_imports.model_choices, name
+            )
             return JSONResponse(result)
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
@@ -1346,9 +1348,12 @@ def create_app(
         async def start(body: ConnectionAnalysisInput) -> dict[str, str]:
             records = repo(request)
             if body.provider or body.model:
-                choices = await asyncio.to_thread(records.workspace_imports.model_choices)
+                choices = await asyncio.to_thread(records.workspace_imports.model_choices, name)
                 if {"provider": body.provider, "model": body.model} not in choices:
-                    raise ProjectInvalid("Choose an available model from Accounts")
+                    raise ProjectInvalid(
+                        "Choose an available model of a maker this project's texts may be "
+                        "sent to (Reviews, Settings)."
+                    )
             return await asyncio.to_thread(
                 records.connections.analyze, name, key, body.provider, body.model
             )
@@ -1414,7 +1419,9 @@ def create_app(
         records = repo(request)
         try:
             result = await asyncio.to_thread(records.planning_analysis.status, name, page)
-            result["models"] = await asyncio.to_thread(records.workspace_imports.model_choices)
+            result["models"] = await asyncio.to_thread(
+                records.workspace_imports.model_choices, name
+            )
             return JSONResponse(result)
         except ProjectNotFound:
             raise HTTPException(status_code=404, detail="Project not found") from None
@@ -1468,13 +1475,16 @@ def create_app(
     async def planning_review_model(name: str, request: Request) -> Response:
         async def change(body: ConnectionAnalysisInput) -> dict[str, str]:
             records = repo(request)
-            choices = await asyncio.to_thread(records.workspace_imports.model_choices)
+            choices = await asyncio.to_thread(records.workspace_imports.model_choices, name)
             if (
                 not body.provider
                 or not body.model
                 or {"provider": body.provider, "model": body.model} not in choices
             ):
-                raise ProjectInvalid("Choose an available model from Accounts")
+                raise ProjectInvalid(
+                    "Choose an available model of a maker this project's texts may be "
+                    "sent to (Reviews, Settings)."
+                )
             return await asyncio.to_thread(
                 records.planning_analysis.set_model, name, body.provider, body.model
             )
@@ -2310,6 +2320,8 @@ def create_app(
                 body.judge(),
                 body.makers,
                 body.rounds,
+                body.cheaper_first,
+                body.numbers,
             ),
             event="project.review_settings_changed",
             subject=name,

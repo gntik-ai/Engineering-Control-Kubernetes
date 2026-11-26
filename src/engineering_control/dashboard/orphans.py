@@ -139,6 +139,8 @@ class _Stories:
     meant: list[UUID] = field(default_factory=list)
     matrix: Any = None
     issues: dict[UUID, Any] = field(default_factory=dict)
+    # How many candidates an issue is shown: the project's settings say.
+    candidates: int = SHORTLIST
 
 
 # The index of each project's Stories, kept for as long as nothing it is made of changed.
@@ -177,11 +179,13 @@ def _stamp(db: Session, project: UUID) -> tuple[Any, ...]:
 
 
 def _stories(db: Session, project: UUID) -> _Stories:
-    stamp = _stamp(db, project)
+    candidates = review_settings.of(db, project).count("candidates")
+    stamp = (*_stamp(db, project), candidates)
     kept = _INDEX.get(project)
     if kept is not None and kept[0] == stamp:
         return kept[1]
     index = _index(db, project)
+    index.candidates = candidates
     _INDEX[project] = (stamp, index)
     return index
 
@@ -303,7 +307,7 @@ def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[di
     nearest = set(close[:3])
     chosen = named + [key for key in ranked if key not in named]
     listed = []
-    for key in chosen[:SHORTLIST]:
+    for key in chosen[: stories.candidates]:
         epic = stories.epics.get(key)
         listed.append(
             {
@@ -655,6 +659,7 @@ class Orphans:
                 "run": parent_choice.latest_run(db, project.id, KIND.name),
                 "models": review_settings.models(db, project.id),
                 "roles": review_settings.roles(db, project.id),
+                "plan": parent_choice.planned(db, project.id, KIND.name),
                 "first": parent_choice.suggested_first(db, project.id, KIND.name),
                 "budget": review_budget.status(db, project.id),
             }
@@ -664,7 +669,7 @@ class Orphans:
         name: str,
         provider: str,
         model: str,
-        token_cap: int,
+        token_cap: int | None,
         again: bool = False,
         first: tuple[str, str] | None = None,
         judge: tuple[str, str] | None = None,

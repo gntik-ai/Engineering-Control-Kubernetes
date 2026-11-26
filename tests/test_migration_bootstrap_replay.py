@@ -67,7 +67,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0086 lets a run be limited in US dollars.
     # 0087 keeps what a judge said to each answer, and whether the two agreed.
     # 0088 keeps what each project's reviews are set to.
-    assert (head, parent) == ("0088", "0087")
+    # 0089 keeps the numbers a project set for its reviews.
+    assert (head, parent) == ("0089", "0088")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -176,6 +177,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     command.downgrade(config, parent)
+    settings = {column["name"] for column in inspect(engine).get_columns("review_settings")}
+    assert "numbers" not in settings and "cheaper_first" not in settings and "rounds" in settings
+    command.downgrade(config, "0087")
     assert "review_settings" not in inspect(engine).get_table_names()
     runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
     assert {"first_model", "cost", "priced", "dollar_cap", "judge_model", "agreed"} <= runs

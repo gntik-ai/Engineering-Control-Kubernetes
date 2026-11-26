@@ -1,4 +1,4 @@
-import { Alert, Button, Field, FieldLabel, Input, Link, SimpleSelect } from '@gntik-ai/ui';
+import { Alert, Button, Field, FieldLabel, Input, Link } from '@gntik-ai/ui';
 import { useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
@@ -99,41 +99,18 @@ export function TokenBudget({ project, budget, reload }: { project: string; budg
 export function PlanningReviews({ project }: { project: string }) {
   const path = 'projects/' + encodeURIComponent(project) + '/planning-reviews';
   const [page, setPage] = useState(1);
-  const [choice, setChoice] = useState('');
   const resource = useResource<ReviewPage>(apiUrl(path, { page }), 5000);
   const data = resource.data;
-  const queue = useSubmit(() => postJson(path + '/pause', { paused: !data?.paused }), resource.reload);
-  const current = data?.model && data.provider ? JSON.stringify([data.provider, data.model]) : '';
-  const save = useSubmit(() => {
-    const [provider, model] = JSON.parse(choice) as [string, string];
-    return postJson(path + '/model', { provider, model });
-  }, () => { setChoice(''); resource.reload(); });
   return <>
     <p className="text-sm text-muted-foreground">The token budget, the limit in dollars, the model of these reviews and the switch that stops them are under <Link href={reviewUrl(project, 'settings')} underline="always">Reviews, Settings</Link>.</p>
     <section className="grid gap-3 rounded-xl border border-border bg-card p-5">
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <h3 className="font-semibold">Automatic planning reviews</h3>
-      {data && <Button size="sm" variant="secondary" loading={queue.pending} disabled={queue.pending || (data.paused && !!data.review_budget?.required)}
-        onClick={() => void queue.submit()}>{data.paused ? 'Resume automatic reviews' : 'Stop automatic reviews'}</Button>}
-    </div>
-    {queue.problem && <Alert tone="warning" title={queue.problem} />}
+    <h3 className="font-semibold">Automatic planning reviews</h3>
+    {data && <p className="text-sm text-muted-foreground">{data.paused ? 'Stopped' : 'Running'}{data.model ? ' · ' + data.model + (data.provider ? ' · ' + data.provider : '') : ' · no model chosen'}</p>}
     {data?.usage_24h && <p className="text-sm text-muted-foreground">Automatic review in the last 24 hours · {data.usage_24h.requests.toLocaleString()} recorded model calls · {data.usage_24h.tokens.toLocaleString()} tokens</p>}
     {data?.paused && <p role="status" className="text-sm">Stopped · {(data.counts.queued ?? 0).toLocaleString()} queued for this project.</p>}
     <LoadError resource={resource} />
     {data && <>
-      <div className="flex flex-wrap items-end gap-2">
-        <Field>
-          <FieldLabel>Planning review model</FieldLabel>
-          <SimpleSelect aria-label="Planning review model" placeholder="Choose a model from Accounts"
-            value={choice || current || null}
-            items={data.models.map(m => ({ value: JSON.stringify([m.provider, m.model]), label: m.model + ' · ' + m.provider }))}
-            onValueChange={v => setChoice(v ?? '')} />
-        </Field>
-        <Button size="sm" variant="secondary" disabled={!choice || choice === current || save.pending}
-          loading={save.pending} onClick={() => void save.submit()}>Save model</Button>
-      </div>
-      {save.problem && <Alert tone="destructive" title={save.problem} />}
-      {!data.model && !!data.counts.queued && <Alert tone="warning" title="Choose a model to start the queued reviews." />}
+      {!data.model && !!data.counts.queued && <Alert tone="warning" title="Choose the model of the planning reviews under Reviews, Settings to start the queued reviews." />}
       {!!data.items.length && <details>
         <summary className="cursor-pointer text-sm">Review history · {Object.entries(data.counts)
           .map(([state, n]) => n + ' ' + (data.status_labels?.[state] ?? state).toLowerCase()).join(' · ')}</summary>

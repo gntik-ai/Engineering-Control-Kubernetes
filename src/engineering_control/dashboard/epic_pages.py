@@ -999,6 +999,7 @@ class EpicPages:
                     "run": parent_choice.latest_run(db, pid, KIND.name),
                     "models": review_settings.models(db, project.id),
                     "roles": review_settings.roles(db, project.id),
+                    "plan": parent_choice.planned(db, project.id, KIND.name),
                     "budget": review_budget.status(db, pid),
                 },
             }
@@ -1053,7 +1054,7 @@ class EpicPages:
         )
 
     def start(
-        self, name: str, provider: str, model: str, token_cap: int, again: bool = False
+        self, name: str, provider: str, model: str, token_cap: int | None, again: bool = False
     ) -> dict[str, Any]:
         """Begin a run that has a model write the overview of each open Epic that has
         none written from its records as they stand."""

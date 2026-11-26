@@ -16,7 +16,12 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import coverage_preview, review_budget, review_flows
+from engineering_control.dashboard import (
+    coverage_preview,
+    review_budget,
+    review_flows,
+    review_settings,
+)
 from engineering_control.dashboard.issue_coverage import Coverage, technical_items
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.project_records import (
@@ -282,7 +287,7 @@ class WorkspaceImports:
                 return status
             return {
                 **status,
-                "models": self.model_choices()
+                "models": self.model_choices(name)
                 if row and row.stage in ("analysis", *KINDS, "complete")
                 else [],
                 "review": (_brief(found) if brief else found)
@@ -293,12 +298,23 @@ class WorkspaceImports:
                 "description": row.draft if row else None,
                 "provider": row.provider if row else None,
                 "model": row.model if row else None,
+                # The model of planning reviews and Discovery, from Reviews, Settings.
+                "settings_model": {
+                    "provider": project.planning_provider,
+                    "model": project.planning_model,
+                }
+                if project.planning_provider and project.planning_model
+                else None,
                 "counts": progress.get("counts") or {},
             }
 
-    def model_choices(self) -> list[dict[str, str]]:
+    def model_choices(self, name: str | None = None) -> list[dict[str, str]]:
+        """The models a review can ask; for a project, those of the makers its texts may
+        be sent to."""
         with self.sessions() as session:
-            return review_flows.model_choices(session)
+            if name is None:
+                return review_flows.model_choices(session)
+            return review_settings.models(session, active_project(session, name).id)
 
     def start(self, name: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -326,9 +342,12 @@ class WorkspaceImports:
         if (
             not provider
             or not model
-            or {"provider": provider, "model": model} not in self.model_choices()
+            or {"provider": provider, "model": model} not in self.model_choices(project.name)
         ):
-            raise ProjectInvalid("Choose an available Accounts model for the coverage check.")
+            raise ProjectInvalid(
+                "Choose the model of the planning reviews under Reviews, Settings: an "
+                "available one, of a maker this project's texts may be sent to."
+            )
         return provider, model
 
     def preview_coverage(
@@ -667,9 +686,10 @@ class WorkspaceImports:
                 settle_bulk_review(session, row)
                 return None
             if row.stage in ("analysis", *KINDS) and (row.provider, row.model) != (provider, model):
-                if {"provider": provider, "model": model} not in self.model_choices():
+                if {"provider": provider, "model": model} not in self.model_choices(name):
                     raise ProjectInvalid(
-                        "Choose an available model account under Global settings → Accounts"
+                        "Choose the model of the planning reviews under Reviews, Settings: an "
+                        "available one, of a maker this project's texts may be sent to."
                     )
                 if row.progress.get("usage_daily") and "legacy_price_model" not in row.progress:
                     row.progress = {

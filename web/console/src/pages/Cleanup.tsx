@@ -2,8 +2,8 @@ import { Alert, Badge, Button, Card, CardBody, CardHeader, CardTitle, Link, Pagi
 import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { recordUrl } from '../router';
-import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run } from './ChoiceRun';
+import { recordUrl, reviewUrl } from '../router';
+import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan } from './ChoiceRun';
 
 type Kind = 'stories' | 'epics' | 'issues';
 interface Twin {
@@ -36,7 +36,7 @@ interface Overview {
     run: Run | null;
     models: Model[];
     first: FirstModel | null;
-    roles?: { answer: Model | null; judge: Model | null } | null;
+    plan?: RunPlan | null;
   };
   stale_days: number;
 }
@@ -150,11 +150,8 @@ export function Cleanup({ project }: { project: string }) {
                 }
                 path={base}
                 run={data.check.run}
-                models={data.check.models}
-                twoModels
-                judged
-                first={data.check.first}
-                roles={data.check.roles}
+                plan={data.check.plan ?? null}
+                settings={reviewUrl(project, 'settings')}
                 options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
                 asked={(chosen) => (chosen.again ? data.check.stories : data.check.to_ask)}
                 likely={(chosen) => (chosen.again ? data.check.likely_all : data.check.likely)}

@@ -1,4 +1,4 @@
-import { Badge, Button, Input, SimpleSelect } from '@gntik-ai/ui';
+import { Badge, Button, Input, Link, SimpleSelect } from '@gntik-ai/ui';
 import { useState, type ReactNode } from 'react';
 import { postJson } from '../api';
 import { Confirm } from '../confirm';
@@ -93,10 +93,23 @@ export interface RunOption {
   key: string;
   label: string;
 }
+/** What a run asks when it is started, as Reviews, Settings says. */
+export interface RunPlan {
+  answer: Model | null;
+  judge: Model | null;
+  /** A cheaper model asked first: the one whose trial on the check agreed. */
+  first: Model | null;
+  /** The tokens the run stops at. */
+  tokens: number;
+  /** How often an answer goes back when the judge says otherwise. */
+  rounds: number;
+}
 
 /**
- * The last run and its controls, and the form that starts the next one: the model, the
- * token limit and the run's options, with what the run is likely to use.
+ * The last run and its controls, and what starts the next one. A run of a check takes
+ * its model, its judge and its limit from Reviews, Settings: it is started with `plan`
+ * and shows no form. A trial of another model is started with `models`: the model to
+ * try and the trial's token limit are chosen here, because choosing them is the trial.
  */
 export function RunPanel({
   title,
@@ -104,16 +117,14 @@ export function RunPanel({
   path,
   run,
   models,
+  plan,
+  settings,
   options,
   asked,
   likely,
   largest,
   noun,
   note,
-  twoModels,
-  judged,
-  first,
-  roles,
   onChanged,
   onProblem,
 }: {
@@ -123,7 +134,12 @@ export function RunPanel({
   /** Where runs are started: `${path}/runs`. */
   path: string;
   run: Run | null;
-  models: Model[];
+  /** For a trial: the models one of which is tried. */
+  models?: Model[];
+  /** For a check: what its run asks, from the project's settings. */
+  plan?: RunPlan | null;
+  /** Where Reviews, Settings is. */
+  settings?: string;
   options: RunOption[];
   /** How many records the run asks about, and what it is likely to use, under the chosen options. */
   asked: (chosen: Record<string, boolean>) => number;
@@ -133,50 +149,27 @@ export function RunPanel({
   noun: [string, string];
   /** What becomes of the answers, said before the run starts. */
   note?: string;
-  /** Whether the run may ask a cheaper model first, and the one it asks by default. */
-  twoModels?: boolean;
-  /** Whether the run may have a judge: a model of another maker that answers unseen. */
-  judged?: boolean;
-  first?: FirstModel | null;
-  /** What Reviews, Settings names as the model that answers and the judge. */
-  roles?: { answer: Model | null; judge: Model | null } | null;
   onChanged: () => void;
   onProblem: (problem: string | null) => void;
 }) {
   const [picked, setPicked] = useState('');
   const [cap, setCap] = useState('');
   const [chosen, setChosen] = useState<Record<string, boolean>>({});
-  // Until the administrator chooses, the model whose trial on this check agreed.
-  const [firstPicked, setFirstPicked] = useState<string | null>(null);
-  // Until the administrator chooses: what the project's settings name.
-  const [judgePicked, setJudgePicked] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const live = run ? LIVE.includes(run.state) : false;
   const asking = isAsking(run);
-  const model =
-    models.find((entry) => keyOf(entry) === picked) ??
-    (roles?.answer ? models.find((entry) => keyOf(entry) === keyOf(roles.answer as Model)) : undefined) ??
-    models[0];
-  const others = twoModels && model ? models.filter((entry) => keyOf(entry) !== keyOf(model)) : [];
-  const firstKey = firstPicked ?? (first ? keyOf(first) : '');
-  const judgeKey = judgePicked ?? (roles?.judge ? keyOf(roles.judge) : '');
-  const judgeModel =
-    judged && model
-      ? (models.find((entry) => keyOf(entry) === judgeKey && keyOf(entry) !== keyOf(model)) ?? null)
-      : null;
-  // A run has a judge or a cheaper model first, not both.
-  const firstModel = judgeModel ? null : (others.find((entry) => keyOf(entry) === firstKey) ?? null);
+  const trial = plan === undefined;
+  const offered = models ?? [];
+  const model = trial ? (offered.find((entry) => keyOf(entry) === picked) ?? offered[0]) : (plan?.answer ?? undefined);
   const count = asked(chosen);
   const use = likely(chosen);
-  // Half as much again as the run is likely to use, and room for the last question: a
-  // question holds its whole size until the provider says what it used.
-  // With a first model, what it passes on is asked twice.
-  const suggested = Math.max(
-    10_000,
-    Math.ceil((use * (judgeModel ? 3 : firstModel ? 2.2 : 1.5) + largest) / 10_000) * 10_000,
-  );
-  const limit = Number(cap || suggested);
+  // A trial: half as much again as it is likely to use, and room for the last question,
+  // which holds its whole size until the provider says what it used.
+  const suggested = Math.max(10_000, Math.ceil((use * 1.5 + largest) / 10_000) * 10_000);
+  const limit = trial ? Number(cap || suggested) : (plan?.tokens ?? 0);
+  // With a judge every question is asked twice; with a first model, what it passes on.
+  const times = plan?.judge ? 2 : plan?.first ? 1.5 : 1;
   const control = (action: 'stop' | 'resume' | 'end') => {
     if (!run) return;
     setBusy(action);
@@ -186,6 +179,23 @@ export function RunPanel({
       .catch((error: unknown) => onProblem(error instanceof Error ? error.message : 'The request failed.'))
       .finally(() => setBusy(null));
   };
+  const inSettings = settings ? (
+    <Link href={settings} underline="always">
+      Reviews, Settings
+    </Link>
+  ) : (
+    'Reviews, Settings'
+  );
+  const checkboxes = options.map((option) => (
+    <label key={option.key} className="flex items-center gap-2 pb-2 text-sm">
+      <input
+        type="checkbox"
+        checked={Boolean(chosen[option.key])}
+        onChange={(event) => setChosen({ ...chosen, [option.key]: event.target.checked })}
+      />
+      {option.label}
+    </label>
+  ));
   return (
     <section className="grid gap-3 rounded-lg border border-border p-4">
       <h3 className="text-sm font-semibold text-foreground">{title}</h3>
@@ -245,104 +255,78 @@ export function RunPanel({
           ) : null}
         </div>
       ) : null}
-      {live ? null : models.length === 0 ? (
+      {live ? null : trial ? (
+        offered.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No API account can be asked. Add one under Global settings, Accounts.
+          </p>
+        ) : (
+          <div className="grid gap-3">
+            <p className="text-sm text-muted-foreground">
+              {about} Asking about {some(count, noun[0], noun[1])} is likely to use about {whole(use)} tokens, counted
+              against the project’s review tokens. While a question is asked it holds up to {whole(largest)} of them,
+              and gives back what it did not use.
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="grid gap-1 text-sm">
+                Model to try
+                <SimpleSelect
+                  aria-label="Model that is tried"
+                  value={model ? keyOf(model) : ''}
+                  items={offered.map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` }))}
+                  onValueChange={(value) => setPicked(String(value))}
+                />
+              </label>
+              <label className="grid gap-1 text-sm">
+                Stop at this many tokens
+                <Input
+                  aria-label="Token limit of the trial"
+                  type="number"
+                  min="1000"
+                  max="5000000"
+                  step="1000"
+                  value={cap || String(suggested)}
+                  onChange={(event) => setCap(event.target.value)}
+                />
+              </label>
+              {checkboxes}
+              <Button disabled={!model || count === 0 || !(limit >= 1000)} onClick={() => setConfirming(true)}>
+                Ask about {some(count, noun[0], noun[1])}
+              </Button>
+            </div>
+          </div>
+        )
+      ) : !plan?.answer ? (
         <p className="text-sm text-muted-foreground">
-          No API account can be asked. Add one under Global settings, Accounts.
+          {about} No model is chosen to answer this project’s reviews: choose it, and a judge if you want one, under{' '}
+          {inSettings}. A run takes them from there.
         </p>
       ) : (
         <div className="grid gap-3">
           <p className="text-sm text-muted-foreground">
-            {about} Asking about {some(count, noun[0], noun[1])} is likely to use about {whole(use)} tokens, counted
-            against the project’s review tokens. While a question is asked it holds up to {whole(largest)} of them, and
-            gives back what it did not use.
+            {about} Asking about {some(count, noun[0], noun[1])} is likely to use about {whole(Math.round(use * times))}{' '}
+            tokens, counted against the project’s review tokens and its limit in dollars.
+          </p>
+          <p className="text-sm text-foreground">
+            {plan.answer.model} answers.{' '}
+            {plan.judge
+              ? `${plan.judge.model} is asked the same question without seeing the answer: where the two say the same the answer is agreed, and where they differ ${
+                  plan.rounds === 0
+                    ? 'it is in doubt and shown to you first'
+                    : `the answer goes back ${plan.rounds === 1 ? 'once' : 'twice'} before it is in doubt`
+                }. `
+              : plan.first
+                ? `${plan.first.model} is asked first, because its trial on this check agreed; what it does not settle goes to ${plan.answer.model}. `
+                : 'No judge is asked. '}
+            The run stops at {whole(plan.tokens)} tokens.{' '}
+            <span className="text-muted-foreground">Set under {inSettings}.</span>
           </p>
           <div className="flex flex-wrap items-end gap-3">
-            <label className="grid gap-1 text-sm">
-              Model
-              <SimpleSelect
-                aria-label="Model that is asked"
-                value={model ? keyOf(model) : ''}
-                items={models.map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` }))}
-                onValueChange={(value) => setPicked(String(value))}
-              />
-            </label>
-            {twoModels ? (
-              <label className="grid gap-1 text-sm">
-                Ask a cheaper model first
-                <SimpleSelect
-                  aria-label="Model that is asked first"
-                  value={firstModel ? keyOf(firstModel) : 'none'}
-                  items={[
-                    { value: 'none', label: 'No: only the model beside this' },
-                    ...others.map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
-                  ]}
-                  onValueChange={(value) => setFirstPicked(value === 'none' ? '' : String(value))}
-                />
-              </label>
-            ) : null}
-            {judged ? (
-              <label className="grid gap-1 text-sm">
-                Judge: a second answer, unseen
-                <SimpleSelect
-                  aria-label="Model that judges"
-                  value={judgeModel ? keyOf(judgeModel) : 'none'}
-                  items={[
-                    { value: 'none', label: 'No judge' },
-                    ...models
-                      .filter((entry) => !model || keyOf(entry) !== keyOf(model))
-                      .map((entry) => ({ value: keyOf(entry), label: `${entry.model} · ${entry.provider}` })),
-                  ]}
-                  onValueChange={(value) => setJudgePicked(value === 'none' ? '' : String(value))}
-                />
-              </label>
-            ) : null}
-            <label className="grid gap-1 text-sm">
-              Stop at this many tokens
-              <Input
-                aria-label="Token limit of the run"
-                type="number"
-                min="1000"
-                max="5000000"
-                step="1000"
-                value={cap || String(suggested)}
-                onChange={(event) => setCap(event.target.value)}
-              />
-            </label>
-            {options.map((option) => (
-              <label key={option.key} className="flex items-center gap-2 pb-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={Boolean(chosen[option.key])}
-                  onChange={(event) => setChosen({ ...chosen, [option.key]: event.target.checked })}
-                />
-                {option.label}
-              </label>
-            ))}
-            <Button disabled={!model || count === 0 || !(limit >= 1000)} onClick={() => setConfirming(true)}>
+            {checkboxes}
+            <Button disabled={count === 0} onClick={() => setConfirming(true)}>
               Ask about {some(count, noun[0], noun[1])}
             </Button>
           </div>
-          {judgeModel ? (
-            <p className="text-sm text-muted-foreground">
-              {judgeModel.model} is asked the same question about each answer, without being shown it. Where the two say
-              the same, the answer is agreed and goes into one batch for you to approve with a sample. Where they
-              differ, the answer goes back once, told what the other chose; if they still differ it is in doubt and is
-              shown to you first. The judge has to be of another maker than the model that answers. A run with a judge
-              can use up to three times the tokens.
-            </p>
-          ) : null}
-          {twoModels && !judgeModel ? (
-            <p className="text-sm text-muted-foreground">
-              {firstModel
-                ? `${firstModel.model} is asked first. An answer of it is kept when it is clear and every passage it quotes is in the texts; everything else is asked of ${model?.model ?? 'the model beside it'}, so the run can use up to twice the tokens. `
-                : ''}
-              {first && firstModel && keyOf(first) === keyOf(firstModel)
-                ? `It is chosen because in its trial on this check it settled ${whole(first.settled)} of ${whole(first.answers)} questions by itself and said the same as the answer on record in ${whole(first.same)} of those.`
-                : first
-                  ? ''
-                  : 'No model has passed a trial on this check, so none is asked first by default. Try one under “Try another model on questions already answered”, on the Reorganize page.'}
-            </p>
-          ) : null}
         </div>
       )}
       {confirming && model ? (
@@ -350,23 +334,21 @@ export function RunPanel({
           title={`Ask about ${some(count, noun[0], noun[1])}?`}
           about={
             <>
-              {firstModel
-                ? `${firstModel.model} is asked first, one question per ${noun[0]}; what it does not settle is asked of ${model.model}.`
-                : `${model.model} is asked one question per ${noun[0]}.`}{' '}
+              {plan?.first
+                ? `${plan.first.model} is asked first, one question per ${noun[0]}; what it does not settle is asked of ${model.model}.`
+                : plan?.judge
+                  ? `${model.model} and ${plan.judge.model} are each asked one question per ${noun[0]}.`
+                  : `${model.model} is asked one question per ${noun[0]}.`}{' '}
               The run stops at {whole(limit)} tokens and counts against the project’s review tokens.{' '}
               {note ?? 'It changes nothing: every answer waits for you.'}
             </>
           }
           action="Start asking"
           run={() =>
-            postJson(`${path}/runs`, {
-              provider: model.provider,
-              model: model.model,
-              token_cap: limit,
-              ...(firstModel ? { first_provider: firstModel.provider, first_model: firstModel.model } : {}),
-              ...(judgeModel ? { judge_provider: judgeModel.provider, judge_model: judgeModel.model } : {}),
-              ...chosen,
-            })
+            postJson(
+              `${path}/runs`,
+              trial ? { provider: model.provider, model: model.model, token_cap: limit, ...chosen } : { ...chosen },
+            )
           }
           onClose={() => setConfirming(false)}
           onDone={() => {

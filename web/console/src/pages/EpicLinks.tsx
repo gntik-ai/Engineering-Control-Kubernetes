@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl, reviewUrl } from '../router';
-import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Run } from './ChoiceRun';
+import { isAsking, RunPanel, some, whole, type FirstModel, type Model, type Run, type RunPlan } from './ChoiceRun';
 
 type Answer = 'part' | 'unrelated' | 'unclear';
 interface Overview {
@@ -23,7 +23,7 @@ interface Overview {
     run: Run | null;
     models: Model[];
     first: FirstModel | null;
-    roles?: { answer: Model | null; judge: Model | null } | null;
+    plan?: RunPlan | null;
   };
 }
 interface Records {
@@ -161,10 +161,8 @@ export function EpicLinks({ project }: { project: string }) {
                 }
                 path={base}
                 run={data.check.run}
-                models={data.check.models}
-                twoModels
-                first={data.check.first}
-                roles={data.check.roles}
+                plan={data.check.plan ?? null}
+                settings={reviewUrl(project, 'settings')}
                 options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
                 asked={(chosen) => (chosen.again ? data.check.stories : data.check.to_ask)}
                 likely={(chosen) => (chosen.again ? data.check.likely_all : data.check.likely)}

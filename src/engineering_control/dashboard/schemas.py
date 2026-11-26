@@ -404,7 +404,8 @@ class EvidenceRunInput(PlainChangeInput):
     candidate: str = Field(default="", max_length=260)
     provider: str = Field(default="", max_length=32)
     model: str = Field(default="", max_length=200)
-    token_cap: int = Field(ge=0, le=2_000_000, strict=True)
+    # None: what the project's settings say a run of Review evidence may use.
+    token_cap: int | None = Field(default=None, ge=0, le=2_000_000, strict=True)
 
 
 class EvidenceControlInput(PlainChangeInput):
@@ -513,11 +514,12 @@ class StoryInput(EpicInput):
 
 
 class OrphanRunInput(PlainChangeInput):
-    """A run that asks about the open issues without a User Story, within these tokens."""
+    """A run of a check. With no model named it takes the model that answers, the judge
+    and the tokens it stops at from the project's settings."""
 
-    provider: str = Field(min_length=1, max_length=32)
-    model: str = Field(min_length=1, max_length=200)
-    token_cap: int = Field(ge=1_000, le=5_000_000, strict=True)
+    provider: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=200)
+    token_cap: int | None = Field(default=None, ge=1_000, le=5_000_000, strict=True)
     # Ask about every one of them, also those that have an answer already.
     again: bool = False
     # A cheaper model that is asked first: what it settles is kept, and the rest is
@@ -565,6 +567,11 @@ class ModelTrialRunInput(OrphanRunInput):
 
 class ReviewSettingsInput(PlainChangeInput):
     """What a project's reviews are set to."""
+
+    # Where there is no judge: the model whose trial on a check agreed is asked first.
+    cheaper_first: bool = True
+    # The numbers the reviews work to, by their key; none leaves them as they are.
+    numbers: dict[str, float] | None = Field(default=None, max_length=40)
 
     dollar_limit: float = Field(ge=0, le=1000)
     # The models a run takes unless it is told otherwise; empty for none.

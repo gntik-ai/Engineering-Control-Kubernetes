@@ -19,7 +19,7 @@ import { ArrowDown, ArrowUp } from '@gntik-ai/icons';
 import { useState } from 'react';
 import { apiUrl, postJson, useResource, type Listing, type Queue, type QueueDetail } from '../api';
 import { LoadError, TableFrame } from '../parts';
-import { navigate, queueUrl, recordUrl, useLocation, workspaceUrl, BASE } from '../router';
+import { navigate, queueUrl, recordUrl, reviewUrl, useLocation, workspaceUrl, BASE } from '../router';
 import { progress, QueuePage, QueueState } from './Queues';
 
 interface Named {
@@ -109,9 +109,9 @@ function QueueList({ project }: { project: string }) {
           </h2>
           <LoadError resource={overview} />
           {data && !data.model && (
-            <Alert tone="warning" title="Choose an Accounts model on the project Home tab." />
+            <Alert tone="warning" title="Choose the model of the planning reviews under Reviews, Settings." />
           )}
-          {data && !data.model && <Link href={workspaceUrl(project)}>Open Home</Link>}
+          {data && !data.model && <Link href={reviewUrl(project, 'settings')}>Open Reviews, Settings</Link>}
           <div className="flex flex-wrap items-end gap-2">
             <Input
               aria-label="Search open Epics"

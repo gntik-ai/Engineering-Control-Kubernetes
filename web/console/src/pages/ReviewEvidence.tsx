@@ -1,9 +1,9 @@
 import { sortParams, useTableOrder } from '../components/table-order';
-import { Alert, Button, Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Tabs, TabsList, TabsTab, Textarea } from '@gntik-ai/ui';
+import { Alert, Button, Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Link, Tabs, TabsList, TabsTab, Textarea } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource, type FlowDocument } from '../api';
 import { useProjects } from '../parts';
-import { projectScope } from '../router';
+import { projectScope, reviewUrl } from '../router';
 import { DataTable } from '../components/blocks/tables/data-table/DataTable';
 import type { DataTableColumn } from '../components/blocks/tables/data-table/data-table-utils';
 
@@ -20,7 +20,7 @@ type Run = { second_opinion?: Native | null; advisory?: Advisory | null; native?
   failed_request?: {arm: string; reason: string; provider_ref?: string | null};
   arms: {arm: string; scope: string | null; evidence: string; tokens: number; input: number; output: number; eur: string | null; provider_ref?: string | null}[] };
 type Unsettled = { id: string; flow: string; reserved: number; at: string | null; detail: string; sample?: string[] | null };
-type Status = { unsettled?: Unsettled[]; second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; paired: boolean; paid: boolean; models: Model[]; configured: Model | null; flow: string; run: Run | null };
+type Status = { unsettled?: Unsettled[]; second_model?: DecisionModel | null; decision_model?: DecisionModel | null; generation?: string; paired: boolean; paid: boolean; models: Model[]; configured: Model | null; settings?: { model: Model | null; tokens: number }; flow: string; run: Run | null };
 const keyOf = (m: Model) => JSON.stringify([m.provider, m.model]);
 const active = ['queued','calling','held','stopping','paused'];
 const labels: Record<string,string> = {
@@ -67,8 +67,12 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
   const ordering = useTableOrder();
   const [pick,setPick]=useState('');
   const fallback=data?.models.find(m=>data.configured && keyOf(m)===keyOf(data.configured)) ?? data?.models.find(m=>m.provider==='anthropic') ?? data?.models[0];
-  const chosen=data?.models.find(m=>keyOf(m)===pick) ?? fallback;
-  const [cap,setCap]=useState('12000');
+  // On a project's page the model and the limit are those of Reviews, Settings; in the Flow Designer they are tried here.
+  const fromSettings=!draft ? data?.settings : undefined;
+  const set=fromSettings?.model ? data?.models.find(m=>keyOf(m)===keyOf(fromSettings.model as Model)) : undefined;
+  const chosen=fromSettings ? set : data?.models.find(m=>keyOf(m)===pick) ?? fallback;
+  const [typedCap,setCap]=useState('12000');
+  const cap=fromSettings ? String(fromSettings.tokens) : typedCap;
   const [view,setView]=useState<Preview|null>(null);
   const [query,setQuery]=useState<{page:number;search:string;nonce:number}|null>(null);
   const decisionModel = draft ? view?.decision_model : data?.decision_model;
@@ -123,7 +127,8 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
         </li>)}</ul>
       </div>}/>}
     {data && <div className="flex flex-wrap items-end gap-3">
-      {!generation && (!decisionModel || data.paired || draft) && !!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
+      {fromSettings && !generation && (!decisionModel || data.paired) && <p className="text-sm">{set ? <>Model · {set.provider} · {set.model} · stops at {fromSettings.tokens.toLocaleString()} tokens. </> : <>No model is chosen to answer this project’s reviews. </>}<span className="text-muted-foreground">Set under <Link href={reviewUrl(project,'settings')}>Reviews, Settings</Link>.</span></p>}
+      {!fromSettings && !generation && (!decisionModel || data.paired || draft) && !!data.models.length && <label className="grid gap-1 text-sm">Accounts model<select className={optionsClass} value={chosen?keyOf(chosen):''} onChange={e=>setPick(e.target.value)}>
         {data.models.map(m=><option key={keyOf(m)} value={keyOf(m)}>{m.provider} · {m.model}</option>)}</select></label>}
       {generation && <p className="text-sm">Generation · {generation}</p>}
       {[{label:'Decision model', model:decisionModel}, {label:'Conditional second opinion', model:secondModel}].map(({label, model}) => model && <div key={label} className="grid gap-1 text-sm"><strong>{label} · {model.provider} · {model.model}</strong>
@@ -133,7 +138,7 @@ export function EvidencePanel({project, draft}: {project:string; draft?: FlowDoc
       {secondModel && <p className="basis-full text-sm text-muted-foreground">One pair per run. A negative, incomplete or conflicting first judgment triggers a second opinion on the same original sources.</p>}
       <Button variant="secondary" size="sm" loading={waiting} disabled={waiting} onClick={()=>setQuery({page:1,search:'',nonce:Date.now()})}>Preview related records</Button>
       {!draft && !(run && active.includes(run.state)) && <>
-        {data.paid && <label className="grid gap-1 text-sm">Pilot token cap<Input aria-label="Pilot token cap" type="number" min="1" max="2000000" value={cap} onChange={e=>setCap(e.target.value)} /></label>}
+        {data.paid && !fromSettings && <label className="grid gap-1 text-sm">Pilot token cap<Input aria-label="Pilot token cap" type="number" min="1" max="2000000" value={cap} onChange={e=>setCap(e.target.value)} /></label>}
         <Button size="sm" disabled={busy || unavailable || (data.paid && ((data.paired && !chosen && !data.generation) || Number(cap)<=0 || Number(cap)>2000000))} loading={busy}
           onClick={()=>void change()}>{data.decision_model?'Run decision review':data.paid?'Run paired comparison':'Run evidence flow'}</Button>
       </>}

@@ -96,13 +96,13 @@ class _Story:
     stated: UUID | None = None
 
 
-def clear(listed: list[dict[str, Any]]) -> bool:
+def clear(listed: list[dict[str, Any]], margin: float = CLEAR) -> bool:
     """Whether the texts alone point to one Epic: the Story's own text names it, or the
-    best is well ahead of the next."""
+    best is ahead of the next by the margin the project's settings say."""
     if len(listed) < 2 or listed[0].get("stated"):
         return True
     best, second = float(listed[0]["score"]), float(listed[1]["score"])
-    return best > 0 and best >= CLEAR * second
+    return best > 0 and best >= margin * second
 
 
 class _Scope:
@@ -301,6 +301,7 @@ class PrimaryEpics:
             # unclear ones of them, and about all; and the most one question holds.
             likely = likely_unclear = likely_all = largest = 0
             placeholder = ChoiceRun(provider="", model="")
+            margin = review_settings.number(db, project.id, "epic_margin")
             for story in scope.children():
                 listed = scope.shortlist(story)
                 current = scope.revision(story, listed)
@@ -312,7 +313,7 @@ class PrimaryEpics:
                     else None
                 )
                 waiting = parent_choice.waiting(shown)
-                plain = clear(listed)
+                plain = clear(listed, margin)
                 suggested = str(story.primary) if story.primary else None
                 agrees = bool(
                     waiting
@@ -424,6 +425,7 @@ class PrimaryEpics:
                 "run": parent_choice.latest_run(db, project.id, KIND.name),
                 "models": review_settings.models(db, project.id),
                 "roles": review_settings.roles(db, project.id),
+                "plan": parent_choice.planned(db, project.id, KIND.name),
                 "first": parent_choice.suggested_first(db, project.id, KIND.name),
                 "budget": review_budget.status(db, project.id),
             }
@@ -433,7 +435,7 @@ class PrimaryEpics:
         name: str,
         provider: str,
         model: str,
-        token_cap: int,
+        token_cap: int | None,
         again: bool = False,
         unclear_only: bool = False,
         first: tuple[str, str] | None = None,
@@ -442,6 +444,8 @@ class PrimaryEpics:
         """Begin a run over the User Stories that wait for a primary Epic and have no
         answer yet: all of them, or only those whose texts do not point to one Epic."""
         self.links.reconcile_project(name)
+        with self.sessions() as db:
+            margin = review_settings.number(db, active_project(db, name).id, "epic_margin")
         return parent_choice.start(
             self.sessions,
             name,
@@ -450,7 +454,7 @@ class PrimaryEpics:
             model,
             token_cap,
             again,
-            lambda child, listed: not child.stated and not (unclear_only and clear(listed)),
+            lambda child, listed: not child.stated and not (unclear_only and clear(listed, margin)),
             first,
             None,
             judge,

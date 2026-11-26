@@ -21,6 +21,7 @@ from engineering_control.dashboard import (
     review_flows,
     review_graph,
     review_prerequisites,
+    review_settings,
 )
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import excerpt
@@ -47,6 +48,7 @@ from engineering_control.engine import reviews
 from engineering_control.engine.document import Document, FlowInvalid, parse
 from engineering_control.engine.validate import errors
 from engineering_control.models import decisions, openrouter
+from engineering_control.models.providers import maker
 from engineering_control.models.service import ModelError, Models, Question, Reply
 from engineering_control.table_sort import Direction, ordered
 
@@ -404,7 +406,14 @@ def status(sessions: sessionmaker[Session], name: str) -> Row:
     with sessions() as db:
         project = active_project(db, name)
         found = latest(db, project.id)
-        models = review_flows.model_choices(db)
+        # Only models of the makers the project's texts may be sent to.
+        models = review_settings.models(db, project.id)
+        mine = review_settings.of(db, project.id)
+        answering = (
+            {"provider": mine.answer[0], "model": mine.answer[1]}
+            if mine.answer and {"provider": mine.answer[0], "model": mine.answer[1]} in models
+            else None
+        )
         wizard = db.execute(
             select(WorkspaceImport.provider, WorkspaceImport.model).where(
                 WorkspaceImport.project_id == project.id
@@ -417,6 +426,8 @@ def status(sessions: sessionmaker[Session], name: str) -> Row:
             "unsettled": unsettled(db, project.id),
             "models": models,
             "configured": configured,
+            # What a run takes when it names neither: Reviews, Settings.
+            "settings": {"model": answering, "tokens": mine.count("evidence_tokens")},
             "flow": doc.name,
             "version": v,
             "paired": any(s.task == reviews.COMPARE for s in doc.nodes),
@@ -433,11 +444,18 @@ def start(
     request_id: UUID,
     provider: str,
     model: str,
-    cap: int,
+    cap: int | None,
     candidate: str = "",
 ) -> Row:
+    """Begin a run. One that names no model or no limit takes the model that answers
+    and the tokens of a run of Review evidence from the project's settings."""
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
+        mine = review_settings.of(db, project.id)
+        if not provider and not model and mine.answer:
+            provider, model = mine.answer
+        if cap is None:
+            cap = mine.count("evidence_tokens")
         old = db.scalar(
             select(ReviewEvidenceJob.project_id).where(ReviewEvidenceJob.run_id == request_id)
         )
@@ -454,6 +472,7 @@ def start(
         settings = reviews.Policy.from_document(doc).settings()
         if settings.get("generation"):
             provider, model = settings["generation"].split(":", 1)
+        asked: list[tuple[str, str]] = []
         for task, key in (
             (reviews.DECISION, "decision_model"),
             (reviews.SECOND_OPINION, "second_model"),
@@ -465,12 +484,24 @@ def start(
                         "and a positive run cap."
                     )
                 settings[key] = native
+                asked.append((native["provider"], native["model"]))
         if any(n.task == reviews.COMPARE for n in doc.nodes):
             if cap <= 0 or {"provider": provider, "model": model} not in review_flows.model_choices(
                 db
             ):
                 raise ProjectInvalid(
-                    "Select an available Accounts API model and a positive pilot token cap."
+                    "Choose the model that answers under Reviews, Settings: an available "
+                    "one, with a positive number of tokens for a run of Review evidence."
+                )
+            asked.append((provider, model))
+        elif settings.get("generation"):
+            asked.append((provider, model))
+        for named in asked:
+            # The project's texts go only to the makers its settings allow.
+            if not review_settings.permits(db, project.id, *named):
+                raise ProjectInvalid(
+                    f"This project's texts are not sent to {maker(*named)}. Allow the maker "
+                    "under Reviews, Settings, or choose another model."
                 )
         run = ReviewFlowRun(
             id=request_id,

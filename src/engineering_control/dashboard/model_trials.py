@@ -50,8 +50,8 @@ from engineering_control.db.models import (
 )
 from engineering_control.models.service import Question, Reply
 
-# How many records a trial asks about unless it is told to ask about all of them.
-SAMPLE: Final = 100
+# How many records a trial asks about unless it is told to ask about all of them is in
+# the project's settings.
 # The trials whose reports are shown.
 SHOWN: Final = 20
 WORKFLOW: Final = "model_trial"
@@ -253,6 +253,7 @@ def _report(
     run: ChoiceRun,
     lines: list[ModelTrialLine],
     paid: dict[tuple[str, str], tuple[int, float]],
+    gate: tuple[int, float] = (parent_choice.GATE_SETTLED, parent_choice.GATE_SAME),
 ) -> dict[str, Any]:
     trial = BY_NAME[run.kind]
     answered = len(lines)
@@ -290,7 +291,7 @@ def _report(
         # of those are the same as on record, and whether that passes the gate.
         "settled": settled,
         "settled_same": kept_same,
-        "gate": parent_choice.trial_gate(settled, kept_same),
+        "gate": parent_choice.trial_gate(settled, kept_same, *gate),
         "tokens_each": round(sum(counted) / len(counted)) if counted else None,
         "cost": round(sum(priced), 6) if priced else None,
         "cost_each": round(sum(priced) / len(priced), 6) if priced else None,
@@ -323,6 +324,9 @@ class ModelTrials:
         with self.sessions() as db:
             project = active_project(db, name)
             placeholder = ChoiceRun(provider="", model="")
+            mine = review_settings.of(db, project.id)
+            sample = mine.count("trial_sample")
+            gate = parent_choice.gate_of(db, project.id)
             checks = []
             for trial in TRIALS.values():
                 scope = trial.scope(db, project)
@@ -341,10 +345,10 @@ class ModelTrials:
                         "noun": list(trial.noun),
                         "answers": len(waiting),
                         "models": sorted({known[child.id].model or "" for child in waiting} - {""}),
-                        "sample": min(SAMPLE, len(waiting)),
+                        "sample": min(sample, len(waiting)),
                         # What the answers on record used: the best guide to what another
                         # model uses for the same questions.
-                        "likely": sum(used[:SAMPLE]),
+                        "likely": sum(used[:sample]),
                         "likely_all": sum(used),
                         "largest": largest,
                         "run": parent_choice.latest_run(db, project.id, trial.name),
@@ -365,15 +369,12 @@ class ModelTrials:
             paid = _paid(db, project.id) if runs else {}
             return {
                 "checks": checks,
-                "trials": [_report(run, lines[run.id], paid) for run in runs],
+                "trials": [_report(run, lines[run.id], paid, gate) for run in runs],
                 "models": review_settings.models(db, project.id),
                 "roles": review_settings.roles(db, project.id),
                 "budget": review_budget.status(db, project.id),
-                "sample": SAMPLE,
-                "gate": {
-                    "settled": parent_choice.GATE_SETTLED,
-                    "same": parent_choice.GATE_SAME,
-                },
+                "sample": sample,
+                "gate": {"settled": gate[0], "same": gate[1]},
             }
 
     def listing(
@@ -432,7 +433,7 @@ class ModelTrials:
         check: str,
         provider: str,
         model: str,
-        token_cap: int,
+        token_cap: int | None,
         everything: bool = False,
     ) -> dict[str, Any]:
         """Begin a trial of a model on a check: a sample of the questions that have an
@@ -440,12 +441,16 @@ class ModelTrials:
         trial = TRIALS.get(check)
         if trial is None:
             raise ProjectInvalid("A model cannot be tried on this check.")
+        if not provider or not model:
+            raise ProjectInvalid("Choose the model to try.")
+        with self.sessions() as db:
+            sample = review_settings.of(db, active_project(db, name).id).count("trial_sample")
         taken = 0
 
         def sampled(_child: Any, _listed: list[dict[str, Any]]) -> bool:
             nonlocal taken
             taken += 1
-            return everything or taken <= SAMPLE
+            return everything or taken <= sample
 
         return parent_choice.start(
             self.sessions, name, trial.name, provider, model, token_cap, True, sampled

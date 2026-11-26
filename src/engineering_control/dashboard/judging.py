@@ -60,12 +60,9 @@ from engineering_control.models.service import Question, Reply
 
 ISSUE_STORY: Final = signals.ISSUE_STORY
 STORY_EPIC: Final = signals.STORY_EPIC
-# Pairs of each sort, right and wrong, a measurement asks about.
-SAMPLE: Final = 60
-# What a measurement may cost unless told otherwise, and what all of a project's
-# measurements may cost together (decided on 26 November 2026).
+# What a measurement may cost unless told otherwise. How many pairs it asks about and
+# what all of a project's measurements may cost together are in the project's settings.
 RUN_DOLLARS: Final = 0.5
-PROJECT_DOLLARS: Final = 3.0
 TEXT: Final = 3000
 SHOWN: Final = 30
 WORKFLOW: Final = "judge_trial"
@@ -231,8 +228,9 @@ class _Scope:
     def children(self) -> list[_Pair]:
         """As many right pairs as wrong ones, the same for every judge."""
         ordered = sorted(self.every().values(), key=lambda pair: _order(pair.id))
-        right = [pair for pair in ordered if pair.right][:SAMPLE]
-        wrong = [pair for pair in ordered if not pair.right][:SAMPLE]
+        sample = review_settings.of(self.db, self.project.id).count("judge_sample")
+        right = [pair for pair in ordered if pair.right][:sample]
+        wrong = [pair for pair in ordered if not pair.right][:sample]
         return sorted([*right, *wrong], key=lambda pair: _order(pair.id))
 
     def record(self, key: UUID) -> _Pair | None:
@@ -423,7 +421,8 @@ class _AnswerScope:
             rows = self.db.scalars(select(BacklogItem).where(BacklogItem.id.in_(list(known)))).all()
             # An issue whose own text names its Story is no test of a model.
             kept = [row for row in rows if not any(entry["named"] for entry in self.shortlist(row))]
-            self._rows = sorted(kept, key=lambda row: _order(row.id))[:SAMPLE]
+            sample = review_settings.of(self.db, self.project.id).count("judge_sample")
+            self._rows = sorted(kept, key=lambda row: _order(row.id))[:sample]
         return self._rows
 
     def record(self, key: UUID) -> BacklogItem | None:
@@ -944,9 +943,9 @@ class Judging:
                 },
                 "models": candidates(db, project.id),
                 "spent": round(_spent(db, project.id), 6),
-                "limit": PROJECT_DOLLARS,
+                "limit": review_settings.number(db, project.id, "measure_dollars"),
                 "run_dollars": RUN_DOLLARS,
-                "sample": SAMPLE,
+                "sample": review_settings.of(db, project.id).count("judge_sample"),
             }
 
     def listing(self, name: str, run_id: UUID, show: str) -> dict[str, Any]:
@@ -1037,11 +1036,12 @@ class Judging:
                     "The account does not say what this model costs, and a measurement is "
                     "limited in dollars. Refresh the account's prices under Accounts."
                 )
-            left = PROJECT_DOLLARS - _spent(db, project.id)
+            allowed = review_settings.number(db, project.id, "measure_dollars")
+            left = allowed - _spent(db, project.id)
             if dollars > left + 1e-9:
                 raise ProjectConflict(
-                    f"The measurements of this project may cost ${PROJECT_DOLLARS:,.2f} "
-                    f"together, and ${max(left, 0):,.2f} is left."
+                    f"The measurements of this project may cost ${allowed:,.2f} together "
+                    f"(Reviews, Settings), and ${max(left, 0):,.2f} is left."
                 )
         return parent_choice.start(
             self.sessions,

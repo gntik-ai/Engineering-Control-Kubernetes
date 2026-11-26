@@ -129,7 +129,9 @@ def test_a_judge_is_measured_on_known_pairs_within_dollars(
         assert stopped["run"]["dollar_cap"] == 0.05
 
         # All of a project's measurements together have a limit too.
-        monkeypatch.setattr(judging, "PROJECT_DOLLARS", 0.07)
+        sum_ = {"dollar_limit": 3, "makers": ["fixture"], "rounds": 0}
+        saved = post(client, "review-settings", **sum_, numbers={"measure_dollars": 0.07})
+        assert saved.status_code == 200, saved.text
         over = post(client, "judge-trials/issue_story/runs", **start)
         assert over.status_code == 409 and "is left" in over.text
     finally:
@@ -426,7 +428,7 @@ def test_a_judge_answers_unseen_and_what_differs_goes_back_once(
                 item.description = "Show failed runs to the operator and keep an audit entry."
         # This project's settings let an answer go back once.
         with repo.sessions.begin() as db:
-            db.scalars(select(ReviewSettings)).one().rounds = 1
+            db.add(ReviewSettings(project_id=data["project"], rounds=1))
         start = {"provider": "fixture", "model": "analysis", "token_cap": 90_000}
         judge = {"judge_provider": "fixture", "judge_model": "other"}
         # The judge is another model, and a run has a judge or a cheaper model first.

@@ -166,11 +166,19 @@ def settles(spec: Any, read: dict[str, Any]) -> bool:
     )
 
 
-def trial_gate(settled: int, same: int) -> bool:
+def trial_gate(
+    settled: int, same: int, least: int = GATE_SETTLED, share: float = GATE_SAME
+) -> bool:
     """Whether a model's trial on a check lets it be asked first by default: it settled
     enough questions by itself, and of those it said the same as the answer on record
     often enough."""
-    return settled >= GATE_SETTLED and same >= GATE_SAME * settled
+    return settled >= least and same >= share * settled
+
+
+def gate_of(db: Session, project: UUID) -> tuple[int, float]:
+    """What a trial must reach in this project: answers settled, and the share the same."""
+    mine = review_settings.of(db, project)
+    return mine.count("gate_settled"), mine.share("gate_same")
 
 
 def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | None:
@@ -179,6 +187,7 @@ def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | N
     whose questions cost least. None when no trial passed: nothing is asked first then."""
     seen: set[tuple[str, str]] = set()
     passed: list[tuple[float, int, dict[str, Any]]] = []
+    least, share = gate_of(db, project)
     runs = db.scalars(
         select(ChoiceRun)
         .where(
@@ -200,7 +209,7 @@ def suggested_first(db: Session, project: UUID, kind: str) -> dict[str, Any] | N
         ).all()
         settled = sum(1 for kept, _same, _cost in lines if kept)
         same = sum(1 for kept, agrees, _cost in lines if kept and agrees)
-        if not trial_gate(settled, same):
+        if not trial_gate(settled, same, least, share):
             continue
         priced = [cost for _kept, _same, cost in lines if cost is not None]
         passed.append(
@@ -559,13 +568,131 @@ def dismiss(sessions: sessionmaker[Session], name: str, kind: str, child: UUID) 
     return {"id": str(child), "dismissed": True}
 
 
+def planned(db: Session, project: UUID, kind: str) -> dict[str, Any]:
+    """What a run of this check asks when it is started without saying: the model the
+    project's settings name to answer, their judge where the check can have one and it
+    is of another maker, or else the model whose trial on the check agreed, asked first.
+    And the tokens the run stops at."""
+    spec = KINDS[kind]
+    mine = review_settings.of(db, project)
+    offered = review_settings.models(db, project)
+
+    def usable(role: tuple[str, str] | None) -> tuple[str, str] | None:
+        return role if role and {"provider": role[0], "model": role[1]} in offered else None
+
+    answer = usable(mine.answer)
+    judge = first = None
+    if answer is not None:
+        if getattr(spec, "judged", False):
+            judge = usable(mine.judge)
+            if judge is not None and family_of(*judge) == family_of(*answer):
+                judge = None
+        if judge is None and mine.cheaper_first and getattr(spec, "two_models", False):
+            found = suggested_first(db, project, kind)
+            named = (found["provider"], found["model"]) if found else None
+            if named != answer:
+                first = usable(named)
+
+    def shown(role: tuple[str, str] | None) -> dict[str, str] | None:
+        return {"provider": role[0], "model": role[1]} if role else None
+
+    return {
+        "answer": shown(answer),
+        "judge": shown(judge),
+        "first": shown(first),
+        "tokens": mine.count("run_tokens"),
+        "rounds": mine.rounds,
+    }
+
+
+# The checks a run of which is started from a worklist, as they are called.
+CHECKS: Final = {
+    "issue_story": "Issues with no User Story",
+    "story_epic": "Primary Epics",
+    "story_needed": "Clean-up: User Stories nothing supports",
+    "epic_links": "Extra Epic links",
+    "epic_overview": "Epic overviews",
+}
+
+
+def question_cost(db: Session, kind: str, named: tuple[str, str]) -> float | None:
+    """What one question of this check has cost with this model, in US dollars: from
+    the runs in which it answered or judged, in any project. None where it never did, or
+    its account does not say what it costs."""
+    cost = count = 0.0
+    for spent, asked, provider, model in (
+        (ChoiceRun.cost, ChoiceRun.priced, ChoiceRun.provider, ChoiceRun.model),
+        (
+            ChoiceRun.judge_cost,
+            ChoiceRun.judge_asked,
+            ChoiceRun.judge_provider,
+            ChoiceRun.judge_model,
+        ),
+    ):
+        for paid, questions in db.execute(
+            select(spent, asked).where(
+                ChoiceRun.kind == kind, provider == named[0], model == named[1], asked > 0
+            )
+        ):
+            if paid:
+                cost, count = cost + float(paid), count + int(questions)
+    return cost / count if count else None
+
+
+def estimates(db: Session, project: ProjectRecord) -> list[dict[str, Any]]:
+    """For each check: what a run started now would ask, how many records wait for an
+    answer, and what asking about them is likely to cost, from what the same questions
+    cost before."""
+    found = []
+    for kind, label in CHECKS.items():
+        spec = KINDS.get(kind)
+        if spec is None:
+            continue
+        plan = planned(db, project.id, kind)
+        scope = spec.scope(db, project)
+        known = reviews(db, project.id, kind)
+        waiting = (
+            0
+            if scope.refusal()
+            else sum(
+                1
+                for child in scope.children()
+                if (review := known.get(child.id)) is None or review.state != "answered"
+            )
+        )
+        each: float | None = None
+        if plan["answer"]:
+            each = question_cost(db, kind, (plan["answer"]["provider"], plan["answer"]["model"]))
+            if each is not None and plan["judge"]:
+                judged = question_cost(
+                    db, kind, (plan["judge"]["provider"], plan["judge"]["model"])
+                )
+                each = each + judged if judged is not None else None
+        found.append(
+            {
+                "check": kind,
+                "label": label,
+                "plan": plan,
+                "waiting": waiting,
+                "each": round(each, 6) if each is not None else None,
+                "cost": round(each * waiting, 4) if each is not None else None,
+            }
+        )
+    return found
+
+
+NO_ANSWERING_MODEL: Final = (
+    "No model is chosen to answer this project's reviews. Choose it under Reviews, Settings."
+)
+
+
 def start(
     sessions: sessionmaker[Session],
     name: str,
     kind: str,
-    provider: str,
-    model: str,
-    token_cap: int,
+    provider: str = "",
+    model: str = "",
+    token_cap: int | None = None,
     again: bool = False,
     only: Any = None,
     first: tuple[str, str] | None = None,
@@ -576,13 +703,30 @@ def start(
     when asked to ask ``again``. ``only`` narrows them: it is given each record and its
     shortlist and says whether the run asks about it. ``first`` names a cheaper model
     that is asked before the run's own: what it settles is kept, the rest goes on.
-    ``dollars`` is what a run of a kind that is limited in money stops at."""
+    ``dollars`` is what a run of a kind that is limited in money stops at.
+
+    A run that names no model takes what the project's settings say: the model that
+    answers, the judge or the cheaper model first, and the tokens it stops at."""
     spec = KINDS[kind]
     free = in_dollars(spec)
     if free and not dollars:
         raise ProjectInvalid("Say how many dollars the run may cost.")
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
+        if not provider and not model:
+            plan = planned(db, project.id, kind)
+            if plan["answer"] is None:
+                raise ProjectInvalid(NO_ANSWERING_MODEL)
+            provider, model = plan["answer"]["provider"], plan["answer"]["model"]
+            if first is None and judge is None:
+                first = (
+                    (plan["first"]["provider"], plan["first"]["model"]) if plan["first"] else None
+                )
+                judge = (
+                    (plan["judge"]["provider"], plan["judge"]["model"]) if plan["judge"] else None
+                )
+        if token_cap is None:
+            token_cap = review_settings.of(db, project.id).count("run_tokens")
         choices = review_flows.model_choices(db)
         more = getattr(spec, "more_choices", None)
         if more is not None:
@@ -826,6 +970,17 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             first = False
             asker = ChoiceRun(provider=run.judge_provider or "", model=run.judge_model or "")
         asked = scope.question(asker, child, listed)
+        # The makers may have changed since the run began.
+        named = asked.choices[0]
+        if getattr(spec, "more_choices", None) is None and not review_settings.permits(
+            db, project.id, *named
+        ):
+            run.state = "held"
+            run.detail = (
+                f"This project's texts are not sent to {maker(*named)}. Allow the maker "
+                "under Reviews, Settings, and resume, or end the run."
+            )
+            return _MOVED
         if phase == "back":
             asked = replace(asked, system=asked.system + _sent_back(review, listed))
         needed = review_budget.reservation_size(asked)

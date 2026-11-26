@@ -2,7 +2,7 @@ import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Input, SimpleSele
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { dollars, whole, type Model } from './ChoiceRun';
+import { dollars, whole, type Model, type RunPlan } from './ChoiceRun';
 import { TokenBudget } from './PlanningReviews';
 
 interface Settings {
@@ -12,6 +12,35 @@ interface Settings {
   makers: { maker: string; models: number; allowed: boolean; by_default: boolean; at_your_word: boolean }[];
   own_makers: boolean;
   models: Model[];
+  cheaper_first: boolean;
+  numbers: {
+    key: string;
+    value: number;
+    default: number;
+    low: number;
+    high: number;
+    unit: string;
+    what: string;
+    whole: boolean;
+  }[];
+  costs: {
+    workflow: string;
+    label: string;
+    model: string;
+    calls: number;
+    tokens: number;
+    dollars: number;
+    unpriced: number;
+    counted: boolean;
+  }[];
+  checks: {
+    check: string;
+    label: string;
+    plan: RunPlan;
+    waiting: number;
+    each: number | null;
+    cost: number | null;
+  }[];
 }
 interface Planning {
   review_budget?: { limit: number | null; used: number; reserved: number; required: number | null };
@@ -23,19 +52,6 @@ interface Planning {
 
 const keyOf = (model: Model | null) => (model ? JSON.stringify([model.provider, model.model]) : '');
 const day = (iso: string) => new Date(iso).toLocaleDateString('en', { day: 'numeric', month: 'long' });
-/** The numbers the reviews work to that are fixed in the platform, with what each is for. */
-const FIXED: [string, string][] = [
-  ['5%', 'The share of wrong lines a batch that adds or corrects may have in its sample before it is withdrawn.'],
-  ['2%', 'The same for a batch that removes or closes.'],
-  ['5 to 20', 'Lines in the sample of a batch, by its size.'],
-  ['30 days', 'How long an approved batch can be undone.'],
-  ['12', 'User Stories shown as candidates for an issue.'],
-  ['1.5 times', 'How far the best Epic must lead the second for a User Story to count as clear.'],
-  ['100', 'Records a trial of another model asks about.'],
-  ['60 and 60', 'Right and wrong pairs a measurement of a judge asks about.'],
-  ['$3', 'What all measurements of judges of a project may cost together.'],
-];
-
 /**
  * What a project's reviews are set to, in one place: what they may cost, which models
  * answer and judge, to whom the project's texts may be sent, and what runs by itself.
@@ -50,6 +66,8 @@ export function ReviewSettings({ project }: { project: string }) {
   const [rounds, setRounds] = useState('0');
   const [allowed, setAllowed] = useState<Record<string, boolean>>({});
   const [planner, setPlanner] = useState('');
+  const [cheaper, setCheaper] = useState(true);
+  const [numbers, setNumbers] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -61,6 +79,8 @@ export function ReviewSettings({ project }: { project: string }) {
     setJudge(keyOf(data.roles.judge));
     setRounds(String(data.rounds));
     setAllowed(Object.fromEntries(data.makers.map((entry) => [entry.maker, entry.allowed])));
+    setCheaper(data.cheaper_first);
+    setNumbers(Object.fromEntries(data.numbers.map((entry) => [entry.key, String(entry.value)])));
   }, [data]);
   const act = (what: string, request: () => Promise<unknown>, after: () => void) => {
     setBusy(what);
@@ -93,6 +113,8 @@ export function ReviewSettings({ project }: { project: string }) {
           // The defaults follow the accounts; a list of the project's own stays as it is.
           makers: asDefault ? null : makers,
           rounds: Number(rounds),
+          cheaper_first: cheaper,
+          numbers: Object.fromEntries(data.numbers.map((entry) => [entry.key, Number(numbers[entry.key])])),
         }),
       settings.reload,
     );
@@ -102,6 +124,16 @@ export function ReviewSettings({ project }: { project: string }) {
     label: `${entry.model} · ${entry.provider}`,
   }));
   const plan = planning.data;
+  // A number that is not within what it can be set to keeps the settings from being saved.
+  const wrong = (data?.numbers ?? []).filter((entry) => {
+    const value = Number(numbers[entry.key]);
+    return (
+      numbers[entry.key] === '' ||
+      !(value >= entry.low && value <= entry.high) ||
+      (entry.whole && !Number.isInteger(value))
+    );
+  });
+  const named = (model: Model | null) => (model ? model.model : null);
   return (
     <>
       <LoadError resource={settings} />
@@ -158,13 +190,108 @@ export function ReviewSettings({ project }: { project: string }) {
           </Card>
           <Card>
             <CardHeader>
+              <CardTitle>What they have cost since {day(data.dollars.since)}</CardTitle>
+            </CardHeader>
+            <CardBody className="grid gap-3">
+              {data.costs.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No review of this project has asked a model since then.</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="py-2 pe-3 font-medium">Workflow</th>
+                        <th className="py-2 pe-3 font-medium">Model</th>
+                        <th className="py-2 pe-3 text-right font-medium">Calls</th>
+                        <th className="py-2 pe-3 text-right font-medium">Tokens</th>
+                        <th className="py-2 text-right font-medium">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.costs.map((row) => (
+                        <tr key={row.workflow + '/' + row.model} className="border-b border-border align-top">
+                          <td className="py-2 pe-3 text-foreground">
+                            {row.label}
+                            {row.counted ? '' : ' · own sum, not in the limit'}
+                          </td>
+                          <td className="py-2 pe-3 text-muted-foreground">{row.model}</td>
+                          <td className="py-2 pe-3 text-right tabular-nums">{whole(row.calls)}</td>
+                          <td className="py-2 pe-3 text-right tabular-nums">{whole(row.tokens)}</td>
+                          <td className="py-2 text-right tabular-nums">
+                            {row.unpriced === row.calls ? 'not priced' : dollars(row.dollars)}
+                            {row.unpriced && row.unpriced !== row.calls ? ` · ${whole(row.unpriced)} not priced` : ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <p className="text-sm text-muted-foreground">
+                A call is priced when its account says what its model costs. What every project has used together is
+                under Global settings, Stats.
+              </p>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>What a run of each check would ask</CardTitle>
+            </CardHeader>
+            <CardBody className="grid gap-3">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-left text-muted-foreground">
+                      <th className="py-2 pe-3 font-medium">Check</th>
+                      <th className="py-2 pe-3 font-medium">Asked</th>
+                      <th className="py-2 pe-3 text-right font-medium">Without an answer</th>
+                      <th className="py-2 pe-3 text-right font-medium">Each</th>
+                      <th className="py-2 text-right font-medium">Likely cost</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.checks.map((row) => (
+                      <tr key={row.check} className="border-b border-border align-top">
+                        <td className="py-2 pe-3 text-foreground">{row.label}</td>
+                        <td className="py-2 pe-3 text-muted-foreground">
+                          {row.plan.answer
+                            ? [
+                                named(row.plan.answer) + ' answers',
+                                row.plan.judge ? named(row.plan.judge) + ' judges' : null,
+                                row.plan.first ? named(row.plan.first) + ' is asked first' : null,
+                              ]
+                                .filter(Boolean)
+                                .join(', ')
+                            : 'No model chosen to answer'}
+                        </td>
+                        <td className="py-2 pe-3 text-right tabular-nums">{whole(row.waiting)}</td>
+                        <td className="py-2 pe-3 text-right tabular-nums">
+                          {row.each === null ? 'not known' : dollars(row.each)}
+                        </td>
+                        <td className="py-2 text-right tabular-nums">
+                          {row.cost === null ? 'not known' : dollars(row.cost)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                What one question costs is taken from the runs in which the same model answered or judged the same
+                check. It is not known for a model that never did; a trial on the Reorganize page tells it.
+              </p>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardHeader>
               <CardTitle>Which models are asked</CardTitle>
             </CardHeader>
             <CardBody className="grid gap-4">
               <p className="text-sm text-muted-foreground">
-                What a run of a check takes unless you choose otherwise when you start it. The judge is asked the same
-                question without seeing the answer and has to be of another maker than the model that answers. Models
-                that write code only are not offered: they are never asked in a review.
+                A run of a check takes these: it is started from its worklist without choosing anything. The judge is
+                asked the same question without seeing the answer and has to be of another maker than the model that
+                answers. Review evidence asks the model that answers too. Models that write code only are not offered:
+                they are never asked in a review.
               </p>
               <div className="flex flex-wrap items-end gap-3">
                 <label className="grid gap-1 text-sm">
@@ -172,7 +299,7 @@ export function ReviewSettings({ project }: { project: string }) {
                   <SimpleSelect
                     aria-label="Model that answers"
                     value={answer || 'none'}
-                    items={[{ value: 'none', label: 'Chosen when a run starts' }, ...models]}
+                    items={[{ value: 'none', label: 'None chosen: no run starts' }, ...models]}
                     onValueChange={(value) => setAnswer(value === 'none' ? '' : String(value ?? ''))}
                   />
                 </label>
@@ -199,10 +326,14 @@ export function ReviewSettings({ project }: { project: string }) {
                   />
                 </label>
               </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={cheaper} onChange={(event) => setCheaper(event.target.checked)} />
+                Where there is no judge, ask first the cheaper model whose trial on the check agreed
+              </label>
               {plan ? (
                 <div className="flex flex-wrap items-end gap-3 border-t border-border pt-4">
                   <label className="grid gap-1 text-sm">
-                    The model of the automatic planning reviews
+                    The model of planning reviews and Discovery
                     <SimpleSelect
                       aria-label="Planning review model"
                       placeholder="Choose a model from Accounts"
@@ -271,12 +402,57 @@ export function ReviewSettings({ project }: { project: string }) {
               </ul>
             </CardBody>
           </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>The numbers the reviews work to</CardTitle>
+            </CardHeader>
+            <CardBody className="grid gap-3">
+              <p className="text-sm text-muted-foreground">
+                Each has the value the platform gives every project until you change it here. A run that is under way
+                keeps the numbers it started with.
+              </p>
+              <table className="w-full text-sm">
+                <tbody>
+                  {data.numbers.map((entry) => {
+                    const bad = wrong.some((other) => other.key === entry.key);
+                    return (
+                      <tr key={entry.key} className="border-b border-border align-top">
+                        <td className="w-40 py-2 pe-3">
+                          <Input
+                            aria-label={entry.what}
+                            aria-invalid={bad}
+                            type="number"
+                            min={entry.low}
+                            max={entry.high}
+                            step={entry.whole ? 1 : 'any'}
+                            value={numbers[entry.key] ?? ''}
+                            onChange={(event) => setNumbers({ ...numbers, [entry.key]: event.target.value })}
+                          />
+                        </td>
+                        <td className="w-20 py-2 pe-3 pt-4 text-muted-foreground">{entry.unit}</td>
+                        <td className="py-2 pt-4 text-muted-foreground">
+                          <span className="text-foreground">{entry.what}</span> From {whole(entry.low)} to{' '}
+                          {whole(entry.high)}
+                          {Number(numbers[entry.key]) !== entry.default
+                            ? `; the platform's is ${whole(entry.default)}`
+                            : ''}
+                          .
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </CardBody>
+          </Card>
           <div className="flex flex-wrap items-center gap-3">
-            <Button loading={busy === 'save'} disabled={!(Number(limit) >= 0)} onClick={save}>
+            <Button loading={busy === 'save'} disabled={!(Number(limit) >= 0) || wrong.length > 0} onClick={save}>
               Save the settings
             </Button>
             <span className="text-sm text-muted-foreground">
-              The cost, the models, the makers and what happens when two models differ are saved together.
+              {wrong.length
+                ? `${wrong.length === 1 ? 'One number is' : whole(wrong.length) + ' numbers are'} outside what it can be set to.`
+                : 'The limit in dollars, the models, the makers and the numbers are saved together.'}
             </span>
           </div>
           <Card>
@@ -307,26 +483,9 @@ export function ReviewSettings({ project }: { project: string }) {
               ) : null}
               <p className="text-sm text-muted-foreground">
                 Reading the backlog, the documents and the meaning of records, the scorer, and where each User Story
-                stands run by themselves and ask no model, so they cost nothing. A check that asks a model runs when you
-                start it.
+                stands run by themselves and ask no model, so they cost nothing and have no switch. A check that asks a
+                model runs when you start it from its worklist, with what is set above.
               </p>
-            </CardBody>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Numbers that are fixed</CardTitle>
-            </CardHeader>
-            <CardBody>
-              <table className="w-full text-sm">
-                <tbody>
-                  {FIXED.map(([value, what]) => (
-                    <tr key={what} className="border-b border-border align-top">
-                      <td className="w-28 py-2 pe-3 font-medium tabular-nums text-foreground">{value}</td>
-                      <td className="py-2 text-muted-foreground">{what}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
             </CardBody>
           </Card>
         </>

@@ -1,8 +1,8 @@
-import { Alert, Button, Field, FieldLabel, Link, SimpleSelect, Textarea } from '@gntik-ai/ui';
+import { Alert, Button, Field, FieldLabel, Link, Textarea } from '@gntik-ai/ui';
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { accountsUrl, RouterLink, setQuery, useLocation, workspaceTabUrl } from '../router';
+import { accountsUrl, reviewUrl, RouterLink, setQuery, useLocation, workspaceTabUrl } from '../router';
 import { useSubmit } from './ProjectDialogs';
 import { CoveragePreview, ReviewControl } from './ReviewControls';
 import { WorkspaceReview, WorkspaceSync, type StageReview, type ReviewActivity } from './WorkspaceReview';
@@ -37,6 +37,8 @@ export interface ImportState {
   checked: number;
   provider: string | null;
   model: string | null;
+  /** The model of planning reviews and Discovery, set under Reviews, Settings. */
+  settings_model?: { provider: string; model: string } | null;
   models: { provider: string; model: string }[];
 }
 const labels: Record<ImportState['stage'], string> = {
@@ -69,7 +71,6 @@ export function WorkspaceImport({
   const [latest, setLatest] = useState<ImportState | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState('');
-  const [choice, setChoice] = useState('');
   const [refreshNote, setRefreshNote] = useState('');
   const [edit, setEdit] = useState<string | null>(null);
   const [auto] = useState(useLocation().query.get('import') === '1');
@@ -83,7 +84,10 @@ export function WorkspaceImport({
     value: encode(provider, model),
     label: provider + ' · ' + model,
   }));
-  const selected = choice || (state?.provider && state.model ? encode(state.provider, state.model) : '');
+  // The model set under Reviews, Settings; until one is, the model Discovery last used.
+  const selected = state?.settings_model
+    ? encode(state.settings_model.provider, state.settings_model.model)
+    : state?.provider && state.model ? encode(state.provider, state.model) : '';
   const model = state?.models.find((option) => encode(option.provider, option.model) === selected);
   const coverage = state?.coverage_run;
   const eligible = !!state && ['epics', 'stories', 'issues', 'complete'].includes(state.stage);
@@ -290,18 +294,19 @@ export function WorkspaceImport({
       )}
       {(state.stage === 'analysis' || state.review || state.stage === 'complete') && (
         <>
-          {options.length ? (
-            <Field>
-              <FieldLabel>Model for analysis</FieldLabel>
-              <SimpleSelect
-                aria-label="Model for analysis"
-                placeholder="Choose a configured model"
-                items={options}
-                disabled={coverage?.state === 'running' || coverage?.state === 'waiting'}
-                value={model ? selected : null}
-                onValueChange={(v) => setChoice(v ?? '')}
-              />
-            </Field>
+          {model ? (
+            <p className="text-sm">
+              Model for analysis · {model.provider} · {model.model}{' '}
+              <span className="text-muted-foreground">
+                Set under <Link href={reviewUrl(project, 'settings')}>Reviews, Settings</Link>.
+              </span>
+            </p>
+          ) : options.length ? (
+            <Alert
+              tone="info"
+              title="Choose the model of planning reviews and Discovery"
+              description={<>It is set under <Link href={reviewUrl(project, 'settings')}>Reviews, Settings</Link>, with the makers this project’s texts may be sent to.</>}
+            />
           ) : (
             <Alert
               tone="info"

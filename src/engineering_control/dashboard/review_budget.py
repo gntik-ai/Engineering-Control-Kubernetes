@@ -43,7 +43,9 @@ def require_available(db: Session, project_id: UUID) -> None:
         raise ReviewBudgetHeld(reached)
     row = db.get(ProjectReviewBudget, project_id)
     if row and row.required is not None:
-        raise ReviewBudgetHeld("Authorize review tokens on the owning project’s Home tab first.")
+        raise ReviewBudgetHeld(
+            "The project's review tokens are used up. Raise the limit under Reviews, Settings."
+        )
 
 
 def locked_budget(db: Session, project_id: UUID) -> ProjectReviewBudget | None:
@@ -120,8 +122,8 @@ def reserve(sessions: sessionmaker[Session], project_id: UUID, needed: int) -> i
         required = row.required
     # Commit the hold before reporting it. Every scheduler sees it after a restart.
     raise ReviewBudgetHeld(
-        f"Project review token limit on hold. Authorize capacity for {required:,} tokens "
-        "under Review token budget on the owning project's Home tab."
+        f"The project's review tokens are used up. Raise the limit by at least {required:,} "
+        "tokens under Reviews, Settings."
     )
 
 
@@ -141,6 +143,10 @@ async def ask_review(
         question = await asyncio.to_thread(
             review_flows.question_for_run, sessions, project_id, run_id, stage, question
         )
+    refused = await asyncio.to_thread(not_sent, sessions, project_id, question.choices[0])
+    if refused:
+        # Nothing was asked: the project's texts stay where its settings allow.
+        raise ModelError("configuration", refused)
     reserved = (
         await asyncio.to_thread(reserve, sessions, project_id, reservation_size(question))
         if budgeted
@@ -168,6 +174,23 @@ async def ask_review(
                 reserved,
                 run_id,
             )
+
+
+def not_sent(
+    sessions: sessionmaker[Session], project_id: UUID, named: tuple[str, str]
+) -> str | None:
+    """Why a review of the project does not ask this model: its maker is not among those
+    the project's texts may be sent to."""
+    from engineering_control.dashboard import review_settings
+    from engineering_control.models.providers import maker
+
+    with sessions() as db:
+        if review_settings.permits(db, project_id, *named):
+            return None
+    return (
+        f"This project's texts are not sent to {maker(*named)}. Allow the maker under "
+        "Reviews, Settings, or choose another model there."
+    )
 
 
 def release_unused(sessions: sessionmaker[Session], project_id: UUID, reserved: int) -> None:

@@ -30,7 +30,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import cleanup, epic_links, parent_choice
+from engineering_control.dashboard import cleanup, epic_links, parent_choice, review_settings
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
@@ -198,10 +198,17 @@ def closing_comment(reason: str) -> str:
     )
 
 
-def sample_size(lines: int) -> int:
+def sample_size(lines: int, least: int = SAMPLE_MIN, most: int = SAMPLE_MAX) -> int:
     """How many lines are judged before a batch may be approved: more for a larger batch,
-    never fewer than five where there are five."""
-    return min(lines, max(SAMPLE_MIN, min(SAMPLE_MAX, math.ceil(math.sqrt(lines)))))
+    never fewer than the least where there are that many."""
+    return min(lines, max(least, min(max(least, most), math.ceil(math.sqrt(lines)))))
+
+
+def error_of(db: Session, project: UUID, kind: str) -> float:
+    """The share of wrong lines a batch of this kind may have: what the project's
+    settings say for what adds or corrects, and for what removes or closes."""
+    mine = review_settings.of(db, project)
+    return mine.share("remove_error" if KINDS[kind][2] == REMOVE_ERROR else "add_error")
 
 
 class Reorg:
@@ -415,7 +422,8 @@ class Reorg:
     @staticmethod
     def _measured(db: Session, project: UUID, kind: str) -> dict[str, Any]:
         """What the scorer measured for that kind of link, as its report says."""
-        link_kind, _outcome, error, _title, _about = KINDS[kind]
+        link_kind, _outcome, _error, _title, _about = KINDS[kind]
+        error = error_of(db, project, kind)
         if kind in RULED:
             # A rule or a model's answer, not the scorer: nothing was measured, and the
             # sample is the check.
@@ -490,13 +498,20 @@ class Reorg:
         }
 
     @staticmethod
-    def _batch(batch: ReorgBatch, lines: list[ReorgLine]) -> dict[str, Any]:
+    def _shown(db: Session, batch: ReorgBatch, lines: list[ReorgLine]) -> dict[str, Any]:
+        days = review_settings.of(db, batch.project_id).count("undo_days")
+        return Reorg._batch(batch, lines, days)
+
+    @staticmethod
+    def _batch(
+        batch: ReorgBatch, lines: list[ReorgLine], undo_days: int = UNDO_DAYS
+    ) -> dict[str, Any]:
         sampled = [line for line in lines if line.sampled]
         now = datetime.now(UTC)
         decided = batch.decided_at
         if decided is not None and decided.tzinfo is None:
             decided = decided.replace(tzinfo=UTC)
-        until = decided + timedelta(days=UNDO_DAYS) if decided else None
+        until = decided + timedelta(days=undo_days) if decided else None
         return {
             "id": str(batch.id),
             "kind": batch.kind,
@@ -549,17 +564,17 @@ class Reorg:
                         "error": error,
                         "ready": len(self._ready(db, project, kind)),
                         "measured": self._measured(db, project.id, kind),
-                        "open": self._batch(opened, lines[opened.id]) if opened else None,
+                        "open": self._shown(db, opened, lines[opened.id]) if opened else None,
                     }
                 )
             return {
                 "kinds": kinds,
                 "past": [
-                    self._batch(batch, lines[batch.id])
+                    self._shown(db, batch, lines[batch.id])
                     for batch in batches
                     if batch.state != "sample"
                 ][:20],
-                "undo_days": UNDO_DAYS,
+                "undo_days": review_settings.of(db, project.id).count("undo_days"),
             }
 
     def lines(self, name: str, batch_id: UUID, page: int, page_size: int) -> dict[str, Any]:
@@ -576,7 +591,7 @@ class Reorg:
             shown = ordered[(page - 1) * page_size : page * page_size]
             titles = self._titles(db, shown)
             return {
-                "batch": self._batch(batch, list(every)),
+                "batch": self._shown(db, batch, list(every)),
                 "items": [self._line(line, titles) for line in shown],
                 "total": len(ordered),
                 "page": page,
@@ -611,8 +626,9 @@ class Reorg:
             ready = self._ready(db, project, kind)
             if not ready:
                 raise ProjectConflict("The scorer has nothing ready of this kind.")
-            count = sample_size(len(ready))
-            error = KINDS[kind][2]
+            mine = review_settings.of(db, project.id)
+            count = sample_size(len(ready), mine.count("sample_least"), mine.count("sample_most"))
+            error = error_of(db, project.id, kind)
             batch = ReorgBatch(
                 project_id=project.id,
                 kind=kind,
@@ -678,7 +694,7 @@ class Reorg:
             wrong = sum(1 for row in lines if row.sampled and row.verdict == "wrong")
             if wrong > batch.allowed_wrong:
                 batch.state, batch.decided_at = "withdrawn", datetime.now(UTC)
-            return self._batch(batch, list(lines))
+            return self._shown(db, batch, list(lines))
 
     def withdraw(self, name: str, batch_id: UUID) -> dict[str, Any]:
         """Set an open batch aside. What was judged in it is kept and learned from."""
@@ -689,7 +705,7 @@ class Reorg:
                 raise ProjectConflict("This batch is decided already.")
             batch.state, batch.decided_at = "withdrawn", datetime.now(UTC)
             lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch.id)).all()
-            return self._batch(batch, list(lines))
+            return self._shown(db, batch, list(lines))
 
     # ----------------------------------------------------------------- applying
 
@@ -726,7 +742,7 @@ class Reorg:
                 line.state, line.before, line.detail = state, before, detail
             batch = db.get_one(ReorgBatch, batch_id)
             lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch_id)).all()
-            return self._batch(batch, list(lines))
+            return self._shown(db, batch, list(lines))
 
     def _apply(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
         """Make one line's change, and return how the link stood before."""
@@ -863,8 +879,9 @@ class Reorg:
                 raise ProjectConflict(
                     "Issues closed on GitHub are not reopened from here. Reopen them on GitHub."
                 )
-            if datetime.now(UTC) > decided + timedelta(days=UNDO_DAYS):
-                raise ProjectConflict(f"A batch can be undone for {UNDO_DAYS} days.")
+            days = review_settings.of(db, batch.project_id).count("undo_days")
+            if datetime.now(UTC) > decided + timedelta(days=days):
+                raise ProjectConflict(f"A batch can be undone for {days} days.")
             kind = batch.kind
             todo = [
                 (line.id, line.child_id, line.parent_id, line.before)
@@ -888,7 +905,7 @@ class Reorg:
                 line.state, line.detail = state, detail
             batch = db.get_one(ReorgBatch, batch_id)
             lines = db.scalars(select(ReorgLine).where(ReorgLine.batch_id == batch_id)).all()
-            return self._batch(batch, list(lines))
+            return self._shown(db, batch, list(lines))
 
     def _revert(
         self, name: str, kind: str, child: UUID, parent: UUID, before: list[dict[str, Any]]

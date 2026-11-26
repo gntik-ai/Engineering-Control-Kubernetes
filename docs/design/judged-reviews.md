@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0, most of J1 and most of J2 are built, J3 to J6 are not.
+Plan, 26 November 2026. Decided the same day; J0, most of J1 and J2 are built, J3 to J6 are not.
 
 ## What is asked for
 
@@ -354,9 +354,20 @@ So, differently from what was asked for:
 
 **The limit decided, $3 a month.** Every project has it from the deployment on.
 
-**Not in J2 yet:** a run still shows its model and its token limit when it starts, filled in from Settings, and they can be changed there. The model and the switch of the automatic reviews are also still on the Planning page. The makers are enforced for the checks and the measurements; the planning reviews, Discovery and Review evidence still take any model an account offers. The fixed numbers are shown and cannot be changed. What each workflow cost is still under Global settings, Stats.
+## J2 completed (26 November 2026)
 
-**Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
+What the first part left open is built.
+
+- **A run of a check is started without a form.** The five worklists (issues with no User Story, primary Epics, the clean-up check, extra Epic links, Epic overviews) show what a run will ask and one button. The model that answers, the judge and the tokens the run stops at come from Settings. Where a check can have a judge and Settings names one of another maker, the run has it; where there is no judge and the switch is on, the model whose trial on the check agreed is asked first. With no model chosen to answer, nothing starts and the worklist says where to choose. A trial of another model still chooses its model where it is started: choosing it is the trial.
+- **The Planning page has no model and no switch.** Both are in Settings only; the Planning page says which model is set and whether the reviews run. Discovery shows the model of planning reviews and Discovery and where it is set, instead of a list to choose from. Review evidence, on a project's page, asks the model that answers and stops at the tokens Settings gives a run of it; in the Flow Designer, where a flow is tried, the choice stays.
+- **The makers hold for every review.** A call of a planning review, Discovery, the coverage check, a connection's analysis, an execution plan, an Epic description or Review evidence is refused before it is made when its model is of a maker the project's texts are not sent to, whatever the review was set to before. The lists of models these reviews offer hold only models of allowed makers. A run of a check that is resumed after the makers changed is held and says why.
+- **The numbers can be changed**, for each project: the tokens of a run and of a run of Review evidence, the candidates shown for an issue, the margin that makes an Epic clear, the error accepted where a batch adds and where it removes (which the scorer works to as well), the size of a batch's sample, the days a batch can be undone, the gate of a trial, the records a trial and a measurement ask about, and what all measurements may cost together. Each has the platform's value until it is changed, and a least and a most it can be set to.
+- **What it cost** is in Settings: for each workflow and model, the calls, tokens and dollars since the limit began to count. And for each check, what a run would ask, how many records have no answer, what one question cost before with the same models, and what asking about the rest is likely to cost. Where a model never answered that check, the cost is said to be not known.
+- **The messages of a run on hold** point to Reviews, Settings.
+
+**Left where it belongs.** How far each workflow goes alone (off, proposes, applies what is agreed) comes with J3, which builds applying. A switch for each reading that runs by itself, and whether questions wait for the night's batch, come with J4, which makes the checks run by themselves: today the readings ask no model and cost nothing, and the one thing that asks by itself, the automatic planning reviews, has its switch in Settings. The analysis of a connection between two projects keeps its choice of model on the Connections page, outside Reviews; the makers hold for it.
+
+**The makers since J2:** the list of makers, which J0 applied only to what a measurement may ask, holds for every review and can be seen and changed in Settings.
 
 ## Sources
 

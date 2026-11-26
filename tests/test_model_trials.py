@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
-from engineering_control.dashboard import parent_choice
 from engineering_control.db.models import (
     ChoiceReview,
     ModelTrialLine,
@@ -297,10 +296,13 @@ def test_a_first_model_keeps_what_it_settles_and_the_rest_goes_on(tmp_path: Path
 def test_a_model_whose_trial_agreed_is_the_first_model_by_default(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    monkeypatch.setattr(parent_choice, "GATE_SETTLED", 2)
     client, repo = _authenticated_client(tmp_path)
     try:
         two_stories_to_judge(repo)
+        # The project asks less of a trial than the platform does: two answers settled.
+        gate = {"dollar_limit": 3, "makers": ["fixture"], "rounds": 0}
+        saved = post(client, "review-settings", **gate, numbers={"gate_settled": 2})
+        assert saved.status_code == 200, saved.text
         record = {
             ("analysis", AUDIT): {"Billing": BILLING, "Operations": PART},
             ("analysis", FAILURES): BOTH_PART,

@@ -15,7 +15,8 @@ against it. Measurements of judges have a sum of their own and are not counted h
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import UUID
@@ -66,6 +67,94 @@ _SPENT: dict[UUID, tuple[float, datetime, float]] = {}
 
 
 @dataclass(frozen=True)
+class Number:
+    """A number the reviews work to: what a project has unless its settings say
+    otherwise, the least and the most it can be set to, and what it is for."""
+
+    default: float
+    low: float
+    high: float
+    unit: str
+    what: str
+    whole: bool = True
+
+
+# In the order they are shown. A share is kept in hundredths, as it is read.
+NUMBERS: Final[dict[str, Number]] = {
+    "run_tokens": Number(
+        1_000_000,
+        10_000,
+        5_000_000,
+        "tokens",
+        "The most one run of a check uses before it stops.",
+    ),
+    "evidence_tokens": Number(
+        12_000,
+        1_000,
+        2_000_000,
+        "tokens",
+        "The most one run of Review evidence uses.",
+    ),
+    "candidates": Number(12, 3, 30, "", "User Stories shown as candidates for an issue."),
+    "epic_margin": Number(
+        1.5,
+        1.05,
+        5,
+        "times",
+        "How far the best Epic must lead the second for a User Story to count as clear.",
+        whole=False,
+    ),
+    "add_error": Number(
+        5,
+        1,
+        20,
+        "%",
+        "The share of wrong lines a batch that adds or corrects may have in its sample "
+        "before it is withdrawn, and the error the scorer may make where it adds.",
+        whole=False,
+    ),
+    "remove_error": Number(
+        2,
+        0.5,
+        20,
+        "%",
+        "The same for a batch that removes or closes.",
+        whole=False,
+    ),
+    "sample_least": Number(5, 1, 50, "lines", "The fewest lines in the sample of a batch."),
+    "sample_most": Number(20, 1, 100, "lines", "The most lines in the sample of a batch."),
+    "undo_days": Number(30, 1, 365, "days", "How long an approved batch can be undone."),
+    "gate_settled": Number(
+        30,
+        1,
+        500,
+        "answers",
+        "What a model must settle by itself in its trial on a check to be asked first.",
+    ),
+    "gate_same": Number(
+        90,
+        50,
+        100,
+        "%",
+        "The share of those in which it must say the same as the answer on record.",
+        whole=False,
+    ),
+    "trial_sample": Number(100, 10, 500, "records", "Records a trial of another model asks about."),
+    "judge_sample": Number(
+        60, 10, 200, "pairs", "Right pairs, and as many wrong ones, a measurement of a judge asks."
+    ),
+    "measure_dollars": Number(
+        3,
+        0,
+        100,
+        "$",
+        "What all measurements of judges of the project may cost together.",
+        whole=False,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class Settings:
     dollars: float
     since: datetime | None
@@ -74,6 +163,24 @@ class Settings:
     # None: the default makers.
     makers: frozenset[str] | None
     rounds: int
+    # Where there is no judge: whether the model whose trial on a check agreed is asked
+    # before the model that answers.
+    cheaper_first: bool = True
+    # The numbers the project set for itself; the others are the defaults.
+    own: Mapping[str, float] = field(default_factory=dict)
+
+    def number(self, key: str) -> float:
+        known = NUMBERS[key]
+        value = self.own.get(key)
+        if not isinstance(value, int | float) or not known.low <= value <= known.high:
+            return known.default
+        return float(value)
+
+    def count(self, key: str) -> int:
+        return int(self.number(key))
+
+    def share(self, key: str) -> float:
+        return self.number(key) / 100
 
 
 def of(db: Session, project: UUID) -> Settings:
@@ -87,7 +194,13 @@ def of(db: Session, project: UUID) -> Settings:
         (row.judge_provider or "", row.judge_model) if row.judge_model else None,
         frozenset(row.makers) if row.makers is not None else None,
         row.rounds,
+        row.cheaper_first,
+        dict(row.numbers or {}),
     )
+
+
+def number(db: Session, project: UUID, key: str) -> float:
+    return of(db, project).number(key)
 
 
 def default_makers(db: Session) -> frozenset[str]:
@@ -175,6 +288,73 @@ def forget(project: UUID) -> None:
     _SPENT.pop(project, None)
 
 
+# What a review's calls are counted under, as it is called.
+WORKFLOWS: Final = {
+    "orphan_parent": "Issues with no User Story",
+    "primary_epic": "Primary Epics",
+    "cleanup_check": "Clean-up check",
+    "epic_links": "Extra Epic links",
+    "epic_page": "Epic overviews",
+    "model_trial": "Trial of another model",
+    "judge_trial": "Measurement of judges",
+    "answer_trial": "Measurement of a second answer",
+    "compare_trial": "Measurement of a comparison",
+    "automatic_review": "Automatic planning reviews",
+    "automatic_review_screen": "Automatic planning reviews: first look",
+    "automatic_review_linking": "Automatic planning reviews: links",
+    "repository_review": "Discovery",
+    "project_planning": "Discovery and planning",
+    "epic_description_validation": "Epic descriptions",
+    "supervisor_advice": "Supervisor: advice on the plan",
+}
+
+
+def costs(db: Session, project: UUID, since: datetime) -> list[dict[str, Any]]:
+    """What the project's reviews have used since then, for each workflow and model:
+    calls, tokens and US dollars, the dearest first. A call whose account does not say
+    what its model costs is counted without a price."""
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for (usage,) in db.execute(
+        select(WorkspaceModelUsage.usage).where(
+            WorkspaceModelUsage.project_id == project, WorkspaceModelUsage.recorded_at >= since
+        )
+    ):
+        if not isinstance(usage, dict):
+            continue
+        workflow = str(usage.get("workflow") or "")
+        model = str(usage.get("model") or usage.get("requested_model") or "")
+        row = rows.setdefault(
+            (workflow, model),
+            {
+                "workflow": workflow,
+                "label": WORKFLOWS.get(workflow) or workflow.replace("_", " ").capitalize(),
+                "model": model,
+                "calls": 0,
+                "tokens": 0,
+                "dollars": 0.0,
+                "unpriced": 0,
+                # Measurements of judges have their own sum.
+                "counted": workflow not in MEASURED,
+            },
+        )
+        row["calls"] += 1
+        tokens = usage.get("tokens")
+        if not isinstance(tokens, int) and all(
+            isinstance(usage.get(key), int) for key in ("input", "output")
+        ):
+            tokens = usage["input"] + usage["output"]
+        row["tokens"] += tokens if isinstance(tokens, int) else 0
+        cost = usage.get("cost")
+        if isinstance(cost, int | float):
+            row["dollars"] += float(cost)
+        else:
+            row["unpriced"] += 1
+    found = sorted(rows.values(), key=lambda row: (-row["dollars"], -row["tokens"], row["label"]))
+    for row in found:
+        row["dollars"] = round(row["dollars"], 6)
+    return found
+
+
 class ReviewSettingsService:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -192,6 +372,8 @@ class ReviewSettingsService:
             for entry in review_flows.decision_models(db):
                 offered.setdefault(maker(entry["provider"], entry["model"]), 0)
             defaults = default_makers(db)
+            from engineering_control.dashboard import parent_choice
+
             return {
                 "dollars": {
                     "limit": mine.dollars,
@@ -201,6 +383,24 @@ class ReviewSettingsService:
                 },
                 "roles": roles(db, project.id),
                 "rounds": mine.rounds,
+                "cheaper_first": mine.cheaper_first,
+                "numbers": [
+                    {
+                        "key": key,
+                        "value": mine.number(key),
+                        "default": known.default,
+                        "low": known.low,
+                        "high": known.high,
+                        "unit": known.unit,
+                        "what": known.what,
+                        "whole": known.whole,
+                    }
+                    for key, known in NUMBERS.items()
+                ],
+                # What each workflow and model has used since the limit began to count,
+                # and what a run of each check would ask and is likely to cost.
+                "costs": costs(db, project.id, since),
+                "checks": parent_choice.estimates(db, project),
                 "makers": [
                     {
                         "maker": made_by,
@@ -223,7 +423,31 @@ class ReviewSettingsService:
         judge: tuple[str, str] | None,
         allowed: list[str] | None,
         rounds: int,
+        cheaper_first: bool = True,
+        numbers: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
+        """Keep what the project's reviews are set to. ``numbers`` none leaves the
+        numbers as they are; given, a number that is its default is not kept, so that
+        the project follows the default when that changes."""
+        own: dict[str, float] | None = None
+        if numbers is not None:
+            own = {}
+            for key, value in numbers.items():
+                known = NUMBERS.get(key)
+                if known is None:
+                    raise ProjectInvalid("That is not a number of the reviews.")
+                if not known.low <= value <= known.high or (known.whole and value != int(value)):
+                    raise ProjectInvalid(
+                        f"“{known.what}” takes {'a whole number' if known.whole else 'a number'} "
+                        f"from {known.low:g} to {known.high:g}."
+                    )
+                if value != known.default:
+                    own[key] = float(value)
+            least = own.get("sample_least", NUMBERS["sample_least"].default)
+            if least > own.get("sample_most", NUMBERS["sample_most"].default):
+                raise ProjectInvalid(
+                    "The fewest lines in a batch's sample cannot be more than the most."
+                )
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
             row = db.scalar(select(ReviewSettings).where(ReviewSettings.project_id == project.id))
@@ -248,5 +472,8 @@ class ReviewSettingsService:
             row.answer_provider, row.answer_model = answer or (None, None)
             row.judge_provider, row.judge_model = judge or (None, None)
             row.rounds = rounds
+            row.cheaper_first = cheaper_first
+            if own is not None:
+                row.numbers = own or None
             forget(project.id)
         return self.shown(name)

@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
 import { recordUrl, reviewUrl, setQuery, useLocation, type ReviewView } from '../router';
-import { isAsking, RunPanel, some, whole, type Model, type Run } from './ChoiceRun';
+import { isAsking, RunPanel, some, whole, type Model, type Run, type RunPlan } from './ChoiceRun';
 
 type Stand =
   | 'in_progress'
@@ -46,6 +46,7 @@ interface Index {
     largest: number;
     run: Run | null;
     models: Model[];
+    plan?: RunPlan | null;
   };
 }
 interface Issue {
@@ -276,7 +277,8 @@ function EpicIndex({ project }: { project: string }) {
                 }
                 path={base}
                 run={data.write.run}
-                models={data.write.models}
+                plan={data.write.plan ?? null}
+                settings={reviewUrl(project, 'settings')}
                 options={[{ key: 'again', label: 'Write all of them again' }]}
                 asked={(chosen) => (chosen.again ? data.write.epics : data.write.to_ask)}
                 likely={(chosen) => (chosen.again ? data.write.likely_all : data.write.likely)}

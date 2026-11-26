@@ -476,6 +476,7 @@ class EpicLinks:
                     "run": parent_choice.latest_run(db, project.id, KIND.name),
                     "models": review_settings.models(db, project.id),
                     "roles": review_settings.roles(db, project.id),
+                    "plan": parent_choice.planned(db, project.id, KIND.name),
                     "first": parent_choice.suggested_first(db, project.id, KIND.name),
                     "budget": review_budget.status(db, project.id),
                 },
@@ -549,7 +550,7 @@ class EpicLinks:
         name: str,
         provider: str,
         model: str,
-        token_cap: int,
+        token_cap: int | None,
         again: bool = False,
         first: tuple[str, str] | None = None,
     ) -> dict[str, Any]:

@@ -16,8 +16,8 @@ import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
-import { recordUrl } from '../router';
-import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run } from './ChoiceRun';
+import { recordUrl, reviewUrl } from '../router';
+import { isAsking, ReviewAnswer, RunPanel, some, whole, type FirstModel, type Model, type Review, type Run, type RunPlan } from './ChoiceRun';
 
 /** One open User Story an issue is shown with, and how alike the two are. */
 interface Candidate {
@@ -71,7 +71,7 @@ interface Worklist {
   run: Run | null;
   models: Model[];
   first: FirstModel | null;
-  roles?: { answer: Model | null; judge: Model | null } | null;
+  plan?: RunPlan | null;
 }
 
 const SAID: Record<string, string> = {
@@ -218,11 +218,8 @@ export function OrphanWorklist({ project }: { project: string }) {
               }
               path={path}
               run={data.run}
-              models={data.models}
-              twoModels
-              judged
-              first={data.first}
-              roles={data.roles}
+              plan={data.plan ?? null}
+              settings={reviewUrl(project, 'settings')}
               options={[{ key: 'again', label: 'Ask again about those that have an answer' }]}
               asked={(chosen) => (chosen.again ? data.counts.total : data.counts.to_ask)}
               likely={(chosen) => (chosen.again ? data.likely_all : data.likely)}
