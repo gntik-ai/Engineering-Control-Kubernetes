@@ -29,7 +29,7 @@ from uuid import NAMESPACE_OID, UUID, uuid5
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import parent_choice, review_flows, signals
+from engineering_control.dashboard import orphans, parent_choice, review_flows, signals
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.parent_choice import Unusable
 from engineering_control.dashboard.planning_links import likeness
@@ -40,6 +40,7 @@ from engineering_control.dashboard.project_records import (
     active_project,
 )
 from engineering_control.db.models import (
+    BacklogItem,
     ChoiceReview,
     ChoiceRun,
     GoldPair,
@@ -48,7 +49,7 @@ from engineering_control.db.models import (
     ProviderAccount,
 )
 from engineering_control.models import decisions
-from engineering_control.models.providers import code_only, maker
+from engineering_control.models.providers import code_only, family_of, maker
 from engineering_control.models.service import Question, Reply
 
 ISSUE_STORY: Final = signals.ISSUE_STORY
@@ -384,7 +385,350 @@ JUDGES: Final[dict[str, _Judge]] = {
 }
 for _judge in JUDGES.values():
     parent_choice.register(_judge)
-BY_NAME: Final = {judge.name: judge for judge in JUDGES.values()}
+BY_NAME: Final[dict[str, Any]] = {judge.name: judge for judge in JUDGES.values()}
+JUDGE_NAMES: Final = frozenset(BY_NAME)
+
+
+# ----------------------------------------------------- a second answer, and a comparison
+#
+# The first measurement (26 November 2026) showed that a judge asked about one pair alone
+# lets most wrong pairs through: it is not shown the neighbouring User Story the issue
+# belongs to. Two other ways of judging are measured here, on the issues whose User Story
+# the administrator set, with that link hidden and the check's own question asked:
+# an answer from the candidates, to see how often two models that do not see each other
+# choose the same Story and how often that Story is the right one; and a comparison, in
+# which a model is shown the Story another chose among the next best and chooses again.
+
+ANSWERS: Final = "answers"
+COMPARES: Final = "comparison"
+OTHERS: Final = 2
+
+
+class _AnswerScope:
+    """The issues whose User Story the administrator set, asked as the check of issues
+    with no User Story asks: the same candidates, the same question."""
+
+    def __init__(self, db: Session, project: ProjectRecord) -> None:
+        self.db, self.project = db, project
+        self.stories = orphans._stories(db, project.id)
+        self._known: dict[UUID, set[UUID]] | None = None
+        self._rows: list[BacklogItem] | None = None
+
+    def known(self) -> dict[UUID, set[UUID]]:
+        """For each such issue, the Stories that are right for it."""
+        if self._known is None:
+            plan = signals._plan(self.db, self.project)
+            found: dict[UUID, set[UUID]] = defaultdict(set)
+            for issue, links in plan.issue_links.items():
+                for parent, origin, _primary in links:
+                    if origin == "administrator" and parent in self.stories.rows:
+                        found[issue].add(parent)
+            for pair in self.db.scalars(
+                select(GoldPair).where(
+                    GoldPair.project_id == self.project.id,
+                    GoldPair.kind == ISSUE_STORY,
+                    GoldPair.label == "yes",
+                )
+            ):
+                if pair.parent_id in self.stories.rows:
+                    found[pair.child_id].add(pair.parent_id)
+            self._known = dict(found)
+        return self._known
+
+    def children(self) -> list[BacklogItem]:
+        if self._rows is None:
+            known = self.known()
+            rows = self.db.scalars(select(BacklogItem).where(BacklogItem.id.in_(list(known)))).all()
+            # An issue whose own text names its Story is no test of a model.
+            kept = [row for row in rows if not any(entry["named"] for entry in self.shortlist(row))]
+            self._rows = sorted(kept, key=lambda row: _order(row.id))[:SAMPLE]
+        return self._rows
+
+    def record(self, key: UUID) -> BacklogItem | None:
+        return next((row for row in self.children() if row.id == key), None)
+
+    def refusal(self) -> str | None:
+        return None if self.stories.rows else "The project has no open User Story to choose from."
+
+    def shortlist(self, child: BacklogItem) -> list[dict[str, Any]]:
+        return orphans.shortlist(child, self.project.source_repository, self.stories)
+
+    def revision(self, child: BacklogItem, listed: list[dict[str, Any]]) -> str:
+        return orphans.revision(child, listed)
+
+    def question(
+        self, run: ChoiceRun, child: BacklogItem, listed: list[dict[str, Any]]
+    ) -> Question:
+        return orphans.question(run, child, self.project.source_repository, listed, self.stories)
+
+    def read(
+        self, data: dict[str, Any], child: BacklogItem, listed: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return orphans.read_answer(data, child, listed, self.stories)
+
+
+def _first_answers(db: Session, project: UUID) -> tuple[ChoiceRun | None, dict[UUID, UUID]]:
+    """The latest finished measurement of an answer, and the Story it chose for each
+    issue: what a comparison is asked to choose again among."""
+    run = db.scalar(
+        select(ChoiceRun)
+        .where(
+            ChoiceRun.project_id == project,
+            ChoiceRun.kind == "ans_issue_story",
+            ChoiceRun.state == "complete",
+        )
+        .order_by(ChoiceRun.created_at.desc(), ChoiceRun.id)
+        .limit(1)
+    )
+    if run is None:
+        return None, {}
+    chosen = {}
+    for line in db.scalars(select(ModelTrialLine).where(ModelTrialLine.run_id == run.id)):
+        picked = (line.differs or [{}])[0].get("parent_id") if line.answer == "story" else None
+        if picked:
+            chosen[line.child_id] = UUID(str(picked))
+    return run, chosen
+
+
+class _CompareScope(_AnswerScope):
+    """The same issues, each with the Story another model chose for it among the next
+    best candidates, in an order that does not say which was chosen."""
+
+    def __init__(self, db: Session, project: ProjectRecord) -> None:
+        super().__init__(db, project)
+        self.first_run, self.first = _first_answers(db, project.id)
+
+    def children(self) -> list[BacklogItem]:
+        return [row for row in super().children() if self.first.get(row.id) in self.stories.rows]
+
+    def refusal(self) -> str | None:
+        if self.first_run is None:
+            return "Measure an answer from the candidates first: a comparison chooses again."
+        return super().refusal()
+
+    def shortlist(self, child: BacklogItem) -> list[dict[str, Any]]:
+        listed = super().shortlist(child)
+        chosen = self.first.get(child.id)
+        if chosen is None:
+            return listed
+        mine = next((entry for entry in listed if entry["id"] == str(chosen)), None)
+        if mine is None:
+            epic = self.stories.epics.get(chosen)
+            mine = {
+                "id": str(chosen),
+                "title": self.stories.rows[chosen][0],
+                "epic_id": str(epic[0]) if epic else None,
+                "epic": epic[1] if epic else None,
+                "score": 0.0,
+                "words": [],
+                "named": False,
+                "weak": False,
+            }
+        others = [entry for entry in listed if entry["id"] != str(chosen)][:OTHERS]
+        return sorted([mine, *others], key=lambda entry: _order(UUID(entry["id"])))
+
+
+class _Answers:
+    """A measurement of a model's own answers on issues whose User Story is known."""
+
+    name = "ans_issue_story"
+    kind = ANSWERS
+    label = "An answer from the candidates: the User Story of an issue"
+    workflow = "answer_trial"
+    actionable: tuple[str, ...] = ()
+    dollars = True
+    nothing_to_ask = nothing_waits = (
+        "No issue has a User Story that you set and that its own text does not name."
+    )
+
+    def scope(self, db: Session, project: ProjectRecord) -> _AnswerScope:
+        return _AnswerScope(db, project)
+
+    def answered(
+        self, db: Session, run: ChoiceRun, review: ChoiceReview, child: BacklogItem, reply: Reply
+    ) -> None:
+        scope = self.scope(db, db.get_one(ProjectRecord, run.project_id))
+        known = scope.known().get(child.id, set())
+        listed = {str(entry.get("id")) for entry in review.shortlist or []}
+        titles = {str(e.get("id")): str(e.get("title") or "") for e in review.shortlist or []}
+        in_list = any(str(story) in listed for story in known)
+        chose = review.parent_id if review.answer == "story" else None
+        more = self._more(db, run, child, chose, known)
+        cost = reply.usage.get("cost")
+        db.add(
+            ModelTrialLine(
+                project_id=run.project_id,
+                run_id=run.id,
+                kind=self.name,
+                child_id=child.id,
+                title=str(child.title or "")[:500],
+                answer=review.answer or "",
+                parent=titles.get(str(chose), "")[:500] or None,
+                reason=review.reason,
+                checked=review.checked,
+                tokens=review.tokens,
+                cost=float(cost) if isinstance(cost, int | float) else None,
+                ref_model="you",
+                ref_answer="story" if in_list else "none",
+                ref_parent=next(
+                    (scope.stories.rows[s][0][:500] for s in known if s in scope.stories.rows),
+                    None,
+                ),
+                ref_checked=True,
+                ref_decision="pending",
+                agrees=self._agrees(chose, known, more),
+                settled=parent_choice.settles(
+                    orphans.KIND,
+                    {
+                        "answer": review.answer,
+                        "checked": review.checked,
+                        "confidence": review.confidence,
+                    },
+                ),
+                differs=[
+                    {
+                        "parent_id": str(chose) if chose else None,
+                        "right": bool(chose and chose in known),
+                        "in_list": in_list,
+                        **more,
+                    }
+                ],
+            )
+        )
+
+    def _more(
+        self, db: Session, run: ChoiceRun, child: BacklogItem, chose: UUID | None, known: set[UUID]
+    ) -> dict[str, Any]:
+        return {}
+
+    def _agrees(self, chose: UUID | None, known: set[UUID], more: dict[str, Any]) -> bool:
+        """An answer is right when it chose a Story that is right for the issue."""
+        return bool(chose and chose in known)
+
+
+class _Compares(_Answers):
+    """A measurement of a comparison: a model chooses again among the Story another
+    chose and the next best. It confirms the first answer when it chooses the same."""
+
+    name = "cmp_issue_story"
+    kind = COMPARES
+    label = "A comparison: the Story another model chose, beside the next best"
+    workflow = "compare_trial"
+
+    def scope(self, db: Session, project: ProjectRecord) -> _CompareScope:
+        return _CompareScope(db, project)
+
+    def _more(
+        self, db: Session, run: ChoiceRun, child: BacklogItem, chose: UUID | None, known: set[UUID]
+    ) -> dict[str, Any]:
+        _run, first = _first_answers(db, run.project_id)
+        was = first.get(child.id)
+        return {"first": str(was) if was else None, "first_right": bool(was and was in known)}
+
+    def _agrees(self, chose: UUID | None, known: set[UUID], more: dict[str, Any]) -> bool:
+        """A comparison agrees when it chooses the Story the first answer chose."""
+        return bool(chose and str(chose) == more.get("first"))
+
+
+MEASURES: Final[dict[str, _Answers]] = {
+    measure.kind: measure for measure in (_Answers(), _Compares())
+}
+for _measure in MEASURES.values():
+    parent_choice.register(_measure)
+BY_NAME.update({measure.name: measure for measure in MEASURES.values()})
+
+
+def _detail(line: ModelTrialLine) -> dict[str, Any]:
+    return (line.differs or [{}])[0]
+
+
+def _answers_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any]:
+    priced = [line.cost for line in lines if line.cost is not None]
+    chose = [line for line in lines if line.answer == "story"]
+    right = [line for line in chose if _detail(line).get("right")]
+    kept = [line for line in chose if line.settled]
+    return {
+        "run": parent_choice.shown_run(run),
+        "maker": maker(run.provider, run.model),
+        "answers": len(lines),
+        # The right Story was among the candidates it was shown.
+        "in_list": sum(1 for line in lines if _detail(line).get("in_list")),
+        "chose": len(chose),
+        "right": len(right),
+        "wrong": len(chose) - len(right),
+        "none": sum(1 for line in lines if line.answer in ("none", "bug")),
+        "unclear": sum(1 for line in lines if line.answer == "unclear"),
+        # What a run would keep from it: a clear answer whose quotes are in the texts.
+        "kept": len(kept),
+        "kept_right": sum(1 for line in kept if _detail(line).get("right")),
+        "cost_each": round(sum(priced) / len(priced), 6) if priced else None,
+        "cost": round(sum(priced), 6) if priced else None,
+    }
+
+
+def _agreements(
+    runs: list[ChoiceRun], lines: dict[UUID, list[ModelTrialLine]]
+) -> list[dict[str, Any]]:
+    """For each two models of different families, on the issues both answered: how often
+    they chose the same Story, and how often that Story is right."""
+    latest: dict[tuple[str, str], ChoiceRun] = {}
+    for run in runs:
+        if run.kind == "ans_issue_story" and run.state == "complete":
+            latest.setdefault((run.provider, run.model), run)
+    found = []
+    models = sorted(latest)
+    for place, one in enumerate(models):
+        for other in models[place + 1 :]:
+            if family_of(*one) == family_of(*other):
+                continue
+            mine = {line.child_id: line for line in lines[latest[one].id]}
+            theirs = {line.child_id: line for line in lines[latest[other].id]}
+            both = [(mine[key], theirs[key]) for key in mine if key in theirs]
+            same = [
+                (a, b)
+                for a, b in both
+                if a.answer == "story"
+                and b.answer == "story"
+                and _detail(a).get("parent_id") == _detail(b).get("parent_id")
+            ]
+            kept = [(a, b) for a, b in same if a.settled and b.settled]
+            costs = [
+                (a.cost or 0.0) + (b.cost or 0.0)
+                for a, b in both
+                if a.cost is not None and b.cost is not None
+            ]
+            found.append(
+                {
+                    "models": [one[1], other[1]],
+                    "issues": len(both),
+                    "same": len(same),
+                    "same_right": sum(1 for a, _b in same if _detail(a).get("right")),
+                    # Both also clear and with their quotes in the texts.
+                    "kept": len(kept),
+                    "kept_right": sum(1 for a, _b in kept if _detail(a).get("right")),
+                    "cost_each": round(sum(costs) / len(costs), 6) if costs else None,
+                }
+            )
+    return found
+
+
+def _compare_report(run: ChoiceRun, lines: list[ModelTrialLine]) -> dict[str, Any]:
+    priced = [line.cost for line in lines if line.cost is not None]
+    confirmed = [line for line in lines if line.agrees]
+    refused = [line for line in lines if not line.agrees]
+    return {
+        "run": parent_choice.shown_run(run),
+        "maker": maker(run.provider, run.model),
+        "answers": len(lines),
+        "first_right": sum(1 for line in lines if _detail(line).get("first_right")),
+        "confirmed": len(confirmed),
+        "confirmed_right": sum(1 for line in confirmed if _detail(line).get("first_right")),
+        "refused": len(refused),
+        # First answers that were wrong and that it did not confirm.
+        "refused_wrong": sum(1 for line in refused if not _detail(line).get("first_right")),
+        "cost_each": round(sum(priced) / len(priced), 6) if priced else None,
+        "cost": round(sum(priced), 6) if priced else None,
+    }
 
 
 def candidates(db: Session) -> list[dict[str, Any]]:
@@ -521,9 +865,29 @@ class Judging:
                 select(ModelTrialLine).where(ModelTrialLine.run_id.in_([run.id for run in runs]))
             ):
                 lines[line.run_id].append(line)
+            asked = MEASURES[ANSWERS].scope(db, project).children()
+            first_run, first = _first_answers(db, project.id)
             return {
                 "kinds": kinds,
-                "trials": [_report(run, lines[run.id]) for run in runs],
+                "trials": [_report(run, lines[run.id]) for run in runs if run.kind in JUDGE_NAMES],
+                "answers": {
+                    "issues": len(asked),
+                    "run": parent_choice.latest_run(db, project.id, "ans_issue_story"),
+                    "compare_run": parent_choice.latest_run(db, project.id, "cmp_issue_story"),
+                    "first": first_run.model if first_run is not None else None,
+                    "to_compare": sum(1 for row in asked if row.id in first),
+                    "runs": [
+                        _answers_report(run, lines[run.id])
+                        for run in runs
+                        if run.kind == "ans_issue_story"
+                    ],
+                    "agreements": _agreements(list(runs), lines),
+                    "comparisons": [
+                        _compare_report(run, lines[run.id])
+                        for run in runs
+                        if run.kind == "cmp_issue_story"
+                    ],
+                },
                 "models": candidates(db),
                 "spent": round(_spent(db, project.id), 6),
                 "limit": PROJECT_DOLLARS,
@@ -571,11 +935,30 @@ class Judging:
         self, name: str, kind: str, provider: str, model: str, dollars: float
     ) -> dict[str, Any]:
         """Begin a measurement of one model as a judge of one sort of pair."""
-        judge = JUDGES.get(kind)
+        judge = JUDGES.get(kind) or MEASURES.get(kind)
         if judge is None:
             raise ProjectInvalid("A judge cannot be measured on this.")
         with self.sessions() as db:
             project = active_project(db, name)
+            if kind in MEASURES:
+                # An answer has a shape a decision model does not give.
+                if any(
+                    (entry["provider"], entry["model"]) == (provider, model) and entry["decision"]
+                    for entry in candidates(db)
+                ):
+                    raise ProjectInvalid(
+                        "A decision model gives a verdict on a pair, not an answer from "
+                        "candidates. Choose a general model."
+                    )
+            if kind == COMPARES:
+                first_run, _first = _first_answers(db, project.id)
+                if first_run is not None and family_of(first_run.provider, first_run.model) == (
+                    family_of(provider, model)
+                ):
+                    raise ProjectInvalid(
+                        f"{first_run.model} gave the answers that are compared, and this "
+                        "model is of its family. Choose a model of another maker."
+                    )
             wanted = next(
                 (
                     entry
@@ -604,7 +987,7 @@ class Judging:
         )
 
     def control(self, name: str, kind: str, run_id: UUID, action: str) -> dict[str, Any]:
-        judge = JUDGES.get(kind)
+        judge = JUDGES.get(kind) or MEASURES.get(kind)
         if judge is None:
             raise ProjectNotFound(kind)
         return parent_choice.control(self.sessions, name, judge.name, run_id, action)

@@ -52,9 +52,55 @@ interface Trial {
   cost: number | null;
   cost_each: number | null;
 }
+type Measured = Run & { dollar_cap?: number | null };
+interface AnswerRun {
+  run: Measured;
+  maker: string;
+  answers: number;
+  in_list: number;
+  chose: number;
+  right: number;
+  wrong: number;
+  none: number;
+  unclear: number;
+  kept: number;
+  kept_right: number;
+  cost_each: number | null;
+}
+interface Agreement {
+  models: [string, string];
+  issues: number;
+  same: number;
+  same_right: number;
+  kept: number;
+  kept_right: number;
+  cost_each: number | null;
+}
+interface Comparison {
+  run: Measured;
+  maker: string;
+  answers: number;
+  first_right: number;
+  confirmed: number;
+  confirmed_right: number;
+  refused: number;
+  refused_wrong: number;
+  cost_each: number | null;
+}
+interface Answers {
+  issues: number;
+  run: Run | null;
+  compare_run: Run | null;
+  first: string | null;
+  to_compare: number;
+  runs: AnswerRun[];
+  agreements: Agreement[];
+  comparisons: Comparison[];
+}
 interface Overview {
   kinds: Kind[];
   trials: Trial[];
+  answers: Answers;
   models: Candidate[];
   spent: number;
   limit: number;
@@ -81,6 +127,9 @@ const FROM: Record<string, string> = {
   presumed: 'presumed',
 };
 const percent = (value: number | null) => (value === null ? '—' : `${Math.round(value * 100)}%`);
+const of = (part: number, whole_: number) => (whole_ ? `${whole(part)} of ${whole(whole_)}` : '—');
+/** How many of these were wrong, as a share: the number that has to be under what you accept. */
+const wrongShare = (right: number, all: number) => (all ? `${Math.round(((all - right) / all) * 100)}% wrong` : '');
 const keyOf = (model: { provider: string; model: string }) => JSON.stringify([model.provider, model.model]);
 const sum = (counts: Record<string, number>) => Object.values(counts).reduce((total, count) => total + count, 0);
 const known = (counts: Record<string, number>) =>
@@ -130,12 +179,55 @@ export function JudgeTrials({ project }: { project: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const overview = useResource<Overview>(apiUrl(base), 60000, { keepPreviousData: true });
-  const asking = (overview.data?.kinds ?? []).some((entry) => isAsking(entry.run));
+  const asking =
+    (overview.data?.kinds ?? []).some((entry) => isAsking(entry.run)) ||
+    isAsking(overview.data?.answers.run ?? null) ||
+    isAsking(overview.data?.answers.compare_run ?? null);
   const live = useResource<Overview>(apiUrl(base), asking ? 4000 : 600000, { keepPreviousData: true });
   const data = (asking ? live.data : null) ?? overview.data;
-  const usable = (data?.kinds ?? []).filter((entry) => entry.sample.right + entry.sample.wrong > 0);
+  // What can be measured: a judge of one pair, an answer from the candidates, a comparison.
+  const usable: (Kind & { count: number; general?: boolean })[] = data
+    ? [
+        ...data.kinds
+          .filter((entry) => entry.sample.right + entry.sample.wrong > 0)
+          .map((entry) => ({
+            ...entry,
+            label: 'A judge of one pair: ' + entry.label.toLowerCase(),
+            count: entry.sample.right + entry.sample.wrong,
+          })),
+        ...(data.answers.issues
+          ? [
+              {
+                kind: 'answers',
+                label: 'An answer from the candidates: the User Story of an issue',
+                right: {},
+                wrong: {},
+                sample: { right: data.answers.issues, wrong: 0 },
+                run: data.answers.run,
+                count: data.answers.issues,
+                general: true,
+              },
+            ]
+          : []),
+        ...(data.answers.to_compare
+          ? [
+              {
+                kind: 'comparison',
+                label: `A comparison: what ${data.answers.first} chose, beside the next best`,
+                right: {},
+                wrong: {},
+                sample: { right: data.answers.to_compare, wrong: 0 },
+                run: data.answers.compare_run,
+                count: data.answers.to_compare,
+                general: true,
+              },
+            ]
+          : []),
+      ]
+    : [];
   const chosen = usable.find((entry) => entry.kind === kind) ?? usable[0];
-  const model = data?.models.find((entry) => keyOf(entry) === picked) ?? data?.models[0];
+  const offered = (data?.models ?? []).filter((entry) => !chosen?.general || !entry.decision);
+  const model = offered.find((entry) => keyOf(entry) === picked) ?? offered[0];
   const left = data ? Math.max(0, data.limit - data.spent) : 0;
   const limit = Number(cap || (data ? Math.min(data.run_dollars, left) : 0));
   const liveRun = chosen?.run && ['queued', 'running', 'paused', 'held'].includes(chosen.run.state) ? chosen.run : null;
@@ -286,6 +378,144 @@ export function JudgeTrials({ project }: { project: string }) {
               </div>
             ) : null}
             {shown ? <Errors key={shown.run.id} base={base} trial={shown} /> : null}
+            <section className="grid gap-3">
+              <h3 className="text-sm font-semibold text-foreground">A second answer, and a comparison</h3>
+              <p className="text-sm text-muted-foreground">
+                A judge asked about one pair alone is not shown the neighbouring User Story an issue may belong to. Two
+                other ways are measured on the {whole(data.answers.issues)} issues whose User Story you set, with that
+                link hidden and the check&apos;s own question asked. In the first, two models of different makers each
+                choose from the same candidates without seeing the other: what counts is how often they choose the same
+                Story, and how often that Story is the one you set. In the second, a model is shown the Story another
+                chose beside the next best ones, not told which was chosen, and chooses again.
+              </p>
+              {data.answers.runs.length ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[48rem] text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-xs text-muted-foreground">
+                        <th className="py-2 pe-3 text-start font-medium">Model answering alone</th>
+                        <th className="py-2 pe-3 text-end font-medium">Issues</th>
+                        <th className="py-2 pe-3 text-end font-medium">Right Story among the candidates</th>
+                        <th className="py-2 pe-3 text-end font-medium">Chose a Story</th>
+                        <th className="py-2 pe-3 text-end font-medium">Of those, right</th>
+                        <th className="py-2 pe-3 text-end font-medium">Clear and quoted, right</th>
+                        <th className="py-2 text-end font-medium">Cost an answer</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.answers.runs.map((entry) => (
+                        <tr key={entry.run.id} className="border-b border-border align-top">
+                          <td className="py-2 pe-3">
+                            <div className="font-medium text-foreground">{entry.run.model}</div>
+                            <div className="text-xs text-muted-foreground">
+                              made by {entry.maker}
+                              {entry.run.detail ? ` · ${entry.run.detail}` : ''}
+                            </div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {whole(entry.answers)} of {whole(entry.run.total)}
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">{of(entry.in_list, entry.answers)}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">{whole(entry.chose)}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(entry.right, entry.chose)}
+                            <div className="text-xs text-muted-foreground">{wrongShare(entry.right, entry.chose)}</div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(entry.kept_right, entry.kept)}
+                            <div className="text-xs text-muted-foreground">
+                              {wrongShare(entry.kept_right, entry.kept)}
+                            </div>
+                          </td>
+                          <td className="py-2 text-end tabular-nums">{dollars(entry.cost_each)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+              {data.answers.agreements.length ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[44rem] text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-xs text-muted-foreground">
+                        <th className="py-2 pe-3 text-start font-medium">Two models, each answering alone</th>
+                        <th className="py-2 pe-3 text-end font-medium">Issues both answered</th>
+                        <th className="py-2 pe-3 text-end font-medium">Chose the same Story</th>
+                        <th className="py-2 pe-3 text-end font-medium">Of those, right</th>
+                        <th className="py-2 pe-3 text-end font-medium">Both clear and quoted, right</th>
+                        <th className="py-2 text-end font-medium">Cost of both</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.answers.agreements.map((pair) => (
+                        <tr key={pair.models.join('|')} className="border-b border-border align-top">
+                          <td className="py-2 pe-3 font-medium text-foreground">{pair.models.join(' and ')}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">{whole(pair.issues)}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">{of(pair.same, pair.issues)}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(pair.same_right, pair.same)}
+                            <div className="text-xs text-muted-foreground">
+                              {wrongShare(pair.same_right, pair.same)}
+                            </div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(pair.kept_right, pair.kept)}
+                            <div className="text-xs text-muted-foreground">
+                              {wrongShare(pair.kept_right, pair.kept)}
+                            </div>
+                          </td>
+                          <td className="py-2 text-end tabular-nums">{dollars(pair.cost_each)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+              {data.answers.comparisons.length ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[44rem] text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-xs text-muted-foreground">
+                        <th className="py-2 pe-3 text-start font-medium">Model comparing</th>
+                        <th className="py-2 pe-3 text-end font-medium">Answers compared</th>
+                        <th className="py-2 pe-3 text-end font-medium">Confirmed</th>
+                        <th className="py-2 pe-3 text-end font-medium">Of those, right</th>
+                        <th className="py-2 pe-3 text-end font-medium">Wrong answers it did not confirm</th>
+                        <th className="py-2 text-end font-medium">Cost a comparison</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.answers.comparisons.map((entry) => (
+                        <tr key={entry.run.id} className="border-b border-border align-top">
+                          <td className="py-2 pe-3">
+                            <div className="font-medium text-foreground">{entry.run.model}</div>
+                            <div className="text-xs text-muted-foreground">made by {entry.maker}</div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {whole(entry.answers)}
+                            <div className="text-xs text-muted-foreground">
+                              {whole(entry.first_right)} of them right
+                            </div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">{of(entry.confirmed, entry.answers)}</td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(entry.confirmed_right, entry.confirmed)}
+                            <div className="text-xs text-muted-foreground">
+                              {wrongShare(entry.confirmed_right, entry.confirmed)}
+                            </div>
+                          </td>
+                          <td className="py-2 pe-3 text-end tabular-nums">
+                            {of(entry.refused_wrong, entry.answers - entry.first_right)}
+                          </td>
+                          <td className="py-2 text-end tabular-nums">{dollars(entry.cost_each)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+            </section>
             {!chosen ? (
               <p className="text-sm text-foreground">
                 No pair of this project has a truth that is known yet: a link the records state themselves, or one you
@@ -332,7 +562,7 @@ export function JudgeTrials({ project }: { project: string }) {
                     <SimpleSelect
                       aria-label="Model that is measured as a judge"
                       value={model ? keyOf(model) : ''}
-                      items={data.models.map((entry) => ({
+                      items={offered.map((entry) => ({
                         value: keyOf(entry),
                         label: `${entry.model} · ${entry.decision ? 'decision model' : entry.provider}${entry.priced ? '' : ' · no price'}`,
                       }))}
@@ -355,7 +585,7 @@ export function JudgeTrials({ project }: { project: string }) {
                     disabled={!model || !model.priced || !(limit >= 0.05) || limit > left}
                     onClick={() => setConfirming(true)}
                   >
-                    Measure on {whole(chosen.sample.right + chosen.sample.wrong)} pairs
+                    Measure on {whole(chosen.count)} {chosen.general ? 'issues' : 'pairs'}
                   </Button>
                 </div>
                 {model && !model.priced ? (
@@ -374,9 +604,11 @@ export function JudgeTrials({ project }: { project: string }) {
           title={`Measure ${model.model} as a judge?`}
           about={
             <>
-              It is asked about {whole(chosen.sample.right)} right and {whole(chosen.sample.wrong)} wrong pairs of “
-              {chosen.label}”, one question each. The measurement stops at {dollars(limit)}. It changes nothing in the
-              plan and uses none of the project&apos;s review tokens.
+              {chosen.general
+                ? `It is asked about ${whole(chosen.count)} issues whose User Story you set, with that link hidden, one question each.`
+                : `It is asked about ${whole(chosen.sample.right)} right and ${whole(chosen.sample.wrong)} wrong pairs, one question each.`}{' '}
+              The measurement stops at {dollars(limit)}. It changes nothing in the plan and uses none of the
+              project&apos;s review tokens.
             </>
           }
           action="Start measuring"

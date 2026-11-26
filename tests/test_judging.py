@@ -10,7 +10,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from engineering_control.dashboard import judging, review_flows
-from engineering_control.db.models import ProjectReviewBudget, ProviderAccount
+from engineering_control.db.models import BacklogItem, ProjectReviewBudget, ProviderAccount
 from engineering_control.engine import validate
 from engineering_control.engine.builtin import STARTERS
 from engineering_control.engine.document import parse
@@ -195,3 +195,102 @@ def test_a_model_that_writes_code_only_is_never_asked_in_a_review(tmp_path: Path
     assert not [p for p in validate.errors(parse(loop)) if "writes code only" in p["text"]]
     judged = _rules(_judging(provider="openrouter", model=INKLING))
     assert any("writes code only" in text for text in judged)
+
+
+class Chooser:
+    """Answers the check's own question: the User Story of the title it is told, with
+    passages that are in the texts."""
+
+    def __init__(self, title: str, model: str, cost: float = 0.001) -> None:
+        self.title, self.model, self.cost = title, model, cost
+        self.shown: list[list[str]] = []
+
+    async def ask(self, question: Question, *, retry: bool) -> Reply:
+        asked = json.loads(question.prompt)
+        self.shown.append([story["title"] for story in asked["stories"]])
+        chosen = next(story for story in asked["stories"] if story["title"] == self.title)
+        said = {
+            "answer": "story",
+            "story": chosen["id"],
+            "confidence": "high",
+            "reason": "It reads so.",
+            "issue_quote": asked["issue"]["text"],
+            "story_quote": chosen["text"],
+            "missing_title": "",
+            "missing_description": "",
+        }
+        usage = {"tokens": 40, "cost": self.cost}
+        return Reply(said, "", "fixture", self.model, uuid4(), "Test", usage, 0.1, 1)
+
+
+def test_a_second_answer_and_a_comparison_are_measured_on_issues_with_a_known_story(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(judging, "MAKERS", frozenset({"fixture"}))
+    # In this test each model is a family of its own.
+    monkeypatch.setattr(judging, "family_of", lambda provider, model: model)
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        seed(repo)
+        # Issue 44 was put under "Respond to failures" by hand; its words fit both Stories.
+        with repo.sessions.begin() as db:
+            issue = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 44)).one()
+            issue.description = "Show failed runs to the operator and keep an audit entry."
+        repo.planning_links.reconcile_project("falcone")
+        priced(repo, ["analysis", "other"])
+        shown = client.get(BASE + "judge-trials").json()["answers"]
+        assert (shown["issues"], shown["first"], shown["to_compare"]) == (1, None, 0)
+        start = {"provider": "fixture", "model": "analysis", "dollars": 0.5}
+        # A comparison needs an answer to compare.
+        early = post(client, "judge-trials/comparison/runs", **start)
+        assert early.status_code == 422 and "first" in early.text
+
+        # One model chooses the right Story, the link hidden; another the wrong one.
+        assert post(client, "judge-trials/answers/runs", **start).status_code == 200
+        right = Chooser("Respond to failures", "analysis")
+        run(repo, right)
+        assert sorted(right.shown[0]) == ["Audit executions", "Respond to failures"]
+        other = {**start, "model": "other"}
+        assert post(client, "judge-trials/answers/runs", **other).status_code == 200
+        run(repo, Chooser("Audit executions", "other"))
+        shown = client.get(BASE + "judge-trials").json()["answers"]
+        wrong_run, right_run = shown["runs"]
+        assert (right_run["answers"], right_run["in_list"], right_run["right"]) == (1, 1, 1)
+        assert (right_run["kept"], right_run["kept_right"], right_run["cost_each"]) == (1, 1, 0.001)
+        assert (wrong_run["chose"], wrong_run["right"], wrong_run["wrong"]) == (1, 0, 1)
+        # They do not agree, so nothing would pass as agreed.
+        (pair,) = shown["agreements"]
+        assert sorted(pair["models"]) == ["analysis", "other"]
+        assert (pair["issues"], pair["same"], pair["same_right"]) == (1, 0, 0)
+
+        # The second model answers again and now chooses the same: agreed, and right.
+        assert post(client, "judge-trials/answers/runs", **other).status_code == 200
+        run(repo, Chooser("Respond to failures", "other"))
+        shown = client.get(BASE + "judge-trials").json()["answers"]
+        (pair,) = shown["agreements"]
+        assert (pair["same"], pair["same_right"], pair["kept"], pair["kept_right"]) == (1, 1, 1, 1)
+        assert pair["cost_each"] == 0.002
+        assert (shown["first"], shown["to_compare"]) == ("other", 1)
+
+        # A comparison is not made by the family that gave the answer.
+        same_family = post(client, "judge-trials/comparison/runs", **other)
+        assert same_family.status_code == 422 and "another maker" in same_family.text
+        assert post(client, "judge-trials/comparison/runs", **start).status_code == 200
+        judge = Chooser("Respond to failures", "analysis")
+        run(repo, judge)
+        # It was shown the chosen Story and the next best, not which was chosen.
+        assert sorted(judge.shown[0]) == ["Audit executions", "Respond to failures"]
+        (compared,) = client.get(BASE + "judge-trials").json()["answers"]["comparisons"]
+        assert (compared["answers"], compared["first_right"]) == (1, 1)
+        assert (compared["confirmed"], compared["confirmed_right"], compared["refused"]) == (
+            1,
+            1,
+            0,
+        )
+
+        assert post(client, "judge-trials/answers/runs", **start).status_code == 200
+        run(repo, Chooser("Respond to failures", "analysis"))
+        # Measurements of every sort count towards the project's sum.
+        assert client.get(BASE + "judge-trials").json()["spent"] == 0.005
+    finally:
+        client.close()
