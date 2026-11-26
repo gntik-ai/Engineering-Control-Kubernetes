@@ -329,7 +329,20 @@ So the reading above, that most of what is left comes from the candidates, was w
 - **A judge for the Epics a User Story is also linked to.** An answer of that check judges several links at once, so the two are compared link by link: the judge's word on each link is kept, and the two agree when they say the same of every one. A link is proposed for taking off only where the judge, asked unseen, calls it unrelated too; a link the two differ on is shown as in doubt with what the judge said, and is not proposed.
 - **A third model for what stays in doubt** (decision 5). Settings can name one, which can be a stronger model: it is asked the same question, unseen, only about answers the two did not agree on and answers that could not tell. It decides nothing. The answer stays in doubt and says whether the third went with the answer, with the judge, or with neither, so that what reaches you comes with a third reading. It has its own sum in dollars a month, $1 unless changed, and is not asked once that is used. It replaces "a comparison where the scorer disagrees" of the first plan: the comparison measured no better than a second answer, and a third reading needs no new question.
 
-**Not measured:** how often the side the third model takes is right. Until it is, its word orders and informs what you see and puts nothing into a batch.
+**The third model, measured (26 November 2026).** On Falcone's 60 issues whose User Story is known, with GPT-5.6 Luna answering and Claude Haiku 5.5 as the judge, a third model was asked about what the two left in doubt.
+
+| Third model | Agreed at once | Right | In doubt | Third went with the answer | Right | With the judge | Right | With neither | Cost of the third, for each issue asked |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gemini 3.8 Flash | 48 | 42 | 8 | 3 | 1 | 4 | 1 | 1 | $0.011 |
+| Claude Sonnet 5.5 | 50 | 42 | 6 | 3 | 2 | 3 | 0 | 0 | $0.013 |
+
+- **The side a third model takes is right 4 times in 13.** That is worse than choosing between the two by chance, with either model, the stronger one included. What two cheap models do not agree on is hard for a third as well: often neither of the two has the right Story, and the third still goes with one of them.
+- **It costs more than the rest.** About a cent for each issue it is asked about, against a fifth of a cent for the answer and the judge together.
+- **So no third model is named by default, and none is recommended.** It stays in Settings, off, for a project where it may measure otherwise; the measurement can be run again with any model. What stays in doubt goes to the administrator as it is, which is what J3 is about.
+
+The numbers are small: 14 issues in doubt over two runs. They are enough to say a third model does not settle doubt, and not enough to rank third models.
+
+**What the measurements have cost** is now counted with the judge and the third model: $1.58 of the $3 set aside.
 
 ## What sending an answer back does (26 November 2026)
 

@@ -330,7 +330,8 @@ export function ReviewSettings({ project }: { project: string }) {
                 answers. Review evidence asks the model that answers too. Models that write code only are not offered:
                 they are never asked in a review. A third model, which can be a stronger one, is asked only about what
                 the two did not agree on: it decides nothing, and you are shown which of the two it sides with. What it
-                may cost a month is among the numbers below.
+                may cost a month is among the numbers below. Measured on Falcone on 26 November 2026, the side a third
+                model took was right 4 times in 13, at about a cent an issue: none is recommended.
               </p>
               <div className="flex flex-wrap items-end gap-3">
                 <label className="grid gap-1 text-sm">
