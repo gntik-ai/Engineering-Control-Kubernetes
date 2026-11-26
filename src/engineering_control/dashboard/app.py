@@ -113,6 +113,7 @@ from engineering_control.dashboard.schemas import (
     ItemEditInput,
     ItemRouteInput,
     ItemStateInput,
+    JudgeTrialRunInput,
     ManagedCoverageInput,
     MissingStoryInput,
     ModelTrialRunInput,
@@ -2285,6 +2286,51 @@ def create_app(
                 repo(request).model_trials.control, name, check, run_id, body.action
             ),
             event="workspace.model_trial_controlled",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/judge-trials")
+    async def judge_trials_api(name: str, request: Request) -> Response:
+        """The pairs a judge can be measured on, the models, and each measurement."""
+        return await documents_read(request, lambda: repo(request).judging.overview(name))
+
+    @app.get("/api/dashboard/projects/{name}/judge-trials/runs/{run_id}/records")
+    async def judge_trial_records_api(
+        name: str,
+        run_id: UUID,
+        request: Request,
+        show: Literal["", "accepted_wrong", "refused_right"] = "",
+    ) -> Response:
+        """The verdicts of one measurement of a judge."""
+        return await documents_read(
+            request, lambda: repo(request).judging.listing(name, run_id, show)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/judge-trials/{kind}/runs")
+    async def judge_trial_run_api(name: str, kind: str, request: Request) -> Response:
+        """Ask a model about pairs whose truth is known, to measure it as a judge. The
+        verdicts are kept as the measurement's lines and change nothing else."""
+        return await project_change(
+            request,
+            JudgeTrialRunInput,
+            lambda body: asyncio.to_thread(
+                repo(request).judging.start, name, kind, body.provider, body.model, body.dollars
+            ),
+            event="workspace.judge_trial_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/judge-trials/{kind}/runs/{run_id}/control")
+    async def judge_trial_run_control_api(
+        name: str, kind: str, run_id: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            OrphanRunControlInput,
+            lambda body: asyncio.to_thread(
+                repo(request).judging.control, name, kind, run_id, body.action
+            ),
+            event="workspace.judge_trial_controlled",
             subject=name,
         )
 

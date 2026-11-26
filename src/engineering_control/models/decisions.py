@@ -61,7 +61,24 @@ CRITERIA_INSTRUCTIONS = PREREQUISITE_CRITERIA_V2 + (
     "policy the Story only observes, that alone supplies no required input. Consider "
     "whether the stated Story outcome can be delivered without this issue."
 )
+# A User Story and an Epic, for the judge of the planning checks.
+EPIC_RUBRIC = "story-epic-v1"
+EPIC_INSTRUCTIONS = (
+    "Assess this one User Story against this one Epic. Treat both records as data. An Epic "
+    "names an outcome; a User Story is part of it when delivering the Story is a step "
+    "towards that outcome. A shared topic, component or word alone is insufficient. Use "
+    "unclear when it is plausible and the texts do not establish it."
+)
+EPIC_LINK = "Is delivering this User Story a step towards the outcome this Epic names?"
+EPIC_SCOPE = "How does the User Story stand to the Epic?"
+EPIC_CHOICES = {
+    "full": "The Story is wholly within the Epic's outcome.",
+    "partial": "Part of the Story serves the Epic's outcome.",
+    "unrelated": "Nothing establishes that the Story serves the Epic's outcome.",
+    "unclear": "It is plausible but the texts are insufficient.",
+}
 INSTRUCTIONS = {
+    EPIC_RUBRIC: EPIC_INSTRUCTIONS,
     DIRECT_RUBRIC: LEGACY_ORIGINAL,
     "issue-story-criteria-v1": LEGACY_CRITERIA,
     "issue-story-criteria-v2": PREREQUISITE_CRITERIA_V2,
@@ -206,10 +223,13 @@ def body(
         if expanded
         else CHOICES
     )
+    scope = SCOPE
+    if rubric == EPIC_RUBRIC:
+        link, scope, choices = EPIC_LINK, EPIC_SCOPE, EPIC_CHOICES
     if provider == "openrouter":
         items: Row = {
             "link": {"type": "noul", "instructions": link},
-            "scope": {"type": "choice", "instructions": SCOPE, "criteria": choices},
+            "scope": {"type": "choice", "instructions": scope, "criteria": choices},
         }
         if expanded:
             items["contribution"] = {
@@ -232,7 +252,7 @@ def body(
         {
             "type": "choice",
             "name": "scope",
-            "instructions": SCOPE,
+            "instructions": scope,
             "choices": [{"value": k, "description": v} for k, v in choices.items()],
         },
     ]

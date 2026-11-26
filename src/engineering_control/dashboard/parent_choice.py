@@ -143,6 +143,12 @@ def position(named: Any, letter: str, listed: list[dict[str, Any]]) -> UUID | No
     return UUID(listed[place - 1]["id"]) if 1 <= place <= len(listed) else None
 
 
+def in_dollars(spec: Any) -> bool:
+    """Whether runs of the kind are limited in US dollars, and hold and use none of the
+    project's review tokens: what they are asked to measure was allowed as a sum."""
+    return bool(getattr(spec, "dollars", False))
+
+
 def settles(spec: Any, read: dict[str, Any]) -> bool:
     """Whether an answer of a run's first model is kept, or the question goes on to the
     run's own model: it is kept when it says something other than that it cannot tell,
@@ -292,6 +298,7 @@ def shown_run(run: ChoiceRun) -> dict[str, Any]:
         "alone": round(run.cost / run.priced * run.done, 6)
         if run.first_model and run.priced and run.done
         else None,
+        "dollar_cap": run.dollar_cap,
         "started_at": run.created_at.isoformat(),
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
     }
@@ -403,15 +410,23 @@ def start(
     again: bool = False,
     only: Any = None,
     first: tuple[str, str] | None = None,
+    dollars: float | None = None,
 ) -> dict[str, Any]:
     """Begin a run over the records that wait and have no answer yet, or over all of them
     when asked to ask ``again``. ``only`` narrows them: it is given each record and its
     shortlist and says whether the run asks about it. ``first`` names a cheaper model
-    that is asked before the run's own: what it settles is kept, the rest goes on."""
+    that is asked before the run's own: what it settles is kept, the rest goes on.
+    ``dollars`` is what a run of a kind that is limited in money stops at."""
     spec = KINDS[kind]
+    free = in_dollars(spec)
+    if free and not dollars:
+        raise ProjectInvalid("Say how many dollars the run may cost.")
     with sessions.begin() as db:
         project = active_project(db, name, lock=True)
         choices = review_flows.model_choices(db)
+        more = getattr(spec, "more_choices", None)
+        if more is not None:
+            choices = [*choices, *more(db)]
         if {"provider": provider, "model": model} not in choices:
             raise ProjectInvalid("Choose a model of an account that can be asked.")
         if first is not None:
@@ -429,7 +444,8 @@ def start(
             )
         ):
             raise ProjectConflict("A run is under way for this project. End it first.")
-        review_budget.require_available(db, project.id)
+        if not free:
+            review_budget.require_available(db, project.id)
         scope = spec.scope(db, project)
         refused = scope.refusal()
         if refused:
@@ -443,6 +459,7 @@ def start(
             token_cap=token_cap,
             first_provider=first[0] if first else None,
             first_model=first[1] if first else None,
+            dollar_cap=dollars if free else None,
         )
         db.add(run)
         db.flush()
@@ -491,7 +508,8 @@ def control(
         elif action == "resume":
             if run.state in ASKING:
                 raise ProjectConflict("The run is asking already.")
-            review_budget.require_available(db, project.id)
+            if not in_dollars(KINDS.get(run.kind)):
+                review_budget.require_available(db, project.id)
             run.state, run.detail = "queued", ""
             # What failed is asked again with the rest: a run stops after failures in a
             # row because something was wrong with the asking, not with the records.
@@ -524,6 +542,8 @@ class _Call:
     needed: int
     # Asked of the run's first model, not of its own.
     first: bool = False
+    # Of a run limited in dollars: it holds none of the project's review tokens.
+    free: bool = False
 
 
 # What a tick did when it asked nothing: there was nothing to do, or it moved a run on.
@@ -629,13 +649,24 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
                 f"not asked about. Run again to ask the rest.",
             )
             return _MOVED
-        return _Call(run.id, review.id, project.id, asked, needed, first)
+        free = in_dollars(spec)
+        paid = (run.cost or 0.0) + (run.first_cost or 0.0)
+        if free and run.dollar_cap is not None and paid >= run.dollar_cap:
+            left = run.total - run.done - run.failed
+            _finish(
+                db,
+                run,
+                "complete",
+                f"Stopped at its limit of ${run.dollar_cap:,.2f} with {left:,} not asked about.",
+            )
+            return _MOVED
+        return _Call(run.id, review.id, project.id, asked, needed, first, free)
 
 
 def _admit(sessions: sessionmaker[Session], call: _Call) -> bool:
     """Hold the project's review tokens for the call and mark the run as asking."""
     try:
-        held = review_budget.reserve(sessions, call.project, call.needed)
+        held = 0 if call.free else review_budget.reserve(sessions, call.project, call.needed)
     except review_budget.ReviewBudgetHeld as held_back:
         with sessions.begin() as db:
             run = _locked(db, call.run)

@@ -35,6 +35,7 @@ from engineering_control.engine.catalogue import BUDGETS, TASKS, Param
 from engineering_control.engine.document import KEY, Document, Node
 from engineering_control.engine.prompts import CONTRACTS
 from engineering_control.models.providers import BY_KEY as API_BY_KEY
+from engineering_control.models.providers import code_only
 from engineering_control.sandbox.deliver import PROVIDERS, commands_of
 
 Problem = dict[str, Any]
@@ -44,6 +45,11 @@ ASKED: Final = {
     "areas": "the areas, which no task before it plans",
     "baseline": "the tests before any change, which no Run the tests before it runs",
 }
+
+
+# The tasks that ask a model over an API to write a change, or to choose the steps
+# of writing one: the only ones a model that writes code only may be named for.
+WRITES_CODE: Final = frozenset({"model.edit", "model.choose"})
 
 
 def _problem(rule: str, text: str, where: str | None = None, level: str = "error") -> Problem:
@@ -408,6 +414,22 @@ def _problems(document: Document) -> list[Problem]:
                             node.id,
                         )
                     )
+            if (
+                task.where == "model"
+                and param.name in ("model", "then_model")
+                and node.task not in WRITES_CODE
+                and code_only(str(node.params.get(param.name) or ""))
+            ):
+                # Decided on 26 November 2026: such a model writes code and is never
+                # asked to judge, report or summarise.
+                found.append(
+                    _problem(
+                        "setting",
+                        f"{node.id} asks {node.params.get(param.name)}, which writes code "
+                        "only: name another model for a task that judges or reports",
+                        node.id,
+                    )
+                )
             if param.name == "asked" and node.params.get("asked") == "batch":
                 provider = API_BY_KEY.get(str(node.params.get("provider") or ""))
                 if provider is not None and not provider.batch and not node.params.get("agent"):

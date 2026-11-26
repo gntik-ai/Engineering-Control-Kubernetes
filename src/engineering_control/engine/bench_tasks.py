@@ -26,6 +26,7 @@ from engineering_control.engine.tasks import (
     _tail,
     _words,
 )
+from engineering_control.models.providers import family_of
 from engineering_control.sandbox import deliver, steps
 from engineering_control.sandbox.flows import Plan
 from engineering_control.sandbox.runs import Lease
@@ -499,8 +500,15 @@ class Apply:
                 "maker": provider,
                 "head": head,
                 "round": int(ctx.given.get("round") or 1),
-                # Whose model wrote the change: the review is by another family's.
-                "ran": {**(ctx.data.get("ran") or {}), ctx.node.id: provider},
+                # Whose model wrote the change: the review is by another family's. A
+                # model asked through OpenRouter is of its maker's family, not
+                # OpenRouter's, so that what Claude wrote there is not reviewed by Claude.
+                "ran": {
+                    **(ctx.data.get("ran") or {}),
+                    ctx.node.id: family_of(provider, str(last.get("model") or ""))
+                    if provider == "openrouter"
+                    else provider,
+                },
                 **({"touched": touched} if touched is not None else {}),
             },
             given={"summary": str(last.get("summary") or "")},

@@ -424,7 +424,12 @@ class Edit:
             "edits_written",
             f"{len(edits)} edits to {len(paths)} files: {summary}"[:500],
             # The edits stay with the step: Apply the edits reads them there.
-            output={"summary": summary, "edits": edits, "provider": reply.provider},
+            output={
+                "summary": summary,
+                "edits": edits,
+                "provider": reply.provider,
+                "model": reply.model,
+            },
             given={"summary": summary},
         )
 

@@ -909,6 +909,9 @@ class ChoiceRun(UUIDPrimaryKey, Timestamps, Base):
     # What the calls of the run's own model cost, and how many of them said so.
     cost: Mapped[float] = mapped_column(Float, default=0.0)
     priced: Mapped[int] = mapped_column(Integer, default=0)
+    # For a run that is limited in money and not in the project's review tokens
+    # (migration 0086): the US dollars it stops at.
+    dollar_cap: Mapped[float | None] = mapped_column(Float)
 
 
 class ChoiceReview(UUIDPrimaryKey, Timestamps, Base):

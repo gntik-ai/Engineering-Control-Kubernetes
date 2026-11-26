@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Nothing in it is built.
+Plan, 26 November 2026. Decided the same day; J0 is built, J1 to J6 are not.
 
 ## What is asked for
 
@@ -176,7 +176,7 @@ A run no longer asks for a model or a token limit: it takes them from Settings a
 
 | Phase | What | Done when |
 | --- | --- | --- |
-| J0 | **Rules and measurement.** Inkling is refused in every review and offered only on tasks that write code. A model's family is its maker. Each candidate judge is asked about pairs whose truth is known: links the records state, your decisions, the pairs you judged, and pairs known to be wrong. | For each judge and each pairing with an answering model: how often it accepts a wrong answer, how often it refuses a right one, and the cost of a verdict. About $1 to $3. |
+| J0 | **Rules and measurement** (built, 26 November 2026). Inkling is refused in every review and offered only on tasks that write code. A model's family is its maker. Each candidate judge is asked about pairs whose truth is known: links the records state, your decisions, the pairs you judged, and pairs known to be wrong. | For each judge and each pairing with an answering model: how often it accepts a wrong answer, how often it refuses a right one, and the cost of a verdict. About $1 to $3. |
 | J1 | **The judge in the checks.** For issues with no User Story, primary Epics, clean-up and Epic links: answer, checks, judge, sent back twice at most. Each answer keeps the judge's verdict, its objection and the rounds. The run reports what each step settled and cost. | A run ends with every answer agreed or in doubt, and its cost for each record settled is shown beside the same run without a judge. |
 | J2 | **Settings in Reviews.** Everything in the table above in one view; a limit in dollars; makers allowed; the numbers that are in the code today. Runs take their model and limits from it. | No model, token limit or switch of Reviews is set anywhere else. |
 | J3 | **Only what is in doubt.** The scorer joined to the two worklists. Both open on "Needs you", ordered by doubt. What is agreed is applied, or waits as one batch, as you decide below. The sample, the stop and the digest. | On Falcone, the Stories shown for a primary Epic are those in doubt and the sample, not 424. |
@@ -188,16 +188,35 @@ J0 to J3 are what the request names. What was built on 25 November goes into the
 
 Order with the rest of the roadmap: J0 to J3, then B3 of the Bugs section, then J4 to J6. C1 to C3 for Inkling on code ([inkling-models.md](inkling-models.md)) whenever you want them.
 
-## Decisions needed
+## Decided (26 November 2026)
 
-| # | Question | Recommended |
+| # | Question | Decided |
 | --- | --- | --- |
-| 1 | May what both models agree on be applied without you? This changes "approval always" of 23 November. | Yes for what adds or corrects and can be undone. No for what removes, closes or writes to GitHub. |
-| 2 | The error rate you accept in what is applied without you | 5%, the rate the scorer works to today. |
-| 3 | To which makers may your projects' texts be sent? | Google, and through OpenRouter the makers of the decision models. The Chinese makers only at your word. |
-| 4 | May J0 spend about $1 to $3 on the measurement? | Yes. Nothing above about quality is known without it. |
-| 5 | A stronger model for what stays in doubt, before it reaches you? | Yes, with its own cap in Settings. |
-| 6 | A limit in dollars a month for each project | Yes; I will propose a figure from what J0 measures. |
+| 1 | May what both models agree on be applied without you? | **Yes**, for what adds or corrects and can be undone. What removes, closes or writes to GitHub stays a batch you approve. This replaces "approval always" of 23 November for those changes, from the phase that builds it (J3). |
+| 2 | The error rate accepted in what is applied without you | **5%.** |
+| 3 | To which makers may a project's texts be sent? | **Google, and through OpenRouter the makers of the decision models**, beside Anthropic and OpenAI. The Chinese makers only at your word. |
+| 4 | May J0 spend about $1 to $3 on the measurement? | **Yes.** |
+| 5 | A stronger model for what stays in doubt, before it reaches you? | **Yes**, with its own cap. |
+| 6 | A limit in dollars a month for each project | **$3** to begin with, to be set in Settings. Until Settings is built (J2) it is the sum all of a project's measurements of judges may cost together. |
+
+## J0 as built
+
+**The rule for models that write code only.** A model whose name begins with `thinkingmachines/inkling` is in no list a review chooses its model from, and a run, a first model, a planning model or a review flow's setting that names it is refused. In a flow it can be named for the two tasks that write a change, "Ask a model: write the change" and "Ask a model: choose the next step", and for no task that judges, reports or summarises.
+
+**A model's family is its maker.** Through OpenRouter a model was of the family "OpenRouter", so what Claude wrote there could be reviewed by Claude. Now `anthropic/…` there is of Claude's family and `openai/…` of ChatGPT's, and every other model of its maker's. The rule that a change is not reviewed by the family that wrote it uses this.
+
+**Measure a judge**, at the foot of a project's Reorganize page.
+
+- *The pairs.* An issue and a User Story; a User Story and an Epic. A pair is right when the records state it or you made or judged it. It is wrong when you judged it so. It is presumed wrong when the record has a known parent and this is another one, the one most like it by its words: the hard case a judge has to refuse. The page says how many pairs of each sort there are and where each is known from.
+- *The question.* A decision model is asked through its own interface, with the rubric the platform already has for an issue and a Story and a new one for a Story and an Epic. Its answer is a yes when it gives the link a probability of a half or more and a scope that says so; a probability and a scope that contradict each other are no verdict. A general model is asked for yes, no or cannot tell, with a reason in one sentence.
+- *The sample.* Up to 60 right and 60 wrong pairs, the same for every judge.
+- *The report.* How many wrong pairs it let through, and how many of those were presumed wrong; how many right pairs it refused; how often it could not tell; of what it said yes to, how much was right; tokens and cost of a verdict; and each error with its reason.
+- *The limit.* In dollars: half a dollar for a measurement unless you say otherwise, $3 for all of a project's measurements together. A measurement holds and uses none of the project's review tokens, so it runs whatever the reviews have left. A model whose account does not say what it costs cannot be measured.
+- *Which models.* The decision models, and the general models of Anthropic, OpenAI and Google. No model of a maker on the list kept for your word, and no model that writes code only. Both lists are in the code until Settings holds them.
+
+A measurement changes nothing in the plan.
+
+**Not in J0:** the whole list of makers is not yet applied to the model lists of the reviews themselves, only to what a measurement may ask; it comes with Settings (J2), where it can be seen and changed.
 
 ## Sources
 

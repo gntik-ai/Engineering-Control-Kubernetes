@@ -8,6 +8,7 @@ import { Arrivals } from './Arrivals';
 import { ChangeBatches } from './ChangeBatches';
 import { Cleanup } from './Cleanup';
 import { EpicLinks } from './EpicLinks';
+import { JudgeTrials } from './JudgeTrials';
 import { ModelTrials } from './ModelTrials';
 import { Shadow } from './Shadow';
 import { Structure } from './Structure';
@@ -326,6 +327,7 @@ export function Reorganize({ project }: { project: string }) {
       <Judge project={project} onJudged={report.reload} />
       <Shadow project={project} />
       <ModelTrials project={project} />
+      <JudgeTrials project={project} />
     </>
   );
 }

@@ -7,7 +7,7 @@ from typing import Any
 
 from engineering_control.engine.document import Document, Node
 from engineering_control.models import openrouter
-from engineering_control.models.providers import BY_KEY, MODEL_NAME
+from engineering_control.models.providers import BY_KEY, MODEL_NAME, code_only
 
 # The terminal task selects the worker and the response contract. Additional instruction
 # nodes execute in graph order and can target just one part of a multi-stage review.
@@ -189,10 +189,14 @@ def invalid(document: Document) -> str | None:
             provider, _, model = str(generation).partition(":")
             if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
                 return "Choose a generation provider and model from Accounts."
+            if code_only(model):
+                return f"{model} writes code only: it is not asked in a review."
         if node.task == "review.supervisor" and node.params.get("rank_model"):
             provider, _, model = str(node.params["rank_model"]).partition(":")
             if provider not in BY_KEY or not MODEL_NAME.fullmatch(model):
                 return "Select an Accounts provider:model for reranking."
+            if code_only(model):
+                return f"{model} writes code only: it is not asked in a review."
         is_decision = node.task in DECISION_TASKS or (
             node.task == "review.supervisor" and node.params.get("method") == "decision"
         )

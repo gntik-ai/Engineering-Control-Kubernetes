@@ -553,6 +553,14 @@ class ModelTrialRunInput(OrphanRunInput):
     everything: bool = False
 
 
+class JudgeTrialRunInput(PlainChangeInput):
+    """A measurement of one model as a judge, limited in US dollars."""
+
+    provider: str = Field(min_length=1, max_length=32)
+    model: str = Field(min_length=1, max_length=200)
+    dollars: float = Field(ge=0.05, le=3.0)
+
+
 class PrimaryEpicRunInput(OrphanRunInput):
     """A run that asks which Epic is the primary one of each User Story under several."""
 

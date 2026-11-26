@@ -26,6 +26,7 @@ from engineering_control.engine.document import Document
 from engineering_control.engine.library import document_in_force
 from engineering_control.engine.reviews import ACTIONS, Policy, action_of, default_key
 from engineering_control.models import openrouter
+from engineering_control.models.providers import CODE_ONLY, code_only
 from engineering_control.models.service import Question
 
 Owner = WorkspaceImport | PlanningReview | ProjectConnection | EpicExecutionPlan
@@ -249,7 +250,9 @@ def matching_key(settings: dict[str, Any]) -> str:
     return text
 
 
-def model_choices(session: Session) -> list[dict[str, str]]:
+def model_choices(session: Session, *, code: bool = False) -> list[dict[str, str]]:
+    """The models a review can ask. With ``code``, also the models that write code
+    and are never asked in a review: for the tasks of a flow that write a change."""
     fields = session.execute(
         select(
             ProviderAccount.provider, ProviderAccount.models, ProviderAccount.model_catalog
@@ -266,6 +269,7 @@ def model_choices(session: Session) -> list[dict[str, str]]:
         for m in (models or [])
         if isinstance(m, str)
         and (p != "openrouter" or openrouter.supports((catalog or {}).get(m, {})))
+        and (code or not code_only(m))
     }
     return [{"provider": p, "model": m} for p, m in sorted(choices)]
 
@@ -323,4 +327,10 @@ def decision_models(db: Session) -> list[dict[str, Any]]:
 
 def designer_models(sessions: sessionmaker[Session]) -> dict[str, Any]:
     with sessions() as db:
-        return {"api_models": model_choices(db), "decision_models": decision_models(db)}
+        return {
+            # A flow's tasks that write a change may ask a model that writes code only;
+            # the designer says which tasks those are.
+            "api_models": model_choices(db, code=True),
+            "code_only": list(CODE_ONLY),
+            "decision_models": decision_models(db),
+        }

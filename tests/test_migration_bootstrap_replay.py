@@ -64,7 +64,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0083 keeps what was decided about each bug.
     # 0084 keeps what a model said in a trial, beside the answer on record.
     # 0085 lets a run ask a cheaper model first.
-    assert (head, parent) == ("0085", "0084")
+    # 0086 lets a run be limited in US dollars.
+    assert (head, parent) == ("0086", "0085")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -167,8 +168,11 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert {"ix_planning_links_child", "uq_planning_links_active"} <= links
     documents = {"doc_folders", "doc_scans", "doc_files", "doc_changes"}
     runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
-    assert {"first_model", "first_done", "first_cost", "cost", "priced"} <= runs
+    assert {"first_model", "first_done", "first_cost", "cost", "priced", "dollar_cap"} <= runs
     command.downgrade(config, parent)
+    runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
+    assert "dollar_cap" not in runs and "first_model" in runs
+    command.downgrade(config, "0084")
     runs = {column["name"] for column in inspect(engine).get_columns("choice_runs")}
     assert "first_model" not in runs and "token_cap" in runs
     assert "passed" not in {c["name"] for c in inspect(engine).get_columns("choice_reviews")}

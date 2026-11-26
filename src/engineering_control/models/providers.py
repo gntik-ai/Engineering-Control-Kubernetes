@@ -207,6 +207,13 @@ FAMILY_OF: Final = {
     "chatgpt": "chatgpt",
     **{provider.key: provider.family for provider in API_PROVIDERS},
 }
+# Models that write code and are never asked in a review, by the beginning of their
+# name (decided on 26 November 2026). A review is any question whose answer judges,
+# places or describes planning records; the tasks of a flow that write a change are not.
+CODE_ONLY: Final = ("thinkingmachines/inkling",)
+# The makers whose models are one family with a subscription: what one of them wrote
+# is not judged by the other.
+_MAKER_FAMILY: Final = {"anthropic": "claude", "openai": "chatgpt"}
 # How many models an account keeps prices for at most.
 MAX_PRICED: Final = 2000
 # What a model's name may look like, whoever the provider.
@@ -298,3 +305,24 @@ def cost_of(
     except (KeyError, TypeError, ValueError):
         return None
     return round(total * part / 1_000_000, precision)
+
+
+def code_only(model: str) -> bool:
+    """Whether the model is one that writes code and is not asked in a review."""
+    return model.casefold().removeprefix("~").startswith(CODE_ONLY)
+
+
+def maker(provider: str, model: str) -> str:
+    """Who made the model. Through OpenRouter that is the beginning of its name, not
+    OpenRouter: ``google/gemini-decision-1`` is Google's."""
+    if provider == "openrouter" and "/" in model:
+        return model.casefold().removeprefix("~").split("/", 1)[0]
+    return provider
+
+
+def family_of(provider: str, model: str) -> str:
+    """The family a model is of, for the rule that work is not judged by the family
+    that did it: its maker, with Anthropic's models and Claude, and OpenAI's and
+    ChatGPT, as one family each."""
+    made_by = maker(provider, model)
+    return _MAKER_FAMILY.get(made_by, FAMILY_OF.get(made_by, made_by))

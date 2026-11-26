@@ -9,7 +9,7 @@ This replaces points 3 and 4 of the decisions of 25 November below, and the plan
 1. **Inkling is for writing code only**, for example in the flow that resolves an issue. It is never asked in a review process: not as the model that answers, not as a first model, not as a judge, and not in a trial on review questions.
 2. **Through OpenRouter**, as before. No model on our own nodes.
 3. **What was built on 25 November stays, for other models.** The trial of a model on questions already answered, two models in a run, and the default first model are not tied to Inkling. They become parts of the judged reviews planned in [judged-reviews.md](judged-reviews.md). No trial of Inkling on review questions was run, and none will be.
-4. **To build:** the rule itself, so that Inkling is not offered where a review chooses its model and is refused there, and is offered only on the tasks of a flow that write code. It is the first item of the judged-reviews plan.
+4. **The rule itself is built** (26 November 2026, with J0 of the judged-reviews plan): Inkling is not offered where a review chooses its model and is refused there, and can be named only for the tasks of a flow that write a change.
 
 ## The trial on code (26 November 2026)
 

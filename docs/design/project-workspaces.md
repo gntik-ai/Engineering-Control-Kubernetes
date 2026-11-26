@@ -455,7 +455,7 @@ Triage is kept in `bug_records` (migration 0083): severity, area, where it was s
 
 ### Judged reviews (planned)
 
-Planned on 26 November 2026 and not built: a second model of another family checks every answer and sends back what it finds wrong; one Settings view inside Reviews holds every limit, model and switch; and the worklists show only what is in doubt. See [judged-reviews.md](judged-reviews.md).
+Planned on 26 November 2026; the first phase is built: a model can be measured as a judge on pairs whose truth is known (Reorganize, "Measure a judge"), within a sum of dollars, and a model that writes code only is refused in every review. Not built yet: a second model of another family checks every answer and sends back what it finds wrong; one Settings view inside Reviews holds every limit, model and switch; and the worklists show only what is in doubt. See [judged-reviews.md](judged-reviews.md).
 
 ### Trying another model
 
