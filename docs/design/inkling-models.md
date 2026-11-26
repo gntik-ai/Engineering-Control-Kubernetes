@@ -1,8 +1,49 @@
-# Inkling: a cheaper tier for the reviews of the plan
+# Inkling: for writing code, never for reviews
 
-Analysis and plan, 25 November 2026.
+Analysis and plan, 25 November 2026; decision and first trial, 26 November 2026.
 
-## Decided (25 November 2026)
+## Decided (26 November 2026)
+
+This replaces points 3 and 4 of the decisions of 25 November below, and the plan to ask Inkling first in the reviews.
+
+1. **Inkling is for writing code only**, for example in the flow that resolves an issue. It is never asked in a review process: not as the model that answers, not as a first model, not as a judge, and not in a trial on review questions.
+2. **Through OpenRouter**, as before. No model on our own nodes.
+3. **What was built on 25 November stays, for other models.** The trial of a model on questions already answered, two models in a run, and the default first model are not tied to Inkling. They become parts of the judged reviews planned in [judged-reviews.md](judged-reviews.md). No trial of Inkling on review questions was run, and none will be.
+4. **To build:** the rule itself, so that Inkling is not offered where a review chooses its model and is refused there, and is offered only on the tasks of a flow that write code. It is the first item of the judged-reviews plan.
+
+## The trial on code (26 November 2026)
+
+**What was tried.** Deliver issue, with Inkling 2 Small through OpenRouter in place of the subscription agent that writes the code: a flow made from the starter "Deliver issue, worked out by a model in a loop", in which the model chooses each step (search, read, have edits written, check) and writes the edits, and a subscription agent reviews the change as before. Tried in the evaluation lab on the one item Deliver issue has run on: #71 of falcone-workflow, "Create the contract-fixtures package and compatibility matrix schema", at the commit the past run worked on. A lab trial publishes nothing. The flow is `deliver-by-inkling-small`; it is a draft and in force for nothing.
+
+**The past run**, by the subscription agents: finished in 11 minutes, 12 files, two rounds, pull request #350.
+
+**Four attempts with Inkling 2 Small. None finished.**
+
+| Attempt | What was set | How far it got | Why it ended | Cost |
+| --- | --- | --- | --- | ---: |
+| 1 | The starter as it is | One search, three reads | Its fourth answer was longer than the 8,000 tokens a model task allows unless told otherwise | $0.012 |
+| 2 | 32,000 tokens an answer, the most the platform allows | One search, four reads, a plan for the whole change | It wrote the whole new package in one answer, which was longer than 32,000 tokens | $0.021 |
+| 3 | The instruction to write in pieces of one or two files | Three files written and applied | It pasted a file's content into its choice of step, which the next step could not use; then it twice gave an answer without the field that says which step it chooses | $0.050 |
+| 4 | The instruction to describe a piece, not paste it | The whole change written in six edits, declared done, reviewed, the reviewer's objection fixed | Writing a last small edit, it twice gave an answer without its summary field | $0.158 |
+
+**What the fourth attempt shows.** The reviewer, a subscription agent, wrote: "The design is sound: the schema, loader and redaction code match the issue, and the pinned commit matches docs/sources.md. But both required commands fail on the committed tree", with about 13 type errors in a test file. Inkling had not run the tests: the platform's quick check does not know the test runner this package uses. It fixed the file when told. So the code it writes is to the point and close, and was not right the first time.
+
+**What stopped it** was not the code. Two of the four attempts ended because its answer did not have the shape the platform asks for, twice in a row, and a run asks about 25 questions. Its answers are also long: 115,000 tokens written in the fourth attempt, most of it reasoning that cannot be switched off.
+
+**What it cost.** $0.24 for all four attempts; $0.16 for the one that wrote the whole change, against a flat subscription for the past run. Cheap enough that cost is not the question.
+
+**Conclusion.** Not ready to resolve issues by itself in this arrangement, on the evidence of one item. No flow that writes code was changed, and none is proposed to change yet.
+
+**What would make the next trial fair** (not built):
+
+| Phase | What | Done when |
+| --- | --- | --- |
+| C1 | **The arrangement, not the model.** An answer without the right shape is asked for again up to three times with what was wrong said to the model. The upstream provider behind OpenRouter can be named for a task, since some hold a model to the shape and some do not. The quick check knows `node --test`. The most an answer may be is raised for models that reason. | The fourth attempt, repeated, ends for a reason of the code and not of the shape. |
+| C2 | **Inkling as an agent with tools.** Today the task that implements a change runs a subscription's command-line agent, which can run commands and read what they print; the gateway lets that agent be paid by an API key of its own vendor only. Letting the agent be pointed at OpenRouter would give Inkling the same tools the subscription agents have. | Deliver issue runs with Inkling as the implementer and a subscription agent as the reviewer. |
+| C3 | **A trial on more than one item.** The lab can try a flow on at most eight past runs, and Deliver issue has two, of the same item. More delivered items are needed first. | The share of items finished, the rounds, and the cost, beside the subscription agents on the same items. Inkling becomes the implementer of a flow only where it finishes as many. |
+
+
+## Decided (25 November 2026), in part replaced
 
 1. **Inkling is used through OpenRouter.** Both models of the second generation are offered there through the account the platform already has.
 2. **No model is run on our own nodes.** The section on that below is kept as the record of what was looked at; nothing of it is built or planned.
