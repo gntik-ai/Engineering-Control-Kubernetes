@@ -78,7 +78,7 @@ def test_every_project_has_a_row_and_a_next_step(tmp_path: Path) -> None:
         assert [step["view"] for step in rows["llmwiki"]["steps"]] == ["discovery"]
         falcone = rows["falcone"]
         assert falcone["planned"] and (falcone["epics"], falcone["stories"]) == (1, 2)
-        assert "ranking service" in falcone["steps"][0]["says"]
+        assert any("ranking service" in step["says"] for step in falcone["steps"])
 
         with repo.sessions.begin() as db:
             item = db.scalars(
@@ -92,7 +92,7 @@ def test_every_project_has_a_row_and_a_next_step(tmp_path: Path) -> None:
         row = client.get(BASE + "rollout").json()
         said = [step["says"] for step in row["steps"]]
         assert any("Judge the pairs" in text for text in said)
-        assert any("2 open issues have no User Story" in text for text in said)
+        assert any("2 open issues with no User Story have no answer" in text for text in said)
         assert row["drift"]["numbers"]["orphans_open"] == 2
         assert client.get("/api/dashboard/projects/unknown/rollout").status_code == 404
     finally:

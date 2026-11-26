@@ -4,8 +4,9 @@ Nothing here decides anything. It answers three questions that only make sense o
 pieces run by themselves:
 
 - **Where does each project stand?** One row a project: whether it has a plan at all, how
-  much the ranking service has read, whether the scorer is measured on it, what waits for
-  approval, and the next step, said in a sentence.
+  much the ranking service has read, whether the scorer is measured on it, and the next
+  steps, which are the rows of its list of what waits for the administrator
+  (``needs_you``).
 - **What arrived, and where is it now?** The issues that came in lately, each with where
   the cascade put it: a bug, under a Story, in a batch to approve, a lead for a Story, or
   waiting with its closest Story named.
@@ -28,6 +29,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
+from engineering_control.dashboard.needs_you import NeedsYou
 from engineering_control.dashboard.planning import _visible_issues
 from engineering_control.dashboard.planning_drift import drift
 from engineering_control.dashboard.planning_links import PlanningLinks
@@ -35,7 +37,6 @@ from engineering_control.dashboard.project_records import active_project
 from engineering_control.dashboard.signals import BUCKETS, ISSUE_STORY
 from engineering_control.db.models import (
     BacklogItem,
-    ChoiceReview,
     DocFile,
     GoldPair,
     PlanningLink,
@@ -62,7 +63,7 @@ def _count(db: Session, model: Any, *where: Any) -> int:
     return int(db.scalar(select(func.count()).select_from(model).where(*where)) or 0)
 
 
-def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
+def _row(db: Session, project: ProjectRecord, steps: list[dict[str, str]]) -> dict[str, Any]:
     pid = project.id
     epics = _count(
         db, ProjectEpic, ProjectEpic.project_id == pid, ProjectEpic.archived_at.is_(None)
@@ -96,101 +97,9 @@ def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
         .tuples()
         .all()
     )
-    unsupported = int(states.get("unsupported", 0))
-    answered = _count(
-        db,
-        ChoiceReview,
-        ChoiceReview.project_id == pid,
-        ChoiceReview.kind == "story_needed",
-        ChoiceReview.state == "answered",
-    )
     moved = drift(db, pid)
-    numbers = (moved or {}).get("numbers", {})
     wanted = sum(count for _kind, count in BUCKETS.values())
     planned = bool(epics and stories)
-    steps: list[dict[str, str]] = []
-    if not planned:
-        steps.append(
-            {
-                "view": "discovery",
-                "says": (
-                    "It has no Epics and no User Stories: bring it through Discovery first. "
-                    "Until then there is nothing to reorganize."
-                ),
-            }
-        )
-    else:
-        if not vectors:
-            steps.append(
-                {"view": "reorganize", "says": "The ranking service has not read its records yet."}
-            )
-        if numbers.get("changes_ready"):
-            steps.append(
-                {
-                    "view": "reorganize",
-                    "says": _some(numbers["changes_ready"], "change waits", "changes wait")
-                    + " for your approval.",
-                }
-            )
-        if numbers.get("structure_proposals"):
-            steps.append(
-                {
-                    "view": "reorganize",
-                    "says": _some(
-                        numbers["structure_proposals"],
-                        "proposal for the structure waits",
-                        "proposals for the structure wait",
-                    )
-                    + " for your word.",
-                }
-            )
-        if unsupported > answered:
-            steps.append(
-                {
-                    "view": "reorganize",
-                    "says": f"Ask a model about the {unsupported - answered:,} User Stories that "
-                    "nothing supports and that have no answer yet.",
-                }
-            )
-        if numbers.get("epic_links_to_judge"):
-            steps.append(
-                {
-                    "view": "reorganize",
-                    "says": "Ask a model about "
-                    + _some(
-                        numbers["epic_links_to_judge"],
-                        "link of a User Story to an Epic",
-                        "links of User Stories to Epics",
-                    )
-                    + " beyond the primary one: whether the Story has to do with that Epic.",
-                }
-            )
-        if vectors and not all(measured.get(kind) for kind in (ISSUE_STORY, "story_epic")):
-            steps.append(
-                {
-                    "view": "reorganize",
-                    "says": (
-                        f"Judge the pairs ({judged:,} of {max(drawn, wanted):,} judged): the "
-                        "scorer is not yet measured on this project's own links."
-                    ),
-                }
-            )
-        if numbers.get("bugs_linked"):
-            steps.append(
-                {
-                    "view": "bugs",
-                    "says": _some(numbers["bugs_linked"], "bug still carries", "bugs still carry")
-                    + " a link to a User Story.",
-                }
-            )
-        if numbers.get("orphans_open"):
-            steps.append(
-                {
-                    "view": "related-work",
-                    "says": _some(numbers["orphans_open"], "open issue has", "open issues have")
-                    + " no User Story.",
-                }
-            )
     return {
         "project": project.name,
         "display_name": project.display_name,
@@ -216,24 +125,41 @@ def _row(db: Session, project: ProjectRecord) -> dict[str, Any]:
 
 
 class Rollout:
-    def __init__(self, sessions: sessionmaker[Session], links: PlanningLinks) -> None:
+    def __init__(
+        self, sessions: sessionmaker[Session], links: PlanningLinks, needs_you: NeedsYou
+    ) -> None:
         self.sessions = sessions
         self.links = links
+        # A project's next steps are the rows of its list of what waits for the
+        # administrator: said once, wherever they are shown.
+        self.needs_you = needs_you
 
     def overview(self) -> dict[str, Any]:
         """Every project with where it stands and what its next step is."""
+        with self.sessions() as db:
+            names = db.scalars(
+                select(ProjectRecord.name)
+                .where(ProjectRecord.archived_at.is_(None))
+                .order_by(ProjectRecord.name)
+            ).all()
+        # Each project's list as it was worked out at most a few minutes ago: the table
+        # of all projects is no place to work every one of them out anew.
+        steps = {name: self.needs_you.steps(name, fresh=False) for name in names}
         with self.sessions() as db:
             projects = db.scalars(
                 select(ProjectRecord)
                 .where(ProjectRecord.archived_at.is_(None))
                 .order_by(ProjectRecord.name)
             ).all()
-            return {"projects": [_row(db, project) for project in projects]}
+            return {
+                "projects": [_row(db, project, steps.get(project.name, [])) for project in projects]
+            }
 
     def status(self, name: str) -> dict[str, Any]:
-        """One project's row: for its own Reorganize page."""
+        """One project's row."""
+        steps = self.needs_you.steps(name)
         with self.sessions() as db:
-            return _row(db, active_project(db, name))
+            return _row(db, active_project(db, name), steps)
 
     def arrivals(self, name: str, days: int = ARRIVED_DAYS) -> dict[str, Any]:
         """The issues that arrived in the last days, the newest first, each with where

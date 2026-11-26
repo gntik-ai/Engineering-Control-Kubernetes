@@ -257,7 +257,7 @@ R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a proj
 
 ### Planning health
 
-**Project Home → Planning health**, also shown at the top of **Reviews → Related Work**, counts how the project's records hang together. Every number is the one the planning tables show: an issue is an orphan here exactly when its row says so. Lower is better for all of them.
+**Project Home → Planning health** counts how the project's records hang together (until J6 it was shown on **Reviews → Related Work** as well; what waits for the administrator is in **Reviews → Needs you**). Every number is the one the planning tables show: an issue is an orphan here exactly when its row says so. Lower is better for all of them.
 
 | Number | What it counts |
 | --- | --- |
@@ -269,7 +269,7 @@ R5 to R12 replace the earlier R5 to R7 and are described in [Reorganizing a proj
 | User Stories in the largest Epic | The size of the largest Epic and its share of all Stories. |
 | Epics with no User Story | Epics nothing is planned under. |
 | Links with no recorded reason | Every link, until links record who made them and why (phase R1). |
-| Reviews waiting | Automatic reviews that are queued, need input or failed, and evidence runs that were cut off. |
+| Reviews waiting | Automatic reviews that are queued, need input or failed, and evidence runs that were cut off. Measured, and since J6 shown in Reviews → Needs you, not as a tile. |
 
 The project is measured once a day, and again when the page is opened after ten minutes or **Measure now** is pressed. The last measurement of each UTC day is kept (`planning_health`, migration 0070). The first one is the baseline: each tile says how its number moved since. `GET /api/dashboard/projects/{name}/planning/health?days=30` returns the current numbers, the baseline and the days between. No model is asked.
 

@@ -5,7 +5,11 @@ import { apiUrl, getJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { bugsUrl, reviewUrl, workspaceUrl } from '../router';
 
-/** What is counted of a project's planning. Every number is one the planning tables show. */
+/**
+ * What is counted of a project's planning. Every number is one the planning tables show.
+ * The numbers of what waits for the administrator are measured too, for the daily digest,
+ * and shown in one place only: Reviews, Needs you.
+ */
 interface Numbers {
   epics: number;
   stories: number;
@@ -167,7 +171,8 @@ export function PlanningHealth({ project }: { project: string }) {
               {since
                 ? `; compared with the first measurement, of ${since}.`
                 : '. This is the first measurement: later ones are compared with it.'}{' '}
-              Every number here is better when it is lower.
+              Every number here is better when it is lower. What waits for you is not counted here: it is one list,
+              under <Link href={reviewUrl(project, 'needs-you')}>Needs you</Link>.
             </p>
             <Group
               title="Issues and their User Stories"
@@ -266,8 +271,8 @@ export function PlanningHealth({ project }: { project: string }) {
               />
             </Group>
             <Group
-              title="Links and reviews"
-              about="A link should say who made it and why. A review that waits or was cut off decides nothing."
+              title="Links"
+              about="A link should say who made it and why."
             >
               <Tile
                 value={now.links_without_reason}
@@ -292,13 +297,6 @@ export function PlanningHealth({ project }: { project: string }) {
                   since={since}
                 />
               )}
-              <Tile
-                value={now.reviews_waiting}
-                label="Reviews waiting"
-                note={`${whole(now.reviews_queued)} queued, ${whole(now.reviews_needing_input)} need your input, ${whole(now.reviews_failed)} failed, ${whole(now.runs_cut_off)} cut off`}
-                was={was?.reviews_waiting}
-                since={since}
-              />
             </Group>
             {now.stories_unsupported !== undefined ? (
               <Group
@@ -334,30 +332,6 @@ export function PlanningHealth({ project }: { project: string }) {
                   label="Records proposed for closing"
                   of="Two reasons of different kinds, or an exact one, speak against each"
                   was={was?.cleanup_proposed}
-                  since={since}
-                  href={reviewUrl(project, 'reorganize')}
-                />
-              </Group>
-            ) : null}
-            {now.scorer_sure !== undefined && now.scorer_sure + (now.scorer_abstains ?? 0) > 0 ? (
-              <Group
-                title="Reorganization"
-                about="The scorer says of each record what it would do. Where it is sure, the change waits in a batch for your approval; where it abstains, the record waits for a decision model or for you."
-              >
-                <Tile
-                  value={now.changes_ready ?? now.scorer_sure}
-                  label="Changes that wait for your approval"
-                  of="Gathered into batches by kind"
-                  note={`${whole(now.structure_proposals ?? 0)} proposals for the structure beside them`}
-                  was={was?.changes_ready}
-                  since={since}
-                  href={reviewUrl(project, 'reorganize')}
-                />
-                <Tile
-                  value={now.scorer_abstains ?? 0}
-                  label="Records the scorer abstains on"
-                  of="It learns from every pair you judge and every answer you approve"
-                  was={was?.scorer_abstains}
                   since={since}
                   href={reviewUrl(project, 'reorganize')}
                 />

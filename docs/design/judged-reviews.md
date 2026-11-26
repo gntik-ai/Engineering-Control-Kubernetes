@@ -1,6 +1,6 @@
 # Judged reviews: a second model checks every answer, and you see only what is in doubt
 
-Plan, 26 November 2026. Decided the same day; J0 to J5 are built, J6 is not.
+Plan, 26 November 2026. Decided the same day; J0 to J6 are built.
 
 ## What is asked for
 
@@ -182,7 +182,7 @@ A run no longer asks for a model or a token limit: it takes them from Settings a
 | J3 | **Only what is in doubt.** The scorer joined to the two worklists. Both open on "Needs you", ordered by doubt. What is agreed is applied, or waits as one batch, as you decide below. The sample, the stop and the digest. | On Falcone, the Stories shown for a primary Epic are those in doubt and the sample, not 424. |
 | J4 | **By itself.** New and changed records are answered and judged as they arrive, within Settings, in the night's batch where it can wait. | Nothing in Related Work or Planning needs a run started by hand. |
 | J5 | **The judge everywhere else.** Review evidence (its second opinion becomes this judge), the proposals of planning reviews and of Discovery, connections, execution order, structure, and Epic overviews, where the judge checks each sentence against the records it names. | Every workflow that asks a model has its answers judged, and shows what is in doubt first. |
-| J6 | **One list.** "Needs you" across all of Reviews, with each workflow's view behind it for detail; panels that say the same thing twice are merged. | Reviews opens on one list of decisions, and it is short. |
+| J6 | **One list** (built, 26 November 2026). "Needs you" across all of Reviews, with each workflow's view behind it for detail; panels that say the same thing twice are merged. | Reviews opens on one list of decisions, and it is short. |
 
 J0 to J3 are what the request names. What was built on 25 November goes into them: the trial of a model on questions already answered is how J0 measures an answering model, and "a cheaper model first" becomes the answering model of J1.
 
@@ -500,3 +500,52 @@ Every ten minutes what is settled is then applied as a batch that can be undone 
 **Not measured.** That two models agreeing are right more often was measured for issues and their User Stories. For proposals, suggestions, classifications and sentences it is assumed, not measured: there the judge marks and orders, and what was applied without approval before (coverage links, the parents a planning review names) is now applied only where both agree.
 
 **Not exercised on live.** No review has run with a judge on live. The judge's step and each review's rule for agreeing are covered by tests; the judge of Epic overviews is tested from the run to the page.
+
+## J6 as built
+
+**Reviews opens on "Needs you".** It is the first view of Reviews, per project. One list says everything in Reviews that waits for you, in rows: how many, what, why, and a link to the panel where it is decided. Nothing is decided in the list, and no number is counted in a way of its own: each is the one its own view shows (`needs_you.py`, `GET /api/dashboard/projects/{name}/needs-you`).
+
+The rows come in three groups, in this order.
+
+| Group | What is in it | Where it leads |
+| --- | --- | --- |
+| **Yours to decide** | Changes that wait for approval, one row for all kinds, each kind with its number and how far the sample of its open batch is judged | Reorganize, Changes to approve |
+| | Lines applied without you that wait to be judged | Reorganize, Changes to approve |
+| | For each of the five checks, the answers that need you. For issues with no User Story and for primary Epics these are the answers the worklist opens on, with how many stand for which reason. For the clean-up, the extra Epic links and the Epic overviews, those the two models differ on | The check's own panel |
+| | Planning reviews that ask a question | Planning, the reviews |
+| | Proposals that wait in the planning tables, by kind, and how many of them the judge did not make | The planning tables |
+| | Verdicts of Review evidence that wait for your review | Related Work |
+| | Proposals for the structure: Epics to split, User Stories that are missing | Reorganize, Structure |
+| | Bugs that still carry a link to a User Story | Bugs |
+| | The pairs to judge, while the scorer is not measured on the project's own links | Reorganize |
+| **On hold** | A run of a check that is on hold or was stopped, with where it stopped and why; a run that failed with records left to ask | The check's own panel |
+| | A check set to run by itself that has no model to ask; the reviews at their limit in dollars, where no run says so already | Settings |
+| | A kind of change you set to be applied without you that its own record stopped | Reorganize |
+| | Planning reviews that failed; planning reviews that are queued while the reviews are stopped, the project is paused or no model is chosen | Planning |
+| | Runs of Review evidence that were cut off and keep their tokens reserved | Related Work |
+| | The ranking service has not read the project's records | Reorganize |
+| **Not asked yet** | For each check that does not run by itself in the project: the records no model was asked about | The check's own panel |
+
+A check that is set to run by itself is not listed under "Not asked yet": it starts without you. A project that was never through Discovery has one row, which says so.
+
+**A row leads to its panel, not to the top of a view.** The link carries the panel's name, and the view scrolls to it. The panels above load after the page and push it down, so it is brought back into view for a few seconds, and left alone as soon as you scroll.
+
+**Below the list**: what the checks did by themselves in the last day (runs, answers, dollars), and what moved between the last two measurements of the plan.
+
+**What was said twice, and is now said once.**
+
+| Before | Now |
+| --- | --- |
+| The next steps of a project were worked out a second way for "Where this project stands" on Reorganize and for the table of all projects on the dashboard, from the day's measurement | They are the rows of the list. The dashboard shows the first three of each project and links to the rest. The list of a project is used again there for five minutes; the project's own view works it out anew |
+| "Where this project stands" on Reorganize: next steps, what moved, and the issues that arrived | The first two are in "Needs you". The card is "Issues that arrived lately" and says only that |
+| Planning health was shown on the project's dashboard and again on Related Work | On the dashboard only |
+| Planning health counted "Reviews waiting", "Changes that wait for your approval" and "Records the scorer abstains on" | Those tiles are gone: the list says them. The numbers are still measured each day, for the digest and for what moved |
+| "What the scorer would do" said it was in shadow mode and proposed nothing, and counted again where the clean-up will look | "What the scorer says, and how well": what it says goes into the batches; the clean-up is said by the Clean-up card alone |
+
+**Left as it was, on purpose.**
+
+- **The views behind the list keep their panels.** Reorganize still has ten cards. Each says something the others do not; they are long, not repeated. The two trials of models are about choosing a model and would fit Settings better; they were not moved, because that is a move and not a merge.
+- **Outside Reviews**: suggestions of a connection between projects the judge did not make (Project settings, Connections), and Issues marked ambiguous in an execution plan (Queue). They are decided where they are and are not in this list.
+- **The daily digest** still says what waits from the day's measurement, in its own words.
+
+**How long it takes.** The list reads every check's records and candidates, as each view does for itself. It is worked out when the view is opened and every two minutes while it is open.

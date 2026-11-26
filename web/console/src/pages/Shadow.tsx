@@ -64,7 +64,6 @@ const KIND: Record<Kind, string> = {
   story_epic: 'The primary Epic of a User Story',
 };
 const MODEL = { light: 'Words and meaning', full: 'Words, meaning and the reranker' } as const;
-const RECORD = { issue: 'Issues', story: 'User Stories', epic: 'Epics' } as const;
 /** The outcomes in the order they are shown, and whether the scorer would act. */
 const ORDER = ['place', 'primary', 'confirmed', 'kept', 'unsupported', 'unsure', 'several', 'none'] as const;
 const ACTS = new Set(['place', 'primary', 'confirmed', 'unsupported']);
@@ -72,10 +71,11 @@ const percent = (value: number | null | undefined) =>
   value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`;
 
 /**
- * What the scorer would do, were it allowed to. It combines every signal into one
- * judgment and abstains where it cannot rule the other candidates out. Shadow mode:
- * everything here is a report. Nothing on this card changes a link, and it has no button
- * that does.
+ * What the scorer says of each record, and how well that was measured. It combines every
+ * signal into one judgment and abstains where it cannot rule the other candidates out.
+ * Where it is sure, the change waits in a batch under "Changes to approve"; this card is
+ * the report behind that, and has no button that changes a link. Where the clean-up
+ * looks is said by the Clean-up card alone.
  */
 export function Shadow({ project }: { project: string }) {
   const base = 'projects/' + encodeURIComponent(project) + '/scorer';
@@ -95,7 +95,7 @@ export function Shadow({ project }: { project: string }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>What the scorer would do</CardTitle>
+        <CardTitle>What the scorer says, and how well</CardTitle>
       </CardHeader>
       <CardBody className="grid gap-5">
         <LoadError resource={report} />
@@ -109,9 +109,9 @@ export function Shadow({ project }: { project: string }) {
               No way of ranking above is good enough alone, so the scorer learns one judgment from all of them, from the
               links known to be right in every project. It keeps each candidate it cannot rule out
               {data.errors ? ` at an error of ${percent(data.errors.add)}` : ''}: with one left, and where it was
-              measured to be right often enough when that sure, it would act; otherwise it abstains and the case goes on
-              to a decision model or to you. This is shadow mode: it has changed nothing and proposes nothing yet. Bugs
-              are left out.
+              measured to be right often enough when that sure, it acts: the change goes into a batch under “Changes to
+              approve”. Otherwise it abstains, and the case goes on to a check that asks two models, or to you. This card
+              changes nothing: it shows what the scorer says and how well that was measured. Bugs are left out.
               {data.computed_at ? ` Computed ${new Date(data.computed_at).toLocaleString('en')}.` : ''}
             </p>
             {!data.ready && !data.kinds ? <p className="text-sm text-foreground">{data.why}</p> : null}
@@ -252,26 +252,6 @@ export function Shadow({ project }: { project: string }) {
                 {list.data.pages > 1 ? (
                   <Pagination page={list.data.page} pageCount={list.data.pages} onPageChange={setPage} />
                 ) : null}
-              </section>
-            ) : null}
-            {data.removal?.some((row) => row.count) ? (
-              <section className="grid gap-2">
-                <h3 className="text-sm font-semibold text-foreground">Where the clean-up will look</h3>
-                <p className="text-sm text-muted-foreground">
-                  A first count of records that one reason speaks against. One reason is never enough: a removal is only
-                  proposed on two independent reasons or an exact one, and only you authorize it. Nothing is proposed
-                  here.
-                </p>
-                <ul className="grid gap-1 text-sm">
-                  {data.removal
-                    .filter((row) => row.count)
-                    .map((row) => (
-                      <li key={row.kind + row.reason}>
-                        <span className="tabular-nums font-medium text-foreground">{whole(row.count)}</span>{' '}
-                        {RECORD[row.kind]} · {row.reason}
-                      </li>
-                    ))}
-                </ul>
               </section>
             ) : null}
           </>

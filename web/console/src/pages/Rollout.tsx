@@ -1,8 +1,9 @@
 import { Badge, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { bugsUrl, reviewUrl, workspaceUrl, type ReviewView } from '../router';
+import { reviewUrl, workspaceUrl } from '../router';
 import { whole } from './ChoiceRun';
+import { moved, stepUrl, type Step } from './NeedsYou';
 
 interface Moved {
   key: string;
@@ -22,19 +23,12 @@ export interface ProjectRow {
   pairs: { judged: number; drawn: number; wanted: number };
   scorer: { computed_at: string | null; measured_here: Record<string, boolean>; sure: number; abstains: number };
   drift: { day: string; before: string | null; waiting: string[]; moved: Moved[] } | null;
-  steps: { view: ReviewView | 'bugs'; says: string }[];
+  /** What waits for the administrator in the project's Reviews: the rows of its one list. */
+  steps: Step[];
 }
 
-/** Where a step is done: a view of Reviews, or the Bugs tab of the project. */
-export const stepUrl = (project: string, view: ReviewView | 'bugs') =>
-  view === 'bugs' ? bugsUrl(project) : reviewUrl(project, view);
-
-/** What moved since the day before, as short phrases with the change. */
-export function moved(entries: Moved[]): string {
-  return entries
-    .map((entry) => `${entry.says} (${entry.now > entry.was ? '+' : ''}${whole(entry.now - entry.was)})`)
-    .join('; ');
-}
+/** No more of a project's rows than this are said in the table of all projects. */
+const SHOWN = 3;
 
 /**
  * Every project in one table: whether it has a plan, how far the reorganization is, and the
@@ -60,7 +54,8 @@ export function Rollout() {
             <p className="text-sm text-muted-foreground">
               Issues are read from GitHub every few minutes; a new one is read by the ranking service, scored and shown
               with its closest User Story without anyone asking. Once a day everything is worked out again and compared
-              with the day before. What a project needs from you next is in its row.
+              with the day before. What waits for you in a project is in its row, the first of it; the whole list is
+              the project's Reviews, Needs you.
             </p>
             <ul className="grid gap-3">
               {data.projects.map((row) => (
@@ -94,11 +89,18 @@ export function Rollout() {
                   ) : null}
                   {row.steps.length ? (
                     <ul className="grid gap-1">
-                      {row.steps.map((step, index) => (
+                      {row.steps.slice(0, SHOWN).map((step, index) => (
                         <li key={step.says}>
-                          <Link href={stepUrl(row.project, step.view)}>{index ? 'Then' : 'Next'}</Link>: {step.says}
+                          <Link href={stepUrl(row.project, step)}>{index ? 'Then' : 'Next'}</Link>: {step.says}
                         </li>
                       ))}
+                      {row.steps.length > SHOWN ? (
+                        <li>
+                          <Link href={reviewUrl(row.project, 'needs-you')}>
+                            And {whole(row.steps.length - SHOWN)} more
+                          </Link>
+                        </li>
+                      ) : null}
                     </ul>
                   ) : null}
                 </li>

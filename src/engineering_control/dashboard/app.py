@@ -2122,6 +2122,11 @@ def create_app(
         """Where one project's reorganization stands, and what moved since the day before."""
         return await documents_read(request, lambda: repo(request).rollout.status(name))
 
+    @app.get("/api/dashboard/projects/{name}/needs-you")
+    async def needs_you_api(name: str, request: Request) -> Response:
+        """Everything in Reviews that waits for the administrator, in one list."""
+        return await documents_read(request, lambda: repo(request).needs_you.listed(name))
+
     @app.get("/api/dashboard/projects/{name}/arrivals")
     async def arrivals_api(
         name: str, request: Request, days: int = Query(14, ge=1, le=90)

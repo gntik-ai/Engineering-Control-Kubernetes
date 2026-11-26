@@ -3,7 +3,6 @@ import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
-import { moved, stepUrl, type ProjectRow } from './Rollout';
 
 type Stands = 'bug' | 'linked' | 'batch' | 'waiting' | 'unscored' | 'unread';
 interface Arrived {
@@ -46,56 +45,23 @@ const ORIGIN: Record<string, string> = {
 };
 
 /**
- * Where the project stands and what arrived lately: the next steps, what moved since the
- * day before, and each issue of the last two weeks with where the cascade put it. Nothing
- * here is done by pressing: it is the trail of what runs by itself.
+ * What arrived lately: each issue of the last two weeks with where the cascade put it.
+ * Nothing here is done by pressing: it is the trail of what runs by itself. What waits
+ * for the administrator, and what moved since the day before, is said once, under
+ * Reviews, Needs you.
  */
 export function Arrivals({ project }: { project: string }) {
   const base = 'projects/' + encodeURIComponent(project);
-  const status = useResource<ProjectRow>(apiUrl(base + '/rollout'), 120000, { keepPreviousData: true });
   const list = useResource<Arrived>(apiUrl(base + '/arrivals'), 120000, { keepPreviousData: true });
-  const row = status.data;
   const data = list.data;
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Where this project stands</CardTitle>
+        <CardTitle>Issues that arrived lately</CardTitle>
       </CardHeader>
       <CardBody className="grid gap-4">
-        <LoadError resource={status} />
         <LoadError resource={list} />
-        {!row ? (
-          status.loading ? (
-            <Skeleton className="h-24 w-full" />
-          ) : null
-        ) : (
-          <>
-            {row.steps.length ? (
-              <ul className="grid gap-1 text-sm">
-                {row.steps.map((step, index) => (
-                  <li key={step.says} className="text-foreground">
-                    <Link href={stepUrl(project, step.view)}>{index ? 'Then' : 'Next'}</Link>: {step.says}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-foreground">Nothing waits for you here.</p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              {row.drift
-                ? row.drift.moved.length
-                  ? `Since the measurement of ${row.drift.before}: ${moved(row.drift.moved)}.`
-                  : row.drift.before
-                    ? `Nothing that is followed moved since the measurement of ${row.drift.before}.`
-                    : 'Measured once so far: tomorrow there is a day to compare with.'
-                : 'Not measured yet.'}{' '}
-              Everything is worked out again once a day, and whenever an issue or a document changes.
-              {row.scorer.computed_at
-                ? ` The scorer last ran ${new Date(row.scorer.computed_at).toLocaleString('en')}.`
-                : ''}
-            </p>
-          </>
-        )}
+        {!data && list.loading ? <Skeleton className="h-24 w-full" /> : null}
         {data ? (
           <section className="grid gap-2">
             <h3 className="text-sm font-semibold text-foreground">

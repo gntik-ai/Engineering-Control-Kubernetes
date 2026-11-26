@@ -71,6 +71,24 @@ def eligible(db: Session, project: UUID) -> ColumnElement[bool]:
     )
 
 
+def waiting(db: Session, project: UUID) -> int:
+    """How many comparisons wait for the administrator's review: those the listing
+    opens on."""
+    disposition = Job.result["advisory"]["status"].as_string()
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(Job)
+            .where(
+                eligible(db, project),
+                Job.result["human_review"]["scope"].as_string().is_(None),
+                or_(disposition.is_(None), disposition == "needs_review"),
+            )
+        )
+        or 0
+    )
+
+
 def listing(
     sessions: sessionmaker[Session],
     name: str,

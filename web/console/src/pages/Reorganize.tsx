@@ -5,6 +5,7 @@ import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
 import { Arrivals } from './Arrivals';
+import { Anchor } from './NeedsYou';
 import { ChangeBatches } from './ChangeBatches';
 import { Cleanup } from './Cleanup';
 import { EpicLinks } from './EpicLinks';
@@ -252,12 +253,20 @@ export function Reorganize({ project }: { project: string }) {
   const data = report.data;
   return (
     <>
+      <Anchor id="changes">
+        <ChangeBatches project={project} />
+      </Anchor>
+      <Anchor id="epic-links">
+        <EpicLinks project={project} />
+      </Anchor>
+      <Anchor id="clean-up">
+        <Cleanup project={project} />
+      </Anchor>
+      <Anchor id="structure">
+        <Structure project={project} />
+      </Anchor>
       <Arrivals project={project} />
-      <ChangeBatches project={project} />
-      <EpicLinks project={project} />
-      <Cleanup project={project} />
-      <Structure project={project} />
-      <Card>
+      <Card id="parents-found" className="scroll-mt-20">
         <CardHeader>
           <CardTitle>How well a parent is found</CardTitle>
         </CardHeader>
@@ -324,7 +333,9 @@ export function Reorganize({ project }: { project: string }) {
           )}
         </CardBody>
       </Card>
-      <Judge project={project} onJudged={report.reload} />
+      <Anchor id="pairs">
+        <Judge project={project} onJudged={report.reload} />
+      </Anchor>
       <Shadow project={project} />
       <ModelTrials project={project} />
       <JudgeTrials project={project} />

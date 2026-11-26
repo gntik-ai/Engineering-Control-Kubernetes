@@ -10,7 +10,7 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug, SlidersHorizontal } from '@gntik-ai/icons';
+import { Inbox, Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug, SlidersHorizontal } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, bugsUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
@@ -25,7 +25,6 @@ import { BugsPage } from './Bugs';
 import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
 import { EvidencePanel } from './ReviewEvidence';
-import { PlanningHealth } from './PlanningHealth';
 import { OrphanWorklist } from './OrphanWorklist';
 import { PrimaryEpics } from './PrimaryEpics';
 import { Documents } from './Documents';
@@ -34,10 +33,12 @@ import { EpicPages } from './EpicPages';
 import { StoryStates } from './StoryStates';
 import { PlanningReviews } from './PlanningReviews';
 import { ReviewSettings } from './ReviewSettings';
+import { Anchor, NeedsYou, useAnchor } from './NeedsYou';
 import { WorkspaceImport } from './WorkspaceImport';
 
 const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignment', agents: 'Agents', commands: 'Commands' };
 const reviewMenu = {
+  'needs-you': { label: 'Needs you', icon: Inbox },
   'related-work': { label: 'Related Work', icon: GitFork },
   planning: { label: 'Planning', icon: ListChecks },
   discovery: { label: 'Discovery', icon: Compass },
@@ -81,6 +82,8 @@ export function ProjectWorkspace({
     ...automationTitles,
   };
   usePageTitle(isReviewView(view) ? reviewMenu[view].label + ' · ' + projectTitle : titles[view]);
+  // A row of the list of what waits leads to one panel of a view: it is brought into view.
+  useAnchor(view + '/' + name + '/' + String(!!project));
 
   const menu = (owner?: string) => (['flows', 'operations', 'assignments', 'agents', 'commands'] as const)
     .filter((v) => owner || v !== 'assignments')
@@ -197,14 +200,14 @@ export function ProjectWorkspace({
             ) : isReviewView(view) ? (
               <div className="grid min-w-0 gap-5" key={project.project}>
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
-                {view === 'related-work' && <OrphanWorklist project={project.project} />}
-                {view === 'related-work' && <PlanningHealth project={project.project} />}
-                {view === 'related-work' && <EvidencePanel project={project.project} />}
-                {view === 'planning' && <PrimaryEpics project={project.project} />}
+                {view === 'needs-you' && <NeedsYou project={project.project} />}
+                {view === 'related-work' && <Anchor id="issues-without-story"><OrphanWorklist project={project.project} /></Anchor>}
+                {view === 'related-work' && <Anchor id="review-evidence"><EvidencePanel project={project.project} /></Anchor>}
+                {view === 'planning' && <Anchor id="primary-epics"><PrimaryEpics project={project.project} /></Anchor>}
                 {view === 'planning' && <StoryStates project={project.project} />}
-                {view === 'planning' && <PlanningReviews project={project.project} />}
+                {view === 'planning' && <Anchor id="planning-reviews"><PlanningReviews project={project.project} /></Anchor>}
                 {view === 'reorganize' && <Reorganize project={project.project} />}
-                {view === 'epics' && <EpicPages project={project.project} />}
+                {view === 'epics' && <Anchor id="epic-pages"><EpicPages project={project.project} /></Anchor>}
                 {view === 'settings' && <ReviewSettings project={project.project} />}
                 {view === 'discovery' && <Documents project={project.project} />}
                 {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
