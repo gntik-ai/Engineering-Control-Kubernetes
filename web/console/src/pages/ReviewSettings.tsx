@@ -1,5 +1,5 @@
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Input, SimpleSelect, Skeleton } from '@gntik-ai/ui';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { dollars, whole, type Model, type RunPlan } from './ChoiceRun';
@@ -73,16 +73,44 @@ export function ReviewSettings({ project }: { project: string }) {
   const [problem, setProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const data = settings.data;
+  // What the form holds, and what it held when it was last filled from what is saved.
+  const form = JSON.stringify([limit, answer, judge, judge ? third : '', rounds, allowed, cheaper, numbers]);
+  const filled = useRef<string | null>(null);
+  const fill = (from: Settings) => {
+    const next = {
+      limit: String(from.dollars.limit),
+      answer: keyOf(from.roles.answer),
+      judge: keyOf(from.roles.judge),
+      third: keyOf(from.roles.third ?? null),
+      rounds: String(from.rounds),
+      allowed: Object.fromEntries(from.makers.map((entry) => [entry.maker, entry.allowed])),
+      cheaper: from.cheaper_first,
+      numbers: Object.fromEntries(from.numbers.map((entry) => [entry.key, String(entry.value)])),
+    };
+    setLimit(next.limit);
+    setAnswer(next.answer);
+    setJudge(next.judge);
+    setThird(next.third);
+    setRounds(next.rounds);
+    setAllowed(next.allowed);
+    setCheaper(next.cheaper);
+    setNumbers(next.numbers);
+    filled.current = JSON.stringify([
+      next.limit,
+      next.answer,
+      next.judge,
+      next.judge ? next.third : '',
+      next.rounds,
+      next.allowed,
+      next.cheaper,
+      next.numbers,
+    ]);
+  };
+  // The page reads what is saved again every minute. That must not take away what was
+  // chosen and is not saved yet: the form is filled again only when nothing in it was changed.
+  const changed = filled.current !== null && form !== filled.current;
   useEffect(() => {
-    if (!data) return;
-    setLimit(String(data.dollars.limit));
-    setAnswer(keyOf(data.roles.answer));
-    setJudge(keyOf(data.roles.judge));
-    setThird(keyOf(data.roles.third ?? null));
-    setRounds(String(data.rounds));
-    setAllowed(Object.fromEntries(data.makers.map((entry) => [entry.maker, entry.allowed])));
-    setCheaper(data.cheaper_first);
-    setNumbers(Object.fromEntries(data.numbers.map((entry) => [entry.key, String(entry.value)])));
+    if (data && !changed) fill(data);
   }, [data]);
   const act = (what: string, request: () => Promise<unknown>, after: () => void) => {
     setBusy(what);
@@ -121,7 +149,11 @@ export function ReviewSettings({ project }: { project: string }) {
           cheaper_first: cheaper,
           numbers: Object.fromEntries(data.numbers.map((entry) => [entry.key, Number(numbers[entry.key])])),
         }),
-      settings.reload,
+      () => {
+        // What is saved is what the form holds: the next reading fills it again.
+        filled.current = form;
+        settings.reload();
+      },
     );
   };
   const models = (data?.models ?? []).map((entry) => ({
@@ -465,14 +497,29 @@ export function ReviewSettings({ project }: { project: string }) {
               </table>
             </CardBody>
           </Card>
-          <div className="flex flex-wrap items-center gap-3">
+          <div
+            className={
+              'flex flex-wrap items-center gap-3 ' +
+              (changed ? 'sticky bottom-4 z-10 rounded-lg border border-warning bg-card p-3 shadow-lg' : '')
+            }
+          >
             <Button loading={busy === 'save'} disabled={!(Number(limit) >= 0) || wrong.length > 0} onClick={save}>
               Save the settings
             </Button>
-            <span className="text-sm text-muted-foreground">
+            {changed ? (
+              <Button variant="secondary" disabled={busy === 'save'} onClick={() => fill(data)}>
+                Discard the changes
+              </Button>
+            ) : null}
+            <span
+              role="status"
+              className={'text-sm ' + (changed ? 'font-medium text-foreground' : 'text-muted-foreground')}
+            >
               {wrong.length
                 ? `${wrong.length === 1 ? 'One number is' : whole(wrong.length) + ' numbers are'} outside what it can be set to.`
-                : 'The limit in dollars, the models, the makers and the numbers are saved together.'}
+                : changed
+                  ? 'You changed something that is not saved yet. Nothing takes effect until you save.'
+                  : 'The limit in dollars, the models, the makers and the numbers are saved together.'}
             </span>
           </div>
           <Card>
