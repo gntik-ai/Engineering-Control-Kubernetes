@@ -81,6 +81,9 @@ def test_settings_give_runs_their_models_makers_and_rounds(
             "third": None,
         }
         assert saved.json()["roles"] == roles and saved.json()["rounds"] == 2
+        # The judge is of another maker than the model the planning reviews ask, which
+        # is Discovery's where none was chosen for planning: those reviews are judged.
+        assert saved.json()["planning_judged"] is True
         assert post(client, "review-settings", **{**save, "rounds": 0}).status_code == 200
         # Every check offers them as what a run takes.
         assert client.get(BASE + "orphans").json()["roles"] == roles

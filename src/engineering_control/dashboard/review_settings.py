@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import review_flows
 from engineering_control.dashboard.project_records import ProjectInvalid, active_project
-from engineering_control.db.models import ReviewSettings, WorkspaceModelUsage
+from engineering_control.db.models import ReviewSettings, WorkspaceImport, WorkspaceModelUsage
 from engineering_control.models.providers import family_of, maker
 
 # Decided on 26 November 2026.
@@ -450,7 +450,11 @@ class ReviewSettingsService:
                 offered.setdefault(maker(entry["provider"], entry["model"]), 0)
             defaults = default_makers(db)
             from engineering_control.dashboard import auto_checks, parent_choice, reorg
+            from engineering_control.dashboard.planning_analysis import selection
 
+            # The model those reviews ask: the one chosen for planning, else Discovery's.
+            chosen = selection(project, db.get(WorkspaceImport, project.id))
+            planning = (chosen[0] or "", chosen[1] or "")
             return {
                 "dollars": {
                     "limit": mine.dollars,
@@ -462,13 +466,8 @@ class ReviewSettingsService:
                 # Whether the judge is asked in the planning reviews, Discovery, the
                 # execution order and the check of a new Epic: it has to be of another
                 # maker than the model those ask. None where there is no such model.
-                "planning_judged": (
-                    judge_of(
-                        db, project.id, (project.planning_provider or "", project.planning_model)
-                    )
-                    is not None
-                )
-                if project.planning_model
+                "planning_judged": (judge_of(db, project.id, planning) is not None)
+                if planning[1]
                 else None,
                 "rounds": mine.rounds,
                 "cheaper_first": mine.cheaper_first,
