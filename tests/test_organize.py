@@ -20,6 +20,7 @@ from engineering_control.db.models import (
     ProjectRecord,
     ProjectStoryEpic,
     ProjectUserStory,
+    WorkspaceAction,
     WorkspaceSource,
 )
 from tests.test_dashboard_web import _authenticated_client
@@ -98,6 +99,9 @@ def _more(repo: Any, ids: dict[str, Any]) -> None:
         for number, title, labels, state, review in (
             (50, "Epic: Billing platform", ["epic"], "open", "planning"),
             (52, "Old story", ["story"], "closed", "planning"),
+            # Its Epic became a record here and the platform closed the issue itself:
+            # the import does not read it again, so its state here still says open.
+            (53, "Epic: Reports", ["epic"], "open", "planning"),
         ):
             db.add(
                 BacklogItem(
@@ -112,6 +116,16 @@ def _more(repo: Any, ids: dict[str, Any]) -> None:
                     workspace_review=review,
                 )
             )
+        db.add(
+            WorkspaceAction(
+                project_id=pid,
+                operation="close",
+                local_id=compliance.id,
+                repository=project.source_repository,
+                number=53,
+                status="done",
+            )
+        )
         db.add(
             WorkspaceSource(
                 project_id=pid,
@@ -168,6 +182,7 @@ def test_what_a_first_run_would_meet_is_counted(tmp_path: Path) -> None:
             "stories_under_one_epic": 1,
             "stories_under_several_epics": 1,
             "stories_under_several_epics_chosen": 0,
+            "stories_under_several_epics_suggested": 0,
             "stories_with_no_epic": 1,
             "stories_under_closed_epics_only": 0,
             "epics_with_no_story": 1,
@@ -185,7 +200,8 @@ def test_what_a_first_run_would_meet_is_counted(tmp_path: Path) -> None:
         # are records here already.
         github = ground["github"]
         assert github["open"] == 2
-        assert github["epics"] == {"open": 1, "closed": 0, "kept_here": 1, "open_numbers": [50]}
+        assert github["epics"] == {"open": 1, "closed": 1, "kept_here": 1, "open_numbers": [50]}
+        assert github["closures"] == {"done": 1}
         assert github["stories"] == {"open": 1, "closed": 1, "kept_here": 0, "open_numbers": [51]}
         # The documentation in parts: two requirements are about the product, the
         # licence is not, the guide is left open, and a file too large has no part.

@@ -134,6 +134,19 @@ def _on_github(db: Session, project: ProjectRecord) -> dict[str, Any]:
         number = evidence.get("number") if isinstance(evidence, dict) else None
         if isinstance(number, int):
             bodies[number] = evidence
+    # An issue whose Epic or Story became a record here is not read again by the import:
+    # what is known of it since is the closure the platform made on GitHub itself.
+    closed_here = {
+        number
+        for number in db.scalars(
+            select(WorkspaceAction.number).where(
+                WorkspaceAction.project_id == project.id,
+                WorkspaceAction.operation == "close",
+                WorkspaceAction.status == "done",
+                WorkspaceAction.number.is_not(None),
+            )
+        )
+    }
     seen: set[int] = set()
     found: dict[str, dict[str, Any]] = {
         kind: {"open": 0, "closed": 0, "kept_here": 0, "open_numbers": []}
@@ -169,13 +182,15 @@ def _on_github(db: Session, project: ProjectRecord) -> dict[str, Any]:
         seen.add(number)
         if kind:
             # ``planning`` marks the issue whose Epic or Story is a record here already.
-            count(number, kind, item.issue_state or "open", item.workspace_review == "planning")
+            state = "closed" if number in closed_here else item.issue_state or "open"
+            count(number, kind, state, item.workspace_review == "planning")
     for number, evidence in bodies.items():
         if number in seen:
             continue
         kind = planning_kind(evidence)
         if kind:
-            count(number, kind, str(evidence.get("state") or "open"), False)
+            state = "closed" if number in closed_here else str(evidence.get("state") or "open")
+            count(number, kind, state, False)
     closing = dict(
         db.execute(
             select(WorkspaceAction.status, func.count())
@@ -234,12 +249,25 @@ def _count(planning: PlanningRecords, db: Session, name: str) -> dict[str, Any]:
             )
         )
     )
-    several_chosen = sum(
-        1
+    under_several = {
+        UUID(str(row["id"]))
         for row in stories
-        if UUID(str(row["id"])) in chosen
-        and len([key for key in row.get("epic_ids") or [] if str(key) in open_epics]) > 1
+        if len([key for key in row.get("epic_ids") or [] if str(key) in open_epics]) > 1
+    }
+    several_chosen = len(under_several & chosen)
+    # And those for which one is only suggested, by how alike the texts are.
+    suggested = set(
+        db.scalars(
+            select(PlanningLink.child_id).where(
+                PlanningLink.project_id == project.id,
+                PlanningLink.kind == "story_epic",
+                PlanningLink.removed_at.is_(None),
+                PlanningLink.is_primary,
+                PlanningLink.primary_by == "suggested",
+            )
+        )
     )
+    several_suggested = len((under_several & suggested) - chosen)
     largest = max(under.values(), default=0)
 
     # User Stories and Issues: an Issue is settled under an open Story.
@@ -290,6 +318,7 @@ def _count(planning: PlanningRecords, db: Session, name: str) -> dict[str, Any]:
             "stories_under_one_epic": one,
             "stories_under_several_epics": several,
             "stories_under_several_epics_chosen": several_chosen,
+            "stories_under_several_epics_suggested": several_suggested,
             "stories_with_no_epic": no_epic,
             "stories_under_closed_epics_only": closed_epic_only,
             "epics_with_no_story": sum(1 for count in under.values() if not count),
