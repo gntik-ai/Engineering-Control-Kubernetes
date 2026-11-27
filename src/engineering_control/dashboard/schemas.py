@@ -385,6 +385,16 @@ class ConnectionDecisionInput(PlainChangeInput):
     accept: bool
 
 
+class ConnectionCarryOutInput(PlainChangeInput):
+    # Carry the plan out as far as the month's limit allows, though it is estimated
+    # to cost more.
+    within_limit: bool = False
+
+
+class ConnectionLineInput(PlainChangeInput):
+    accept: bool
+
+
 class ConnectionBulkLinksInput(PlainChangeInput):
     through: AwareDatetime
 

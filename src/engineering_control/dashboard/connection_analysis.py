@@ -1,4 +1,17 @@
-"""Durable, incremental analysis of the two repositories in a project connection."""
+"""The run of a connection between two projects: its plan, and then its proposals.
+
+When a connection is added, or one of its projects changes, the worker prepares the
+connection's plan (``connection_plan``) and stops there: no model is asked. At the
+administrator's word the plan is carried out. The references one project states to the
+other are recorded, and the records the connection touches are put before a model, a few
+to a question, each with the records of the other project nearest to it. A second model
+of another maker is asked the same without seeing the first answer. What both say is a
+link is recorded; everything else waits for the administrator. Each result is a finding
+of the connection and a line of the run's three lists.
+
+The work is durable and incremental: what was asked is remembered by the digest of what
+was asked, and a restart goes on where it stopped.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +19,8 @@ import asyncio
 import json
 import logging
 import re
-from collections import Counter, defaultdict
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,7 +29,14 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard import (
+    connection_lines,
+    connection_plan,
+    review_budget,
+    review_flows,
+    review_settings,
+)
+from engineering_control.dashboard.connection_plan import BATCH, Across
 from engineering_control.dashboard.connection_records import (
     KINDS,
     RECORD_MODELS,
@@ -28,10 +49,17 @@ from engineering_control.dashboard.connection_records import (
     link_identity,
     watermark,
 )
-from engineering_control.dashboard.connections import audit, store_link
+from engineering_control.dashboard.connections import (
+    _record_decision,
+    _reviewed_endpoints,
+    audit,
+    store_link,
+)
+from engineering_control.dashboard.project_records import ProjectConflict
 from engineering_control.dashboard.workspace_review import shape
 from engineering_control.db.models import (
     ConnectionFinding,
+    OrganizeRun,
     ProjectConnection,
     ProjectRecord,
 )
@@ -58,38 +86,6 @@ FINDINGS = shape(
         }
     }
 )
-BATCH = 6
-
-
-def words(item: Item) -> set[str]:
-    return set(WORD.findall((item.title + " " + item.body[:900]).casefold()))
-
-
-class Search:
-    def __init__(self, data: Catalog) -> None:
-        self.items = {i.key: i for i in data.local.values() if i.approved}
-        self.terms: dict[str, list[str]] = defaultdict(list)
-        self.by_kind: dict[str, list[str]] = defaultdict(list)
-        for key, i in sorted(self.items.items()):
-            self.by_kind[i.kind].append(key)
-            for term in words(i):
-                self.terms[term].append(key)
-
-    def near(self, item: Item) -> list[Item]:
-        scores: Counter[str] = Counter()
-        for term in sorted(words(item)):
-            matches = self.terms.get(term, [])
-            if matches and len(matches) <= max(15, len(self.items) // 4):
-                for key in matches:
-                    scores[key] += max(1, 100 // len(matches))
-        result: list[Item] = []
-        for kind in KINDS:
-            group = self.by_kind[kind]
-            ranked = sorted(
-                (k for k in scores if self.items[k].kind == kind), key=lambda k: (-scores[k], k)
-            )
-            result.extend(self.items[k] for k in (ranked or group)[:4])
-        return result
 
 
 @dataclass
@@ -103,6 +99,10 @@ class Batch:
     context: dict[str, Any]
     watermark: str
     cursor: str
+    run: UUID
+    # The model that answers the same without seeing the first answer, where there is
+    # one that both projects allow.
+    judge: tuple[str, str] | None = None
     run_id: UUID | None = None
 
 
@@ -218,6 +218,68 @@ def judged(suggestions: list[dict[str, Any]], second: Any, model: str) -> list[d
     return [{**mine, "judge": {"model": model, "agreed": also(mine)}} for mine in suggestions]
 
 
+def asking(
+    db: Session,
+    c: ProjectConnection,
+    projects: list[ProjectRecord],
+    answer: tuple[str, str] | None,
+) -> tuple[dict[str, Any], Callable[[Item, list[Item]], str]]:
+    """What every question of the connection carries, and the digest of what a model is
+    asked about one record: it is asked again only when the record, what it is offered,
+    or who is asked changed."""
+    context = {
+        "purpose": c.purpose,
+        "dependent": next((p.name for p in projects if p.id == c.dependent_id), None),
+        "projects": {
+            p.name: {
+                "repository": p.source_repository,
+                "description": (p.description or "")[:1800],
+            }
+            for p in projects
+        },
+    }
+    settings = review_flows.effective_settings(
+        db, c.owner_id, "connections", c.review_run_id, active=True
+    )
+    policy = review_flows.wording(settings, "connections")
+    general = dict(context)
+
+    def stamp(item: Item, near: list[Item]) -> str:
+        if answer is None:
+            return ""
+        found = digest([general, answer[0], answer[1], item.summary(), [n.summary() for n in near]])
+        return digest([found, policy]) if policy else found
+
+    return context, stamp
+
+
+_PLANS: dict[UUID, tuple[str, dict[str, Any]]] = {}
+# One at a time: a page that asks again while a plan is worked out waits for it.
+_PLANNING = threading.Lock()
+
+
+def plan_now(db: Session, c: ProjectConnection) -> dict[str, Any] | None:
+    """The connection's plan as its records stand, worked out on the spot and kept
+    nowhere but in memory: for a connection the worker does not wake, because the
+    administrator stopped it. Nothing is written and no model is asked."""
+    projects = project_pair(db, c)
+    if len(projects) != 2:
+        return None
+    mark = revision(db, projects, c)
+    with _PLANNING:
+        kept = _PLANS.get(c.id)
+        if kept and kept[0] == mark:
+            return kept[1]
+        sides = [catalog(db, p) for p in projects]
+        across = Across.read(db, sides)
+        _, stamp = asking(db, c, projects, connection_plan.answering(db, c))
+        plan = connection_plan.prepare(
+            db, c, projects, sides, across, (c.progress or {}).get("done", {}), stamp, mark
+        )
+        _PLANS[c.id] = (mark, plan)
+        return plan
+
+
 class ConnectionAnalysis:
     def __init__(self, sessions: sessionmaker[Session]) -> None:
         self.sessions = sessions
@@ -225,6 +287,8 @@ class ConnectionAnalysis:
     def claim(self) -> tuple[UUID, UUID] | None:
         now = datetime.now(UTC)
         with self.sessions.begin() as db:
+            # A connection the administrator stopped is never woken, nor one whose
+            # project is out of review tokens: their plan is prepared when it is asked for.
             key = db.scalar(
                 select(ProjectConnection.id)
                 .where(
@@ -261,6 +325,67 @@ class ConnectionAnalysis:
             datetime.now(UTC) + timedelta(seconds=seconds),
         )
 
+    @staticmethod
+    def _plan(
+        db: Session,
+        c: ProjectConnection,
+        projects: list[ProjectRecord],
+        sides: list[Catalog],
+        across: Across,
+        stamp: Callable[[Item, list[Item]], str],
+        mark: str,
+    ) -> dict[str, Any]:
+        """The connection's plan as its records stand, kept as the run that waits for
+        the word. There is one such run for a connection: a new plan replaces it."""
+        plan = connection_plan.prepare(
+            db, c, projects, sides, across, c.progress.get("done", {}), stamp, mark
+        )
+        run = connection_lines.proposed(db, c.id)
+        if run is None:
+            run = OrganizeRun(
+                project_id=c.owner_id,
+                kind="connection",
+                connection_id=c.id,
+                state="proposed",
+                stage="read",
+                counts={},
+            )
+            db.add(run)
+            audit(db, c, "A plan was prepared: what to update and how it will be verified.")
+        run.scope = [str(c.owner_id), str(c.second_id if c.owner_id == c.first_id else c.first_id)]
+        run.estimate = plan
+        return plan
+
+    @staticmethod
+    def _stated(db: Session, c: ProjectConnection, run: OrganizeRun, sides: list[Catalog]) -> None:
+        """What one project's text states of the other is a link without asking a model:
+        each reference that still stands is recorded, and can be undone."""
+        by_project = {side.project.id: side for side in sides}
+        for f in db.scalars(
+            select(ConnectionFinding).where(
+                ConnectionFinding.connection_id == c.id,
+                ConnectionFinding.origin == "reference",
+                ConnectionFinding.action == "link",
+                ConnectionFinding.status == "pending",
+            )
+        ):
+            try:
+                _reviewed_endpoints(
+                    f, by_project[f.source_project], by_project[counterpart(c, f.source_project)]
+                )
+            except ProjectConflict:
+                continue
+            _record_decision(db, c, f, "approved")
+            connection_lines.write(
+                db,
+                run,
+                c,
+                f,
+                said=[{"stage": "read", "by": "the text", "answer": "names it"}],
+                doubt=0.0,
+                applied=True,
+            )
+
     def prepare(self, key: UUID, lease: UUID) -> Batch | None:
         with self.sessions.begin() as db:
             c = db.scalar(
@@ -272,14 +397,27 @@ class ConnectionAnalysis:
                 return None
             projects = project_pair(db, c)
             if len(projects) != 2:
-                self.finish(c, "waiting", 300)
+                self.finish(c, "paused" if c.status == "paused" else "waiting", 300)
                 return None
             mark = revision(db, projects, c)
-            if c.progress.get("watermark") == mark and c.status not in (
-                "queued",
-                "running",
+            run = connection_lines.carried(db, c.id)
+            stopped = c.status == "paused"
+            if (
+                run is None
+                and c.progress.get("planned") == mark
+                and c.status
+                not in (
+                    "queued",
+                    "running",
+                )
             ):
                 self.finish(c, c.status, 60)
+                return None
+            if run is not None and (
+                stopped or review_budget.status(db, c.owner_id)["required"] is not None
+            ):
+                # Stopped by the administrator, or out of review tokens: nothing is asked.
+                self.finish(c, c.status, 120)
                 return None
             sides = [catalog(db, p) for p in projects]
             cursor = (
@@ -287,26 +425,16 @@ class ConnectionAnalysis:
             )
             if mark != c.progress.get("references_mark"):
                 references(db, c, sides)
-            search = [Search(s) for s in sides]
+            across = Across.read(db, sides)
             readiness = {
-                s.project.name: {kind: len(index.by_kind[kind]) for kind in KINDS}
-                for s, index in zip(sides, search, strict=True)
+                side.project.name: {kind: len(across.by_kind[place][kind]) for kind in KINDS}
+                for place, side in enumerate(sides)
             }
-            context = {
-                "purpose": c.purpose,
-                "dependent": next((p.name for p in projects if p.id == c.dependent_id), None),
-                "projects": {
-                    p.name: {
-                        "repository": p.source_repository,
-                        "description": (p.description or "")[:1800],
-                    }
-                    for p in projects
-                },
-            }
-            total = sum(len(idx.items) for idx in search)
-            active = {k for idx in search for k in idx.items}
+            total = sum(len(items) for items in across.items)
+            active = {k for items in across.items for k in items}
             done = {k: v for k, v in c.progress.get("done", {}).items() if k in active}
             c.progress = {
+                **{k: v for k, v in c.progress.items() if k in ("watermark", "planned", "stated")},
                 "run_id": c.progress.get("run_id") or str(uuid4()),
                 "references_mark": mark,
                 "readiness": readiness,
@@ -315,64 +443,124 @@ class ConnectionAnalysis:
             }
             c.last_checked = datetime.now(UTC)
             c.detail = None
+            answer = connection_plan.answering(db, c)
             status = "ready"
-            if not all(idx.items for idx in search):
+            if not all(across.items):
                 status = "waiting"
-            elif not c.provider or not c.model:
+            elif not answer:
                 status = "needs_model"
-            else:
-                rows = []
-                settings = review_flows.effective_settings(
-                    db, c.owner_id, "connections", c.review_run_id, active=True
-                )
-                for side, idx in enumerate(search):
-                    for key_id, item in sorted(idx.items.items()):
-                        if f"{side}:{key_id}" <= cursor:
-                            continue
-                        near = search[1 - side].near(item)
-                        fingerprint = digest(
-                            [
-                                context,
-                                c.provider,
-                                c.model,
-                                item.summary(),
-                                [n.summary() for n in near],
-                            ]
-                        )
-                        policy = review_flows.wording(settings, "connections")
-                        if policy:
-                            fingerprint = digest([fingerprint, policy])
-                        if done.get(item.key) != fingerprint:
-                            rows.append((item, near, fingerprint))
-                            if len(rows) >= BATCH:
-                                break
-                    if rows:
-                        context = {
-                            **context,
-                            "source": projects[side].name,
-                            "target": projects[1 - side].name,
-                        }
-                        break
-                if rows:
-                    c.status = "running"
-                    return Batch(
-                        key,
-                        lease,
-                        c.owner_id,
-                        c.provider,
-                        c.model,
-                        rows,
-                        context,
-                        mark,
-                        f"{side}:{rows[-1][0].key}",
-                        review_flows.start(db, c, c.owner_id, "connections"),
+            context, stamp = asking(db, c, projects, answer)
+            if run is None:
+                # Nothing is asked without the word: the plan says what would be.
+                plan = self._plan(db, c, projects, sides, across, stamp, mark)
+                c.progress = {**c.progress, "planned": mark}
+                if status == "ready" and (plan["ask"]["records"] or plan["stated"]):
+                    status = "planned"
+                review_flows.finish(db, c, "succeeded")
+                self.finish(c, "paused" if stopped else status, 60)
+                return None
+            refusal = connection_plan.refused(db, projects, answer) if answer else None
+            if status != "ready" or refusal:
+                run.state, run.detail = "held", refusal or "It cannot go on as the records stand."
+                c.detail = refusal
+                self.finish(c, "needs_model" if refusal else status, 300)
+                return None
+            assert answer is not None
+            if run.state == "held":
+                run.state, run.detail = "running", ""
+            if not c.progress.get("stated"):
+                self._stated(db, c, run, sides)
+                c.progress = {**c.progress, "stated": True}
+            # A record an earlier suggestion still waits for is asked about again.
+            held = set(
+                db.scalars(
+                    select(ConnectionFinding.source_id).where(
+                        ConnectionFinding.connection_id == c.id,
+                        ConnectionFinding.origin == "model",
+                        ConnectionFinding.status == "pending",
+                        ConnectionFinding.source_id.is_not(None),
                     )
-            c.progress = {**c.progress, "watermark": mark}
+                )
+            )
+            rows = []
+            for place in range(2):
+                for key_id, item in sorted(across.items[place].items()):
+                    if f"{place}:{key_id}" <= cursor:
+                        continue
+                    if not across.touched(place, item) and item.id not in held:
+                        continue
+                    near = across.near(place, item)
+                    fingerprint = stamp(item, near)
+                    if done.get(item.key) != fingerprint:
+                        rows.append((item, near, fingerprint))
+                        if len(rows) >= BATCH:
+                            break
+                if rows:
+                    context = {
+                        **context,
+                        "source": projects[place].name,
+                        "target": projects[1 - place].name,
+                    }
+                    break
+            if rows:
+                c.status = "running"
+                run.stage = "verify"
+                judge, _ = connection_plan.judging(db, c, projects, answer)
+                return Batch(
+                    key,
+                    lease,
+                    c.owner_id,
+                    answer[0],
+                    answer[1],
+                    rows,
+                    context,
+                    mark,
+                    f"{place}:{rows[-1][0].key}",
+                    run.id,
+                    judge,
+                    review_flows.start(db, c, c.owner_id, "connections"),
+                )
+            # Everything the plan named was asked about: the run is over.
+            run.state, run.stage, run.ended_at = "complete", "done", datetime.now(UTC)
+            c.progress = {
+                **{k: v for k, v in c.progress.items() if k != "stated"},
+                "watermark": mark,
+                "planned": mark,
+            }
+            self._count(db, run, c)
+            audit(db, c, "The plan was carried out.")
             review_flows.finish(db, c, "succeeded")
-            self.finish(c, status, 60)
+            self.finish(c, "ready", 60)
             return None
 
-    def apply(self, b: Batch, suggestions: list[dict[str, Any]]) -> None:
+    @staticmethod
+    def _count(db: Session, run: OrganizeRun, c: ProjectConnection) -> None:
+        """How the run's stages stand: what it read, what it put before the models, how
+        each was left, and what is missing."""
+        lines = connection_lines.counts(db, c.id)
+        asked = len(c.progress.get("done", {}))
+        plan = run.estimate or {}
+        records = sum(sum(p["records"].values()) for p in plan.get("projects", []))
+        to_ask = int((plan.get("ask") or {}).get("records", 0))
+        run.counts = {
+            "read": {"records": records, "none": max(0, records - to_ask)},
+            "match": {"records": to_ask},
+            "verify": {
+                "records": min(asked, to_ask) if to_ask else asked,
+                "settled": lines["done"],
+                "in_doubt": lines["needs_you"],
+            },
+            "create": {"records": lines["created"]},
+        }
+
+    def apply(
+        self,
+        b: Batch,
+        suggestions: list[dict[str, Any]],
+        *,
+        judge: str | None = None,
+        used: tuple[int, float] = (0, 0.0),
+    ) -> None:
         with self.sessions.begin() as db:
             c = db.scalar(
                 select(ProjectConnection)
@@ -381,10 +569,52 @@ class ConnectionAnalysis:
             )
             if not c or c.archived_at:
                 return
+            run = db.get(OrganizeRun, b.run)
+            if run is None or run.state != "running":
+                # Stopped while the question was out: its answer is not used.
+                self.finish(c, "paused" if c.status == "paused" else "queued", 0)
+                return
+            run.spent += used[0]
+            run.cost = round(run.cost + used[1], 6)
             if revision(db, project_pair(db, c), c) != b.watermark:
                 self.finish(c, "queued", 0)
                 return
             offered = {item.key: (item, {n.key: n for n in near}) for item, near, _ in b.rows}
+            seen: set[UUID] = set()
+
+            def listed(f: ConnectionFinding, suggestion: dict[str, Any]) -> None:
+                """The finding as a line of the run: a link both models make is recorded;
+                everything else waits for the administrator."""
+                seen.add(f.id)
+                if f.status != "pending":
+                    return
+                second = suggestion.get("judge")
+                said = [
+                    {
+                        "stage": "verify",
+                        "by": b.model,
+                        "answer": f.action,
+                        "reason": suggestion["reason"].strip(),
+                    }
+                ]
+                if second:
+                    said.append(
+                        {
+                            "stage": "verify",
+                            "by": second["model"],
+                            "answer": "the same" if second["agreed"] else "not this",
+                        }
+                    )
+                agreed = bool(second and second["agreed"])
+                if f.action == "link" and agreed:
+                    _record_decision(db, c, f, "approved")
+                    connection_lines.write(db, run, c, f, said=said, doubt=0.0, applied=True)
+                    return
+                doubt = "both" if agreed else "alone" if second else "unjudged"
+                connection_lines.write(
+                    db, run, c, f, said=said, doubt=connection_lines.DOUBT[doubt]
+                )
+
             for suggestion in suggestions:
                 if suggestion["source"] not in offered:
                     raise ValueError("The model returned an unknown source")
@@ -411,7 +641,9 @@ class ConnectionAnalysis:
                             ConnectionFinding.status != "outdated",
                         )
                     ):
-                        self.model_link(db, c, src, target, reason, suggestion.get("judge"))
+                        found = self.model_link(db, c, src, target, reason, suggestion.get("judge"))
+                        if found is not None:
+                            listed(found, suggestion)
                     continue
                 parents = sorted(set(suggestion["parents"]))
                 parent_kind = {"stories": "epics", "issues": "stories"}.get(kind)
@@ -473,9 +705,14 @@ class ConnectionAnalysis:
                 )
                 if f and f.source_id != src.id and f.status != "outdated":
                     continue
-                if f and (
-                    f.proposal_id or (f.status != "outdated" and f.fingerprint == fingerprint)
-                ):
+                if f and f.proposal_id:
+                    continue
+                if f and f.status != "outdated" and f.fingerprint == fingerprint:
+                    # The same suggestion as before: what a second model says of it now
+                    # is kept with it.
+                    if suggestion.get("judge"):
+                        f.evidence = {**f.evidence, "judge": suggestion["judge"]}
+                    listed(f, suggestion)
                     continue
                 if not f:
                     f = ConnectionFinding(
@@ -499,8 +736,42 @@ class ConnectionAnalysis:
                     "pending",
                 )
                 db.flush()
+                listed(f, suggestion)
+            # What an earlier analysis suggested for these records and nobody repeats
+            # now is not dropped: it is put before the administrator as such.
+            asked = [item.id for item, _, _ in b.rows if item.id]
+            if asked:
+                for f in db.scalars(
+                    select(ConnectionFinding).where(
+                        ConnectionFinding.connection_id == c.id,
+                        ConnectionFinding.origin == "model",
+                        ConnectionFinding.status == "pending",
+                        ConnectionFinding.source_id.in_(asked),
+                    )
+                ):
+                    if f.id in seen or any(
+                        line.run_id == run.id for line in connection_lines.lines_of(db, f)
+                    ):
+                        continue
+                    connection_lines.write(
+                        db,
+                        run,
+                        c,
+                        f,
+                        said=[
+                            {"stage": "verify", "by": "an earlier analysis", "answer": f.action},
+                            {"stage": "verify", "by": b.model, "answer": "not this"},
+                            *(
+                                [{"stage": "verify", "by": judge, "answer": "not this"}]
+                                if judge
+                                else []
+                            ),
+                        ],
+                        doubt=connection_lines.DOUBT["earlier"],
+                    )
             done = {**c.progress.get("done", {}), **{i.key: stamp for i, _, stamp in b.rows}}
             c.progress = {**c.progress, "done": done, "cursor": b.cursor}
+            self._count(db, run, c)
             self.finish(c, "queued", 0)
 
     @staticmethod
@@ -511,7 +782,7 @@ class ConnectionAnalysis:
         target: Item,
         reason: str,
         judge: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> ConnectionFinding | None:
         f = db.scalar(
             select(ConnectionFinding).where(
                 ConnectionFinding.connection_id == c.id,
@@ -519,11 +790,13 @@ class ConnectionAnalysis:
             )
         )
         evidence = digest([src.summary(), target.summary()])
-        if f and (
-            f.origin != "model"
-            or (f.evidence.get("input_version") == evidence and f.status != "outdated")
-        ):
-            return
+        if f and f.origin != "model":
+            return None
+        if f and f.evidence.get("input_version") == evidence and f.status != "outdated":
+            # The same link as before: what a second model says of it now is kept.
+            if judge:
+                f.evidence = {**f.evidence, "judge": judge}
+            return f
         if f and f.status in ("approved", "dismissed"):
             f.status = "pending"
         f = store_link(db, c, src, target, target.number, "model", reason, f)
@@ -533,6 +806,7 @@ class ConnectionAnalysis:
             "source_excerpt": src.body[:350],
             **({"judge": judge} if judge else {}),
         }
+        return f
 
     def failed(self, key: UUID, token: UUID, detail: str) -> None:
         with self.sessions.begin() as db:
@@ -545,18 +819,26 @@ class ConnectionAnalysis:
                 review_flows.finish(db, row, "failed")
                 self.finish(row, "failed", 600)
                 row.detail = detail[:400]
-                row.progress = {**row.progress, "watermark": row.progress.get("references_mark")}
+                run = connection_lines.carried(db, row.id)
+                if run is not None:
+                    run.state, run.detail = "held", detail[:2000]
 
     def defer_for_budget(self, key: UUID, token: UUID) -> None:
         with self.sessions.begin() as db:
-            db.execute(
-                update(ProjectConnection)
-                .where(
-                    ProjectConnection.id == key,
-                    ProjectConnection.lease == token,
-                )
-                .values(status="queued", lease=None, due_at=datetime.now(UTC))
+            row = db.scalar(
+                select(ProjectConnection)
+                .where(ProjectConnection.id == key, ProjectConnection.lease == token)
+                .with_for_update()
             )
+            if row:
+                self.finish(row, "queued", 120)
+                run = connection_lines.carried(db, row.id)
+                if run is not None:
+                    run.state = "held"
+                    run.detail = (
+                        review_settings.over(db, row.owner_id)
+                        or "The project's review tokens are used up."
+                    )
 
     async def tick(self, models: Models | None) -> bool:
         claimed = await asyncio.to_thread(self.claim)
@@ -567,7 +849,7 @@ class ConnectionAnalysis:
             b = await asyncio.to_thread(self.prepare, key, token)
             if b:
                 if not models:
-                    raise ValueError("Choose an available model in Accounts and rerun the analysis")
+                    raise ValueError("Choose an available model in Accounts and carry out the plan")
                 prompt = {
                     **b.context,
                     "records": [
@@ -605,22 +887,32 @@ class ConnectionAnalysis:
                     run_id=b.run_id,
                     stage="connections",
                 )
-                # Where the owning project has a judge, it is asked the same, unseen:
-                # each suggestion then says whether the judge made it too.
-                second = await review_budget.ask_judge(
-                    self.sessions,
-                    b.owner,
-                    models,
-                    asked,
-                    reply,
-                    "connection_review",
-                    run_id=b.run_id,
-                    stage="connections",
+                # A second model of another maker, which both projects allow, is asked
+                # the same, unseen: each suggestion then says whether it made it too.
+                second = (
+                    await review_budget.ask_judge(
+                        self.sessions,
+                        b.owner,
+                        models,
+                        asked,
+                        reply,
+                        "connection_review",
+                        run_id=b.run_id,
+                        stage="connections",
+                    )
+                    if b.judge
+                    else None
                 )
                 suggestions = reply.data["suggestions"]
                 if second is not None:
                     suggestions = judged(suggestions, second.data, second.model)
-                await asyncio.to_thread(self.apply, b, suggestions)
+                await asyncio.to_thread(
+                    self.apply,
+                    b,
+                    suggestions,
+                    judge=second.model if second is not None else None,
+                    used=_used(reply, second),
+                )
         except review_budget.ReviewBudgetHeld:
             await asyncio.to_thread(self.defer_for_budget, key, token)
         except (ValueError, ModelError) as error:
@@ -628,6 +920,19 @@ class ConnectionAnalysis:
         except Exception:  # noqa: BLE001 - keep the durable job available for retry
             logging.getLogger(__name__).exception("Connection review failed")
             await asyncio.to_thread(
-                self.failed, key, token, "Analysis interrupted. Retry from the last saved batch."
+                self.failed, key, token, "The run was interrupted. It goes on from the last batch."
             )
         return True
+
+
+def _used(*replies: Any) -> tuple[int, float]:
+    """The tokens and the US dollars the answers of one question used."""
+    tokens, cost = 0, 0.0
+    for reply in replies:
+        usage = getattr(reply, "usage", None) or {}
+        for key in ("input", "output"):
+            if type(usage.get(key)) is int:
+                tokens += usage[key]
+        if type(usage.get("cost")) in (int, float):
+            cost += float(usage["cost"])
+    return tokens, cost

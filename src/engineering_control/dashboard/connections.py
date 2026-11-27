@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -10,7 +10,7 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard import connection_lines, review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import (
     KINDS,
@@ -33,6 +33,8 @@ from engineering_control.db.models import (
     BacklogItem,
     ConnectionEvent,
     ConnectionFinding,
+    OrganizeLine,
+    OrganizeRun,
     ProjectConnection,
     ProjectEpic,
     ProjectRecord,
@@ -41,6 +43,10 @@ from engineering_control.db.models import (
 )
 
 Relation = Literal["depends_on", "used_by", "related"]
+# For how long what a run applied can be undone.
+UNDO = timedelta(days=30)
+LISTS = {"needs_you": "Needs you", "done": "Done", "created": "Created"}
+STAGES = {"read": "Read", "match": "Match", "verify": "Verify", "create": "Create", "done": "Done"}
 
 
 def audit(session: Session, row: ProjectConnection, message: str) -> None:
@@ -127,6 +133,8 @@ def _connection(
         "processed": len(c.progress.get("done", {})),
         "total": c.progress.get("total", 0),
         "counts": counts,
+        # What the connection's runs left in their three lists.
+        "lists": connection_lines.counts(session, c.id),
     }
 
 
@@ -361,6 +369,8 @@ class Connections:
                 row.archived_at = None
                 if row.status != "paused":
                     schedule(row)
+                # A changed connection gets a new plan.
+                row.progress = {**(row.progress or {}), "planned": None}
                 db.flush()
                 audit(
                     db,
@@ -435,19 +445,21 @@ class Connections:
     def analyze(
         self, name: str, key: UUID, provider: str | None, model: str | None
     ) -> dict[str, str]:
+        """The model that answers for the connection, and its plan prepared again. No
+        model is asked: that needs the plan to be carried out."""
         with self.sessions.begin() as db:
             p = active_project(db, name)
             row = _get(db, p.id, key, lock=True)
             _peer(db, row, p.id)
             review_budget.require_available(db, row.owner_id)
             if row.status == "paused":
-                raise ProjectConflict("Resume the stopped connection analysis first.")
+                raise ProjectConflict("Resume the stopped connection first.")
             if provider and model:
                 row.provider, row.model = provider, model
-            if row.status != "running":
+            if connection_lines.carried(db, row.id) is None:
                 review_flows.finish(db, row, "cancelled")
                 schedule(row)
-                row.progress = {**row.progress, "watermark": None, "run_id": str(uuid4())}
+                row.progress = {**row.progress, "planned": None, "run_id": str(uuid4())}
             return {"id": str(key)}
 
     def pause_analysis(self, name: str, key: UUID, control_id: str, paused: bool) -> dict[str, str]:
@@ -464,10 +476,15 @@ class Connections:
                 review_budget.require_available(db, row.owner_id)
             if (row.status == "paused") == paused:
                 raise ProjectConflict("The connection analysis is no longer in that state.")
+            run = connection_lines.carried(db, row.id)
             if paused:
                 row.status, row.lease = "paused", None
+                if run is not None:
+                    run.state, run.detail = "held", "Stopped by the administrator."
             else:
                 schedule(row)
+                if run is not None:
+                    run.state, run.detail = "running", ""
             row.progress = {**row.progress, "run_id": str(uuid4())}
             return {"status": row.status}
 
@@ -577,6 +594,7 @@ class Connections:
                     stale += 1
                     continue
                 _record_decision(db, row, f, "approved")
+                connection_lines.decided(db, f, "approved", None)
                 connected += 1
             return {"connected": connected, "stale": stale, "newer": newer}
 
@@ -592,58 +610,382 @@ class Connections:
                 raise ProjectNotFound(str(finding))
             if f.fingerprint != version or f.status == "outdated":
                 raise ProjectConflict("The evidence changed. Reload the connection.")
-            decision = "approved" if accept else "dismissed"
-            if f.status == decision:
-                return {"id": str(f.id)}
-            if f.status != "pending" and not (f.action == "link" and not accept):
-                raise ProjectConflict("This suggestion already has a decision")
-            if accept:
-                source_project = p if f.source_project == p.id else peer
-                owner = peer if source_project == p else p
-                targets = catalog(db, owner)
-                source, target = _reviewed_endpoints(f, catalog(db, source_project), targets)
-                if f.action in ("create", "edit"):
-                    proposal = f.evidence
-                    if proposal.get("source_version") != digest(source.summary()):
-                        raise ProjectConflict("The source changed. Run the analysis again.")
-                    if f.action == "edit":
-                        if not target or proposal.get("target_version") != digest(target.summary()):
-                            raise ProjectConflict("The target changed. Run the analysis again.")
-                        cls = RECORD_MODELS[target.kind]
-                        item = db.get(cls, target.id)
-                        if not isinstance(item, (BacklogItem, ProjectEpic, ProjectUserStory)):
-                            raise ProjectConflict("The target is no longer available")
-                        item.title = clean_title(proposal["title"])
-                        item.description = clean_description(proposal["description"])
-                    else:
-                        parents = proposal["parents"]
-                        parent_kind = {"stories": "epics", "issues": "stories"}.get(
-                            f.target_kind or ""
-                        )
-                        if f.target_kind not in KINDS or (
-                            parent_kind
-                            and (
-                                not parents
-                                or not all(
-                                    UUID(k) in targets.local
-                                    and targets.local[UUID(k)].kind == parent_kind
-                                    and targets.local[UUID(k)].approved
-                                    for k in parents
-                                )
-                            )
-                        ):
-                            raise ProjectConflict("A local parent changed. Run the analysis again.")
-                        candidate = WorkspaceCandidate(
-                            project_id=owner.id,
-                            kind=f.target_kind,
-                            origin="connection",
-                            identity="connection-" + str(f.id),
-                            title=clean_title(proposal["title"]),
-                            description=clean_description(proposal["description"]),
-                            parents=parents,
-                        )
-                        db.add(candidate)
-                        db.flush()
-                        f.proposal_id = candidate.id
-            _record_decision(db, row, f, decision)
+            _decide(db, p, row, peer, f, accept)
             return {"id": str(f.id)}
+
+    # -- the plan of a connection, and what its runs found ---------------------------
+
+    def plan(self, name: str, key: UUID) -> dict[str, Any]:
+        """The connection's plan as it waits for the word, the run that is carrying a
+        plan out or the last that did, and how many lines the three lists hold."""
+        with self.sessions() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, archived=True)
+            peer = _peer(db, row, p.id)
+            waiting = connection_lines.proposed(db, row.id)
+            runs = [run for run in connection_lines.runs_of(db, row.id) if run.state != "proposed"]
+            run = runs[0] if runs else None
+            plan = dict(waiting.estimate or {}) if waiting else None
+            live = run is not None and run.state in ("running", "held")
+            if plan is None and not live and row.status == "paused" and not row.archived_at:
+                # The worker does not wake a stopped connection: its plan is worked out
+                # here, when it is asked for.
+                from engineering_control.dashboard.connection_analysis import plan_now
+
+                plan = plan_now(db, row)
+            why = None
+            if run is not None and run.state in ("running", "held"):
+                why = "The plan is being carried out."
+            elif plan is None and run is not None and row.status == "ready":
+                why = "Nothing is left to check: the plan is carried out."
+            elif plan is None:
+                why = "The plan is being prepared. It is here within a minute."
+            elif plan.get("blocked"):
+                why = str(plan["blocked"])
+            elif not (plan["ask"]["records"] or plan.get("stated")):
+                why = "Nothing is left to check: the plan is carried out."
+            counts = run.counts or {} if run else {}
+            reached = list(STAGES).index(run.stage) if run and run.stage in STAGES else -1
+            return {
+                "connection": str(row.id),
+                "projects": {str(p.id): _names(p), str(peer.id): _names(peer)},
+                "owner": p.name if row.owner_id == p.id else peer.name,
+                # The plan that waits for the word; else the one that was carried out.
+                "plan": plan if plan is not None else dict(run.estimate or {}) if run else None,
+                "waits": plan is not None,
+                "can_carry_out": why is None,
+                "why_not": why,
+                "run": {
+                    "id": str(run.id),
+                    "state": run.state,
+                    "stage": run.stage,
+                    "detail": run.detail,
+                    "spent": run.spent,
+                    "cost": run.cost,
+                    "started_at": instant(run.started_at),
+                    "ended_at": instant(run.ended_at),
+                    "stages": [
+                        {
+                            "stage": stage,
+                            "name": title,
+                            "reached": index <= reached,
+                            **{
+                                key: int((counts.get(stage) or {}).get(key, 0))
+                                for key in ("records", "settled", "in_doubt", "none")
+                            },
+                        }
+                        for index, (stage, title) in enumerate(STAGES.items())
+                    ],
+                }
+                if run
+                else None,
+                "runs": len(runs),
+                "lists": connection_lines.counts(db, row.id),
+                "undo_days": UNDO.days,
+            }
+
+    def carry_out(self, name: str, key: UUID, *, within_limit: bool = False) -> dict[str, str]:
+        """The administrator's word: the plan is carried out. Where it is estimated to
+        cost more than is left of the month's limit, it is refused with what it would
+        cost, unless the word is to go as far as the limit allows."""
+        with self.sessions.begin() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, lock=True)
+            _peer(db, row, p.id)
+            if connection_lines.carried(db, row.id) is not None:
+                raise ProjectConflict("The plan is being carried out.")
+            run = connection_lines.proposed(db, row.id)
+            if run is None and row.status == "paused":
+                from engineering_control.dashboard.connection_analysis import plan_now
+
+                made = plan_now(db, row)
+                if made is not None:
+                    run = OrganizeRun(
+                        project_id=row.owner_id,
+                        kind="connection",
+                        connection_id=row.id,
+                        scope=[str(row.first_id), str(row.second_id)],
+                        state="proposed",
+                        stage="read",
+                        counts={},
+                        estimate=made,
+                    )
+                    db.add(run)
+                    db.flush()
+            if run is None:
+                raise ProjectConflict("The plan is being prepared. It is here within a minute.")
+            plan = run.estimate or {}
+            if plan.get("blocked"):
+                raise ProjectInvalid(str(plan["blocked"]))
+            ask = plan.get("ask") or {}
+            if not (ask.get("records") or plan.get("stated")):
+                raise ProjectConflict("Nothing is left to check: the plan is carried out.")
+            if ask.get("records"):
+                review_budget.require_available(db, row.owner_id)
+            if ask.get("over") and not within_limit:
+                left = max(0.0, float(ask["limit"]) - float(ask["spent"]))
+                raise ProjectConflict(
+                    f"Carrying out the plan is estimated at {float(ask['dollars']):.2f} US "
+                    f"dollars, and {left:.2f} are left of this month's limit. Raise the limit "
+                    "under Reviews, Settings, or carry it out as far as the limit allows."
+                )
+            run.state, run.started_at, run.stage, run.detail = (
+                "running",
+                datetime.now(UTC),
+                "match",
+                "",
+            )
+            schedule(row)
+            row.progress = {**row.progress, "stated": False, "run_id": str(uuid4())}
+            audit(db, row, "The plan is carried out, at the administrator's word.")
+            return {"id": str(run.id)}
+
+    def _line(self, db: Session, row: ProjectConnection, key: UUID) -> OrganizeLine:
+        line = db.get(OrganizeLine, key)
+        run = db.get(OrganizeRun, line.run_id) if line else None
+        if line is None or run is None or run.connection_id != row.id:
+            raise ProjectNotFound(str(key))
+        return line
+
+    def lines(
+        self, name: str, key: UUID, listed: str, page: int = 1, page_size: int = 25
+    ) -> dict[str, Any]:
+        """One of the connection's three lists, over all its runs. "Needs you" shows
+        what still waits, the most doubtful first; the others what stands, newest first."""
+        from engineering_control.dashboard.organize import shown_line
+
+        if listed not in LISTS:
+            raise ProjectInvalid("That is no list of a run")
+        now = datetime.now(UTC)
+        page, page_size = max(1, page), min(100, max(1, page_size))
+        with self.sessions() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, archived=True)
+            peer = _peer(db, row, p.id)
+            names = {str(p.id): _names(p), str(peer.id): _names(peer)}
+            where = [
+                OrganizeLine.run_id.in_(
+                    select(OrganizeRun.id).where(OrganizeRun.connection_id == row.id)
+                ),
+                OrganizeLine.listed == listed,
+                OrganizeLine.state == ("open" if listed == "needs_you" else "applied"),
+            ]
+            total = int(
+                db.scalar(select(func.count()).select_from(OrganizeLine).where(*where)) or 0
+            )
+            order = (
+                (OrganizeLine.doubt.desc(), OrganizeLine.created_at, OrganizeLine.id)
+                if listed == "needs_you"
+                else (OrganizeLine.answered_at.desc(), OrganizeLine.id)
+            )
+            items = []
+            for line in db.scalars(
+                select(OrganizeLine)
+                .where(*where)
+                .order_by(*order)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ):
+                shown = shown_line(line, now)
+                shown["subject"]["in"] = names.get(str(line.subject_project))
+                for candidate in shown["candidates"]:
+                    candidate["in"] = names.get(str(candidate.get("project")))
+                if line.case == "text" and line.state == "open":
+                    # A text that would change is shown as it stands beside what is proposed.
+                    target = (line.candidates or [{}])[0]
+                    model = RECORD_MODELS.get(str(target.get("kind")))
+                    record = (
+                        db.get(model, UUID(target["id"])) if model and target.get("id") else None
+                    )
+                    shown["now"] = (
+                        {"title": record.title, "description": record.description or ""}
+                        if isinstance(record, (BacklogItem, ProjectEpic, ProjectUserStory))
+                        else None
+                    )
+                items.append(shown)
+            return {
+                "list": listed,
+                "name": LISTS[listed],
+                "total": total,
+                "page": page,
+                "pages": max(1, -(-total // page_size)),
+                "items": items,
+            }
+
+    def answer(self, name: str, key: UUID, line: UUID, accept: bool) -> dict[str, str]:
+        """The administrator's answer to a case in doubt. Where the records changed
+        since it was proposed, it is set aside and says so."""
+        with self.sessions.begin() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, lock=True)
+            peer = _peer(db, row, p.id)
+            entry = self._line(db, row, line)
+            if entry.listed != "needs_you" or entry.state != "open":
+                raise ProjectConflict("This case was decided already.")
+            action = entry.action or {}
+            f = db.get(ConnectionFinding, UUID(str(action.get("finding"))))
+            problem = None
+            if f is None or f.status != "pending" or f.fingerprint != action.get("version"):
+                problem = "The records changed since this was proposed."
+            else:
+                try:
+                    _decide(db, p, row, peer, f, accept)
+                except ProjectConflict as changed:
+                    problem = str(changed)
+            if problem:
+                entry.state, entry.answered_at = "skipped", datetime.now(UTC)
+                entry.reason = f"{entry.reason} Set aside: {problem}".strip()
+                return {"id": str(entry.id), "state": "skipped", "detail": problem}
+            return {"id": str(entry.id), "state": entry.state}
+
+    def undo(self, name: str, key: UUID, line: UUID) -> dict[str, str]:
+        """What a line applied is taken back, and the case waits for the administrator
+        again."""
+        with self.sessions.begin() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, lock=True)
+            peer = _peer(db, row, p.id)
+            _undo(db, row, {p.id: p, peer.id: peer}, self._line(db, row, line))
+            return {"id": str(line)}
+
+    def undo_run(self, name: str, key: UUID, run: UUID) -> dict[str, int]:
+        """Everything a run applied is taken back, as far as it still can be."""
+        with self.sessions.begin() as db:
+            p = active_project(db, name)
+            row = _get(db, p.id, key, lock=True)
+            peer = _peer(db, row, p.id)
+            found = db.get(OrganizeRun, run)
+            if found is None or found.connection_id != row.id:
+                raise ProjectNotFound(str(run))
+            undone = kept = 0
+            for entry in db.scalars(
+                select(OrganizeLine).where(
+                    OrganizeLine.run_id == found.id, OrganizeLine.state == "applied"
+                )
+            ):
+                try:
+                    with db.begin_nested():
+                        _undo(db, row, {p.id: p, peer.id: peer}, entry)
+                    undone += 1
+                except ProjectConflict:
+                    kept += 1
+            found.undone_at = datetime.now(UTC)
+            audit(db, row, f"A run was undone: {undone} changes taken back, {kept} kept.")
+            return {"undone": undone, "kept": kept}
+
+
+def _decide(
+    db: Session,
+    p: ProjectRecord,
+    row: ProjectConnection,
+    peer: ProjectRecord,
+    f: ConnectionFinding,
+    accept: bool,
+) -> None:
+    """Approve or dismiss a finding, and say so on the line of the run that holds it."""
+    decision = "approved" if accept else "dismissed"
+    if f.status == decision:
+        return
+    if f.status != "pending" and not (f.action == "link" and not accept):
+        raise ProjectConflict("This suggestion already has a decision")
+    before: dict[str, Any] | None = None
+    if accept:
+        source_project = p if f.source_project == p.id else peer
+        owner = peer if source_project == p else p
+        targets = catalog(db, owner)
+        source, target = _reviewed_endpoints(f, catalog(db, source_project), targets)
+        if f.action in ("create", "edit"):
+            proposal = f.evidence
+            if proposal.get("source_version") != digest(source.summary()):
+                raise ProjectConflict("The source changed. Run the analysis again.")
+            if f.action == "edit":
+                if not target or proposal.get("target_version") != digest(target.summary()):
+                    raise ProjectConflict("The target changed. Run the analysis again.")
+                cls = RECORD_MODELS[target.kind]
+                item = db.get(cls, target.id)
+                if not isinstance(item, (BacklogItem, ProjectEpic, ProjectUserStory)):
+                    raise ProjectConflict("The target is no longer available")
+                # How the text stood, to put it back.
+                before = {"title": item.title, "description": item.description}
+                item.title = clean_title(proposal["title"])
+                item.description = clean_description(proposal["description"])
+            else:
+                parents = proposal["parents"]
+                parent_kind = {"stories": "epics", "issues": "stories"}.get(f.target_kind or "")
+                if f.target_kind not in KINDS or (
+                    parent_kind
+                    and (
+                        not parents
+                        or not all(
+                            UUID(k) in targets.local
+                            and targets.local[UUID(k)].kind == parent_kind
+                            and targets.local[UUID(k)].approved
+                            for k in parents
+                        )
+                    )
+                ):
+                    raise ProjectConflict("A local parent changed. Run the analysis again.")
+                candidate = WorkspaceCandidate(
+                    project_id=owner.id,
+                    kind=f.target_kind,
+                    origin="connection",
+                    identity="connection-" + str(f.id),
+                    title=clean_title(proposal["title"]),
+                    description=clean_description(proposal["description"]),
+                    parents=parents,
+                )
+                db.add(candidate)
+                db.flush()
+                f.proposal_id = candidate.id
+    _record_decision(db, row, f, decision)
+    connection_lines.decided(db, f, decision, before)
+
+
+def _undo(
+    db: Session,
+    row: ProjectConnection,
+    projects: dict[UUID, ProjectRecord],
+    line: OrganizeLine,
+) -> None:
+    """Take back what the line applied: a link comes off, a changed text is put back as
+    it stood, a proposal that was sent to a project is withdrawn."""
+    since = line.answered_at or line.created_at
+    since = since if since.tzinfo else since.replace(tzinfo=UTC)
+    if line.listed == "needs_you" or line.state != "applied":
+        raise ProjectConflict("There is nothing to undo here.")
+    if datetime.now(UTC) - since >= UNDO:
+        raise ProjectConflict(f"This can be undone for {UNDO.days} days, and they are over.")
+    f = db.get(ConnectionFinding, UUID(str((line.action or {}).get("finding"))))
+    if f is None or f.connection_id != row.id or f.status != "approved":
+        raise ProjectConflict("This was taken back already.")
+    if f.action == "edit":
+        model = RECORD_MODELS.get(f.target_kind or "")
+        item = db.get(model, f.target_id) if model and f.target_id else None
+        proposal, before = f.evidence, line.before or {}
+        if (
+            not isinstance(item, (BacklogItem, ProjectEpic, ProjectUserStory))
+            or "title" not in before
+            or item.title != clean_title(proposal["title"])
+            or item.description != clean_description(proposal["description"])
+        ):
+            raise ProjectConflict("The text was changed again since. Correct it by hand.")
+        item.title, item.description = before["title"], before.get("description")
+    elif f.action == "create":
+        candidate = db.get(WorkspaceCandidate, f.proposal_id) if f.proposal_id else None
+        if candidate is None or candidate.decision != "pending":
+            where = projects.get(candidate.project_id) if candidate else None
+            raise ProjectConflict(
+                "The proposal was decided in the planning tables"
+                + (f" of {where.display_name}" if where else "")
+                + ". Change the record there."
+            )
+        db.delete(candidate)
+        f.proposal_id = None
+    f.status = "pending"
+    audit(
+        db,
+        row,
+        f"Undone: {f.action} from {f.evidence.get('source_title', 'record')} "
+        f"to {f.evidence.get('target_title') or f.target_kind or 'project'}.",
+    )
+    connection_lines.put_back(db, f)

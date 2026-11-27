@@ -1430,14 +1430,19 @@ class OrganizeRun(UUIDPrimaryKey, Timestamps, Base):
     organizes, and what it finds is kept as lines in three lists.
 
     ``kind`` says what is organized: ``stories_issues`` (User Stories and Issues),
-    ``epics_stories`` (Epics and User Stories) or ``coverage`` (the documentation against
-    all three)."""
+    ``epics_stories`` (Epics and User Stories), ``coverage`` (the documentation against
+    all three) or ``connection`` (what two connected projects have to do with each
+    other)."""
 
     __tablename__ = "organize_runs"
     project_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
     kind: Mapped[str] = mapped_column(String(16))
+    # For a run of a connection (migration 0096): the connection it carries out.
+    connection_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    # The projects it reads: its own, and those connected to it (migration 0096).
+    scope: Mapped[list[str]] = mapped_column(JSON, default=list)
     # proposed while it shows what it would ask and cost and waits for the word; running;
     # held at a limit of Settings; stopped by the administrator; complete; failed.
     state: Mapped[str] = mapped_column(String(16), index=True, default="proposed")
@@ -1480,6 +1485,8 @@ class OrganizeLine(UUIDPrimaryKey, Timestamps, Base):
     # The record it is about: epics, stories, issues, or a part of a document.
     subject_kind: Mapped[str] = mapped_column(String(12))
     subject_id: Mapped[UUID | None] = mapped_column(Uuid)
+    # The project the record belongs to, where it is not the run's own (migration 0096).
+    subject_project: Mapped[UUID | None] = mapped_column(Uuid)
     # For a part of a document: its path and heading.
     subject_ref: Mapped[str | None] = mapped_column(String(900))
     title: Mapped[str] = mapped_column(String(300), default="")

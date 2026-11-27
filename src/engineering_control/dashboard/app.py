@@ -90,8 +90,10 @@ from engineering_control.dashboard.schemas import (
     CommandSelectionInput,
     ConnectionAnalysisInput,
     ConnectionBulkLinksInput,
+    ConnectionCarryOutInput,
     ConnectionDecisionInput,
     ConnectionInput,
+    ConnectionLineInput,
     ConnectionLinkInput,
     DocFoldersInput,
     EpicDescriptionCheck,
@@ -1393,6 +1395,77 @@ def create_app(
             request, ConnectionAnalysisInput, start, event="connection.queued", subject=name
         )
 
+    @app.get("/api/dashboard/projects/{name}/connections/{key}/plan")
+    async def connection_plan_api(name: str, key: UUID, request: Request) -> Response:
+        """The connection's plan (what to update and how it will be verified), the run
+        that carries it out, and how many lines its three lists hold."""
+        try:
+            return JSONResponse(await asyncio.to_thread(repo(request).connections.plan, name, key))
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Connection not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/carry-out")
+    async def carry_out_connection(name: str, key: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            ConnectionCarryOutInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.carry_out, name, key, within_limit=b.within_limit
+            ),
+            event="connection.plan_carried_out",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/connections/{key}/lines/{listed}")
+    async def connection_lines_api(
+        name: str,
+        key: UUID,
+        listed: Literal["needs_you", "done", "created"],
+        request: Request,
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        """One of the connection's three lists: needs you, done, created."""
+        try:
+            return JSONResponse(
+                await asyncio.to_thread(repo(request).connections.lines, name, key, listed, page)
+            )
+        except ProjectNotFound:
+            raise HTTPException(status_code=404, detail="Connection not found") from None
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/lines/{line}")
+    async def answer_connection_line(
+        name: str, key: UUID, line: UUID, request: Request
+    ) -> Response:
+        return await project_change(
+            request,
+            ConnectionLineInput,
+            lambda b: asyncio.to_thread(
+                repo(request).connections.answer, name, key, line, b.accept
+            ),
+            event="connection.reviewed",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/lines/{line}/undo")
+    async def undo_connection_line(name: str, key: UUID, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).connections.undo, name, key, line),
+            event="connection.undone",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/connections/{key}/runs/{run}/undo")
+    async def undo_connection_run(name: str, key: UUID, run: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).connections.undo_run, name, key, run),
+            event="connection.run_undone",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/connections/{key}/links")
     async def add_connection_link(name: str, key: UUID, request: Request) -> Response:
         return await project_change(
@@ -2176,6 +2249,14 @@ def create_app(
         """What a first run of Organize and of Coverage would meet in the project."""
         return await documents_read(
             request, lambda: repo(request).organize.ground(name, fresh=fresh)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/organize/candidates/{record}")
+    async def organize_candidates_api(name: str, record: UUID, request: Request) -> Response:
+        """The parents a record could be put under, from the project and the projects
+        connected to it."""
+        return await documents_read(
+            request, lambda: repo(request).organize.candidates(name, record)
         )
 
     @app.get("/api/dashboard/projects/{name}/organize/runs/{key}/{listed}")

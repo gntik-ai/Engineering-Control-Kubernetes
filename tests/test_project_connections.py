@@ -515,6 +515,13 @@ def test_model_gaps_resume_after_restart_and_owner_approves_before_publication(
         lease = repo.connection_analysis.claim()
         assert lease and not repo.connection_analysis.claim()
         due(repo, key)
+        # The connection gets its plan first, and no model is asked for it.
+        check(repo, Model())
+        assert not calls and client.get(path).json()["status"] == "planned"
+        plan = client.get(path + "/plan").json()
+        assert plan["can_carry_out"] and plan["plan"]["ask"]["records"] == 3
+        # At the administrator's word it is carried out.
+        assert write(client, path + "/carry-out").status_code == 200
         check(repo, Model())
         assert len(calls) == 2
         data = client.get(path).json()

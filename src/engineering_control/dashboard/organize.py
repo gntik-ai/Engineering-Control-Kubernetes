@@ -27,6 +27,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import doc_parts, reorg
+from engineering_control.dashboard.connection_plan import Across
+from engineering_control.dashboard.connection_records import catalog
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_health import _rows
@@ -39,9 +41,11 @@ from engineering_control.dashboard.project_records import (
 from engineering_control.dashboard.workspace_issues import planning_kind
 from engineering_control.db.models import (
     BacklogItem,
+    ConnectionFinding,
     OrganizeLine,
     OrganizeRun,
     PlanningLink,
+    ProjectConnection,
     ProjectRecord,
     StoryDelivery,
     WorkspaceAction,
@@ -53,6 +57,7 @@ KINDS: Final = {
     "stories_issues": "User Stories and Issues",
     "epics_stories": "Epics and User Stories",
     "coverage": "Documentation coverage",
+    "connection": "Connection",
 }
 # The stages every run goes through, in order, and what each does.
 STAGES: Final = {
@@ -362,9 +367,141 @@ def _count(planning: PlanningRecords, db: Session, name: str) -> dict[str, Any]:
             # Of those with no Issue at all: where the evidence says each stands.
             "stories_with_no_issue_by_standing": dict(sorted(no_issue.items())),
         },
+        # The projects connected to it, which every run reads as part of it.
+        "scope": _connected(db, project),
         "github": _on_github(db, project),
         "documentation": doc_parts.survey(db, project),
     }
+
+
+def scope(db: Session, project: UUID) -> list[UUID]:
+    """The projects a run of this project reads: itself first, then the projects it is
+    connected to. Direct connections only: a project connected to a connected project
+    is not read."""
+    found = [project]
+    for first, second in db.execute(
+        select(ProjectConnection.first_id, ProjectConnection.second_id)
+        .where(
+            (ProjectConnection.first_id == project) | (ProjectConnection.second_id == project),
+            ProjectConnection.archived_at.is_(None),
+        )
+        .order_by(ProjectConnection.created_at, ProjectConnection.id)
+    ):
+        other = second if first == project else first
+        peer = db.get(ProjectRecord, other)
+        if peer is not None and peer.archived_at is None and other not in found:
+            found.append(other)
+    return found
+
+
+PARENT: Final = {"issues": "stories", "stories": "epics"}
+
+
+def _connected(db: Session, project: ProjectRecord) -> list[dict[str, Any]]:
+    """The projects a run of this project reads beside it, each with what it brings:
+    its records, and the links across the two that were approved or still wait."""
+    found = []
+    for c in db.scalars(
+        select(ProjectConnection)
+        .where(
+            (ProjectConnection.first_id == project.id)
+            | (ProjectConnection.second_id == project.id),
+            ProjectConnection.archived_at.is_(None),
+        )
+        .order_by(ProjectConnection.created_at, ProjectConnection.id)
+    ):
+        peer = db.get(ProjectRecord, c.second_id if c.first_id == project.id else c.first_id)
+        if peer is None or peer.archived_at is not None:
+            continue
+        links = dict(
+            db.execute(
+                select(ConnectionFinding.status, func.count())
+                .where(
+                    ConnectionFinding.connection_id == c.id,
+                    ConnectionFinding.action == "link",
+                    ConnectionFinding.status.in_(("approved", "pending")),
+                )
+                .group_by(ConnectionFinding.status)
+            )
+            .tuples()
+            .all()
+        )
+        found.append(
+            {
+                "project": peer.name,
+                "label": peer.display_name,
+                "connection": str(c.id),
+                "relation": "related"
+                if not c.dependent_id
+                else "depends_on"
+                if c.dependent_id == project.id
+                else "used_by",
+                "records": (c.progress or {}).get("readiness", {}).get(peer.name, {}),
+                "links": {
+                    "approved": int(links.get("approved", 0)),
+                    "pending": int(links.get("pending", 0)),
+                },
+            }
+        )
+    return found
+
+
+def candidates(
+    sessions: sessionmaker[Session], name: str, record: UUID, limit: int = 10
+) -> dict[str, Any]:
+    """The parents a record could be put under, drawn from the whole scope: for an
+    Issue the User Stories, for a User Story the Epics, of the project and of every
+    project connected to it, the nearest first. Each says which project it belongs to.
+    By meaning where the ranking service read both projects with the same model, and by
+    the words they share."""
+    with sessions() as db:
+        project = active_project(db, name)
+        mine = catalog(db, project)
+        item = mine.local.get(record)
+        if item is None or item.kind not in PARENT:
+            raise ProjectNotFound(str(record))
+        kind = PARENT[item.kind]
+        found: list[dict[str, Any]] = []
+        for key in scope(db, project.id):
+            other = db.get(ProjectRecord, key)
+            if other is None:
+                continue
+            theirs = mine if key == project.id else catalog(db, other)
+            across = Across.read(db, [mine, theirs])
+            # A record that is not approved yet is no part of the pair: it is compared
+            # by its words alone.
+            for position, (parent, close, shared) in enumerate(across.ranked(0, item, kind)):
+                if parent.id == item.id:
+                    continue
+                found.append(
+                    {
+                        "project": other.name,
+                        "label": other.display_name,
+                        "own": key == project.id,
+                        "kind": kind,
+                        "id": str(parent.id) if parent.id else None,
+                        "title": parent.title,
+                        "closeness": round(close, 3) if close is not None else None,
+                        "shared": shared,
+                        "place": position + 1,
+                    }
+                )
+        # The closest by meaning first; what has no vector follows by its place in its
+        # own project's ranking.
+        found.sort(
+            key=lambda entry: (
+                entry["closeness"] is None,
+                -(entry["closeness"] or 0.0),
+                entry["place"],
+                entry["project"],
+            )
+        )
+        return {
+            "project": project.name,
+            "record": {"id": str(item.id), "kind": item.kind, "title": item.title},
+            "scope": [entry["project"] for entry in _connected(db, project)],
+            "candidates": found[:limit],
+        }
 
 
 def ground(sessions: sessionmaker[Session], name: str, *, fresh: bool = False) -> dict[str, Any]:
@@ -393,7 +530,13 @@ def ground(sessions: sessionmaker[Session], name: str, *, fresh: bool = False) -
     return counted
 
 
-def _shown_line(line: OrganizeLine, now: datetime) -> dict[str, Any]:
+def can_undo(line: OrganizeLine, now: datetime) -> bool:
+    """Whether the line changed the plan and that can still be put back."""
+    since = line.answered_at or line.created_at
+    return line.listed != "needs_you" and line.state == "applied" and now - _aware(since) < UNDO
+
+
+def shown_line(line: OrganizeLine, now: datetime) -> dict[str, Any]:
     return {
         "id": str(line.id),
         "run": str(line.run_id),
@@ -402,6 +545,7 @@ def _shown_line(line: OrganizeLine, now: datetime) -> dict[str, Any]:
         "subject": {
             "kind": line.subject_kind,
             "id": str(line.subject_id) if line.subject_id else None,
+            "project": str(line.subject_project) if line.subject_project else None,
             "ref": line.subject_ref,
             "title": line.title,
         },
@@ -420,18 +564,18 @@ def _shown_line(line: OrganizeLine, now: datetime) -> dict[str, Any]:
         "answered_at": line.answered_at.isoformat() if line.answered_at else None,
         "undone_at": line.undone_at.isoformat() if line.undone_at else None,
         # A line that changed the plan can be undone for a while after it was written.
-        "can_undo": line.listed != "needs_you"
-        and line.state == "applied"
-        and now - _aware(line.created_at) < UNDO,
+        "can_undo": can_undo(line, now),
     }
 
 
-def _shown_run(run: OrganizeRun, lists: dict[str, int]) -> dict[str, Any]:
+def shown_run(run: OrganizeRun, lists: dict[str, int]) -> dict[str, Any]:
     counts = run.counts or {}
     reached = list(STAGES).index(run.stage) if run.stage in STAGES else 0
     return {
         "id": str(run.id),
         "kind": run.kind,
+        "connection": str(run.connection_id) if run.connection_id else None,
+        "scope": list(run.scope or []),
         "name": KINDS.get(run.kind, run.kind),
         "state": run.state,
         "stage": run.stage,
@@ -466,6 +610,9 @@ class Organize:
     def ground(self, name: str, *, fresh: bool = False) -> dict[str, Any]:
         return ground(self.sessions, name, fresh=fresh)
 
+    def candidates(self, name: str, record: UUID) -> dict[str, Any]:
+        return candidates(self.sessions, name, record)
+
     # -- a run, from the word that proposes it to its end ---------------------------
 
     def propose(
@@ -476,10 +623,12 @@ class Organize:
         estimate: dict[str, Any] | None = None,
         dollar_cap: float | None = None,
         auto: bool = False,
+        connection: UUID | None = None,
     ) -> UUID:
         """A run that says what it would ask and cost, and waits for the word. One run
-        of a kind at a time in a project: a second is refused while the first is live."""
-        if kind not in KINDS:
+        of a kind at a time in a project, and one at a time for a connection: a second
+        is refused while the first is live."""
+        if kind not in KINDS or (kind == "connection") != (connection is not None):
             raise ProjectInvalid("Choose what to organize")
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
@@ -487,6 +636,9 @@ class Organize:
                 select(OrganizeRun.id).where(
                     OrganizeRun.project_id == project.id,
                     OrganizeRun.kind == kind,
+                    OrganizeRun.connection_id == connection
+                    if connection
+                    else OrganizeRun.connection_id.is_(None),
                     OrganizeRun.state.in_(LIVE),
                 )
             )
@@ -495,6 +647,8 @@ class Organize:
             run = OrganizeRun(
                 project_id=project.id,
                 kind=kind,
+                connection_id=connection,
+                scope=[str(key) for key in scope(db, project.id)],
                 state="proposed",
                 stage="read",
                 counts={},
@@ -634,7 +788,7 @@ class Organize:
                     if counts:
                         entry = lists.setdefault(run_id, {})
                         entry[listed] = entry.get(listed, 0) + int(number)
-            shown = [_shown_run(run, lists.get(run.id, {})) for run in runs]
+            shown = [shown_run(run, lists.get(run.id, {})) for run in runs]
             return {
                 "project": project.name,
                 "kind": kind,
@@ -691,5 +845,5 @@ class Organize:
                 "total": total,
                 "page": page,
                 "pages": max(1, -(-total // page_size)),
-                "items": [_shown_line(row, now) for row in rows],
+                "items": [shown_line(row, now) for row in rows],
             }

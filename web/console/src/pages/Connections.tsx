@@ -22,6 +22,8 @@ import { apiUrl, postJson, useResource, type ProjectSummary } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { connectionsUrl, navigate, recordUrl, setQuery, useLocation, workspaceUrl } from '../router';
+import { some } from './ChoiceRun';
+import { ConnectionPlan } from './ConnectionPlan';
 import { useSubmit } from './ProjectDialogs';
 
 type Peer = { name: string; label: string; repository: string };
@@ -62,6 +64,8 @@ type Connection = {
   detail: string | null;
   archived: boolean;
   counts: Record<string, number>;
+  /** What the connection's runs left in their three lists. */
+  lists?: { needs_you: number; done: number; created: number };
   model: string | null;
   provider: string | null;
   processed: number;
@@ -86,12 +90,14 @@ const relations: Record<string, string> = {
   related: 'Related to',
 };
 const states: Record<string, string> = {
-  queued: 'Queued',
-  running: 'Analyzing',
+  queued: 'Preparing the plan',
+  planned: 'A plan waits for your word',
+  running: 'Carrying out the plan',
   waiting: 'Awaiting planning',
   needs_model: 'Choose a model',
-  ready: 'Analysis complete',
-  failed: 'Analysis needs attention',
+  ready: 'Plan carried out',
+  paused: 'Stopped',
+  failed: 'Needs attention',
   disconnected: 'Disconnected',
 };
 const options = (map: Record<string, string>) =>
@@ -464,8 +470,7 @@ function ConnectionDetail({
     issue = query.get('issue') ?? '';
   const path = base(project) + '/' + id;
   const [status, setStatus] = useState(''),
-    [page, setPage] = useState(1),
-    [model, setModel] = useState('');
+    [page, setPage] = useState(1);
   const data = useResource<Detail>(apiUrl(path, { status, page }), 4000);
   const c = data.data;
   const issueLinks = c?.pending_issue_links;
@@ -488,14 +493,6 @@ function ConnectionDetail({
       reload();
     },
   );
-  const selected = model || (c?.provider && c.model ? JSON.stringify([c.provider, c.model]) : '');
-  const pause = useSubmit(() => postJson(path + '/pause', {
-    control_id: c?.control_id, paused: c?.status !== 'paused',
-  }), reload);
-  const analyze = useSubmit(() => {
-    const chosen = selected ? (JSON.parse(selected) as [string, string]) : null;
-    return postJson(path + '/analyze', chosen ? { provider: chosen[0], model: chosen[1] } : {});
-  }, reload);
   const close = () => {
     setEditor(null);
     if (issue) setQuery({ issue: null });
@@ -524,66 +521,23 @@ function ConnectionDetail({
             )}
           </div>
           {c.purpose && <p className="max-w-prose whitespace-pre-wrap">{c.purpose}</p>}
-          <Card>
-            <CardBody className="grid gap-3">
-              <h3 className="font-semibold">Analysis</h3>
-              <p role="status">
-                {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status}
-                {c.total > 0 && c.model ? ' · ' + c.processed + ' / ' + c.total + ' records reviewed' : ''}
-              </p>
-              {Object.entries(c.readiness).map(([p, counts]) => (
-                <p key={p} className="text-sm">
-                  {projects.find((it) => it.project === p)?.display_name ?? p} · {counts.epics} Epics ·{' '}
-                  {counts.stories} User Stories · {counts.issues} Issues
-                </p>
-              ))}
-              {c.checked && (
-                <p className="text-xs text-muted-foreground">
-                  Last checked {new Date(c.checked).toLocaleString()}
-                </p>
-              )}
-              {(pause.problem || analyze.problem || c.detail) && (
-                <Alert tone="warning" title={pause.problem || analyze.problem || c.detail || ''} />
-              )}
-              {!c.archived && (
-                <div className="flex flex-wrap items-end gap-2">
-                  <Field>
-                    <FieldLabel>Analysis model from Accounts</FieldLabel>
-                    <SimpleSelect
-                      aria-label="Analysis model from Accounts"
-                      items={models.map((m) => ({
-                        value: JSON.stringify([m.provider, m.model]),
-                        label: m.model + ' · ' + m.provider,
-                      }))}
-                      value={selected || null}
-                      onValueChange={(v) => setModel(v ?? '')}
-                      placeholder="Choose a model"
-                    />
-                  </Field>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={analyze.pending || (c.status === 'running' && !c.budget_held)}
-                    disabled={c.budget_held || ['queued','running','paused'].includes(c.status)}
-                    onClick={() => void analyze.submit()}
-                  >
-                    Analyze connection
-                  </Button>
-                </div>
-              )}
-              {c.budget_held && <p role="status" className="text-sm">Model analysis is on hold under the owning project’s Review token budget.</p>}
-              {!c.archived && (c.model || ['queued','running','paused'].includes(c.status)) && (
-                <Button className="justify-self-start" size="sm" variant="secondary" loading={pause.pending}
-                  disabled={pause.pending || (c.status === 'paused' && c.budget_held)} onClick={() => void pause.submit()}>{c.status === 'paused' ? 'Resume' : 'Stop'}</Button>
-              )}
-              {selected && (
-                <p className="text-xs text-muted-foreground">
-                  Model usage is recorded in{' '}
-                  {projects.find((p) => p.project === c.owner)?.display_name ?? c.owner}.
-                </p>
-              )}
-            </CardBody>
-          </Card>
+          <p role="status" className="text-sm text-muted-foreground">
+            {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status}
+            {Object.entries(c.readiness)
+              .map(
+                ([p, counts]) =>
+                  ` · ${projects.find((it) => it.project === p)?.display_name ?? p}: ${some(counts.epics ?? 0, 'Epic', 'Epics')}, ${some(counts.stories ?? 0, 'User Story', 'User Stories')}, ${some(counts.issues ?? 0, 'Issue', 'Issues')}`,
+              )
+              .join('')}
+            {c.checked ? ` · read ${new Date(c.checked).toLocaleString()}` : ''}. What the models are asked is charged to{' '}
+            {projects.find((p) => p.project === c.owner)?.display_name ?? c.owner}.
+          </p>
+          <ConnectionPlan path={path} connection={c} models={models} reload={reload} />
+          <details>
+            <summary className="cursor-pointer font-medium">
+              Every link and proposal of this connection ({c.total_findings})
+            </summary>
+            <div className="grid gap-3 pt-3">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="me-auto font-semibold">Links and proposals</h3>
             <SimpleSelect
@@ -623,7 +577,7 @@ function ConnectionDetail({
             <p role="status" className="text-sm">
               Connected {linkResult.connected} issue {linkResult.connected === 1 ? 'link.' : 'links.'}
               {linkResult.stale > 0 &&
-                ` Evidence changed for ${linkResult.stale} ${linkResult.stale === 1 ? 'link' : 'links'}. Run Analyze connection to review again.`}
+                ` Evidence changed for ${linkResult.stale} ${linkResult.stale === 1 ? 'link' : 'links'}. Prepare the plan again to review them.`}
               {linkResult.newer > 0 &&
                 ` ${linkResult.newer} new or updated ${linkResult.newer === 1 ? 'link is' : 'links are'} pending review.`}
             </p>
@@ -657,6 +611,8 @@ function ConnectionDetail({
               </Button>
             </div>
           )}
+            </div>
+          </details>
           <details>
             <summary className="cursor-pointer font-medium">Recent history</summary>
             <ul className="grid gap-1 py-2 text-sm">
@@ -765,8 +721,8 @@ export function ConnectionsPage({
                     {relations[c.relation]} {c.peer.label}
                   </Link>
                   <p className="text-sm">
-                    {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status} · {c.counts.approved ?? 0} approved ·{' '}
-                    {c.counts.pending ?? 0} pending review
+                    {c.budget_held && ['running', 'queued'].includes(c.status) ? 'Waiting for review tokens' : states[c.status] ?? c.status} · {c.counts.approved ?? 0} links and proposals approved ·{' '}
+                    {c.lists?.needs_you ?? 0} need you
                   </p>
                   {c.purpose && <p className="line-clamp-2 text-sm text-muted-foreground">{c.purpose}</p>}
                 </CardBody>
