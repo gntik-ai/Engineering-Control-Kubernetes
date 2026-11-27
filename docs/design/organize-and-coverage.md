@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1 and O2 are built and deployed** ("O0 as built", "OC as built", "O1 as built" and "O2 as built", below); O3 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1, O2 and O3 are built and deployed** ("O0 as built", "OC as built", "O1 as built", "O2 as built" and "O3 as built", below); O4 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -611,3 +611,98 @@ So the goal of the phase holds on Falcone but for one Story: every open Story ha
 - **An Epic that holds a quarter of all Stories or unrelated groups is not proposed for splitting.** It is in the proposal's table for this pair; it changes the shape of the plan and belongs with creating, in O3.
 - **The old views are still there** (Planning, Reorganize). They read the same records. They go in O5.
 - **Not exercised on live:** starting a run, answering, the two one-word answers, and undoing. They are the administrator's to start. Covered by four tests of the run and looked at in a local console.
+
+## O3 as built (27 November 2026)
+
+Started at the administrator's word ("go next O3"). Both buttons of Organize now go on after the linking with a stage that creates. The stage "Create" of a run, which stood at zero, counts what was made and what was put before the administrator; the list "Created" is filled.
+
+### What each button creates
+
+**User Stories and Issues**, in this order:
+
+| What the run meets | What it does |
+| --- | --- |
+| A User Story whose Issues are all closed as done, with the proof the records hold | Puts it before the administrator to be closed. No Issue is made for finished work (decision 4). One word closes all of them |
+| Issues that two models found to fit no User Story | Groups those that lie close together and has the User Story written that they are the work of, under the Epic it belongs to. Made, the Issues are put under it |
+| A User Story no Issue is linked to | Has its Issues written (one to three, each with what is to be done and how it is known to be done); or finds its work done by closed Issues it is shown; or finds that nothing says what would have to be done. The last two are the administrator's to close or keep |
+
+**Epics and User Stories:**
+
+| What the run meets | What it does |
+| --- | --- |
+| An Epic with no open User Story | Has its Stories written from its own text, the Stories that were under it and are closed, and the documents nearest to it; or finds its work done; or finds that nothing says what it should hold, and then it is the administrator's to close or explain (decision 5). No Story is invented |
+| An Epic that is the one Epic of too many Stories | Proposes the split the Structure view proposed: its Stories in groups by meaning, each group beyond the largest an Epic of its own. Nothing is split without the administrator, who can give the new Epics their titles |
+
+### The careful review
+
+A record is made without the administrator only when all of this holds:
+
+1. **One model wrote it, and named for every sentence the records it rests on.** It is shown those records and nothing else: the User Story or Epic, the documents nearest to it, the Issues that may be its work. A sentence that names no record it was shown is left out, and then nothing of that answer is made without the administrator.
+2. **A second model, of another maker, found every sentence supported.** It is not asked to write again. It is shown the same records and what was written, sentence by sentence, and says of each: supported, not supported, or it cannot tell.
+3. **Nothing like it exists** in the project or the projects connected to it: no record of that kind with the same title, and none as close as 0.9 by meaning. The new record is read by the ranking service before it is made. Where that fails, nothing is made on words alone.
+4. **For a new User Story: an Epic it belongs under was named, and the second model agreed.**
+5. **Making records is in force:** of the records made so far, no more were taken away again than the settings accept (5% unless changed).
+
+Everything else is a case under "Needs you", with what was written, each sentence with the records it names and the check's word on it, and the records like it where there are any. The administrator makes it as written, or leaves it.
+
+These are three new checks of the engine that asks the other reviews (`new_story`, `new_issues`, `new_stories`), so a run of them is started, limited in tokens and dollars, stopped, resumed and paid for like the others, and its cost is counted under "Organize: records that were written".
+
+### Who writes
+
+Settings has one more model: **the model that writes new records**. Where none is named, the model that answers writes. What it writes is checked by the judge, or else by the model that answers, whichever is of another maker than the writer. Where neither is, every answer waits for the administrator.
+
+The proposal said writing needs a stronger model than choosing (decision 7). That is the administrator's to set: on Falcone the writer is gpt-5.6-luna today, because it is the model that answers and no other was named.
+
+### Created, and undo
+
+Every record made is a line under "Created": what it is, under what, its text, the records it was made from, and whether a run made it or the administrator. It can be taken away again for 30 days. Taken away:
+
+- an Issue or a User Story is removed again, and Issues that were put under a new Story are taken off it;
+- the record counts as wrongly made. Where more than the accepted share was, nothing more is made without the administrator, and what is written and checked waits for one word;
+- it is not written again.
+
+The proposal said a sample of what was applied is put before the administrator. Here the whole list is the sample: every made record is listed with its sources, and taking one away is the judgment.
+
+A record that was made does not get the automatic planning review a new record otherwise gets: two models have read it, and that review would ask a third time and propose records under it.
+
+### Issues reach GitHub at one word
+
+The Issues a run makes are kept here (decision 1). The page says how many wait, and one button publishes them all: each is then created on GitHub by the worker that writes every approved Issue. An Issue that was published is not taken away from here: on GitHub it is closed.
+
+### What a run would cost, said first
+
+Before it starts, the page says how many records it would write for, who writes and who checks, how many tokens that is and what it is likely to cost at the accounts' prices, without a model being asked for the estimate. Where the cost would pass the month's limit it says so, and that the run stops there with what it has (decision 7). It also says where one run stops at its tokens and the next goes on.
+
+### One word for many
+
+| | |
+| --- | --- |
+| The User Stories whose work is done | Close them |
+| What was written and only waits for a word (no second model, or making is not in force) | Make them |
+| The records nothing says anything about | Keep them open. Closing is one by one |
+| The Issues that were made | Publish them to GitHub |
+
+### Two things read on live, and corrected
+
+The administrator used both buttons after O2. Reading what was done showed two faults of O2, corrected with this phase:
+
+- **421 links in doubt were taken off one by one,** in nine minutes, because only keeping them was offered together. One word now takes them off, as one keeps them; each is a line that can be undone.
+- **Taking a link off made the check ask again about the Story's other links:** 216 Stories on Falcone, estimated at $0.33. What a model said of a link was said of that link by itself. An answer now stands when links it judged went away and nothing else changed. On live the Epics card says again that no model is asked.
+
+### Read on live
+
+| Project | What the stage would do |
+| --- | --- |
+| falcone | 389 User Stories have no Issue: 123 that a document describes, 151 that an Issue may be the work of, 115 with nothing behind them. For each its Issues would be written, or it would be found done, or found to have nothing behind it. gpt-5.6-luna writes, claude-haiku-5-5 checks. Estimated at $0.71 and 2.1 million tokens; one run stops at 1 million, so it takes two or three. The month's limit is $10, of which $6.11 is spent. No Story is delivered and still open; no Issue fits no Story; no Epic is without a Story; no split is proposed |
+| falcone-serverless | Nothing to create: every Story has an Issue and every Epic a Story. A run of the Epics button is held: the project's review tokens are used up |
+| falcone-workflow, gntik-ui, llmwiki, musematic | Nothing: they have no plan yet |
+
+The page answers in 0.3 to 1.3 seconds.
+
+### What is not in O3, and why
+
+- **No Epic is written for Stories that fit none.** The records do not let a User Story stand without an Epic: it is made under one, and its last Epic cannot be taken off. So there is no group of Stories without an Epic to write one for. A Story that was written and for which no Epic fits waits for the administrator, who chooses the Epic it is made under. A new Epic comes from a split, or from the administrator's hand.
+- **The code is not read for an Epic with no Story.** The proposal named the Epic's own text, the documentation and the code that names it. The Stories are written from the first two and the closed Stories; the code is not indexed by Epic.
+- **No split is proposed on live.** An Epic is proposed to be split when it is the one Epic of more than a tenth of the Stories, and of at least twenty. Counted by the one Epic of each Story, the largest holds 32 of 580 on Falcone and 11 of 66 on falcone-serverless. The Epic of falcone-serverless that 68% of its Stories were linked to (read in O0) is the one Epic of 11. The rule is the Structure view's own, unchanged.
+- **The old views are still there.** They go in O5.
+- **Not exercised on live:** writing, making, publishing and undoing. They are the administrator's to start, and the first asks 389 questions of two models. Covered by four tests of the stage and looked at in a local console. The search for twins by meaning asks the ranking service from the console's process for the first time; where it cannot, the cases say so and nothing is made.
