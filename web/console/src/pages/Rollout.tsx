@@ -1,8 +1,9 @@
 import { Badge, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { reviewUrl, workspaceUrl } from '../router';
+import { bugsUrl, reviewUrl, workspaceUrl } from '../router';
 import { whole } from './ChoiceRun';
+import { bugsSaid, type BugsBrief } from './BugNumbers';
 import { moved, stepUrl, type Step } from './NeedsYou';
 
 interface Moved {
@@ -25,6 +26,8 @@ export interface ProjectRow {
   drift: { day: string; before: string | null; waiting: string[]; moved: Moved[] } | null;
   /** What waits for the administrator in the project's Reviews: the rows of its one list. */
   steps: Step[];
+  /** The open bugs by severity. A bug stands apart from the plan. */
+  bugs?: BugsBrief;
 }
 
 /** No more of a project's rows than this are said in the table of all projects. */
@@ -85,6 +88,13 @@ export function Rollout() {
                       The scorer is sure of {whole(row.scorer.sure)} records and abstains on{' '}
                       {whole(row.scorer.abstains)}; {whole(row.pairs.judged)} pairs judged.
                       {row.drift?.moved.length ? ` Since ${row.drift.before}: ${moved(row.drift.moved)}.` : ''}
+                    </p>
+                  ) : null}
+                  {row.bugs ? (
+                    <p className="text-muted-foreground">
+                      <Link href={bugsUrl(row.project)}>Bugs</Link>: {bugsSaid(row.bugs).toLowerCase()}
+                      {row.bugs.new ? `, ${whole(row.bugs.new)} new and not looked at yet` : ''}
+                      {row.bugs.in_progress ? `, ${whole(row.bugs.in_progress)} in progress` : ''}.
                     </p>
                   ) : null}
                   {row.steps.length ? (

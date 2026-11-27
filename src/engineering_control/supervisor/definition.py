@@ -726,6 +726,58 @@ CATALOGUE: Final[tuple[Tool, ...]] = (
         default_mode="confirm",
         modes=("confirm",),
     ),
+    Tool(
+        "report_bug",
+        "plan",
+        "Report a bug",
+        "Report a bug the administrator described: something that should work and does "
+        "not. It becomes an issue of the project's repository with the bug label, and "
+        "belongs to no User Story and no Epic. Call it when the administrator asks for "
+        "it (“Report a bug: …”, “there is a bug in …”), with what they said and nothing "
+        "made up: leave a part out when they did not say it, and give a severity only "
+        "when they named one. It is never created at once: the administrator is shown "
+        "what you understood, with the open bugs that look alike, and confirms or "
+        "rejects it. When they did not say which project, ask.",
+        _schema(
+            {
+                "project": _PROJECT,
+                "title": {
+                    "type": "string",
+                    "maxLength": 300,
+                    "description": "The bug in one line, as a title of an issue.",
+                },
+                "happens": {
+                    "type": "string",
+                    "maxLength": 6000,
+                    "description": "What happens that is wrong.",
+                },
+                "expected": {
+                    "type": "string",
+                    "maxLength": 6000,
+                    "description": "What should have happened instead, when it was said.",
+                },
+                "steps": {
+                    "type": "string",
+                    "maxLength": 6000,
+                    "description": "How to reproduce it, one step a line, when it was said.",
+                },
+                "seen_in": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "The version, commit or place it was seen, when said.",
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low"],
+                    "description": "Only when the administrator named one.",
+                },
+                "reason": _REASON,
+            },
+            ("project", "title", "happens", "reason"),
+        ),
+        default_mode="confirm",
+        modes=("confirm",),
+    ),
 )
 TOOLS: Final = {tool.name: tool for tool in CATALOGUE}
 

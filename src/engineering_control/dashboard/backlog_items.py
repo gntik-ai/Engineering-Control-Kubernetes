@@ -754,9 +754,19 @@ class BacklogItems:
                 else:
                     counts["updated"] += 1
                     if item.issue_state == "closed":
-                        # Reopened on GitHub: it is to be decided on again.
+                        # Reopened on GitHub: it is to be decided on again, and the item
+                        # says that it came back.
                         item.state = "proposed"
                         counts["reopened"] += 1
+                        try:
+                            before = int((item.facts or {}).get("reopened") or 0)
+                        except (TypeError, ValueError):
+                            before = 0
+                        item.facts = {
+                            **(item.facts or {}),
+                            "reopened": before + 1,
+                            "reopened_at": datetime.now(UTC).isoformat(),
+                        }
                 item.title = clean_title(issue.title or f"Issue {issue.number}")
                 item.issue_url = issue.url[:300] or None
                 item.issue_state = "open"

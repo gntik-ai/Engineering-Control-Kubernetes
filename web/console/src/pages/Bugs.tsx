@@ -26,9 +26,9 @@ import { ApiError, apiUrl, postJson, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
 import { BASE, RouterLink, automationUrl, navigate, queueUrl } from '../router';
 import { BugLinks } from './BugLinks';
+import { BugNumbers, SEVERE, SEVERITIES, type Narrowed, type Severity } from './BugNumbers';
 import { some, whole } from './ChoiceRun';
 
-type Severity = 'critical' | 'high' | 'medium' | 'low';
 type Triage = 'new' | 'confirmed' | 'in_progress' | 'fixed' | 'duplicate' | 'wont_fix' | 'closed';
 type PartKey = 'happens' | 'expected' | 'steps' | 'seen_in';
 interface Overview {
@@ -83,6 +83,11 @@ interface Bug extends Brief {
   severity: Severity | null;
   area: string | null;
   seen_in: string | null;
+  /** What introduced it, when known; a regression by that or by a label of its issue. */
+  caused_by?: string | null;
+  regression?: boolean;
+  /** How often it was opened again after it had been closed. */
+  reopened?: number;
   duplicate_of: Brief | null;
   alike: (Brief & { likeness: number })[];
   confirmed: boolean;
@@ -103,13 +108,6 @@ type Shown = 'open' | 'new' | 'confirmed' | 'in_progress' | 'closed' | '';
 type Sort = 'newest' | 'oldest' | 'updated' | 'severity';
 type Reason = 'fixed' | 'wont_fix' | 'duplicate';
 
-const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low'];
-const SEVERE: Record<Severity, { says: string; tone: 'destructive' | 'warning' | 'info' | 'neutral' }> = {
-  critical: { says: 'Critical', tone: 'destructive' },
-  high: { says: 'High', tone: 'warning' },
-  medium: { says: 'Medium', tone: 'info' },
-  low: { says: 'Low', tone: 'neutral' },
-};
 const STATE_TONE: Record<Triage, 'success' | 'info' | 'neutral' | 'warning'> = {
   new: 'warning',
   confirmed: 'info',
@@ -409,10 +407,11 @@ function Decide({
   const [severity, setSeverity] = useState<Severity | ''>(bug.severity ?? '');
   const [area, setArea] = useState(bug.area ?? '');
   const [seen, setSeen] = useState(bug.seen_in ?? '');
+  const [cause, setCause] = useState(bug.caused_by ?? '');
   const change = useChange(onDone);
   const submit = () =>
     change.run(async () => {
-      await postJson(`${base}/${bug.id}/triage`, { severity, area, seen_in: seen });
+      await postJson(`${base}/${bug.id}/triage`, { severity, area, seen_in: seen, caused_by: cause });
       return severity
         ? `${named(bug)} is confirmed, with severity ${SEVERE[severity].says.toLowerCase()}${bug.number ? ', which is on the issue as a label' : ''}.`
         : `${named(bug)} has no severity and stands as new.`;
@@ -447,6 +446,14 @@ function Decide({
       <Field>
         <FieldLabel htmlFor="bug-seen">Where it was seen (optional)</FieldLabel>
         <Input id="bug-seen" value={seen} onValueChange={setSeen} maxLength={200} />
+      </Field>
+      <Field>
+        <FieldLabel htmlFor="bug-cause">What caused it, when known (optional)</FieldLabel>
+        <Input id="bug-cause" value={cause} onValueChange={setCause} maxLength={200} />
+        <p className="text-xs text-muted-foreground">
+          The pull request or the commit that introduced it. Naming one makes the bug a regression; it is kept here and
+          not written to GitHub.
+        </p>
       </Field>
     </FormDialog>
   );
@@ -570,6 +577,16 @@ function Row({
         <Badge tone={STATE_TONE[bug.triage]} size="sm">
           {bug.says}
         </Badge>
+        {bug.regression ? (
+          <Badge tone="warning" size="sm">
+            Regression
+          </Badge>
+        ) : null}
+        {bug.reopened ? (
+          <Badge tone="neutral" size="sm">
+            Came back{bug.reopened > 1 ? ` ${bug.reopened} times` : ''}
+          </Badge>
+        ) : null}
         {bug.severity ? (
           <Badge tone={SEVERE[bug.severity].tone} size="sm">
             {SEVERE[bug.severity].says}
@@ -591,6 +608,7 @@ function Row({
           </span>
         ) : null}
         {bug.seen_in ? <span>Seen in {bug.seen_in}</span> : null}
+        {bug.caused_by ? <span>Caused by {bug.caused_by}</span> : null}
         <span>{bug.confirmed ? 'A bug by your word' : 'A bug by its label, type or title'}</span>
       </div>
       {bug.duplicate_of ? <p className="text-muted-foreground">Duplicate of {named(bug.duplicate_of)}.</p> : null}
@@ -716,6 +734,7 @@ export function BugsPage({ project }: { project: string }) {
   const [shown, setShown] = useState<Shown>('open');
   const [severity, setSeverity] = useState<Severity | 'none' | ''>('');
   const [area, setArea] = useState('');
+  const [mark, setMark] = useState<'' | 'regression' | 'reopened'>('');
   const [sort, setSort] = useState<Sort>('newest');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
@@ -727,7 +746,7 @@ export function BugsPage({ project }: { project: string }) {
   const [problem, setProblem] = useState<string | null>(null);
   const overview = useResource<Overview>(apiUrl(base), 15000, { keepPreviousData: true });
   const list = useResource<Listing>(
-    apiUrl(base + '/records', { state: shown, severity, area, sort, search, page }),
+    apiUrl(base + '/records', { state: shown, severity, area, mark, sort, search, page }),
     15000,
     { keepPreviousData: true },
   );
@@ -789,6 +808,17 @@ export function BugsPage({ project }: { project: string }) {
     change();
     setPage(1);
     setPicked(new Set());
+  };
+  /** A number of the page leads to the list, narrowed to exactly what it counts. */
+  const show = (narrowed: Narrowed) => {
+    narrow(() => {
+      setShown(narrowed.state);
+      setSeverity(narrowed.severity ?? '');
+      setArea(narrowed.area ?? '');
+      setMark(narrowed.mark ?? '');
+      setSearch('');
+    });
+    document.getElementById('bug-list')?.scrollIntoView({ block: 'start' });
   };
   const states = Object.fromEntries((data?.states ?? []).map((entry) => [entry.state, entry.count]));
   const severe = Object.fromEntries((data?.severities ?? []).map((entry) => [entry.severity, entry.open]));
@@ -897,8 +927,9 @@ export function BugsPage({ project }: { project: string }) {
               </CardBody>
             </Card>
           ) : null}
+          <BugNumbers project={project} onShow={show} />
           {data.linked ? <BugLinks project={project} onChanged={reload} /> : null}
-          <Card>
+          <Card id="bug-list" className="scroll-mt-20">
             <CardHeader>
               <CardTitle>The bugs</CardTitle>
             </CardHeader>
@@ -949,11 +980,27 @@ export function BugsPage({ project }: { project: string }) {
                       options={[
                         ['', 'Any'],
                         ...data.areas.slice(0, 8).map((entry): [string, string] => [entry, entry]),
+                        // An area a number led to, beyond the ones offered here.
+                        ...(area && area !== 'none' && !data.areas.slice(0, 8).includes(area)
+                          ? [[area, area] as [string, string]]
+                          : []),
+                        ['none', 'None yet'],
                       ]}
                       onChange={(next) => narrow(() => setArea(next))}
                     />
                   </>
                 ) : null}
+                <span className="ms-2 text-xs text-muted-foreground">Only</span>
+                <Choice
+                  label="Only"
+                  value={mark}
+                  options={[
+                    ['', 'All of them'],
+                    ['regression', 'Regressions'],
+                    ['reopened', 'Those that came back'],
+                  ]}
+                  onChange={(next) => narrow(() => setMark(next))}
+                />
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-xs text-muted-foreground">Order</span>

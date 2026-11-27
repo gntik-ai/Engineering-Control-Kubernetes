@@ -334,6 +334,36 @@ def why_no_fix(item: BacklogItem, record: BugRecord | None, fix: dict[str, Any])
     return None
 
 
+REGRESSION: Final = "regression"
+# How the list is asked for the bugs that have no area.
+NO_AREA: Final = "none"
+
+
+def is_regression(item: BacklogItem, record: BugRecord | None) -> bool:
+    """A bug that something broke: what caused it is known, or its issue is labelled a
+    regression."""
+    if record is not None and record.caused_by:
+        return True
+    return any(label.casefold() == REGRESSION for label in _labels(item))
+
+
+def reopened(item: BacklogItem) -> int:
+    """How often the bug was opened again after it had been closed, since that is kept."""
+    try:
+        return max(0, int((item.facts or {}).get("reopened") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def note_reopened(item: BacklogItem, now: datetime | None = None) -> None:
+    """The issue was closed and is open again: said on the item."""
+    item.facts = {
+        **(item.facts or {}),
+        "reopened": reopened(item) + 1,
+        "reopened_at": (now or datetime.now(UTC)).isoformat(),
+    }
+
+
 def _bugs(db: Session, project: ProjectRecord) -> list[BacklogItem]:
     """Every bug of the project, whatever its plan knows of it."""
     return list(
@@ -477,6 +507,11 @@ def _row(
         "severity": severity_of(item, record),
         "area": area_of(item, record),
         "seen_in": record.seen_in if record else None,
+        # What introduced it, when known; and whether it is a regression, by that or by
+        # a label on its issue. How often it came back after it had been closed.
+        "caused_by": record.caused_by if record else None,
+        "regression": is_regression(item, record),
+        "reopened": reopened(item),
         "duplicate_of": _brief(other) if other is not None else None,
         "alike": [
             {**_brief(known[key]), "likeness": round(likeness, 3)}
@@ -527,6 +562,77 @@ def _engine(db: Session, project: ProjectRecord) -> dict[str, Any]:
         "flow": {"key": found[0].key, "name": found[0].name} if found is not None else None,
         "refused": why,
     }
+
+
+def check_report(
+    db: Session, project: ProjectRecord, title: str, parts: dict[str, str], severity: str | None
+) -> str:
+    """Whether a bug can be reported as it is written, whoever writes it: the title as
+    it will be kept, or the refusal."""
+    if severity is not None and severity not in SEVERITIES:
+        raise ProjectInvalid("A severity is critical, high, medium or low.")
+    if not project.source_repository:
+        raise ProjectInvalid("This project has no repository to report a bug in.")
+    if not (parts.get("happens") or "").strip():
+        raise ProjectInvalid("Say what happens.")
+    cleaned = clean_title(title)
+    same = next(
+        (
+            item
+            for item in _bugs(db, project)
+            if _stands(item) != "closed" and item.title.casefold() == cleaned.casefold()
+        ),
+        None,
+    )
+    if same is not None:
+        known = f"#{same.issue_number}" if same.issue_number else "being created"
+        raise ProjectConflict(f"A bug with this title is open already: {known}.")
+    return cleaned
+
+
+def alike_open(db: Session, project: ProjectRecord, title: str, text: str) -> list[BacklogItem]:
+    """The open bugs that share the most words with a bug as it is written."""
+    open_bugs = [item for item in _bugs(db, project) if _stands(item) != "closed"]
+    known = {item.id: item for item in open_bugs}
+    return [known[key] for _share, key in alike_by_words(title, text, open_bugs)[:SHOWN_ALIKE]]
+
+
+def draft_report(
+    sessions: sessionmaker[Session],
+    name: str,
+    title: str,
+    parts: dict[str, str],
+    severity: str | None,
+) -> tuple[UUID, UUID]:
+    """Keep a bug as it was reported, and queue the creation of its issue on GitHub,
+    with the ``bug`` label and the severity it was given. Returns the bug and what is
+    queued: whoever can reach GitHub carries it out at once, and the worker that retries
+    what GitHub did not take does within half a minute otherwise."""
+    with sessions.begin() as db:
+        project = active_project(db, name, lock=True)
+        cleaned = check_report(db, project, title, parts, severity)
+        item = BacklogItem(
+            project_id=project.id,
+            source="manual",
+            state="proposed",
+            # Reporting is the administrator's word for creating it.
+            workspace_review="publishing",
+            title=cleaned,
+            description=clean_description(body_of(parts)),
+            execution_type="bug",
+            type_confirmed=True,
+            classification_reason="Reported as a bug by the administrator.",
+        )
+        db.add(item)
+        db.flush()
+        seen = " ".join((parts.get("seen_in") or "").split())[:200] or None
+        if severity or seen:
+            record = _record(db, project, item.id)
+            record.seen_in = seen
+            if severity:
+                record.severity, record.confirmed_at = severity, datetime.now(UTC)
+        action = enqueue(db, project.id, "create", item.id, project.source_repository)
+        return item.id, action.id
 
 
 class BugSection:
@@ -626,10 +732,13 @@ class BugSection:
         page_size: int,
         severity: str = "",
         area: str = "",
+        mark: str = "",
     ) -> dict[str, Any]:
         """The project's bugs: open, closed, in one state of triage, or all; of one
-        severity or area; the newest first, the oldest, the last changed, or the most
-        severe. An open bug comes with the open bugs that lie closest to it in meaning."""
+        severity or area (``none`` for those that have no area); only the regressions,
+        or only those that came back after they had been closed; the newest first, the
+        oldest, the last changed, or the most severe. An open bug comes with the open
+        bugs that lie closest to it in meaning."""
         wanted = " ".join(search.split()).casefold()
         with self.sessions() as db:
             project = active_project(db, name)
@@ -655,7 +764,12 @@ class BugSection:
                 mine = severity_of(item, record)
                 if severity and (mine or "none") != severity:
                     continue
-                if area and (area_of(item, record) or "").casefold() != area.casefold():
+                mine_area = (area_of(item, record) or "").casefold()
+                if area and mine_area != ("" if area == NO_AREA else area.casefold()):
+                    continue
+                if mark == "regression" and not is_regression(item, record):
+                    continue
+                if mark == "reopened" and not reopened(item):
                     continue
                 if wanted and not (
                     wanted in item.title.casefold()
@@ -720,48 +834,7 @@ class BugSection:
     def _draft(
         self, name: str, title: str, parts: dict[str, str], severity: str | None
     ) -> tuple[UUID, UUID]:
-        if severity is not None and severity not in SEVERITIES:
-            raise ProjectInvalid("A severity is critical, high, medium or low.")
-        with self.sessions.begin() as db:
-            project = active_project(db, name, lock=True)
-            if not project.source_repository:
-                raise ProjectInvalid("This project has no repository to report a bug in.")
-            if not (parts.get("happens") or "").strip():
-                raise ProjectInvalid("Say what happens.")
-            cleaned = clean_title(title)
-            same = next(
-                (
-                    item
-                    for item in _bugs(db, project)
-                    if _stands(item) != "closed" and item.title.casefold() == cleaned.casefold()
-                ),
-                None,
-            )
-            if same is not None:
-                known = f"#{same.issue_number}" if same.issue_number else "being created"
-                raise ProjectConflict(f"A bug with this title is open already: {known}.")
-            item = BacklogItem(
-                project_id=project.id,
-                source="manual",
-                state="proposed",
-                # Reporting is the administrator's word for creating it.
-                workspace_review="publishing",
-                title=cleaned,
-                description=clean_description(body_of(parts)),
-                execution_type="bug",
-                type_confirmed=True,
-                classification_reason="Reported as a bug by the administrator.",
-            )
-            db.add(item)
-            db.flush()
-            seen = " ".join((parts.get("seen_in") or "").split())[:200] or None
-            if severity or seen:
-                record = _record(db, project, item.id)
-                record.seen_in = seen
-                if severity:
-                    record.severity, record.confirmed_at = severity, datetime.now(UTC)
-            action = enqueue(db, project.id, "create", item.id, project.source_repository)
-            return item.id, action.id
+        return draft_report(self.sessions, name, title, parts, severity)
 
     async def report(
         self,
@@ -811,6 +884,8 @@ class BugSection:
             item.title = clean_title(str(snapshot.get("title") or item.title))
             item.description = clean_description(snapshot.get("body"))
             state = "closed" if snapshot.get("state") == "closed" else "open"
+            if state == "open" and item.issue_state == "closed":
+                note_reopened(item)
             closed = _when(snapshot.get("closed_at"))
             item.issue_state = state
             item.github_closed_at = closed if state == "closed" else None
@@ -869,7 +944,13 @@ class BugSection:
     # ------------------------------------------------------------------- triage
 
     def _decided(
-        self, name: str, key: UUID, severity: str | None, area: str | None, seen_in: str | None
+        self,
+        name: str,
+        key: UUID,
+        severity: str | None,
+        area: str | None,
+        seen_in: str | None,
+        caused_by: str | None = None,
     ) -> tuple[str | None, int | None, str | None]:
         """Keep what was decided about the bug. Returns where its issue is and the
         severity it has now, for GitHub to be told."""
@@ -890,6 +971,8 @@ class BugSection:
                 record.area = " ".join(area.split())[:60] or None
             if seen_in is not None:
                 record.seen_in = " ".join(seen_in.split())[:200] or None
+            if caused_by is not None:
+                record.caused_by = " ".join(caused_by.split())[:200] or None
             record.updated_at = datetime.now(UTC)
             return (
                 (item.repository or project.source_repository) if item.issue_number else None,
@@ -913,8 +996,10 @@ class BugSection:
         severity: str | None = None,
         area: str | None = None,
         seen_in: str | None = None,
+        caused_by: str | None = None,
     ) -> dict[str, Any]:
-        """Say how severe a bug is, which area it is in and where it was seen. Giving a
+        """Say how severe a bug is, which area it is in, where it was seen and, when it is
+        known, what caused it, which makes it a regression. Giving a
         severity confirms the bug; an empty severity takes the confirmation back. The
         severity is put on the issue as a label first; where GitHub does not take it,
         nothing is changed here either. ``None`` leaves a thing as it is."""
@@ -939,7 +1024,7 @@ class BugSection:
             except GitHubAppError as error:
                 raise ProjectConflict(str(error)) from error
             await asyncio.to_thread(self._labelled, name, key, labels)
-        await asyncio.to_thread(self._decided, name, key, severity, area, seen_in)
+        await asyncio.to_thread(self._decided, name, key, severity, area, seen_in, caused_by)
         return {"id": str(key), "severity": severity, "area": area}
 
     def _where(self, name: str, key: UUID) -> tuple[str | None, int | None]:

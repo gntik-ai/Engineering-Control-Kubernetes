@@ -703,6 +703,8 @@ class BugTriageInput(PlainChangeInput):
     severity: Literal["", "critical", "high", "medium", "low"] | None = None
     area: str | None = Field(default=None, max_length=60)
     seen_in: str | None = Field(default=None, max_length=200)
+    # The pull request or commit that introduced the bug: what makes it a regression.
+    caused_by: str | None = Field(default=None, max_length=200)
 
 
 class BugSeveralInput(PlainChangeInput):

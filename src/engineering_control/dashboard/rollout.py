@@ -28,6 +28,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard import bug_numbers
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.needs_you import NeedsYou
 from engineering_control.dashboard.planning import _visible_issues
@@ -121,6 +122,9 @@ def _row(db: Session, project: ProjectRecord, steps: list[dict[str, str]]) -> di
         "states": {key: int(value) for key, value in states.items()},
         "drift": moved,
         "steps": steps,
+        # The open bugs by severity: a bug stands apart from the plan, and a project
+        # without a plan has bugs too.
+        "bugs": bug_numbers.brief(db, project),
     }
 
 

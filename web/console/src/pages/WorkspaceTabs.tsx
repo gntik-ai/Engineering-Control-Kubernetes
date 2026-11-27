@@ -35,6 +35,7 @@ import { querySort, sortParams } from '../components/table-order';
 import { LayoutSwitch, PlanningGrid, type Layout } from './PlanningGrid';
 import { NewEpicDialog } from './NewEpicDialog';
 import { PlanningLinkNote, type ParentLink } from './PlanningLinkNote';
+import { BugsInShort } from './BugNumbers';
 import { PlanningHealth } from './PlanningHealth';
 import { BugLinks } from './BugLinks';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
@@ -794,6 +795,7 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
               </dd>
             </div>
           </dl>
+          {tab === 'home' && <BugsInShort project={project.project} />}
           {tab === 'home' && <PlanningHealth project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
         </TabsPanel>

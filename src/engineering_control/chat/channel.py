@@ -1,11 +1,11 @@
 """The chat channel: one conversation with the administrator in a messaging app.
 
 It carries three kinds of message. What the administrator writes: a fixed command
-(``/status``, ``/inbox``, ``/runs``, ``/queues``, ``/digest``, ``/help``) is answered by the
-platform itself; anything else is a message to the supervisor, in the same conversation as
-the console's panel. What the platform tells them: the supervisor's replies to what they
-wrote here, things that wait for them, runs that failed, queues that stopped. And once a
-day, a digest.
+(``/status``, ``/inbox``, ``/runs``, ``/queues``, ``/bugs``, ``/digest``, ``/help``) is
+answered by the platform itself; anything else is a message to the supervisor, in the same
+conversation as the console's panel. What the platform tells them: the supervisor's replies
+to what they wrote here, things that wait for them, runs that failed, queues that stopped,
+a critical bug that arrived. And once a day, a digest.
 
 Only the administrator is answered: one user id, in a private chat. Anyone else is ignored
 without a reply. What the supervisor proposed can be accepted or rejected with a button;
@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import auto_checks
+from engineering_control.dashboard import auto_checks, bug_numbers
 from engineering_control.dashboard.planning_drift import digest_lines
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -57,10 +57,13 @@ HELP: Final = (
     "/inbox — everything that waits for you\n"
     "/runs — the latest runs\n"
     "/queues — the queues and how far they are\n"
+    "/bugs — the open bugs of every project, by severity\n"
     "/digest — the last day in short\n"
     "/help — this text"
 )
 STALE: Final = timedelta(minutes=2)
+# How often the bugs are looked at for a critical one that arrived.
+BUGS_EVERY: Final = timedelta(minutes=1)
 OUTCOMES: Final = {
     "applied": "done at once",
     "accepted": "accepted by you",
@@ -112,6 +115,8 @@ class ChatChannel:
         self.queues = queues
         self.console_url = console_url.rstrip("/") if console_url else None
         self.digest_hour = digest_hour
+        # When the bugs were last looked at for a critical one that arrived.
+        self._bugs_looked: datetime | None = None
 
     # --- what it remembers ---------------------------------------------------------------
 
@@ -186,6 +191,8 @@ class ChatChannel:
             await self.transport.send(self.administrator_id, self.latest_runs())
         elif command == "/queues":
             await self.transport.send(self.administrator_id, self.queue_summary())
+        elif command == "/bugs":
+            await self.transport.send(self.administrator_id, self.bugs())
         elif command == "/digest":
             await self.transport.send(self.administrator_id, self.digest(datetime.now(UTC)))
         elif command is not None:
@@ -335,6 +342,22 @@ class ChatChannel:
             lines.append(line)
         return "\n".join(lines) + self._link("queues")
 
+    def bugs(self) -> str:
+        """The open bugs of every project, by severity. To report one, the administrator
+        writes it to the supervisor, which shows what it understood before anything is
+        created."""
+        with self.sessions() as session:
+            lines = [
+                f"- **{project.name}**: {bug_numbers.said(numbers)}"
+                + (f", {numbers['new']} new" if numbers["new"] else "")
+                + (f", {numbers['in_progress']} in progress" if numbers["in_progress"] else "")
+                + "."
+                for project in bug_numbers._projects(session)
+                if (numbers := bug_numbers.brief(session, project))["open"]
+            ]
+        told = "\n".join(["**Open bugs**", *lines]) if lines else "No bug is open."
+        return told + "\nTo report one, write: Report a bug in <project>: what happens."
+
     def digest(self, now: datetime) -> str:
         """The last day in short: what ran, what the supervisor did, what waits."""
         since = now - timedelta(hours=24)
@@ -393,6 +416,8 @@ class ChatChannel:
         lines.extend(digest_lines(self.sessions))
         # What the checks that run by themselves asked, and what it cost.
         lines.extend(auto_checks.digest_lines(self.sessions, since))
+        # The bugs that arrived and were fixed, and what is open.
+        lines.extend(bug_numbers.digest_lines(self.sessions, since))
         waiting = [
             entry
             for entry in self.toolbox.inbox_entries()
@@ -425,8 +450,36 @@ class ChatChannel:
                 sent += 1
         return sent
 
+    def _critical_bugs(self, since: datetime) -> list[dict[str, Any]]:
+        """The critical bugs that were not told yet. Looked for once a minute: issues
+        are read from GitHub every few minutes, so nothing arrives sooner."""
+        now = datetime.now(UTC)
+        if self._bugs_looked is not None and now - self._bugs_looked < BUGS_EVERY:
+            return []
+        self._bugs_looked = now
+        with self.sessions() as session:
+            told = frozenset(
+                session.scalars(select(ChatDelivery.ref).where(ChatDelivery.kind == "bug_critical"))
+            )
+        return bug_numbers.critical(self.sessions, since, told)
+
     def _news(self, since: datetime) -> list[tuple[str, str, str, list[tuple[str, str]] | None]]:
         news: list[tuple[str, str, str, list[tuple[str, str]] | None]] = []
+        # A critical bug is told at once, each one once: one that a label on GitHub
+        # calls critical and nobody gave a severity here.
+        for bug in self._critical_bugs(since):
+            known = f"#{bug['number']} " if bug["number"] else ""
+            news.append(
+                (
+                    "bug_critical",
+                    str(bug["id"]),
+                    f"A critical bug in {bug['project_name']}: **{known}{bug['title']}**. It "
+                    "is new: nobody gave it a severity here yet."
+                    + (f"\n{bug['url']}" if bug["url"] else "")
+                    + self._link(f"workspace/{bug['project']}/bugs"),
+                    None,
+                )
+            )
         with self.sessions() as session:
             # The supervisor's replies to what was written here, and turns of this channel
             # that could not be answered.

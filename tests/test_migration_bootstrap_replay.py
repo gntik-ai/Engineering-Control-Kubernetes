@@ -72,7 +72,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0091 keeps how far each kind of change goes without the administrator.
     # 0092 keeps which checks a project runs by itself.
     # 0093 keeps what a judge said to each proposed planning record.
-    assert (head, parent) == ("0093", "0092")
+    # 0094 keeps what caused a bug, when it is known.
+    assert (head, parent) == ("0094", "0093")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -181,6 +182,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     command.downgrade(config, parent)
+    assert "caused_by" not in {
+        column["name"] for column in inspect(engine).get_columns("bug_records")
+    }
+    command.downgrade(config, "0092")
     assert "judged" not in {
         column["name"] for column in inspect(engine).get_columns("workspace_candidates")
     }

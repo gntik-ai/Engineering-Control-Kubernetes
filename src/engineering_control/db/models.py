@@ -1243,8 +1243,9 @@ class StructureDecision(UUIDPrimaryKey, Timestamps, Base):
 
 class BugRecord(UUIDPrimaryKey, Timestamps, Base):
     """What the administrator decided about one bug beyond what its issue says (migration
-    0083): its severity, the area of the code it is in, where it was seen, and the bug it
-    duplicates. Whether it is open or closed, and why, stays with its issue."""
+    0083): its severity, the area of the code it is in, where it was seen, what caused it,
+    and the bug it duplicates. Whether it is open or closed, and why, stays with its
+    issue."""
 
     __tablename__ = "bug_records"
     project_id: Mapped[UUID] = mapped_column(
@@ -1259,6 +1260,9 @@ class BugRecord(UUIDPrimaryKey, Timestamps, Base):
     duplicate_of: Mapped[UUID | None] = mapped_column(Uuid)
     # When the administrator said it is a bug to be dealt with, by giving it a severity.
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The pull request or commit that introduced it, when known (migration 0094): what
+    # makes a bug a regression.
+    caused_by: Mapped[str | None] = mapped_column(String(200))
     __table_args__ = (UniqueConstraint("project_id", "item_id", name="uq_bug_records_item"),)
 
 

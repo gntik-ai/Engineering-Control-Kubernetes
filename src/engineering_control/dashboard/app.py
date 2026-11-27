@@ -32,6 +32,7 @@ from fastapi.responses import (
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard import (
+    bug_numbers,
     doc_inventory,
     evidence_verdicts,
     parent_choice,
@@ -1763,6 +1764,7 @@ def create_app(
         sort: Literal["newest", "oldest", "updated", "severity"] = "newest",
         severity: Literal["", "critical", "high", "medium", "low", "none"] = "",
         area: str = Query("", max_length=60),
+        mark: Literal["", "regression", "reopened"] = "",
         page: int = Query(1, ge=1),
         page_size: int = Query(20, ge=1, le=100),
     ) -> Response:
@@ -1770,8 +1772,16 @@ def create_app(
         return await documents_read(
             request,
             lambda: repo(request).bug_section.listing(
-                name, state, search, sort, page, page_size, severity, area
+                name, state, search, sort, page, page_size, severity, area, mark
             ),
+        )
+
+    @app.get("/api/dashboard/projects/{name}/bugs/numbers")
+    async def bugs_numbers_api(name: str, request: Request) -> Response:
+        """The project's bugs in numbers: open by severity and area, how old, how long a
+        fix takes, what came back, and what is a regression."""
+        return await documents_read(
+            request, lambda: bug_numbers.report(repo(request).sessions, name)
         )
 
     @app.get("/api/dashboard/projects/{name}/bugs/similar")
@@ -1852,6 +1862,7 @@ def create_app(
                 severity=body.severity,
                 area=body.area,
                 seen_in=body.seen_in,
+                caused_by=body.caused_by,
             ),
             event="workspace.bug_triaged",
             subject=name,

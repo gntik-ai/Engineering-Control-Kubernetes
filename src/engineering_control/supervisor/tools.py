@@ -31,6 +31,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.accounts import Accounts
 from engineering_control.dashboard.backlog_items import OPEN_STATES, BacklogItems, clean_title
+from engineering_control.dashboard.bug_section import (
+    PARTS as BUG_PARTS,
+)
+from engineering_control.dashboard.bug_section import (
+    alike_open,
+    check_report,
+    draft_report,
+)
 from engineering_control.dashboard.execution_plans import ExecutionPlans
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -1103,6 +1111,44 @@ class Toolbox:
                 f"{titles}{more}.",
                 project=project,
             )
+        if name == "report_bug":
+            target = str(project or "")
+            parts = self._bug_parts(arguments)
+            severity = str(arguments.get("severity") or "") or None
+            with self.sessions() as db:
+                reported_in = active_project(db, target)
+                title = check_report(
+                    db, reported_in, str(arguments.get("title") or ""), parts, severity
+                )
+                # By the title alone: a long report shares few of its words with any bug.
+                alike = alike_open(db, reported_in, title, "")
+            # What was understood, for the administrator to read before anything is
+            # created: each part that was said, and the open bugs that look alike.
+            said = [
+                f"{heading}: {_words(parts[key], 150)}"
+                for key, heading in BUG_PARTS
+                if key in parts
+            ]
+            if alike:
+                said.append(
+                    "Open bugs that look alike: "
+                    + "; ".join(
+                        (f"#{bug.issue_number} " if bug.issue_number else "")
+                        + _words(bug.title, 60)
+                        for bug in alike
+                    )
+                )
+            return Intent(
+                f"Report a bug in {target}"
+                + (f", severity {severity}" if severity else "")
+                + f": {title}",
+                project=target,
+                confirm=_words(
+                    "Accepting creates the issue on GitHub, with the bug label. "
+                    + " | ".join(said),
+                    600,
+                ),
+            )
         if name == "route_item":
             item = self.backlog.get(_uuid(arguments.get("item"), "an item"))
             if item["state"] not in OPEN_STATES:
@@ -1363,7 +1409,31 @@ class Toolbox:
             "state": "in force",
         }
 
+    @staticmethod
+    def _bug_parts(arguments: dict[str, Any]) -> dict[str, str]:
+        """The parts of a bug's report that were said, as its issue's text is made of."""
+        return {
+            key: str(arguments[key]).strip()
+            for key, _heading in BUG_PARTS
+            if isinstance(arguments.get(key), str) and arguments[key].strip()
+        }
+
     def _perform(self, name: str, arguments: dict[str, Any], run_id: UUID | None = None) -> Any:
+        if name == "report_bug":
+            # Kept here and queued: the worker that writes to GitHub creates the issue,
+            # with the bug label and the severity, within half a minute.
+            reported, _action = draft_report(
+                self.sessions,
+                str(arguments["project"]),
+                str(arguments["title"]),
+                self._bug_parts(arguments),
+                str(arguments.get("severity") or "") or None,
+            )
+            return {
+                "bug": str(reported),
+                "created": "Its issue is being created on GitHub; it has a number within "
+                "a minute, on the project's Bugs page.",
+            }
         if name == "remember_approach":
             return self.learning.approach(arguments)
         if name == "propose_process_issue":
