@@ -1,7 +1,7 @@
 import { Badge, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { bugsUrl, reviewUrl, workspaceUrl } from '../router';
+import { bugsUrl, workspaceUrl } from '../router';
 import { whole } from './ChoiceRun';
 import { bugsSaid, type BugsBrief } from './BugNumbers';
 import { moved, stepUrl, type Step } from './NeedsYou';
@@ -58,7 +58,7 @@ export function Rollout() {
               Issues are read from GitHub every few minutes; a new one is read by the ranking service, scored and shown
               with its closest User Story without anyone asking. Once a day everything is worked out again and compared
               with the day before. What waits for you in a project is in its row, the first of it; the whole list is
-              the project's Reviews, Needs you.
+              the project's Dashboard.
             </p>
             <ul className="grid gap-3">
               {data.projects.map((row) => (
@@ -106,7 +106,7 @@ export function Rollout() {
                       ))}
                       {row.steps.length > SHOWN ? (
                         <li>
-                          <Link href={reviewUrl(row.project, 'needs-you')}>
+                          <Link href={workspaceUrl(row.project) + '#waits'}>
                             And {whole(row.steps.length - SHOWN)} more
                           </Link>
                         </li>

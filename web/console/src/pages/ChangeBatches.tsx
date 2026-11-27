@@ -62,6 +62,8 @@ interface Overview {
     about: string;
     error: number;
     ready: number;
+    /** A run of Organize carries this kind out itself: no new batch of it is offered. */
+    organized?: boolean;
     measured: Measured;
     open: Batch | null;
     /** For what may be applied without the administrator: how far it goes, and the record. */
@@ -289,7 +291,9 @@ export function ChangeBatches({ project }: { project: string }) {
     }
   }
 
-  const nothing = data ? data.kinds.every((kind) => !kind.ready && !kind.open) : false;
+  // What a run of Organize does case by case is not offered as a new batch here.
+  const offered = (data?.kinds ?? []).filter((kind) => kind.open || (kind.ready && !kind.organized));
+  const nothing = data ? !offered.length : false;
   return (
     <Card>
       <CardHeader>
@@ -305,54 +309,53 @@ export function ChangeBatches({ project }: { project: string }) {
         ) : (
           <>
             <p className="text-sm text-muted-foreground">
-              Where the scorer is sure, its changes are gathered here by kind. Nothing is applied until you approve a
-              batch. A batch opens with a sample of its lines to judge; an approved batch can be undone as a whole for{' '}
-              {whole(data.undo_days)} days. Bugs are never in a batch.
+              Changes that are decided together are gathered here by kind: reasons of links to record, and records
+              nothing stands behind to close. Nothing is applied until you approve a batch. A batch opens with a sample
+              of its lines to judge; an approved batch can be undone as a whole for {whole(data.undo_days)} days. Bugs
+              are never in a batch.
               {nothing
-                ? ' Nothing is ready for this project: the scorer abstains on what is open here. Judging the pairs below, and approving answers in the worklists, is what it learns from.'
+                ? ' Nothing waits here. Placing Issues, choosing the one Epic of a User Story, taking links off and closing delivered User Stories are done by the two buttons above, case by case.'
                 : ''}
             </p>
-            {data.kinds
-              .filter((kind) => kind.ready || kind.open)
-              .map((kind) => (
-                <section key={kind.kind} className="grid gap-2">
-                  <h3 className="text-sm font-semibold text-foreground">{kind.title}</h3>
+            {offered.map((kind) => (
+              <section key={kind.kind} className="grid gap-2">
+                <h3 className="text-sm font-semibold text-foreground">{kind.title}</h3>
+                <p className="text-sm text-muted-foreground">
+                  {kind.about} {measuredText(kind.open ? kind.open.measured : kind.measured)}
+                </p>
+                {kind.open ? (
+                  <OpenBatch project={project} batch={kind.open} onChanged={overview.reload} />
+                ) : (
+                  <div>
+                    <Button
+                      size="sm"
+                      loading={busy === kind.kind}
+                      disabled={Boolean(busy)}
+                      onClick={() => void prepare(kind.kind)}
+                    >
+                      Review {some(kind.ready, 'change', 'changes')}
+                    </Button>
+                  </div>
+                )}
+                {kind.open && kind.ready && !kind.organized ? (
                   <p className="text-sm text-muted-foreground">
-                    {kind.about} {measuredText(kind.open ? kind.open.measured : kind.measured)}
+                    {some(kind.ready, 'more change is', 'more changes are')} ready for a next batch.
                   </p>
-                  {kind.open ? (
-                    <OpenBatch project={project} batch={kind.open} onChanged={overview.reload} />
-                  ) : (
-                    <div>
-                      <Button
-                        size="sm"
-                        loading={busy === kind.kind}
-                        disabled={Boolean(busy)}
-                        onClick={() => void prepare(kind.kind)}
-                      >
-                        Review {some(kind.ready, 'change', 'changes')}
-                      </Button>
-                    </div>
-                  )}
-                  {kind.open && kind.ready ? (
-                    <p className="text-sm text-muted-foreground">
-                      {some(kind.ready, 'more change is', 'more changes are')} ready for a next batch.
-                    </p>
-                  ) : null}
-                  {kind.alone ? (
-                    <p className="text-sm text-muted-foreground">
-                      {kind.alone.in_force
-                        ? 'In this project these are applied without you within ten minutes, with a share of them to judge afterwards. '
-                        : kind.alone.setting === 'apply'
-                          ? `Applying without you is asked for and not in force. ${kind.alone.why} `
-                          : kind.alone.setting === 'off'
-                            ? 'What two models agree on is kept out of these batches: it waits in its worklist. '
-                            : `Each batch waits for your approval. So far you judged ${whole(kind.alone.judged)} sampled ${kind.alone.judged === 1 ? 'line' : 'lines'} of these batches, ${whole(kind.alone.wrong)} of them wrong. `}
-                      <Link href={reviewUrl(project, 'settings')}>Reviews, Settings</Link> says how far they go alone.
-                    </p>
-                  ) : null}
-                </section>
-              ))}
+                ) : null}
+                {kind.alone ? (
+                  <p className="text-sm text-muted-foreground">
+                    {kind.alone.in_force
+                      ? 'In this project these are applied without you within ten minutes, with a share of them to judge afterwards. '
+                      : kind.alone.setting === 'apply'
+                        ? `Applying without you is asked for and not in force. ${kind.alone.why} `
+                        : kind.alone.setting === 'off'
+                          ? 'What two models agree on is kept out of these batches: it waits in its worklist. '
+                          : `Each batch waits for your approval. So far you judged ${whole(kind.alone.judged)} sampled ${kind.alone.judged === 1 ? 'line' : 'lines'} of these batches, ${whole(kind.alone.wrong)} of them wrong. `}
+                    <Link href={reviewUrl(project, 'settings')}>Reviews, Settings</Link> says how far they go alone.
+                  </p>
+                ) : null}
+              </section>
+            ))}
             {data.past
               .filter((batch) => batch.alone && batch.state === 'approved' && batch.sample_judged < batch.sample)
               .map((batch) => (

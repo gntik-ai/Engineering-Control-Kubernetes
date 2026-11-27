@@ -153,7 +153,7 @@ export function ProjectsPage() {
             : !projects.error && Array.from({ length: 6 }, (_, index) => <Skeleton key={index} className="h-44 w-full" />)}
         </div>
       </div>
-      <NewProjectDialog open={creating} onOpenChange={setCreating} onSaved={({ project }) => { projects.reload(); navigate(reviewUrl(project, 'discovery') + '?import=1'); }} />
+      <NewProjectDialog open={creating} onOpenChange={setCreating} onSaved={({ project }) => { projects.reload(); navigate(reviewUrl(project, 'coverage') + '?import=1#first-plan'); }} />
     </Page>
   );
 }

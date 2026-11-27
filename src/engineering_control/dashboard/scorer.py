@@ -1,7 +1,8 @@
 """The scorer: one learned judgment from every signal, in shadow mode.
 
-No single way of finding a parent is good enough alone (Reviews → Reorganize measures
-them). The scorer combines them: shared words, closeness of meaning, the reranker's score,
+No single way of finding a parent is good enough alone (Reviews → Settings, “How well it
+works”, measures them). The scorer combines them: shared words, closeness of meaning, the
+reranker's score,
 how the titles overlap, and whether the parent's other children resemble the record. It is
 a logistic regression, so each signal's weight can be read, and the same input always
 gives the same answer.

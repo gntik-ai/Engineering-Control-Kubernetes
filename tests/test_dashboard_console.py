@@ -141,7 +141,12 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             "/console",
             "/console/admin",
             "/console/workspace/falcone",
+            "/console/workspace/falcone/reviews/organize",
+            "/console/workspace/falcone/reviews/coverage",
+            # The views Reviews had before still open the console, which leads on.
+            "/console/workspace/falcone/reviews/needs-you",
             "/console/workspace/falcone/reviews/related-work",
+            "/console/workspace/falcone/reviews/reorganize",
             "/console/workspace/falcone/reviews/planning",
             "/console/workspace/falcone/reviews/discovery",
             "/console/workspace/falcone/reviews/epics",
@@ -163,7 +168,7 @@ def test_console_serves_the_built_page_and_only_its_own_assets(tmp_path: Path) -
             assert "unsafe" not in policy
         legacy = client.get("/console/workspace/llmwiki?import=1", follow_redirects=False)
         assert legacy.status_code == 303
-        assert legacy.headers["location"] == "/console/workspace/llmwiki/reviews/discovery?import=1"
+        assert legacy.headers["location"] == "/console/workspace/llmwiki/reviews/coverage?import=1"
         # Every script and stylesheet is a same-origin console asset; nothing is inline.
         references = re.findall(r'(?:src|href)="([^"]+)"', index)
         assert references

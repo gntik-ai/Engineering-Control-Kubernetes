@@ -358,7 +358,7 @@ export function ReviewSettings({ project }: { project: string }) {
               </div>
               <p className="text-sm text-muted-foreground">
                 What one question costs is taken from the runs in which the same model answered or judged the same
-                check. It is not known for a model that never did; a trial on the Reorganize page tells it.
+                check. It is not known for a model that never did; a trial under “How well it works”, below, tells it.
               </p>
             </CardBody>
           </Card>

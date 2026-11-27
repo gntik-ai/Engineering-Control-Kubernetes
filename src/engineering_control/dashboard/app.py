@@ -2264,6 +2264,11 @@ def create_app(
         """Where one project's reorganization stands, and what moved since the day before."""
         return await documents_read(request, lambda: repo(request).rollout.status(name))
 
+    @app.get("/api/dashboard/projects/{name}/reviews/waiting")
+    async def reviews_waiting_api(name: str, request: Request) -> Response:
+        """How many cases wait on each page of Reviews: the count beside its menu entry."""
+        return await documents_read(request, lambda: repo(request).needs_you.badges(name))
+
     @app.get("/api/dashboard/projects/{name}/needs-you")
     async def needs_you_api(name: str, request: Request) -> Response:
         """Everything in Reviews that waits for the administrator, in one list."""
@@ -5396,7 +5401,7 @@ def create_app(
             and PROJECT_NAME.fullmatch(view.removeprefix("workspace/"))
             and request.query_params.get("import") == "1"
         ):
-            return RedirectResponse(f"/console/{view}/reviews/discovery?import=1", status_code=303)
+            return RedirectResponse(f"/console/{view}/reviews/coverage?import=1", status_code=303)
         if view in {"", "workspace"}:
             default = await service(request).default_project()
             if default is not None:
@@ -5489,7 +5494,9 @@ def _console_view(view: str) -> bool:
             view.startswith("workspace/")
             and PROJECT_NAME.fullmatch(
                 re.sub(
-                    r"/(?:settings/connections|queue|bugs|supervisor|reviews/(?:related-work|planning|discovery|reorganize|epics|settings)"
+                    r"/(?:settings/connections|queue|bugs|supervisor|reviews/(?:organize|coverage|settings"
+                    # The views Reviews had before: the console leads each to its new place.
+                    r"|needs-you|related-work|planning|discovery|reorganize|epics)"
                     r"|automation/(?:flow|flows|operations|assignments|agents|commands))$",
                     "",
                     view.removeprefix("workspace/"),

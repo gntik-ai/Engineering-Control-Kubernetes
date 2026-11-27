@@ -738,3 +738,39 @@ export function Coverage({ project }: { project: string }) {
     </div>
   );
 }
+
+interface Ground {
+  github: {
+    epics: { open: number; closed: number; kept_here: number };
+    stories: { open: number; closed: number; kept_here: number };
+    open: number;
+    closures: Record<string, number>;
+  };
+}
+
+/**
+ * The Epics and User Stories that are issues on GitHub. Only Issues are kept there: an
+ * Epic or a User Story becomes a record here and is closed there when it is approved.
+ */
+export function OnGitHub({ project }: { project: string }) {
+  const ground = useResource<Ground>(apiUrl('projects/' + encodeURIComponent(project) + '/organize/ground'), 300000, {
+    keepPreviousData: true,
+  });
+  const found = ground.data?.github;
+  if (!found) return null;
+  const closed = found.epics.closed + found.stories.closed;
+  const kept = found.epics.kept_here + found.stories.kept_here;
+  const waiting = (found.closures.pending ?? 0) + (found.closures.failed ?? 0) + (found.closures.uncertain ?? 0);
+  if (!found.open && !closed) return null;
+  return (
+    <p className="max-w-prose text-sm text-muted-foreground">
+      Epics and User Stories are kept here, not on GitHub: only Issues are.{' '}
+      {found.open
+        ? `${some(found.epics.open, 'Epic', 'Epics')} and ${some(found.stories.open, 'User Story', 'User Stories')} of this project are open issues on GitHub` +
+          (kept
+            ? `, ${whole(kept)} of them with a record here already: ${kept === 1 ? 'it is' : 'they are'} closed there by the platform${waiting ? `, and ${some(waiting, 'closure waits', 'closures wait')} to be written` : ''}.`
+            : '. None of them is a record here yet: each becomes one, and is closed there, as you approve it in the first plan below. Nothing is closed on GitHub that has no record here.')
+        : `None of them is open on GitHub: ${some(closed, 'was', 'were')} closed there as ${closed === 1 ? 'its record was' : 'their records were'} approved here.`}
+    </p>
+  );
+}

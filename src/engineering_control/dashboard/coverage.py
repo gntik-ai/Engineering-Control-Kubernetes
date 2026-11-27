@@ -99,7 +99,7 @@ FRESH: Final = 300.0
 SAMPLE: Final = 40
 NO_PLAN: Final = (
     "This project has no Epic, User Story or Issue yet: there is nothing to compare its "
-    "documentation with. Discovery makes the first plan."
+    "documentation with. Its first plan is made below, from the repository."
 )
 # From how close by meaning a part is taken to speak of a record.
 SPEAKS: Final = 0.7

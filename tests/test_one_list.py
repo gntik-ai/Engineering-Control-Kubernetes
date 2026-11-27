@@ -41,7 +41,7 @@ def test_what_waits_across_reviews_is_one_list(tmp_path: Path, monkeypatch: Any)
         assert not [row for row in before.values() if row["group"] == "decide"]
         unasked = before["unasked:issue_story"]
         assert (unasked["group"], unasked["count"]) == ("start", 3)
-        assert (unasked["view"], unasked["anchor"]) == ("related-work", "issues-without-story")
+        assert (unasked["view"], unasked["anchor"]) == ("organize", "stories-issues")
         assert before["ranking"]["group"] == "held"
 
         shown = candidates(client)
@@ -70,19 +70,20 @@ def test_what_waits_across_reviews_is_one_list(tmp_path: Path, monkeypatch: Any)
         assert doubt["count"] == client.get(BASE + "orphans").json()["counts"]["needs"]
         assert "the answer could not tell" in doubt["detail"]
         assert "the texts alone point to another" in doubt["detail"]
-        # What two models and the texts agree on waits as a change to approve.
-        changes = after["changes"]
-        assert changes["count"] == 1 and (changes["view"], changes["anchor"]) == (
-            "reorganize",
-            "changes",
-        )
-        assert "Place issues under a User Story: 1" in changes["detail"]
+        # What two models and the texts agree on is carried out by Organize, case by
+        # case: it is no change that waits here until a batch of it is opened.
+        assert "changes" not in after
+        # The count beside Organize in the menu: the two answers no run of Organize
+        # gathered into its lists yet.
+        waiting = client.get(BASE + "reviews/waiting").json()
+        assert (waiting["organize"], waiting["coverage"]) == (2, 0)
+        assert waiting["beside"] == {"changes": 0, "evidence": 0, "planning": 0}
         # Every issue has an answer now: none is left to start.
         assert "unasked:issue_story" not in after
         # What is to decide comes first, then what is held, then what is to start.
         groups = [row["group"] for row in found["rows"]]
         assert groups == sorted(groups, key=needs_you.GROUPS.index)
-        assert found["counts"]["decide"] == 2
+        assert found["counts"]["decide"] == 1
 
         # A project's next steps, wherever they are shown, are these rows.
         steps = client.get(BASE + "rollout").json()["steps"]
@@ -97,6 +98,8 @@ def test_what_waits_across_reviews_is_one_list(tmp_path: Path, monkeypatch: Any)
             changes["count"] == 1
             and "a batch is open; 0 of 1 sampled lines judged" in (changes["detail"])
         )
+        assert (changes["view"], changes["anchor"]) == ("organize", "changes")
+        assert client.get(BASE + "reviews/waiting").json()["beside"]["changes"] == 1
     finally:
         client.close()
 
@@ -159,7 +162,7 @@ def test_what_stopped_and_what_asks_is_in_the_list(tmp_path: Path, monkeypatch: 
 
         # A project that was never through Discovery has one row, and it says so.
         (only,) = listed(client, "llmwiki")["rows"]
-        assert (only["key"], only["view"]) == ("discovery", "discovery")
+        assert (only["key"], only["view"]) == ("discovery", "coverage")
         assert client.get("/api/dashboard/projects/unknown/needs-you").status_code == 404
     finally:
         client.close()

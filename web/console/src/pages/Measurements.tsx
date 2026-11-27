@@ -4,15 +4,10 @@ import { apiUrl, postJson, useResource } from '../api';
 import { LoadError } from '../parts';
 import { recordUrl } from '../router';
 import { some, whole } from './ChoiceRun';
-import { Arrivals } from './Arrivals';
-import { Anchor } from './NeedsYou';
-import { ChangeBatches } from './ChangeBatches';
-import { Cleanup } from './Cleanup';
-import { EpicLinks } from './EpicLinks';
+import { Anchor } from './Anchor';
 import { JudgeTrials } from './JudgeTrials';
 import { ModelTrials } from './ModelTrials';
 import { Shadow } from './Shadow';
-import { Structure } from './Structure';
 
 /** How well one way of finding a parent does against the parents that are known. */
 interface Method {
@@ -246,26 +241,13 @@ function Judge({ project, onJudged }: { project: string; onJudged: () => void })
  * How well a parent is found, measured against what is known to be true: links the
  * records' own text states, the administrator's choices, and the pairs judged here.
  */
-export function Reorganize({ project }: { project: string }) {
+export function Measurements({ project }: { project: string }) {
   const report = useResource<Report>(apiUrl('projects/' + encodeURIComponent(project) + '/signals'), 120000, {
     keepPreviousData: true,
   });
   const data = report.data;
   return (
     <>
-      <Anchor id="changes">
-        <ChangeBatches project={project} />
-      </Anchor>
-      <Anchor id="epic-links">
-        <EpicLinks project={project} />
-      </Anchor>
-      <Anchor id="clean-up">
-        <Cleanup project={project} />
-      </Anchor>
-      <Anchor id="structure">
-        <Structure project={project} />
-      </Anchor>
-      <Arrivals project={project} />
       <Card id="parents-found" className="scroll-mt-20">
         <CardHeader>
           <CardTitle>How well a parent is found</CardTitle>

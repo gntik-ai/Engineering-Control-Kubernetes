@@ -6,7 +6,7 @@ text, and one score for each pair of records it was asked about. Both are kept u
 text or the model changes, so nothing is asked twice.
 
 Neither a vector nor a score decides anything. They are two of the signals that the
-measurement on Reviews → Reorganize compares with word matching.
+measurement under Reviews → Settings, “How well it works”, compares with word matching.
 """
 
 from __future__ import annotations

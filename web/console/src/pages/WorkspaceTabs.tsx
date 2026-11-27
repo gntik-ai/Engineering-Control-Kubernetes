@@ -37,6 +37,10 @@ import { NewEpicDialog } from './NewEpicDialog';
 import { PlanningLinkNote, type ParentLink } from './PlanningLinkNote';
 import { BugsInShort } from './BugNumbers';
 import { PlanningHealth } from './PlanningHealth';
+import { Anchor, useAnchor } from './Anchor';
+import { Arrivals } from './Arrivals';
+import { EpicPages } from './EpicPages';
+import { NeedsYou } from './NeedsYou';
 import { BugLinks } from './BugLinks';
 import { WorkspaceMetrics } from './WorkspaceMetrics';
 import { RecordReview, type ReviewResult } from './PlanningReviews';
@@ -458,7 +462,7 @@ function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; proj
   };
   const finish = useSubmit(
     () => postJson(importPath + '/review', { version: data?.version, choices: [] }),
-    () => { reload(); navigate(reviewUrl(project, 'discovery')); },
+    () => { reload(); navigate(reviewUrl(project, 'coverage') + '#first-plan'); },
   );
   const afterDecision = (result: unknown) => {
     reload();
@@ -467,7 +471,7 @@ function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; proj
       ((kind === 'epics' && result.advanced_to === 'stories') ||
         (kind === 'stories' && result.advanced_to === 'issues'))
     ) {
-      navigate(reviewUrl(project, 'discovery'));
+      navigate(reviewUrl(project, 'coverage') + '#first-plan');
     }
   };
   const [editor, setEditor] = useState<{ row?: PlanRow; version?: number } | null>(null);
@@ -719,7 +723,7 @@ function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; proj
         </Confirm>
       )}
       {editor && kind === 'epics' && !editor.row && <NewEpicDialog path={path} close={() => setEditor(null)}
-        saved={() => { if (view === 'closed') setQuery({ state: null, page: null, epic: null, record: null, search: null }); reload(); }} />}
+        saved={() => { if (view === 'closed') setQuery({ state: null, page: null, epic: null, overview: null, record: null, search: null }); reload(); }} />}
       {editor && (kind !== 'epics' || editor.row) && (
         <RecordEditor
           kind={kind}
@@ -729,7 +733,7 @@ function Records({ kind, project, onRead, bugsOnly = false }: { kind: Kind; proj
           version={editor.version}
           close={() => setEditor(null)}
           saved={() => {
-            if (!editor.row && kind !== 'issues' && view === 'closed') setQuery({ state: null, page: null, epic: null, record: null, search: null });
+            if (!editor.row && kind !== 'issues' && view === 'closed') setQuery({ state: null, page: null, epic: null, overview: null, record: null, search: null });
             reload();
           }}
         />
@@ -751,7 +755,10 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
     window.addEventListener(CHANGED, counts.reload);
     return () => window.removeEventListener(CHANGED, counts.reload);
   }, [counts.reload]);
-  const requested = useLocation().query.get('tab') ?? 'home';
+  const location = useLocation();
+  const requested = location.query.get('tab') ?? 'home';
+  const overview = location.query.get('overview');
+  useAnchor(requested + '/' + project.project);
   // Bugs have a section of their own: a link to the tab they once had leads there.
   useEffect(() => { if (requested === 'bugs') navigate(bugsUrl(project.project), { replace: true }); }, [requested, project.project]);
   const tab = Object.hasOwn(sections, requested) ? requested : 'home';
@@ -762,7 +769,7 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
       <h1 id="project-title" className="break-words text-2xl font-semibold tracking-tight">
         {project.display_name}
       </h1>
-      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, record: null, connected: null, bugs: null, issue_state: null, state: null })}>
+      <Tabs value={tab} onValueChange={(value) => setQuery({ tab: value === 'home' ? null : String(value), page: null, search: null, epic: null, overview: null, record: null, connected: null, bugs: null, issue_state: null, state: null })}>
         <div className="max-w-full overflow-x-auto">
           <TabsList aria-label="Project">
             {(Object.keys(sections) as Array<keyof typeof sections>).map((id) => {
@@ -795,13 +802,30 @@ export function WorkspaceTabs({ project }: { project: ProjectSummary }) {
               </dd>
             </div>
           </dl>
+          {tab === 'home' && <Anchor id="waits"><NeedsYou project={project.project} /></Anchor>}
           {tab === 'home' && <BugsInShort project={project.project} />}
           {tab === 'home' && <PlanningHealth project={project.project} />}
+          {tab === 'home' && <Arrivals project={project.project} />}
           {tab === 'home' && <WorkspaceMetrics project={project.project} />}
         </TabsPanel>
         {(['epics', 'stories', 'issues'] as const).map((kind) => (
           <TabsPanel key={kind} value={kind} className="pt-5">
-            {tab === kind && <Records kind={kind} project={project.project} onRead={setReading} />}
+            {tab === kind && kind === 'epics' && overview ? (
+              // The page of one Epic: what it holds, where each User Story stands, its overview.
+              <EpicPages project={project.project} />
+            ) : tab === kind ? (
+              <div className="grid min-w-0 gap-5">
+                <Records kind={kind} project={project.project} onRead={setReading} />
+                {kind === 'epics' && (
+                  <Anchor id="epic-pages">
+                    <details className="rounded-xl border border-border bg-card p-5" open={window.location.hash === '#epic-pages'}>
+                      <summary className="cursor-pointer text-base font-semibold text-foreground">The page of each Epic, and its overview</summary>
+                      <div className="pt-4"><EpicPages project={project.project} /></div>
+                    </details>
+                  </Anchor>
+                )}
+              </div>
+            ) : null}
           </TabsPanel>
         ))}
         <TabsPanel value="architecture" />

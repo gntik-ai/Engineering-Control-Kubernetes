@@ -75,7 +75,7 @@ def test_every_project_has_a_row_and_a_next_step(tmp_path: Path) -> None:
         rows = {row["project"]: row for row in found.json()["projects"]}
         # A project that was never through Discovery has nothing to reorganize.
         assert not rows["llmwiki"]["planned"]
-        assert [step["view"] for step in rows["llmwiki"]["steps"]] == ["discovery"]
+        assert [step["view"] for step in rows["llmwiki"]["steps"]] == ["coverage"]
         falcone = rows["falcone"]
         assert falcone["planned"] and (falcone["epics"], falcone["stories"]) == (1, 2)
         assert any("ranking service" in step["says"] for step in falcone["steps"])

@@ -10,7 +10,7 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Inbox, ListTree, FileCheck, Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug, SlidersHorizontal } from '@gntik-ai/icons';
+import { ListTree, FileCheck, Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, Bug, SlidersHorizontal } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, bugsUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
@@ -24,30 +24,20 @@ import { ProjectQueue } from './ProjectQueue';
 import { BugsPage } from './Bugs';
 import { AutomationPage } from './Automation';
 import { WorkspaceTabs } from './WorkspaceTabs';
-import { EvidencePanel } from './ReviewEvidence';
-import { OrphanWorklist } from './OrphanWorklist';
-import { PrimaryEpics } from './PrimaryEpics';
 import { Documents } from './Documents';
-import { Reorganize } from './Reorganize';
-import { EpicPages } from './EpicPages';
-import { StoryStates } from './StoryStates';
-import { PlanningReviews } from './PlanningReviews';
+import { Measurements } from './Measurements';
 import { ReviewSettings } from './ReviewSettings';
-import { Anchor, NeedsYou, useAnchor } from './NeedsYou';
+import { Anchor, useAnchor } from './Anchor';
+import { OrganizeBefore } from './OrganizeBefore';
+import { ReviewCounts } from './ReviewCounts';
 import { Organize } from './Organize';
-import { Coverage } from './Coverage';
+import { Coverage, OnGitHub } from './Coverage';
 import { WorkspaceImport } from './WorkspaceImport';
 
 const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignment', agents: 'Agents', commands: 'Commands' };
 const reviewMenu = {
   organize: { label: 'Organize', icon: ListTree },
   coverage: { label: 'Coverage', icon: FileCheck },
-  'needs-you': { label: 'Needs you', icon: Inbox },
-  'related-work': { label: 'Related Work', icon: GitFork },
-  planning: { label: 'Planning', icon: ListChecks },
-  discovery: { label: 'Discovery', icon: Compass },
-  reorganize: { label: 'Reorganize', icon: Shuffle },
-  epics: { label: 'Epic pages', icon: BookOpen },
   settings: { label: 'Settings', icon: SlidersHorizontal },
 };
 export function ProjectWorkspace({
@@ -103,7 +93,8 @@ export function ProjectWorkspace({
       label: 'Reviews',
       collapsible: true,
       defaultOpen: true,
-      items: reviewViews.map(page => ({ ...reviewMenu[page], href: reviewUrl(context, page) })),
+      // Beside each page: how many cases wait for the administrator there.
+      items: reviewViews.map(page => ({ ...reviewMenu[page], href: reviewUrl(context, page), badge: page === 'settings' ? undefined : <ReviewCounts project={context} page={page} /> })),
     });
     groups.push({
       id: 'project-engine',
@@ -206,17 +197,39 @@ export function ProjectWorkspace({
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
                 {view === 'organize' && <Organize project={project.project} />}
                 {view === 'coverage' && <Coverage project={project.project} />}
-      {view === 'needs-you' && <NeedsYou project={project.project} />}
-                {view === 'related-work' && <Anchor id="issues-without-story"><OrphanWorklist project={project.project} /></Anchor>}
-                {view === 'related-work' && <Anchor id="review-evidence"><EvidencePanel project={project.project} /></Anchor>}
-                {view === 'planning' && <Anchor id="primary-epics"><PrimaryEpics project={project.project} /></Anchor>}
-                {view === 'planning' && <StoryStates project={project.project} />}
-                {view === 'planning' && <Anchor id="planning-reviews"><PlanningReviews project={project.project} /></Anchor>}
-                {view === 'reorganize' && <Reorganize project={project.project} />}
-                {view === 'epics' && <Anchor id="epic-pages"><EpicPages project={project.project} /></Anchor>}
+                {view === 'organize' && <OrganizeBefore project={project.project} />}
+                {view === 'coverage' && (
+                  <Anchor id="first-plan">
+                    <div className="grid min-w-0 gap-5">
+                      <h2 className="pt-2 text-lg font-semibold tracking-tight text-foreground">The first plan, from the repository</h2>
+                      <p className="max-w-prose text-sm text-muted-foreground">
+                        A project with no plan gets its first one here: the repository and its issues are read, and Epics, User Stories and Issues are proposed for you to approve. What you approve is the plan the number above is measured against.
+                      </p>
+                      <OnGitHub project={project.project} />
+                      <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />
+                    </div>
+                  </Anchor>
+                )}
+                {view === 'coverage' && (
+                  <Anchor id="documents">
+                    <div className="grid min-w-0 gap-5">
+                      <h2 className="pt-2 text-lg font-semibold tracking-tight text-foreground">The documents, and what changed in them</h2>
+                      <Documents project={project.project} />
+                    </div>
+                  </Anchor>
+                )}
                 {view === 'settings' && <ReviewSettings project={project.project} />}
-                {view === 'discovery' && <Documents project={project.project} />}
-                {view === 'discovery' && <WorkspaceImport project={project.project} repository={project.repository_url} onApproved={projects.reload} />}
+                {view === 'settings' && (
+                  <details id="how-well-it-works" className="scroll-mt-20 rounded-xl border border-border bg-card p-5" open={window.location.hash === '#how-well-it-works'}>
+                    <summary className="cursor-pointer text-base font-semibold text-foreground">How well it works</summary>
+                    <p className="pt-2 text-sm text-muted-foreground">
+                      The measurements behind the checks: how often the right parent is found, the pairs you judge to teach it, what the scorer would have done, and the trials of other models and of judges. Nothing here changes the plan.
+                    </p>
+                    <div className="grid min-w-0 gap-5 pt-4">
+                      <Measurements project={project.project} />
+                    </div>
+                  </details>
+                )}
               </div>
             ) : <WorkspaceTabs key={project.project} project={project} />
           ) : projects.loading ? (
@@ -254,7 +267,7 @@ export function ProjectWorkspace({
         onOpenChange={setCreating}
         onSaved={({ project }) => {
           projects.reload();
-          navigate(reviewUrl(project, 'discovery') + '?import=1');
+          navigate(reviewUrl(project, 'coverage') + '?import=1#first-plan');
         }}
       />
     </SidebarLayout>

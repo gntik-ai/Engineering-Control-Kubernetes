@@ -8,10 +8,54 @@ export const accountsUrl = (project?: string | null) =>
   project ? ACCOUNTS + '?' + new URLSearchParams({ project }).toString() : ACCOUNTS;
 export const WORKSPACE = `${BASE}/workspace`;
 export const workspaceUrl = (name: string) => `${WORKSPACE}/${encodeURIComponent(name)}`;
-export const reviewViews = ['organize', 'coverage', 'needs-you', 'related-work', 'planning', 'discovery', 'reorganize', 'epics', 'settings'] as const;
+export const reviewViews = ['organize', 'coverage', 'settings'] as const;
 export type ReviewView = typeof reviewViews[number];
 export const isReviewView = (value: string): value is ReviewView => reviewViews.some(view => view === value);
 export const reviewUrl = (project: string, view: ReviewView) => workspaceUrl(project) + '/reviews/' + view;
+/** The page of one Epic: opened from the Epic in the planning tables. */
+export const epicPageUrl = (project: string, epic?: string) =>
+  workspaceUrl(project) + '?' + new URLSearchParams({ tab: 'epics', ...(epic ? { overview: epic } : {}) }) + (epic ? '' : '#epic-pages');
+/**
+ * Reviews was eight views and is three: Organize, Coverage and Settings. A panel is still
+ * named by the view it was in and its own name, by the server and in old addresses: this
+ * says where it is now.
+ */
+const FORMER: Record<string, { view: ReviewView; anchor: string; panels?: Record<string, [ReviewView, string]> }> = {
+  'needs-you': { view: 'organize', anchor: '' },
+  'related-work': {
+    view: 'organize',
+    anchor: 'stories-issues',
+    panels: { 'issues-without-story': ['organize', 'stories-issues'], 'review-evidence': ['organize', 'review-evidence'] },
+  },
+  planning: {
+    view: 'organize',
+    anchor: 'epics-stories',
+    panels: { 'primary-epics': ['organize', 'epics-stories'], 'planning-reviews': ['organize', 'planning-reviews'] },
+  },
+  reorganize: {
+    view: 'organize',
+    anchor: '',
+    panels: {
+      changes: ['organize', 'changes'],
+      'epic-links': ['organize', 'epics-stories'],
+      structure: ['organize', 'epics-stories'],
+      'clean-up': ['organize', 'stories-issues'],
+      'parents-found': ['settings', 'how-well-it-works'],
+      pairs: ['settings', 'how-well-it-works'],
+    },
+  },
+  discovery: { view: 'coverage', anchor: 'first-plan' },
+};
+export const isFormerReview = (value: string) => value === 'epics' || Object.hasOwn(FORMER, value);
+export function placeUrl(project: string, view: string, anchor = '', query = new URLSearchParams()): string {
+  if (view === 'epics') return epicPageUrl(project, query.get('epic') ?? undefined);
+  const search = query.size ? '?' + query : '';
+  if (isReviewView(view)) return reviewUrl(project, view) + search + (anchor ? '#' + anchor : '');
+  const former = FORMER[view];
+  if (!former) return workspaceUrl(project);
+  const [to, panel] = former.panels?.[anchor] ?? [former.view, former.anchor];
+  return reviewUrl(project, to) + search + (panel ? '#' + panel : '');
+}
 export function workspaceTabUrl(project: string, tab: string, issueState?: 'draft') {
   const query = new URLSearchParams({ tab });
   if (issueState) query.set('issue_state', issueState);

@@ -2,7 +2,7 @@ import { Alert, Badge, Button, Card, CardBody, CardHeader, CardTitle, Link, Prog
 import { useState } from 'react';
 import { apiUrl, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
-import { recordUrl, reviewUrl, setQuery, useLocation, type ReviewView } from '../router';
+import { epicPageUrl, placeUrl, recordUrl, reviewUrl, setQuery, useLocation } from '../router';
 import { isAsking, RunPanel, some, whole, type Model, type Run, type RunPlan, type RunsAlone } from './ChoiceRun';
 
 type Stand =
@@ -94,7 +94,7 @@ interface Shown {
       through: string[];
       excerpt?: string;
     }[];
-    attention: { key: string; view: ReviewView; says: string }[];
+    attention: { key: string; view: string; says: string }[];
   };
   history: { version: number; at: string; changes: string[] }[];
   overview: {
@@ -139,7 +139,7 @@ const done = (numbers: Numbers, progress: Partial<Record<Stand, number>>) =>
  */
 export function EpicPages({ project }: { project: string }) {
   const { query } = useLocation();
-  const epic = query.get('epic');
+  const epic = query.get('overview');
   return epic ? <EpicPage project={project} epic={epic} /> : <EpicIndex project={project} />;
 }
 
@@ -167,8 +167,8 @@ function EpicIndex({ project }: { project: string }) {
           ) : null
         ) : !data.epics.length ? (
           <p className="text-sm text-foreground">
-            This project has no Epics yet. Bring it through Discovery first:{' '}
-            <Link href={reviewUrl(project, 'discovery')}>Discovery</Link>.
+            This project has no Epics yet. Its first plan is made under{' '}
+            <Link href={reviewUrl(project, 'coverage') + '#first-plan'}>Coverage</Link>.
           </p>
         ) : (
           <>
@@ -205,10 +205,7 @@ function EpicIndex({ project }: { project: string }) {
                     return (
                       <tr key={row.id} className="border-b border-border align-top">
                         <td className="py-2 pe-3">
-                          <Link
-                            href={reviewUrl(project, 'epics') + '?' + new URLSearchParams({ epic: row.id })}
-                            className="font-medium"
-                          >
+                          <Link href={epicPageUrl(project, row.id)} className="font-medium">
                             {row.title}
                           </Link>
                           {row.closed ? (
@@ -362,8 +359,8 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
   const shown = useResource<Shown>(apiUrl(base), 60000, { keepPreviousData: true });
   const data = shown.data;
   const back = (
-    <Button size="sm" variant="ghost" onClick={() => setQuery({ epic: null })}>
-      All Epic pages
+    <Button size="sm" variant="ghost" onClick={() => setQuery({ overview: null })}>
+      All Epics
     </Button>
   );
   if (!data) {
@@ -453,7 +450,9 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
                       return said && said.verdict !== 'supported' ? (
                         <span className="mt-1 flex flex-wrap items-center gap-2 text-xs">
                           <Badge tone="warning" size="sm">
-                            {said.verdict === 'unsupported' ? 'In doubt: not in the records it names' : 'In doubt: could not be checked'}
+                            {said.verdict === 'unsupported'
+                              ? 'In doubt: not in the records it names'
+                              : 'In doubt: could not be checked'}
                           </Badge>
                           <span className="text-muted-foreground">{said.reason}</span>
                         </span>
@@ -509,7 +508,7 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
               <ul className="grid gap-1 text-sm">
                 {page.attention.map((entry) => (
                   <li key={entry.key}>
-                    {entry.says} <Link href={reviewUrl(project, entry.view)}>Where it is done</Link>
+                    {entry.says} <Link href={placeUrl(project, entry.view)}>Where it is done</Link>
                   </li>
                 ))}
               </ul>
@@ -551,14 +550,7 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
                       {story.primary_epic ? (
                         <>
                           (primary Epic:{' '}
-                          <Link
-                            href={
-                              reviewUrl(project, 'epics') + '?' + new URLSearchParams({ epic: story.primary_epic.id })
-                            }
-                          >
-                            {story.primary_epic.title}
-                          </Link>
-                          )
+                          <Link href={epicPageUrl(project, story.primary_epic.id)}>{story.primary_epic.title}</Link>)
                         </>
                       ) : (
                         '(no primary Epic chosen)'
@@ -609,7 +601,7 @@ function EpicPage({ project, epic }: { project: string; epic: string }) {
               </ul>
               <p className="text-xs text-muted-foreground">
                 Every document and what changed in it is under{' '}
-                <Link href={reviewUrl(project, 'discovery')}>Discovery</Link>.
+                <Link href={reviewUrl(project, 'coverage') + '#first-plan'}>Coverage</Link>.
               </p>
             </>
           )}

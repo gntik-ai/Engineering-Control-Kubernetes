@@ -3,7 +3,7 @@ import { RefreshCw } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { apiUrl, getJson, useResource } from '../api';
 import { LoadError } from '../parts';
-import { bugsUrl, reviewUrl, workspaceUrl } from '../router';
+import { bugsUrl, placeUrl, workspaceUrl } from '../router';
 
 /**
  * What is counted of a project's planning. Every number is one the planning tables show.
@@ -172,7 +172,7 @@ export function PlanningHealth({ project }: { project: string }) {
                 ? `; compared with the first measurement, of ${since}.`
                 : '. This is the first measurement: later ones are compared with it.'}{' '}
               Every number here is better when it is lower. What waits for you is not counted here: it is one list,
-              under <Link href={reviewUrl(project, 'needs-you')}>Needs you</Link>.
+              above, under <Link href={workspaceUrl(project) + '#waits'}>What waits for you in Reviews</Link>.
             </p>
             <Group
               title="Issues and their User Stories"
@@ -184,7 +184,7 @@ export function PlanningHealth({ project }: { project: string }) {
                 of={`of ${whole(now.issues_open)} open issues`}
                 was={was?.orphans_open}
                 since={since}
-                href={reviewUrl(project, 'related-work')}
+                href={placeUrl(project, 'related-work')}
               />
               <Tile
                 value={now.orphans_closed}
@@ -230,7 +230,7 @@ export function PlanningHealth({ project }: { project: string }) {
                 note={`Epics per Story: ${now.epics_per_story.toLocaleString('en')} on average, ${whole(now.most_epics_of_a_story)} at most${now.epic_links_extra !== undefined ? `; ${whole(now.epic_links_extra)} links beyond the primary Epic, ${whole(now.epic_links_to_judge ?? 0)} not judged` : ''}`}
                 was={was?.stories_under_several_epics}
                 since={since}
-                href={reviewUrl(project, 'reorganize')}
+                href={placeUrl(project, 'reorganize')}
               />
               <Tile
                 value={now.largest_epic_stories}
@@ -259,7 +259,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   of="Delivered, or waiting for an issue nobody wrote"
                   was={was?.stories_with_closed_issues_only}
                   since={since}
-                  href={reviewUrl(project, 'planning')}
+                  href={placeUrl(project, 'planning')}
                 />
               )}
               <Tile
@@ -292,7 +292,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   label="Primary parents nobody chose"
                   of="Records under several parents whose primary one is only suggested"
                   note={now.primaries_chosen === undefined ? undefined : `${whole(now.primaries_chosen)} chosen by you`}
-                  href={reviewUrl(project, 'planning')}
+                  href={placeUrl(project, 'planning')}
                   was={was?.primaries_suggested}
                   since={since}
                 />
@@ -309,7 +309,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   of="Their issues are closed and the whole Story is shown covered"
                   was={was?.stories_delivered_open}
                   since={since}
-                  href={reviewUrl(project, 'planning')}
+                  href={placeUrl(project, 'planning')}
                 />
                 <Tile
                   value={now.stories_with_leads ?? 0}
@@ -317,7 +317,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   of="Issues with no User Story look like their work"
                   was={was?.stories_with_leads}
                   since={since}
-                  href={reviewUrl(project, 'planning')}
+                  href={placeUrl(project, 'planning')}
                 />
                 <Tile
                   value={now.stories_unsupported}
@@ -325,7 +325,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   of="No issue and no document was found"
                   was={was?.stories_unsupported}
                   since={since}
-                  href={reviewUrl(project, 'planning')}
+                  href={placeUrl(project, 'planning')}
                 />
                 <Tile
                   value={now.cleanup_proposed ?? 0}
@@ -333,7 +333,7 @@ export function PlanningHealth({ project }: { project: string }) {
                   of="Two reasons of different kinds, or an exact one, speak against each"
                   was={was?.cleanup_proposed}
                   since={since}
-                  href={reviewUrl(project, 'reorganize')}
+                  href={placeUrl(project, 'reorganize')}
                 />
               </Group>
             ) : null}

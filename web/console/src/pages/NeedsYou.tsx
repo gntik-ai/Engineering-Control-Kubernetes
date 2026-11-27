@@ -1,15 +1,15 @@
 import { Badge, Button, Card, CardAction, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { RefreshCw } from '@gntik-ai/icons';
-import { useEffect, type ReactNode } from 'react';
 import { apiUrl, useResource } from '../api';
 import { LoadError } from '../parts';
-import { bugsUrl, reviewUrl, workspaceTabUrl, type ReviewView } from '../router';
+import { bugsUrl, placeUrl, workspaceTabUrl } from '../router';
 import { some, whole } from './ChoiceRun';
 
 type Group = 'decide' | 'held' | 'start' | 'doubt';
 /** One thing that waits: how many, what, and the view and panel it is decided in. */
 export interface Step {
-  view: ReviewView | 'bugs' | 'tables';
+  /** The view the panel was in when Reviews had eight: it still names the panel. */
+  view: string;
   says: string;
   anchor?: string;
   tab?: string;
@@ -37,8 +37,9 @@ interface Listed {
 /** Where a row is decided: a panel of a view of Reviews, the Bugs section, or the planning tables. */
 export function stepUrl(project: string, step: Step) {
   if (step.view === 'bugs') return bugsUrl(project);
-  if (step.view === 'tables') return workspaceTabUrl(project, step.tab || 'epics');
-  return reviewUrl(project, step.view) + (step.anchor ? '#' + step.anchor : '');
+  if (step.view === 'tables')
+    return workspaceTabUrl(project, step.tab || 'epics') + (step.anchor ? '#' + step.anchor : '');
+  return placeUrl(project, step.view, step.anchor);
 }
 
 /** What moved since the day before, as short phrases with the change. */
@@ -75,64 +76,18 @@ const GROUPS: { key: Group; title: string; about: string; tone: 'warning' | 'neu
     tone: 'neutral',
   },
 ];
-const WHERE: Record<Step['view'], string> = {
-  organize: 'Organize',
-  coverage: 'Coverage',
-  'needs-you': 'Needs you',
-  'related-work': 'Related Work',
-  planning: 'Planning',
-  discovery: 'Discovery',
-  reorganize: 'Reorganize',
-  epics: 'Epic pages',
-  settings: 'Settings',
-  bugs: 'Bugs',
-  tables: 'Planning tables',
-};
-
-/** A panel a row of the list leads to: the page scrolls to it when its name is in the address. */
-export function Anchor({ id, children }: { id: string; children: ReactNode }) {
-  return (
-    <div id={id} className="min-w-0 scroll-mt-20 empty:hidden">
-      {children}
-    </div>
-  );
+/** The page a row is decided on, as the menu calls it. */
+function whereSaid(step: Step): string {
+  if (step.view === 'bugs') return 'Bugs';
+  if (step.view === 'tables' || step.view === 'epics') return 'Planning tables';
+  const to = placeUrl('-', step.view, step.anchor);
+  return to.includes('/reviews/coverage') ? 'Coverage' : to.includes('/reviews/settings') ? 'Settings' : 'Organize';
 }
 
 /**
- * Brings the panel named in the address into view. The panels above it load after the
- * page does and push it down, so it is brought back for a few seconds, and left alone as
- * soon as the page is scrolled by hand.
- */
-export function useAnchor(view: string) {
-  useEffect(() => {
-    const id = window.location.hash.slice(1);
-    if (!id) return;
-    let tries = 0;
-    let timer = 0;
-    let stopped = false;
-    const stop = () => {
-      stopped = true;
-    };
-    const events = ['wheel', 'touchmove', 'keydown', 'mousedown'] as const;
-    events.forEach((name) => window.addEventListener(name, stop, { passive: true }));
-    const go = () => {
-      if (stopped) return;
-      document.getElementById(id)?.scrollIntoView({ block: 'start' });
-      tries += 1;
-      if (tries < 10) timer = window.setTimeout(go, 400);
-    };
-    go();
-    return () => {
-      window.clearTimeout(timer);
-      events.forEach((name) => window.removeEventListener(name, stop));
-    };
-  }, [view]);
-}
-
-/**
- * Everything in Reviews that waits for the administrator, in one list. Each row says how
- * many, what, and why, and leads to the panel where it is decided. Nothing is decided
- * here: every number is the one its own view shows.
+ * Everything in Reviews that waits for the administrator, in one list, on the project's
+ * Dashboard. Each row says how many, what, and why, and leads to the page where it is
+ * decided. Nothing is decided here: every number is the one its own page shows.
  */
 export function NeedsYou({ project }: { project: string }) {
   const list = useResource<Listed>(apiUrl('projects/' + encodeURIComponent(project) + '/needs-you'), 120000, {
@@ -195,7 +150,7 @@ export function NeedsYou({ project }: { project: string }) {
                           </div>
                           <div className="flex shrink-0 items-center gap-2">
                             <Badge tone={group.tone} size="sm">
-                              {WHERE[row.view]}
+                              {whereSaid(row)}
                             </Badge>
                             <Link href={stepUrl(project, row)} className="text-sm">
                               Open

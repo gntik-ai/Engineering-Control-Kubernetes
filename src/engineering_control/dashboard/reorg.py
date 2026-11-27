@@ -211,6 +211,9 @@ def sample_size(lines: int, least: int = SAMPLE_MIN, most: int = SAMPLE_MAX) -> 
 ALONE: Final = {"place": "issue_story", "primary": "story_epic"}
 # The judged lines the record of a kind goes by: the latest of them.
 RECORD: Final = 100
+# The kinds of change a run of Organize carries out itself, case by case in its lists:
+# no new batch is offered for them. One that is open is still decided as a batch.
+ORGANIZED: Final = frozenset({"primary", "place", "unsupported", "extra_epics", "close"})
 
 
 def alone_standing(db: Session, project: UUID, kind: str) -> dict[str, Any]:
@@ -626,6 +629,7 @@ class Reorg:
                 kinds.append(
                     {
                         "kind": kind,
+                        "organized": kind in ORGANIZED,
                         "title": title,
                         "about": about,
                         "error": error,

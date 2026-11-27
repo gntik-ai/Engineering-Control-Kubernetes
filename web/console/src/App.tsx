@@ -22,7 +22,7 @@ import { RunPage, RunsPage } from './pages/Runs';
 import { SupervisorPage } from './pages/Supervisor';
 import { ProjectWorkspace } from './pages/Workspace';
 import { usePageTitle } from './parts';
-import { ACCOUNTS, ADMIN, BASE, WORKSPACE, isAutomation, isReviewView, useLocation } from './router';
+import { ACCOUNTS, ADMIN, BASE, WORKSPACE, isAutomation, isFormerReview, isReviewView, navigate, placeUrl, useLocation } from './router';
 import { SupervisorPanel } from './supervisor';
 
 /** The navigation; the inbox shows how many things are waiting. */
@@ -63,6 +63,12 @@ const DETAIL_PARENTS: Record<string, string> = {
   [`${BASE}/project`]: `${BASE}/projects`,
   [`${BASE}/run`]: `${BASE}/runs`,
 };
+
+/** An address that moved: the browser is taken to where it is now. */
+function Moved({ to }: { to: string }) {
+  useEffect(() => navigate(to, { replace: true }), [to]);
+  return null;
+}
 
 function SignOut({ onError }: { onError: (message: string) => void }) {
   const [pending, setPending] = useState(false);
@@ -170,6 +176,10 @@ export default function App() {
     const [group, page = ''] = rest;
     if (group === 'reviews' && rest.length === 2 && isReviewView(page)) {
       return <ProjectWorkspace name={name} view={page} actions={actions} notice={notice} />;
+    }
+    // An address of a view Reviews had before leads to where its panel is now.
+    if (group === 'reviews' && rest.length === 2 && isFormerReview(page)) {
+      return <Moved to={placeUrl(name, page, window.location.hash.slice(1), query)} />;
     }
     if (rest[0] === 'automation' && rest.length === 2 && isAutomation(rest[1] ?? '')) {
       return <ProjectWorkspace name={name} view={rest[1] as import('./router').AutomationView} actions={actions} notice={notice} />;

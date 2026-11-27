@@ -310,6 +310,15 @@ def test_a_run_says_how_much_of_the_documentation_the_plan_covers(
 
         needs = {line["case"]: line for line in lines(client, "needs_you")}
         assert set(needs) == {"differ", "draft_epic"} and after["waiting"] == {"drafts": 1}
+        # The two cases are the count beside Coverage in the menu, and a row of what
+        # waits in the project.
+        counted = client.get(BASE + "reviews/waiting").json()
+        assert (counted["coverage"], counted["lines"]) == (2, {"coverage": 2})
+        waits = {row["key"]: row for row in client.get(BASE + "needs-you").json()["rows"]}
+        assert (waits["lines:coverage"]["count"], waits["lines:coverage"]["view"]) == (
+            2,
+            "coverage",
+        )
         # Where the two models differ, the part waits with the records it was shown.
         doubt = needs["differ"]
         assert doubt["subject"]["title"] == "docs/audit.md: Retention"
@@ -485,9 +494,9 @@ def test_without_models_a_run_still_reads_what_the_documents_state(
             if repo.coverage.tick():
                 break
         bare = client.get(there + "coverage").json()
-        assert bare["run"]["state"] == "complete" and "Discovery" in bare["run"]["detail"]
+        assert bare["run"]["state"] == "complete" and "first plan" in bare["run"]["detail"]
         assert bare["stands"]["read"] and bare["stands"]["open"] == 1
-        assert not bare["can_start"] and "Discovery" in bare["why_not"]
+        assert not bare["can_start"] and "first plan" in bare["why_not"]
         # A project whose documentation was never read says so.
         other = client.get(BASE.replace("falcone", "llmwiki") + "coverage").json()
         assert other["stands"]["parts"] == 0 and not other["can_start"]

@@ -1,3 +1,4 @@
+import { Anchor } from './Anchor';
 import { Alert, Badge, Button, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
@@ -466,8 +467,12 @@ export function Organize({ project }: { project: string }) {
         Each button checks one pair of levels of the plan, links what is settled, and puts what is in doubt before you.
         The result is always three lists: what needs you, what was done, and what was created.
       </p>
-      <EpicsAndStories project={project} />
-      <StoriesAndIssues project={project} />
+      <Anchor id="epics-stories">
+        <EpicsAndStories project={project} />
+      </Anchor>
+      <Anchor id="stories-issues">
+        <StoriesAndIssues project={project} />
+      </Anchor>
     </>
   );
 }
