@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026. Asked for the same day. Nothing of it is built. It needs the decisions at the end before the first phase starts.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 is built and deployed** ("O0 as built", below); O1 to O6 are not.
 
 ## What is asked for
 
@@ -163,9 +163,11 @@ Each phase is deployed and usable on its own. The old views stay until O5, so th
 
 O1 and O2 are mostly existing engines behind a new page. O3 and O4 are where the new work is.
 
-## Decisions needed
+## Decisions (27 November 2026)
 
-| # | Question | Recommended |
+All eight were answered by the administrator on 27 November 2026, each as recommended. The table keeps the question and what was decided.
+
+| # | Question | Decided |
 | --- | --- | --- |
 | 1 | The Issues a run creates: written to GitHub at once, or kept here and published together on one word from you? | **Kept here, published together.** On 26 November you decided that what writes to GitHub stays a batch you approve. One button publishes them all; none is public before you saw it |
 | 2 | New Epics and User Stories are made and linked without asking, and can be undone for 30 days. Confirm? | **Yes.** It is your decision of 26 November applied to creation: it adds, and it can be undone. With the 5% you accepted, watched by the sample |
@@ -175,3 +177,127 @@ O1 and O2 are mostly existing engines behind a new page. O3 and O4 are where the
 | 6 | Coverage counts the parts of the documentation that are about the product, and you can correct which are. Agreed as the measure? | **Yes** |
 | 7 | Writing records needs a stronger model than choosing among candidates. The limit is $3 a month for each project. May a run that would pass it stop and show its estimate, for you to raise the limit or not? | **Yes.** A first full run over Falcone will cost more than $3; how much is shown before it starts |
 | 8 | May I remove the six old views in O5, with the measurements moved into Settings and the Epic pages opened from the planning tables? | **Yes**, once O1 to O4 are shown to do what they did |
+
+## O0 as built (27 November 2026)
+
+O0 is the ground. It has no page and no button: those come with O1. It asks no model and changes nothing of the plan.
+
+### One kind of run
+
+A run is a record (`organize_runs`, migration 0095) with what it organizes (`stories_issues`, `epics_stories` or `coverage`), its state and the stage it is in. Its results are lines (`organize_lines`) in one of three lists.
+
+| | |
+| --- | --- |
+| States | proposed (it says what it would ask and cost, and waits for the word), running, held (it reached the dollars it may cost), stopped, complete, failed |
+| Stages | Read, Match, Verify, Create, Done. A run never goes back to a stage it left. Each stage keeps how many records it took in and how it left them: settled, in doubt, none |
+| Lists | Needs you (what still waits, the most doubtful first), Done, Created |
+| A line | The record it is about, the candidates, what each stage said of it, the reason, how doubtful it is, what was done and how things stood before, and for a created record what it was made from |
+| Limits | One run of a kind at a time in a project. At its dollar limit a run is held with what it has, and goes on at the administrator's word |
+
+A line keeps how things stood before it, so that it can be put back. The undoing itself arrives with the first operation, in O1: O0 has nothing to undo.
+
+Read: `GET /api/dashboard/projects/{name}/organize/{kind}` (the run under way or the last one, with its stages and how many lines each list holds) and `.../organize/runs/{run}/{list}` (one list, in pages).
+
+### Every check, and what it becomes
+
+Kept in the code (`BECOMES` in `dashboard/organize.py`), and a test holds that no check of the Needs-you list and no kind of batch is missing from it.
+
+| Today | Run | Stage |
+| --- | --- | --- |
+| Which User Story an Issue belongs to (`issue_story`) | User Stories and Issues | Verify |
+| Whether a User Story with no Issue and nothing done is still wanted (`story_needed`) | User Stories and Issues | Verify |
+| What the code says of an Issue's Story (review evidence) | User Stories and Issues | Verify |
+| Where each User Story stands (delivery) | User Stories and Issues | Read |
+| Batches: reasons of links, Issues placed | User Stories and Issues | Done |
+| Batches: links nothing supports, delivered Stories to close, Stories and Issues nothing stands behind | User Stories and Issues | Verify, then Needs you |
+| The one Epic of a User Story under several (`story_epic`) | Epics and User Stories | Verify |
+| Whether a Story's other Epics are related (`epic_links`) | Epics and User Stories | Verify |
+| Batches: primary Epics chosen, unrelated Epic links taken off | Epics and User Stories | Done |
+| Batch: Epics nothing stands behind | Epics and User Stories | Verify, then Needs you |
+| Structure: Stories an Epic lacks, Epics to split | Epics and User Stories | Create; splits in Needs you |
+| Epic overviews: the writer and the check of each sentence | Epics and User Stories | Create |
+| Links stated in a text, and those you chose | every run | Read |
+| Ranking service: meaning, rare words, pair by pair | every run | Match |
+| Scorer | every run | Match |
+| The judge: a second model of another maker | every run | Verify |
+| Automatic planning reviews | every run | Read, when a record arrives (O6) |
+| Documentation inventory | Coverage | Read |
+| The import of a repository | Coverage | Create |
+
+One correction to the proposal: the clean-up check (is a Story that nothing supports still wanted?) goes with User Stories and Issues, not with Epics and User Stories. It is what decides, for a Story with no Issue, between writing Issues and proposing to close it.
+
+### Only Issues are written to GitHub
+
+Reading the code showed that the platform never did write an Epic or a User Story to GitHub: the one place that creates an issue there is the publication of an approved Issue. Two things now hold it:
+
+- An approved record that calls itself an Epic or a User Story (by its title or the head of its text) is refused at publication and says why. Nothing is sent.
+- A test fails if an issue is ever created on GitHub from another place in the code.
+
+Epics and Stories that were issues on GitHub when a project was imported are another matter (decision 3). Their numbers are below.
+
+### The documentation in parts
+
+`dashboard/doc_parts.py` cuts each document at its headings. A part is what stands under one heading, down to the next heading of any level. Fewer than 20 words under a heading say nothing by themselves and go with the part before (or, at the top of a document, the part after). The same text always cuts the same.
+
+What a part is about is said by rule where the path or the heading says it:
+
+- **About the product:** an OpenSpec capability; the proposal, design and requirements of an OpenSpec change that is not archived.
+- **Not about the product:** a licence, change log, contributing guide and the like, by file name; a table of contents and the like, by heading; the task list of a change; an archived OpenSpec change, whose decisions are in the capabilities.
+- **Open:** everything else. A model says which in O4, and the administrator can correct it (decision 6).
+
+### What a first run would meet, read on live
+
+Read on 27 November 2026 from `GET /api/dashboard/projects/{name}/organize/ground`, which counts from the records in one to two seconds. Only open records are counted; bugs are left out.
+
+**Epics and User Stories**
+
+| Project | Epics | Stories | Under one Epic | Under several | With no Epic | Epics with no Story | Largest Epic holds |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| falcone | 63 | 580 | 73 | 507, the one Epic chosen for all | 0 | 0 | 97 Stories (17%) |
+| falcone-serverless | 16 | 66 | 1 | 65, none chosen (one is suggested for each) | 0 | 0 | 45 Stories (68%) |
+| falcone-workflow, gntik-ui, llmwiki, musematic | 0 | 0 | | | | | |
+
+"Chosen" is a primary Epic set by the administrator or by a batch that was approved or applied; "suggested" is one set only by how alike the texts are.
+
+**User Stories and Issues**
+
+| Project | Issues in the plan | Under a Story | Under several | With no Story | Stories with no Issue at all | Open issues never taken into the plan |
+| --- | --- | --- | --- | --- | --- | --- |
+| falcone | 265 | 265 (103 of them under a Story of a connected project) | 44 | 0 | 389 of 580 | 0 |
+| falcone-serverless | 204 | 203 | 78 | 1 | 0 of 66 | 0 |
+| falcone-workflow | 0 | | | | | 279 |
+| gntik-ui | 0 | | | | | 431 |
+| llmwiki | 0 | | | | | 2 |
+| musematic | 0 | | | | | 40 |
+
+Of Falcone's 389 Stories with no Issue: for 151 similar work exists, for 123 only documents speak of it, and 115 are supported by nothing. A further 46 Stories have closed Issues only. Falcone has 7 open bugs, left out.
+
+**Epics and Stories that are issues on GitHub**
+
+| Project | Open on GitHub | Closed there | Note |
+| --- | --- | --- | --- |
+| falcone | 0 | 23 Epics | 182 closures were made on approval earlier |
+| falcone-serverless | 0 | 16 Epics, 58 Stories | All 74 were closed by the platform on approval |
+| falcone-workflow | 12 Epics, 47 Stories | 0 | None of them is a record here |
+| gntik-ui, llmwiki, musematic | 0 | 0 | |
+
+**Documentation**
+
+| Project | Documents | Parts | Words | About the product, by rule | Not about it, by rule | Open |
+| --- | --- | --- | --- | --- | --- | --- |
+| falcone | 432 | 2,855 | 424,700 | 1,300 | 238 | 1,317 |
+| falcone-serverless | 56 | 398 | 87,930 | 0 | 1 | 397 |
+| falcone-workflow | 28 | 362 | 58,576 | 0 | 0 | 362 |
+| gntik-ui | 323 (1 too large to keep) | 1,916 | 125,544 | 1,462 | 340 | 114 |
+| llmwiki | 11 | 461 | 33,424 | 0 | 0 | 461 |
+| musematic | 958 | 8,064 | 727,554 | 2,571 | 957 | 4,536 |
+
+### What the numbers change
+
+1. **On Falcone and falcone-serverless there is almost nothing left to link.** No Story is without an Epic and one Issue is without a Story, because the checks built before did that work. O1 and O2 are still what was asked for (one button, three lists, undo), and they verify what is linked: 122 Issues under several Stories, and the Stories of Falcone whose other Epic links are in doubt.
+2. **The work is in creating.** 389 Stories of Falcone have no Issue. Each gets Issues written or is proposed for closing (decisions 4 and 5 apply). This is the part that will pass the 3 dollars a month, as decision 7 foresaw.
+3. **falcone-serverless has one Epic that holds 68% of its Stories**, and no Story of several Epics has its one Epic chosen. O2 starts there.
+4. **Four projects have no plan here at all**, and 752 open issues between them. A run of Organize would have to create a Story for nearly every Issue. For them Coverage should run first: it makes Epics and Stories from the documentation, and Organize then places the Issues under them. The order is offered by the page; it is not forced.
+5. **falcone-workflow has 59 issues on GitHub that call themselves Epics and Stories and no record here.** The batch of decision 3 closes on GitHub only what is a record here, so these are taken in first.
+6. **Coverage is large.** 14,056 parts and 1.46 million words over six projects, 8,064 of the parts in musematic. Half of the parts are decided by rule without a model. What a run costs is said by the run before it starts.
+

@@ -392,13 +392,15 @@ Asked for on 27 November: Reviews has too much on it. It is to become Organize (
 
 | Phase | What | Done when |
 | --- | --- | --- |
-| O0 | Ground: one run type with stages and three lists; the numbers a first run would meet; new Epics and Stories no longer written to GitHub. | The numbers are known for each project, and no new Epic or Story reaches GitHub. |
+| O0 | **Built, 27 November 2026.** Ground: one run type with stages and three lists; the numbers a first run would meet; only Issues are written to GitHub. See "O0 as built" in `organize-and-coverage.md`. | The numbers are known for each project, and no new Epic or Story reaches GitHub. |
 | O1 | Organize, User Stories and Issues: linking, behind one button. | Every open Issue that is no bug is under a Story or in "Needs you". |
 | O2 | Organize, Epics and User Stories: linking, behind the other button. | Every open Story has one Epic or is in "Needs you". |
 | O3 | Creating what has no counterpart, after the careful review; the list "Created", with undo. | No open Story without an Epic and no open Issue without a Story, except what is in "Needs you". |
 | O4 | Coverage: the documentation in parts, matched and verified, one number, missing records created. | One number for each project; a part nothing covered has a record or is in "Needs you". |
 | O5 | Two pages: the old views removed, what survives moved, old addresses redirected. | Reviews has three entries: Organize, Coverage, Settings. |
 | O6 | By itself, and told: organized as records and documents arrive; Dashboard, digest and chat; each stage measured again when it changes. | A new Issue is under a Story or in "Needs you" without a button. |
+
+The eight decisions the plan needed were taken on 27 November 2026, all as recommended: Issues a run creates are kept here and published together on one word; new Epics and User Stories are made without asking and can be undone for 30 days; the Epics and Stories that are GitHub issues are closed there in one approved batch, in O5; a Story with no Issue whose work is done is proposed for closing; an Epic with no Story and nothing that says what it should hold is the administrator's to close or explain; Coverage counts the parts of the documentation about the product; a run that would pass the dollar limit stops and shows its estimate; the six old views are removed in O5.
 
 ## Decisions (23 November 2026)
 
