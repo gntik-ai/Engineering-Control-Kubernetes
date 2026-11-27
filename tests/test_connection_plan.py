@@ -224,6 +224,11 @@ def test_a_new_connection_gets_its_plan_and_no_model_is_asked(
         assert ask["answer"]["model"] == "analysis" and ask["judge"]["model"] == "other"
         assert ask["dollars"] is not None and not ask["over"] and ask["limit"] == 5
         steps = {step["step"]: step["says"] for step in plan["verify"]}
+        # What counts as close is said, and that nothing was learned yet.
+        measured = plan["measured"]
+        assert (measured["threshold"], measured["learned_from"]) == (0.6, 0)
+        assert measured["nearest"]["95"] == 1.0 and measured["linked"] is None
+        assert "from a closeness of 0.60" in steps["Candidates"]
         assert "analysis (fixture) is asked about 6 records" in steps["Answer"]
         assert "other (fixture), of another maker" in steps["Review"]
         assert "never applied" in steps["What is applied"]
@@ -537,6 +542,18 @@ def test_records_are_offered_what_is_nearest_in_the_other_project(
             assert offered.index("Cron triggers") < offered.index("Timers that last")
             assert across.touched(0, story) == "names" and across.touched(0, theme) is None
             assert across.closest(0, story)[1].title == "Cron triggers"
+            # What "close" is, is learned from the links that were approved: with
+            # thirty known pairs that lie as close as can be, a record whose nearest
+            # lies at 0.8 is no longer close. It is never set above 0.95.
+            epic = across.items[1][ids["Triggers"]]
+            assert across.touched(1, epic) == "close" and across.close == connection_plan.CLOSE
+            known = (0, ids["Durable timers"], ids["Timers that last"])
+            assert across.learn([known] * 29) and across.learned == 0
+            spread = across.learn([known] * 30)
+            assert across.learned == 30 and across.close == 0.95
+            assert [round(value, 2) for value in spread[:2]] == [1.0, 1.0]
+            assert across.touched(1, epic) is None
+            assert across.touched(1, across.items[1][ids["Timers that last"]]) == "close"
         else:
             # Without the ranking service every record is put before the models.
             assert across.touched(0, theme) == "words"

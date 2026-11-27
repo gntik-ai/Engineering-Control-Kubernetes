@@ -10,7 +10,12 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import connection_lines, review_budget, review_flows
+from engineering_control.dashboard import (
+    connection_lines,
+    review_budget,
+    review_flows,
+    review_settings,
+)
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import (
     KINDS,
@@ -644,6 +649,9 @@ class Connections:
                 why = str(plan["blocked"])
             elif not (plan["ask"]["records"] or plan.get("stated")):
                 why = "Nothing is left to check: the plan is carried out."
+            elif plan["ask"]["records"] and review_settings.over(db, row.owner_id):
+                # The month's limit is reached: it says so before the word is given.
+                why = review_settings.over(db, row.owner_id)
             counts = run.counts or {} if run else {}
             reached = list(STAGES).index(run.stage) if run and run.stage in STAGES else -1
             return {

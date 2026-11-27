@@ -426,6 +426,7 @@ class ConnectionAnalysis:
             if mark != c.progress.get("references_mark"):
                 references(db, c, sides)
             across = Across.read(db, sides)
+            connection_plan.calibrate(db, c, across)
             readiness = {
                 side.project.name: {kind: len(across.by_kind[place][kind]) for kind in KINDS}
                 for place, side in enumerate(sides)

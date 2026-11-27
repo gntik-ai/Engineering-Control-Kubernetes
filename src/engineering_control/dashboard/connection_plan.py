@@ -48,6 +48,11 @@ OPTIONS: Final = 3
 # From how close by meaning a record counts as touched by the connection, and from how
 # close two records of the same kind count as the same thing recorded twice.
 CLOSE: Final = 0.6
+# The closeness a record has to reach is learned from the links of the connection that
+# were approved, once there are this many: it is set so that this share of them would
+# be missed, and never below the value above.
+LEARN_FROM: Final = 30
+MISSED: Final = 0.05
 TWIN: Final = 0.9
 # How many examples of a group the plan names.
 SHOWN: Final = 8
@@ -138,6 +143,10 @@ class Across:
                         numpy.stack([self.vector[place][key] for key in keys]),
                     )
         self.meaning = all(self.vector)
+        # From how close by meaning a record counts as touched, and from how many
+        # approved links that was learned.
+        self.close = CLOSE
+        self.learned = 0
         # What was worked out once for a record is kept while these records are read.
         self._close: dict[tuple[int, str, str], dict[str, float]] = {}
 
@@ -233,7 +242,23 @@ class Across:
         if item.key not in self.vector[place]:
             return "unread"
         best = self.closest(place, item)
-        return "close" if best is not None and best[0] >= CLOSE else None
+        return "close" if best is not None and best[0] >= self.close else None
+
+    def learn(self, pairs: list[tuple[int, str, str]]) -> list[float]:
+        """Set how close a record has to lie from the pairs that are known to be linked:
+        each a source, by its side, and what it is linked to on the other. How close a
+        pair lies depends on the model that read the texts, so a fixed value says
+        little; the approved links of the connection say what "close" is here. Returns
+        how close each known pair lies."""
+        found = []
+        for place, source, target in pairs:
+            one, two = self.vector[place].get(source), self.vector[1 - place].get(target)
+            if one is not None and two is not None and one.shape == two.shape:
+                found.append(float(one @ two))
+        if len(found) >= LEARN_FROM:
+            self.close = min(0.95, max(CLOSE, float(numpy.quantile(found, MISSED))))
+            self.learned = len(found)
+        return found
 
     def twins(self) -> list[tuple[float, Item, Item]]:
         """The pairs of the same kind that lie so close that they may be the same thing
@@ -253,6 +278,40 @@ class Across:
                     )
                 )
         return sorted(found, key=lambda pair: (-pair[0], pair[1].key, pair[2].key))
+
+
+def calibrate(db: Session, c: ProjectConnection, across: Across) -> list[float]:
+    """Teach the pair of projects what "close" is from the links of the connection that
+    were approved."""
+    places = {side.project.id: place for place, side in enumerate(across.sides)}
+    pairs = [
+        (places[project], str(source), str(target))
+        for project, source, target in db.execute(
+            select(
+                ConnectionFinding.source_project,
+                ConnectionFinding.source_id,
+                ConnectionFinding.target_id,
+            ).where(
+                ConnectionFinding.connection_id == c.id,
+                ConnectionFinding.action == "link",
+                ConnectionFinding.status == "approved",
+                ConnectionFinding.source_id.is_not(None),
+                ConnectionFinding.target_id.is_not(None),
+            )
+        )
+        if project in places
+    ]
+    return across.learn(pairs)
+
+
+def _spread(values: list[float]) -> dict[str, float] | None:
+    """Where the values lie: the value 5, 25, 50, 75 and 95 of a hundred lie below."""
+    if not values:
+        return None
+    return {
+        str(share): round(float(numpy.quantile(values, share / 100)), 3)
+        for share in (5, 25, 50, 75, 95)
+    }
 
 
 def _example(project: ProjectRecord, item: Item) -> dict[str, Any]:
@@ -365,6 +424,13 @@ def prepare(
     gives for a record and what it is offered: a record is asked about again only when
     it, or one of the records it is offered, changed."""
     by_name = {project.id: project for project in projects}
+    linked = calibrate(db, c, across)
+    nearest = [
+        best[0]
+        for place in range(2)
+        for item in across.items[place].values()
+        if (best := across.closest(place, item)) is not None
+    ]
     findings = list(
         db.scalars(select(ConnectionFinding).where(ConnectionFinding.connection_id == c.id))
     )
@@ -562,7 +628,16 @@ def prepare(
             "says": f"Each record is offered {OPTIONS} records of each kind of the other "
             "project: "
             + (
-                "by the words they share and by meaning, from the ranking service."
+                "by the words they share and by meaning, from the ranking service. "
+                + (
+                    f"A record counts as close to the other project from a closeness of "
+                    f"{across.close:.2f}, learned from the {across.learned} links approved "
+                    "so far: 95 of 100 of them lie at least that close."
+                    if across.learned
+                    else f"A record counts as close to the other project from a closeness "
+                    f"of {across.close:.2f}, the value used until {LEARN_FROM} links of "
+                    "this connection are approved to learn from."
+                )
                 if across.meaning
                 else "by the words they share. The ranking service has not read both "
                 "projects with the same model, so closeness by meaning is not used and "
@@ -633,7 +708,18 @@ def prepare(
         "meaning": across.meaning,
         "update": update,
         "verify": verify,
-        "measured": {"links": known, "selected": selected, "offered": offered},
+        "measured": {
+            "links": known,
+            "selected": selected,
+            "offered": offered,
+            # From how close a record counts as touched, how many approved links that
+            # was learned from, how close the linked pairs lie, and how close every
+            # record lies to its nearest in the other project.
+            "threshold": round(across.close, 3),
+            "learned_from": across.learned,
+            "linked": _spread(linked),
+            "nearest": _spread(nearest),
+        },
         "ask": {
             "records": len(ask),
             # Touched records a model was asked about already, as they stand.
