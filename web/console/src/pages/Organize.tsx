@@ -33,6 +33,8 @@ interface Shown {
   stands: { issues: number; settled: number; in_doubt: number; none: number; left: number; bugs_left_out: number };
   plan: {
     to_ask: number;
+    /** Why the models are not asked, where they are not. */
+    ask_blocked: string | null;
     answered: number;
     settled: number;
     unsupported: number;
@@ -377,7 +379,11 @@ function ListOf({
 /** What a run started now would do, said before it starts. */
 function planSaid(plan: Shown['plan']): string[] {
   const said: string[] = [];
-  if (plan.to_ask) {
+  if (plan.to_ask && plan.ask_blocked) {
+    said.push(
+      `${some(plan.to_ask, 'Issue has', 'Issues have')} no User Story and no answer yet, and no model is asked about ${plan.to_ask === 1 ? 'it' : 'them'}: ${plan.ask_blocked} What needs no model is still gathered, and costs nothing.`,
+    );
+  } else if (plan.to_ask) {
     said.push(
       `${some(plan.to_ask, 'Issue has', 'Issues have')} no User Story and no answer yet. ` +
         (plan.answer

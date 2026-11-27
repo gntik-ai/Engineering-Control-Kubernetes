@@ -176,17 +176,23 @@ class IssuesRun:
             run = runs[0] if runs else None
             live = run is not None and run.state in LIVE
             lists = _counts(db, project.id)
+            # What keeps the models from being asked. Whatever needs no model is still
+            # gathered: answers that wait, and links nothing supports.
+            blocked = None
+            if to_ask and not plan["answer"]:
+                blocked = parent_choice.NO_ANSWERING_MODEL
+            elif to_ask:
+                blocked = review_settings.over(db, project.id)
+            other = waits + unsupported
             why = None
             if live:
                 why = "A run is under way."
             elif refusal and cases:
                 why = refusal
-            elif not (to_ask or stands.get("settled") or unsupported or waits):
+            elif not (to_ask or other):
                 why = "Every open Issue is under a User Story: there is nothing to check."
-            elif to_ask and not plan["answer"]:
-                why = parent_choice.NO_ANSWERING_MODEL
-            elif to_ask and review_settings.over(db, project.id):
-                why = review_settings.over(db, project.id)
+            elif blocked and not other:
+                why = blocked
             issues = max(counted, len(cases))
             return {
                 "project": project.name,
@@ -202,6 +208,8 @@ class IssuesRun:
                 },
                 "plan": {
                     "to_ask": to_ask,
+                    # Why the models are not asked, where they are not.
+                    "ask_blocked": blocked,
                     "answered": len(cases) - to_ask,
                     "settled": stands.get("settled", 0),
                     "unsupported": unsupported,
@@ -272,7 +280,7 @@ class IssuesRun:
         if not shown["can_start"]:
             raise ProjectConflict(str(shown["why_not"]))
         asking: str | None = None
-        if shown["plan"]["to_ask"]:
+        if shown["plan"]["to_ask"] and not shown["plan"]["ask_blocked"]:
             with self.sessions() as db:
                 project = active_project(db, name)
                 under_way = db.scalar(
@@ -599,9 +607,7 @@ class IssuesRun:
             }
             run.state, run.stage, run.ended_at = final, "done", datetime.now(UTC)
             run.detail = (
-                f"{left} were not asked about: the run stopped before it reached them."
-                if left
-                else ""
+                f"{left} have no answer yet: they were not asked about in this run." if left else ""
             )
         organize.forget(name)
 

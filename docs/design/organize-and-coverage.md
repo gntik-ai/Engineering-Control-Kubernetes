@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 and OC are built and deployed** ("O0 as built" and "OC as built", below); O1 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 are built and deployed** ("O0 as built", "OC as built" and "O1 as built", below); O2 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -465,4 +465,77 @@ Candidates across the scope, on 12 Falcone issues that are linked to a Story of 
 - **The runs of one project do not read the scope yet.** The scope, the count and the candidates are there; the buttons that use them are O1 and O2.
 - **Nothing is carried out by itself.** A change brings a new plan; carrying it out within Settings is O6.
 - **Not exercised on live:** carrying a plan out, answering and undoing. They need the administrator's word and a model; they are covered by tests and were looked at in a local console.
+
+## O1 as built (27 November 2026)
+
+Started at the administrator's word ("go next O1"). Reviews has a new first entry, **Organize**, with the button for User Stories and Issues. The second button, Epics and User Stories, is O2: the page says so and points to where that work is done until then.
+
+### The page
+
+1. **One sentence on top:** "265 open Issues: 265 under a User Story, 0 in doubt, 0 with none", and how many bugs are left out.
+2. **What the button will do, said before it starts:** how many Issues will be asked about, by which two models, what that is likely to cost (from what the same question cost before), which connected projects' Stories are offered, and whether what is settled is applied or only put before the administrator, with the reason.
+3. **One button, "Check and organize",** behind a confirmation that repeats the above. Where it cannot start, the page says why in its place.
+4. **The stages of the run:** Read, Match, Verify, Create, Done, each with its count. Create is shown and stays at zero: nothing is created in this phase.
+5. **Three lists:** Needs you, Done, Created.
+
+### The run
+
+It puts the engines that exist in one order and adds none.
+
+| Stage | What | Engine |
+| --- | --- | --- |
+| Read | The open Issues that are no bug, and which have no User Story | The worklist of the check `issue_story` |
+| Match | Each Issue with none is offered the nearest User Stories, by shared words and by meaning | The shortlist of the check, now over the scope |
+| Verify | A model answers; a second, of another maker, answers without seeing the first | The check's run, started with the project's models. A check that is asking already is taken into the run |
+| Done | What both chose, with the texts ranking it first, is applied where the project's record allows | The batch "Place issues under a User Story", applied without the administrator, its sample judged afterwards |
+| Needs you | Every other answer, the most doubtful first; and links that nothing supports | The standings of the check; the scorer's "unsupported" |
+
+The run follows the check's asking in the background and gathers what was answered when it is over. It can be stopped, resumed, or ended keeping what was answered.
+
+### Needs you, and what the administrator does there
+
+A case shows the Issue, what each model answered and why, the passages it quoted, and the Stories the Issue was offered, each with its Epic, its project where that is another one, and who chose it. What both models chose is selected already.
+
+| The case | The answers |
+| --- | --- |
+| An Issue with no User Story | Put it under the chosen Story; it is a bug; leave it without a Story |
+| A link nothing supports | Take the link off; keep it |
+
+What stays out of "Needs you": an Issue that was left by the administrator, and one nobody was asked about yet (the sentence on top counts both under "with none").
+
+### Done, and undo
+
+A line under Done is an Issue put under a Story, by the record or at the administrator's word, or a link taken off. Each can be undone for 30 days, and so can everything a run applied. Undone, the case waits under "Needs you" again, and:
+
+- a link the record applied counts as **judged wrong** on that record. It is not proposed again, and it is part of what decides whether applying without the administrator goes on;
+- a link to a Story of a connected project is taken off the connection.
+
+### Connected projects
+
+- The Stories an Issue is offered are the project's own **and those of the projects connected to it**, ranked together. The models are told which project a Story belongs to.
+- An Issue put under a Story of a connected project is a link of their connection. It counts as placed, as it did before.
+- This holds for the old worklist under Related Work as well, since it is the same engine.
+
+### When applying happens by itself
+
+Unchanged, and now said on the page: a project applies what is settled once the administrator judged enough sampled lines of its batches and the share judged wrong is within what the settings accept (40 lines and 5% unless changed). Until then, what is settled is a case under "Needs you" with "Both models and the texts agree" and one click.
+
+### Read on live
+
+| Project | Open Issues | Under a Story | With none | Links nothing supports | What the button would do |
+| --- | --- | --- | --- | --- | --- |
+| falcone | 265 | 265 | 0 | 0 | Nothing to check; it says so. 7 bugs left out |
+| falcone-serverless | 204 | 203 | 1 | 11 | No model is set for this project's reviews, so the one Issue is not asked about; the 11 links are put before the administrator |
+| falcone-workflow, gntik-ui, llmwiki, musematic | 0 | | | | Nothing: they have no Issue in the plan yet |
+
+On Falcone the answering model is gpt-5.6-luna and the judge claude-haiku-5-5; a question has cost $0.0017 with the two. Neither project applies by itself yet: no sampled line was judged.
+
+So the goal of the phase holds on Falcone today: every open Issue that is no bug is under a User Story.
+
+### What is not in O1, and why
+
+- **Nothing is created.** An Issue that fits no Story waits under "Needs you" (both models say none fits). Making its Story is O3.
+- **A User Story with no Issue is not looked at.** Falcone has 389. Writing their Issues or proposing to close them is O3.
+- **The old views are still there.** Related Work shows the same worklist; both read the same records. They go in O5.
+- **Not exercised on live:** starting a run, answering and undoing. Falcone has nothing to check, and falcone-serverless would put 11 cases before the administrator, which is theirs to start. Covered by five tests of the run and looked at in a local console.
 

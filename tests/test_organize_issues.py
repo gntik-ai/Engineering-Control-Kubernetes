@@ -8,12 +8,14 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
+from engineering_control.dashboard import review_settings
 from engineering_control.db.models import (
     BacklogItem,
     ConnectionFinding,
     ProjectRecord,
     ReorgBatch,
     ReorgLine,
+    ReviewSettings,
 )
 from tests.test_automatic_planning import post
 from tests.test_dashboard_web import _authenticated_client
@@ -333,7 +335,42 @@ def test_a_run_can_be_stopped_and_says_when_it_cannot_start(
         assert post(client, "organize/stories-issues/control", action="end").status_code == 200
         ended = shown(client)
         assert ended["run"]["state"] == "stopped" and ended["can_start"]
-        assert "3 were not asked about" in ended["run"]["detail"]
+        assert "3 have no answer yet" in ended["run"]["detail"]
         assert ended["lists"]["needs_you"] == 0
+    finally:
+        client.close()
+
+
+def test_what_needs_no_model_is_gathered_when_none_can_be_asked(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    client, repo = _authenticated_client(tmp_path)
+    try:
+        ready(repo, monkeypatch)
+        assert post(client, "review-settings", **SAVE).status_code == 200
+        assert post(client, "organize/stories-issues/runs").status_code == 200
+        unclear = {("analysis", number): ["unclear"] for number in (41, 42, 45)}
+        asked(repo, Readers(unclear))
+        assert shown(client)["lists"]["needs_you"] == 3
+        # One Issue changes, so it has no answer to its text; and no model is set any more.
+        with repo.sessions.begin() as db:
+            issue = db.scalars(select(BacklogItem).where(BacklogItem.issue_number == 41)).one()
+            issue.description = "Write every invocation to the ledger, once."
+            project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
+            for settings in db.scalars(
+                select(ReviewSettings).where(ReviewSettings.project_id == project.id)
+            ):
+                settings.answer_provider = settings.answer_model = None
+            pid = project.id
+        review_settings.forget(pid)
+        now = shown(client)
+        # It says that nobody is asked and why, and still gathers what waits.
+        assert now["plan"]["to_ask"] == 1 and "No model" in now["plan"]["ask_blocked"]
+        assert now["can_start"] and now["why_not"] is None
+        assert post(client, "organize/stories-issues/runs").status_code == 200
+        after = shown(client)
+        assert after["run"]["state"] == "complete" and after["run"]["asking"] is None
+        assert "1 have no answer yet" in after["run"]["detail"]
+        assert after["lists"]["needs_you"] == 2
     finally:
         client.close()
