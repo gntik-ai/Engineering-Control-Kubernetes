@@ -121,6 +121,8 @@ from engineering_control.dashboard.schemas import (
     MissingStoryInput,
     ModelTrialRunInput,
     NewEpicInput,
+    OrganizeAnswerInput,
+    OrganizeControlInput,
     OrphanApproveInput,
     OrphanDraftInput,
     OrphanLinkInput,
@@ -517,6 +519,16 @@ def create_app(
             except Exception as error:  # noqa: BLE001 - tried again at the next pass
                 log_failure("checks-by-themselves", "Starting a check by itself failed", error)
 
+    async def keep_organizing(records: DashboardRepository) -> None:
+        """The runs of Organize that are under way are carried on: each follows its
+        check's asking and gathers what was answered when that is over."""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await asyncio.to_thread(records.organize_issues.tick)
+            except Exception as error:  # noqa: BLE001 - tried again at the next pass
+                log_failure("organize", "A run of Organize could not be carried on", error)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_repository = repository or DashboardRepository(
@@ -591,6 +603,8 @@ def create_app(
             )
             # The checks a project's settings ask to run by themselves.
             keepers.append(asyncio.create_task(keep_checks_asked(resolved_repository)))
+            # The runs of Organize follow their checks and gather what was answered.
+            keepers.append(asyncio.create_task(keep_organizing(resolved_repository)))
             if resolved.ranker_url:
                 # Vectors and scores of the planning records, from the ranking service.
                 keepers.append(
@@ -2249,6 +2263,76 @@ def create_app(
         """What a first run of Organize and of Coverage would meet in the project."""
         return await documents_read(
             request, lambda: repo(request).organize.ground(name, fresh=fresh)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/organize/stories-issues")
+    async def organize_issues_api(name: str, request: Request) -> Response:
+        """Where the Issues stand to the User Stories, what a run would do and cost, the
+        run under way or the last one, and how many lines its lists hold."""
+        return await documents_read(request, lambda: repo(request).organize_issues.shown(name))
+
+    @app.get("/api/dashboard/projects/{name}/organize/stories-issues/lines/{listed}")
+    async def organize_issues_lines_api(
+        name: str,
+        listed: Literal["needs_you", "done", "created"],
+        request: Request,
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        """One of the three lists: needs you, done, created."""
+        return await documents_read(
+            request, lambda: repo(request).organize_issues.lines(name, listed, page)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/runs")
+    async def organize_issues_start(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_issues.start, name),
+            event="organize.started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/control")
+    async def organize_issues_control(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeControlInput,
+            lambda b: asyncio.to_thread(repo(request).organize_issues.control, name, b.action),
+            event="organize.controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/lines/{line}")
+    async def organize_issues_answer(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeAnswerInput,
+            lambda b: asyncio.to_thread(
+                repo(request).organize_issues.answer, name, line, b.choice, b.story_id
+            ),
+            event="organize.answered",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/lines/{line}/undo")
+    async def organize_issues_undo(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_issues.undo, name, line),
+            event="organize.undone",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/runs/{run}/undo")
+    async def organize_issues_undo_run(name: str, run: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_issues.undo_run, name, run),
+            event="organize.run_undone",
+            subject=name,
         )
 
     @app.get("/api/dashboard/projects/{name}/organize/candidates/{record}")

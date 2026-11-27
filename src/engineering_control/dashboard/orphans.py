@@ -32,7 +32,8 @@ from engineering_control.dashboard import (
     review_budget,
     review_settings,
 )
-from engineering_control.dashboard.connection_records import digest, finding_links
+from engineering_control.dashboard.connection_records import digest, finding_links, peers
+from engineering_control.dashboard.connections import link_issue_across
 from engineering_control.dashboard.issue_coverage import excerpt
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.parent_choice import THINKING_ROOM, Unusable, passage, position
@@ -142,6 +143,9 @@ class _Stories:
     issues: dict[UUID, Any] = field(default_factory=dict)
     # How many candidates an issue is shown: the project's settings say.
     candidates: int = SHORTLIST
+    # The Stories that belong to a connected project, each with that project and what
+    # it is called. A run reads the projects connected to its own as part of it.
+    home: dict[UUID, tuple[UUID, str]] = field(default_factory=dict)
 
 
 # The index of each project's Stories, kept for as long as nothing it is made of changed.
@@ -181,55 +185,73 @@ def _stamp(db: Session, project: UUID) -> tuple[Any, ...]:
 
 def _stories(db: Session, project: UUID) -> _Stories:
     candidates = review_settings.of(db, project).count("candidates")
-    stamp = (*_stamp(db, project), candidates)
+    connected = peers(db, project)
+    stamp = (
+        *_stamp(db, project),
+        candidates,
+        *((peer.id, *_stamp(db, peer.id)) for peer in connected),
+    )
     kept = _INDEX.get(project)
     if kept is not None and kept[0] == stamp:
         return kept[1]
-    index = _index(db, project)
+    index = _index(db, project, connected)
     index.candidates = candidates
     _INDEX[project] = (stamp, index)
     return index
 
 
-def _index(db: Session, project: UUID) -> _Stories:
-    rows = {
-        key: (title, body or "")
-        for key, title, body in db.execute(
-            select(ProjectUserStory.id, ProjectUserStory.title, ProjectUserStory.description).where(
-                ProjectUserStory.project_id == project,
-                ProjectUserStory.archived_at.is_(None),
-                ProjectUserStory.closed_at.is_(None),
-            )
-        )
-    }
-    titles = dict(
-        db.execute(
-            select(ProjectEpic.id, ProjectEpic.title).where(
-                ProjectEpic.project_id == project, ProjectEpic.archived_at.is_(None)
-            )
-        )
-        .tuples()
-        .all()
-    )
+def _index(db: Session, project: UUID, connected: list[ProjectRecord] | None = None) -> _Stories:
+    """The open User Stories an issue of the project may be put under: its own, and
+    those of the projects connected to it."""
+    rows: dict[UUID, tuple[str, str]] = {}
+    home: dict[UUID, tuple[UUID, str]] = {}
     epics: dict[UUID, tuple[UUID, str]] = {}
-    # The primary Epic where one is recorded, else the first the Story is under.
-    for story, epic in db.execute(
-        select(ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id)
-        .where(ProjectStoryEpic.project_id == project)
-        .order_by(ProjectStoryEpic.epic_id)
-    ):
-        if story in rows and epic in titles:
-            epics.setdefault(story, (epic, titles[epic]))
-    for story, epic in db.execute(
-        select(PlanningLink.child_id, PlanningLink.parent_id).where(
-            PlanningLink.project_id == project,
-            PlanningLink.kind == "story_epic",
-            PlanningLink.removed_at.is_(None),
-            PlanningLink.is_primary,
+    for owner, label in [
+        (project, ""),
+        *((peer.id, peer.display_name) for peer in connected or []),
+    ]:
+        mine = {
+            key: (title, body or "")
+            for key, title, body in db.execute(
+                select(
+                    ProjectUserStory.id, ProjectUserStory.title, ProjectUserStory.description
+                ).where(
+                    ProjectUserStory.project_id == owner,
+                    ProjectUserStory.archived_at.is_(None),
+                    ProjectUserStory.closed_at.is_(None),
+                )
+            )
+        }
+        rows.update(mine)
+        if owner != project:
+            home.update(dict.fromkeys(mine, (owner, label)))
+        titles = dict(
+            db.execute(
+                select(ProjectEpic.id, ProjectEpic.title).where(
+                    ProjectEpic.project_id == owner, ProjectEpic.archived_at.is_(None)
+                )
+            )
+            .tuples()
+            .all()
         )
-    ):
-        if story in rows and epic in titles:
-            epics[story] = (epic, titles[epic])
+        # The primary Epic where one is recorded, else the first the Story is under.
+        for story, epic in db.execute(
+            select(ProjectStoryEpic.story_id, ProjectStoryEpic.epic_id)
+            .where(ProjectStoryEpic.project_id == owner)
+            .order_by(ProjectStoryEpic.epic_id)
+        ):
+            if story in mine and epic in titles:
+                epics.setdefault(story, (epic, titles[epic]))
+        for story, epic in db.execute(
+            select(PlanningLink.child_id, PlanningLink.parent_id).where(
+                PlanningLink.project_id == owner,
+                PlanningLink.kind == "story_epic",
+                PlanningLink.removed_at.is_(None),
+                PlanningLink.is_primary,
+            )
+        ):
+            if story in mine and epic in titles:
+                epics[story] = (epic, titles[epic])
     postings: dict[str, list[tuple[UUID, int]]] = defaultdict(list)
     lengths: dict[UUID, int] = {}
     for key in sorted(rows, key=str):
@@ -238,12 +260,20 @@ def _index(db: Session, project: UUID) -> _Stories:
         lengths[key] = sum(words.values())
         for word, count in words.items():
             postings[word].append((key, count))
-    numbers = {number: key for key, number in _numbers(db, project, "stories", set(rows)).items()}
+    own = {key for key in rows if key not in home}
+    numbers = {number: key for key, number in _numbers(db, project, "stories", own).items()}
     index = _Stories(
         rows, epics, numbers, postings, lengths, sum(lengths.values()) / max(1, len(rows)) or 1.0
     )
+    index.home = home
     embedding = ranking.stored_model(db, RecordVector, project)
     kept = ranking.vectors(db, project, embedding) if embedding else {}
+    for peer in connected or []:
+        # A connected project's Stories are compared by meaning only where the ranking
+        # service read them with the same model.
+        if embedding and ranking.stored_model(db, RecordVector, peer.id) == embedding:
+            theirs = ranking.vectors(db, peer.id, embedding)
+            kept.update({key: vector for key, vector in theirs.items() if key[0] == "story"})
     index.meant = [key for key in sorted(rows, key=str) if ("story", key) in kept]
     if index.meant:
         index.matrix = numpy.stack([kept["story", key] for key in index.meant])
@@ -322,6 +352,8 @@ def shortlist(issue: BacklogItem, repository: str, stories: _Stories) -> list[di
                 # Few words in common, and not among the closest in meaning either.
                 "weak": key not in named and scores.get(key, 0.0) < WEAK and key not in nearest,
                 "meaning": close.index(key) + 1 if key in close[:JOINED] else None,
+                # For a Story of a connected project: which project it belongs to.
+                **({"project": stories.home[key][1]} if key in stories.home else {}),
             }
         )
     stories.ranked[known] = listed
@@ -337,6 +369,26 @@ def revision(issue: BacklogItem, listed: list[dict[str, Any]]) -> str:
             "stories": [entry["id"] for entry in listed],
         }
     )
+
+
+def open_issues(db: Session, project: ProjectRecord) -> tuple[int, int]:
+    """How many open issues of the plan the project has that are no bug, and how many
+    open bugs, which are left out: counted as the worklist below counts."""
+    bugs = bugs_with_optional_stories(db, project.id)
+    listed = (
+        BacklogItem.project_id == project.id,
+        _visible_issues(project.id),
+        BacklogItem.workspace_review.is_distinct_from("planning"),
+        BacklogItem.issue_number.is_not(None),
+        func.coalesce(BacklogItem.issue_state, "open") == "open",
+    )
+    plain = db.scalar(
+        select(func.count()).select_from(BacklogItem).where(*listed, BacklogItem.id.not_in(bugs))
+    )
+    left_out = db.scalar(
+        select(func.count()).select_from(BacklogItem).where(*listed, BacklogItem.id.in_(bugs))
+    )
+    return int(plain or 0), int(left_out or 0)
 
 
 def orphans(db: Session, project: ProjectRecord) -> list[BacklogItem]:
@@ -383,7 +435,13 @@ def question(
     for place, entry in enumerate(listed, start=1):
         title, body = stories.rows[UUID(entry["id"])]
         offered.append(
-            {"id": f"S{place}", "title": title, "epic": entry["epic"], "text": body[:STORY_TEXT]}
+            {
+                "id": f"S{place}",
+                "title": title,
+                "epic": entry["epic"],
+                "text": body[:STORY_TEXT],
+                **({"project": entry["project"]} if entry.get("project") else {}),
+            }
         )
     asked = {
         "issue": {
@@ -733,8 +791,11 @@ class Orphans:
         """Link the issue to the Story and record who chose it: the review, approved by
         the administrator, when it is the Story the review answered with or the one it
         said was missing (``proposed``); otherwise the administrator alone."""
-        self.links.before_change(name, "issues", item)
-        self.planning.link_stories(name, item, [story])
+        with self.sessions() as db:
+            across = story in _stories(db, active_project(db, name).id).home
+        if not across:
+            self.links.before_change(name, "issues", item)
+            self.planning.link_stories(name, item, [story])
         note = Note("administrator", confirmed=True)
         with self.sessions.begin() as db:
             project = active_project(db, name)
@@ -754,7 +815,12 @@ class Orphans:
                         or None,
                     )
                 parent_choice.decide(review, agreed)
-        self.links.noted(name, "issues", item, story, note)
+            if across:
+                # A User Story of a connected project: the link is a link of their
+                # connection, made at the administrator's word.
+                link_issue_across(db, project, item, story, note.reason or "", by="administrator")
+        if not across:
+            self.links.noted(name, "issues", item, story, note)
         return note
 
     def link(self, name: str, item: UUID, story: UUID) -> dict[str, Any]:
@@ -764,14 +830,16 @@ class Orphans:
         with self.sessions() as db:
             project = active_project(db, name)
             self._orphan(db, project, item)
-            if not db.scalar(
+            if story not in _stories(db, project.id).home and not db.scalar(
                 select(ProjectUserStory.id).where(
                     ProjectUserStory.project_id == project.id,
                     ProjectUserStory.id == story,
                     ProjectUserStory.archived_at.is_(None),
                 )
             ):
-                raise ProjectInvalid("Choose a User Story of this project.")
+                raise ProjectInvalid(
+                    "Choose a User Story of this project, or of a project connected to it."
+                )
         note = self._put_under(name, item, story, False)
         return {"id": str(item), "story_id": str(story), "origin": note.origin}
 

@@ -882,6 +882,70 @@ class Connections:
             return {"undone": undone, "kept": kept}
 
 
+def _between(db: Session, one: UUID, two: UUID) -> ProjectConnection:
+    first, second = sorted([one, two])
+    row = db.scalar(
+        select(ProjectConnection).where(
+            ProjectConnection.first_id == first,
+            ProjectConnection.second_id == second,
+            ProjectConnection.archived_at.is_(None),
+        )
+    )
+    if row is None:
+        raise ProjectConflict("The two projects are not connected.")
+    return row
+
+
+def link_issue_across(
+    db: Session, project: ProjectRecord, item: UUID, story: UUID, reason: str, *, by: str
+) -> ConnectionFinding:
+    """Put an issue of this project under a User Story of a connected project: the link
+    is a link of their connection. ``by`` says who made it: the ``administrator``, or a
+    ``model`` whose answer a second model agreed with."""
+    target = db.get(ProjectUserStory, story)
+    peer = db.get(ProjectRecord, target.project_id) if target else None
+    if target is None or peer is None or target.archived_at is not None:
+        raise ProjectConflict("The User Story is gone.")
+    row = _between(db, project.id, peer.id)
+    source, dest = catalog(db, project).local.get(item), catalog(db, peer).local.get(story)
+    if source is None or dest is None:
+        raise ProjectConflict("The issue or the User Story is no longer listed.")
+    why = reason.strip() or "Linked by the administrator."
+    if by == "administrator":
+        f = store_link(db, row, source, dest, None, "manual", why)
+    else:
+        f = store_link(db, row, source, dest, None, "model", why)
+        f.evidence = {**f.evidence, "input_version": digest([source.summary(), dest.summary()])}
+        if f.status != "approved":
+            _record_decision(db, row, f, "approved")
+    audit(db, row, f"Linked {source.title} to {dest.title} of {peer.display_name}.")
+    return f
+
+
+def unlink_issue_across(db: Session, project: ProjectRecord, item: UUID, story: UUID) -> bool:
+    """Take the issue off the User Story of a connected project again."""
+    f = db.scalar(
+        select(ConnectionFinding)
+        .join(ProjectConnection, ProjectConnection.id == ConnectionFinding.connection_id)
+        .where(
+            (ProjectConnection.first_id == project.id)
+            | (ProjectConnection.second_id == project.id),
+            ProjectConnection.archived_at.is_(None),
+            ConnectionFinding.action == "link",
+            ConnectionFinding.status == "approved",
+            ConnectionFinding.source_id == item,
+            ConnectionFinding.target_id == story,
+        )
+        .limit(1)
+    )
+    if f is None:
+        return False
+    row = db.get(ProjectConnection, f.connection_id)
+    if row is not None:
+        _record_decision(db, row, f, "dismissed")
+    return True
+
+
 def _decide(
     db: Session,
     p: ProjectRecord,

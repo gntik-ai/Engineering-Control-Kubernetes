@@ -385,6 +385,17 @@ class ConnectionDecisionInput(PlainChangeInput):
     accept: bool
 
 
+class OrganizeControlInput(PlainChangeInput):
+    action: Literal["stop", "resume", "end"]
+
+
+class OrganizeAnswerInput(PlainChangeInput):
+    # What the administrator says of a case: the Issue goes under that User Story, is a
+    # bug, or is left; a link nothing supports is taken off or kept.
+    choice: Literal["story", "bug", "leave", "take_off", "keep"]
+    story_id: UUID | None = None
+
+
 class ConnectionCarryOutInput(PlainChangeInput):
     # Carry the plan out as far as the month's limit allows, though it is estimated
     # to cost more.

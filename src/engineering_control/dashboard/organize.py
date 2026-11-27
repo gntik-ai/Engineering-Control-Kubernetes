@@ -508,7 +508,8 @@ def ground(sessions: sessionmaker[Session], name: str, *, fresh: bool = False) -
     """What a first run would meet in the project: how its Epics, User Stories and Issues
     stand to each other, which of its Epics and Stories are issues on GitHub, and how its
     documentation cuts into parts. Counted from the records; no model is asked."""
-    kept = _KEPT.get(name)
+    key = f"{id(sessions)}:{name}"
+    kept = _KEPT.get(key)
     now = time.monotonic()
     if kept and not fresh and now - kept[0] < FRESH:
         return kept[1]
@@ -526,8 +527,14 @@ def ground(sessions: sessionmaker[Session], name: str, *, fresh: bool = False) -
         }
         for check, (run, stage, says) in BECOMES.items()
     ]
-    _KEPT[name] = (now, counted)
+    _KEPT[key] = (now, counted)
     return counted
+
+
+def forget(name: str) -> None:
+    """What was counted for the project is counted anew at the next asking."""
+    for key in [key for key in _KEPT if key.endswith(":" + name)]:
+        _KEPT.pop(key, None)
 
 
 def can_undo(line: OrganizeLine, now: datetime) -> bool:

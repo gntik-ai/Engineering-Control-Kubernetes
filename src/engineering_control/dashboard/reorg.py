@@ -31,6 +31,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import cleanup, epic_links, parent_choice, review_settings
+from engineering_control.dashboard.connections import link_issue_across, unlink_issue_across
 from engineering_control.dashboard.issue_types import bugs_with_optional_stories
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks, explained
@@ -987,6 +988,16 @@ class Reorg:
                 )
                 if linked:
                     raise ProjectConflict("The issue has a User Story by now.")
+                story = db.get(ProjectUserStory, parent)
+                across = story is not None and story.project_id != project.id
+            if across:
+                # A User Story of a connected project: the link is one of their
+                # connection, and says that a model's agreed answer made it.
+                with self.sessions.begin() as db:
+                    link_issue_across(
+                        db, active_project(db, name), child, parent, reason, by="model"
+                    )
+                return [{"across": True}]
             self.links.before_change(name, "issues", child)
             self.planning.link_stories(name, child, [parent])
             self.links.noted(
@@ -1005,6 +1016,74 @@ class Reorg:
             raise ProjectConflict("The link is gone.")
         self.links.after_change(name, "issues", child)
         return before
+
+    def ready(self, name: str, kind: str) -> list[dict[str, Any]]:
+        """The changes of that kind that are ready to be made, the surest first: each
+        with the two records, how sure it is, and why."""
+        with self.sessions() as db:
+            project = active_project(db, name)
+            return [
+                {
+                    "child": row.child_id,
+                    "parent": row.parent_id,
+                    "confidence": float(row.confidence),
+                    "why": str((row.detail or {}).get("why") or ""),
+                    "signals": (row.detail or {}).get("signals") or {},
+                }
+                for row in self._ready(db, project, kind)
+            ]
+
+    def apply_one(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
+        """Make one change of that kind by itself, outside a batch, and return how
+        things stood before: for a run that applies one line at the administrator's
+        word."""
+        if kind not in KINDS:
+            raise ProjectInvalid("That is no kind of change.")
+        return self._apply(name, kind, child, parent, reason)
+
+    def revert_one(self, name: str, kind: str, child: UUID, parent: UUID, before: Any) -> None:
+        """Take one change back that was made by itself."""
+        if kind not in KINDS or kind in FINAL:
+            raise ProjectInvalid("That change cannot be taken back from here.")
+        self._revert(name, kind, child, parent, before or [])
+
+    def applied(self, name: str, batch_id: UUID) -> list[dict[str, Any]]:
+        """The lines of a batch that were applied."""
+        with self.sessions() as db:
+            project = active_project(db, name)
+            batch = self._get(db, project, batch_id)
+            return [
+                {
+                    "id": line.id,
+                    "child": line.child_id,
+                    "parent": line.parent_id,
+                    "reason": line.reason,
+                    "before": line.before,
+                }
+                for line in db.scalars(
+                    select(ReorgLine).where(
+                        ReorgLine.batch_id == batch.id, ReorgLine.state == "applied"
+                    )
+                )
+            ]
+
+    def undo_line(self, name: str, line_id: UUID) -> None:
+        """Put back what one applied line of an approved batch changed. The line counts
+        as judged wrong from then on: it is not proposed again, and it is part of the
+        record that decides how far its kind of change goes without the administrator."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            line = db.get(ReorgLine, line_id)
+            batch = db.get(ReorgBatch, line.batch_id) if line else None
+            if line is None or batch is None or batch.project_id != project.id:
+                raise ProjectNotFound(str(line_id))
+            if line.state != "applied" or batch.kind in FINAL:
+                raise ProjectConflict("There is nothing to put back here.")
+            kind, child, parent, before = batch.kind, line.child_id, line.parent_id, line.before
+        self._revert(name, kind, child, parent, before or [])
+        with self.sessions.begin() as db:
+            line = db.get_one(ReorgLine, line_id)
+            line.state, line.verdict = "undone", "wrong"
 
     def undo(self, name: str, batch_id: UUID) -> dict[str, Any]:
         """Put back everything an approved batch changed, within thirty days. A line
@@ -1067,6 +1146,11 @@ class Reorg:
             side = "issues" if kind == "reasons" else "stories"
             if not self.links.restore(name, side, child, before):
                 raise ProjectConflict("The link is gone.")
+            return
+        if kind == "place" and before and before[0].get("across"):
+            with self.sessions.begin() as db:
+                if not unlink_issue_across(db, active_project(db, name), child, parent):
+                    raise ProjectConflict("The link is gone already.")
             return
         if kind == "place":
             self.links.before_change(name, "issues", child)

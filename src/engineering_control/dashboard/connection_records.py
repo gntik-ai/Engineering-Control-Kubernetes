@@ -42,6 +42,24 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def peers(session: Session, project: UUID) -> list[ProjectRecord]:
+    """The projects connected to this one, the oldest connection first. Direct
+    connections only: a project connected to a connected project is not among them."""
+    found: list[ProjectRecord] = []
+    for first, second in session.execute(
+        select(ProjectConnection.first_id, ProjectConnection.second_id)
+        .where(
+            (ProjectConnection.first_id == project) | (ProjectConnection.second_id == project),
+            ProjectConnection.archived_at.is_(None),
+        )
+        .order_by(ProjectConnection.created_at, ProjectConnection.id)
+    ):
+        peer = session.get(ProjectRecord, second if first == project else first)
+        if peer is not None and peer.archived_at is None and peer not in found:
+            found.append(peer)
+    return found
+
+
 def counterpart(connection: ProjectConnection, project: UUID) -> UUID:
     return connection.second_id if project == connection.first_id else connection.first_id
 
