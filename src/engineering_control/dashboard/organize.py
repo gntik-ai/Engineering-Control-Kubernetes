@@ -608,6 +608,106 @@ def shown_run(run: OrganizeRun, lists: dict[str, int]) -> dict[str, Any]:
     }
 
 
+# -- what the runs behind the buttons of Organize share ------------------------------------
+
+
+def runs_of(db: Session, project: UUID, kind: str) -> list[OrganizeRun]:
+    """The project's runs of that kind, the newest first."""
+    return list(
+        db.scalars(
+            select(OrganizeRun)
+            .where(
+                OrganizeRun.project_id == project,
+                OrganizeRun.kind == kind,
+                OrganizeRun.connection_id.is_(None),
+            )
+            .order_by(OrganizeRun.created_at.desc(), OrganizeRun.id)
+        )
+    )
+
+
+def lines_where(project: UUID, kind: str) -> Any:
+    """The lines of every run of that kind in the project."""
+    return OrganizeLine.run_id.in_(
+        select(OrganizeRun.id).where(
+            OrganizeRun.project_id == project,
+            OrganizeRun.kind == kind,
+            OrganizeRun.connection_id.is_(None),
+        )
+    )
+
+
+def list_counts(db: Session, project: UUID, kind: str) -> dict[str, int]:
+    """How many lines each list holds: what still waits, and what was done and created
+    and still stands."""
+    found = dict.fromkeys(LISTS, 0)
+    for listed, state, number in db.execute(
+        select(OrganizeLine.listed, OrganizeLine.state, func.count())
+        .where(lines_where(project, kind))
+        .group_by(OrganizeLine.listed, OrganizeLine.state)
+    ):
+        if (listed == "needs_you" and state == "open") or (
+            listed != "needs_you" and state == "applied"
+        ):
+            found[listed] = found.get(listed, 0) + int(number)
+    return found
+
+
+def shown_stages(run: OrganizeRun) -> list[dict[str, Any]]:
+    """The stages of a run, each with whether it was reached and its counts."""
+    counts = run.counts or {}
+    reached = list(STAGES).index(run.stage) if run.stage in STAGES else 0
+    return [
+        {
+            "stage": stage,
+            "name": title,
+            "reached": index <= reached,
+            **{key: int((counts.get(stage) or {}).get(key, 0)) for key in ("records", *STANDS)},
+        }
+        for index, (stage, title) in enumerate(STAGES.items())
+    ]
+
+
+def list_page(
+    db: Session, project: UUID, kind: str, listed: str, page: int, page_size: int
+) -> tuple[int, list[OrganizeLine], int, int]:
+    """A page of one list over every run of that kind: what still waits, the most
+    doubtful first; what was done and still stands, the newest first."""
+    if listed not in LISTS:
+        raise ProjectInvalid("That is no list of a run")
+    page, page_size = max(1, page), min(100, max(1, page_size))
+    where = [
+        lines_where(project, kind),
+        OrganizeLine.listed == listed,
+        OrganizeLine.state == ("open" if listed == "needs_you" else "applied"),
+    ]
+    total = int(db.scalar(select(func.count()).select_from(OrganizeLine).where(*where)) or 0)
+    order = (
+        (OrganizeLine.doubt.desc(), OrganizeLine.created_at, OrganizeLine.id)
+        if listed == "needs_you"
+        else (OrganizeLine.answered_at.desc(), OrganizeLine.id)
+    )
+    rows = list(
+        db.scalars(
+            select(OrganizeLine)
+            .where(*where)
+            .order_by(*order)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    )
+    return total, rows, page, max(1, -(-total // page_size))
+
+
+def own_line(db: Session, project: UUID, kind: str, key: UUID) -> OrganizeLine:
+    """The line, where it is one of that kind of run in the project."""
+    line = db.get(OrganizeLine, key)
+    run = db.get(OrganizeRun, line.run_id) if line else None
+    if line is None or run is None or run.project_id != project or run.kind != kind:
+        raise ProjectNotFound(str(key))
+    return line
+
+
 class Organize:
     """The runs of Organize and Coverage, and what each found."""
 
