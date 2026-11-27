@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 are built and deployed** ("O0 as built", "OC as built" and "O1 as built", below); O2 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1 and O2 are built and deployed** ("O0 as built", "OC as built", "O1 as built" and "O2 as built", below); O3 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -539,3 +539,75 @@ So the goal of the phase holds on Falcone today: every open Issue that is no bug
 - **The old views are still there.** Related Work shows the same worklist; both read the same records. They go in O5.
 - **Not exercised on live:** starting a run, answering and undoing. Falcone has nothing to check, and falcone-serverless would put 11 cases before the administrator, which is theirs to start. Covered by five tests of the run and looked at in a local console.
 
+## O2 as built (27 November 2026)
+
+Started at the administrator's word ("go next O2"). The Organize page now has both buttons: **Epics and User Stories** first, as the plan orders them, then User Stories and Issues. The card that said the button was not built is gone.
+
+### The page
+
+The same shape as the first button, so that one is learned for both.
+
+1. **One sentence on top:** "580 open User Stories: 579 with their one Epic, 1 in doubt, 0 under several Epics and not checked yet, 0 with none", and how many open Epics there are.
+2. **What the button will do, said before it starts:** how many Stories get their Epic by rule, how many are asked about and by which two models, what that is likely to cost, whether what is settled is applied or only put before the administrator, how many links to other Epics will be put before the administrator, and how many Stories the texts call in question.
+3. **One button, "Check and organize",** behind a confirmation that repeats the above.
+4. **The stages of the run** and **the three lists**, as for the first button.
+
+### The run
+
+It puts the two checks that exist in one order, adds one rule and one comparison, and asks no new kind of question.
+
+| Step | What | Engine |
+| --- | --- | --- |
+| By rule | A Story whose own text names one of its Epics gets that Epic as its one Epic. No model is asked. Listed under Done, and can be undone | The stated link of the check `story_epic` |
+| The one Epic | For a Story under several Epics, a model says which it belongs to; a second, of another maker, says so without seeing the first | The check `story_epic`, started with the project's models |
+| Done | What both chose, with the texts ranking it first, is made the Story's one Epic where the project's record allows | The batch "Choose primary Epics", applied without the administrator, its sample judged afterwards |
+| The other Epics | For a Story that has its one Epic, the two models say of each other Epic it is under whether the Story has to do with it | The check `epic_links`, asked only about Stories whose one Epic is chosen |
+| The only Epic | A Story under one Epic is compared with every Epic of the project by shared words and by meaning. Where both place the same other Epic first and neither places its own among the first five (the first third, and at least two, in a project with few Epics), it is called in question. No model is asked | The ranking service, as the connection's plan uses it |
+| With none | A Story under no open Epic is offered the nearest Epics of the project and of the projects connected to it | The candidates of the scope, from OC |
+
+The run follows each check's asking in the background, gathers what was answered when it is over, and goes on to the next. It can be stopped, resumed, or ended keeping what was answered. A check that is asking already is taken into the run.
+
+**Why the other Epics are asked only once the one Epic is chosen.** The question is about the Epics *beside* the Story's own. Asked before that one is known, the answer would go stale the moment the administrator chose another, and the money would be spent twice. So in a project that does not yet apply by itself, the first run settles the one Epic, and the next run, after the administrator answered, asks about the others. Where the Epic is given by rule or applied by the record, both happen in one run.
+
+### Needs you, and what the administrator does there
+
+| The case | The answers |
+| --- | --- |
+| A Story under several Epics: the models differ, could not tell, or agree where the project does not apply by itself | Make the chosen Epic its one Epic; leave it as it is |
+| A link to another Epic that both models call unrelated | Take the link off; keep it |
+| A link to another Epic in doubt: the models differ, could not tell, only one answered, or it rests on a passage that is not in the Epic's text | Take the link off; keep it |
+| A Story under one Epic that the texts place elsewhere | Move it under the chosen Epic; keep it where it is |
+| A Story under no open Epic | Put it under the chosen Epic; leave it under none |
+
+**A link is never taken off without the administrator.** The proposal said that links the models do not both find related "are taken off". The decision of 26 November stands above it: what removes stays for the administrator. So every such link is a case. A link both models call related stays and is no case.
+
+**One word for many.** Read on live, Falcone's first run would put 421 links before the administrator. Two buttons above the list answer them together: one takes off every link both models call unrelated, one keeps every link in doubt. Each link taken off is its own line under Done and can be put back; kept links are not put before the administrator again, and neither is a link whose taking off they judged wrong in a batch before.
+
+### Done, and undo
+
+A line under Done is a Story given its one Epic (by rule, by the record or at the administrator's word), a Story moved, or a link taken off. Each can be undone for 30 days, and so can everything a run applied. Undone, the links stand as they did and the case waits under "Needs you" again. What the record applied counts as judged wrong on that record, as for the first button.
+
+### Connected projects
+
+- **The one Epic of a Story is an Epic of its own project.** A Story stands under at least one Epic of its project by the records' own rule, and what it has to do with the Epics of a connected project is a link of the connection, which the connection's plan proposes (OC). The run does not offer another project's Epic as the home of a Story that has one.
+- **A Story with no Epic is offered the Epics of the whole scope,** each of a connected project with its project. Choosing one makes a link of the connection; the Story then counts as having its Epic, and the sentence on top says how many stand so. Undone, the link is taken off the connection.
+
+### Read on live
+
+| Project | Open Stories | With their one Epic | Under several, not checked | With none | What the button would do |
+| --- | --- | --- | --- | --- | --- |
+| falcone | 580 | 579 | 0 | 0 | Ask no model and cost nothing. Put 421 links to other Epics before the administrator, all in doubt and none that both models call unrelated, with one word to keep them; and 1 Story whose only Epic the texts place elsewhere |
+| falcone-serverless | 66 | 1 | 65 | 0 | Give 41 Stories their Epic by rule, at once and for nothing. The other 24, and what the other Epics of those 41 are to them, are not asked about: no model is set for this project's reviews |
+| falcone-workflow, gntik-ui, llmwiki, musematic | 0 | | | | Nothing: they have no Story in the plan yet, and the page says so |
+
+Of Falcone's 1,027 links to other Epics, the models found 739 related, 31 unrelated and could not tell about 257; none of the 31 is called unrelated by both models with its passage in the text, which is why nothing is offered for taking off together. No Epic of either project is without an open Story. The page answers in 0.3 to 0.7 seconds.
+
+So the goal of the phase holds on Falcone but for one Story: every open Story has its one Epic, and that one is called in question by the texts and will wait under "Needs you" after the first run.
+
+### What is not in O2, and why
+
+- **Nothing is created.** Stories that fit no Epic, and an Epic with no Story, are O3. Both projects have none of either today.
+- **No model is asked about a Story's only Epic.** The comparison by shared words and by meaning calls it in question, and the administrator decides: moving a Story takes a link off, which is theirs anyway. A model's answer would not change who decides. One Story on Falcone is concerned.
+- **An Epic that holds a quarter of all Stories or unrelated groups is not proposed for splitting.** It is in the proposal's table for this pair; it changes the shape of the plan and belongs with creating, in O3.
+- **The old views are still there** (Planning, Reorganize). They read the same records. They go in O5.
+- **Not exercised on live:** starting a run, answering, the two one-word answers, and undoing. They are the administrator's to start. Covered by four tests of the run and looked at in a local console.
