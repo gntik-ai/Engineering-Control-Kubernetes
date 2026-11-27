@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1, O2 and O3 are built and deployed** ("O0 as built", "OC as built", "O1 as built", "O2 as built" and "O3 as built", below); O4 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1, O2, O3 and O4 are built and deployed** ("O0 as built", "OC as built", "O1 as built", "O2 as built", "O3 as built" and "O4 as built", below); O5 and O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -706,3 +706,101 @@ The page answers in 0.3 to 1.3 seconds.
 - **No split is proposed on live.** An Epic is proposed to be split when it is the one Epic of more than a tenth of the Stories, and of at least twenty. Counted by the one Epic of each Story, the largest holds 32 of 580 on Falcone and 11 of 66 on falcone-serverless. The Epic of falcone-serverless that 68% of its Stories were linked to (read in O0) is the one Epic of 11. The rule is the Structure view's own, unchanged.
 - **The old views are still there.** They go in O5.
 - **Not exercised on live:** writing, making, publishing and undoing. They are the administrator's to start, and the first asks 389 questions of two models. Covered by four tests of the stage and looked at in a local console. The search for twins by meaning asks the ranking service from the console's process for the first time; where it cannot, the cases say so and nothing is made.
+
+## O4 as built (27 November 2026)
+
+Coverage is one page under Reviews, beside Organize: how much of a project's documentation its plan covers, checked behind one button. `dashboard/coverage.py` is the run, `coverage_parts.py` keeps the parts, `coverage_check.py` holds the two checks. The run is the same kind as a run of Organize (`organize_runs`, `organize_lines`), with the same stages and the same three lists, and it creates through the same creator (`organize_create.py`).
+
+### The parts, kept
+
+Until O4 the parts were cut on the fly (O0). A run now keeps them (`doc_parts`, migration 0098): the document, the heading and the headings above it, the text, what a rule says it is about, what the administrator says it is about, where it stands (not checked, covered, covered by nothing, in doubt, not about the product) and the records that cover it, each with how that is known.
+
+A part's key is made from the document's path and the part's own text. A part that did not change keeps everything that was found of it when the document around it changes; a part whose text changed is a new part and is checked; a part that is no longer there is marked as gone and kept, because records may have been made for it.
+
+### The number
+
+"Documentation covered: 60% (3 of 5 parts that are about the product)". The parts that count are those about the product: by rule, by what the two models said, or by the administrator's word. A part of which nobody said yet does not count until a run or the administrator says what it is about. Under the number the page says how many parts are covered by nothing, in doubt and not checked, how many are not about the product, and how many are still open.
+
+A part is covered in one of four ways, and the page says which:
+
+| How | What it means |
+| --- | --- |
+| The change is named after it | The part belongs to an OpenSpec change that is not archived and whose name carries the number of an Issue of the plan. No model is asked: the change says itself what it is for |
+| Found by both models | Two models of different makers, each without seeing the other's answer, named the same record, and the passages they quoted are in the texts |
+| Made for this part | A run wrote a record for it and made it after the careful review, or the administrator made it |
+| Said by you | The administrator chose the record |
+
+### The run
+
+1. **Read.** The documents as the last reading left them are cut into parts and the kept parts are brought in step, for the project and the projects connected to it. Then the ranking service reads the parts it has not read (160 at a time, between the worker's passes), so that each part can be compared with the records by meaning. Where there is no ranking service, or the records were read with another model, parts and records are compared by the words they share. No model is asked in this stage.
+2. **Match and Verify** (the check `doc_cover`). Every part that is about the product, or of which nobody said yet, and that nothing settles without a model, is shown the eight records nearest to it: Epics, User Stories and Issues of the project and of the connected projects, closed ones too, never bugs and never Issues closed as not planned. The model answers one of four: a record covers it (it names up to three, the best first, and quotes a passage of the part and of the record), nothing covers it, it is not about the product, or it cannot tell. The second model, of another maker, answers the same question without seeing the first answer. They agree when they say the same and, for "covered", name a record in common.
+3. **Create** (the check `doc_record`). The parts found covered by nothing are put in groups that lie close together by meaning (at most six; a part the ranking service did not read is a group of its own). For each group the writer is shown the parts, the five open Epics and the six open User Stories nearest to them, and writes one to three records at the lowest level that fits: an Issue under a User Story that is there, a User Story under an Epic that is there, or an Epic where no Epic holds the capability. Every sentence names the part it rests on. The second model checks every sentence, and the search for a record like it runs over the project and the connected projects, exactly as in O3.
+
+What follows from the answers:
+
+| Answer | What happens |
+| --- | --- |
+| Both say covered, a record in common, the passages are in the texts | The part is covered. Listed under Done with what was quoted. Nothing in the plan changes, so there is nothing to undo |
+| Both say nothing covers it | The part goes to the stage that creates |
+| Both say it is not about the product | The part stops counting. The administrator can say otherwise in the list of parts |
+| They differ, one cannot tell, only one answered, or a quoted passage is not in the texts | Needs you: the part's text, what each model said, and the records it was shown. The administrator says which record covers it, that nothing does, or that it is not about the product |
+| Written, every sentence supported, nothing like it exists, and it is an Issue or a User Story | Made, and listed under Created with the part it was made from. The part is covered |
+| An Epic was written | Needs you, always. An Epic shapes the plan: it is made at the administrator's word, also when everything else about it passed |
+| Written, and a sentence is not supported, or a record like it exists, or the check could not tell, or no second model is set | Needs you, with every sentence and its verdict |
+
+An Issue that is made is kept here and is not on GitHub (decision 1). The page offers the one word that publishes the Issues that were made; it is the same word as on Organize, and counts the same Issues.
+
+### Answers that stand
+
+An answer was paid for and is not thrown away lightly. A part is asked about again only when its own text changed, or:
+
+- it was covered, and a record that covers it changed;
+- nothing covered it, and it would be shown a record today that it was not shown then. A record that Coverage itself made for another part does not count: parts that ask for the same thing are written for together.
+
+A part found not to be about the product is not asked about again. What the administrator decided about what was written for a group of parts stands while the parts are the same: a record that was taken away is not written again because an Epic was added nearby.
+
+### When the documentation changes
+
+The page says when the documentation was read again, and changed, since the last run; the button is then offered although every kept part has its answer. The run brings the parts in step and asks only about the parts that are new. A record that was made for parts that are all gone is put before the administrator ("Its part of the documentation is gone"), who keeps it or takes it away. Nothing is deleted by a run.
+
+### Connected projects
+
+A part of a connected project's documentation that names this project (by its name, its repository or what it is shown as, standing by itself) is checked against this project's plan as well: what the neighbour's documents ask of this project should be in this project's plan. Those parts are counted beside the number, not in it, and nothing is written for them: the documentation is the neighbour's. The records a part is compared with are those of the whole scope, so a part of this project's documentation can be covered by a record of a connected project, and the page says whose it is.
+
+### Correcting what a part is about
+
+"The parts of the documentation" lists the parts by where they stand, with what each is about and who said so (a rule, the models, or the administrator) and what covers it. One word says that a part is about the product or is not, and one takes that word back. A part the models set aside and the administrator calls about the product counts as covered by nothing: the models saw the records nearest to it and named none.
+
+### Not in the documentation
+
+The other direction, as proposed: the open Epics, User Stories and Issues of the project that no part is covered by and that no part lies close to by meaning (0.7 and more counts as close). Nothing is created for them.
+
+### What a run would cost, said first
+
+Before the button the page says how many parts would be asked about, by which two models, the estimate in dollars and tokens, the month's limit and what is spent, the tokens one run stops at, what the project's review tokens still allow where the estimate is more than that, and how many parts the ranking service has yet to read. The writing for what the run itself finds covered by nothing is not in the estimate, and the page says so: how many such parts there are is known only when the models have answered. The run holds at the month's limit like every other run.
+
+A run with no model set still reads: the parts are kept and what the changes state themselves is counted. A project with no Epic, User Story or Issue of its own is read in the same way and no model is asked about it: there is nothing to compare its documentation with, and Discovery makes the first plan. Without that rule a run on such a project would have asked about every part and then written a plan from single parts, which is not what Coverage is for.
+
+### Read on live
+
+No run was started. Before a first run the page says what the rules alone say of the parts, and what a run would do:
+
+| Project | Documents | Parts | About the product by rule | Not | Nobody said yet | What a run would do |
+| --- | --- | --- | --- | --- | --- | --- |
+| falcone | 432 | 2,855 | 1,300 | 238 | 1,317 | Ask about 2,617 parts, gpt-5.6-luna and claude-haiku-5-5. Estimated at $2.43 and 8.9 million tokens. The month's limit is $10, of which $6.11 is spent. One run stops at 1 million tokens; the project's review tokens allow 2.28 million more |
+| falcone-serverless | 56 | 398 | 0 | 1 | 397 | Ask about 397 parts, the same two models. Estimated at $0.37 and 1.35 million tokens. The limit is $3, of which $0.06 is spent. Its review tokens allow 15,820 more: the run would be held almost at once, until that limit is raised |
+| falcone-workflow | 28 | 362 | 0 | 0 | 362 | Read the parts and ask nothing: the project has no plan yet |
+| gntik-ui | 322 | 1,916 | 1,462 | 340 | 114 | The same |
+| llmwiki | 11 | 461 | 0 | 0 | 461 | The same |
+| musematic | 958 | 8,064 | 2,571 | 957 | 4,536 | The same. Before the rule for projects with no plan it would have asked about 7,107 parts |
+
+The ranking service has read none of the parts yet; the first run has it read them. The parts of a connected project's documentation that name a project are counted once a run has kept the neighbour's parts; until then that number is nought. The page answers in 0.3 to 1.7 seconds the first time and in under 0.3 after.
+
+### What is not in O4, and why
+
+- **No run was started on live.** Starting one spends money and is the administrator's. What a run does is covered by three tests (a run from the first reading to the answers and the undo; connected documentation and documents that change; a run without models and a project without a plan) and was looked at in a local console.
+- **The first run on Falcone takes several starts as the settings stand.** The estimate is 8.9 million tokens and one run stops at 1 million, so it would take nine starts, and the project's review tokens allow 2.28 million. Both numbers are the administrator's, under Settings; the page names both before the button. Each start goes on where the last one stopped: answers are kept.
+- **Nothing is written for a part of a connected project's documentation.** It is counted and shown; the record, if one is wanted, is the administrator's to ask for in the project the document belongs to.
+- **An Epic is never made by a run.** Decision 2 lets Epics and User Stories be made without asking. For Coverage an Epic waits all the same: one part of a document is thin ground for a whole capability, and a wrong Epic costs more to put right than a wrong Issue. One word makes all that wait.
+- **Coverage's cases are not in the shared "Needs you" view.** Neither are those of Organize. The old views go in O5, and the list across both pages is part of that.
+- **Parts are not checked by themselves when a document changes.** The page says that the documentation was read again and offers the button. Running it without a button is O6.

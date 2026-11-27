@@ -397,7 +397,7 @@ Asked for on 27 November: Reviews has too much on it. It is to become Organize (
 | O1 | **Built, 27 November 2026** (see "O1 as built" in `organize-and-coverage.md`). Organize, User Stories and Issues: linking, behind one button. | Every open Issue that is no bug is under a Story or in "Needs you". |
 | O2 | **Built, 27 November 2026** (see "O2 as built" in `organize-and-coverage.md`). Organize, Epics and User Stories: linking, behind the other button. | Every open Story has one Epic or is in "Needs you". |
 | O3 | **Built, 27 November 2026** (see "O3 as built" in `organize-and-coverage.md`). Creating what has no counterpart, after the careful review; the list "Created", with undo. | No open Story without an Epic and no open Issue without a Story, except what is in "Needs you". |
-| O4 | Coverage: the documentation in parts, matched and verified, one number, missing records created. | One number for each project; a part nothing covered has a record or is in "Needs you". |
+| O4 | **Built, 27 November 2026** (see "O4 as built" in `organize-and-coverage.md`). Coverage: the documentation in parts, matched and verified, one number, missing records created. | One number for each project; a part nothing covered has a record or is in "Needs you". |
 | O5 | Two pages: the old views removed, what survives moved, old addresses redirected. | Reviews has three entries: Organize, Coverage, Settings. |
 | O6 | By itself, and told: organized as records and documents arrive; Dashboard, digest and chat; each stage measured again when it changes. | A new Issue is under a Story or in "Needs you" without a button. |
 
