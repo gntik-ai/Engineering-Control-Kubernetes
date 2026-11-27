@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 is built and deployed** ("O0 as built", below); O1 to O6 are not.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 is built and deployed** ("O0 as built", below); O1 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -300,4 +300,94 @@ Of Falcone's 389 Stories with no Issue: for 151 similar work exists, for 123 onl
 4. **Four projects have no plan here at all**, and 752 open issues between them. A run of Organize would have to create a Story for nearly every Issue. For them Coverage should run first: it makes Epics and Stories from the documentation, and Organize then places the Issues under them. The order is offered by the page; it is not forced.
 5. **falcone-workflow has 59 issues on GitHub that call themselves Epics and Stories and no record here.** The batch of decision 3 closes on GitHub only what is a record here, so these are taken in first.
 6. **Coverage is large.** 14,056 parts and 1.46 million words over six projects, 8,064 of the parts in musematic. Half of the parts are decided by rule without a model. What a run costs is said by the run before it starts.
+
+## Connected projects (added 27 November 2026)
+
+Asked by the administrator after O0: projects are connected, and a review, a reorganization or a discovery has to take the connected projects into account and read their features as if they were part of the project's own documentation.
+
+### What was checked
+
+What takes a connected project into account today:
+
+- **Connections are records.** One exists on live: falcone depends on falcone-serverless. The other four projects have none.
+- **A connection has its own analysis**, which reads the records of the two projects and proposes links between them. On live it has been paused since 20 November (the OpenAI account ran out of credit) at 353 of 1,919 records. It holds 500 approved findings, 614 pending and 88 outdated; 334 of the pending ones are links of Issues.
+- **The planning tables** count an Issue as placed when it is linked to a User Story of a connected project. That is why 103 open Issues of Falcone have no Story in Falcone and are no orphans.
+- **The code evidence** of a planning review can read the connected repository.
+
+What does not:
+
+| Where | What it reads | What goes wrong |
+| --- | --- | --- |
+| Candidates for a parent: ranking service, scorer, every check | The project's own records | A Story or Epic of a connected project is never offered, however well it fits |
+| Where each Story stands; clean-up; structure | The project's own Issues and documents | A Story is called "supported by nothing" when its work is tracked in the connected project. Falcone has 389 Stories with no Issue of its own |
+| Documentation inventory; the import of a repository | The project's own repository | A feature documented in the connected repository is unknown to Discovery |
+| Epic pages | The project's own plan | An Epic that spans two projects is described from half of it |
+| O0: the count and the parts | The project's own records and documents | The numbers say nothing of what the connected projects bring |
+| The plan O1 to O6 as it was written | One project at a time | Organize would write Issues, and Coverage would create records, for what a connected project already holds |
+
+So the point stands, and the plan needed adjusting.
+
+### Which projects are connected
+
+Only one connection is recorded. The repositories name each other more than that. Counted in the local copies of five repositories (falcone-serverless has no local copy), as documents that name the other repository:
+
+| Pair | Evidence | Recorded |
+| --- | --- | --- |
+| falcone and falcone-serverless | The connection, with 500 approved findings | Yes |
+| falcone and falcone-workflow | 9 documents of falcone, 12 of falcone-workflow | No |
+| falcone-workflow and falcone-serverless | 18 documents of falcone-workflow | No |
+| falcone and gntik-ui | falcone depends on `@gntik-ai/ui` in a manifest; 24 documents | No |
+| musematic and gntik-ui | 232 documents of musematic, 13 of gntik-ui and a manifest | No |
+| falcone and llmwiki | 11 documents of falcone, 6 of llmwiki | No |
+| falcone and musematic | 8 documents of falcone | No, and weak |
+| falcone-workflow and llmwiki; falcone-workflow and musematic | 5 documents each | No, and weak |
+
+Which of these are connections is the administrator's to say. The platform will propose them with this evidence and record none by itself.
+
+### The adjustment
+
+**A run works on a scope: the project and the projects connected to it.** Every record and every part of a document keeps the project it belongs to, and every line of a list names it.
+
+| Stage | With connected projects |
+| --- | --- |
+| Read | The records, links and documents of the whole scope. The documents of a connected project are read as documentation of the project |
+| Match | Candidates come from the whole scope. A parent may be a record of a connected project: the link crosses projects, as the links of a connection do today |
+| Verify | The models see each candidate with its project. An approved link of a connection is a stated link; a pending one is a candidate like any other |
+| "Has none" | Said only when nothing in the whole scope fits |
+| Create | A twin is searched in the whole scope, so that nothing is created that a connected project holds. **A run creates only in its own project.** What belongs in a connected project is left to that project's run and shown in "Needs you" as such |
+| Coverage | A part of the project's documentation is covered by a record of any project of the scope. The parts of connected documentation that ask something of this project are counted beside it, each covered or not |
+| Done, undo | A link across projects is undone like any other |
+
+Further rules:
+
+- **Direct connections only.** A project connected to a connected project is not in the scope, unless the administrator says so. Otherwise falcone would bring in every project.
+- **Makers.** A question that holds text of two projects goes only to makers both projects allow.
+- **Money.** A run is charged to the project it was started in. A larger scope costs more, and the estimate shown before the run says so.
+- **The connection's own analysis is taken into the run.** Its question (which records of two projects belong together) is the question of Match and Verify over a scope. Its 500 approved findings stay as links. Its 614 pending ones go through Verify and end in "Done" or "Needs you". Its own run is not resumed, and its view goes in O5 with the others.
+- **A change in a connected project** (a new record, a changed document) puts the records it touches up for checking again, in O6.
+
+### Phases, adjusted
+
+One phase is added before O1, because the first button already has to draw its candidates from the scope.
+
+| Phase | What | Done when |
+| --- | --- | --- |
+| O0 | Built | |
+| **OC** | **Connected projects as one scope.** A run and its lines carry the scope and the project of every record. The count of O0 says what each connected project brings. Candidates are drawn across the scope by the ranking service, and the links of connections are read as links. Connections are proposed from evidence, for the administrator to confirm, in Settings. The makers rule | For a Falcone Issue the candidates include Stories of falcone-serverless; the count shows each project with its scope; and no question goes to a maker one of its projects does not allow |
+| O1 | As before, over the scope. The pending Issue links of the connection (334) go through it | As before, with every line naming its project |
+| O2 | As before, over the scope | As before |
+| O3 | As before. Twins are searched in the scope; a run creates only in its own project | As before, and nothing is created that a connected project holds |
+| O4 | As before. Connected documentation is read as documentation; the second number | As before, and the parts of connected documents that ask something of the project are counted |
+| O5 | As before. The view of a connection and its own analysis are removed; connections are kept in Settings | As before |
+| O6 | As before. A change in a connected project is taken up | As before, across the scope |
+
+### Decisions needed
+
+| # | Question | Recommended |
+| --- | --- | --- |
+| 9 | Which projects are connected? The table above lists what the repositories say | Confirm the first six pairs; leave the weak ones |
+| 10 | Direct connections only, or also the connections of connected projects? | **Direct only** |
+| 11 | A run creates records only in its own project; what belongs in a connected one is shown and left to that project's run. Agreed? | **Yes** |
+| 12 | Text of two projects goes only to makers both allow. Agreed? | **Yes** |
+| 13 | The connection's own analysis is not resumed: its pending findings go through Organize, and its view is removed in O5. Agreed? | **Yes** |
 

@@ -393,6 +393,7 @@ Asked for on 27 November: Reviews has too much on it. It is to become Organize (
 | Phase | What | Done when |
 | --- | --- | --- |
 | O0 | **Built, 27 November 2026.** Ground: one run type with stages and three lists; the numbers a first run would meet; only Issues are written to GitHub. See "O0 as built" in `organize-and-coverage.md`. | The numbers are known for each project, and no new Epic or Story reaches GitHub. |
+| OC | Added 27 November 2026: connected projects as one scope. A run reads, matches and searches for twins over the project and the projects connected to it, and creates only in its own project. See "Connected projects" in `organize-and-coverage.md`. | For a Falcone Issue the candidates include Stories of falcone-serverless, and the count shows each project with its scope. |
 | O1 | Organize, User Stories and Issues: linking, behind one button. | Every open Issue that is no bug is under a Story or in "Needs you". |
 | O2 | Organize, Epics and User Stories: linking, behind the other button. | Every open Story has one Epic or is in "Needs you". |
 | O3 | Creating what has no counterpart, after the careful review; the list "Created", with undo. | No open Story without an Epic and no open Issue without a Story, except what is in "Needs you". |
