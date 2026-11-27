@@ -26,6 +26,7 @@ export interface CreatePlan {
   dollars: number | null;
   limit: number;
   spent: number;
+  run_tokens: number;
   would_pass: boolean;
   blocked: string | null;
   creating: { in_force: boolean; why: string | null; made: number; undone: number; accepted: number };
@@ -466,6 +467,9 @@ export function createSaid(create: CreatePlan): string[] {
           : `Writing is estimated at ${dollars(create.dollars)} (${whole(create.tokens)} tokens).` +
               (create.would_pass
                 ? ` The month’s limit is ${dollars(create.limit)}, of which ${dollars(create.spent)} is spent: the run stops at the limit with what it has. Raise the limit under Settings to let it finish.`
+                : '') +
+              (create.tokens > create.run_tokens
+                ? ` One run stops at ${whole(create.run_tokens)} tokens: what is left is written by the next run.`
                 : ''),
       );
       told.push(

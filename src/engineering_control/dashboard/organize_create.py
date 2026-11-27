@@ -471,6 +471,8 @@ class Creator:
             "dollars": round(dollars, 2) if dollars is not None else None,
             "limit": mine.dollars,
             "spent": round(spent, 2),
+            # One run of a check stops at this many tokens: more takes another run.
+            "run_tokens": mine.count("run_tokens"),
             # A run that would pass the month's limit stops there with what it has.
             "would_pass": bool(dollars and spent + dollars > mine.dollars),
             "blocked": blocked,

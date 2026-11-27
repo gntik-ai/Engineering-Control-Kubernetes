@@ -359,7 +359,7 @@ function planSaid(plan: Shown['plan'], create: CreatePlan): string[] {
   const links = plan.links_unrelated + plan.links_in_doubt;
   said.push(
     links
-      ? `${some(links, 'link to another Epic is', 'links to other Epics are')} put before you: ${whole(plan.links_unrelated)} that both models call unrelated, ${whole(plan.links_in_doubt)} in doubt. A link is never taken off without you; one word can take off all that both call unrelated, and one can keep all in doubt. A link both models call related stays.`
+      ? `${some(links, 'link to another Epic is', 'links to other Epics are')} put before you: ${whole(plan.links_unrelated)} that both models call unrelated, ${whole(plan.links_in_doubt)} in doubt. A link is never taken off without you; one word takes off, or keeps, all of a kind. A link both models call related stays.`
       : 'A link to another Epic that the models find unrelated is put before you: a link is never taken off without you.',
   );
   if (plan.only)
@@ -376,7 +376,7 @@ export function EpicsAndStories({ project }: { project: string }) {
   const [busy, setBusy] = useState(false);
   const shown = useResource<Shown>(apiUrl(path), busy ? 4000 : 30000, { keepPreviousData: true });
   const [tick, setTick] = useState(0);
-  const [asking, setAsking] = useState<'start' | 'undo' | 'take_off' | 'keep' | null>(null);
+  const [asking, setAsking] = useState<'start' | 'undo' | 'take_off' | 'take_doubt' | 'keep' | null>(null);
   const changed = () => {
     setTick((value) => value + 1);
     shown.reload();
@@ -484,9 +484,14 @@ export function EpicsAndStories({ project }: { project: string }) {
                     </Button>
                   ) : null}
                   {data.waiting.in_doubt ? (
-                    <Button size="sm" variant="secondary" onClick={() => setAsking('keep')}>
-                      Keep the {some(data.waiting.in_doubt, 'link', 'links')} in doubt
-                    </Button>
+                    <>
+                      <Button size="sm" variant="secondary" onClick={() => setAsking('take_doubt')}>
+                        Take off the {some(data.waiting.in_doubt, 'link', 'links')} in doubt
+                      </Button>
+                      <Button size="sm" variant="secondary" onClick={() => setAsking('keep')}>
+                        Keep the {some(data.waiting.in_doubt, 'link', 'links')} in doubt
+                      </Button>
+                    </>
                   ) : null}
                 </div>
               </section>
@@ -529,6 +534,20 @@ export function EpicsAndStories({ project }: { project: string }) {
             action="Take them off"
             destructive
             run={() => answerAll('unrelated', 'take_off')}
+            onClose={() => setAsking(null)}
+            onDone={() => {
+              setAsking(null);
+              changed();
+            }}
+          />
+        ) : null}
+        {asking === 'take_doubt' && data ? (
+          <Confirm
+            title="Take the links in doubt off?"
+            about={`${some(data.waiting.in_doubt, 'link to another Epic is', 'links to other Epics are')} taken off: those the two models did not agree on, could not tell about, or that only one called unrelated. Both models did not find them related, and neither did both find them unrelated. Every Story keeps its one Epic and its other Epics. Each link is listed under Done and can be put back for ${data.undo_days} days.`}
+            action="Take them off"
+            destructive
+            run={() => answerAll('in_doubt', 'take_off')}
             onClose={() => setAsking(null)}
             onDone={() => {
               setAsking(null);

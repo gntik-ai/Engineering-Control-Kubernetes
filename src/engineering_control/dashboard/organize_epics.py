@@ -98,7 +98,10 @@ LINK: Final = {"differ": 0.8, "unclear": 0.7, "unchecked": 0.65, "alone": 0.6, "
 # unrelated, taken off or kept; and those in doubt, kept.
 GROUPS: Final = {
     "unrelated": (("link_unrelated",), ("take_off", "keep")),
-    "in_doubt": (("link_differ", "link_unclear", "link_unchecked", "link_alone"), ("keep",)),
+    "in_doubt": (
+        ("link_differ", "link_unclear", "link_unchecked", "link_alone"),
+        ("take_off", "keep"),
+    ),
 }
 # How many lines one request answers: the page asks again until none is left.
 CHUNK: Final = 25

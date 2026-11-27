@@ -302,7 +302,7 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
         # One word takes off every link both models call unrelated; a link in doubt
         # cannot be taken off that way.
         many = "organize/epics-stories/groups"
-        assert post(client, many, group="in_doubt", choice="take_off").status_code == 422
+        assert post(client, many, group="in_doubt", choice="close").status_code == 422
         assert answer(client, unrelated, "epic", chosen["id"]).status_code == 422
         taken = post(client, many, group="unrelated", choice="take_off")
         assert taken.json() == {"answered": 1, "skipped": 0, "left": 0}
@@ -315,20 +315,34 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
         assert "stands again" in waits["reason"]
         assert answer(client, waits, "take_off").status_code == 200
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[OPERATIONS]}
+        # What was said of the link that remains still stands: taking the other off is
+        # no reason to ask, and pay, again.
+        assert shown(client)["plan"]["links_to_ask"] == 0
 
-        # Kept, the links in doubt leave the list and are not put before the
-        # administrator again.
-        kept = post(client, many, group="in_doubt", choice="keep")
-        assert kept.json() == {"answered": 1, "skipped": 0, "left": 0}
+        # The links in doubt can be taken off with one word too, and each put back.
+        gone = post(client, many, group="in_doubt", choice="take_off")
+        assert gone.json() == {"answered": 1, "skipped": 0, "left": 0}
+        assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL]}
+        last = next(
+            line
+            for line in lines(client, "done")
+            if line["case"] == "link_off" and line["candidates"][0]["title"] == OPERATIONS
+        )
+        assert post(client, f"organize/epics-stories/lines/{last['id']}/undo").status_code == 200
+        assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[OPERATIONS]}
+        # Kept, a link leaves the list and is not put before the administrator again.
+        again_waits = next(line for line in lines(client, "needs_you") if line["case"] == "undone")
+        assert answer(client, again_waits, "keep").status_code == 200
         # Left as it is, a Story under several Epics is counted as left.
         assert answer(client, differ, "leave").status_code == 200
         assert lines(client, "needs_you") == []
         now = shown(client)
         assert now["stands"]["settled"] == 1 and now["stands"]["left"] == 1
         assert now["plan"]["to_ask"] == 0 and now["plan"]["links_in_doubt"] == 0
-        assert post(client, "organize/epics-stories/runs").status_code == 200
-        asked(repo, Both({}))
-        assert shown(client)["lists"]["needs_you"] == 0
+        # Nothing is left to check, and nothing is asked again: the button says so.
+        assert now["plan"]["links_to_ask"] == 0 and not now["can_start"]
+        assert "nothing to check" in now["why_not"]
+        assert post(client, "organize/epics-stories/runs").status_code == 409
 
         # Everything a run applied is taken back at once.
         undone = post(client, f"organize/epics-stories/runs/{second['id']}/undo")

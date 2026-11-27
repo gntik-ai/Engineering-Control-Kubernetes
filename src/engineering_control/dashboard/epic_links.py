@@ -237,6 +237,27 @@ class _Scope:
             }
         )
 
+    def stands(self, child: _Story, review: ChoiceReview) -> bool:
+        """An answer still stands when links it judged went away since and nothing else
+        changed: the texts are as they were, the primary Epic is the same, and every
+        link that is judged today was judged then. What it said of a link was said of
+        that link by itself, so taking another off is no reason to ask, and pay, again."""
+        was = {str(entry.get("id")): entry for entry in review.shortlist or []}
+        now = self.shortlist(child)
+        for entry in now:
+            then = was.get(str(entry["id"]))
+            if (
+                then is None
+                or bool(then.get("judge")) != bool(entry["judge"])
+                or bool(then.get("primary")) != bool(entry["primary"])
+            ):
+                return False
+        try:
+            return bool(now) and self.revision(child, list(was.values())) == review.revision
+        except (KeyError, ValueError):
+            # An Epic it was asked about is gone.
+            return False
+
     def question(self, run: ChoiceRun, child: _Story, listed: list[dict[str, Any]]) -> Question:
         offered = []
         for place, entry in enumerate(listed, start=1):
@@ -387,7 +408,7 @@ def _findings(
         review = known.get(story.id)
         if review is None or review.state != "answered":
             continue
-        current = scope.revision(story, scope.shortlist(story))
+        current = parent_choice.standing(scope, story, scope.shortlist(story), review)
         entries = review.evidence or []
         quoted = any(e.get("side") == "story" and e.get("found") for e in entries)
         stands = review.revision == current and quoted
@@ -491,7 +512,7 @@ class EpicLinks:
             placeholder = ChoiceRun(provider="", model="")
             for story in waiting:
                 listed = scope.shortlist(story)
-                current = scope.revision(story, listed)
+                current = parent_choice.standing(scope, story, listed, known.get(story.id))
                 held, use = parent_choice.sizes(scope.question(placeholder, story, listed))
                 largest, likely_all = max(largest, held), likely_all + use
                 if parent_choice.to_ask(known.get(story.id), current, False):
