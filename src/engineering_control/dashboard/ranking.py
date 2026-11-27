@@ -11,8 +11,10 @@ measurement on Reviews → Reorganize compares with word matching.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+from collections.abc import Callable
 from typing import Any, Final
 from uuid import UUID
 
@@ -101,6 +103,17 @@ class Ranker:
         if len(scores) != len(documents):
             raise RankerError("The ranking service answered with the wrong scores.")
         return model, scores
+
+
+def reader(url: str) -> Callable[[list[str]], tuple[str, list[bytes]]]:
+    """A way to have texts read by the ranking service from a worker thread, which has
+    no event loop of its own: each call opens its own connection and closes it."""
+
+    async def read(texts: list[str]) -> tuple[str, list[bytes]]:
+        async with httpx.AsyncClient(timeout=SECONDS) as client:
+            return await Ranker(url, client).embed(texts)
+
+    return lambda texts: asyncio.run(read(texts))
 
 
 def stored_model(db: Session, table: Any, project: UUID) -> str | None:

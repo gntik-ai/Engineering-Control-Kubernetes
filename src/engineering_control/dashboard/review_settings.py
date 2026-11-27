@@ -208,6 +208,8 @@ class Settings:
     alone: Mapping[str, str] = field(default_factory=dict)
     # Which checks run by themselves, by the check: as records arrive, or at night.
     runs: Mapping[str, str] = field(default_factory=dict)
+    # The model that writes a record that is missing; none for the model that answers.
+    writer: tuple[str, str] | None = None
 
     def goes(self, kind: str) -> str:
         """ "off", "propose" or "apply" for that kind of batch; proposing unless set."""
@@ -244,6 +246,7 @@ def of(db: Session, project: UUID) -> Settings:
         dict(row.numbers or {}),
         dict(row.alone or {}),
         dict(row.runs or {}),
+        (row.writer_provider or "", row.writer_model) if row.writer_model else None,
     )
 
 
@@ -304,6 +307,7 @@ def roles(db: Session, project: UUID) -> dict[str, Any]:
         "answer": shown(mine.answer),
         "judge": shown(mine.judge),
         "third": shown(mine.doubt),
+        "writer": shown(mine.writer),
     }
 
 
@@ -359,6 +363,7 @@ WORKFLOWS: Final = {
     "cleanup_check": "Clean-up check",
     "epic_links": "Extra Epic links",
     "epic_page": "Epic overviews",
+    "organize_create": "Organize: records that were written",
     "model_trial": "Trial of another model",
     "judge_trial": "Measurement of judges",
     "answer_trial": "Measurement of a second answer",
@@ -527,6 +532,7 @@ class ReviewSettingsService:
         third: tuple[str, str] | None = None,
         alone: Mapping[str, str] | None = None,
         runs: Mapping[str, str] | None = None,
+        writer: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Keep what the project's reviews are set to. ``numbers`` none leaves the
         numbers as they are; given, a number that is its default is not kept, so that
@@ -564,6 +570,7 @@ class ReviewSettingsService:
                 (answer, "The model that answers"),
                 (judge, "The judge"),
                 (third, "The third model"),
+                (writer, "The model that writes"),
             ):
                 if role and {"provider": role[0], "model": role[1]} not in offered:
                     raise ProjectInvalid(
@@ -583,6 +590,7 @@ class ReviewSettingsService:
                 )
             row.judge_provider, row.judge_model = judge or (None, None)
             row.doubt_provider, row.doubt_model = third or (None, None)
+            row.writer_provider, row.writer_model = writer or (None, None)
             row.rounds = rounds
             row.cheaper_first = cheaper_first
             if own is not None:

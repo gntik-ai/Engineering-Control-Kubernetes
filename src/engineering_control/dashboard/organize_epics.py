@@ -47,6 +47,8 @@ from engineering_control.dashboard.connection_plan import Across
 from engineering_control.dashboard.connection_records import catalog
 from engineering_control.dashboard.connections import link_story_across, unlink_issue_across
 from engineering_control.dashboard.epic_links import EpicLinks
+from engineering_control.dashboard.organize_create import GROUPS as CREATE_GROUPS
+from engineering_control.dashboard.organize_create import OPS, Creator
 from engineering_control.dashboard.planning import PlanningRecords
 from engineering_control.dashboard.planning_links import Note, PlanningLinks
 from engineering_control.dashboard.primary_epics import PrimaryEpics
@@ -124,10 +126,13 @@ class EpicsRun:
         changes: Reorg,
         planning: PlanningRecords,
         links: PlanningLinks,
+        creator: Creator,
     ) -> None:
         self.sessions = sessions
         self.primary, self.others, self.changes = primary, others, changes
         self.planning, self.links = planning, links
+        # What goes on when the linking is done: the stage that creates.
+        self.creator = creator
 
     # -- how things stand ---------------------------------------------------------------
 
@@ -493,16 +498,21 @@ class EpicsRun:
             runs = organize.runs_of(db, project.id, KIND)
             run = runs[0] if runs else None
             live = run is not None and run.state in LIVE
+            create = self.creator.plan(db, project, KIND)
+            # What the stage that creates would do without asking, or may ask.
+            creates = int(create["splits"]) + (
+                int(create["to_ask"]) if not create["blocked"] else 0
+            )
             other = waits + stated + len(links) + len(only)
             why = None
             if live:
                 why = "A run is under way."
-            elif not read["stories"]:
+            elif not read["stories"] and not create["to_ask"]:
                 why = "The project has no open User Story."
-            elif not (to_ask or links_to_ask or other):
+            elif not (to_ask or links_to_ask or other or create["to_ask"] or create["splits"]):
                 why = "Every open User Story has its one Epic: there is nothing to check."
-            elif blocked and not other:
-                why = blocked
+            elif (blocked or not (to_ask or links_to_ask)) and not other and not creates:
+                why = blocked or create["blocked"]
             without = sum(1 for epic in read["epics"] if not any(epic in e for e in under.values()))
             return {
                 "project": project.name,
@@ -545,9 +555,14 @@ class EpicsRun:
                 "why_not": why,
                 "run": self._shown_run(db, run) if run else None,
                 "runs": len(runs),
+                # What the stage that creates would do after the linking.
+                "create": create,
                 "lists": organize.list_counts(db, project.id, KIND),
-                # Of what needs you: the links that can be answered together.
-                "waiting": self._waiting(db, project.id),
+                # Of what needs you: the cases that can be answered together.
+                "waiting": {
+                    **self._waiting(db, project.id),
+                    **self.creator.waiting(db, project.id, KIND),
+                },
                 "undo_days": organize.UNDO.days,
             }
 
@@ -580,7 +595,7 @@ class EpicsRun:
             "ended_at": run.ended_at.isoformat() if run.ended_at else None,
             # Which of the two checks is asking, and how far it is.
             "asking": {
-                "about": "the one Epic" if est.get("step") == "one" else "the other Epics",
+                "about": organize.ASKS.get(asking.kind, ""),
                 "done": asking.done,
                 "total": asking.total,
                 "state": asking.state,
@@ -721,6 +736,12 @@ class EpicsRun:
                 run = db.get_one(OrganizeRun, key)
                 if run.state not in LIVE:
                     return True
+                created = run.stage == "create"
+            if created:
+                # The linking is done: the stage that creates carries the run on.
+                return self.creator.advance(name, key)
+            with self.sessions.begin() as db:
+                run = db.get_one(OrganizeRun, key)
                 est = dict(run.estimate or {})
                 check = (
                     db.get(ChoiceRun, UUID(str(est["choice_run"])))
@@ -770,7 +791,9 @@ class EpicsRun:
                     run.estimate = {**est, "step": "others", "begun": False, "choice_run": None}
                 continue
             self._gather_rest(name, key, "stopped" if est.get("ended") else "complete")
-            return True
+            # The linking is done. Where the run was not ended, the stage that creates
+            # goes on from here.
+            return self.creator.advance(name, key)
         return False
 
     def tick(self) -> bool:
@@ -1071,13 +1094,16 @@ class EpicsRun:
                 },
                 "create": {"records": 0},
             }
-            run.state, run.stage, run.ended_at = final, "done", datetime.now(UTC)
             run.detail = (
                 f"{left} User Stories under several Epics have no answer yet: they were not "
                 "asked about in this run."
                 if left
                 else ("No model could be asked." if est.get("blocked") else "")
             )
+            # Ended by the administrator, the run stops here; otherwise the stage that
+            # creates goes on with what has no counterpart.
+            if final != "complete" or not self.creator.begin(db, run):
+                run.state, run.stage, run.ended_at = final, "done", datetime.now(UTC)
 
     @staticmethod
     def _offered(listed: list[dict[str, Any]], review: ChoiceReview | None) -> list[dict[str, Any]]:
@@ -1169,7 +1195,14 @@ class EpicsRun:
             self.links.after_change(name, "stories", story)
         return {"links": before, "current": str(current) if current else None}
 
-    def answer(self, name: str, key: UUID, choice: str, epic: UUID | None = None) -> dict[str, str]:
+    def answer(
+        self,
+        name: str,
+        key: UUID,
+        choice: str,
+        epic: UUID | None = None,
+        titles: list[str] | None = None,
+    ) -> dict[str, str]:
         """The administrator's answer to a case: the Story belongs to that Epic
         (``epic``) or is left as it is (``leave``); a link to another Epic is taken off
         (``take_off``) or kept (``keep``). Where the records changed since, the case is
@@ -1182,6 +1215,8 @@ class EpicsRun:
             action = dict(line.action or {})
             offered = {str(entry.get("id")): entry for entry in line.candidates or []}
             reason = line.reason
+        if action.get("op") in OPS:
+            return self.creator.answer(name, KIND, key, choice, epic=epic, titles=titles)
         op, story = action["op"], UUID(str(action["story"]))
         listed, state, before, problem = "needs_you", "answered", None, None
         try:
@@ -1248,6 +1283,8 @@ class EpicsRun:
     def answer_many(self, name: str, group: str, choice: str) -> dict[str, int]:
         """One word for many: every link of that group that waits is taken off, or
         kept. A request answers some of them and says how many are left."""
+        if group in CREATE_GROUPS:
+            return self.creator.answer_many(name, KIND, group, choice)
         if group not in GROUPS or choice not in GROUPS[group][1]:
             raise ProjectInvalid("That cannot be answered for all of them at once.")
         with self.sessions() as db:
@@ -1286,6 +1323,9 @@ class EpicsRun:
                     f"This can be undone for {organize.UNDO.days} days after it was applied."
                 )
             action, before = dict(line.action or {}), dict(line.before or {})
+        if action.get("op") in OPS:
+            self.creator.undo(name, KIND, key)
+            return
         op, story, epic = action["op"], UUID(str(action["story"])), UUID(str(action["epic"]))
         links = before.get("links") or []
         if op == "epic_link":

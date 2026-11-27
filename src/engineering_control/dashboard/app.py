@@ -67,6 +67,7 @@ from engineering_control.dashboard.project_records import (
 )
 from engineering_control.dashboard.project_sections import SECTION_KEY, Guide
 from engineering_control.dashboard.ranking import Ranker
+from engineering_control.dashboard.ranking import reader as ranking_reader
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import (
     AccountCreateInput,
@@ -609,6 +610,9 @@ def create_app(
             # The runs of Organize follow their checks and gather what was answered.
             keepers.append(asyncio.create_task(keep_organizing(resolved_repository)))
             if resolved.ranker_url:
+                # A record a run of Organize is about to make is read by the ranking
+                # service first, to search for one like it. Asked from a worker thread.
+                resolved_repository.organize_create.embed = ranking_reader(resolved.ranker_url)
                 # Vectors and scores of the planning records, from the ranking service.
                 keepers.append(
                     asyncio.create_task(
@@ -2306,13 +2310,41 @@ def create_app(
             subject=name,
         )
 
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/groups")
+    async def organize_issues_answer_many(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeGroupAnswerInput,
+            lambda b: asyncio.to_thread(
+                repo(request).organize_issues.answer_many, name, b.group, b.choice
+            ),
+            event="organize.answered",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/stories-issues/publish")
+    async def organize_issues_publish(name: str, request: Request) -> Response:
+        """The administrator's one word: the Issues a run made reach GitHub together."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_issues.publish, name),
+            event="organize.published",
+            subject=name,
+        )
+
     @app.post("/api/dashboard/projects/{name}/organize/stories-issues/lines/{line}")
     async def organize_issues_answer(name: str, line: UUID, request: Request) -> Response:
         return await project_change(
             request,
             OrganizeAnswerInput,
             lambda b: asyncio.to_thread(
-                repo(request).organize_issues.answer, name, line, b.choice, b.story_id
+                repo(request).organize_issues.answer,
+                name,
+                line,
+                b.choice,
+                b.story_id,
+                b.epic_id,
             ),
             event="organize.answered",
             subject=name,
@@ -2394,7 +2426,7 @@ def create_app(
             request,
             OrganizeEpicAnswerInput,
             lambda b: asyncio.to_thread(
-                repo(request).organize_epics.answer, name, line, b.choice, b.epic_id
+                repo(request).organize_epics.answer, name, line, b.choice, b.epic_id, b.titles
             ),
             event="organize.answered",
             subject=name,
@@ -2685,6 +2717,7 @@ def create_app(
                 body.third(),
                 body.alone,
                 body.runs,
+                body.writer(),
             ),
             event="project.review_settings_changed",
             subject=name,

@@ -643,6 +643,36 @@ def lines_where(project: UUID, kind: str) -> Any:
     )
 
 
+# What a run is asking about, by the check that asks.
+ASKS: Final = {
+    "issue_story": "which User Story each Issue belongs to",
+    "story_epic": "the one Epic",
+    "epic_links": "the other Epics",
+    "new_story": "writing User Stories for Issues that fit none",
+    "new_issues": "writing Issues for User Stories that have none",
+    "new_stories": "writing User Stories for Epics that have none",
+}
+
+
+def count_costs(run: OrganizeRun, est: dict[str, Any], check: Any) -> None:
+    """Keep what one check of a run has used so far, and the run's total over every
+    check it asked: a run asks several, one after the other."""
+    est["costs"] = {
+        **(est.get("costs") or {}),
+        str(check.id): [
+            int(check.spent or 0) + int(check.first_spent or 0),
+            float(check.cost or 0)
+            + float(check.first_cost or 0)
+            + float(check.judge_cost or 0)
+            + float(check.third_cost or 0),
+            int(check.done or 0),
+        ],
+    }
+    used = list(est["costs"].values())
+    run.spent = sum(int(entry[0]) for entry in used)
+    run.cost = round(sum(float(entry[1]) for entry in used), 6)
+
+
 def list_counts(db: Session, project: UUID, kind: str) -> dict[str, int]:
     """How many lines each list holds: what still waits, and what was done and created
     and still stands."""

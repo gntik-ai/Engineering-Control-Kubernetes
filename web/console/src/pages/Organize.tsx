@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { dollars, some, whole } from './ChoiceRun';
+import { CreateBar, type CreateLine, type CreatePlan, CreateRow, createSaid, isCreateLine } from './OrganizeCreate';
 import { EpicsAndStories } from './OrganizeEpics';
 import { type Listed, ListsSection, type Model, type Run, RunSection } from './OrganizeParts';
 import { useSubmit } from './ProjectDialogs';
@@ -26,10 +27,14 @@ interface Shown {
     scope: string[];
     applies: { in_force: boolean; setting: string; why: string | null };
   };
+  /** What the stage that creates would do after the linking. */
+  create: CreatePlan;
   can_start: boolean;
   why_not: string | null;
   run: Run | null;
   lists: Record<Listed, number>;
+  /** Of what needs you: the cases that one word answers together. */
+  waiting: Record<string, number>;
   undo_days: number;
 }
 interface Candidate {
@@ -59,7 +64,7 @@ interface Line {
   said: Said[];
   reason: string;
   doubt: number;
-  action: { op: 'place' | 'unsupported'; story?: string | null; across?: boolean } | null;
+  action: { op: string; story?: string | null; across?: boolean } | null;
   can_undo: boolean;
 }
 const CASE: Record<string, { says: string; tone: 'info' | 'neutral' | 'success' | 'warning' }> = {
@@ -271,7 +276,7 @@ function LineRow({ line, listed, path, changed }: { line: Line; listed: Listed; 
 }
 
 /** What a run started now would do, said before it starts. */
-function planSaid(plan: Shown['plan']): string[] {
+function planSaid(plan: Shown['plan'], create: CreatePlan): string[] {
   const said: string[] = [];
   if (plan.to_ask && plan.ask_blocked) {
     said.push(
@@ -310,7 +315,7 @@ function planSaid(plan: Shown['plan']): string[] {
     said.push(
       `${some(plan.unsupported, 'link that nothing supports is', 'links that nothing support are')} put before you: a link is never taken off without you.`,
     );
-  return said;
+  return [...said, ...createSaid(create)];
 }
 
 function StoriesAndIssues({ project }: { project: string }) {
@@ -356,7 +361,7 @@ function StoriesAndIssues({ project }: { project: string }) {
             {!live ? (
               <section className="grid gap-2">
                 <ul className="grid gap-1 text-sm text-muted-foreground">
-                  {planSaid(data.plan).map((line, index) => (
+                  {planSaid(data.plan, data.create).map((line, index) => (
                     <li key={index}>{line}</li>
                   ))}
                 </ul>
@@ -387,21 +392,33 @@ function StoriesAndIssues({ project }: { project: string }) {
                       : stage.stage === 'verify'
                         ? `asked about; ${whole(stage.settled)} settled, ${whole(stage.in_doubt)} in doubt`
                         : stage.stage === 'create'
-                          ? 'created: not in this phase'
+                          ? `made; ${whole(stage.in_doubt)} put before you`
                           : 'the run is over'
                 }
               />
             ) : null}
-            {run || data.lists.needs_you + data.lists.done > 0 ? (
-              <ListsSection<Line>
+            {!live ? (
+              <CreateBar
+                path={path}
+                waiting={data.waiting}
+                unpublished={data.create.unpublished ?? 0}
+                changed={changed}
+              />
+            ) : null}
+            {run || data.lists.needs_you + data.lists.done + data.lists.created > 0 ? (
+              <ListsSection<Line | CreateLine>
                 path={path}
                 lists={data.lists}
                 tick={tick}
                 changed={changed}
-                doneSaid={`Issues that were put under a User Story, and links that were taken off. Each can be undone for ${data.undo_days} days.`}
-                row={(line, listed, done) => (
-                  <LineRow key={line.id} line={line} listed={listed} path={path} changed={done} />
-                )}
+                doneSaid={`Issues that were put under a User Story, links that were taken off, and User Stories that were closed. Each can be undone for ${data.undo_days} days.`}
+                row={(line, listed, done) =>
+                  isCreateLine(line) ? (
+                    <CreateRow key={line.id} line={line as CreateLine} listed={listed} path={path} changed={done} />
+                  ) : (
+                    <LineRow key={line.id} line={line as Line} listed={listed} path={path} changed={done} />
+                  )
+                }
               />
             ) : null}
           </>
@@ -409,7 +426,7 @@ function StoriesAndIssues({ project }: { project: string }) {
         {asking === 'start' && data ? (
           <Confirm
             title="Check and organize the Issues?"
-            about={planSaid(data.plan).join(' ')}
+            about={planSaid(data.plan, data.create).join(' ')}
             action="Check and organize"
             run={() => postJson(path + '/runs')}
             onClose={() => setAsking(null)}

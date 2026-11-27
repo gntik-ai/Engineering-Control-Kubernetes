@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import organize, parent_choice, reorg, review_settings
 from engineering_control.dashboard.connection_records import peers
+from engineering_control.dashboard.organize_create import OPS, Creator
 from engineering_control.dashboard.orphans import Orphans, open_issues
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -110,10 +111,18 @@ def _counts(db: Session, project: UUID) -> dict[str, int]:
 class IssuesRun:
     """The run behind the button "User Stories and Issues"."""
 
-    def __init__(self, sessions: sessionmaker[Session], orphans: Orphans, changes: Reorg) -> None:
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        orphans: Orphans,
+        changes: Reorg,
+        creator: Creator,
+    ) -> None:
         self.sessions = sessions
         self.orphans = orphans
         self.changes = changes
+        # What goes on when the linking is done: the stage that creates.
+        self.creator = creator
 
     # -- how things stand, and what a run would do ------------------------------------
 
@@ -183,16 +192,24 @@ class IssuesRun:
                 blocked = parent_choice.NO_ANSWERING_MODEL
             elif to_ask:
                 blocked = review_settings.over(db, project.id)
+            create = self.creator.plan(db, project, KIND)
+            # What the stage that creates would do without asking, or may ask.
+            creates = int(create["delivered"]) + (
+                int(create["to_ask"]) if not create["blocked"] else 0
+            )
             other = waits + unsupported
             why = None
             if live:
                 why = "A run is under way."
-            elif refusal and cases:
+            elif refusal and cases and not creates:
                 why = refusal
-            elif not (to_ask or other):
-                why = "Every open Issue is under a User Story: there is nothing to check."
-            elif blocked and not other:
-                why = blocked
+            elif not (to_ask or other or create["to_ask"] or create["delivered"]):
+                why = (
+                    "Every open Issue is under a User Story and every User Story has "
+                    "Issues: there is nothing to check."
+                )
+            elif (blocked or not to_ask) and not other and not creates:
+                why = blocked or create["blocked"]
             issues = max(counted, len(cases))
             return {
                 "project": project.name,
@@ -229,11 +246,15 @@ class IssuesRun:
                         "why": alone["why"],
                     },
                 },
+                # What the stage that creates would do after the linking.
+                "create": create,
                 "can_start": why is None,
                 "why_not": why,
                 "run": self._shown_run(db, run) if run else None,
                 "runs": len(runs),
                 "lists": lists,
+                # Of what needs you: the cases that one word answers together.
+                "waiting": self.creator.waiting(db, project.id, KIND),
                 "undo_days": organize.UNDO.days,
             }
 
@@ -255,7 +276,12 @@ class IssuesRun:
             "cost": run.cost,
             "started_at": run.started_at.isoformat() if run.started_at else None,
             "ended_at": run.ended_at.isoformat() if run.ended_at else None,
-            "asking": {"done": asking.done, "total": asking.total, "state": asking.state}
+            "asking": {
+                "about": organize.ASKS.get(asking.kind, ""),
+                "done": asking.done,
+                "total": asking.total,
+                "state": asking.state,
+            }
             if asking is not None
             else None,
             "stages": [
@@ -324,8 +350,10 @@ class IssuesRun:
             db.flush()
             key = run.id
         if asking is None:
-            # Nothing to ask: what was answered before is gathered at once.
+            # Nothing to ask: what was answered before is gathered at once, and the
+            # stage that creates goes on from there.
             self._collect(name, key, "complete")
+            self.creator.advance(name, key)
         return {"id": str(key)}
 
     def control(self, name: str, action: str) -> dict[str, str]:
@@ -337,10 +365,16 @@ class IssuesRun:
             if run is None:
                 raise ProjectConflict("No run is under way.")
             asking = (run.estimate or {}).get("choice_run")
+            check = db.get(ChoiceRun, UUID(str(asking))) if asking else None
+            kind = check.kind if check is not None else CHECK
             key = run.id
+        if action == "end":
+            with self.sessions.begin() as db:
+                ending = db.get_one(OrganizeRun, key)
+                ending.estimate = {**(ending.estimate or {}), "ended": True}
         if asking:
             try:
-                parent_choice.control(self.sessions, name, CHECK, UUID(str(asking)), action)
+                parent_choice.control(self.sessions, name, kind, UUID(str(asking)), action)
             except ProjectConflict:
                 if action != "end":
                     raise
@@ -353,12 +387,26 @@ class IssuesRun:
         ended = False
         with self.sessions() as db:
             waiting = [
-                (run.id, run.project_id, (run.estimate or {}).get("choice_run"))
+                (run.id, run.project_id, (run.estimate or {}).get("choice_run"), run.stage)
                 for run in db.scalars(
                     select(OrganizeRun).where(OrganizeRun.kind == KIND, OrganizeRun.state.in_(LIVE))
                 )
             ]
-        for key, project_id, asking in waiting:
+        for key, project_id, asking, stage in waiting:
+            if stage == "create":
+                # The linking is done: the stage that creates carries the run on.
+                with self.sessions() as db:
+                    project = db.get(ProjectRecord, project_id)
+                    name = project.name if project is not None else ""
+                try:
+                    ended = self.creator.advance(name, key) or ended
+                except Exception:  # noqa: BLE001 - one project's run must not stop the others
+                    log.exception("What Organize creates for %s could not be carried on", name)
+                    with self.sessions.begin() as db:
+                        failed = db.get_one(OrganizeRun, key)
+                        failed.state, failed.ended_at = "failed", datetime.now(UTC)
+                        failed.detail = "What was written could not be gathered. Start it again."
+                continue
             with self.sessions.begin() as db:
                 project = db.get(ProjectRecord, project_id)
                 run = db.get(OrganizeRun, key)
@@ -386,7 +434,7 @@ class IssuesRun:
             if final:
                 try:
                     self._collect(name, key, final)
-                    ended = True
+                    ended = self.creator.advance(name, key) or ended
                 except Exception:  # noqa: BLE001 - one project's run must not stop the others
                     log.exception("Organizing the Issues of %s could not be gathered", name)
                     with self.sessions.begin() as db:
@@ -397,14 +445,9 @@ class IssuesRun:
 
     @staticmethod
     def _spent(run: OrganizeRun, check: ChoiceRun) -> None:
-        run.spent = int(check.spent or 0) + int(check.first_spent or 0)
-        run.cost = round(
-            float(check.cost or 0)
-            + float(check.first_cost or 0)
-            + float(check.judge_cost or 0)
-            + float(check.third_cost or 0),
-            6,
-        )
+        est = dict(run.estimate or {})
+        organize.count_costs(run, est, check)
+        run.estimate = est
         run.counts = {**(run.counts or {}), "verify": {"records": int(check.done or 0)}}
 
     def _line(self, db: Session, project: UUID, issue: UUID, op: str) -> OrganizeLine | None:
@@ -605,10 +648,13 @@ class IssuesRun:
                 },
                 "create": {"records": 0},
             }
-            run.state, run.stage, run.ended_at = final, "done", datetime.now(UTC)
             run.detail = (
                 f"{left} have no answer yet: they were not asked about in this run." if left else ""
             )
+            # Ended by the administrator, the run stops here; otherwise the stage that
+            # creates goes on with what has no counterpart.
+            if final != "complete" or not self.creator.begin(db, run):
+                run.state, run.stage, run.ended_at = final, "done", datetime.now(UTC)
         organize.forget(name)
 
     @staticmethod
@@ -739,7 +785,7 @@ class IssuesRun:
         return line
 
     def answer(
-        self, name: str, key: UUID, choice: str, story: UUID | None = None
+        self, name: str, key: UUID, choice: str, story: UUID | None = None, epic: UUID | None = None
     ) -> dict[str, str]:
         """The administrator's answer to a case: the Issue goes under that User Story
         (``story``), is a bug (``bug``) or is left as it is (``leave``); a link nothing
@@ -752,6 +798,8 @@ class IssuesRun:
             action = dict(line.action or {})
             offered = {str(entry.get("id")): entry for entry in line.candidates or []}
             reason = line.reason
+        if action.get("op") in OPS:
+            return self.creator.answer(name, KIND, key, choice, epic=epic)
         item = UUID(str(action["item"]))
         listed, state, before, problem = "needs_you", "answered", None, None
         try:
@@ -808,6 +856,10 @@ class IssuesRun:
                     f"This can be undone for {organize.UNDO.days} days after it was applied."
                 )
             action, before = dict(line.action or {}), (line.before or {}).get("links")
+        if action.get("op") in OPS:
+            self.creator.undo(name, KIND, key)
+            organize.forget(name)
+            return
         item, story = UUID(str(action["item"])), UUID(str(action["story"]))
         if action["op"] == "unsupported":
             self.changes.revert_one(name, "unsupported", item, story, before)
@@ -830,6 +882,16 @@ class IssuesRun:
                 else "The link stands again."
             )
         organize.forget(name)
+
+    def answer_many(self, name: str, group: str, choice: str) -> dict[str, int]:
+        """One word for many cases of the stage that creates."""
+        found = self.creator.answer_many(name, KIND, group, choice)
+        organize.forget(name)
+        return found
+
+    def publish(self, name: str) -> dict[str, int]:
+        """The Issues a run made and that are kept here are given to GitHub, together."""
+        return self.creator.publish(name)
 
     def undo(self, name: str, key: UUID) -> dict[str, str]:
         self._undo(name, key)

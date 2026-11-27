@@ -392,22 +392,34 @@ class OrganizeControlInput(PlainChangeInput):
 class OrganizeAnswerInput(PlainChangeInput):
     # What the administrator says of a case: the Issue goes under that User Story, is a
     # bug, or is left; a link nothing supports is taken off or kept.
-    choice: Literal["story", "bug", "leave", "take_off", "keep"]
+    # And of what a run would create: what was written is made or left; a User Story
+    # whose work is done, or that nothing says anything about, is closed or kept.
+    choice: Literal["story", "bug", "leave", "take_off", "keep", "make", "close"]
     story_id: UUID | None = None
+    # The Epic a User Story that was written is made under, where one is chosen.
+    epic_id: UUID | None = None
 
 
 class OrganizeGroupAnswerInput(PlainChangeInput):
     # One word for every link of a group that waits: those both models call unrelated
     # are taken off or kept; those in doubt are kept.
-    group: Literal["unrelated", "in_doubt"]
-    choice: Literal["take_off", "keep"]
+    # And of what a run would create: the User Stories whose work is done are closed
+    # or kept; what was written and only waits for a word is made.
+    group: Literal["unrelated", "in_doubt", "delivered", "drafts", "nothing"]
+    choice: Literal["take_off", "keep", "close", "make"]
 
 
 class OrganizeEpicAnswerInput(PlainChangeInput):
     # What the administrator says of a case: the User Story belongs to that Epic, or is
     # left as it is; a link to another Epic is taken off or kept.
-    choice: Literal["epic", "leave", "take_off", "keep"]
+    # And of what a run would create: what was written is made or left; an Epic is
+    # closed or kept, or split as proposed.
+    choice: Literal["epic", "leave", "take_off", "keep", "make", "close", "split"]
     epic_id: UUID | None = None
+    # The titles of the Epics a split makes, where they are not those proposed.
+    titles: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(
+        default=None, max_length=8
+    )
 
 
 class ConnectionCarryOutInput(PlainChangeInput):
@@ -619,6 +631,13 @@ class ReviewSettingsInput(PlainChangeInput):
         if not self.third_provider and not self.third_model:
             return None
         return (self.third_provider, self.third_model)
+
+    # The model that writes a record that is missing; empty for the one that answers.
+    writer_provider: str = Field(default="", max_length=32)
+    writer_model: str = Field(default="", max_length=200)
+
+    def writer(self) -> tuple[str, str] | None:
+        return (self.writer_provider, self.writer_model) if self.writer_model else None
 
     # The numbers the reviews work to, by their key; none leaves them as they are.
     numbers: dict[str, float] | None = Field(default=None, max_length=40)

@@ -315,6 +315,8 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/orphans/{key}/dismiss",
         "/api/dashboard/projects/{name}/organize/stories-issues/runs",
         "/api/dashboard/projects/{name}/organize/stories-issues/control",
+        "/api/dashboard/projects/{name}/organize/stories-issues/groups",
+        "/api/dashboard/projects/{name}/organize/stories-issues/publish",
         "/api/dashboard/projects/{name}/organize/stories-issues/lines/{line}",
         "/api/dashboard/projects/{name}/organize/stories-issues/lines/{line}/undo",
         "/api/dashboard/projects/{name}/organize/stories-issues/runs/{run}/undo",

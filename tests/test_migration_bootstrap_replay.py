@@ -75,7 +75,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0094 keeps what caused a bug, when it is known.
     # 0095 keeps the runs of Organize and of Coverage, and what each found.
     # 0096 lets a run carry out a connection, and say which projects it reads.
-    assert (head, parent) == ("0096", "0095")
+    # 0097 lets a project name the model that writes a record that is missing.
+    assert (head, parent) == ("0097", "0096")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -185,6 +186,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
     assert {"organize_runs", "organize_lines"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, parent)
+    assert "writer_model" not in {
+        column["name"] for column in inspect(engine).get_columns("review_settings")
+    }
+    command.downgrade(config, "0095")
     assert "connection_id" not in {
         column["name"] for column in inspect(engine).get_columns("organize_runs")
     }

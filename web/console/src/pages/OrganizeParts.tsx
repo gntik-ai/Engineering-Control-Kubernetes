@@ -45,7 +45,7 @@ const STATE: Record<Run['state'], { says: string; tone: 'info' | 'neutral' | 'su
 const LISTS: { key: Listed; says: string; none: string }[] = [
   { key: 'needs_you', says: 'Needs you', none: 'Nothing waits for you.' },
   { key: 'done', says: 'Done', none: 'Nothing was applied yet.' },
-  { key: 'created', says: 'Created', none: 'Nothing is created here yet: that arrives with a later phase.' },
+  { key: 'created', says: 'Created', none: 'Nothing was created yet.' },
 ];
 function ListOf<T extends { id: string }>({
   path,
@@ -229,7 +229,7 @@ export function ListsSection<T extends { id: string }>({
           ? 'What is in doubt, the most doubtful first. Nothing of it is applied until you say so.'
           : listed === 'done'
             ? doneSaid
-            : 'Records a run made.'}
+            : 'Records a run made, each with what it was made from. Each can be taken away again.'}
       </p>
       <ListOf<T>
         key={listed}

@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import select
 
-from engineering_control.dashboard import review_settings
+from engineering_control.dashboard import organize_create, review_settings
 from engineering_control.db.models import (
     BacklogItem,
     ConnectionFinding,
@@ -26,6 +27,13 @@ from tests.test_project_connections import F, write
 from tests.test_review_settings import BASE, ready
 
 HERE = BASE + "organize/stories-issues"
+
+
+@pytest.fixture(autouse=True)
+def linking_only(monkeypatch: Any) -> None:
+    """These tests are about linking. What a run creates when the linking is done has
+    tests of its own (``test_organize_create``): here that stage has nothing to do."""
+    monkeypatch.setattr(organize_create, "STEPS", {})
 
 
 def shown(client: Any) -> dict[str, Any]:

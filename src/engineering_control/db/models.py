@@ -1298,6 +1298,10 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     # Which checks run by themselves (migration 0092), by the check: "off", "arrive"
     # or "night". None where none does.
     runs: Mapped[dict[str, str] | None] = mapped_column(JSON)
+    # The model that writes a record that is missing (migration 0097); none for the
+    # model that answers.
+    writer_provider: Mapped[str | None] = mapped_column(String(32))
+    writer_model: Mapped[str | None] = mapped_column(String(200))
 
 
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):

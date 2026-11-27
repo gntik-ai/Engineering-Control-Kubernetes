@@ -8,9 +8,15 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import select
 
-from engineering_control.dashboard import organize_epics, ranking, review_settings
+from engineering_control.dashboard import (
+    organize_create,
+    organize_epics,
+    ranking,
+    review_settings,
+)
 from engineering_control.db.models import (
     ConnectionFinding,
     PlanningLink,
@@ -32,6 +38,15 @@ from tests.test_project_connections import F, write
 from tests.test_review_settings import BASE, ready
 
 HERE = BASE + "organize/epics-stories"
+
+
+@pytest.fixture(autouse=True)
+def linking_only(monkeypatch: Any) -> None:
+    """These tests are about linking. What a run creates when the linking is done has
+    tests of its own (``test_organize_create``): here that stage has nothing to do."""
+    monkeypatch.setattr(organize_create, "STEPS", {})
+
+
 AUDIT, FAILURES = "Audit executions", "Respond to failures"
 TRAIL, BILLING, OPERATIONS = "Audit trail", "Billing", "Operations"
 
@@ -273,7 +288,7 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
         assert {story for _model, story, kind in model.calls if kind == "links"} == {AUDIT}
         again = shown(client)
         second = again["run"]
-        assert again["waiting"] == {"unrelated": 1, "in_doubt": 1}
+        assert (again["waiting"]["unrelated"], again["waiting"]["in_doubt"]) == (1, 1)
         # The case that waited from the first run is the same line, not a second one.
         assert again["lists"]["needs_you"] == 3
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[BILLING], ids[OPERATIONS]}

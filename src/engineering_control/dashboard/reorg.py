@@ -1021,17 +1021,20 @@ class Reorg:
         """The changes of that kind that are ready to be made, the surest first: each
         with the two records, how sure it is, and why."""
         with self.sessions() as db:
-            project = active_project(db, name)
-            return [
-                {
-                    "child": row.child_id,
-                    "parent": row.parent_id,
-                    "confidence": float(row.confidence),
-                    "why": str((row.detail or {}).get("why") or ""),
-                    "signals": (row.detail or {}).get("signals") or {},
-                }
-                for row in self._ready(db, project, kind)
-            ]
+            return self.ready_in(db, active_project(db, name), kind)
+
+    def ready_in(self, db: Session, project: ProjectRecord, kind: str) -> list[dict[str, Any]]:
+        """The same, within a transaction that is open."""
+        return [
+            {
+                "child": row.child_id,
+                "parent": row.parent_id,
+                "confidence": float(row.confidence),
+                "why": str((row.detail or {}).get("why") or ""),
+                "signals": (row.detail or {}).get("signals") or {},
+            }
+            for row in self._ready(db, project, kind)
+        ]
 
     def apply_one(self, name: str, kind: str, child: UUID, parent: UUID, reason: str) -> Any:
         """Make one change of that kind by itself, outside a batch, and return how

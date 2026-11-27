@@ -56,7 +56,7 @@ def test_settings_give_runs_their_models_makers_and_rounds(
         shown = client.get(BASE + "review-settings").json()
         assert shown["dollars"]["limit"] == 3.0 and shown["dollars"]["spent"] == 0
         assert not shown["dollars"]["over"] and shown["rounds"] == 0
-        assert shown["roles"] == {"answer": None, "judge": None, "third": None}
+        assert shown["roles"] == {"answer": None, "judge": None, "third": None, "writer": None}
         fixture = next(entry for entry in shown["makers"] if entry["maker"] == "fixture")
         # The maker of the test account is among the defaults in every test.
         assert fixture["allowed"] and fixture["by_default"] and fixture["models"] == 2
@@ -79,8 +79,15 @@ def test_settings_give_runs_their_models_makers_and_rounds(
             "answer": {"provider": "fixture", "model": "analysis"},
             "judge": {"provider": "fixture", "model": "other"},
             "third": None,
+            "writer": None,
         }
         assert saved.json()["roles"] == roles and saved.json()["rounds"] == 2
+        # A model can be named to write the records a run of Organize makes.
+        written = post(
+            client, "review-settings", **save, writer_provider="fixture", writer_model="other"
+        )
+        assert written.json()["roles"]["writer"] == {"provider": "fixture", "model": "other"}
+        assert post(client, "review-settings", **save).json()["roles"]["writer"] is None
         # The judge is of another maker than the model the planning reviews ask, which
         # is Discovery's where none was chosen for planning: those reviews are judged.
         assert saved.json()["planning_judged"] is True

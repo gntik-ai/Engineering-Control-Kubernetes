@@ -4,6 +4,7 @@ import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
 import { dollars, some, whole } from './ChoiceRun';
+import { CreateBar, type CreateLine, type CreatePlan, CreateRow, createSaid, isCreateLine } from './OrganizeCreate';
 import { type Listed, ListsSection, type Model, type Run, RunSection } from './OrganizeParts';
 import { useSubmit } from './ProjectDialogs';
 
@@ -39,8 +40,10 @@ interface Shown {
   why_not: string | null;
   run: Run | null;
   lists: Record<Listed, number>;
-  /** Of what needs you: the links to other Epics that one word answers together. */
-  waiting: { unrelated: number; in_doubt: number };
+  /** What the stage that creates would do after the linking. */
+  create: CreatePlan;
+  /** Of what needs you: the cases that one word answers together. */
+  waiting: { unrelated: number; in_doubt: number } & Record<string, number>;
   undo_days: number;
 }
 interface Candidate {
@@ -72,7 +75,7 @@ interface Line {
   candidates: Candidate[];
   said: Said[];
   reason: string;
-  action: { op: 'primary' | 'epic_link' | 'epic_of'; current?: string | null; across?: boolean } | null;
+  action: { op: string; current?: string | null; across?: boolean } | null;
   can_undo: boolean;
 }
 
@@ -309,7 +312,7 @@ function LineRow({ line, listed, path, changed }: { line: Line; listed: Listed; 
 }
 
 /** What a run started now would do, said before it starts. */
-function planSaid(plan: Shown['plan']): string[] {
+function planSaid(plan: Shown['plan'], create: CreatePlan): string[] {
   const said: string[] = [];
   if (plan.stated)
     said.push(
@@ -363,7 +366,7 @@ function planSaid(plan: Shown['plan']): string[] {
     said.push(
       `${some(plan.only, 'User Story is', 'User Stories are')} under one Epic that the texts place elsewhere, or under none: put before you with the nearest Epics. No model is asked about ${plan.only === 1 ? 'it' : 'them'}.`,
     );
-  return said;
+  return [...said, ...createSaid(create)];
 }
 
 /** The button for Epics and User Stories: the one Epic of each Story, and its other Epics. */
@@ -419,14 +422,14 @@ export function EpicsAndStories({ project }: { project: string }) {
                   : ''}
                 {` ${some(data.stands.epics, 'open Epic', 'open Epics')}`}
                 {data.stands.epics_with_no_story
-                  ? `, of which ${some(data.stands.epics_with_no_story, 'holds', 'hold')} no open User Story: writing Stories for ${data.stands.epics_with_no_story === 1 ? 'it' : 'them'} is a later phase.`
+                  ? `, of which ${some(data.stands.epics_with_no_story, 'holds', 'hold')} no open User Story.`
                   : '.'}
               </span>
             </p>
             {!live ? (
               <section className="grid gap-2">
                 <ul className="grid gap-1 text-sm text-muted-foreground">
-                  {planSaid(data.plan).map((line, index) => (
+                  {planSaid(data.plan, data.create).map((line, index) => (
                     <li key={index}>{line}</li>
                   ))}
                 </ul>
@@ -457,11 +460,12 @@ export function EpicsAndStories({ project }: { project: string }) {
                       : stage.stage === 'verify'
                         ? `asked about; ${whole(stage.settled)} done, ${whole(stage.in_doubt)} need you`
                         : stage.stage === 'create'
-                          ? 'created: not in this phase'
+                          ? `made; ${whole(stage.in_doubt)} put before you`
                           : 'the run is over'
                 }
               />
             ) : null}
+            {!live ? <CreateBar path={path} waiting={data.waiting} unpublished={0} changed={changed} /> : null}
             {!live && data.waiting.unrelated + data.waiting.in_doubt > 0 ? (
               <section className="grid gap-2 rounded-lg border border-border p-3">
                 <p className="text-sm text-muted-foreground">
@@ -487,16 +491,20 @@ export function EpicsAndStories({ project }: { project: string }) {
                 </div>
               </section>
             ) : null}
-            {run || data.lists.needs_you + data.lists.done > 0 ? (
-              <ListsSection<Line>
+            {run || data.lists.needs_you + data.lists.done + data.lists.created > 0 ? (
+              <ListsSection<Line | CreateLine>
                 path={path}
                 lists={data.lists}
                 tick={tick}
                 changed={changed}
                 doneSaid={`User Stories that were given their one Epic, and links to other Epics that were taken off. Each can be undone for ${data.undo_days} days.`}
-                row={(line, listed, done) => (
-                  <LineRow key={line.id} line={line} listed={listed} path={path} changed={done} />
-                )}
+                row={(line, listed, done) =>
+                  isCreateLine(line) ? (
+                    <CreateRow key={line.id} line={line as CreateLine} listed={listed} path={path} changed={done} />
+                  ) : (
+                    <LineRow key={line.id} line={line as Line} listed={listed} path={path} changed={done} />
+                  )
+                }
               />
             ) : null}
           </>
@@ -504,7 +512,7 @@ export function EpicsAndStories({ project }: { project: string }) {
         {asking === 'start' && data ? (
           <Confirm
             title="Check and organize the User Stories?"
-            about={planSaid(data.plan).join(' ')}
+            about={planSaid(data.plan, data.create).join(' ')}
             action="Check and organize"
             run={() => postJson(path + '/runs')}
             onClose={() => setAsking(null)}

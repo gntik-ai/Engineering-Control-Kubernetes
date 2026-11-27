@@ -8,7 +8,7 @@ import { TokenBudget } from './PlanningReviews';
 
 interface Settings {
   dollars: { limit: number; spent: number; since: string; over: boolean };
-  roles: { answer: Model | null; judge: Model | null; third?: Model | null };
+  roles: { answer: Model | null; judge: Model | null; third?: Model | null; writer?: Model | null };
   rounds: number;
   makers: { maker: string; models: number; allowed: boolean; by_default: boolean; at_your_word: boolean }[];
   own_makers: boolean;
@@ -78,6 +78,7 @@ export function ReviewSettings({ project }: { project: string }) {
   const [answer, setAnswer] = useState('');
   const [judge, setJudge] = useState('');
   const [third, setThird] = useState('');
+  const [writer, setWriter] = useState('');
   const [rounds, setRounds] = useState('0');
   const [allowed, setAllowed] = useState<Record<string, boolean>>({});
   const [planner, setPlanner] = useState('');
@@ -101,6 +102,7 @@ export function ReviewSettings({ project }: { project: string }) {
     numbers,
     alone,
     runs,
+    writer,
   ]);
   const filled = useRef<string | null>(null);
   const fill = (from: Settings) => {
@@ -109,6 +111,7 @@ export function ReviewSettings({ project }: { project: string }) {
       answer: keyOf(from.roles.answer),
       judge: keyOf(from.roles.judge),
       third: keyOf(from.roles.third ?? null),
+      writer: keyOf(from.roles.writer ?? null),
       rounds: String(from.rounds),
       allowed: Object.fromEntries(from.makers.map((entry) => [entry.maker, entry.allowed])),
       cheaper: from.cheaper_first,
@@ -120,6 +123,7 @@ export function ReviewSettings({ project }: { project: string }) {
     setAnswer(next.answer);
     setJudge(next.judge);
     setThird(next.third);
+    setWriter(next.writer);
     setRounds(next.rounds);
     setAllowed(next.allowed);
     setCheaper(next.cheaper);
@@ -137,6 +141,7 @@ export function ReviewSettings({ project }: { project: string }) {
       next.numbers,
       next.alone,
       next.runs,
+      next.writer,
     ]);
   };
   // The page reads what is saved again every minute. That must not take away what was
@@ -163,6 +168,7 @@ export function ReviewSettings({ project }: { project: string }) {
     const [answerProvider, answerModel] = pick(answer);
     const [judgeProvider, judgeModel] = pick(judge);
     const [thirdProvider, thirdModel] = pick(judge ? third : '');
+    const [writerProvider, writerModel] = pick(writer);
     const makers = data.makers.filter((entry) => allowed[entry.maker]).map((entry) => entry.maker);
     const asDefault = data.makers.every((entry) => Boolean(allowed[entry.maker]) === entry.by_default);
     act(
@@ -176,6 +182,8 @@ export function ReviewSettings({ project }: { project: string }) {
           judge_model: judgeModel,
           third_provider: thirdProvider,
           third_model: thirdModel,
+          writer_provider: writerProvider,
+          writer_model: writerModel,
           // The defaults follow the accounts; a list of the project's own stays as it is.
           makers: asDefault ? null : makers,
           rounds: Number(rounds),
@@ -405,6 +413,15 @@ export function ReviewSettings({ project }: { project: string }) {
                   />
                 </label>
                 <label className="grid gap-1 text-sm">
+                  The model that writes new records
+                  <SimpleSelect
+                    aria-label="Model that writes new records"
+                    value={writer || 'none'}
+                    items={[{ value: 'none', label: 'The model that answers' }, ...models]}
+                    onValueChange={(value) => setWriter(value === 'none' ? '' : String(value ?? ''))}
+                  />
+                </label>
+                <label className="grid gap-1 text-sm">
                   When the two differ
                   <SimpleSelect
                     aria-label="How often an answer goes back"
@@ -418,6 +435,11 @@ export function ReviewSettings({ project }: { project: string }) {
                   />
                 </label>
               </div>
+              <p className="max-w-prose text-xs text-muted-foreground">
+                The model that writes is asked when a run of Organize makes a record that is missing. What it writes is
+                checked, sentence by sentence, by a model of another maker: the judge, or else the model that answers.
+                Where neither is of another maker, nothing is made without you.
+              </p>
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={cheaper} onChange={(event) => setCheaper(event.target.checked)} />
                 Where there is no judge, ask first the cheaper model whose trial on the check agreed
