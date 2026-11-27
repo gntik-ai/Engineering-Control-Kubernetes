@@ -234,7 +234,10 @@ def test_what_is_settled_is_applied_where_the_record_allows(
         assert not placed(repo, 41)
         waiting = {line["subject"]["ref"]: line for line in lines(client, "needs_you")}
         assert set(waiting) == {"#41", "#45"}
-        assert "not applied again by itself" in waiting["#41"]["reason"]
+        # It says why: taken back before, or, where the undone line was one of the
+        # sampled ones, that the record no longer allows applying at all.
+        reason = waiting["#41"]["reason"]
+        assert "not applied again by itself" in reason or "It is not applied by itself" in reason
     finally:
         client.close()
 
