@@ -386,6 +386,20 @@ Asked for on 26 November: a judge in every Reviews workflow, one Settings view, 
 
 Decided on 26 November 2026: what both models agree on is applied without approval where it adds or corrects and can be undone, within an error rate of 5%; what removes, closes or writes to GitHub stays a batch to approve. "Approval always" (decision of 23 November, below) holds until J3 builds that, and after it for those batches.
 
+### Queued: Reviews in two pages (27 November 2026)
+
+Asked for on 27 November: Reviews has too much on it. It is to become Organize (two buttons: Epics and User Stories; User Stories and Issues), Coverage (the documentation against the plan) and Settings, with missing records created after a careful review and only Issues on GitHub. The proposal, what happens to each of today's panels, and the decisions it needs are in [organize-and-coverage.md](organize-and-coverage.md). None of it is built; it starts once the decisions are taken.
+
+| Phase | What | Done when |
+| --- | --- | --- |
+| O0 | Ground: one run type with stages and three lists; the numbers a first run would meet; new Epics and Stories no longer written to GitHub. | The numbers are known for each project, and no new Epic or Story reaches GitHub. |
+| O1 | Organize, User Stories and Issues: linking, behind one button. | Every open Issue that is no bug is under a Story or in "Needs you". |
+| O2 | Organize, Epics and User Stories: linking, behind the other button. | Every open Story has one Epic or is in "Needs you". |
+| O3 | Creating what has no counterpart, after the careful review; the list "Created", with undo. | No open Story without an Epic and no open Issue without a Story, except what is in "Needs you". |
+| O4 | Coverage: the documentation in parts, matched and verified, one number, missing records created. | One number for each project; a part nothing covered has a record or is in "Needs you". |
+| O5 | Two pages: the old views removed, what survives moved, old addresses redirected. | Reviews has three entries: Organize, Coverage, Settings. |
+| O6 | By itself, and told: organized as records and documents arrive; Dashboard, digest and chat; each stage measured again when it changes. | A new Issue is under a Story or in "Needs you" without a button. |
+
 ## Decisions (23 November 2026)
 
 1. **Approval always.** Nothing is applied without the administrator's word; the cascade prepares batches and plans.
