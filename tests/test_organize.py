@@ -102,6 +102,8 @@ def _more(repo: Any, ids: dict[str, Any]) -> None:
             # Its Epic became a record here and the platform closed the issue itself:
             # the import does not read it again, so its state here still says open.
             (53, "Epic: Reports", ["epic"], "open", "planning"),
+            # An open issue of the repository that was never taken into the plan.
+            (60, "Tidy the logs", ["chore"], "open", None),
         ):
             db.add(
                 BacklogItem(
@@ -194,6 +196,7 @@ def test_what_a_first_run_would_meet_is_counted(tmp_path: Path) -> None:
         assert (between["issues"], between["issues_under_a_story"]) == (3, 1)
         assert between["issues_with_no_story"] == 2 and between["issues_not_on_github"] == 0
         assert between["stories_with_open_issues"] == 1
+        assert between["issues_outside_the_plan"] == 1
         assert between["stories_with_no_issue"] == 2
         assert between["stories_with_no_issue_by_standing"] == {"unknown": 2}
         # Epics and Stories that are issues on GitHub: the open ones, and which of them

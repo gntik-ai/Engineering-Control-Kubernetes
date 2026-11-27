@@ -306,9 +306,25 @@ def _count(planning: PlanningRecords, db: Session, name: str) -> dict[str, Any]:
             continue
         state = standing.get(UUID(str(row["id"])), "unknown")
         no_issue[state] = no_issue.get(state, 0) + 1
-    known_bugs = db.scalar(
-        select(func.count()).select_from(bugs_with_optional_stories(db, project.id).subquery())
-    )
+    known_bugs = set(db.scalars(bugs_with_optional_stories(db, project.id)))
+    # Open issues of the repository that were never taken into the plan: no bug, and
+    # none that calls itself an Epic or a User Story. A run has to take them in first.
+    outside = 0
+    for item in db.scalars(
+        select(BacklogItem).where(
+            BacklogItem.project_id == project.id,
+            BacklogItem.issue_number.is_not(None),
+            BacklogItem.issue_state == "open",
+            BacklogItem.workspace_review.is_(None),
+        )
+    ):
+        if item.id in known_bugs:
+            continue
+        if planning_kind(
+            {"title": item.title, "labels": item.issue_labels, "body": item.description}
+        ):
+            continue
+        outside += 1
     return {
         "project": project.name,
         "epics_stories": {
@@ -337,7 +353,8 @@ def _count(planning: PlanningRecords, db: Session, name: str) -> dict[str, Any]:
             "issues_under_closed_stories_only": closed_story_only,
             "issues_under_a_story_of_another_project": elsewhere,
             "bugs_left_out": len(bugs),
-            "bugs_in_all": int(known_bugs or 0),
+            "bugs_in_all": len(known_bugs),
+            "issues_outside_the_plan": outside,
             "stories": len(stories),
             "stories_with_open_issues": len(has_open_issue),
             "stories_with_closed_issues_only": closed_issues_only,
