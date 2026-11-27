@@ -19,6 +19,7 @@ from engineering_control.dashboard.bugs import Bugs
 from engineering_control.dashboard.cleanup import Cleanup
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
 from engineering_control.dashboard.connections import Connections
+from engineering_control.dashboard.coverage import CoverageRun
 from engineering_control.dashboard.delivery import Delivery
 from engineering_control.dashboard.doc_inventory import DocInventory
 from engineering_control.dashboard.epic_descriptions import EpicDescriptions
@@ -195,6 +196,7 @@ class DashboardRepository:
             self.planning_links,
             self.organize_create,
         )
+        self.coverage = CoverageRun(self.sessions, self.organize_create)
         self.rollout = Rollout(self.sessions, self.planning_links, self.needs_you)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)

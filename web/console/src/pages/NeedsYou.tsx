@@ -77,6 +77,7 @@ const GROUPS: { key: Group; title: string; about: string; tone: 'warning' | 'neu
 ];
 const WHERE: Record<Step['view'], string> = {
   organize: 'Organize',
+  coverage: 'Coverage',
   'needs-you': 'Needs you',
   'related-work': 'Related Work',
   planning: 'Planning',

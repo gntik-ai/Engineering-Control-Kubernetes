@@ -1067,6 +1067,41 @@ class DocFile(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (UniqueConstraint("project_id", "path", name="uq_doc_files_path"),)
 
 
+class DocPart(UUIDPrimaryKey, Timestamps, Base):
+    """One part of a project's documentation as Coverage last read it (migration 0098):
+    what stands under one heading, what it is about, and whether an Epic, a User Story
+    or an Issue does what it says. Its key is made from the document's path and the
+    part's own text, so that a part that did not change keeps what was found of it."""
+
+    __tablename__ = "doc_parts"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    path: Mapped[str] = mapped_column(String(700))
+    heading: Mapped[str] = mapped_column(String(300))
+    # The headings above it, the nearest last.
+    under: Mapped[list[str]] = mapped_column(JSON, default=list)
+    first_line: Mapped[int] = mapped_column(Integer, default=0)
+    last_line: Mapped[int] = mapped_column(Integer, default=0)
+    words: Mapped[int] = mapped_column(Integer, default=0)
+    digest: Mapped[str] = mapped_column(String(64))
+    text: Mapped[str] = mapped_column(Text, default="")
+    # What a rule says it is about: product, other or open.
+    about: Mapped[str] = mapped_column(String(8))
+    # What the administrator says it is about, where they said so: product or other.
+    said: Mapped[str | None] = mapped_column(String(8))
+    # unchecked, covered, none (nothing covers it), doubt, or other (not about the product).
+    state: Mapped[str] = mapped_column(String(12), default="unchecked")
+    # The records that do what it says: kind, id, title, and how that is known.
+    covered_by: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # The vector the ranking service gave for its text, and the model that made it.
+    model: Mapped[str | None] = mapped_column(String(120))
+    vector: Mapped[bytes | None] = mapped_column(LargeBinary)
+    # When a reading no longer found it. It is kept: records may have been made for it.
+    gone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (Index("ix_doc_parts_state", "project_id", "state"),)
+
+
 class DocChange(UUIDPrimaryKey, Timestamps, Base):
     """What one reading found changed in one document (migration 0074): whether it was
     added, modified or removed, how many lines, under which headings, and the lines."""

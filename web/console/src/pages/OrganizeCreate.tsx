@@ -45,6 +45,9 @@ interface Item {
   title: string;
   description: string;
   sentences: Sentence[];
+  /** Where a check writes records of several kinds: which, and what it goes under. */
+  kind?: string;
+  parent?: { title: string } | null;
 }
 interface Candidate {
   id: string;
@@ -86,7 +89,12 @@ export interface CreateLine {
 export const CREATE_OPS = ['make', 'retire', 'close_story', 'split', 'created'];
 export const isCreateLine = (line: { action: { op: string } | null }) => CREATE_OPS.includes(line.action?.op ?? '');
 
-const KIND: Record<string, string> = { stories: 'User Story', issues: 'Issue', epics: 'Epic' };
+const KIND: Record<string, string> = {
+  stories: 'User Story',
+  issues: 'Issue',
+  epics: 'Epic',
+  parts: 'Part of the documentation',
+};
 const SOURCE: Record<string, string> = { story: 'User Story', epic: 'Epic', doc: 'Document', issue: 'Issue' };
 const CASE: Record<string, { says: string; tone: 'info' | 'neutral' | 'success' | 'warning' }> = {
   draft_unsupported: { says: 'Written: a sentence is not supported', tone: 'warning' },
@@ -97,6 +105,7 @@ const CASE: Record<string, { says: string; tone: 'info' | 'neutral' | 'success' 
   draft_single: { says: 'Written: no second model checked it', tone: 'info' },
   draft_unchecked: { says: 'Written: a sentence was left out', tone: 'warning' },
   draft_stopped: { says: 'Written and checked: it waits for your word', tone: 'info' },
+  draft_epic: { says: 'An Epic was written: it waits for your word', tone: 'info' },
   unclear: { says: 'The model could not tell what it needs', tone: 'warning' },
   nothing: { says: 'Nothing says what it needs', tone: 'warning' },
   nothing_doubt: { says: 'In doubt: nothing may say what it needs', tone: 'warning' },
@@ -132,7 +141,11 @@ function said(entry: CreateLine['said'][number]): string {
 function Draft({ item }: { item: Item }) {
   return (
     <div className="grid gap-1 rounded-lg border border-border p-3">
-      <p className="text-sm font-medium text-foreground">{item.title}</p>
+      <p className="text-sm font-medium text-foreground">
+        {item.kind ? <span className="font-normal text-muted-foreground">{KIND[item.kind] ?? 'Record'}: </span> : null}
+        {item.title}
+        {item.parent ? <span className="font-normal text-muted-foreground"> · under “{item.parent.title}”</span> : null}
+      </p>
       <p className="whitespace-pre-line text-sm text-muted-foreground">{item.description}</p>
       <details className="text-xs text-muted-foreground">
         <summary className="cursor-pointer">Each sentence, with what it rests on</summary>
@@ -245,9 +258,11 @@ export function CreateRow({
         <div className="grid gap-2">
           <p className="text-xs font-medium text-muted-foreground">
             What was written (
-            {line.action?.check === 'new_issues'
-              ? some(items.length, 'Issue', 'Issues')
-              : some(items.length, 'User Story', 'User Stories')}
+            {items.some((item) => item.kind)
+              ? some(items.length, 'record', 'records')
+              : line.action?.check === 'new_issues'
+                ? some(items.length, 'Issue', 'Issues')
+                : some(items.length, 'User Story', 'User Stories')}
             ):
           </p>
           {items.map((item, place) => (
@@ -513,7 +528,7 @@ export function CreateBar({
       <div className="flex flex-wrap gap-2">
         {unpublished ? (
           <Button size="sm" onClick={() => setAsking('publish')}>
-            Publish the {some(unpublished, 'Issue', 'Issues')} that were made to GitHub
+            Publish the {some(unpublished, 'Issue that was', 'Issues that were')} made to GitHub
           </Button>
         ) : null}
         {delivered ? (
@@ -523,7 +538,7 @@ export function CreateBar({
         ) : null}
         {drafts ? (
           <Button size="sm" variant="secondary" onClick={() => setAsking('make')}>
-            Make the {some(drafts, 'record', 'records')} that only wait for your word
+            Make the {some(drafts, 'record that only waits', 'records that only wait')} for your word
           </Button>
         ) : null}
         {nothing ? (

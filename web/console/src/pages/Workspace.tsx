@@ -10,7 +10,7 @@ import {
   WorkspaceSwitcher,
   type NavGroup,
 } from '@gntik-ai/ui';
-import { Inbox, ListTree, Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug, SlidersHorizontal } from '@gntik-ai/icons';
+import { Inbox, ListTree, FileCheck, Workflow, ListTodo, Bot, Terminal, FolderKanban, KeyRound, LayoutDashboard, Sparkles, ListOrdered, Network, Plus, GitFork, ListChecks, Compass, Shuffle, BookOpen, Bug, SlidersHorizontal } from '@gntik-ai/icons';
 import { useState, type ReactNode } from 'react';
 import { LoadError, RefreshButton, usePageTitle, useProjects } from '../parts';
 import { ADMIN, BASE, RouterLink, statsUrl, automationUrl, isAutomation, type AutomationView, accountsUrl, connectionsUrl, navigate, queueUrl, bugsUrl, workspaceUrl, reviewUrl, reviewViews, isReviewView, type ReviewView } from '../router';
@@ -35,11 +35,13 @@ import { PlanningReviews } from './PlanningReviews';
 import { ReviewSettings } from './ReviewSettings';
 import { Anchor, NeedsYou, useAnchor } from './NeedsYou';
 import { Organize } from './Organize';
+import { Coverage } from './Coverage';
 import { WorkspaceImport } from './WorkspaceImport';
 
 const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignment', agents: 'Agents', commands: 'Commands' };
 const reviewMenu = {
   organize: { label: 'Organize', icon: ListTree },
+  coverage: { label: 'Coverage', icon: FileCheck },
   'needs-you': { label: 'Needs you', icon: Inbox },
   'related-work': { label: 'Related Work', icon: GitFork },
   planning: { label: 'Planning', icon: ListChecks },
@@ -203,6 +205,7 @@ export function ProjectWorkspace({
               <div className="grid min-w-0 gap-5" key={project.project}>
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
                 {view === 'organize' && <Organize project={project.project} />}
+                {view === 'coverage' && <Coverage project={project.project} />}
       {view === 'needs-you' && <NeedsYou project={project.project} />}
                 {view === 'related-work' && <Anchor id="issues-without-story"><OrphanWorklist project={project.project} /></Anchor>}
                 {view === 'related-work' && <Anchor id="review-evidence"><EvidencePanel project={project.project} /></Anchor>}

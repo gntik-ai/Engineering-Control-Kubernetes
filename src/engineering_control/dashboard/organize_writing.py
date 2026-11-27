@@ -205,18 +205,23 @@ class Subject:
 
 
 def clusters(
-    keys: list[UUID], vectors: dict[tuple[str, UUID], Any], bound: float, depth: int = 0
+    keys: list[UUID],
+    vectors: dict[tuple[str, UUID], Any],
+    bound: float,
+    depth: int = 0,
+    kind: str = "issue",
+    most: int = GROUP_MOST,
 ) -> list[list[UUID]]:
     """The Issues in groups that lie close together, the same each time: around the one
     with the most neighbours, all within the bound of it; then the same among what is
     left. One that lies close to no other is a group of its own, and so is one the
     ranking service did not read. A group too large for one User Story is looked at
     again more strictly."""
-    have = [key for key in sorted(keys, key=str) if ("issue", key) in vectors]
+    have = [key for key in sorted(keys, key=str) if (kind, key) in vectors]
     found: list[list[UUID]] = [[key] for key in sorted(keys, key=str) if key not in have]
     if not have:
         return found
-    table = numpy.stack([vectors["issue", key] for key in have])
+    table = numpy.stack([vectors[kind, key] for key in have])
     close = table @ table.T >= bound
     left = set(range(len(have)))
     for place in sorted(left, key=lambda at: (-int(close[at].sum()), at)):
@@ -225,11 +230,11 @@ def clusters(
         members = [other for other in sorted(left) if close[place, other]]
         left -= set(members)
         group = [have[place], *(have[other] for other in members if other != place)]
-        if len(group) > GROUP_MOST and depth < 12:
-            found.extend(clusters(group, vectors, bound + TIGHTER, depth + 1))
+        if len(group) > most and depth < 12:
+            found.extend(clusters(group, vectors, bound + TIGHTER, depth + 1, kind, most))
         else:
-            found.append(group[:GROUP_MOST])
-            found.extend([key] for key in group[GROUP_MOST:])
+            found.append(group[:most])
+            found.extend([key] for key in group[most:])
     return sorted(found, key=lambda group: (-len(group), str(group[0])))
 
 
@@ -242,10 +247,26 @@ class _Scope:
     check of it are read. Each says for itself which records wait."""
 
     kind = ""
+    # The shape an answer has, the answers that can be given, and how many records one
+    # answer may write: a check may say otherwise for itself.
+    schema: dict[str, Any] = {}
+    answers: tuple[str, ...] = ("written", "done", "nothing", "unclear")
+    most = 0
 
     def __init__(self, db: Session, project: ProjectRecord) -> None:
         self.db, self.project = db, project
         self._waiting: list[Subject] | None = None
+
+    def _item(
+        self,
+        entry: dict[str, Any],
+        by_label: dict[str, dict[str, Any]],
+        place: int,
+        kept: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """What more a check keeps of one record that was written; None where the
+        record cannot be kept as it was written."""
+        return {}
 
     def _subjects(self) -> list[Subject]:
         raise NotImplementedError
@@ -282,6 +303,9 @@ class _Scope:
             ]
         )
 
+    def system(self) -> str:
+        return SYSTEMS[self.kind]
+
     def question(self, run: ChoiceRun, child: Subject, listed: list[dict[str, Any]]) -> Question:
         asked = {
             "records": [
@@ -297,9 +321,9 @@ class _Scope:
         }
         return Question(
             choices=((run.provider, run.model),),
-            system=SYSTEMS[self.kind],
+            system=self.system(),
             prompt=json.dumps(asked, ensure_ascii=False, separators=(",", ":")),
-            schema=SCHEMA,
+            schema=self.schema or SCHEMA,
             max_tokens=1800 + THINKING_ROOM,
             seconds=150,
         )
@@ -356,7 +380,7 @@ class _Scope:
             for entry in listed
         }
         answer = str(data.get("answer") or "")
-        allowed = ("written", "unclear") if self.kind == NEW_STORY else SCHEMA_ANSWERS
+        allowed = ("written", "unclear") if self.kind == NEW_STORY else self.answers
         if answer not in allowed:
             raise Unusable("The answer was none of those that could be given.")
         reason = _brief(str(data.get("reason") or ""), 1000) or None
@@ -368,7 +392,7 @@ class _Scope:
         if answer == "written":
             given = data.get("items")
             for entry in given if isinstance(given, list) else []:
-                if not isinstance(entry, dict) or len(items) >= MOST[self.kind]:
+                if not isinstance(entry, dict) or len(items) >= (self.most or MOST[self.kind]):
                     clean = False
                     continue
                 title = _brief(str(entry.get("title") or ""), 200)
@@ -385,7 +409,12 @@ class _Scope:
                     del kept[before:]
                     clean = False
                     continue
-                items.append({"title": title, "what": what, "done_when": done})
+                more = self._item(entry, by_label, len(items), kept)
+                if more is None:
+                    del kept[before:]
+                    clean = False
+                    continue
+                items.append({"title": title, "what": what, "done_when": done, **more})
             if not items:
                 raise Unusable("Nothing that was written named a record it was shown.")
             if self.kind == NEW_STORY:
@@ -472,7 +501,7 @@ class _Scope:
                 "number": place,
                 "about": (
                     f"“{titles[int(sentence.get('item') or 0)]}”: "
-                    if sentence.get("part") in ("what", "done_when")
+                    if sentence.get("part") in ("what", "done_when", "parent")
                     and int(sentence.get("item") or 0) < len(titles)
                     else ""
                 )

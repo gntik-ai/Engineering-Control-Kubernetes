@@ -48,6 +48,7 @@ from engineering_control.dashboard import (
     review_settings,
     structure,
 )
+from engineering_control.dashboard.coverage_check import RECORD as DOC_RECORD
 from engineering_control.dashboard.delivery import Delivery
 from engineering_control.dashboard.organize_writing import (
     NEW_ISSUES,
@@ -71,6 +72,7 @@ from engineering_control.db.models import (
     BacklogItem,
     ChoiceReview,
     ChoiceRun,
+    DocPart,
     OrganizeLine,
     OrganizeRun,
     PlanningReview,
@@ -91,8 +93,10 @@ LIVE: Final = ("running", "held")
 STEPS: Final = {
     "stories_issues": ("delivered", NEW_STORY, NEW_ISSUES),
     "epics_stories": (NEW_STORIES, "splits"),
+    # Coverage carries its own run: here is only what its writing would ask.
+    "coverage": (DOC_RECORD,),
 }
-CHECKS: Final = (NEW_STORY, NEW_ISSUES, NEW_STORIES)
+CHECKS: Final = (NEW_STORY, NEW_ISSUES, NEW_STORIES, DOC_RECORD)
 # The lines of "Needs you" this stage writes, by what the administrator can say to them.
 OPS: Final = ("make", "retire", "close_story", "split", "created")
 # What each check writes, and under what.
@@ -177,17 +181,22 @@ class _Twins:
         ]
         self._titles: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self._vectors: dict[str, tuple[list[dict[str, Any]], Any]] = {}
-        self.made: dict[str, list[tuple[dict[str, Any], Any]]] = {"stories": [], "issues": []}
+        self.made: dict[str, list[tuple[dict[str, Any], Any]]] = {
+            "epics": [],
+            "stories": [],
+            "issues": [],
+        }
 
     def _records(self, kind: str) -> list[dict[str, Any]]:
         found = []
         for row in self.scope:
-            if kind == "stories":
+            if kind in ("stories", "epics"):
+                table: Any = ProjectUserStory if kind == "stories" else ProjectEpic
                 rows = self.db.execute(
-                    select(ProjectUserStory.id, ProjectUserStory.title).where(
-                        ProjectUserStory.project_id == row.id,
-                        ProjectUserStory.archived_at.is_(None),
-                        ProjectUserStory.closed_at.is_(None),
+                    select(table.id, table.title).where(
+                        table.project_id == row.id,
+                        table.archived_at.is_(None),
+                        table.closed_at.is_(None),
                     )
                 )
             else:
@@ -219,7 +228,7 @@ class _Twins:
     def _by_meaning(self, kind: str) -> tuple[list[dict[str, Any]], Any]:
         if kind not in self._vectors:
             known = {entry["id"]: entry for entry in self._records(kind)}
-            side = "story" if kind == "stories" else "issue"
+            side = {"stories": "story", "issues": "issue", "epics": "epic"}[kind]
             entries, rows = [], []
             for row in self.scope:
                 if ranking.stored_model(self.db, RecordVector, row.id) != self.model:
@@ -346,7 +355,10 @@ class Creator:
         found = []
         for child in scope.children():
             listed = scope.shortlist(child)
-            found.append((child, listed, known.get(child.id), str(scope.revision(child, listed))))
+            review = known.get(child.id)
+            found.append(
+                (child, listed, review, parent_choice.standing(scope, child, listed, review))
+            )
         return found
 
     @staticmethod
@@ -376,6 +388,7 @@ class Creator:
                     BacklogItem,
                     OrganizeLine,
                     StructureDecision,
+                    DocPart,
                 )
             ),
             int(links or 0),
@@ -796,7 +809,13 @@ class Creator:
             if done:
                 text += "\n\nDone when:\n" + "\n".join(f"- {entry['text']}" for entry in done)
             found.append(
-                {"title": item.get("title"), "description": text, "sentences": [*what, *done]}
+                {
+                    "title": item.get("title"),
+                    "description": text,
+                    "sentences": [*what, *done],
+                    # Where a check writes records of several kinds: which, and under what.
+                    **{key: item[key] for key in ("kind", "parent") if key in item},
+                }
             )
         return found
 
@@ -993,18 +1012,21 @@ class Creator:
 
     # -- making -----------------------------------------------------------------------
 
-    def _save(self, name: str, kind: str, title: str, text: str, parent: UUID, by: str) -> UUID:
+    def _save(
+        self, name: str, kind: str, title: str, text: str, parent: UUID | None, by: str
+    ) -> UUID:
         """One record, as a model wrote it. The review a new record otherwise gets is
         not asked for: two models have read it."""
         with self.sessions.begin() as db:
             project = active_project(db, name, lock=True)
-            made = save_record(db, project, kind, title, text, [parent])  # type: ignore[arg-type]
+            under = [parent] if parent is not None else []
+            made = save_record(db, project, kind, title, text, under)  # type: ignore[arg-type]
             job = db.get(PlanningReview, (project.id, kind, made))
             if job is not None:
                 job.status, job.lease = "dismissed", None
                 job.result = {"note": "Written and checked by a run of Organize."}
         self.links.after_change(name, kind, made)
-        if by == "run":
+        if by == "run" and parent is not None:
             self.links.noted(
                 name,
                 kind,

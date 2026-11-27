@@ -422,6 +422,26 @@ class OrganizeEpicAnswerInput(PlainChangeInput):
     )
 
 
+class CoverageAnswerInput(PlainChangeInput):
+    # What the administrator says of a case of Coverage. Of a part in doubt: that
+    # record covers it, nothing does, or it is not about the product. Of what was
+    # written: it is made or left. Of a record whose part is gone: kept or taken away.
+    choice: Literal["covered", "none", "other", "make", "leave", "keep", "take_away"]
+    record_id: UUID | None = None
+
+
+class CoverageGroupInput(PlainChangeInput):
+    # One word for everything that was written and only waits for a word.
+    group: Literal["drafts"]
+    choice: Literal["make"]
+
+
+class CoveragePartInput(PlainChangeInput):
+    # What a part of the documentation is about: the product, or not; or the
+    # administrator's word is taken back and the rule says it again.
+    about: Literal["product", "other", "rule"]
+
+
 class ConnectionCarryOutInput(PlainChangeInput):
     # Carry the plan out as far as the month's limit allows, though it is estimated
     # to cost more.

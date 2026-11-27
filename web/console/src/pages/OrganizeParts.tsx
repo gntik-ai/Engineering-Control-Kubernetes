@@ -116,6 +116,7 @@ export function RunSection({
   undoable,
   onUndo,
   stageSaid,
+  undoSaid = 'Undo all the last run applied',
 }: {
   run: Run;
   path: string;
@@ -123,6 +124,8 @@ export function RunSection({
   undoable: boolean;
   onUndo: () => void;
   stageSaid: (stage: Stage) => string;
+  /** What undoing a run is called, where it is not what a run applied. */
+  undoSaid?: string;
 }) {
   const control = (action: string) => () => postJson(path + '/control', { action });
   const stop = useSubmit(control('stop'), changed);
@@ -183,7 +186,7 @@ export function RunSection({
         ) : null}
         {!live && undoable ? (
           <Button size="sm" variant="ghost" onClick={onUndo}>
-            Undo all the last run applied
+            {undoSaid}
           </Button>
         ) : null}
       </div>

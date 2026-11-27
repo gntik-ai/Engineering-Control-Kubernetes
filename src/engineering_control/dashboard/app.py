@@ -96,6 +96,9 @@ from engineering_control.dashboard.schemas import (
     ConnectionInput,
     ConnectionLineInput,
     ConnectionLinkInput,
+    CoverageAnswerInput,
+    CoverageGroupInput,
+    CoveragePartInput,
     DocFoldersInput,
     EpicDescriptionCheck,
     EpicInput,
@@ -530,6 +533,7 @@ def create_app(
             try:
                 await asyncio.to_thread(records.organize_issues.tick)
                 await asyncio.to_thread(records.organize_epics.tick)
+                await asyncio.to_thread(records.coverage.tick)
             except Exception as error:  # noqa: BLE001 - tried again at the next pass
                 log_failure("organize", "A run of Organize could not be carried on", error)
 
@@ -2449,6 +2453,126 @@ def create_app(
             PlainChangeInput,
             lambda _: asyncio.to_thread(repo(request).organize_epics.undo_run, name, run),
             event="organize.run_undone",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/coverage")
+    async def coverage_api(name: str, request: Request) -> Response:
+        """How much of the documentation the plan covers, what a run would check and
+        cost, and the run under way or the last one."""
+        return await documents_read(request, lambda: repo(request).coverage.shown(name))
+
+    @app.get("/api/dashboard/projects/{name}/coverage/lines/{listed}")
+    async def coverage_lines_api(
+        name: str,
+        listed: Literal["needs_you", "done", "created"],
+        request: Request,
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        return await documents_read(
+            request, lambda: repo(request).coverage.lines(name, listed, page)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/coverage/parts")
+    async def coverage_parts_api(
+        name: str,
+        request: Request,
+        show: Literal[
+            "all", "product", "other", "open", "covered", "none", "doubt", "unchecked"
+        ] = "all",
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        """The parts of the documentation: what each is about, and what covers it."""
+        return await documents_read(request, lambda: repo(request).coverage.parts(name, show, page))
+
+    @app.get("/api/dashboard/projects/{name}/coverage/undocumented")
+    async def coverage_silent_api(
+        name: str, request: Request, page: int = Query(1, ge=1)
+    ) -> Response:
+        """The open records the documentation does not speak of."""
+        return await documents_read(request, lambda: repo(request).coverage.silent(name, page))
+
+    @app.post("/api/dashboard/projects/{name}/coverage/runs")
+    async def coverage_start(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).coverage.start, name),
+            event="coverage.started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/control")
+    async def coverage_control(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeControlInput,
+            lambda b: asyncio.to_thread(repo(request).coverage.control, name, b.action),
+            event="coverage.controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/groups")
+    async def coverage_answer_many(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            CoverageGroupInput,
+            lambda b: asyncio.to_thread(
+                repo(request).coverage.answer_many, name, b.group, b.choice
+            ),
+            event="coverage.answered",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/publish")
+    async def coverage_publish(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).coverage.publish, name),
+            event="coverage.published",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/parts/{part}")
+    async def coverage_say(name: str, part: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            CoveragePartInput,
+            lambda b: asyncio.to_thread(repo(request).coverage.say, name, part, b.about),
+            event="coverage.part_said",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/lines/{line}")
+    async def coverage_answer(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            CoverageAnswerInput,
+            lambda b: asyncio.to_thread(
+                repo(request).coverage.answer, name, line, b.choice, b.record_id
+            ),
+            event="coverage.answered",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/lines/{line}/undo")
+    async def coverage_undo(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).coverage.undo, name, line),
+            event="coverage.undone",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/coverage/runs/{run}/undo")
+    async def coverage_undo_run(name: str, run: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).coverage.undo_run, name, run),
+            event="coverage.run_undone",
             subject=name,
         )
 
