@@ -123,6 +123,7 @@ from engineering_control.dashboard.schemas import (
     NewEpicInput,
     OrganizeAnswerInput,
     OrganizeControlInput,
+    OrganizeEpicAnswerInput,
     OrphanApproveInput,
     OrphanDraftInput,
     OrphanLinkInput,
@@ -526,6 +527,7 @@ def create_app(
             await asyncio.sleep(5)
             try:
                 await asyncio.to_thread(records.organize_issues.tick)
+                await asyncio.to_thread(records.organize_epics.tick)
             except Exception as error:  # noqa: BLE001 - tried again at the next pass
                 log_failure("organize", "A run of Organize could not be carried on", error)
 
@@ -2331,6 +2333,76 @@ def create_app(
             request,
             PlainChangeInput,
             lambda _: asyncio.to_thread(repo(request).organize_issues.undo_run, name, run),
+            event="organize.run_undone",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/organize/epics-stories")
+    async def organize_epics_api(name: str, request: Request) -> Response:
+        """Where the User Stories stand to the Epics, what a run would do and cost, the
+        run under way or the last one, and how many lines its lists hold."""
+        return await documents_read(request, lambda: repo(request).organize_epics.shown(name))
+
+    @app.get("/api/dashboard/projects/{name}/organize/epics-stories/lines/{listed}")
+    async def organize_epics_lines_api(
+        name: str,
+        listed: Literal["needs_you", "done", "created"],
+        request: Request,
+        page: int = Query(1, ge=1),
+    ) -> Response:
+        """One of the three lists: needs you, done, created."""
+        return await documents_read(
+            request, lambda: repo(request).organize_epics.lines(name, listed, page)
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/runs")
+    async def organize_epics_start(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_epics.start, name),
+            event="organize.started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/control")
+    async def organize_epics_control(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeControlInput,
+            lambda b: asyncio.to_thread(repo(request).organize_epics.control, name, b.action),
+            event="organize.controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/lines/{line}")
+    async def organize_epics_answer(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeEpicAnswerInput,
+            lambda b: asyncio.to_thread(
+                repo(request).organize_epics.answer, name, line, b.choice, b.epic_id
+            ),
+            event="organize.answered",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/lines/{line}/undo")
+    async def organize_epics_undo(name: str, line: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_epics.undo, name, line),
+            event="organize.undone",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/runs/{run}/undo")
+    async def organize_epics_undo_run(name: str, run: UUID, request: Request) -> Response:
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).organize_epics.undo_run, name, run),
             event="organize.run_undone",
             subject=name,
         )

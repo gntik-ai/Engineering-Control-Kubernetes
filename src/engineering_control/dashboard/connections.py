@@ -922,8 +922,29 @@ def link_issue_across(
     return f
 
 
+def link_story_across(
+    db: Session, project: ProjectRecord, story: UUID, epic: UUID, reason: str
+) -> ConnectionFinding:
+    """Put a User Story of this project under an Epic of a connected project, at the
+    administrator's word: the link is a link of their connection."""
+    target = db.get(ProjectEpic, epic)
+    peer = db.get(ProjectRecord, target.project_id) if target else None
+    if target is None or peer is None or target.archived_at is not None:
+        raise ProjectConflict("The Epic is gone.")
+    row = _between(db, project.id, peer.id)
+    source, dest = catalog(db, project).local.get(story), catalog(db, peer).local.get(epic)
+    if source is None or dest is None:
+        raise ProjectConflict("The User Story or the Epic is no longer listed.")
+    f = store_link(
+        db, row, source, dest, None, "manual", reason.strip() or "Linked by the administrator."
+    )
+    audit(db, row, f"Linked {source.title} to {dest.title} of {peer.display_name}.")
+    return f
+
+
 def unlink_issue_across(db: Session, project: ProjectRecord, item: UUID, story: UUID) -> bool:
-    """Take the issue off the User Story of a connected project again."""
+    """Take the issue off the User Story of a connected project again; or a User Story
+    off an Epic of one."""
     f = db.scalar(
         select(ConnectionFinding)
         .join(ProjectConnection, ProjectConnection.id == ConnectionFinding.connection_id)

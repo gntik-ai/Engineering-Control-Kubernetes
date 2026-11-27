@@ -396,6 +396,13 @@ class OrganizeAnswerInput(PlainChangeInput):
     story_id: UUID | None = None
 
 
+class OrganizeEpicAnswerInput(PlainChangeInput):
+    # What the administrator says of a case: the User Story belongs to that Epic, or is
+    # left as it is; a link to another Epic is taken off or kept.
+    choice: Literal["epic", "leave", "take_off", "keep"]
+    epic_id: UUID | None = None
+
+
 class ConnectionCarryOutInput(PlainChangeInput):
     # Carry the plan out as far as the month's limit allows, though it is estimated
     # to cost more.

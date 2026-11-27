@@ -29,6 +29,7 @@ from engineering_control.dashboard.judging import Judging
 from engineering_control.dashboard.model_trials import ModelTrials
 from engineering_control.dashboard.needs_you import NeedsYou
 from engineering_control.dashboard.organize import Organize
+from engineering_control.dashboard.organize_epics import EpicsRun
 from engineering_control.dashboard.organize_issues import IssuesRun
 from engineering_control.dashboard.orphans import Orphans
 from engineering_control.dashboard.planning import PlanningRecords
@@ -173,6 +174,14 @@ class DashboardRepository:
         self.needs_you = NeedsYou(self.reorg)
         self.organize = Organize(self.sessions)
         self.organize_issues = IssuesRun(self.sessions, self.orphans, self.reorg)
+        self.organize_epics = EpicsRun(
+            self.sessions,
+            self.primary_epics,
+            self.epic_links,
+            self.reorg,
+            self.planning,
+            self.planning_links,
+        )
         self.rollout = Rollout(self.sessions, self.planning_links, self.needs_you)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)

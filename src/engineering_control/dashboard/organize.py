@@ -455,53 +455,59 @@ def candidates(
     By meaning where the ranking service read both projects with the same model, and by
     the words they share."""
     with sessions() as db:
-        project = active_project(db, name)
-        mine = catalog(db, project)
-        item = mine.local.get(record)
-        if item is None or item.kind not in PARENT:
-            raise ProjectNotFound(str(record))
-        kind = PARENT[item.kind]
-        found: list[dict[str, Any]] = []
-        for key in scope(db, project.id):
-            other = db.get(ProjectRecord, key)
-            if other is None:
+        return candidates_in(db, active_project(db, name), record, limit)
+
+
+def candidates_in(
+    db: Session, project: ProjectRecord, record: UUID, limit: int = 10
+) -> dict[str, Any]:
+    """The same, within a transaction that is open."""
+    mine = catalog(db, project)
+    item = mine.local.get(record)
+    if item is None or item.kind not in PARENT:
+        raise ProjectNotFound(str(record))
+    kind = PARENT[item.kind]
+    found: list[dict[str, Any]] = []
+    for key in scope(db, project.id):
+        other = db.get(ProjectRecord, key)
+        if other is None:
+            continue
+        theirs = mine if key == project.id else catalog(db, other)
+        across = Across.read(db, [mine, theirs])
+        # A record that is not approved yet is no part of the pair: it is compared
+        # by its words alone.
+        for position, (parent, close, shared) in enumerate(across.ranked(0, item, kind)):
+            if parent.id == item.id:
                 continue
-            theirs = mine if key == project.id else catalog(db, other)
-            across = Across.read(db, [mine, theirs])
-            # A record that is not approved yet is no part of the pair: it is compared
-            # by its words alone.
-            for position, (parent, close, shared) in enumerate(across.ranked(0, item, kind)):
-                if parent.id == item.id:
-                    continue
-                found.append(
-                    {
-                        "project": other.name,
-                        "label": other.display_name,
-                        "own": key == project.id,
-                        "kind": kind,
-                        "id": str(parent.id) if parent.id else None,
-                        "title": parent.title,
-                        "closeness": round(close, 3) if close is not None else None,
-                        "shared": shared,
-                        "place": position + 1,
-                    }
-                )
-        # The closest by meaning first; what has no vector follows by its place in its
-        # own project's ranking.
-        found.sort(
-            key=lambda entry: (
-                entry["closeness"] is None,
-                -(entry["closeness"] or 0.0),
-                entry["place"],
-                entry["project"],
+            found.append(
+                {
+                    "project": other.name,
+                    "label": other.display_name,
+                    "own": key == project.id,
+                    "kind": kind,
+                    "id": str(parent.id) if parent.id else None,
+                    "title": parent.title,
+                    "closeness": round(close, 3) if close is not None else None,
+                    "shared": shared,
+                    "place": position + 1,
+                }
             )
+    # The closest by meaning first; what has no vector follows by its place in its
+    # own project's ranking.
+    found.sort(
+        key=lambda entry: (
+            entry["closeness"] is None,
+            -(entry["closeness"] or 0.0),
+            entry["place"],
+            entry["project"],
         )
-        return {
-            "project": project.name,
-            "record": {"id": str(item.id), "kind": item.kind, "title": item.title},
-            "scope": [entry["project"] for entry in _connected(db, project)],
-            "candidates": found[:limit],
-        }
+    )
+    return {
+        "project": project.name,
+        "record": {"id": str(item.id), "kind": item.kind, "title": item.title},
+        "scope": [entry["project"] for entry in _connected(db, project)],
+        "candidates": found[:limit],
+    }
 
 
 def ground(sessions: sessionmaker[Session], name: str, *, fresh: bool = False) -> dict[str, Any]:

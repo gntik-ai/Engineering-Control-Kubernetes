@@ -3,32 +3,11 @@ import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
 import { Confirm } from '../confirm';
 import { LoadError } from '../parts';
-import { reviewUrl } from '../router';
 import { dollars, some, whole } from './ChoiceRun';
+import { EpicsAndStories } from './OrganizeEpics';
+import { type Listed, ListsSection, type Model, type Run, RunSection } from './OrganizeParts';
 import { useSubmit } from './ProjectDialogs';
 
-type Model = { provider: string; model: string };
-type Listed = 'needs_you' | 'done' | 'created';
-interface Stage {
-  stage: string;
-  name: string;
-  reached: boolean;
-  records: number;
-  settled: number;
-  in_doubt: number;
-  none: number;
-}
-interface Run {
-  id: string;
-  state: 'running' | 'held' | 'stopped' | 'complete' | 'failed';
-  stage: string;
-  detail: string;
-  cost: number;
-  started_at: string | null;
-  ended_at: string | null;
-  asking: { done: number; total: number; state: string } | null;
-  stages: Stage[];
-}
 interface Shown {
   stands: { issues: number; settled: number; in_doubt: number; none: number; left: number; bugs_left_out: number };
   plan: {
@@ -83,26 +62,6 @@ interface Line {
   action: { op: 'place' | 'unsupported'; story?: string | null; across?: boolean } | null;
   can_undo: boolean;
 }
-interface Lines {
-  total: number;
-  page: number;
-  pages: number;
-  items: Line[];
-}
-
-const STATE: Record<Run['state'], { says: string; tone: 'info' | 'neutral' | 'success' | 'warning' | 'destructive' }> =
-  {
-    running: { says: 'Under way', tone: 'info' },
-    held: { says: 'Held', tone: 'warning' },
-    stopped: { says: 'Ended by you', tone: 'neutral' },
-    complete: { says: 'Done', tone: 'success' },
-    failed: { says: 'Failed', tone: 'destructive' },
-  };
-const LISTS: { key: Listed; says: string; none: string }[] = [
-  { key: 'needs_you', says: 'Needs you', none: 'Nothing waits for you.' },
-  { key: 'done', says: 'Done', none: 'Nothing was applied yet.' },
-  { key: 'created', says: 'Created', none: 'Nothing is created here yet: that arrives with a later phase.' },
-];
 const CASE: Record<string, { says: string; tone: 'info' | 'neutral' | 'success' | 'warning' }> = {
   unclear: { says: 'In doubt: the answer could not tell', tone: 'warning' },
   differ: { says: 'In doubt: the two models chose differently', tone: 'warning' },
@@ -311,71 +270,6 @@ function LineRow({ line, listed, path, changed }: { line: Line; listed: Listed; 
   );
 }
 
-function ListOf({
-  path,
-  listed,
-  none,
-  tick,
-  changed,
-}: {
-  path: string;
-  listed: Listed;
-  none: string;
-  tick: number;
-  changed: () => void;
-}) {
-  const [page, setPage] = useState(1);
-  const lines = useResource<Lines>(apiUrl(`${path}/lines/${listed}`, { page, tick }), 15000, {
-    keepPreviousData: true,
-  });
-  const data = lines.data;
-  return (
-    <div className="grid gap-2">
-      <LoadError resource={lines} />
-      {!data ? (
-        lines.loading ? (
-          <Skeleton className="h-24 w-full" />
-        ) : null
-      ) : data.items.length ? (
-        <ul>
-          {data.items.map((line) => (
-            <LineRow
-              key={line.id}
-              line={line}
-              listed={listed}
-              path={path}
-              changed={() => {
-                lines.reload();
-                changed();
-              }}
-            />
-          ))}
-        </ul>
-      ) : (
-        <p className="text-sm text-muted-foreground">{none}</p>
-      )}
-      {data && data.pages > 1 ? (
-        <div className="flex items-center gap-2 text-sm">
-          <Button size="sm" variant="secondary" disabled={data.page === 1} onClick={() => setPage(data.page - 1)}>
-            Previous
-          </Button>
-          <span>
-            {data.page} / {data.pages}
-          </span>
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={data.page === data.pages}
-            onClick={() => setPage(data.page + 1)}
-          >
-            Next
-          </Button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 /** What a run started now would do, said before it starts. */
 function planSaid(plan: Shown['plan']): string[] {
   const said: string[] = [];
@@ -424,17 +318,12 @@ function StoriesAndIssues({ project }: { project: string }) {
   // Asked often while a run is under way, seldom otherwise.
   const [busy, setBusy] = useState(false);
   const shown = useResource<Shown>(apiUrl(path), busy ? 4000 : 30000, { keepPreviousData: true });
-  const [listed, setListed] = useState<Listed>('needs_you');
   const [tick, setTick] = useState(0);
   const [asking, setAsking] = useState<'start' | 'undo' | null>(null);
   const changed = () => {
     setTick((value) => value + 1);
     shown.reload();
   };
-  const control = (action: string) => () => postJson(path + '/control', { action });
-  const stop = useSubmit(control('stop'), changed);
-  const resume = useSubmit(control('resume'), changed);
-  const end = useSubmit(control('end'), changed);
   const data = shown.data;
   const run = data?.run ?? null;
   const live = run?.state === 'running' || run?.state === 'held';
@@ -484,111 +373,36 @@ function StoriesAndIssues({ project }: { project: string }) {
               </section>
             ) : null}
             {run ? (
-              <section className="grid gap-2">
-                <div className="flex flex-wrap items-center gap-2 text-sm">
-                  <Badge tone={STATE[run.state].tone} size="sm">
-                    {STATE[run.state].says}
-                  </Badge>
-                  <span className="text-muted-foreground">
-                    {run.started_at ? `Started ${new Date(run.started_at).toLocaleString('en')}` : ''}
-                    {run.ended_at ? `, ended ${new Date(run.ended_at).toLocaleString('en')}` : ''}
-                    {live && run.asking ? `. Asked about ${whole(run.asking.done)} of ${whole(run.asking.total)}` : ''}.
-                    It cost {dollars(run.cost)}.
-                  </span>
-                </div>
-                {run.detail ? <p className="text-sm text-muted-foreground">{run.detail}</p> : null}
-                <ol className="grid gap-2 sm:grid-cols-5">
-                  {run.stages.map((stage) => (
-                    <li
-                      key={stage.stage}
-                      className={
-                        'grid content-start gap-0.5 rounded-lg border p-3 ' +
-                        (stage.reached ? 'border-border' : 'border-dashed border-border opacity-60')
-                      }
-                    >
-                      <span className="text-xs font-medium text-muted-foreground">{stage.name}</span>
-                      <span className="text-xl font-semibold tabular-nums text-foreground">
-                        {stage.stage === 'done'
-                          ? live
-                            ? '—'
-                            : run.state === 'complete'
-                              ? 'Yes'
-                              : 'No'
-                          : whole(stage.records)}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {stage.stage === 'read'
-                          ? `open Issues; ${whole(stage.settled)} under a User Story`
-                          : stage.stage === 'match'
-                            ? 'with none, offered User Stories'
-                            : stage.stage === 'verify'
-                              ? `asked about; ${whole(stage.settled)} settled, ${whole(stage.in_doubt)} in doubt`
-                              : stage.stage === 'create'
-                                ? 'created: not in this phase'
-                                : 'the run is over'}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-                {stop.problem || resume.problem || end.problem ? (
-                  <Alert tone="destructive" title={stop.problem || resume.problem || end.problem || ''} />
-                ) : null}
-                <div className="flex flex-wrap gap-2">
-                  {run.state === 'running' ? (
-                    <Button size="sm" variant="secondary" loading={stop.pending} onClick={() => void stop.submit()}>
-                      Stop
-                    </Button>
-                  ) : null}
-                  {run.state === 'held' ? (
-                    <Button size="sm" variant="secondary" loading={resume.pending} onClick={() => void resume.submit()}>
-                      Resume
-                    </Button>
-                  ) : null}
-                  {live ? (
-                    <Button size="sm" variant="ghost" loading={end.pending} onClick={() => void end.submit()}>
-                      End it and keep what was answered
-                    </Button>
-                  ) : null}
-                  {!live && data.lists.done > 0 ? (
-                    <Button size="sm" variant="ghost" onClick={() => setAsking('undo')}>
-                      Undo all the last run applied
-                    </Button>
-                  ) : null}
-                </div>
-              </section>
+              <RunSection
+                run={run}
+                path={path}
+                changed={changed}
+                undoable={data.lists.done > 0}
+                onUndo={() => setAsking('undo')}
+                stageSaid={(stage) =>
+                  stage.stage === 'read'
+                    ? `open Issues; ${whole(stage.settled)} under a User Story`
+                    : stage.stage === 'match'
+                      ? 'with none, offered User Stories'
+                      : stage.stage === 'verify'
+                        ? `asked about; ${whole(stage.settled)} settled, ${whole(stage.in_doubt)} in doubt`
+                        : stage.stage === 'create'
+                          ? 'created: not in this phase'
+                          : 'the run is over'
+                }
+              />
             ) : null}
             {run || data.lists.needs_you + data.lists.done > 0 ? (
-              <section className="grid gap-3">
-                <div className="flex flex-wrap gap-2" role="tablist" aria-label="Lists of results">
-                  {LISTS.map((entry) => (
-                    <Button
-                      key={entry.key}
-                      size="sm"
-                      role="tab"
-                      aria-selected={listed === entry.key}
-                      variant={listed === entry.key ? 'primary' : 'secondary'}
-                      onClick={() => setListed(entry.key)}
-                    >
-                      {entry.says} ({whole(data.lists[entry.key])})
-                    </Button>
-                  ))}
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {listed === 'needs_you'
-                    ? 'What is in doubt, the most doubtful first. Nothing of it is applied until you say so.'
-                    : listed === 'done'
-                      ? `Issues that were put under a User Story, and links that were taken off. Each can be undone for ${data.undo_days} days.`
-                      : 'Records a run made.'}
-                </p>
-                <ListOf
-                  key={listed}
-                  path={path}
-                  listed={listed}
-                  none={LISTS.find((entry) => entry.key === listed)?.none ?? ''}
-                  tick={tick}
-                  changed={changed}
-                />
-              </section>
+              <ListsSection<Line>
+                path={path}
+                lists={data.lists}
+                tick={tick}
+                changed={changed}
+                doneSaid={`Issues that were put under a User Story, and links that were taken off. Each can be undone for ${data.undo_days} days.`}
+                row={(line, listed, done) => (
+                  <LineRow key={line.id} line={line} listed={listed} path={path} changed={done} />
+                )}
+              />
             ) : null}
           </>
         )}
@@ -635,19 +449,8 @@ export function Organize({ project }: { project: string }) {
         Each button checks one pair of levels of the plan, links what is settled, and puts what is in doubt before you.
         The result is always three lists: what needs you, what was done, and what was created.
       </p>
+      <EpicsAndStories project={project} />
       <StoriesAndIssues project={project} />
-      <Card>
-        <CardHeader>
-          <CardTitle>Epics and User Stories</CardTitle>
-        </CardHeader>
-        <CardBody className="grid gap-2 text-sm text-muted-foreground">
-          <p>
-            This button is not built yet: it is the next phase. Until then the same work is done under{' '}
-            <Link href={reviewUrl(project, 'planning')}>Planning</Link> (the one Epic of a User Story) and under{' '}
-            <Link href={reviewUrl(project, 'reorganize')}>Reorganize</Link> (a Story’s other Epics).
-          </p>
-        </CardBody>
-      </Card>
     </>
   );
 }
