@@ -1,4 +1,4 @@
-"""The sections of a project: six core ones, and the administrator's own.
+"""The sections of a project: seven core ones, and the administrator's own.
 
 A section is one kind of work on the project. It runs the flow assigned to it, and nothing
 while it has none: a flow is never guessed.
@@ -155,19 +155,52 @@ CORE_SECTIONS: Final = (
     CoreSection(
         "issues",
         "Issues",
-        "Issues reported on the repository: defects and tasks to resolve.",
-        use_when="Something is wrong, or a concrete task is reported: a defect, something "
-        "that worked before and no longer does, a failing test, a task with a clear end.",
-        avoid_when="The request asks for something new (use Enhancement). A general review "
-        "is wanted and no particular fault is named (use Code audit).",
-        labels=("bug", "defect", "regression", "fix"),
+        "Issues reported on the repository that are work to do and no bug: tasks to resolve.",
+        use_when="A concrete task is reported: work of the plan with a clear end, a "
+        "failing build to put right, a chore that somebody asked for.",
+        avoid_when="Something that should work does not (use Bugs). The request asks for "
+        "something new (use Enhancement). A general review is wanted and no particular "
+        "fault is named (use Code audit).",
+        labels=("fix",),
         examples=(
-            "Signing in fails when the session cookie has expired.",
+            "Move the configuration of the workers into one file.",
             "The nightly build has been failing since the dependency update.",
         ),
         registry_flow="deliver-issue",
     ),
+    CoreSection(
+        "bugs",
+        "Bugs",
+        "Bugs: something that should work and does not. A bug stands apart from the plan; "
+        "it is fixed with a test that fails before the fix and passes after it.",
+        use_when="Something is wrong with what exists: a defect, something that worked "
+        "before and no longer does, a wrong result, a crash.",
+        avoid_when="The work is a task and nothing is broken (use Issues). The request "
+        "asks for something new (use Enhancement). No particular fault is named (use Code "
+        "audit).",
+        labels=("bug", "defect", "regression"),
+        examples=(
+            "Signing in fails when the session cookie has expired.",
+            "The export leaves out the last row of every page.",
+        ),
+        registry_flow="fix-bug",
+    ),
 )
+# The section bugs were sent to before they had one of their own, as it was described
+# then. Where a project still has these words, they are the platform's and not the
+# administrator's, and are replaced by today's.
+BUGS: Final = "bugs"
+_ISSUES_BEFORE: Final = {
+    "description": "Issues reported on the repository: defects and tasks to resolve.",
+    "use_when": "Something is wrong, or a concrete task is reported: a defect, something "
+    "that worked before and no longer does, a failing test, a task with a clear end.",
+    "avoid_when": "The request asks for something new (use Enhancement). A general review "
+    "is wanted and no particular fault is named (use Code audit).",
+    "examples": [
+        "Signing in fails when the session cookie has expired.",
+        "The nightly build has been failing since the dependency update.",
+    ],
+}
 CORE_KEYS: Final = frozenset(section.key for section in CORE_SECTIONS)
 
 
@@ -260,7 +293,35 @@ def ensure_core_sections(session: Session, project: ProjectRecord) -> int:
     position = max((row.position for row in sections), default=-1) + 1
     registry = {core.key: core.registry_flow for core in CORE_SECTIONS}
     added = 0
-    for key, values in operation_definitions(session).items():
+    definitions = operation_definitions(session)
+    if BUGS in definitions:
+        # Whatever a shared operation says, the labels that mean a bug are the Bugs
+        # section's alone.
+        claimed = set(definitions[BUGS]["labels"])
+        definitions = {
+            key: values
+            if key == BUGS
+            else {**values, "labels": [name for name in values["labels"] if name not in claimed]}
+            for key, values in definitions.items()
+        }
+    if BUGS not in existing and BUGS in definitions:
+        # Bugs get a section of their own (B3). A label sends work to one section only,
+        # so the labels that mean a bug leave whichever section had them; and the
+        # section that had them by the platform's own words is described anew. A
+        # section named Bugs that the administrator made stays, and is theirs.
+        if any(row.name.casefold() == definitions[BUGS]["name"].casefold() for row in sections):
+            definitions = {key: values for key, values in definitions.items() if key != BUGS}
+        else:
+            mine = set(definitions[BUGS]["labels"])
+            issues = definitions.get("issues")
+            for row in sections:
+                if mine & set(row.labels or []):
+                    row.labels = [label for label in row.labels or [] if label not in mine]
+                if row.key == "issues" and issues is not None:
+                    for field, before in _ISSUES_BEFORE.items():
+                        if getattr(row, field) == before:
+                            setattr(row, field, issues[field])
+    for key, values in definitions.items():
         if key in existing:
             continue
         section = ProjectSection(

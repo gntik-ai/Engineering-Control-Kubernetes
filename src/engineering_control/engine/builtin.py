@@ -66,6 +66,106 @@ _DELIVER: Final[dict[str, Any]] = {
     "budgets": {"rounds": 3},
 }
 
+# What the agents of "Fix a bug" are told. They are instructions of the flow: a later
+# version of the flow can word them otherwise.
+REPRODUCE: Final = (
+    "This item is a bug. Do not fix it. Write one automated test that shows it: a test "
+    "that fails today for the reason the bug describes, and that will pass once the bug "
+    "is fixed.\n"
+    "- Put the test in a new test file of its own, where the project keeps its tests and "
+    "named the way the project names them, so that it can be run alone. Change no other "
+    "file: not the code the bug is in, and not an existing test.\n"
+    "- Follow the steps of the report, and assert what the report says was expected, so "
+    "that the failure reads as the bug.\n"
+    "- Run the test and see it fail for that reason before you answer. A test that fails "
+    "because of a mistake in the test itself, a missing import or a wrong path does not "
+    "show the bug.\n"
+    "- If you cannot make a test fail for the bug's reason, answer BLOCKED and say what "
+    "you tried, what happened instead, and what is missing from the report. That is an "
+    "answer too. Do not write a test that passes, and do not change the code to make "
+    "one fail."
+)
+FIX: Final = (
+    "This item is a bug, and this run has already written a test that fails because of "
+    "it. Fix the bug in the code, so that this test passes and everything that passed "
+    "before still passes.\n"
+    "- Find the cause and remove it. Do not make the test pass by treating what it does "
+    "as a special case.\n"
+    "- Leave the test as it is: do not weaken it, skip it or delete it. Change it only if "
+    "the test itself is wrong, and then say so in your summary.\n"
+    "- Change what the fix needs and nothing else.\n"
+    "- Run the bug's test and the project's tests before you answer."
+)
+
+_FIX: Final[dict[str, Any]] = {
+    "format": FORMAT,
+    "key": "fix-bug",
+    "name": "Fix a bug",
+    "summary": "Write a test that fails because of the bug, fix the bug so that the test "
+    "passes, have the change reviewed by the other subscription, run the tests, and "
+    "publish it as a pull request that resolves the bug's issue, once the administrator "
+    "agrees. A bug no test can show ends the run, and says so.",
+    "start": "prepare",
+    "tasks": [
+        {"id": "prepare", "task": "workspace.clone", "next": {"ok": "install"}},
+        {"id": "install", "task": "workspace.install", "next": {"ok": "tests"}},
+        {
+            # What already fails is known before anything is changed.
+            "id": "tests",
+            "task": "check.tests",
+            "next": {"passed": "reproduce", "failed": "reproduce"},
+        },
+        {
+            # A test that shows the bug, and nothing else. An agent that cannot write
+            # one says so, and the run ends there with what it said.
+            "id": "reproduce",
+            "task": "agent.change",
+            "with": {"instruction": REPRODUCE, "providers": _PROVIDERS},
+            "next": {"done": "shown"},
+        },
+        {
+            # The test has to fail before the fix: no agent is asked. A test that
+            # passes shows no bug, and the flow ends here.
+            "id": "shown",
+            "task": "check.reproduction",
+            "with": {"expect": "fail"},
+            "next": {"fails": "fix"},
+        },
+        {
+            "id": "fix",
+            "task": "agent.change",
+            "with": {"instruction": FIX, "providers": _PROVIDERS},
+            "next": {"done": "fixed"},
+        },
+        {
+            # The same test has to pass after the fix.
+            "id": "fixed",
+            "task": "check.reproduction",
+            "with": {"expect": "pass"},
+            "next": {"passes": "review", "fails": "fix", "none": "review"},
+        },
+        {
+            "id": "review",
+            "task": "agent.review",
+            "with": {"other_than": "fix"},
+            "next": {"pass": "verify", "changes": "fix"},
+        },
+        {
+            # The project's tests, compared with before the change.
+            "id": "verify",
+            "task": "check.tests",
+            "next": {"passed": "scan", "failed": "scan", "regression": "fix"},
+        },
+        {"id": "scan", "task": "check.secrets", "next": {"ok": "bundle"}},
+        {"id": "bundle", "task": "change.collect", "next": {"ok": "approve"}},
+        {"id": "approve", "task": "people.approval", "next": {"publish": "publish"}},
+        # Like Deliver issue, it ends at the pull request: merging is the
+        # administrator's, and a later version of the flow can add it.
+        {"id": "publish", "task": "github.pull_request"},
+    ],
+    "budgets": {"rounds": 3},
+}
+
 _AUDIT: Final[dict[str, Any]] = {
     "format": FORMAT,
     "key": "audit-code",
@@ -314,7 +414,7 @@ _UX: Final = _application_audit(
 )
 
 BUILTIN: Final[dict[str, Document]] = {
-    str(raw["key"]): parse(raw) for raw in (_DELIVER, _AUDIT, _DISCOVER, _CLEAN, _UI, _UX)
+    str(raw["key"]): parse(raw) for raw in (_DELIVER, _AUDIT, _DISCOVER, _CLEAN, _UI, _UX, _FIX)
 }
 BUILTIN.update(reviews.defaults())
 # The kind of run each of the platform's flows is recorded as, and the flow of a run

@@ -1749,7 +1749,15 @@ def create_app(
         name: str,
         request: Request,
         state: Literal[
-            "", "open", "closed", "new", "confirmed", "fixed", "duplicate", "wont_fix"
+            "",
+            "open",
+            "closed",
+            "new",
+            "confirmed",
+            "in_progress",
+            "fixed",
+            "duplicate",
+            "wont_fix",
         ] = "open",
         search: str = Query("", max_length=200),
         sort: Literal["newest", "oldest", "updated", "severity"] = "newest",
@@ -1865,6 +1873,31 @@ def create_app(
 
         return await project_change(
             request, BugSeveralInput, decide, event="workspace.bugs_triaged", subject=name
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/fix")
+    async def bug_fix_api(name: str, key: UUID, request: Request) -> Response:
+        """Start the fix of a confirmed bug: the flow of the section Bugs runs for it."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).fix_bug(name, key),
+            event="workspace.bug_fix_started",
+            subject=name,
+            status_code=201,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/queue")
+    async def bugs_queue_api(name: str, request: Request) -> Response:
+        """Make a queue of the confirmed bugs, the most severe first. It is a draft."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _body: service(request).queue_bugs(name),
+            event="workspace.bugs_queued",
+            subject=name,
+            status_code=201,
+            entity="queue",
         )
 
     @app.post("/api/dashboard/projects/{name}/bugs/{key}/reopen")

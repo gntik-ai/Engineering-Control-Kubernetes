@@ -1602,7 +1602,7 @@ precedence.
    sign-in may be offered to make the connection easier.
 2. **Flows per project.** Inside a project, add flows by creating new ones or importing
    existing ones.
-3. **Sections.** Every project starts with six core sections, and custom sections with their
+3. **Sections.** Every project starts with six core sections (seven since 27 November 2026: Bugs, see [bugs-section.md](bugs-section.md)), and custom sections with their
    own names can be added:
 
    | Section | Purpose |

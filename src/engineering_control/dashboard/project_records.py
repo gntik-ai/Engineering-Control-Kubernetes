@@ -283,7 +283,7 @@ class ProjectRecords:
         session.add(record)
         try:
             session.flush()
-            # A project is born with its six core sections.
+            # A project is born with its seven core sections.
             from engineering_control.dashboard.project_sections import ensure_core_sections
 
             ensure_core_sections(session, record)

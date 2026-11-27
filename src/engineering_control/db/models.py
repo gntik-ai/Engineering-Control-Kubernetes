@@ -1501,7 +1501,7 @@ class ProjectIssueStory(Base):
 class ProjectSection(UUIDPrimaryKey, Timestamps, Base):
     """One kind of work on a project (migration 0026).
 
-    Every project has the six core sections; the administrator adds custom ones. A section
+    Every project has the seven core sections; the administrator adds custom ones. A section
     runs the flow assigned to it, or nothing while it has none.
 
     Five fields are its routing guide, written for whoever decides where work goes (the

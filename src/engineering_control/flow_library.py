@@ -1,6 +1,6 @@
 """The names of the flows the platform knows from the start.
 
-The first six are flows of the platform's own (``engine/builtin.py``). The last four
+The first seven are flows of the platform's own (``engine/builtin.py``). The last four
 name work the original system did and this platform does not do yet: a section can be
 given one, and nothing runs for it until a flow of that key is made in the designer.
 Assigning a flow records the choice; it does not start anything.
@@ -103,6 +103,14 @@ _FLOWS: Final = (
         for_item=DELIVER,
         for_section=FLOW,
         section_action="Audit the experience",
+    ),
+    BuiltInFlow(
+        "fix-bug",
+        "Fix a bug",
+        "Write a test that fails because of the bug, fix the bug so that the test passes, "
+        "have the change reviewed and tested, and publish it as a pull request that "
+        "resolves the bug's issue, once the administrator agrees.",
+        for_item=FLOW,
     ),
     BuiltInFlow(
         "change-request",

@@ -77,7 +77,7 @@ def test_issues_are_imported_and_routed_by_their_labels(tmp_path: Path, github: 
             item["state"] == "proposed" and item["source"] == "github" for item in items.values()
         )
         # One label of one section decides without a judgement, whatever its case.
-        assert (items[1]["section"]["key"], items[1]["routed_by"]) == ("issues", "label")
+        assert (items[1]["section"]["key"], items[1]["routed_by"]) == ("bugs", "label")
         assert items[1]["routing_reason"] == "Label bug"
         assert items[2]["section"]["key"] == "enhancement"  # "good first issue" belongs nowhere
         assert (
@@ -86,7 +86,7 @@ def test_issues_are_imported_and_routed_by_their_labels(tmp_path: Path, github: 
         # Labels of two sections decide nothing: that is a judgement, and it is said why.
         assert items[3]["section"] is None and items[3]["routed_by"] is None
         assert items[3]["routing_reason"] == (
-            "Its labels point to more than one section: Enhancement, Issues"
+            "Its labels point to more than one section: Enhancement, Bugs"
         )
         assert items[4]["section"] is None and items[4]["routing_reason"] is None
         assert items[1]["issue_url"] == f"https://github.com/{FALCONE}/issues/1"
@@ -106,7 +106,7 @@ def test_filters_and_search(tmp_path: Path, github: GitHub) -> None:
     client = _console(tmp_path, _app(tmp_path, github))
     try:
         _post(client, "projects/falcone/backlog/sync")
-        assert set(_by_number(client, project="falcone", section="issues")) == {1}
+        assert set(_by_number(client, project="falcone", section="bugs")) == {1}
         assert set(_by_number(client, section="none")) == {3, 4}
         assert set(_by_number(client, search="csv")) == {2}
         assert set(_by_number(client, search="#4")) == {4}
@@ -152,8 +152,8 @@ def test_a_later_import_follows_github_and_keeps_what_the_administrator_decided(
         assert items[1]["title"].endswith("(again)") and items[1]["section"]["key"] == "code-audit"
         assert items[4]["section"]["key"] == "ux-audit" and items[4]["routed_by"] == "administrator"
         # An item nobody routed follows its labels as they change.
-        assert (items[3]["section"]["key"], items[3]["routing_reason"]) == ("issues", "Label bug")
-        assert items[7]["section"]["key"] == "issues" and items[7]["state"] == "proposed"
+        assert (items[3]["section"]["key"], items[3]["routing_reason"]) == ("bugs", "Label bug")
+        assert items[7]["section"]["key"] == "bugs" and items[7]["state"] == "proposed"
         # Closed on GitHub: done, whatever it was. Skipped stays skipped.
         assert (items[2]["state"], items[2]["issue_state"]) == ("done", "closed")
         assert items[6]["state"] == "skipped"
@@ -351,7 +351,7 @@ def test_one_change_to_every_item_a_filter_matches(tmp_path: Path, github: GitHu
         items = _by_number(client, project="falcone")
         assert {items[3]["section"]["key"], items[4]["section"]["key"]} == {"code-audit"}
         assert items[3]["routed_by"] == items[4]["routed_by"] == "administrator"
-        assert items[1]["section"]["key"] == "issues"  # outside the filter: untouched
+        assert items[1]["section"]["key"] == "bugs"  # outside the filter: untouched
 
         # Accept everything that is proposed; doing it twice changes nothing more.
         accepted = bulk(state="proposed", expected=5, state_to="accepted")

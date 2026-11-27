@@ -1,6 +1,6 @@
 # A section for bugs
 
-Proposal, 25 November 2026. Phases B1 and B2 are built (25 November 2026); B3 to B5 are not.
+Proposal, 25 November 2026. Phases B1 and B2 are built (25 November 2026), B3 on 27 November 2026; B4 and B5 are not.
 
 ## What is asked for
 
@@ -103,7 +103,7 @@ Each phase is deployed and usable on its own.
 | --- | --- | --- |
 | B1 | **The section and reporting.** The Bugs page for every project, read from the repository's issues and not from the plan. Reporting in one step, with the label set at creation. Edit, close with a reason, reopen. "Not a bug" and "It is a bug". The Bugs tab goes. | A bug reported in the console is an issue with the `bug` label on GitHub within a minute. A project without a plan lists its bugs. Nothing about a bug mentions a User Story. |
 | B2 | **Triage.** States, severity, area, seen in. Similar bugs while reporting and for bugs that arrive, found by the ranking service with no language model. Closing as duplicate or won't fix writes the comment on GitHub. Severity mirrored as a label. Several bugs at once. | Every open bug has a state and, once confirmed, a severity. A duplicate is found before it is created. GitHub shows the same severity as the platform. |
-| B3 | **Fixing.** The flow "Fix a bug" with a test that fails before and passes after. A section of the engine for bugs. Start from a row, or queue by severity. "Fixed by" and the state follow the pull request. | A bug goes from Confirmed to Fixed through a merged pull request that contains its test, started with one button. A bug that cannot be reproduced says so. |
+| B3 | **Fixing** (built, 27 November 2026). The flow "Fix a bug" with a test that fails before and passes after. A section of the engine for bugs. Start from a row, or queue by severity. "Fixed by" and the state follow the pull request. | A bug goes from Confirmed to Fixed through a merged pull request that contains its test, started with one button. A bug that cannot be reproduced says so. |
 | B4 | **Seen and told.** Numbers: open by severity and area, age, time from report to fix, reopened bugs, regressions. Dashboard tiles, the table of all projects, digest lines, the alert for a critical bug, reporting from the chat. | The numbers match the list. A critical bug reaches the chat within minutes. |
 | B5 | **Help with triage, on your word.** A run in which a model suggests severity, area and a likely duplicate for the bugs that are New, and says what is missing from a report. You accept or change each suggestion. Optional: a failing check on the default branch becomes a draft bug. | Suggestions are shown with their reasons and nothing is set without you. |
 
@@ -127,7 +127,56 @@ B1 and B2 change no flow and spend no model tokens.
 - **Duplicates.** A bug is closed as the duplicate of another, named by its number. GitHub gets the comment "Duplicate of #n", with your note under it, and the issue is closed as not planned. Opened again, it is no duplicate any more.
 - **Several at once.** Bugs are selected in the list and given a severity together, or closed together as fixed or as not going to be fixed. Each is done on its own: one that GitHub does not take is told, and the others are done.
 - **The list.** Narrowed by state, severity and area, and ordered by severity as well as by age. The page opens with the open bugs by severity and the count of new ones nobody looked at.
- B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
+
+B3 spends what a delivery run spends. B5 is the only phase that asks a model about bugs in bulk.
+
+### B3 as built
+
+**The flow "Fix a bug".** One of the platform's own flows, version 0 of `fix-bug`, built from the tasks the engine has and one new one.
+
+| Step | Task | What it does | Where it goes on |
+| --- | --- | --- | --- |
+| prepare, install, tests | Clone, Install, Run the tests | As in Deliver issue: the checkout, the installation, and what already fails before anything is changed | reproduce |
+| reproduce | Agent: change the code | An agent is told to fix nothing and to write one test, in a file of its own, that fails for the reason the bug describes. It is told to run it and see it fail, and to answer that it cannot where it cannot | shown; an agent that cannot ends the run, with its reason |
+| shown | **Run the bug's test** (new) | The tests the run wrote are run, and nothing else. No agent is asked | fails: fix. Passes, or no test: the flow ends, the bug is not shown |
+| fix | Agent: change the code | The same subscription is told to fix the bug so that the test passes, to leave the test as it is, and is given what the test said | fixed |
+| fixed | Run the bug's test | The same files have to pass now | passes: review. Fails: back to fix, which is a round |
+| review | Review the change | The other subscription reads the whole change, test and fix | pass: verify. Changes: back to fix |
+| verify, scan, bundle | Run the tests, Scan for secrets, Collect the change | As for any change | approve |
+| approve, publish | Wait for the administrator, Open a pull request | The run waits for your word. The pull request says "Resolves #n" | the flow ends |
+
+Three rounds at most, as in Deliver issue. The two instructions are settings of the flow: a later version, made in the designer, can word them otherwise.
+
+**The task "Run the bug's test"** (`check.reproduction`, among the deterministic checks). It runs in the run's workbench, without the network and without an agent.
+
+- **Which tests.** The first time: the test files the run added or changed, and none that only cover what was changed. They are kept with the run, and the same files are run after the fix.
+- **How.** Each by the repository's own runner: pytest, vitest, jest, node --test, go test. The flow can name commands for it instead, where a repository needs a build first.
+- **Where none can be run alone**, as in a Rust project: the project's own test commands are run, every one, and compared command by command with before anything was changed. A command that failed before as well says nothing of the bug.
+- **Before the fix** a failing test is what shows the bug, and what it said is given to the agent that fixes. A test that passes shows nothing: the step is told as "not reproduced". **After the fix** the tests have to pass.
+- It does not stand in for Run the tests: a flow that has only this cannot publish.
+
+**A section of the engine.** Bugs is the seventh core section of every project, with the labels `bug`, `defect` and `regression`; Issues keeps `fix`. For the six projects of the registry its flow is Fix a bug. When the section is added to a project that was there before, those three labels leave whichever section had them, since a label sends work to one section; and the description of Issues is replaced where it was still the platform's own words. A section named Bugs that you made yourself would be left alone, and none is added beside it.
+
+**From the Bugs page.**
+
+- **Fix**, on the row of a confirmed bug. The bug goes to the section Bugs, by your word, and the section's flow starts for it; the page opens the run. A new bug is given a severity first. One fix of a bug runs at a time.
+- **Queue them, the most severe first**, where more than one confirmed bug waits. It makes a queue of the confirmed bugs that have no fix under way and are in no queue: critical first, and of one severity the oldest first. The queue is a draft: nothing starts until you start it on the Queue page, where it runs within the budgets like any queue.
+- **In progress** is a state now: a run is under way, or a pull request a run opened is open. The row says which, with a link to the run and to the pull request. A fix that waits for your decision says so.
+- **Fixed by.** The pull request resolves the bug's issue. When it is merged, GitHub closes the issue as completed; the next reading of the repository says so here, and the bug is fixed, by that pull request.
+- **Not reproduced.** Where no test could show the bug the row says so, with what the run said: the check's sentence, or the agent's reason where it could not write the test at all. The bug is confirmed again, and a fix can be started anew.
+- Nothing of this is kept beside the run and the issue: where fixing stands is read from the bug's latest run and from the pull request the run noted on the item.
+
+**Different from the proposal.**
+
+- **The platform does not merge.** The proposal said "merge on your word, as Deliver issue does". Deliver issue, as it is in force, ends at the pull request, and so does Fix a bug: you merge on GitHub, and the bug follows. Waiting for GitHub's checks and merging are two tasks the engine has; they can be added to a version of the flow in the designer.
+- **Bugs that carry the label move.** The proposal said issues already routed stay where they are until you move them. A label decides the section at every reading of the repository, so an open bug that carries `bug`, `defect` or `regression` and that nobody routed by hand goes from Issues to Bugs at the next reading. Closed bugs, and bugs you routed yourself, stay where they are. A bug that is one by its title or its GitHub type alone is not routed by a label; Fix puts it in Bugs.
+- **Nothing is written to GitHub about a bug that was not reproduced.** It is said on the bug's row here.
+
+**Limits.**
+
+- A pull request that is closed on GitHub without being merged leaves the bug in progress here until a new fix is started or the bug is closed: the platform does not read the state of pull requests.
+- A test added to an existing test file is run with the whole file. The agent is told to write a file of its own.
+- Not exercised on live: no fix has been started there. The flow is covered by a run in tests up to the administrator's decision, with stand-ins for the sandboxes and the workbench.
 
 Added 25 November 2026: [inkling-models.md](inkling-models.md) plans a cheaper model for the reviews. B5's suggestions are one use for it. The flow B3 builds writes code, and keeps the models that write code here: Inkling is not a default for it.
 
@@ -136,7 +185,7 @@ Added 25 November 2026: [inkling-models.md](inkling-models.md) plans a cheaper m
 - **Records.** One new table for what a bug carries beyond its issue (state, severity, area, seen in, duplicate of, fixed by, caused by, who decided and when). The issue itself stays where it is.
 - **GitHub.** Creating an issue with its labels in one call; adding and removing a label by name; the labels `severity: critical` to `severity: low` created where missing. No new permission: the platform already writes issues, comments, labels and closures.
 - **Ranking service.** Bugs are read as their own kind, compared only with other bugs. They stay out of everything that looks for a User Story.
-- **Engine.** A seventh core section, Bugs, with the labels `bug`, `defect` and `regression`; the section Issues keeps `fix` and tasks. One new flow.
+- **Engine.** A seventh core section, Bugs, with the labels `bug`, `defect` and `regression`; the section Issues keeps `fix` and tasks. One new flow, and one new task for it.
 - **Unchanged.** The bug rule: no code path gives a bug a User Story or an Epic, and the reorganization keeps leaving bugs out.
 
 ## Decisions needed

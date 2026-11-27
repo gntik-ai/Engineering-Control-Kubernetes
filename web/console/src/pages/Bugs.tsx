@@ -24,11 +24,12 @@ import {
 import { useEffect, useState, type ReactNode } from 'react';
 import { ApiError, apiUrl, postJson, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
+import { BASE, RouterLink, automationUrl, navigate, queueUrl } from '../router';
 import { BugLinks } from './BugLinks';
 import { some, whole } from './ChoiceRun';
 
 type Severity = 'critical' | 'high' | 'medium' | 'low';
-type Triage = 'new' | 'confirmed' | 'fixed' | 'duplicate' | 'wont_fix' | 'closed';
+type Triage = 'new' | 'confirmed' | 'in_progress' | 'fixed' | 'duplicate' | 'wont_fix' | 'closed';
 type PartKey = 'happens' | 'expected' | 'steps' | 'seen_in';
 interface Overview {
   repository: string | null;
@@ -40,6 +41,33 @@ interface Overview {
   linked: number;
   oldest_open: string | null;
   parts: { key: PartKey; heading: string }[];
+  /** Whether a fix can be started here, by which flow, and how many confirmed bugs wait for one. */
+  fixing?: {
+    section: string | null;
+    flow: { key: string; name: string } | null;
+    refused: string | null;
+    ready: number;
+  };
+}
+/** Where fixing a bug stands: its latest run, the pull request a run opened, and what follows. */
+interface Fix {
+  run: {
+    id: string;
+    state: string;
+    outcome: string | null;
+    detail: string | null;
+    flow: string;
+    started_at: string | null;
+    ended_at: string | null;
+  } | null;
+  under_way: boolean;
+  waits: boolean;
+  pull_request: { number: number; url: string | null; merged: boolean } | null;
+  not_reproduced: boolean;
+  in_progress: boolean;
+  says: string;
+  /** Why a fix cannot be started now; null when it can. */
+  refused: string | null;
 }
 interface Brief {
   id: string;
@@ -63,6 +91,7 @@ interface Bug extends Brief {
   updated_at: string | null;
   closed_at: string | null;
   problem: string | null;
+  fix?: Fix;
 }
 interface Listing {
   items: Bug[];
@@ -70,7 +99,7 @@ interface Listing {
   page: number;
   pages: number;
 }
-type Shown = 'open' | 'new' | 'confirmed' | 'closed' | '';
+type Shown = 'open' | 'new' | 'confirmed' | 'in_progress' | 'closed' | '';
 type Sort = 'newest' | 'oldest' | 'updated' | 'severity';
 type Reason = 'fixed' | 'wont_fix' | 'duplicate';
 
@@ -84,6 +113,7 @@ const SEVERE: Record<Severity, { says: string; tone: 'destructive' | 'warning' |
 const STATE_TONE: Record<Triage, 'success' | 'info' | 'neutral' | 'warning'> = {
   new: 'warning',
   confirmed: 'info',
+  in_progress: 'info',
   fixed: 'success',
   duplicate: 'neutral',
   wont_fix: 'neutral',
@@ -496,6 +526,9 @@ function Row({
   onEdit,
   onDecide,
   onClose,
+  canFix,
+  onFix,
+  fixing,
 }: {
   base: string;
   bug: Bug;
@@ -505,9 +538,14 @@ function Row({
   onEdit: () => void;
   onDecide: () => void;
   onClose: () => void;
+  /** Whether the project's engine can fix a bug at all. */
+  canFix: boolean;
+  onFix: () => void;
+  fixing: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const live = bug.state !== 'closed';
+  const fix = bug.fix;
   return (
     <li className="grid gap-2 rounded-lg border border-border p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
@@ -574,6 +612,22 @@ function Row({
           title={`GitHub did not take the last change: ${bug.problem} It is tried again by itself.`}
         />
       ) : null}
+      {fix && fix.says ? (
+        <p className={fix.waits || fix.not_reproduced ? 'text-foreground' : 'text-muted-foreground'}>
+          {fix.says}{' '}
+          {fix.run ? (
+            <Link href={`${BASE}/run?id=${fix.run.id}`}>{fix.under_way ? 'See the run' : 'The run'}</Link>
+          ) : null}
+          {fix.pull_request?.url ? (
+            <>
+              {fix.run ? ' · ' : ''}
+              <Link href={fix.pull_request.url} target="_blank" rel="noreferrer">
+                Pull request #{fix.pull_request.number}
+              </Link>
+            </>
+          ) : null}
+        </p>
+      ) : null}
       {open ? (
         <div className="grid gap-1 rounded-md bg-muted/40 p-3 text-foreground">
           {bug.text ? (
@@ -600,6 +654,18 @@ function Row({
         {live ? (
           <Button size="sm" variant="ghost" onClick={onDecide}>
             Triage
+          </Button>
+        ) : null}
+        {bug.state === 'open' && canFix && fix && !fix.under_way ? (
+          <Button
+            size="sm"
+            variant={fix.refused ? 'ghost' : 'secondary'}
+            disabled={!!fix.refused}
+            title={fix.refused ?? undefined}
+            loading={fixing}
+            onClick={onFix}
+          >
+            {fix.run || fix.pull_request ? 'Fix again' : 'Fix'}
           </Button>
         ) : null}
         {bug.number && bug.state !== 'creating' ? (
@@ -683,6 +749,25 @@ export function BugsPage({ project }: { project: string }) {
       .then(() => done(message))
       .catch((error: unknown) => setProblem(said(error)));
   };
+  const [starting, setStarting] = useState<string | null>(null);
+  const fix = (bug: Bug) => {
+    setProblem(null);
+    setTold(null);
+    setStarting(bug.id);
+    postJson<{ id: string }>(`${base}/${bug.id}/fix`)
+      .then((run) => navigate(`${BASE}/run?id=${run.id}`))
+      .catch((error: unknown) => setProblem(said(error)))
+      .finally(() => setStarting(null));
+  };
+  const queue = () => {
+    setProblem(null);
+    setTold(null);
+    setStarting('queue');
+    postJson<{ id: string }>(`${base}/queue`)
+      .then((made) => navigate(queueUrl(project, made.id)))
+      .catch((error: unknown) => setProblem(said(error)))
+      .finally(() => setStarting(null));
+  };
   const several = (body: Record<string, unknown>, doing: string) => {
     setProblem(null);
     setTold(null);
@@ -741,9 +826,10 @@ export function BugsPage({ project }: { project: string }) {
                     , the oldest reported <When value={data.oldest_open} />
                   </>
                 ) : null}
-                : {whole(states.new ?? 0)} new and not looked at yet, {whole(states.confirmed ?? 0)} confirmed.{' '}
-                {whole(data.counts.closed)} closed: {whole(states.fixed ?? 0)} fixed, {whole(states.duplicate ?? 0)}{' '}
-                duplicates, {whole(states.wont_fix ?? 0)} not going to be fixed
+                : {whole(states.new ?? 0)} new and not looked at yet, {whole(states.confirmed ?? 0)} confirmed,{' '}
+                {whole(states.in_progress ?? 0)} in progress. {whole(data.counts.closed)} closed:{' '}
+                {whole(states.fixed ?? 0)} fixed, {whole(states.duplicate ?? 0)} duplicates,{' '}
+                {whole(states.wont_fix ?? 0)} not going to be fixed
                 {states.closed ? `, ${whole(states.closed)} closed before the reason was kept` : ''}.
               </p>
               {open ? (
@@ -767,6 +853,50 @@ export function BugsPage({ project }: { project: string }) {
               ) : null}
             </CardBody>
           </Card>
+          {data.fixing && data.can_report ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>Fixing</CardTitle>
+              </CardHeader>
+              <CardBody className="grid gap-3 text-sm">
+                {data.fixing.refused ? (
+                  <Alert tone="warning" title="No fix can be started here yet">
+                    {data.fixing.refused}{' '}
+                    <Link render={<RouterLink href={automationUrl('assignments', project)} />}>Flow assignment</Link>
+                  </Alert>
+                ) : (
+                  <>
+                    <p className="text-muted-foreground">
+                      A fix is started from a confirmed bug, with <span className="text-foreground">Fix</span> on its
+                      row. The bug goes to the section {data.fixing.section} of the engine, and that section&rsquo;s
+                      flow runs: <span className="text-foreground">{data.fixing.flow?.name}</span>.{' '}
+                      {data.fixing.flow?.key === 'fix-bug'
+                        ? 'It writes a test that fails because of the bug, fixes the bug so that the test passes, and waits for your word before a pull request is opened. The bug is fixed when you merge that pull request on GitHub. A bug no test can show says so. '
+                        : ''}
+                      A run spends what a delivery spends.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="text-foreground">
+                        {data.fixing.ready
+                          ? `${some(data.fixing.ready, 'confirmed bug waits', 'confirmed bugs wait')} for a fix.`
+                          : 'No confirmed bug waits for a fix.'}
+                      </span>
+                      {data.fixing.ready > 1 ? (
+                        <Button size="sm" variant="secondary" loading={starting === 'queue'} onClick={queue}>
+                          Queue them, the most severe first
+                        </Button>
+                      ) : null}
+                    </div>
+                    {data.fixing.ready > 1 ? (
+                      <p className="text-xs text-muted-foreground">
+                        The queue is made as a draft: nothing starts until you start it, on the Queue page.
+                      </p>
+                    ) : null}
+                  </>
+                )}
+              </CardBody>
+            </Card>
+          ) : null}
           {data.linked ? <BugLinks project={project} onChanged={reload} /> : null}
           <Card>
             <CardHeader>
@@ -781,6 +911,7 @@ export function BugsPage({ project }: { project: string }) {
                     ['open', `Open (${whole(open)})`],
                     ['new', `New (${whole(states.new ?? 0)})`],
                     ['confirmed', `Confirmed (${whole(states.confirmed ?? 0)})`],
+                    ['in_progress', `In progress (${whole(states.in_progress ?? 0)})`],
                     ['closed', `Closed (${whole(data.counts.closed)})`],
                     ['', 'All'],
                   ]}
@@ -902,6 +1033,9 @@ export function BugsPage({ project }: { project: string }) {
                       })
                     }
                     act={act}
+                    canFix={!!data.fixing && !data.fixing.refused}
+                    onFix={() => fix(bug)}
+                    fixing={starting === bug.id}
                     onEdit={() => setDialog({ kind: 'edit', bug })}
                     onDecide={() => setDialog({ kind: 'decide', bug })}
                     onClose={() => setDialog({ kind: 'close', bug })}

@@ -428,6 +428,135 @@ class RelatedTests:
         )
 
 
+class BugTest:
+    """Run the tests the run wrote for its bug. Before the fix they have to fail: that is
+    what shows the bug. After it they have to pass. Which files they are is found the
+    first time, from what the run changed, and kept for the times after."""
+
+    @staticmethod
+    def _kept(ctx: Context) -> list[str]:
+        return [str(path) for path in ((ctx.data.get("bug") or {}).get("tests") or [])]
+
+    async def plan(self, ctx: Context, lease: Lease | None) -> Plan:
+        kept = self._kept(ctx)
+        minutes = max(1, min(int(ctx.params.get("minutes") or RELATED_MINUTES), 30))
+        project = ctx.toolchain().tests
+        whole = sum(command.timeout for command in project)
+        question: dict[str, Any] = {
+            "paths": kept,
+            "base": str(ctx.data.get("base_sha") or ""),
+            # The first time: the tests the run wrote, and none that only cover them.
+            "only_changed": not kept,
+            "limit": 20,
+            "seconds": minutes * 60,
+            # Where none of them can be run alone, the project's own test commands.
+            "otherwise": [
+                {
+                    "argv": list(command.argv),
+                    "cwd": command.cwd,
+                    "timeout": command.timeout,
+                    "line": deliver.line_of(command),
+                }
+                for command in project
+            ],
+            "otherwise_seconds": whole,
+        }
+        named = ctx.params.get("commands")
+        if isinstance(named, list) and named:
+            question["commands"] = [
+                {"argv": list(command.argv), "cwd": command.cwd, "timeout": command.timeout}
+                for command in deliver.commands_of(named)
+            ]
+        seconds = minutes * 60 + whole
+        job = tool_job(
+            "tests", question, max_bytes=600_000, seconds=seconds + 60, env=deliver.TOOLS
+        )
+        return _bench(job, seconds=seconds + 360)
+
+    async def conclude(self, ctx: Context, commands: list[dict[str, Any]], log: str) -> Concluded:
+        found = _answer(commands, log, "tests")
+        if isinstance(found, str):
+            return Failed("tests_failed", f"The bug's tests could not be run: {found}")
+        fixing = ctx.params.get("expect") == "pass"
+        ran = [entry for entry in found.get("ran") or [] if isinstance(entry, dict)]
+        whole = bool(found.get("whole"))
+        files = self._kept(ctx) or [
+            str(entry.get("path"))
+            for entry in found.get("tests") or []
+            if isinstance(entry, dict) and entry.get("path")
+        ]
+        known = dict(ctx.data.get("bug") or {})
+        if not ran:
+            why = (
+                "The run wrote no test for the bug."
+                if not files
+                else f"None of the {len(files)} test files written for the bug can be run "
+                "here, and the project names no test commands."
+            )
+            return Done(
+                "none",
+                "no_test",
+                why,
+                output=found,
+                data={"bug": {**known, "tests": files, **({} if fixing else {"shown": False})}},
+            )
+        failed = [entry for entry in ran if entry.get("exit_code") != 0]
+        if whole:
+            # The project's own commands: one that failed before anything was changed
+            # says nothing of the bug.
+            before = ctx.data.get("baseline_by_command")
+            if isinstance(before, dict):
+                failed = [entry for entry in failed if before.get(str(entry.get("line"))) == 0]
+        how = (
+            "the project's test commands, compared with before anything was changed"
+            if whole
+            else f"{len(files)} test file{'s' if len(files) != 1 else ''} of its own"
+        )
+        lines = "; ".join(str(entry.get("line")) for entry in failed)
+        failures = [
+            f"{entry.get('line')}"
+            + (" (stopped: it took too long)" if entry.get("timed_out") else "")
+            + f"\n{str(entry.get('said') or '')[-3000:]}"
+            for entry in failed
+        ]
+        bug = {**known, "tests": files, "by": "commands" if whole else "tests"}
+        if fixing:
+            if failed:
+                return Done(
+                    "fails",
+                    "still_failing",
+                    _words(f"The bug's test still fails after the fix ({how}): {lines}", 600),
+                    output=found,
+                    data={"bug": {**bug, "fixed": False}},
+                    given={"failures": failures},
+                )
+            return Done(
+                "passes",
+                "fixed",
+                f"The bug's test passes after the fix ({how}).",
+                output=found,
+                data={"bug": {**bug, "fixed": True}},
+            )
+        if failed:
+            return Done(
+                "fails",
+                "reproduced",
+                _words(f"The bug is shown: its test fails before the fix ({how}): {lines}", 600),
+                output=found,
+                data={"bug": {**bug, "shown": True}},
+                # What the test says is what the fix has to make go away.
+                given={"failures": failures},
+            )
+        return Done(
+            "passes",
+            "not_reproduced",
+            "The bug is not shown: what was written for it passes before anything is "
+            f"fixed ({how}).",
+            output=found,
+            data={"bug": {**bug, "shown": False}},
+        )
+
+
 class Apply:
     """Apply the edits a model wrote, and commit. What is changed this way is a change
     like an agent's, and is held to the same rules before it is published."""
@@ -520,6 +649,7 @@ BENCH: Final[dict[str, SandboxTask]] = {
     "code.read": Read(),
     "code.run": Run(),
     "code.tests": RelatedTests(),
+    "check.reproduction": BugTest(),
     "code.digest": Digest(),
     "code.apply": Apply(),
 }

@@ -30,7 +30,7 @@ def _sections(client: TestClient, project: str) -> list[dict[str, Any]]:
     return list(response.json()["sections"])
 
 
-def test_every_project_has_the_six_core_sections(tmp_path: Path) -> None:
+def test_every_project_has_the_seven_core_sections(tmp_path: Path) -> None:
     client, repository = _authenticated_client(tmp_path)
     try:
         assert CORE_KEYS == [
@@ -40,6 +40,7 @@ def test_every_project_has_the_six_core_sections(tmp_path: Path) -> None:
             "code-clean",
             "enhancement",
             "issues",
+            "bugs",
         ]
         falcone = client.get("/api/dashboard/projects/falcone").json()
         assert falcone["project"]["project"] == "falcone"
@@ -53,7 +54,7 @@ def test_every_project_has_the_six_core_sections(tmp_path: Path) -> None:
             assert section["labels"] and section["examples"], section["key"]
         labels = [label for section in sections for label in section["labels"]]
         assert len(labels) == len(set(labels))
-        assert "bug" in next(s for s in sections if s["key"] == "issues")["labels"]
+        assert "bug" in next(s for s in sections if s["key"] == "bugs")["labels"]
         assert "enhancement" in next(s for s in sections if s["key"] == "enhancement")["labels"]
         # The work that already runs for the built-in projects is shown as its flow.
         flows = {section["key"]: (section["flow"] or {}).get("key") for section in sections}
@@ -64,6 +65,7 @@ def test_every_project_has_the_six_core_sections(tmp_path: Path) -> None:
             "code-clean": None,
             "enhancement": "discover-enhancements",
             "issues": "deliver-issue",
+            "bugs": "fix-bug",
         }
         # A project made in the console has the same sections and no flow: none is guessed.
         created = client.post(
@@ -159,7 +161,7 @@ def test_sections_of_the_administrator(tmp_path: Path) -> None:
             client, "falcone/sections", name="Docs", description="Documentation.", labels=["BUG"]
         )
         assert taken.status_code == 409
-        assert taken.json()["detail"] == "The label bug already belongs to the section Issues"
+        assert taken.json()["detail"] == "The label bug already belongs to the section Bugs"
 
         renamed = _post(client, "falcone/sections/release-notes/update", name="Changelog")
         assert renamed.status_code == 200
@@ -172,7 +174,7 @@ def test_sections_of_the_administrator(tmp_path: Path) -> None:
         assert _post(client, "falcone/sections/issues/update", name="Bugs").status_code == 409
         guided = _post(
             client,
-            "falcone/sections/issues/update",
+            "falcone/sections/bugs/update",
             description="Only defects, never tasks.",
             labels=["bug", "crash"],
             examples=[],
@@ -180,11 +182,11 @@ def test_sections_of_the_administrator(tmp_path: Path) -> None:
         assert guided.status_code == 200
         assert guided.json()["description"] == "Only defects, never tasks."
         assert (guided.json()["labels"], guided.json()["examples"]) == (["bug", "crash"], [])
-        assert guided.json()["name"] == "Issues" and guided.json()["use_when"]  # left as it was
+        assert guided.json()["name"] == "Bugs" and guided.json()["use_when"]  # left as it was
         # The description can be rewritten but not emptied.
         emptied = _post(client, "falcone/sections/issues/update", description="  ")
         assert emptied.status_code == 422
-        # "regression" was given up by Issues above, so another section can take it.
+        # "regression" was given up by Bugs above, so another section can take it.
         assert (
             _post(
                 client, "falcone/sections/release-notes/update", labels=["regression"]
@@ -222,18 +224,35 @@ def test_the_brief_is_what_the_supervisor_reads(tmp_path: Path) -> None:
         assert "exactly one section" in rules
         assert "never choose the nearest one" in rules
         assert "never send the work to another section instead" in rules
-        for name in ("Code audit", "UI audit", "UX audit", "Code clean", "Enhancement", "Issues"):
+        for name in (
+            "Code audit",
+            "UI audit",
+            "UX audit",
+            "Code clean",
+            "Enhancement",
+            "Issues",
+            "Bugs",
+        ):
             assert f"## {name} (section key: " in brief
-        issues = brief[brief.index("## Issues") :]
+        issues = brief[brief.index("## Issues") : brief.index("## Bugs")]
         for part in (
-            "What belongs here: Issues reported on the repository",
-            "Use it when: Something is wrong",
-            "Do not use it when: The request asks for something new (use Enhancement)",
-            "- Signing in fails when the session cookie has expired.",
-            "belongs here without further judgement: bug, defect, regression, fix.",
+            "What belongs here: Issues reported on the repository that are work to do",
+            "Use it when: A concrete task is reported",
+            "Do not use it when: Something that should work does not (use Bugs).",
+            "- The nightly build has been failing since the dependency update.",
+            "belongs here without further judgement: fix.",
             "Flow: Deliver issue. Implement what an item asks for",
         ):
             assert part in issues, part
+        # A bug has a section of its own, with the flow that fixes it.
+        bugs = brief[brief.index("## Bugs") :]
+        for part in (
+            "What belongs here: Bugs: something that should work and does not.",
+            "- Signing in fails when the session cookie has expired.",
+            "belongs here without further judgement: bug, defect, regression.",
+            "Flow: Fix a bug. Write a test that fails because of the bug",
+        ):
+            assert part in bugs, part
         ui_audit = brief[brief.index("## UI audit") : brief.index("## UX audit")]
         assert "Flow: none assigned. This section cannot run work yet." in ui_audit
         # The brief follows the records: a rewritten guide and a new flow show up in it.

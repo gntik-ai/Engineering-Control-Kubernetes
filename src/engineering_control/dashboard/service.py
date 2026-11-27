@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -327,6 +327,31 @@ class DashboardService:
             return self.repository.runs.start_item(item_id, toolchain=toolchain)
 
         return await asyncio.to_thread(start)
+
+    async def fix_bug(self, project: str, key: UUID) -> dict[str, object]:
+        """Start the fix of a bug: it goes to the section Bugs, and that section's flow
+        runs for it."""
+
+        def start() -> dict[str, Any]:
+            item = self.repository.bug_section.to_fix(project, key)
+            return self.repository.runs.start_item(item, toolchain=toolchain_for(project).as_dict())
+
+        return await asyncio.to_thread(start)
+
+    async def queue_bugs(self, project: str) -> dict[str, object]:
+        """Put the confirmed bugs in a queue, the most severe first. The queue is a
+        draft: nothing starts until the administrator starts it."""
+
+        def make() -> dict[str, Any]:
+            items = self.repository.bug_section.to_queue(project)
+            return self.repository.queues.create(
+                project,
+                name=f"Bugs by severity, {datetime.now(UTC):%-d %B}",
+                item_ids=items,
+                at_once=1,
+            )
+
+        return await asyncio.to_thread(make)
 
     async def run_section(self, project: str, section: str, scope: str) -> dict[str, object]:
         """Start what the section runs by itself: an audit, or a search for enhancements."""

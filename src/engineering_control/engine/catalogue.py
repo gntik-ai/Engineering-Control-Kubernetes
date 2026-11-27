@@ -414,6 +414,51 @@ _TASKS: Final = (
         ),
     ),
     TaskType(
+        "check.reproduction",
+        "Deterministic checks",
+        "Run the bug's test",
+        "Run the tests the run wrote for the bug it is about, and nothing else: before "
+        "the fix they have to fail, which is what shows the bug; after it they have to "
+        "pass. The first time, the tests are the test files the run added or changed; "
+        "from then on, the same files. Each is run by the repository's own runner. "
+        "Where none of them can be run alone, the project's test commands are run and "
+        "compared, command by command, with before anything was changed. No agent "
+        "takes part. It does not stand in for Run the tests, which a change has to "
+        "pass before it is published.",
+        "bench",
+        needs=("checkout", "change"),
+        produces=("reproduction",),
+        outcomes=("fails", "passes", "none"),
+        params=(
+            Param(
+                "expect",
+                "choice",
+                "fail",
+                "What the tests are expected to do here: fail, before the bug is fixed, "
+                "or pass, after it. It decides how the step is told, not where the flow "
+                "goes: that is said by the outcome.",
+                choices=("fail", "pass"),
+            ),
+            Param(
+                "commands",
+                "commands",
+                [],
+                "How the bug's tests are run, when the repository's own runner is not "
+                "enough: commands, one on each line, run in order up to the first that "
+                "fails. {files} stands for the test files. None: the runner is found "
+                "from the repository.",
+            ),
+            Param(
+                "minutes",
+                "int",
+                10,
+                "How long the bug's tests may take in all before they are stopped.",
+                low=1,
+                high=30,
+            ),
+        ),
+    ),
+    TaskType(
         "workspace.checkout",
         "Workspace",
         "Check out and install",

@@ -21,6 +21,15 @@ the plan, so a project that was never through Discovery has it too.
 - **Several at once.** Severity and area can be given to several bugs together, and
   several can be closed together.
 
+- **Fixing.** A fix is started from a confirmed bug, or the confirmed bugs are put in a
+  queue, the most severe first. The bug goes to the section Bugs of the engine and that
+  section's flow runs: "Fix a bug" writes a test that fails because of the bug, fixes
+  the bug, and publishes the change once the administrator agrees. While a run is under
+  way or its pull request is open the bug is *in progress*. The pull request resolves
+  the bug's issue: merged, by the administrator on GitHub, it closes the issue, and the
+  bug is *fixed*, by that pull request. A bug no test could show says so, with what the
+  run said.
+
 GitHub stays where a bug lives. Every change here is written there first and kept here as
 GitHub answered it. A text that was changed on GitHub since it was read here is read
 again instead of being overwritten.
@@ -62,10 +71,16 @@ from engineering_control.db.models import (
     BugRecord,
     ProjectIssueStory,
     ProjectRecord,
+    ProjectSection,
     RecordVector,
+    SandboxRun,
+    WorkQueue,
+    WorkQueueEntry,
     WorkspaceAction,
     WorkspaceSource,
 )
+from engineering_control.engine.library import document_in_force, plan_for_item
+from engineering_control.flow_library import WORK_KINDS
 from engineering_control.github_app import GitHubApp, GitHubAppError
 
 # What a report is made of, in the order and under the headings its issue carries.
@@ -88,6 +103,7 @@ SEVERITIES: Final = {
 STATES: Final = {
     "new": "New",
     "confirmed": "Confirmed",
+    "in_progress": "In progress",
     "fixed": "Fixed",
     "duplicate": "Duplicate",
     "wont_fix": "Not going to be fixed",
@@ -104,6 +120,8 @@ ALIKE: Final = 0.9
 SHARED: Final = 0.5
 SHOWN_ALIKE: Final = 3
 SEVERAL: Final = 100
+# How many bugs a queue of fixes is made of at most: what a queue holds.
+QUEUED: Final = 200
 
 
 def severity_label(severity: str) -> str:
@@ -182,14 +200,138 @@ def area_of(item: BacklogItem, record: BugRecord | None) -> str | None:
     return None
 
 
-def triage_of(item: BacklogItem, record: BugRecord | None) -> str:
-    """Where the bug stands in triage, from its issue and what was decided here."""
+def triage_of(
+    item: BacklogItem, record: BugRecord | None, fix: dict[str, Any] | None = None
+) -> str:
+    """Where the bug stands, from its issue, what was decided here, and the fix that is
+    under way."""
     if _stands(item) == "closed":
         if record is not None and record.duplicate_of is not None:
             return "duplicate"
         reason = (item.facts or {}).get("github_state_reason")
         return {"completed": "fixed", "not_planned": "wont_fix"}.get(str(reason), "closed")
+    if fix is not None and fix["in_progress"]:
+        return "in_progress"
     return "confirmed" if record is not None and record.confirmed_at is not None else "new"
+
+
+# The section of the engine bugs are fixed in, and the flow it has unless another is
+# assigned.
+SECTION: Final = "bugs"
+# A run that is not over: waiting to start, at work, or waiting for the administrator.
+ACTIVE: Final = ("queued", "running", "waiting")
+
+
+def _pull_request(item: BacklogItem) -> dict[str, Any] | None:
+    """The pull request a run opened for the bug, as the run noted it on the item."""
+    pull = (item.facts or {}).get("pull_request")
+    if not isinstance(pull, dict) or not isinstance(pull.get("number"), int):
+        return None
+    return {
+        "number": pull["number"],
+        "url": pull.get("url"),
+        "merged": bool(pull.get("merged")),
+    }
+
+
+def fix_of(item: BacklogItem, run: SandboxRun | None) -> dict[str, Any]:
+    """Where fixing the bug stands: its latest run, the pull request a run opened, and
+    what follows from them, said in a sentence. Nothing is kept for it: it is read from
+    the run and from the item."""
+    pull = _pull_request(item)
+    data = (run.data or {}) if run is not None else {}
+    shown = (data.get("bug") or {}).get("shown")
+    under_way = run is not None and run.state in ACTIVE
+    opened_here = bool(data.get("pull_request"))
+    # A bug no test could show: the check said so, or the agent that was to write the
+    # test gave up before any check ran.
+    not_reproduced = (
+        run is not None
+        and not under_way
+        and not opened_here
+        and (shown is False or (shown is None and run.outcome == "blocked"))
+    )
+    open_pull = pull is not None and not pull["merged"] and _stands(item) == "open"
+    # The pull request resolves the bug's issue: GitHub closes the issue, as completed,
+    # when it is merged, whoever merges it.
+    fixed = (
+        _stands(item) == "closed" and (item.facts or {}).get("github_state_reason") == "completed"
+    )
+    detail = " ".join(str(run.detail or "").split())[:600] if run is not None else ""
+    if under_way and run is not None and run.state == "waiting":
+        says = "A fix waits for you" + (f": {detail}" if detail else ".")
+    elif under_way:
+        says = "A fix is being worked on."
+    elif pull is not None and (pull["merged"] or fixed):
+        says = f"Fixed by pull request #{pull['number']}."
+    elif open_pull and pull is not None:
+        says = f"Pull request #{pull['number']} is open: the bug is fixed when it is merged."
+    elif _stands(item) == "closed":
+        # Closed some other way: what a run once did says nothing of it any more.
+        says = ""
+    elif not_reproduced:
+        says = "No test could show the bug" + (f": {detail}" if detail else ".")
+    elif run is not None and run.state == "failed":
+        says = "The last fix did not finish" + (f": {detail}" if detail else ".")
+    elif run is not None and run.state == "cancelled":
+        says = "The last fix was stopped."
+    elif run is not None:
+        says = "The last fix ended without a change" + (f": {detail}" if detail else ".")
+    else:
+        says = ""
+    return {
+        "run": {
+            "id": str(run.id),
+            "state": run.state,
+            "outcome": run.outcome,
+            "detail": detail or None,
+            "flow": str((data.get("flow") or {}).get("name") or ""),
+            "started_at": _iso(run.created_at),
+            "ended_at": _iso(run.finished_at),
+        }
+        if run is not None
+        else None,
+        "under_way": under_way,
+        "waits": bool(under_way and run is not None and run.state == "waiting"),
+        "pull_request": pull,
+        "not_reproduced": not_reproduced,
+        "in_progress": bool(under_way or open_pull),
+        "says": says,
+    }
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=UTC)).isoformat()
+
+
+def _runs(db: Session, project: ProjectRecord) -> dict[UUID, SandboxRun]:
+    """The latest run of work on each item of the project."""
+    found: dict[UUID, SandboxRun] = {}
+    for run in db.scalars(
+        select(SandboxRun)
+        .where(
+            SandboxRun.project_id == project.id,
+            SandboxRun.item_id.is_not(None),
+            SandboxRun.kind.in_(WORK_KINDS),
+        )
+        .order_by(SandboxRun.created_at, SandboxRun.id)
+    ):
+        if run.item_id is not None:
+            found[run.item_id] = run
+    return found
+
+
+def why_no_fix(item: BacklogItem, record: BugRecord | None, fix: dict[str, Any]) -> str | None:
+    """Why a fix of the bug cannot be started now; None when it can."""
+    if item.issue_number is None or _stands(item) != "open":
+        return "A fix starts from a bug whose issue is open on GitHub."
+    if fix["under_way"]:
+        return "A fix of this bug is under way."
+    if record is None or record.confirmed_at is None:
+        return "Give the bug a severity first: a fix starts from a confirmed bug."
+    return None
 
 
 def _bugs(db: Session, project: ProjectRecord) -> list[BacklogItem]:
@@ -315,11 +457,13 @@ def _row(
     opened: dict[int, Any] | None,
     known: dict[UUID, BacklogItem],
     alike: list[tuple[float, UUID]],
+    run: SandboxRun | None = None,
 ) -> dict[str, Any]:
     stands = _stands(item)
     updated = _when(item.issue_updated_at)
     closed = _when(item.github_closed_at)
-    triage = triage_of(item, record)
+    fix = fix_of(item, run)
+    triage = triage_of(item, record, fix)
     other = known.get(record.duplicate_of) if record and record.duplicate_of else None
     return {
         "id": str(item.id),
@@ -345,6 +489,43 @@ def _row(
         "updated_at": updated.isoformat() if updated else None,
         "closed_at": closed.isoformat() if closed else None,
         "problem": problems.get(item.id),
+        # Where fixing it stands, and why a fix cannot be started now, when it cannot.
+        "fix": {**fix, "refused": why_no_fix(item, record, fix)},
+    }
+
+
+def _engine(db: Session, project: ProjectRecord) -> dict[str, Any]:
+    """The section of the engine the project's bugs are fixed in, the flow it has, and
+    why no fix can be started, when none can."""
+    section = db.scalar(
+        select(ProjectSection).where(
+            ProjectSection.project_id == project.id, ProjectSection.key == SECTION
+        )
+    )
+    plan = (
+        plan_for_item(db, section.flow_key, produced=False, version=section.flow_version)
+        if section is not None and section.flow_key
+        else None
+    )
+    found = document_in_force(db, plan[0]) if plan is not None else None
+    why = None
+    if not project.source_repository:
+        why = "Connect a repository to the project first."
+    elif section is None:
+        why = "This project has no section Bugs in its engine."
+    elif not section.flow_key:
+        why = (
+            "The section Bugs has no flow. Assign “Fix a bug” to it under Engine, Flow assignment."
+        )
+    elif found is None:
+        why = (
+            "The flow of the section Bugs cannot run here. Assign “Fix a bug” to it "
+            "under Engine, Flow assignment."
+        )
+    return {
+        "section": section.name if section is not None else None,
+        "flow": {"key": found[0].key, "name": found[0].name} if found is not None else None,
+        "refused": why,
     }
 
 
@@ -382,6 +563,8 @@ class BugSection:
             project = active_project(db, name)
             found = _bugs(db, project)
             records = _records(db, project)
+            runs = _runs(db, project)
+            fixable = 0
             counts = {"open": 0, "closed": 0, "creating": 0, "draft": 0}
             states: Counter[str] = Counter()
             severities: Counter[str] = Counter()
@@ -390,7 +573,9 @@ class BugSection:
                 record = records.get(item.id)
                 stands = _stands(item)
                 counts[stands] += 1
-                states[triage_of(item, record)] += 1
+                fix = fix_of(item, runs.get(item.id))
+                states[triage_of(item, record, fix)] += 1
+                fixable += why_no_fix(item, record, fix) is None
                 area = area_of(item, record)
                 if area:
                     areas[area] += 1
@@ -426,6 +611,9 @@ class BugSection:
                 "linked": linked,
                 "oldest_open": oldest.isoformat() if oldest else None,
                 "parts": [{"key": key, "heading": heading} for key, heading in PARTS],
+                # Whether a fix can be started here, by which flow, and how many
+                # confirmed bugs wait for one.
+                "fixing": {**_engine(db, project), "ready": fixable},
             }
 
     def listing(
@@ -450,6 +638,7 @@ class BugSection:
             records = _records(db, project)
             every = _bugs(db, project)
             known = {item.id: item for item in every}
+            runs = _runs(db, project)
             rows = []
             for item in every:
                 record = records.get(item.id)
@@ -458,7 +647,10 @@ class BugSection:
                 if state in ("open", "closed"):
                     if group != state:
                         continue
-                elif state in STATES and triage_of(item, record) != state:
+                elif (
+                    state in STATES
+                    and triage_of(item, record, fix_of(item, runs.get(item.id))) != state
+                ):
                     continue
                 mine = severity_of(item, record)
                 if severity and (mine or "none") != severity:
@@ -501,6 +693,7 @@ class BugSection:
                         opened,
                         known,
                         alike.get(item.id, []),
+                        runs.get(item.id),
                     )
                     for item in shown
                 ],
@@ -862,6 +1055,97 @@ class BugSection:
         except GitHubAppError as error:
             raise ProjectConflict(str(error)) from error
         return await asyncio.to_thread(self._kept, name, key, snapshot)
+
+    # ------------------------------------------------------------------ fixing
+
+    @staticmethod
+    def _to_section(db: Session, project: ProjectRecord, item: BacklogItem) -> None:
+        """Put the bug in the section Bugs of the engine, by the administrator's word:
+        what starts for it is that section's flow."""
+        section = db.scalar(
+            select(ProjectSection).where(
+                ProjectSection.project_id == project.id, ProjectSection.key == SECTION
+            )
+        )
+        if section is None:  # ``_engine`` said so before
+            raise ProjectConflict("This project has no section Bugs in its engine.")
+        if item.section_id != section.id:
+            item.section_id = section.id
+            item.routed_by = "administrator"
+            item.routing_reason = None
+
+    def to_fix(self, name: str, key: UUID) -> UUID:
+        """Make a bug ready for its fix to be started: it is open and confirmed, no fix
+        of it is under way, and it stands in the section Bugs. Returns the item a run
+        is started for. Nothing is started here."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            item = db.get(BacklogItem, key)
+            if (
+                item is None
+                or item.project_id != project.id
+                or item.id not in {row.id for row in _bugs(db, project)}
+            ):
+                raise ProjectNotFound(str(key))
+            engine = _engine(db, project)
+            if engine["refused"]:
+                raise ProjectConflict(str(engine["refused"]))
+            record = db.scalar(
+                select(BugRecord).where(
+                    BugRecord.project_id == project.id, BugRecord.item_id == item.id
+                )
+            )
+            refused = why_no_fix(item, record, fix_of(item, _runs(db, project).get(item.id)))
+            if refused:
+                raise ProjectConflict(refused)
+            self._to_section(db, project, item)
+            return item.id
+
+    def to_queue(self, name: str) -> list[UUID]:
+        """The confirmed bugs a fix can be started for, the most severe first and of one
+        severity the oldest first, each put in the section Bugs: what a queue of fixes
+        is made of. A bug that is in a queue under way already is left there."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            engine = _engine(db, project)
+            if engine["refused"]:
+                raise ProjectConflict(str(engine["refused"]))
+            records = _records(db, project)
+            runs = _runs(db, project)
+            opened = _opened(db, project)
+            queued = set(
+                db.scalars(
+                    select(WorkQueueEntry.item_id)
+                    .join(WorkQueue, WorkQueueEntry.queue_id == WorkQueue.id)
+                    .where(
+                        WorkQueue.project_id == project.id,
+                        WorkQueue.state.in_(("draft", "running", "paused")),
+                        WorkQueueEntry.state.in_(("waiting", "running")),
+                    )
+                )
+            )
+            order = {severity: place for place, severity in enumerate(SEVERITIES)}
+            ready = [
+                item
+                for item in _bugs(db, project)
+                if item.id not in queued
+                and item.state in ("proposed", "accepted")
+                and why_no_fix(item, records.get(item.id), fix_of(item, runs.get(item.id))) is None
+            ]
+            ready.sort(
+                key=lambda item: (
+                    order.get(severity_of(item, records.get(item.id)) or "", len(order)),
+                    _reported(item, opened),
+                )
+            )
+            if not ready:
+                raise ProjectConflict(
+                    "No confirmed bug waits for a fix: each is new, in progress, or in a "
+                    "queue already."
+                )
+            for item in ready:
+                self._to_section(db, project, item)
+            return [item.id for item in ready[:QUEUED]]
 
     def not_a_bug(self, name: str, key: UUID) -> dict[str, Any]:
         """Say that the issue is ordinary work and no bug. Its ``bug`` label is taken off

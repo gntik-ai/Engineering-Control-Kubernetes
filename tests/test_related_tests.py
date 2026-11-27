@@ -174,7 +174,14 @@ def test_the_related_tests_run_and_say_what_failed(shop: dict[str, Any]) -> None
     tools, root = shop["tools"], shop["root"]
     # Nothing changed: nothing to run.
     nothing = tools.tests({"base": shop["base"], "seconds": 60})
-    assert nothing == {"changed": [], "tests": [], "ran": [], "unrunnable": [], "passed": None}
+    assert nothing == {
+        "changed": [],
+        "tests": [],
+        "ran": [],
+        "unrunnable": [],
+        "passed": None,
+        "whole": False,
+    }
 
     # A change that breaks the price: its own test and the test of what uses it run, and
     # nothing else of the repository's does.

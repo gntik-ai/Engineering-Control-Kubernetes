@@ -44,6 +44,8 @@ FILE = "packages/billing/src/money.ts"
 def test_flows_are_of_two_sorts_and_only_one_sort_is_put_next_to_each_other() -> None:
     sorts = {key: sort_of(flow) for key, flow in BUILTIN.items()}
     assert sorts.pop("deliver-issue") == "item"
+    # Fix a bug works on an item too: the bug it fixes.
+    assert sorts.pop("fix-bug") == "item"
     assert sorts["review-evidence"] == "review"
     assert sorts["review-native-decisions"] == "review"
     assert sorts["review-advisory-decisions"] == "review"

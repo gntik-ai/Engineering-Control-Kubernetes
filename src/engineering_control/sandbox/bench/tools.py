@@ -867,6 +867,33 @@ def _own(commands: list[dict[str, Any]], found: list[str], deadline: float) -> l
     return ran
 
 
+def _whole(commands: list[dict[str, Any]], deadline: float) -> list[dict[str, Any]]:
+    """Run commands of the project's own, every one whatever the one before it did. Each
+    is told by the line it was given with, so that it can be compared with an earlier
+    run of the same command."""
+    ran: list[dict[str, Any]] = []
+    for command in commands:
+        folder = str(command.get("cwd") or "").strip("/")
+        folder = "" if folder == "." else folder
+        argv = [str(part) for part in command.get("argv") or []]
+        if not argv:
+            continue
+        group: dict[str, Any] = {
+            "runner": "the project's tests",
+            "folder": folder,
+            "files": 0,
+            "line": str(command.get("line") or shlex.join(argv))[:600],
+        }
+        left = deadline - time.monotonic()
+        if left < 5:
+            ran.append({**group, "exit_code": None, "seconds": 0.0, "timed_out": True, "said": ""})
+            continue
+        ran.append(
+            {**group, **_run(argv, folder, min(left, float(command.get("timeout") or left)))}
+        )
+    return ran
+
+
 def tests(question: dict[str, Any]) -> dict[str, Any]:
     """Find the tests that cover what was changed and run them: with the commands the
     flow names for it, or each kind by the repository's own runner."""
@@ -875,7 +902,14 @@ def tests(question: dict[str, Any]) -> dict[str, Any]:
     changed = named or changed_since(str(question.get("base") or ""))
     limit = max(1, min(int(question.get("limit") or 20), 60))
     related = related_tests(changed, files, limit)
+    if question.get("only_changed"):
+        # The tests that were written or changed themselves, and none that only cover
+        # what was changed.
+        related = [entry for entry in related if entry["why"] == "it was changed"]
     deadline = time.monotonic() + max(5, int(question.get("seconds") or 600))
+    # What is run where none of these tests can be run on its own: commands of the
+    # project's, every one of them whatever the one before did.
+    otherwise = [c for c in question.get("otherwise") or [] if isinstance(c, dict)]
     own = [command for command in question.get("commands") or [] if isinstance(command, dict)]
     if own:
         ran_own = _own(own, [entry["path"] for entry in related], deadline) if related else []
@@ -913,12 +947,17 @@ def tests(question: dict[str, Any]) -> dict[str, Any]:
             ran.append({**group, "exit_code": None, "seconds": 0.0, "timed_out": True, "said": ""})
             continue
         ran.append({**group, **_run([*command, *listed], where, left)})
+    whole = not ran and bool(otherwise)
+    if whole:
+        ran = _whole(otherwise, deadline + max(0, int(question.get("otherwise_seconds") or 0)))
     return {
         "changed": changed[:200],
         "tests": related,
         "ran": ran,
         "unrunnable": unrunnable,
         "passed": all(run["exit_code"] == 0 for run in ran) if ran else None,
+        # The project's own test commands were run, because no test could be run alone.
+        "whole": whole,
     }
 
 
