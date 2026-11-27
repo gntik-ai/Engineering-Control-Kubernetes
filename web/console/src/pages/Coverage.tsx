@@ -38,6 +38,8 @@ interface Shown {
     would_pass: boolean;
     reread: boolean;
     run_tokens: number;
+    /** What the project's review tokens still allow, where it has such a limit. */
+    tokens_left: number | null;
     unread: number;
     meaning: boolean;
   };
@@ -337,6 +339,9 @@ function planSaid(data: Shown): string[] {
             : '') +
           (plan.tokens > plan.run_tokens
             ? ` One run stops at ${whole(plan.run_tokens)} tokens: what is left is checked by the next run. The number can be raised under Settings.`
+            : '') +
+          (plan.tokens_left !== null && plan.tokens > plan.tokens_left
+            ? ` The project’s review tokens allow ${whole(plan.tokens_left)} more: the run is held when they are used up, until that limit is raised under Settings.`
             : ''),
       );
     }
@@ -360,7 +365,7 @@ function planSaid(data: Shown): string[] {
       'For what this run finds covered by nothing, records are written in the same run. That writing is not in the estimate: how many there are is known only then. The run stops at the month’s limit.',
     );
   told.push(...createSaid(create));
-  if (plan.to_ask || create.to_ask)
+  if ((plan.to_ask && !plan.ask_blocked) || create.to_ask)
     told.push(
       'An Epic that is written is never made without your word. Issues that are made are kept here until you publish them.',
     );

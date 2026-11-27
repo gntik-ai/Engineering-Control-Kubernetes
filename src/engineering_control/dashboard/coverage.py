@@ -39,6 +39,7 @@ from engineering_control.dashboard import (
     doc_parts,
     organize,
     parent_choice,
+    review_budget,
     review_settings,
 )
 from engineering_control.dashboard.coverage_check import COVER, RECORD, SETTLED, named
@@ -96,6 +97,10 @@ CHUNK: Final = 20
 FRESH: Final = 300.0
 # How many questions are read to say how long a question is.
 SAMPLE: Final = 40
+NO_PLAN: Final = (
+    "This project has no Epic, User Story or Issue yet: there is nothing to compare its "
+    "documentation with. Discovery makes the first plan."
+)
 # From how close by meaning a part is taken to speak of a record.
 SPEAKS: Final = 0.7
 _PLANS: dict[str, tuple[float, Any, dict[str, Any]]] = {}
@@ -284,10 +289,18 @@ class CoverageRun:
             )
             dollars = first + second if first is not None and second is not None else None
         blocked = None
-        if to_ask and answer is None:
+        if to_ask and not self._planned(db, project):
+            blocked = NO_PLAN
+        elif to_ask and answer is None:
             blocked = parent_choice.NO_ANSWERING_MODEL
         elif to_ask:
             blocked = review_settings.over(db, project.id)
+        budget = review_budget.status(db, project.id)
+        tokens_left = (
+            max(0, int(budget["limit"]) - int(budget["used"] or 0) - int(budget["reserved"] or 0))
+            if budget["limit"] is not None
+            else None
+        )
         unread = int(
             db.scalar(
                 select(func.count())
@@ -315,10 +328,18 @@ class CoverageRun:
             # The documentation was read again, and changed, since the last run looked.
             "reread": self._reread(db, project.id),
             "run_tokens": mine.count("run_tokens"),
+            # What the project's review tokens still allow: a run is held when they are
+            # used up. None where the project has no such limit.
+            "tokens_left": tokens_left,
             # Parts the ranking service has not read: it reads them when a run starts.
             "unread": unread if numbers["read"] else int(numbers["parts"]),
             "meaning": self.creator.embed is not None,
         }
+
+    @staticmethod
+    def _planned(db: Session, project: ProjectRecord) -> bool:
+        """Whether the project has a plan of its own to compare its documentation with."""
+        return any(rec.project is None for rec in coverage_parts.records(db, project).rows.values())
 
     @staticmethod
     def _reread(db: Session, project: UUID) -> bool:
@@ -468,8 +489,11 @@ class CoverageRun:
                 )
             )
             roles = self.creator.roles(db, project.id)
+            planned = self._planned(db, project)
         if under_way:
             return str(under_way)
+        if not planned:
+            raise ProjectInvalid(NO_PLAN)
         if check == COVER:
             return str(parent_choice.start(self.sessions, name, COVER)["id"])
         writer = roles["writer"]

@@ -469,6 +469,25 @@ def test_without_models_a_run_still_reads_what_the_documents_state(
         assert stands["percent"] == 100.0 and stands["read"]
         # Nothing can be asked until a model is named under Settings.
         assert not after["can_start"] and after["why_not"]
+        # A project with documents and no plan is read, and no model is asked about it:
+        # there is nothing to compare its parts with.
+        assert post(client, "review-settings", **SAVE).status_code == 200
+        with repo.sessions.begin() as db:
+            peer = db.scalars(
+                select(ProjectRecord).where(ProjectRecord.name == "falcone-serverless")
+            ).one()
+            document(db, peer.id, "docs/platform.md", (("Calling the platform", CALLING),))
+        there = BASE.replace("falcone", "falcone-serverless")
+        bare = client.get(there + "coverage").json()
+        assert "no Epic, User Story or Issue" in bare["plan"]["ask_blocked"] and bare["can_start"]
+        repo.coverage.start("falcone-serverless")
+        for _ in range(4):
+            if repo.coverage.tick():
+                break
+        bare = client.get(there + "coverage").json()
+        assert bare["run"]["state"] == "complete" and "Discovery" in bare["run"]["detail"]
+        assert bare["stands"]["read"] and bare["stands"]["open"] == 1
+        assert not bare["can_start"] and "Discovery" in bare["why_not"]
         # A project whose documentation was never read says so.
         other = client.get(BASE.replace("falcone", "llmwiki") + "coverage").json()
         assert other["stands"]["parts"] == 0 and not other["can_start"]
