@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC, O1, O2, O3 and O4 are built and deployed** ("O0 as built", "OC as built", "O1 as built", "O2 as built", "O3 as built" and "O4 as built", below); O5 and O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 to O5 are built and deployed** (each has its "as built" section below); O6 is not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -804,3 +804,78 @@ The ranking service has read none of the parts yet; the first run has it read th
 - **An Epic is never made by a run.** Decision 2 lets Epics and User Stories be made without asking. For Coverage an Epic waits all the same: one part of a document is thin ground for a whole capability, and a wrong Epic costs more to put right than a wrong Issue. One word makes all that wait.
 - **Coverage's cases are not in the shared "Needs you" view.** Neither are those of Organize. The old views go in O5, and the list across both pages is part of that.
 - **Parts are not checked by themselves when a document changes.** The page says that the documentation was read again and offers the button. Running it without a button is O6.
+
+## O5 as built (27 November 2026)
+
+Reviews has three entries: **Organize**, **Coverage** and **Settings**. The six views beside them are gone from the menu and from the console. Nothing that waited in them was dropped: each panel that still held something was moved, and the address of every old view leads to where its panel is now.
+
+### Where each view went
+
+| The view, and what it held | Where it is now |
+| --- | --- |
+| **Needs you**: one list of what waits across Reviews, and what happened without you | The project's Dashboard, as its first card. Beside each of Organize and Coverage in the menu stands how many cases wait there |
+| **Related Work**: Issues with no User Story | Organize, User Stories and Issues: the button and its three lists. The old worklist is removed |
+| **Related Work**: Review evidence (what the code says of an Issue's User Story) | Organize, "Beside the two buttons", closed until opened: *What the code says* |
+| **Planning**: primary Epics | Organize, Epics and User Stories. The old worklist is removed |
+| **Planning**: where each User Story stands | The stage of User Stories and Issues that reads it: delivered Stories are put before the administrator to close, Stories with no Issue get Issues written. The table of every Story's state is removed; the state is still in the page of each Epic |
+| **Planning**: automatic planning reviews | Organize, "Beside the two buttons": *Records reviewed as they arrive*. Until O6 does it by a run |
+| **Reorganize**: changes to approve | Organize, "Beside the two buttons": *Changes to approve*, open when something waits in it |
+| **Reorganize**: extra Epic links, clean-up, structure | Organize, Epics and User Stories (links, splits, Epics with no Story) and User Stories and Issues (Stories with no Issue). The three panels are removed |
+| **Reorganize**: arrivals | The project's Dashboard |
+| **Reorganize**: how well a parent is found, the pairs to judge, the scorer in shadow, trials of models, measurements of judges | Settings, one closed section at the end: *How well it works* |
+| **Discovery**: the import of a repository | Coverage: *The first plan, from the repository* |
+| **Discovery**: the documentation, its readings and what changed | Coverage: *The documents, and what changed in them* |
+| **Epic pages** | The planning tables, Epics: a closed section lists the page of each Epic and writes the overviews; the page of one Epic opens there |
+
+A panel is still named, by the server and in old links, by the view it was in and its own name (`reorganize#changes`, `related-work#review-evidence`). One table in the console (`FORMER` in `router.tsx`) says where each is now, and both an old address typed into the browser and a row of "what waits" go through it. The server keeps answering the old addresses with the console, so a bookmark still works.
+
+### Batches, beside the runs
+
+A batch was the way to apply many sure changes at one word. Five of the nine kinds are now what a run of Organize carries out itself, case by case, with its own undo: placing an Issue under a User Story, choosing the one Epic of a Story, taking off a link nothing supports, taking off an Epic link two models found unrelated, and closing a delivered User Story. For those no new batch is offered, and what is ready for them is not counted as waiting: the next run of the button takes it. A batch of such a kind that was already opened is still decided as a batch, and a batch that was approved can still be undone.
+
+Four kinds are still offered as batches, because no run does them: recording why links hold, and closing User Stories, Epics and Issues that nothing stands behind by rule.
+
+### The count beside the menu entry
+
+`GET /api/dashboard/projects/{name}/reviews/waiting`. For Organize: the open lines of "Needs you" of both buttons, the answers of their checks that no run has gathered into a list yet, and what waits in the three panels beside them (changes, verdicts of the code, reviews that ask a question). For Coverage: its open lines. The lines are counted as they are; the rest as it was worked out at most five minutes ago.
+
+The list of what waits (`needs_you.py`) names the new pages, has a row for the cases of each run, and no longer counts twice what a run put in its list: an answer in doubt is a row of its own only while no run of Organize gathered it. A proposal for the structure is something to start (the button of Epics and User Stories makes cases of it), not a second count.
+
+### Epics and User Stories on GitHub (decision 3)
+
+Decision 3 was to close the Epics and User Stories that are issues on GitHub in one approved batch, their records staying here. Counted in O0 and again now:
+
+| Project | Open on GitHub | What O5 does |
+| --- | --- | --- |
+| falcone | 0 (23 closed) | Nothing is left to close |
+| falcone-serverless | 0 (74 closed) | Nothing is left to close |
+| falcone-workflow | 12 Epics, 47 User Stories | None of them is a record here. They are not closed |
+| gntik-ui, llmwiki, musematic | 0 | Nothing |
+
+So there is no batch to approve: where a record exists, its issue is closed already, and the platform closed it when the record was approved. The 59 of falcone-workflow have no record here, and closing them now would leave the plan nowhere: "their records stay here" would not be true. They become records, and are closed on GitHub, one by one as the first plan of falcone-workflow is approved under Coverage. That is the path that closed the 97 of the other two projects, and it refuses to close an issue that has no approved, living record here.
+
+The Coverage page says this with the numbers, above the first plan. **This departs from the letter of the decision**, and a batch that takes the 59 in as they stand and closes them, with no model asked, can be built if that is what is wanted.
+
+### Read on live
+
+Nothing was pressed. After the deploy:
+
+| Project | Beside Organize | Of which | Beside Coverage |
+| --- | --- | --- | --- |
+| falcone | nothing | | nothing |
+| falcone-serverless | 110 | 24 cases of Epics and User Stories, 2 of User Stories and Issues, 9 changes to approve, 4 verdicts of the code, 71 reviews of single records that ask a question | nothing |
+| falcone-workflow, gntik-ui, llmwiki, musematic | nothing | Their one next step: "make its first plan under Coverage" | nothing |
+
+Before the deploy falcone-serverless showed 36 changes waiting for approval, none of them in an opened batch: 23 primary Epics to choose, 3 Epic links to take off, 1 link nothing supports, 8 reasons of links to record and 1 Issue nothing stands behind. The first 27 are what the two buttons carry out, and are no longer offered as batches; the last 9 still are. Its run of Epics and User Stories is held as before (the project's review tokens are used up), and takes the 26 that are its own when it goes on.
+
+On falcone the list of what waits holds no decision: 256 reviews of single records are queued and stopped by the administrator's switch, 2 Epic overviews are not written, and three rows of answers two models differed on, which decide nothing.
+
+Every address of a view that is gone was opened and led on: `needs-you` to Organize, `related-work#review-evidence` and `reorganize#changes` to their panels of Organize, `planning#primary-epics` to Epics and User Stories, `reorganize#pairs` to "How well it works" under Settings, `discovery` to the first plan under Coverage, `epics` to the Epics table. The count beside the menu answers in 0.2 seconds.
+
+### What is not in O5, and why
+
+- **The engines behind the removed panels are kept, with their addresses on the server.** Organize runs on them (the checks for Issues with no Story, the one Epic, the Epic links, the batches, the delivery states, the structure), and their tests drive them through those addresses. What was removed is every view of them in the console.
+- **Three panels are moved as they were, not rebuilt as runs:** changes to approve, what the code says, and the reviews of single records. They sit beside the two buttons, closed. Making them part of a run is O6 for the reviews of single records; the other two are not planned.
+- **The check "is a User Story that nothing supports still wanted?" has no button of its own any more.** Organize answers the question differently (it writes the Issues, finds the work done, or finds nothing that says what to do, and puts the last two before the administrator). As a check it still runs where Settings say it runs by itself, and what it finds reaches the batches that close Stories nothing stands behind.
+- **The table of every User Story's state is gone.** The numbers by state are in the plan of User Stories and Issues, and each Story's state is on the page of its Epic.
+- **"Discovery" is still what the reading of a repository is called** in Settings and in the costs by workflow. It is a workflow, no longer a view.

@@ -1,5 +1,8 @@
 # Project workspaces
 
+> **Since 27 November 2026 Reviews has three entries: Organize, Coverage and Settings.** Where this document names a view that is gone (Needs you, Related Work, Planning, Discovery, Reorganize, Epic pages), the panel it describes still exists and has moved: the table "Where each view went" in `organize-and-coverage.md` ("O5 as built") says where. The addresses of the old views lead there.
+
+
 The Project is the workspace for a single repository. The Superadmin signs in to the global default Project. The project sidebar provides **Global settings → Accounts** for the subscriptions and API keys shared across projects. Global settings also houses the shared Flows, Operations, Agents and Commands. Each project has its own automation library and flow assignments. The **Administrator Console** houses operational tools such as execution budgets.
 
 | Phase | Deliverable | Acceptance criteria |
