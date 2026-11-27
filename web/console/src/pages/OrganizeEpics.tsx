@@ -39,6 +39,8 @@ interface Shown {
   why_not: string | null;
   run: Run | null;
   lists: Record<Listed, number>;
+  /** Of what needs you: the links to other Epics that one word answers together. */
+  waiting: { unrelated: number; in_doubt: number };
   undo_days: number;
 }
 interface Candidate {
@@ -88,6 +90,7 @@ const CASE: Record<string, { says: string; tone: 'info' | 'neutral' | 'success' 
   link_alone: { says: 'Another Epic: one model calls it unrelated', tone: 'warning' },
   link_differ: { says: 'Another Epic: the two models differ', tone: 'warning' },
   link_unclear: { says: 'Another Epic: no model could tell', tone: 'warning' },
+  link_unchecked: { says: 'Another Epic: a quoted passage is not in the text', tone: 'warning' },
   only_epic: { says: 'Its only Epic: the texts point elsewhere', tone: 'warning' },
   no_epic: { says: 'Under no Epic', tone: 'warning' },
   one_epic: { says: 'Has its one Epic', tone: 'success' },
@@ -318,7 +321,7 @@ function planSaid(plan: Shown['plan']): string[] {
       ? `which of ${plan.to_ask === 1 ? 'its' : 'their'} Epics ${some(plan.to_ask, 'User Story under several belongs', 'User Stories under several belong')} to`
       : '',
     plan.links_to_ask
-      ? `what the other Epics of ${some(plan.links_to_ask, 'User Story', 'User Stories')} are to ${plan.links_to_ask === 1 ? 'it' : 'them'}`
+      ? `what the other Epics of ${some(plan.links_to_ask, 'User Story that has its one Epic', 'User Stories that have their one Epic')} are to ${plan.links_to_ask === 1 ? 'it' : 'them'}`
       : '',
   ]
     .filter(Boolean)
@@ -353,7 +356,7 @@ function planSaid(plan: Shown['plan']): string[] {
   const links = plan.links_unrelated + plan.links_in_doubt;
   said.push(
     links
-      ? `${some(links, 'link to another Epic is', 'links to other Epics are')} put before you (${whole(plan.links_unrelated)} found unrelated, ${whole(plan.links_in_doubt)} in doubt): a link is never taken off without you. A link both models call related stays.`
+      ? `${some(links, 'link to another Epic is', 'links to other Epics are')} put before you: ${whole(plan.links_unrelated)} that both models call unrelated, ${whole(plan.links_in_doubt)} in doubt. A link is never taken off without you; one word can take off all that both call unrelated, and one can keep all in doubt. A link both models call related stays.`
       : 'A link to another Epic that the models find unrelated is put before you: a link is never taken off without you.',
   );
   if (plan.only)
@@ -370,10 +373,20 @@ export function EpicsAndStories({ project }: { project: string }) {
   const [busy, setBusy] = useState(false);
   const shown = useResource<Shown>(apiUrl(path), busy ? 4000 : 30000, { keepPreviousData: true });
   const [tick, setTick] = useState(0);
-  const [asking, setAsking] = useState<'start' | 'undo' | null>(null);
+  const [asking, setAsking] = useState<'start' | 'undo' | 'take_off' | 'keep' | null>(null);
   const changed = () => {
     setTick((value) => value + 1);
     shown.reload();
+  };
+  // One word for many: the server answers some at a time and says how many are left.
+  const answerAll = async (group: 'unrelated' | 'in_doubt', choice: 'take_off' | 'keep') => {
+    for (;;) {
+      const said = await postJson<{ answered: number; skipped: number; left: number }>(path + '/groups', {
+        group,
+        choice,
+      });
+      if (!said.left || said.answered + said.skipped === 0) return;
+    }
   };
   const data = shown.data;
   const run = data?.run ?? null;
@@ -449,6 +462,31 @@ export function EpicsAndStories({ project }: { project: string }) {
                 }
               />
             ) : null}
+            {!live && data.waiting.unrelated + data.waiting.in_doubt > 0 ? (
+              <section className="grid gap-2 rounded-lg border border-border p-3">
+                <p className="text-sm text-muted-foreground">
+                  Of what needs you,{' '}
+                  {some(
+                    data.waiting.unrelated + data.waiting.in_doubt,
+                    'case is a link to another Epic',
+                    'cases are links to other Epics',
+                  )}
+                  . They can be answered one by one below, or together.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {data.waiting.unrelated ? (
+                    <Button size="sm" variant="secondary" onClick={() => setAsking('take_off')}>
+                      Take off the {some(data.waiting.unrelated, 'link', 'links')} both models call unrelated
+                    </Button>
+                  ) : null}
+                  {data.waiting.in_doubt ? (
+                    <Button size="sm" variant="secondary" onClick={() => setAsking('keep')}>
+                      Keep the {some(data.waiting.in_doubt, 'link', 'links')} in doubt
+                    </Button>
+                  ) : null}
+                </div>
+              </section>
+            ) : null}
             {run || data.lists.needs_you + data.lists.done > 0 ? (
               <ListsSection<Line>
                 path={path}
@@ -469,6 +507,33 @@ export function EpicsAndStories({ project }: { project: string }) {
             about={planSaid(data.plan).join(' ')}
             action="Check and organize"
             run={() => postJson(path + '/runs')}
+            onClose={() => setAsking(null)}
+            onDone={() => {
+              setAsking(null);
+              changed();
+            }}
+          />
+        ) : null}
+        {asking === 'take_off' && data ? (
+          <Confirm
+            title="Take these links off?"
+            about={`${some(data.waiting.unrelated, 'link to another Epic is', 'links to other Epics are')} taken off: those that both models, each without seeing the other’s answer, found to have nothing to do with the User Story. Every Story keeps its one Epic and its other Epics. Each link is listed under Done and can be put back for ${data.undo_days} days.`}
+            action="Take them off"
+            destructive
+            run={() => answerAll('unrelated', 'take_off')}
+            onClose={() => setAsking(null)}
+            onDone={() => {
+              setAsking(null);
+              changed();
+            }}
+          />
+        ) : null}
+        {asking === 'keep' && data ? (
+          <Confirm
+            title="Keep these links?"
+            about={`${some(data.waiting.in_doubt, 'link to another Epic stays', 'links to other Epics stay')} as it is: those the models did not agree on or could not tell about. They leave this list and are not put before you again.`}
+            action="Keep them"
+            run={() => answerAll('in_doubt', 'keep')}
             onClose={() => setAsking(null)}
             onDone={() => {
               setAsking(null);

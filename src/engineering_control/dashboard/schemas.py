@@ -396,6 +396,13 @@ class OrganizeAnswerInput(PlainChangeInput):
     story_id: UUID | None = None
 
 
+class OrganizeGroupAnswerInput(PlainChangeInput):
+    # One word for every link of a group that waits: those both models call unrelated
+    # are taken off or kept; those in doubt are kept.
+    group: Literal["unrelated", "in_doubt"]
+    choice: Literal["take_off", "keep"]
+
+
 class OrganizeEpicAnswerInput(PlainChangeInput):
     # What the administrator says of a case: the User Story belongs to that Epic, or is
     # left as it is; a link to another Epic is taken off or kept.

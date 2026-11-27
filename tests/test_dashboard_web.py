@@ -320,6 +320,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/organize/stories-issues/runs/{run}/undo",
         "/api/dashboard/projects/{name}/organize/epics-stories/runs",
         "/api/dashboard/projects/{name}/organize/epics-stories/control",
+        "/api/dashboard/projects/{name}/organize/epics-stories/groups",
         "/api/dashboard/projects/{name}/organize/epics-stories/lines/{line}",
         "/api/dashboard/projects/{name}/organize/epics-stories/lines/{line}/undo",
         "/api/dashboard/projects/{name}/organize/epics-stories/runs/{run}/undo",

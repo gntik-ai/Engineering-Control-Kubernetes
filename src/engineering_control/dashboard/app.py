@@ -124,6 +124,7 @@ from engineering_control.dashboard.schemas import (
     OrganizeAnswerInput,
     OrganizeControlInput,
     OrganizeEpicAnswerInput,
+    OrganizeGroupAnswerInput,
     OrphanApproveInput,
     OrphanDraftInput,
     OrphanLinkInput,
@@ -2372,6 +2373,18 @@ def create_app(
             OrganizeControlInput,
             lambda b: asyncio.to_thread(repo(request).organize_epics.control, name, b.action),
             event="organize.controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/organize/epics-stories/groups")
+    async def organize_epics_answer_many(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeGroupAnswerInput,
+            lambda b: asyncio.to_thread(
+                repo(request).organize_epics.answer_many, name, b.group, b.choice
+            ),
+            event="organize.answered",
             subject=name,
         )
 

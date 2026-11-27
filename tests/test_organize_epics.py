@@ -226,36 +226,25 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
             },
         )
         asked(repo, model)
-        # First which Epic each Story belongs to, then what its other Epics are to it.
-        kinds = [kind for _model, _story, kind in model.calls]
-        assert kinds == sorted(kinds, key=["one", "links"].index) and set(kinds) == {
-            "one",
-            "links",
-        }
+        # No Story has its one Epic yet: nobody is asked about a Story's other Epics.
+        assert {kind for _model, _story, kind in model.calls} == {"one"}
         after = shown(client)
-        run_ = after["run"]
-        assert run_["state"] == "complete" and run_["asking"] is None and run_["cost"] > 0
-        assert all(stage["reached"] for stage in run_["stages"])
-        # Nothing was applied: the project's record does not allow it yet, and a link
-        # is never taken off without the administrator.
-        assert after["lists"] == {"needs_you": 4, "done": 0, "created": 0}
-        assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[BILLING], ids[OPERATIONS]}
+        first = after["run"]
+        assert first["state"] == "complete" and first["asking"] is None and first["cost"] > 0
+        assert all(stage["reached"] for stage in first["stages"])
+        # Nothing was applied: the project's record does not allow it yet.
+        assert after["lists"] == {"needs_you": 2, "done": 0, "created": 0}
         needs = lines(client, "needs_you")
         assert [(line["subject"]["title"], line["case"]) for line in needs] == [
             (FAILURES, "differ"),
-            (AUDIT, "link_differ"),
-            (AUDIT, "link_unrelated"),
             (AUDIT, "settled"),
         ]
-        differ, link_differ, unrelated, settled = needs
+        differ, settled = needs
         assert "not applied by itself" in settled["reason"]
         (chosen,) = [entry for entry in settled["candidates"] if entry["chosen"]]
         assert chosen["title"] == TRAIL and chosen["judge"]
         assert [said["by"] for said in settled["said"]] == ["analysis", "other"]
         assert settled["said"][0]["epic"] == TRAIL and settled["said"][0]["passages"]
-        assert [entry["title"] for entry in unrelated["candidates"]] == [BILLING]
-        assert [said["answer"] for said in unrelated["said"]] == ["unrelated", "unrelated"]
-        assert [said["answer"] for said in link_differ["said"]] == ["unrelated", "part"]
 
         # The administrator's word makes it the Story's one Epic; undo takes it back.
         assert answer(client, settled, "epic", str(uuid4())).status_code == 422
@@ -276,21 +265,46 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
         assert back["subject"]["title"] == AUDIT and "You took this back" in back["reason"]
         assert answer(client, back, "epic", chosen["id"]).status_code == 200
 
-        # A link both models call unrelated is taken off at the administrator's word,
-        # and put back when they take that back.
+        # Now that the Story has its one Epic, the next run asks what its other Epics
+        # are to it. Nothing is taken off: both links wait for the administrator.
+        assert shown(client)["plan"]["links_to_ask"] == 1
+        assert post(client, "organize/epics-stories/runs").status_code == 200
+        asked(repo, model)
+        assert {story for _model, story, kind in model.calls if kind == "links"} == {AUDIT}
+        again = shown(client)
+        second = again["run"]
+        assert again["waiting"] == {"unrelated": 1, "in_doubt": 1}
+        # The case that waited from the first run is the same line, not a second one.
+        assert again["lists"]["needs_you"] == 3
+        assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[BILLING], ids[OPERATIONS]}
+        links = {line["case"]: line for line in lines(client, "needs_you")}
+        assert set(links) == {"differ", "link_differ", "link_unrelated"}
+        unrelated, link_differ = links["link_unrelated"], links["link_differ"]
+        assert [entry["title"] for entry in unrelated["candidates"]] == [BILLING]
+        assert [said["answer"] for said in unrelated["said"]] == ["unrelated", "unrelated"]
+        assert [said["answer"] for said in link_differ["said"]] == ["unrelated", "part"]
+
+        # One word takes off every link both models call unrelated; a link in doubt
+        # cannot be taken off that way.
+        many = "organize/epics-stories/groups"
+        assert post(client, many, group="in_doubt", choice="take_off").status_code == 422
         assert answer(client, unrelated, "epic", chosen["id"]).status_code == 422
-        assert answer(client, unrelated, "take_off").status_code == 200
+        taken = post(client, many, group="unrelated", choice="take_off")
+        assert taken.json() == {"answered": 1, "skipped": 0, "left": 0}
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[OPERATIONS]}
+        # Taken back, the link stands again and the case waits; taken off once more.
         off = next(line for line in lines(client, "done") if line["case"] == "link_off")
         assert post(client, f"organize/epics-stories/lines/{off['id']}/undo").status_code == 200
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[BILLING], ids[OPERATIONS]}
-        again = next(line for line in lines(client, "needs_you") if line["case"] == "undone")
-        assert "stands again" in again["reason"]
-        assert answer(client, again, "take_off").status_code == 200
+        waits = next(line for line in lines(client, "needs_you") if line["case"] == "undone")
+        assert "stands again" in waits["reason"]
+        assert answer(client, waits, "take_off").status_code == 200
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[OPERATIONS]}
 
-        # Kept, a link leaves the list and is not put before the administrator again.
-        assert answer(client, link_differ, "keep").status_code == 200
+        # Kept, the links in doubt leave the list and are not put before the
+        # administrator again.
+        kept = post(client, many, group="in_doubt", choice="keep")
+        assert kept.json() == {"answered": 1, "skipped": 0, "left": 0}
         # Left as it is, a Story under several Epics is counted as left.
         assert answer(client, differ, "leave").status_code == 200
         assert lines(client, "needs_you") == []
@@ -301,11 +315,13 @@ def test_one_button_gives_each_story_its_epic_or_puts_it_before_you(
         asked(repo, Both({}))
         assert shown(client)["lists"]["needs_you"] == 0
 
-        # Everything the first run applied is taken back at once.
-        undone = post(client, f"organize/epics-stories/runs/{run_['id']}/undo")
-        assert undone.json() == {"undone": 2, "kept": 0}
-        assert one_epic(repo, ids[AUDIT]) is None
+        # Everything a run applied is taken back at once.
+        undone = post(client, f"organize/epics-stories/runs/{second['id']}/undo")
+        assert undone.json() == {"undone": 1, "kept": 0}
         assert epics_of(repo, ids[AUDIT]) == {ids[TRAIL], ids[BILLING], ids[OPERATIONS]}
+        undone = post(client, f"organize/epics-stories/runs/{first['id']}/undo")
+        assert undone.json() == {"undone": 1, "kept": 0}
+        assert one_epic(repo, ids[AUDIT]) is None
         assert client.get(f"{HERE}/lines/elsewhere").status_code == 422
         assert post(client, f"organize/epics-stories/lines/{uuid4()}/undo").status_code == 404
     finally:

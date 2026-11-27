@@ -91,7 +91,15 @@ DOUBT: Final = {
     "back": 0.5,
     "settled": 0.2,
 }
-LINK: Final = {"differ": 0.8, "unclear": 0.7, "alone": 0.6, "unrelated": 0.3}
+LINK: Final = {"differ": 0.8, "unclear": 0.7, "unchecked": 0.65, "alone": 0.6, "unrelated": 0.3}
+# The link cases that can be answered together, with one word: those both models call
+# unrelated, taken off or kept; and those in doubt, kept.
+GROUPS: Final = {
+    "unrelated": (("link_unrelated",), ("take_off", "keep")),
+    "in_doubt": (("link_differ", "link_unclear", "link_unchecked", "link_alone"), ("keep",)),
+}
+# How many lines one request answers: the page asks again until none is left.
+CHUNK: Final = 25
 ONLY: Final = 0.45
 # A Story's own Epic has to be this far down both rankings to be called in question:
 # not among the first five, or the first third where the project has few Epics.
@@ -217,21 +225,29 @@ class EpicsRun:
         return cases
 
     @staticmethod
-    def _links(db: Session, project: ProjectRecord) -> tuple[int, list[dict[str, Any]]]:
+    def _links(
+        db: Session, project: ProjectRecord, chosen: set[UUID], soon: set[UUID]
+    ) -> tuple[int, list[dict[str, Any]]]:
         """The Epics a Story is under beside its one Epic, as two models judged them:
         how many Stories still wait to be asked about, and every judged link that is
-        not settled, with what each model said. A link both call related is settled."""
+        not settled, with what each model said. A link both call related is settled.
+
+        Only for a Story whose one Epic is chosen (or, for the count, will be by rule
+        when the run starts): what its other Epics are to it is asked once that is
+        known, since the answer is about the Epics beside that one."""
         scope = epic_links._Scope(db, project)
         known = parent_choice.reviews(db, project.id, OTHERS)
         to_ask = 0
         for child in scope.children():
+            if child.id not in chosen and child.id not in soon:
+                continue
             listed = scope.shortlist(child)
             review = known.get(child.id)
             current = parent_choice.standing(scope, child, listed, review)
             to_ask += parent_choice.to_ask(review, current, False)
         found = []
         for story, review, entry, stands in epic_links._findings(db, project, scope):
-            if not stands:
+            if not stands or story.id not in chosen:
                 continue
             first = str(entry.get("answer"))
             second = epic_links.second_opinion(review, entry)
@@ -239,6 +255,9 @@ class EpicsRun:
                 continue
             if first == "unclear" and second in (None, "unclear"):
                 case = "unclear"
+            elif first == "unrelated" and not entry.get("found"):
+                # It would be taken off on a passage that is not in the Epic's text.
+                case = "unchecked"
             elif first == "unrelated" and second == "unrelated":
                 case = "unrelated"
             elif first == "unrelated" and second is None:
@@ -412,7 +431,12 @@ class EpicsRun:
             project = active_project(db, name)
             read = self._read(db, project)
             cases = self._cases(db, project)
-            links_to_ask, links = self._links(db, project)
+            links_to_ask, links = self._links(
+                db,
+                project,
+                read["chosen"],
+                {case["story"].id for case in cases if case["story"].stated},
+            )
             kept = self._kept(db, project.id)
             links = [
                 entry
@@ -504,8 +528,8 @@ class EpicsRun:
                     "stated": stated,
                     "settled": sum(1 for case in cases if case["stands"] == "settled"),
                     "links_to_ask": links_to_ask,
-                    "links_unrelated": sum(1 for e in links if e["case"] != "differ"),
-                    "links_in_doubt": sum(1 for e in links if e["case"] == "differ"),
+                    "links_unrelated": sum(1 for e in links if e["case"] == "unrelated"),
+                    "links_in_doubt": sum(1 for e in links if e["case"] != "unrelated"),
                     "only": len(only),
                     "answer": plan["answer"],
                     "judge": plan["judge"],
@@ -522,8 +546,24 @@ class EpicsRun:
                 "run": self._shown_run(db, run) if run else None,
                 "runs": len(runs),
                 "lists": organize.list_counts(db, project.id, KIND),
+                # Of what needs you: the links that can be answered together.
+                "waiting": self._waiting(db, project.id),
                 "undo_days": organize.UNDO.days,
             }
+
+    @staticmethod
+    def _waiting(db: Session, project: UUID) -> dict[str, int]:
+        found = dict.fromkeys(GROUPS, 0)
+        for case in db.scalars(
+            select(OrganizeLine.case).where(
+                organize.lines_where(project, KIND),
+                OrganizeLine.listed == "needs_you",
+                OrganizeLine.state == "open",
+            )
+        ):
+            for group, (cases, _choices) in GROUPS.items():
+                found[group] += case in cases
+        return found
 
     @staticmethod
     def _shown_run(db: Session, run: OrganizeRun) -> dict[str, Any]:
@@ -658,9 +698,17 @@ class EpicsRun:
             )
         if under_way:
             return str(under_way)
-        service: Any = self.primary if check == ONE else self.others
         try:
-            return str(service.start(name, "", "", None)["id"])
+            if check == ONE:
+                return str(self.primary.start(name, "", "", None)["id"])
+            # What a Story's other Epics are to it is asked once its one Epic is chosen.
+            self.links.reconcile_project(name)
+            with self.sessions() as db:
+                chosen = self._read(db, active_project(db, name))["chosen"]
+            started = parent_choice.start(
+                self.sessions, name, OTHERS, only=lambda child, _listed: child.id in chosen
+            )
+            return str(started["id"])
         except (ProjectInvalid, ProjectConflict) as nothing:
             log.info("Organize did not start %s for %s: %s", check, name, nothing)
             return None
@@ -795,8 +843,7 @@ class EpicsRun:
                     )
                 )
                 if (line.action or {}).get("op") == op
-                and str((line.action or {}).get("epic") or "")
-                == (epic if op == "epic_link" else "")
+                and (op != "epic_link" or str((line.action or {}).get("epic") or "") == epic)
             ),
             None,
         )
@@ -911,7 +958,7 @@ class EpicsRun:
             run = db.get_one(OrganizeRun, key)
             read = self._read(db, project)
             kept = self._kept(db, project.id)
-            _, links = self._links(db, project)
+            _, links = self._links(db, project, read["chosen"], set())
             seen: set[tuple[UUID, str, str]] = set()
             for entry in links:
                 story, epic = entry["story"], str(entry["epic"])
@@ -960,6 +1007,8 @@ class EpicsRun:
                     "differ": "The two models did not say the same of this link.",
                     "unclear": "No model could tell whether the User Story has to do with "
                     "this Epic.",
+                    "unchecked": "A model found the User Story unrelated to this Epic, on a "
+                    "passage that is not in the Epic's text.",
                 }[entry["case"]]
                 line.doubt = LINK[entry["case"]]
                 line.action = {"op": "epic_link", "story": str(story.id), "epic": epic}
@@ -1195,6 +1244,38 @@ class EpicsRun:
                     for entry in line.candidates or []
                 ]
         return {"id": str(key), "state": state}
+
+    def answer_many(self, name: str, group: str, choice: str) -> dict[str, int]:
+        """One word for many: every link of that group that waits is taken off, or
+        kept. A request answers some of them and says how many are left."""
+        if group not in GROUPS or choice not in GROUPS[group][1]:
+            raise ProjectInvalid("That cannot be answered for all of them at once.")
+        with self.sessions() as db:
+            project = active_project(db, name)
+            keys = list(
+                db.scalars(
+                    select(OrganizeLine.id)
+                    .where(
+                        organize.lines_where(project.id, KIND),
+                        OrganizeLine.listed == "needs_you",
+                        OrganizeLine.state == "open",
+                        OrganizeLine.case.in_(GROUPS[group][0]),
+                    )
+                    .order_by(OrganizeLine.created_at, OrganizeLine.id)
+                )
+            )
+        answered = skipped = 0
+        for key in keys[:CHUNK]:
+            try:
+                skipped += self.answer(name, key, choice)["state"] == "skipped"
+                answered += 1
+            except (ProjectConflict, ProjectNotFound):
+                skipped += 1
+        return {
+            "answered": answered - skipped if answered else 0,
+            "skipped": skipped,
+            "left": max(0, len(keys) - CHUNK),
+        }
 
     def _undo(self, name: str, key: UUID) -> None:
         with self.sessions() as db:
