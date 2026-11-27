@@ -34,6 +34,10 @@ from engineering_control.github_app import GitHubApp, GitHubAppError
 
 LOGGER = logging.getLogger(__name__)
 CLOSE_ISSUE = "close_issue"
+NOT_AN_ISSUE = (
+    "This record calls itself an Epic or a User Story. Those are kept here and are not "
+    "written to GitHub: only Issues are."
+)
 
 
 def action_row(action: WorkspaceAction) -> dict[str, Any]:
@@ -215,6 +219,13 @@ class WorkspacePublishing:
                 item = session.get(BacklogItem, action.local_id)
                 if item is None or item.workspace_review != "publishing":
                     raise ProjectConflict("This issue no longer has a recorded approval")
+                if planning_kind({"title": item.title, "body": item.description}):
+                    # Only Issues are on GitHub. What calls itself an Epic or a User
+                    # Story is a record here and is never written there.
+                    action.status, action.detail = "blocked", NOT_AN_ISSUE
+                    session.flush()
+                    session.expunge(action)
+                    return action, "", ""
                 title, body = item.title, item.description or ""
             if action.operation == "label":
                 item = session.get(BacklogItem, action.local_id)

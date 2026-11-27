@@ -1424,6 +1424,89 @@ class ReorgLine(UUIDPrimaryKey, Timestamps, Base):
     detail: Mapped[str | None] = mapped_column(Text)
 
 
+class OrganizeRun(UUIDPrimaryKey, Timestamps, Base):
+    """One run of Organize or of Coverage over a project (migration 0095): the one kind of
+    run the two pages of Reviews have. It goes through the same stages whatever it
+    organizes, and what it finds is kept as lines in three lists.
+
+    ``kind`` says what is organized: ``stories_issues`` (User Stories and Issues),
+    ``epics_stories`` (Epics and User Stories) or ``coverage`` (the documentation against
+    all three)."""
+
+    __tablename__ = "organize_runs"
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    # proposed while it shows what it would ask and cost and waits for the word; running;
+    # held at a limit of Settings; stopped by the administrator; complete; failed.
+    state: Mapped[str] = mapped_column(String(16), index=True, default="proposed")
+    # The stage it is in: read, match, verify, create, done.
+    stage: Mapped[str] = mapped_column(String(8), default="read")
+    # How many records each stage took in and how it left them: for each stage that
+    # began, ``{"records": n, "settled": n, "in_doubt": n, "none": n}``.
+    counts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # What it said it would ask before it began: questions, tokens, the models, and the
+    # most it can cost in US dollars.
+    estimate: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # The US dollars it stops at, and what it used and cost so far.
+    dollar_cap: Mapped[float | None] = mapped_column(Float)
+    spent: Mapped[int] = mapped_column(BigInteger, default=0)
+    cost: Mapped[float] = mapped_column(Float, default=0.0)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    # Started by itself, because the project's settings ask for it.
+    auto: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When all of it was undone.
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OrganizeLine(UUIDPrimaryKey, Timestamps, Base):
+    """One result of a run (migration 0095), in one of its three lists: ``needs_you`` (a
+    case in doubt, for the administrator), ``done`` (a link made or corrected) or
+    ``created`` (a record the run made)."""
+
+    __tablename__ = "organize_lines"
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("organize_runs.id", ondelete="CASCADE"), index=True
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    listed: Mapped[str] = mapped_column(String(12), index=True)
+    # What the case is: linked, moved, taken off, close, split, created, and so on.
+    case: Mapped[str] = mapped_column(String(24))
+    # The record it is about: epics, stories, issues, or a part of a document.
+    subject_kind: Mapped[str] = mapped_column(String(12))
+    subject_id: Mapped[UUID | None] = mapped_column(Uuid)
+    # For a part of a document: its path and heading.
+    subject_ref: Mapped[str | None] = mapped_column(String(900))
+    title: Mapped[str] = mapped_column(String(300), default="")
+    # The records it could go with: id, kind, title and how close each is.
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # What each stage said of it, in order: the stage, who said it, the answer, the
+    # reason, and the passages it quoted.
+    said: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    # How doubtful it is, from 0 to 1: the list "Needs you" shows the most doubtful first.
+    doubt: Mapped[float] = mapped_column(Float, default=0.0)
+    # What was done, or would be: the operation and the records it names.
+    action: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # How things stood before it was done, to put them back.
+    before: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # For a record the run made: what it is, and what it was made from.
+    made_kind: Mapped[str | None] = mapped_column(String(12))
+    made_id: Mapped[UUID | None] = mapped_column(Uuid)
+    sources: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    # open (waits for the administrator), answered, applied, skipped (the plan had
+    # changed) or undone.
+    state: Mapped[str] = mapped_column(String(12), default="open", index=True)
+    answer: Mapped[str | None] = mapped_column(String(24))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ProjectReviewBudget(Base):
     """An administrator's cumulative allowance for this project's model reviews."""
 

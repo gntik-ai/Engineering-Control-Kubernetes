@@ -73,7 +73,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     # 0092 keeps which checks a project runs by itself.
     # 0093 keeps what a judge said to each proposed planning record.
     # 0094 keeps what caused a bug, when it is known.
-    assert (head, parent) == ("0094", "0093")
+    # 0095 keeps the runs of Organize and of Coverage, and what each found.
+    assert (head, parent) == ("0095", "0094")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -181,7 +182,10 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
             text("SELECT dollar_limit, dollars_from FROM review_settings")
         ).all()
     assert limits and all(row[0] == 3.0 and row[1] is not None for row in limits)
+    assert {"organize_runs", "organize_lines"} <= set(inspect(engine).get_table_names())
     command.downgrade(config, parent)
+    assert not {"organize_runs", "organize_lines"} & set(inspect(engine).get_table_names())
+    command.downgrade(config, "0093")
     assert "caused_by" not in {
         column["name"] for column in inspect(engine).get_columns("bug_records")
     }

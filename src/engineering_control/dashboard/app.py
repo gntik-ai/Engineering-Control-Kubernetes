@@ -2171,6 +2171,36 @@ def create_app(
         """Everything in Reviews that waits for the administrator, in one list."""
         return await documents_read(request, lambda: repo(request).needs_you.listed(name))
 
+    @app.get("/api/dashboard/projects/{name}/organize/ground")
+    async def organize_ground_api(name: str, request: Request, fresh: bool = False) -> Response:
+        """What a first run of Organize and of Coverage would meet in the project."""
+        return await documents_read(
+            request, lambda: repo(request).organize.ground(name, fresh=fresh)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/organize/runs/{key}/{listed}")
+    async def organize_lines_api(
+        name: str,
+        key: UUID,
+        listed: Literal["needs_you", "done", "created"],
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ) -> Response:
+        """One of a run's three lists: what needs you, what was done, what was created."""
+        return await documents_read(
+            request, lambda: repo(request).organize.lines(name, key, listed, page, page_size)
+        )
+
+    @app.get("/api/dashboard/projects/{name}/organize/{kind}")
+    async def organize_api(
+        name: str,
+        kind: Literal["stories_issues", "epics_stories", "coverage"],
+        request: Request,
+    ) -> Response:
+        """The run of that kind under way, or the last one, with its stages and lists."""
+        return await documents_read(request, lambda: repo(request).organize.overview(name, kind))
+
     @app.get("/api/dashboard/projects/{name}/arrivals")
     async def arrivals_api(
         name: str, request: Request, days: int = Query(14, ge=1, le=90)
