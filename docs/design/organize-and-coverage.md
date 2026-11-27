@@ -329,7 +329,7 @@ So the point stands, and the plan needed adjusting.
 
 ### Which projects are connected
 
-Only one connection is recorded. The repositories name each other more than that. Counted in the local copies of five repositories (falcone-serverless has no local copy), as documents that name the other repository:
+Connections are made by the administrator on the Connections page of a project, which exists: the two projects, which depends on which, and what the connection is for. The platform records none by itself and proposes none. Only one is recorded on live. For reference, the repositories name each other as follows (counted in the local copies of five repositories; falcone-serverless has no local copy):
 
 | Pair | Evidence | Recorded |
 | --- | --- | --- |
@@ -342,52 +342,62 @@ Only one connection is recorded. The repositories name each other more than that
 | falcone and musematic | 8 documents of falcone | No, and weak |
 | falcone-workflow and llmwiki; falcone-workflow and musematic | 5 documents each | No, and weak |
 
-Which of these are connections is the administrator's to say. The platform will propose them with this evidence and record none by itself.
+### When a connection is added (the administrator, 27 November 2026)
 
-### The adjustment
+Stated by the administrator: the page already offers the connections service; what the system must do, every time a connection is added, is prepare a plan for updating and verifying the requirements, and then propose and review the changes to the entities.
 
-**A run works on a scope: the project and the projects connected to it.** Every record and every part of a document keeps the project it belongs to, and every line of a list names it.
+**What the service does today.** Adding a connection queues its analysis at once. A model is asked about the records six at a time: each record of one project with the four records of each kind of the other that share the most words with it. It suggests links, edits and missing records, a judge is asked the same, and every suggestion waits for the administrator. There is no plan and no cost said beforehand; the documentation of the projects is not read; the candidates are by shared words, not by the ranking service; and nothing is staged, so the administrator meets 614 pending findings in one list.
+
+**What it becomes.** A connection is worked through by the same kind of run as everything else (O0), in three steps.
+
+1. **The plan, prepared at once when the connection is added or changed.** No model is asked for it, so it costs nothing and is there within moments. It has two halves:
+   - *Requirements to update.* What of each project the connection touches, counted and listed: the Epics, User Stories, Issues and parts of the documentation of one project that concern the other. Found by what is stated (a record or document that names the other repository, its package or one of its issues) and by closeness (the ranking service, across the two projects). Sorted by what is expected of each: a link across the projects, a text to compare with the other project's, something one project's documentation asks of the other that nothing there covers, and twins (the same thing recorded in both).
+   - *How it will be verified.* For each group: which stages check it and in what order, on how many records, by which models of which makers, what a quoted passage has to match, what is applied and what is only shown, and the most the run can cost. Also what the run will not do: it closes and deletes nothing.
+
+   The plan is shown on the connection's page. Nothing is asked of a model before the administrator's word.
+2. **Changes are proposed for the entities.** The run goes through Match, Verify and Create over the two projects and proposes, for Epics, User Stories and Issues of both: links across the projects, corrected texts, and new records for what is missing. A new record is proposed in the project that has to do the work.
+3. **The changes are reviewed.** Each proposal is answered a second time by a model of another maker that does not see the first answer, and every passage it quotes has to be found in the text. The result is the three lists: "Needs you" for what is in doubt, "Done" for what was applied, "Created" for new records, each line with its project.
+
+What is applied without asking follows the decisions that stand: a link both models agree on (26 November), a new Epic or User Story (decision 2); a new Issue is kept here until published (decision 1). A changed text of an existing record is always shown first, with the text before and after.
+
+**When either project changes later** (a new record, a changed document), the plan is brought up to date for what changed and says so; in O6 it is then carried out within Settings.
+
+**The connection on live.** Its 500 approved findings stay as links. Its 614 pending findings are taken into its first plan as proposals still to be reviewed. Its old analysis is not resumed.
+
+### Runs of Organize and Coverage over connected projects
+
+The administrator's first point stands beside this: a review, a reorganization or a discovery of one project reads the connected projects as part of it. **A run works on a scope: the project and the projects connected to it.** Every record and every part of a document keeps the project it belongs to, and every line of a list names it.
 
 | Stage | With connected projects |
 | --- | --- |
 | Read | The records, links and documents of the whole scope. The documents of a connected project are read as documentation of the project |
 | Match | Candidates come from the whole scope. A parent may be a record of a connected project: the link crosses projects, as the links of a connection do today |
-| Verify | The models see each candidate with its project. An approved link of a connection is a stated link; a pending one is a candidate like any other |
+| Verify | The models see each candidate with its project. An approved link of a connection is a stated link |
 | "Has none" | Said only when nothing in the whole scope fits |
-| Create | A twin is searched in the whole scope, so that nothing is created that a connected project holds. **A run creates only in its own project.** What belongs in a connected project is left to that project's run and shown in "Needs you" as such |
+| Create | A twin is searched in the whole scope, so that nothing is created that a connected project holds. A run of one project creates only in that project; what belongs in a connected one is the business of the connection's own run |
 | Coverage | A part of the project's documentation is covered by a record of any project of the scope. The parts of connected documentation that ask something of this project are counted beside it, each covered or not |
-| Done, undo | A link across projects is undone like any other |
 
-Further rules:
+Rules taken as recommended unless the administrator says otherwise:
 
-- **Direct connections only.** A project connected to a connected project is not in the scope, unless the administrator says so. Otherwise falcone would bring in every project.
+- **Direct connections only.** A project connected to a connected project is not in the scope. Otherwise falcone would bring in every project.
 - **Makers.** A question that holds text of two projects goes only to makers both projects allow.
-- **Money.** A run is charged to the project it was started in. A larger scope costs more, and the estimate shown before the run says so.
-- **The connection's own analysis is taken into the run.** Its question (which records of two projects belong together) is the question of Match and Verify over a scope. Its 500 approved findings stay as links. Its 614 pending ones go through Verify and end in "Done" or "Needs you". Its own run is not resumed, and its view goes in O5 with the others.
-- **A change in a connected project** (a new record, a changed document) puts the records it touches up for checking again, in O6.
+- **Money.** A run is charged to the project it was started in; a connection's run to the project the connection was made in. The plan says the most it can cost.
 
 ### Phases, adjusted
 
-One phase is added before O1, because the first button already has to draw its candidates from the scope.
+One phase is added before O1, because the first button already has to draw its candidates from the scope, and because a connection added tomorrow should get its plan.
 
 | Phase | What | Done when |
 | --- | --- | --- |
 | O0 | Built | |
-| **OC** | **Connected projects as one scope.** A run and its lines carry the scope and the project of every record. The count of O0 says what each connected project brings. Candidates are drawn across the scope by the ranking service, and the links of connections are read as links. Connections are proposed from evidence, for the administrator to confirm, in Settings. The makers rule | For a Falcone Issue the candidates include Stories of falcone-serverless; the count shows each project with its scope; and no question goes to a maker one of its projects does not allow |
-| O1 | As before, over the scope. The pending Issue links of the connection (334) go through it | As before, with every line naming its project |
+| **OC** | **Connections.** (1) Adding or changing a connection prepares its plan: the requirements to update and how they will be verified, with the most it can cost, on the connection's page. (2) At the administrator's word the run proposes the changes for Epics, User Stories and Issues of both projects and reviews each with a second model, into the three lists, with undo. (3) Runs and their lines carry the scope and the project of every record; candidates are drawn across the scope by the ranking service; the makers rule. The old analysis is replaced, its findings kept | A connection added on the page shows its plan without a model being asked; carrying it out fills the three lists for the two projects; and for a Falcone Issue the candidates include Stories of falcone-serverless |
+| O1 | As before, over the scope, every line naming its project | As before |
 | O2 | As before, over the scope | As before |
-| O3 | As before. Twins are searched in the scope; a run creates only in its own project | As before, and nothing is created that a connected project holds |
+| O3 | As before. Twins are searched in the scope; a run of one project creates only in it | As before, and nothing is created that a connected project holds |
 | O4 | As before. Connected documentation is read as documentation; the second number | As before, and the parts of connected documents that ask something of the project are counted |
-| O5 | As before. The view of a connection and its own analysis are removed; connections are kept in Settings | As before |
-| O6 | As before. A change in a connected project is taken up | As before, across the scope |
+| O5 | As before. The Connections page stays, in the shape of the other two | As before |
+| O6 | As before. A change in a connected project brings the connection's plan up to date and is carried out within Settings | As before, across the scope |
 
-### Decisions needed
+### What is still the administrator's to say
 
-| # | Question | Recommended |
-| --- | --- | --- |
-| 9 | Which projects are connected? The table above lists what the repositories say | Confirm the first six pairs; leave the weak ones |
-| 10 | Direct connections only, or also the connections of connected projects? | **Direct only** |
-| 11 | A run creates records only in its own project; what belongs in a connected one is shown and left to that project's run. Agreed? | **Yes** |
-| 12 | Text of two projects goes only to makers both allow. Agreed? | **Yes** |
-| 13 | The connection's own analysis is not resumed: its pending findings go through Organize, and its view is removed in O5. Agreed? | **Yes** |
-
+Nothing blocks OC. Three points are taken as written above unless the administrator says otherwise: the plan waits for the administrator's word before a model is asked (today the analysis starts by itself); a changed text of an existing record is always shown before it is applied; and only direct connections are in a scope.
