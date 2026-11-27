@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 is built and deployed** ("O0 as built", below); O1 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0 and OC are built and deployed** ("O0 as built" and "OC as built", below); O1 to O6 are not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -401,3 +401,68 @@ One phase is added before O1, because the first button already has to draw its c
 ### What is still the administrator's to say
 
 Nothing blocks OC. Three points are taken as written above unless the administrator says otherwise: the plan waits for the administrator's word before a model is asked (today the analysis starts by itself); a changed text of an existing record is always shown before it is applied; and only direct connections are in a scope.
+
+## OC as built (27 November 2026)
+
+Started at the administrator's word ("go next OC"). The Connections page is the service; what changed is what happens when a connection is added or changed.
+
+### What happens now
+
+1. **Adding or changing a connection prepares its plan. No model is asked.** The worker reads the records of the two projects, records the references one states to the other as findings that wait, and writes the plan as a run in the state `proposed` (the run type of O0, kind `connection`). The connection's state is then "A plan waits for your word".
+2. **The plan has the two halves that were asked for.**
+   - *What is to be updated*, as a table: issues one project names in the other's repository; records whose text names the other project; records that lie close by meaning to a record of the other; the same thing recorded in both; suggestions of an earlier analysis that still wait; parts of the documentation that name the other project; and the records nothing ties to the other project, which no model is asked about. Each row says how many, in which project, what is expected, and who checks it.
+   - *How it will be verified*, as six steps: stated links, candidates, the answer, the review by a second model, what is applied, and the limits. Then what it can cost at most, per model.
+3. **At the administrator's word ("Carry out the plan") the run goes.** Stated references are recorded. Each touched record is put before the answering model, six to a question, with three records of each kind of the other project, drawn by shared words and by meaning joined. A second model of another maker is asked the same without seeing the first answer.
+4. **The results are three lists over the connection**, each line naming the project of its records:
+   - **Needs you:** what only one model said, what no second model was asked about, every changed text and every missing record, the most doubtful first. A changed text is shown as it stands beside what is proposed.
+   - **Done:** links the text states, links both models made, and what the administrator accepted. Each can be undone for 30 days: a link comes off, a text is put back as it stood.
+   - **Created:** records that were missing and were sent, at the administrator's word, to the project that has to make them, as proposals in its planning tables. Undoing withdraws the proposal.
+   A whole run can be undone.
+5. **A change in either project** brings a new plan, which names only what changed since it was asked about: the changed record, and the records it is offered to. Nothing is asked for it by itself.
+
+### Rules that hold
+
+- **A record nothing ties to the other project is not put before a model.** What "close" is, is not a fixed number: how close two texts lie depends on the model that read them. Once a connection has 30 approved links, the threshold is set so that 5 in 100 of them would be missed, and the plan shows the measurement. Before that a default is used, and without the ranking service every record is asked about, as before.
+- **Text of two projects goes only to a maker both allow.** A model one project does not allow blocks the plan and says why; a judge one project does not allow is not asked, and then every suggestion waits.
+- **Money.** The run is charged to the project the connection was made in. A plan estimated above what is left of the month's limit is refused with the estimate, unless the word is to go as far as the limit allows. At the limit the run is held with what it has.
+- **A connection the administrator stopped is never woken by the worker.** Its plan is worked out when its page asks for it, kept only in memory, and nothing is written. Carrying it out is the word to go on.
+- **Nothing is closed and nothing is deleted.**
+
+### What a run of one project got from this
+
+- A run carries its scope: the project and the projects directly connected to it (`organize.scope`), and a line can name the project of its record.
+- The count of O0 says what each connected project brings: its records, and the links across that are approved or wait.
+- `GET /api/dashboard/projects/{name}/organize/candidates/{record}` gives the parents a record could be put under, from the whole scope, each with its project. The buttons of O1 and O2 are what will use it.
+
+### Read on live
+
+The one connection on live (falcone depends on falcone-serverless) is stopped, so its plan was worked out on request: 7 to 10 seconds the first time, a third of a second after. No model was asked and nothing was written.
+
+| | |
+| --- | --- |
+| Records read | 1,628 of falcone, 293 of falcone-serverless; all read by the ranking service |
+| Links the texts state | 130, all in falcone-serverless naming issues of falcone |
+| Records that name the other project | 308 (177 in falcone, 131 in falcone-serverless) |
+| Records close by meaning | 919 (757 in falcone, 162 in falcone-serverless) |
+| The same thing recorded in both | 12 pairs |
+| Earlier suggestions that still wait | 484 |
+| Parts of the documentation that name the other project | 159 (156 in falcone-serverless) |
+| Records nothing ties to the other project | 694, all in falcone: not asked about |
+| To put before the models | 1,227 records in 205 questions, about 3.9 million tokens read |
+| What it can cost | The judge (claude-haiku-5-5): about $0.61. The answering model on record (gpt-6.2-sol): not priced by its account, and that account has no credit |
+| The threshold | 0.71, learned from 423 approved links. Linked pairs lie between 0.71 and 0.86; a record's nearest in the other project between 0.65 and 0.87 |
+| Measured on the 423 approved links | All 423 have a source the plan would put before the models; 354 (84%) would be offered the record they are linked to |
+| Can it be carried out now | No: falcone's reviews have cost $6.11 of the $6.00 allowed this month. The page says so in place of the button |
+
+With the fixed threshold the first version used, 1,914 of the 1,921 records counted as touched and the plan saved nothing. Learned from the approved links, 694 records are left out and the tokens fall from 6.0 to 3.9 million.
+
+Candidates across the scope, on 12 Falcone issues that are linked to a Story of falcone-serverless: all 12 are offered Stories of falcone-serverless, and 11 are offered the Story they are linked to, among ten candidates.
+
+### What is not in OC, and why
+
+- **A missing record is never made without the administrator.** The plan of the phase said a new Epic or User Story both models agree on would be made without asking (decision 2). That decision rests on the careful review of O3 (the search for twins, each sentence checked), which does not exist yet. Until it does, every missing record waits under "Needs you".
+- **The documentation is listed, not checked.** The plan counts and names the parts that name the other project. Checking them against the records is Coverage (O4).
+- **The runs of one project do not read the scope yet.** The scope, the count and the candidates are there; the buttons that use them are O1 and O2.
+- **Nothing is carried out by itself.** A change brings a new plan; carrying it out within Settings is O6.
+- **Not exercised on live:** carrying a plan out, answering and undoing. They need the administrator's word and a model; they are covered by tests and were looked at in a local console.
+
