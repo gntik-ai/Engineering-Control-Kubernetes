@@ -427,9 +427,7 @@ class ChatChannel:
         # The bugs that arrived and were fixed, and what is open.
         lines.extend(bug_numbers.digest_lines(self.sessions, since))
         waiting = [
-            entry
-            for entry in self.toolbox.inbox_entries()
-            if entry["kind"] not in NOT_PRESSING
+            entry for entry in self.toolbox.inbox_entries() if entry["kind"] not in NOT_PRESSING
         ]
         lines.append(
             f"Waiting for you: {_plural(len(waiting), 'thing', 'things')}. /inbox shows them."
