@@ -54,11 +54,19 @@ def test_a_new_issue_is_organized_without_a_button(tmp_path: Path, monkeypatch: 
         assert {entry["check"]: entry["mode"] for entry in standing} == dict.fromkeys(
             organize_auto.RUNS, "off"
         )
-        # A setting that let the check run by itself lets the run now, and the bare
-        # check is no longer started on its own.
+        # A check that was set to run by itself goes on as it was set, and lets no run
+        # start: a run does more than the check, and starts only on its own setting.
         assert post(client, "review-settings", **SAVE, runs={"issue_story": "arrive"}).status_code
-        assert ("falcone", "stories_issues") in repo.organize_auto.asked_for()
+        assert repo.organize_auto.asked_for() == []
+        assert repo.auto_checks.asked_for() == [("falcone", "issue_story")]
+        listed = {e["check"]: e for e in client.get(BASE + "review-settings").json()["runs"]}
+        assert listed["issue_story"]["by_run"] == "Organize: User Stories and Issues"
+        # Once the run starts by itself, it asks the check: the check is not started
+        # on its own as well.
+        both = {"issue_story": "arrive", "stories_issues": "arrive"}
+        assert post(client, "review-settings", **SAVE, runs=both).status_code == 200
         assert repo.auto_checks.asked_for() == []
+        assert repo.organize_auto.asked_for() == [("falcone", "stories_issues")]
         assert (
             post(client, "review-settings", **SAVE, runs={"stories_issues": "arrive"}).status_code
             == 200

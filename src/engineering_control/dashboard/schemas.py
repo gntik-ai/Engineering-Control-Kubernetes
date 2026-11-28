@@ -642,7 +642,7 @@ class ReviewSettingsInput(PlainChangeInput):
     alone: dict[str, Literal["off", "propose", "apply"]] | None = Field(default=None, max_length=8)
     # Which checks run by themselves, by the check: "off", "arrive" or "night". None
     # leaves it as it is.
-    runs: dict[str, Literal["off", "arrive", "night"]] | None = Field(default=None, max_length=8)
+    runs: dict[str, Literal["off", "arrive", "night"]] | None = Field(default=None, max_length=12)
     # The model asked about what the two did not agree on; empty for none.
     third_provider: str = Field(default="", max_length=32)
     third_model: str = Field(default="", max_length=200)

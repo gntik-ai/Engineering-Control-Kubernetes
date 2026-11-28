@@ -625,9 +625,13 @@ class ReviewSettingsService:
                         {
                             **auto_checks.standing(db, project, kind, datetime.now(UTC)),
                             "label": label,
+                            # The run that asks this check, where one does: the check is
+                            # listed only while it is set to start on its own.
+                            "by_run": organize_auto.RUNS.get(auto_checks.BY_RUN.get(kind, "")),
                         }
                         for kind, label in parent_choice.CHECKS.items()
-                        if kind in parent_choice.KINDS and kind not in auto_checks.BY_RUN
+                        if kind in parent_choice.KINDS
+                        and (kind not in auto_checks.BY_RUN or mine.runs.get(kind, "off") != "off")
                     ),
                 ],
                 # The record of each stage since its models were set, and whether going

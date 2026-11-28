@@ -46,6 +46,8 @@ interface Settings {
     due: boolean;
     why: string;
     waiting: number;
+    /** For a check a run asks: the run. The check is listed only while it is set on its own. */
+    by_run?: string | null;
   }[];
   /** The record of each stage since its models were set, and what was set before. */
   stages: {
@@ -666,6 +668,12 @@ export function ReviewSettings({ project }: { project: string }) {
                         onValueChange={(value) => setRuns({ ...runs, [entry.check]: String(value ?? 'off') })}
                       />
                     </label>
+                    {entry.by_run ? (
+                      <p className="text-sm text-muted-foreground">
+                        “{entry.by_run}” asks this check. Where that run starts by itself, this is not started on its
+                        own as well; set to “Only when you start it”, it leaves this list.
+                      </p>
+                    ) : null}
                     {entry.mode !== 'off' ? (
                       <p className="text-sm text-muted-foreground">
                         {entry.due

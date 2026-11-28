@@ -38,9 +38,19 @@ EVERY: Final = timedelta(minutes=30)
 NIGHT: Final = (1, 5)
 # A record a model gave no usable answer about is not asked again by itself before this.
 RETRY: Final = timedelta(hours=24)
-# The checks a run of Organize asks. They are not started by themselves on their own
-# any more: the run is, where the settings say so, and it gathers what they answer.
-BY_RUN: Final = frozenset({"issue_story", "story_epic", "epic_links"})
+# The checks a run of Organize asks, and the run that asks each. Where the settings let
+# that run start by itself, the check is not started on its own as well: the run asks
+# it, and gathers what it answers. Where they do not, the check starts as it is set.
+BY_RUN: Final = {
+    "issue_story": "stories_issues",
+    "story_epic": "epics_stories",
+    "epic_links": "epics_stories",
+}
+
+
+def by_run(runs: Mapping[str, str], kind: str) -> bool:
+    """Whether a run that starts by itself asks the check in its place."""
+    return runs.get(BY_RUN.get(kind, ""), "off") in MODES[1:]
 
 
 def _aware(moment: datetime) -> datetime:
@@ -165,7 +175,7 @@ class AutoChecks:
                     .order_by(ProjectRecord.name)
                 )
                 for kind, mode in (runs or {}).items()
-                if mode in MODES[1:] and kind in self.starters and kind not in BY_RUN
+                if mode in MODES[1:] and kind in self.starters and not by_run(runs or {}, kind)
             ]
 
     def start_due(self, now: datetime | None = None) -> list[tuple[str, str]]:

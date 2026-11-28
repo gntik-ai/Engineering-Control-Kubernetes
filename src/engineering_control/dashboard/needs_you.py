@@ -383,7 +383,7 @@ def _checks(db: Session, project: ProjectRecord, lines: dict[str, int]) -> list[
             mode = (
                 # A check a run of Organize asks starts by itself where the run does.
                 organize_auto.standing(db, project, organize_auto.TAKES[kind])
-                if kind in organize_auto.TAKES
+                if auto_checks.by_run(review_settings.of(db, project.id).runs, kind)
                 else auto_checks.standing(db, project, kind)
             )
             if mode["mode"] == "off" and kind == "story_needed":

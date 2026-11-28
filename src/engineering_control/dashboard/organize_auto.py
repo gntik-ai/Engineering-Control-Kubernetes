@@ -49,13 +49,11 @@ RUNS: Final = {
     "coverage": "Coverage",
     "connection": "Connections: carrying out a plan that changed",
 }
-# The checks a run asks. A setting that let one of them run by itself lets the run now,
-# until the settings are saved again and say it for the run.
-TAKES: Final = {
-    "issue_story": "stories_issues",
-    "story_epic": "epics_stories",
-    "epic_links": "epics_stories",
-}
+# The checks a run asks, and the run that asks each. A setting that let such a check run
+# by itself does not let the run: a run does more than the check did (it also writes
+# what is missing), and that is allowed for the run, by its own setting. The check
+# goes on starting as it was set until the run is set to start by itself.
+TAKES: Final = auto_checks.BY_RUN
 PAGES: Final = {"epics_stories": "Organize", "stories_issues": "Organize", "coverage": "Coverage"}
 LIVE: Final = ("running", "held")
 # A run that left as much to do as it found is not started again by itself before this:
@@ -71,10 +69,7 @@ def mode_of(runs: Mapping[str, str], kind: str) -> str:
     """Whether that run starts by itself in a project: not at all, as records arrive, or
     once a night."""
     own = runs.get(kind)
-    if own in auto_checks.MODES:
-        return str(own)
-    asked = [runs.get(check) for check, run in TAKES.items() if run == kind]
-    return "arrive" if "arrive" in asked else "night" if "night" in asked else "off"
+    return str(own) if own in auto_checks.MODES else "off"
 
 
 def organized(db: Session, project: UUID) -> bool:

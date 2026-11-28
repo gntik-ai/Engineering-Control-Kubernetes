@@ -32,13 +32,6 @@ def began(repo: Any, when: datetime) -> None:
         latest.created_at = when
 
 
-def on_its_own(monkeypatch: Any) -> None:
-    """The engine is tried here on the check for Issues with no User Story. In the
-    product a run of Organize asks that check, and starts by itself in its place (see
-    test_organize_auto); the checks no run asks still start as these tests say."""
-    monkeypatch.setattr(auto_checks, "BY_RUN", frozenset())
-
-
 def standing(repo: Any, kind: str, now: datetime) -> dict[str, Any]:
     with repo.sessions() as db:
         project = db.scalars(select(ProjectRecord).where(ProjectRecord.name == "falcone")).one()
@@ -49,20 +42,18 @@ def test_a_check_starts_by_itself_as_records_arrive(tmp_path: Path, monkeypatch:
     client, repo = _authenticated_client(tmp_path)
     try:
         ready(repo, monkeypatch)
-        on_its_own(monkeypatch)
         # Nothing runs by itself unless the settings ask for it.
         assert post(client, "review-settings", **SAVE).status_code == 200
         assert repo.auto_checks.start_due(NOON) == []
         shown = client.get(BASE + "review-settings").json()["runs"]
+        # The runs, and the checks no run asks. A check a run asks is listed only while
+        # it is set to start on its own.
         assert {entry["check"]: entry["mode"] for entry in shown} == {
             "epics_stories": "off",
             "stories_issues": "off",
             "coverage": "off",
             "connection": "off",
-            "issue_story": "off",
-            "story_epic": "off",
             "story_needed": "off",
-            "epic_links": "off",
             "epic_overview": "off",
         }
         unknown = post(client, "review-settings", **SAVE, runs={"no_such_check": "arrive"})
@@ -147,7 +138,6 @@ def test_a_nightly_check_starts_once_a_night(tmp_path: Path, monkeypatch: Any) -
     client, repo = _authenticated_client(tmp_path)
     try:
         ready(repo, monkeypatch)
-        on_its_own(monkeypatch)
         asked = {"runs": {"issue_story": "night"}}
         assert post(client, "review-settings", **SAVE, **asked).status_code == 200
         assert "in the night" in standing(repo, "issue_story", NOON)["why"]
