@@ -264,6 +264,16 @@ The tests check it: after a run the bugs are as new as before, no label and no c
 
 **Underneath.** No migration. Runs and answers are the engine's (`choice_runs`, `choice_reviews`); how a suggestion was decided is kept with its answer; a draft made from a check is a backlog item that carries the check's name. The engine got one addition: a check whose answers say more than one thing tells in its own words what an answer is told when it goes back.
 
+**On live** (deployed 28 November 2026 at 09:10 UTC; read afterwards, nothing pressed).
+
+| Project | Read |
+| --- | --- |
+| falcone | 7 bugs are new. A run would ask about all 7: gpt-5.6-luna answers and claude-haiku-5-5 answers again, for about $0.01 and 53,000 tokens. $6.42 of this month's $15.00 for reviews are spent, so it can be started |
+| musematic | 3 bugs are new. No model is chosen to answer its reviews, so a run cannot be started, and the page says so and where to choose one |
+| The other four | No bug is new: there is nothing to suggest |
+
+The page answers in 0.2 to 0.6 seconds. No run was started and no checks were read on live: a run spends money, and reading the checks makes drafts among your records. Both are yours to press. What a run does, and what the checks make, is covered by three tests with stand-ins for the models and for GitHub, and by a look at the page over a throwaway database. The estimate is from list prices and the size of the questions; the first runs of Coverage cost more tokens than their estimate, because a model that thinks writes more than its answer.
+
 **What is not in B5, and why.**
 
 - **The checks are not read by themselves.** B5 is help on your word. Reading them on a schedule would make drafts nobody asked for whenever a check is red for an hour.
