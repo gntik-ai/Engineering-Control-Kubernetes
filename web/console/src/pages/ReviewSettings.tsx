@@ -572,9 +572,10 @@ export function ReviewSettings({ project }: { project: string }) {
                       {entry.since
                         ? `Changed ${new Date(entry.since).toLocaleString('en')}. Since then: `
                         : 'Not changed since its record began. On record: '}
-                      {whole(entry.counted)} {entry.says.split(',')[0]}, {whole(entry.wrong)}{' '}
-                      {entry.stage === 'decision' ? 'of them wrong' : 'of them taken away again'}; you accept{' '}
-                      {entry.accepted}%.
+                      {entry.stage === 'decision'
+                        ? `${whole(entry.counted)} sampled ${entry.counted === 1 ? 'line' : 'lines'} you judged, ${whole(entry.wrong)} of them wrong`
+                        : `${whole(entry.counted)} ${entry.counted === 1 ? 'record that was' : 'records that were'} made, ${whole(entry.wrong)} of them taken away again`}
+                      ; you accept {entry.accepted}%.
                       {entry.worse
                         ? ' That is worse than you accept: nothing of this stage is applied without you.'
                         : ''}

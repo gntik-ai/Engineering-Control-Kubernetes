@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 to O5 are built and deployed; O6 is built and tested and waits to be deployed** (each has its "as built" section below). On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **Every phase is built and deployed: O0, OC and O1 to O6** (each has its "as built" section below). On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -798,7 +798,7 @@ The ranking service has read none of the parts yet; the first run has it read th
 
 ### What is not in O4, and why
 
-- **No run was started on live.** Starting one spends money and is the administrator's. What a run does is covered by three tests (a run from the first reading to the answers and the undo; connected documentation and documents that change; a run without models and a project without a plan) and was looked at in a local console.
+- **No run was started on live by the platform's builder.** Starting one spends money and is the administrator's; they started two a day later (see "The first runs of Coverage on live", under O6). What a run does is covered by three tests (a run from the first reading to the answers and the undo; connected documentation and documents that change; a run without models and a project without a plan) and was looked at in a local console.
 - **The first run on Falcone takes several starts as the settings stand.** The estimate is 8.9 million tokens and one run stops at 1 million, so it would take nine starts, and the project's review tokens allow 2.28 million. Both numbers are the administrator's, under Settings; the page names both before the button. Each start goes on where the last one stopped: answers are kept.
 - **Nothing is written for a part of a connected project's documentation.** It is counted and shown; the record, if one is wanted, is the administrator's to ask for in the project the document belongs to.
 - **An Epic is never made by a run.** Decision 2 lets Epics and User Stories be made without asking. For Coverage an Epic waits all the same: one part of a document is thin ground for a whole capability, and a wrong Epic costs more to put right than a wrong Issue. One word makes all that wait.
@@ -934,9 +934,42 @@ The stages that ask no model measure themselves already and needed nothing: the 
 
 ### Read on live
 
-O6 is not on live yet. When it was ready (28 November, 00:23 UTC) two runs of Coverage the administrator had started were asking, on falcone and on falcone-serverless, and nothing is deployed while a run asks. It is deployed when they have stopped, and this section then says what was read.
+Deployed on 28 November 2026 at 01:14 UTC, after two runs of Coverage the administrator had started on falcone and falcone-serverless had ended: nothing is deployed while a run asks. Nothing was pressed.
 
-Read before the deploy: on falcone three checks are set to run each night (Issues with no User Story, primary Epics, extra Epic links) and one as records arrive (User Stories nothing supports). They go on exactly as set. No other project has anything set to run by itself.
+| | Read |
+| --- | --- |
+| What starts by itself | Nothing new, on any of the six projects: the four runs are off everywhere |
+| Checks set before | On falcone three checks are set to run each night (Issues with no User Story, primary Epics, extra Epic links) and one as records arrive (User Stories nothing supports). They stand exactly as set, and each is listed with the run that asks it. No other project had anything set |
+| The record of each stage | falcone: 15 sampled lines judged, none wrong; 12 records made, none taken away. falcone-serverless: no line judged yet; 1 record made. Neither stage was ever changed, so nothing can be put back |
+| Told | The inbox lists 86 cases under Coverage of falcone, and 61 under Organize and 41 under Coverage of falcone-serverless. No run started by itself in the last day, and the Dashboard says so |
+| Reviews of single records | Stopped by the administrator's switch on every project, as before; none is taken over by a run, because no run of Organize starts by itself |
+
+The page that says whether a run starts by itself answers in 0.2 to 0.3 seconds.
+
+### The first runs of Coverage on live (the administrator's, 27 to 28 November)
+
+O4 said that no run had been started on live. Two were, by the administrator, while O6 was being built. Read afterwards, without pressing anything:
+
+| | falcone | falcone-serverless |
+| --- | --- | --- |
+| Parts read | 2,855 | 398 |
+| Covered without a model (an OpenSpec change named after an Issue) | 481 | 0 |
+| Asked about before the run stopped at its tokens | 165 | 141 |
+| Of those: covered, by nothing, in doubt | 43, 59, 56 | 59, 8, 36 |
+| Groups of uncovered parts written for | 39 | 6 |
+| Records made | 12 (9 Issues, 3 User Stories) | 1 Issue |
+| Written and put before the administrator | 30 (15 with a sentence not supported, 15 the check could not tell) | 5 |
+| Documentation covered now | 41.5% (540 of 1,300) | 58.3% (60 of 103) |
+| Cases that wait | 86 | 41 |
+| Parts not asked about yet | 2,127 | 259 |
+| Cost, and time | $0.31, 77 minutes | $0.23, 61 minutes |
+
+What this showed:
+
+- **One run stops at a million tokens long before the documentation is through.** A question costs about 6,000 tokens for both models together, so a run asks about some 150 parts. For the rest of falcone the page now estimates $3.01 and 14 million tokens (it said 8.9 million before the parts were read: the real questions are longer than the guess), which is fourteen starts as the settings stand. The number of tokens a run may use is the administrator's, under Settings, up to five million.
+- **The careful review holds back most of what is written.** Of 45 groups written for, 13 passed and were made; 35 wait, about half because the second model found a sentence the parts do not support. A stronger model to write would change that more than anything else.
+- **Where the two models differ, it is mostly the first saying "covered".** On falcone-serverless 21 of the 34 differences are the answering model naming a record and the judge finding none, or finding the part not about the product.
+- **Two runs do not ask at once.** The writing for falcone-serverless waited 25 minutes in the queue behind the asking for falcone. That is the check engine's rule, not Coverage's.
 
 ### What is not in O6, and why
 
